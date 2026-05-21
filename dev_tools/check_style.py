@@ -17,6 +17,7 @@ Checks performed (per-file):
     8.  main_function     – Top-level `def main()` function present.
     9.  logging_present   – `import logging` and at least one `logging.` call present.
     10. success_message   – A success/completion message via `logging` present.
+    11. no_dataclasses    – No use of `dataclasses` (import or decorator).
 
 Exit status:
     0 – all enabled checks passed for all files
@@ -72,6 +73,7 @@ CHECKS_ENABLED: dict[str, bool] = {
     "main_function": True,
     "logging_present": True,
     "success_message": True,
+    "no_dataclasses": True,
 }
 
 # === END CONFIG ===
@@ -448,6 +450,79 @@ def check_success_message(src: str) -> list[Violation]:
     return []
 
 
+def check_no_dataclasses(src: str, path: Path) -> list[Violation]:
+    """Flag any import of dataclasses or use of the @dataclass decorator."""
+    try:
+        tree = ast.parse(src, filename=str(path))
+    except SyntaxError:
+        return []
+
+    found: list[Violation] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "dataclasses":
+                    found.append(
+                        Violation(
+                            check="no_dataclasses",
+                            line=node.lineno,
+                            message=(
+                                "`import dataclasses` detected — use a plain class or "
+                                "NamedTuple instead of dataclasses per house style"
+                            ),
+                        )
+                    )
+        elif isinstance(node, ast.ImportFrom):
+            if (node.module or "") == "dataclasses":
+                names = ", ".join(a.name for a in node.names)
+                found.append(
+                    Violation(
+                        check="no_dataclasses",
+                        line=node.lineno,
+                        message=(
+                            f"`from dataclasses import {names}` detected — use a plain "
+                            "class or NamedTuple instead of dataclasses per house style"
+                        ),
+                    )
+                )
+        elif isinstance(node, ast.ClassDef):
+            for decorator in node.decorator_list:
+                is_dataclass = (
+                    (isinstance(decorator, ast.Name) and decorator.id == "dataclass")
+                    or (
+                        isinstance(decorator, ast.Attribute)
+                        and decorator.attr == "dataclass"
+                        and isinstance(decorator.value, ast.Name)
+                        and decorator.value.id == "dataclasses"
+                    )
+                    or (
+                        isinstance(decorator, ast.Call)
+                        and (
+                            (
+                                isinstance(decorator.func, ast.Name)
+                                and decorator.func.id == "dataclass"
+                            )
+                            or (
+                                isinstance(decorator.func, ast.Attribute)
+                                and decorator.func.attr == "dataclass"
+                            )
+                        )
+                    )
+                )
+                if is_dataclass:
+                    found.append(
+                        Violation(
+                            check="no_dataclasses",
+                            line=node.lineno,
+                            message=(
+                                f"`@dataclass` on class `{node.name}` detected — use a "
+                                "plain class or NamedTuple instead per house style"
+                            ),
+                        )
+                    )
+    return found
+
+
 # =============================================================================
 # ORCHESTRATION
 # =============================================================================
@@ -485,6 +560,8 @@ def audit_file(path: Path) -> FileResult:
         violations.extend(check_logging_present(src))
     if enabled.get("success_message", True):
         violations.extend(check_success_message(src))
+    if enabled.get("no_dataclasses", True):
+        violations.extend(check_no_dataclasses(src, path))
 
     return FileResult(path=path, violations=violations)
 
