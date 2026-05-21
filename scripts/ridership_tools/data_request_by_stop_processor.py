@@ -844,10 +844,11 @@ def _resolve_script_source() -> Tuple[str, str]:
         RuntimeError: If neither source can be located.
     """
     # --- 1. IPython / Jupyter kernel ---
-    try:
-        ip = get_ipython()  # type: ignore[name-defined]  # injected by IPython
-    except NameError:
-        ip = None
+    # IPython registers itself in sys.modules when a kernel starts; avoid a
+    # direct import so ty doesn't flag an unresolved-import for a dep that is
+    # intentionally optional.  get_ipython() returns None outside a live kernel.
+    _ipython = sys.modules.get("IPython")
+    ip = _ipython.get_ipython() if _ipython is not None else None  # type: ignore[attr-defined]
 
     if ip is not None:
         history: List[str] = ip.user_ns.get("In", [])
