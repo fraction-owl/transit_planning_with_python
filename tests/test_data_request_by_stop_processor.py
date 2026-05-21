@@ -49,11 +49,7 @@ def test_write_run_log_creates_file(tmp_path: Path) -> None:
     output_file = tmp_path / "output.xlsx"
     log_path = tmp_path / "output_runlog.txt"
 
-    fake_source = (
-        "# === BEGIN CONFIG ===\n"
-        "KEY = 1\n"
-        "# === END CONFIG ===\n"
-    )
+    fake_source = "# === BEGIN CONFIG ===\nKEY = 1\n# === END CONFIG ===\n"
     with patch(
         "data_request_by_stop_processor._resolve_script_source",
         return_value=(fake_source, "<test>"),
@@ -72,11 +68,7 @@ def test_write_run_log_returns_false_on_io_error(tmp_path: Path) -> None:
     """write_run_log returns False (and logs) when the file cannot be written."""
     output_file = tmp_path / "output.xlsx"
 
-    fake_source = (
-        "# === BEGIN CONFIG ===\n"
-        "K=1\n"
-        "# === END CONFIG ===\n"
-    )
+    fake_source = "# === BEGIN CONFIG ===\nK=1\n# === END CONFIG ===\n"
     with (
         patch(
             "data_request_by_stop_processor._resolve_script_source",
