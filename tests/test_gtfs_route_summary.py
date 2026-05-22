@@ -131,9 +131,7 @@ def test_classify_services_calendar_dates_exception_adds_date() -> None:
             }
         ]
     )
-    cal_dates = pd.DataFrame(
-        [{"service_id": "WKD", "date": "20260103", "exception_type": "1"}]
-    )
+    cal_dates = pd.DataFrame([{"service_id": "WKD", "date": "20260103", "exception_type": "1"}])
     result = classify_services(cal, cal_dates)
     assert "Weekday" in result["WKD"]
 
@@ -390,9 +388,7 @@ def test_build_summary_extras_joined(gtfs_basic: dict[str, pd.DataFrame]) -> Non
     assert summary[summary["route_short_name"] == "R3"].iloc[0]["service_type"] == ""
 
 
-def test_build_summary_export_to_xlsx(
-    gtfs_basic: dict[str, pd.DataFrame], tmp_path: Path
-) -> None:
+def test_build_summary_export_to_xlsx(gtfs_basic: dict[str, pd.DataFrame], tmp_path: Path) -> None:
     from scripts.field_tools.gtfs_route_summary import export_to_xlsx
 
     summary = build_summary(

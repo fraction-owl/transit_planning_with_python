@@ -320,11 +320,7 @@ def trip_distances_meters(
             if not per_trip.empty:
                 return per_trip
 
-    if (
-        shapes_df is not None
-        and not shapes_df.empty
-        and "shape_dist_traveled" in shapes_df.columns
-    ):
+    if shapes_df is not None and not shapes_df.empty and "shape_dist_traveled" in shapes_df.columns:
         s = pd.to_numeric(shapes_df["shape_dist_traveled"], errors="coerce")
         tmp = shapes_df.assign(_d=s).dropna(subset=["_d"])
         per_shape = tmp.groupby("shape_id")["_d"].max() * factor
@@ -632,9 +628,7 @@ def main() -> None:
     dist_unit = args.distance_unit or DISTANCE_UNIT
     svc_types_path = args.service_types if args.service_types is not None else SERVICE_TYPES_PATH
     corridors_path = args.corridors if args.corridors is not None else CORRIDORS_PATH
-    last_changed_path = (
-        args.last_changed if args.last_changed is not None else LAST_CHANGED_PATH
-    )
+    last_changed_path = args.last_changed if args.last_changed is not None else LAST_CHANGED_PATH
     ridership_path = args.ridership if args.ridership is not None else RIDERSHIP_PATH
     holiday_max = (
         args.holiday_max_days_per_year
