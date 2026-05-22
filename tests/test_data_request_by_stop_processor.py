@@ -179,3 +179,106 @@ def test_full_processing_integration() -> None:
         assert stop_1001_am.iloc[0]["ROUTES"] == "10A, 10B", (
             f"Expected '10A, 10B', got {stop_1001_am.iloc[0]['ROUTES']}"
         )
+
+
+def test_build_route_level_analysis_percentages() -> None:
+    """Route-level percentages divide by full-route totals, not the filtered slice."""
+    df = pd.read_csv(FIXTURE_PATH)
+    df["ROUTE_NAME"] = df["ROUTE_NAME"].astype(str).str.strip()
+
+    # Filter to one stop on route 30; the other stop (4005) must still appear in
+    # the denominator so the % columns reflect the full route.
+    result = target.build_route_level_analysis(df, stop_ids_filter=[4004])
+
+    route_30 = result[result["ROUTE_NAME"] == "30"].set_index("STOP_ID")
+    assert set(route_30.index) == {4004, 4005}, (
+        "Route Analysis must include every stop on the route, not just filtered ones"
+    )
+
+    # Route 30 totals:
+    #   4004: board = 42 + 55.2 = 97.2,  alight = 38.1 + 47   = 85.1
+    #   4005: board = 15.6 + 18.9 = 34.5, alight = 12.3 + 16.2 = 28.5
+    # Route board total = 131.7; route alight total = 113.6; route total = 245.3
+    assert route_30.loc[4004, "Boardings"] == pytest.approx(97.2)
+    assert route_30.loc[4004, "Route Boardings"] == pytest.approx(131.7)
+    assert route_30.loc[4004, "% of Route Boardings"] == pytest.approx(73.8, abs=0.01)
+    assert route_30.loc[4004, "% of Route Total"] == pytest.approx(74.32, abs=0.01)
+
+    # The two stops' percentages must sum to 100 on each metric.
+    assert route_30["% of Route Boardings"].sum() == pytest.approx(100.0, abs=0.01)
+    assert route_30["% of Route Alightings"].sum() == pytest.approx(100.0, abs=0.01)
+    assert route_30["% of Route Total"].sum() == pytest.approx(100.0, abs=0.01)
+
+    # In Filter flag tracks STOP_IDS membership.
+    assert bool(route_30.loc[4004, "In Filter"]) is True
+    assert bool(route_30.loc[4005, "In Filter"]) is False
+
+
+def test_build_route_level_analysis_no_stop_filter() -> None:
+    """With no STOP_IDS filter, every row is marked In Filter = True."""
+    df = pd.read_csv(FIXTURE_PATH)
+    df["ROUTE_NAME"] = df["ROUTE_NAME"].astype(str).str.strip()
+    result = target.build_route_level_analysis(df, stop_ids_filter=[])
+    assert result["In Filter"].all()
+
+
+def test_main_passes_route_analysis_when_enabled() -> None:
+    """main() builds route analysis from route-only-filtered data when the flag is on."""
+    fixture_df = pd.read_csv(FIXTURE_PATH)
+
+    with (
+        patch("data_request_by_stop_processor.read_excel_file") as mock_read,
+        patch("data_request_by_stop_processor.write_to_excel") as mock_write,
+        patch("data_request_by_stop_processor.write_run_log", return_value=True),
+        patch("data_request_by_stop_processor.INPUT_FILE_PATH", Path("dummy_input.xlsx")),
+        patch("data_request_by_stop_processor.OUTPUT_DIR", Path("dummy_output")),
+        patch("data_request_by_stop_processor.ROUTES", ["30"]),
+        patch("data_request_by_stop_processor.ROUTES_EXCLUDE", []),
+        patch("data_request_by_stop_processor.STOP_IDS", [4004]),
+        patch("data_request_by_stop_processor.TIME_PERIODS", ["AM PEAK", "PM PEAK"]),
+        patch("data_request_by_stop_processor.AGGREGATE_ROUTES_TOGETHER", True),
+        patch("data_request_by_stop_processor.APPLY_ROUNDING", True),
+        patch("data_request_by_stop_processor.AGGREGATE_BIN_RANGES", False),
+        patch("data_request_by_stop_processor.EXPORT_ROUTE_LEVEL_ANALYSIS", True),
+    ):
+        mock_read.return_value = fixture_df.copy()
+        target.main()
+
+        _, kwargs = mock_write.call_args
+        route_analysis = kwargs["route_analysis"]
+
+    assert route_analysis is not None
+    # Both stops on route 30 must be present even though STOP_IDS filtered to 4004.
+    assert set(route_analysis["STOP_ID"].tolist()) == {4004, 4005}
+    assert bool(
+        route_analysis.loc[route_analysis["STOP_ID"] == 4004, "In Filter"].iloc[0]
+    ) is True
+    assert bool(
+        route_analysis.loc[route_analysis["STOP_ID"] == 4005, "In Filter"].iloc[0]
+    ) is False
+
+
+def test_main_omits_route_analysis_when_disabled() -> None:
+    """main() leaves route_analysis as None when the flag is off (default)."""
+    fixture_df = pd.read_csv(FIXTURE_PATH)
+
+    with (
+        patch("data_request_by_stop_processor.read_excel_file") as mock_read,
+        patch("data_request_by_stop_processor.write_to_excel") as mock_write,
+        patch("data_request_by_stop_processor.write_run_log", return_value=True),
+        patch("data_request_by_stop_processor.INPUT_FILE_PATH", Path("dummy_input.xlsx")),
+        patch("data_request_by_stop_processor.OUTPUT_DIR", Path("dummy_output")),
+        patch("data_request_by_stop_processor.ROUTES", []),
+        patch("data_request_by_stop_processor.ROUTES_EXCLUDE", []),
+        patch("data_request_by_stop_processor.STOP_IDS", []),
+        patch("data_request_by_stop_processor.TIME_PERIODS", ["AM PEAK"]),
+        patch("data_request_by_stop_processor.AGGREGATE_ROUTES_TOGETHER", True),
+        patch("data_request_by_stop_processor.APPLY_ROUNDING", True),
+        patch("data_request_by_stop_processor.AGGREGATE_BIN_RANGES", False),
+        patch("data_request_by_stop_processor.EXPORT_ROUTE_LEVEL_ANALYSIS", False),
+    ):
+        mock_read.return_value = fixture_df.copy()
+        target.main()
+        _, kwargs = mock_write.call_args
+
+    assert kwargs["route_analysis"] is None
