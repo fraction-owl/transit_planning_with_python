@@ -14,11 +14,12 @@ against the full input dataset (stop counts and total ridership, with percents).
 When ``EXPORT_ROUTE_LEVEL_ANALYSIS`` is True, an additional ``Route Analysis``
 sheet is produced that shows, for every stop on each kept route, the share of
 that route's total boardings, alightings, and combined ridership contributed
-by the stop. Route denominators are computed from data filtered by
-``ROUTES``/``ROUTES_EXCLUDE`` only — the ``STOP_IDS`` filter does not shrink
-them — so a stop-filtered run can still compare the selected stop(s) against
-the rest of the route. Stops kept by the ``STOP_IDS`` filter are flagged in an
-``In Filter`` column.
+by the stop. When ``STOP_IDS`` is set, the sheet is scoped to routes that
+actually serve at least one filtered stop — but within each of those routes,
+all stops are included so the filtered stop(s) can be compared against their
+siblings. Route denominators are always computed from data filtered by
+``ROUTES``/``ROUTES_EXCLUDE`` only — ``STOP_IDS`` does not shrink them —
+and stops kept by the ``STOP_IDS`` filter are flagged in an ``In Filter`` column.
 
 A sidecar ``_runlog.txt`` is written alongside the output workbook, capturing
 the CONFIGURATION block of this script verbatim (the text between the
@@ -1160,13 +1161,21 @@ def main() -> None:  # noqa: D401 – imperative mood is OK for main entry point
         }
         clean_stops = build_clean_stops_sheet(final_filtered, gtfs_stops, GTFS_JOIN_KEY)
 
-    # Optional route-level analysis. Denominators come from route_filtered_data
-    # (routes filtered, STOP_IDS not applied) so every stop on each kept route
-    # is included and the STOP_IDS filter only flags the "In Filter" column.
+    # Optional route-level analysis. When STOP_IDS is set, restrict the sheet
+    # to routes that actually serve at least one filtered stop — otherwise the
+    # output would list every route in route_filtered_data, including ones the
+    # user's stop selection has nothing to do with. Within each kept route,
+    # all stops are still included so the comparison stays meaningful, and
+    # STOP_IDS only drives the "In Filter" column.
     route_analysis: pd.DataFrame | None = None
     if EXPORT_ROUTE_LEVEL_ANALYSIS:
         route_scope: pd.DataFrame = route_filtered_data.copy()
         route_scope["ROUTE_NAME"] = route_scope["ROUTE_NAME"].astype(str).str.strip()
+        if STOP_IDS:
+            relevant_routes: set[str] = set(
+                filtered_data["ROUTE_NAME"].astype(str).str.strip().unique()
+            )
+            route_scope = route_scope[route_scope["ROUTE_NAME"].isin(relevant_routes)]
         route_analysis = build_route_level_analysis(
             route_scope,
             stop_ids_filter=STOP_IDS,

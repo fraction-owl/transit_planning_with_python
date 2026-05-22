@@ -254,6 +254,39 @@ def test_main_passes_route_analysis_when_enabled() -> None:
     assert bool(route_analysis.loc[route_analysis["STOP_ID"] == 4005, "In Filter"].iloc[0]) is False
 
 
+def test_main_scopes_route_analysis_to_routes_serving_filtered_stops() -> None:
+    """STOP_IDS without ROUTES should still limit Route Analysis to relevant routes."""
+    fixture_df = pd.read_csv(FIXTURE_PATH)
+
+    with (
+        patch("data_request_by_stop_processor.read_excel_file") as mock_read,
+        patch("data_request_by_stop_processor.write_to_excel") as mock_write,
+        patch("data_request_by_stop_processor.write_run_log", return_value=True),
+        patch("data_request_by_stop_processor.INPUT_FILE_PATH", Path("dummy_input.xlsx")),
+        patch("data_request_by_stop_processor.OUTPUT_DIR", Path("dummy_output")),
+        patch("data_request_by_stop_processor.ROUTES", []),
+        patch("data_request_by_stop_processor.ROUTES_EXCLUDE", []),
+        # Stop 4004 belongs to route 30 only. The fixture contains many other
+        # routes that don't serve this stop; those must not appear in the sheet.
+        patch("data_request_by_stop_processor.STOP_IDS", [4004]),
+        patch("data_request_by_stop_processor.TIME_PERIODS", ["AM PEAK", "PM PEAK"]),
+        patch("data_request_by_stop_processor.AGGREGATE_ROUTES_TOGETHER", True),
+        patch("data_request_by_stop_processor.APPLY_ROUNDING", True),
+        patch("data_request_by_stop_processor.AGGREGATE_BIN_RANGES", False),
+        patch("data_request_by_stop_processor.EXPORT_ROUTE_LEVEL_ANALYSIS", True),
+    ):
+        mock_read.return_value = fixture_df.copy()
+        target.main()
+        _, kwargs = mock_write.call_args
+        route_analysis = kwargs["route_analysis"]
+
+    assert route_analysis is not None
+    # Only route 30 serves stop 4004, so no other route should appear.
+    assert set(route_analysis["ROUTE_NAME"].unique()) == {"30"}
+    # Both stops on route 30 are still included for comparison.
+    assert set(route_analysis["STOP_ID"].tolist()) == {4004, 4005}
+
+
 def test_main_omits_route_analysis_when_disabled() -> None:
     """main() leaves route_analysis as None when the flag is off (default)."""
     fixture_df = pd.read_csv(FIXTURE_PATH)
