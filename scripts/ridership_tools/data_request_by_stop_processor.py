@@ -11,6 +11,16 @@ with Stop Code, Stop Name, Latitude, Longitude, Boardings, Alightings, and Total
 A ``Summary`` sheet is also written that compares the post-filter selection
 against the full input dataset (stop counts and total ridership, with percents).
 
+When ``EXPORT_ROUTE_LEVEL_ANALYSIS`` is True, an additional ``Route Analysis``
+sheet is produced that shows, for every stop on each kept route, the share of
+that route's total boardings, alightings, and combined ridership contributed
+by the stop. When ``STOP_IDS`` is set, the sheet is scoped to routes that
+actually serve at least one filtered stop — but within each of those routes,
+all stops are included so the filtered stop(s) can be compared against their
+siblings. Route denominators are always computed from data filtered by
+``ROUTES``/``ROUTES_EXCLUDE`` only — ``STOP_IDS`` does not shrink them —
+and stops kept by the ``STOP_IDS`` filter are flagged in an ``In Filter`` column.
+
 A sidecar ``_runlog.txt`` is written alongside the output workbook, capturing
 the CONFIGURATION block of this script verbatim (the text between the
 ``# === BEGIN CONFIG ===`` and ``# === END CONFIG ===`` markers) along with a
@@ -84,6 +94,13 @@ APPLY_ROUNDING: bool = True
 # If True → convert aggregated totals to textual bins; numeric rounding is
 # suppressed.  If False → leave numeric (subject to APPLY_ROUNDING).
 AGGREGATE_BIN_RANGES: bool = False
+
+# If True → emit a "Route Analysis" sheet that shows each stop's share of its
+# route's total boardings, alightings, and combined ridership. Route totals
+# are computed from data filtered by ROUTES / ROUTES_EXCLUDE only — STOP_IDS
+# does not shrink the denominator — so the sheet is useful for comparing a
+# stop-filtered selection against the rest of the route.
+EXPORT_ROUTE_LEVEL_ANALYSIS: bool = False
 
 # Optional GTFS enrichment.
 # GTFS_PATH may point to a stops.txt file, a GTFS .zip archive, or an
@@ -524,6 +541,133 @@ def build_clean_stops_sheet(
     ]
 
 
+def build_route_level_analysis(
+    route_filtered_data: pd.DataFrame,
+    stop_ids_filter: Sequence[int] | None,
+    gtfs_stops: pd.DataFrame | None = None,
+    gtfs_join_key: str = "stop_id",
+) -> pd.DataFrame:
+    """Build a per-stop view of each stop's share of its route's ridership.
+
+    Aggregates BOARD_ALL and ALIGHT_ALL by (ROUTE_NAME, STOP, STOP_ID) and
+    divides each stop's totals by its route's totals to produce the share
+    of route boardings, alightings, and combined ridership contributed by
+    that stop. Routes are always kept separate — the percentages would be
+    meaningless if rows for different routes were rolled up together — so
+    this sheet ignores ``AGGREGATE_ROUTES_TOGETHER``.
+
+    The input should already be filtered by ``ROUTES`` / ``ROUTES_EXCLUDE``
+    but **not** by ``STOP_IDS``; otherwise the route denominator collapses
+    onto the filtered stop(s).
+
+    Args:
+        route_filtered_data: Ridership rows filtered by route only.
+        stop_ids_filter: The ``STOP_IDS`` config value, used to populate
+            the ``In Filter`` column. Empty/None marks every row as in-filter.
+        gtfs_stops: Optional output of :func:`load_gtfs_stops`. When supplied,
+            ``Stop Name``, ``Latitude``, and ``Longitude`` columns are joined on.
+        gtfs_join_key: ``"stop_id"`` or ``"stop_code"``; ignored when
+            ``gtfs_stops`` is None.
+
+    Returns:
+        DataFrame with one row per (ROUTE_NAME, STOP_ID), sorted by route
+        then by descending route share. Numeric columns are rounded for
+        readability when ``APPLY_ROUNDING`` is True.
+    """
+    per_stop: pd.DataFrame = route_filtered_data.groupby(
+        ["ROUTE_NAME", "STOP", "STOP_ID"], as_index=False
+    ).agg(Boardings=("BOARD_ALL", "sum"), Alightings=("ALIGHT_ALL", "sum"))
+    per_stop["Total"] = per_stop["Boardings"] + per_stop["Alightings"]
+
+    route_totals: pd.DataFrame = per_stop.groupby("ROUTE_NAME", as_index=False).agg(
+        Route_Boardings=("Boardings", "sum"),
+        Route_Alightings=("Alightings", "sum"),
+        Route_Total=("Total", "sum"),
+    )
+
+    merged: pd.DataFrame = per_stop.merge(route_totals, on="ROUTE_NAME", how="left")
+
+    def _pct(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
+        return (numerator / denominator * 100.0).where(denominator > 0, 0.0)
+
+    merged["% of Route Boardings"] = _pct(merged["Boardings"], merged["Route_Boardings"])
+    merged["% of Route Alightings"] = _pct(merged["Alightings"], merged["Route_Alightings"])
+    merged["% of Route Total"] = _pct(merged["Total"], merged["Route_Total"])
+
+    if stop_ids_filter:
+        filter_set: set[int] = {int(x) for x in stop_ids_filter}
+        merged["In Filter"] = merged["STOP_ID"].apply(
+            lambda sid: int(sid) in filter_set if pd.notna(sid) else False
+        )
+    else:
+        merged["In Filter"] = True
+
+    merged = merged.rename(
+        columns={
+            "Route_Boardings": "Route Boardings",
+            "Route_Alightings": "Route Alightings",
+            "Route_Total": "Route Total",
+        }
+    )
+
+    column_order: List[str] = [
+        "ROUTE_NAME",
+        "STOP",
+        "STOP_ID",
+        "In Filter",
+        "Boardings",
+        "Route Boardings",
+        "% of Route Boardings",
+        "Alightings",
+        "Route Alightings",
+        "% of Route Alightings",
+        "Total",
+        "Route Total",
+        "% of Route Total",
+    ]
+
+    if gtfs_stops is not None:
+        if gtfs_join_key not in {"stop_id", "stop_code"}:
+            raise ValueError(
+                f"gtfs_join_key must be 'stop_id' or 'stop_code', got '{gtfs_join_key}'"
+            )
+        merged["_join_key"] = merged["STOP_ID"].astype(str).str.strip()
+        gtfs_subset: pd.DataFrame = (
+            gtfs_stops.assign(_join_key=gtfs_stops[gtfs_join_key])[
+                ["_join_key", "stop_name", "stop_lat", "stop_lon"]
+            ]
+            .drop_duplicates(subset=["_join_key"])
+            .rename(
+                columns={
+                    "stop_name": "Stop Name",
+                    "stop_lat": "Latitude",
+                    "stop_lon": "Longitude",
+                }
+            )
+        )
+        merged = merged.merge(gtfs_subset, on="_join_key", how="left").drop(columns=["_join_key"])
+        column_order = column_order[:3] + ["Stop Name", "Latitude", "Longitude"] + column_order[3:]
+
+    if APPLY_ROUNDING:
+        for col in (
+            "Boardings",
+            "Route Boardings",
+            "Alightings",
+            "Route Alightings",
+            "Total",
+            "Route Total",
+        ):
+            merged[col] = merged[col].round(1)
+        for col in ("% of Route Boardings", "% of Route Alightings", "% of Route Total"):
+            merged[col] = merged[col].round(2)
+
+    merged = merged.sort_values(
+        ["ROUTE_NAME", "% of Route Total"], ascending=[True, False]
+    ).reset_index(drop=True)
+
+    return merged[column_order]
+
+
 def verify_required_columns(data_frame: pd.DataFrame, required_columns: Sequence[str]) -> None:
     """Ensure *data_frame* contains all columns listed in *required_columns*.
 
@@ -586,6 +730,7 @@ def write_to_excel(
     all_time_aggregated: pd.DataFrame,
     selection_summary: pd.DataFrame | None = None,
     clean_stops: pd.DataFrame | None = None,
+    route_analysis: pd.DataFrame | None = None,
 ) -> None:
     """Write the processed data sets to *output_file* in a sensible order.
 
@@ -593,9 +738,11 @@ def write_to_excel(
         1. ``Summary``           – selection-vs-system totals (if provided)
         2. ``Stops Clean``       – per-stop summary with GTFS attributes
                                    (if provided)
-        3. ``Original``          – raw (but optionally rounded) rows
-        4. ``All Time Periods``  – aggregation across *all* rows
-        5. One sheet per entry in ``aggregated_peaks``
+        3. ``Route Analysis``    – per-stop share of route ridership
+                                   (if provided)
+        4. ``Original``          – raw (but optionally rounded) rows
+        5. ``All Time Periods``  – aggregation across *all* rows
+        6. One sheet per entry in ``aggregated_peaks``
 
     Args:
         output_file: Path to the workbook to create/overwrite.
@@ -606,6 +753,8 @@ def write_to_excel(
             :func:`build_selection_summary`.
         clean_stops: Optional clean per-stop sheet from
             :func:`build_clean_stops_sheet`.
+        route_analysis: Optional route-level analysis DataFrame from
+            :func:`build_route_level_analysis`.
 
     Raises:
         SystemExit: On any I/O error (permission, disk full, etc.).
@@ -616,6 +765,8 @@ def write_to_excel(
                 selection_summary.to_excel(writer, sheet_name="Summary", index=False)
             if clean_stops is not None:
                 clean_stops.to_excel(writer, sheet_name="Stops Clean", index=False)
+            if route_analysis is not None:
+                route_analysis.to_excel(writer, sheet_name="Route Analysis", index=False)
             filtered_data.to_excel(writer, sheet_name="Original", index=False)
             all_time_aggregated.to_excel(writer, sheet_name="All Time Periods", index=False)
             for period, df_agg in aggregated_peaks.items():
@@ -972,13 +1123,14 @@ def main() -> None:  # noqa: D401 – imperative mood is OK for main entry point
     ridership_df: pd.DataFrame = read_excel_file(input_file)
     verify_required_columns(ridership_df, REQUIRED_COLUMNS)
 
-    # Apply optional filters
-    filtered_data: pd.DataFrame = filter_data(
+    # Apply route filters first so the route-level analysis denominator covers
+    # every stop on each kept route, then narrow further by STOP_IDS.
+    route_filtered_data: pd.DataFrame = filter_data(
         ridership_df,
         routes=ROUTES,
-        stop_ids=STOP_IDS,
         routes_exclude=ROUTES_EXCLUDE,
     )
+    filtered_data: pd.DataFrame = filter_data(route_filtered_data, stop_ids=STOP_IDS)
 
     # Build & log selection-vs-system summary (filtered rows vs. full input)
     selection_summary: pd.DataFrame = build_selection_summary(ridership_df, filtered_data)
@@ -994,8 +1146,9 @@ def main() -> None:  # noqa: D401 – imperative mood is OK for main entry point
 
     # Optional GTFS enrichment
     clean_stops: pd.DataFrame | None = None
+    gtfs_stops: pd.DataFrame | None = None
     if GTFS_PATH is not None:
-        gtfs_stops: pd.DataFrame = load_gtfs_stops(GTFS_PATH)
+        gtfs_stops = load_gtfs_stops(GTFS_PATH)
         logging.info(
             "Loaded GTFS: %d stops; joining ridership STOP_ID against GTFS '%s'.",
             len(gtfs_stops),
@@ -1008,6 +1161,28 @@ def main() -> None:  # noqa: D401 – imperative mood is OK for main entry point
         }
         clean_stops = build_clean_stops_sheet(final_filtered, gtfs_stops, GTFS_JOIN_KEY)
 
+    # Optional route-level analysis. When STOP_IDS is set, restrict the sheet
+    # to routes that actually serve at least one filtered stop — otherwise the
+    # output would list every route in route_filtered_data, including ones the
+    # user's stop selection has nothing to do with. Within each kept route,
+    # all stops are still included so the comparison stays meaningful, and
+    # STOP_IDS only drives the "In Filter" column.
+    route_analysis: pd.DataFrame | None = None
+    if EXPORT_ROUTE_LEVEL_ANALYSIS:
+        route_scope: pd.DataFrame = route_filtered_data.copy()
+        route_scope["ROUTE_NAME"] = route_scope["ROUTE_NAME"].astype(str).str.strip()
+        if STOP_IDS:
+            relevant_routes: set[str] = set(
+                filtered_data["ROUTE_NAME"].astype(str).str.strip().unique()
+            )
+            route_scope = route_scope[route_scope["ROUTE_NAME"].isin(relevant_routes)]
+        route_analysis = build_route_level_analysis(
+            route_scope,
+            stop_ids_filter=STOP_IDS,
+            gtfs_stops=gtfs_stops,
+            gtfs_join_key=GTFS_JOIN_KEY,
+        )
+
     # Write to disk
     write_to_excel(
         output_file,
@@ -1016,6 +1191,7 @@ def main() -> None:  # noqa: D401 – imperative mood is OK for main entry point
         all_time_aggregated,
         selection_summary=selection_summary,
         clean_stops=clean_stops,
+        route_analysis=route_analysis,
     )
 
     # Sidecar run log — required by default so outputs are always traceable.
