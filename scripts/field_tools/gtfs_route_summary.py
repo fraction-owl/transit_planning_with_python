@@ -2,7 +2,8 @@
 
 Typical usage
 -------------
-    python gtfs_route_summary.py --gtfs-dir ./feed --out-dir ./out
+Adjust the paths and options in the CONFIGURATION section below, then run
+the script in ArcGIS Pro, a standalone Python environment, or a notebook.
 
 Key Features
 ------------
@@ -18,7 +19,6 @@ Key Features
 
 from __future__ import annotations
 
-import argparse
 import logging
 import os
 from collections.abc import Mapping, Sequence
@@ -586,31 +586,6 @@ def export_to_xlsx(data_frame: pd.DataFrame, output_file: str) -> None:
     logging.info("Wrote %s (%s rows)", output_file, len(data_frame))
 
 
-def _parse_cli_args() -> argparse.Namespace:
-    """Parse command-line overrides for every CONFIGURATION constant.
-
-    Returns:
-        Parsed argument namespace.
-    """
-    p = argparse.ArgumentParser(description="Export a one-row-per-route GTFS summary XLSX.")
-    p.add_argument("--gtfs-dir", default=None)
-    p.add_argument("--out-dir", default=None)
-    p.add_argument("--out-file", default=None)
-    p.add_argument(
-        "--distance-unit", default=None, choices=["meters", "kilometers", "feet", "miles"]
-    )
-    p.add_argument("--service-types", default=None)
-    p.add_argument("--corridors", default=None)
-    p.add_argument("--last-changed", default=None)
-    p.add_argument("--ridership", default=None)
-    p.add_argument("--holiday-max-days-per-year", type=float, default=None)
-    p.add_argument("--weekday-dow-share", type=float, default=None)
-    args, unknown = p.parse_known_args()
-    if unknown:
-        logging.debug("Ignoring unknown args (e.g. Jupyter kernel): %s", unknown)
-    return args
-
-
 # ==== MAIN ===================================================================
 
 
@@ -620,54 +595,36 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
-    args = _parse_cli_args()
-
-    gtfs_dir = args.gtfs_dir or GTFS_FOLDER_PATH
-    out_dir = args.out_dir or BASE_OUTPUT_PATH
-    out_file = args.out_file or OUTPUT_FILENAME
-    dist_unit = args.distance_unit or DISTANCE_UNIT
-    svc_types_path = args.service_types if args.service_types is not None else SERVICE_TYPES_PATH
-    corridors_path = args.corridors if args.corridors is not None else CORRIDORS_PATH
-    last_changed_path = args.last_changed if args.last_changed is not None else LAST_CHANGED_PATH
-    ridership_path = args.ridership if args.ridership is not None else RIDERSHIP_PATH
-    holiday_max = (
-        args.holiday_max_days_per_year
-        if args.holiday_max_days_per_year is not None
-        else HOLIDAY_MAX_DAYS_PER_YEAR
-    )
-    weekday_share = (
-        args.weekday_dow_share if args.weekday_dow_share is not None else WEEKDAY_DOW_SHARE
-    )
 
     logging.info("==== GTFS Route Summary ====")
-    logging.info("GTFS dir      : %s", gtfs_dir)
-    logging.info("Output        : %s", os.path.join(out_dir, out_file))
-    logging.info("Distance unit : %s", dist_unit)
-    logging.info("Holiday max/y : %s", holiday_max)
-    logging.info("Weekday share : %s", weekday_share)
+    logging.info("GTFS dir      : %s", GTFS_FOLDER_PATH)
+    logging.info("Output        : %s", os.path.join(BASE_OUTPUT_PATH, OUTPUT_FILENAME))
+    logging.info("Distance unit : %s", DISTANCE_UNIT)
+    logging.info("Holiday max/y : %s", HOLIDAY_MAX_DAYS_PER_YEAR)
+    logging.info("Weekday share : %s", WEEKDAY_DOW_SHARE)
 
     try:
-        core = load_gtfs_data(gtfs_dir, files=REQUIRED_GTFS_FILES)
+        core = load_gtfs_data(GTFS_FOLDER_PATH, files=REQUIRED_GTFS_FILES)
 
         calendar_dates_df: Optional[pd.DataFrame] = None
         try:
-            cd = load_gtfs_data(gtfs_dir, files=("calendar_dates.txt",))
+            cd = load_gtfs_data(GTFS_FOLDER_PATH, files=("calendar_dates.txt",))
             calendar_dates_df = cd.get("calendar_dates")
         except OSError as exc:
             logging.warning("calendar_dates.txt unavailable: %s", exc)
 
         shapes_df: Optional[pd.DataFrame] = None
         try:
-            sh = load_gtfs_data(gtfs_dir, files=("shapes.txt",))
+            sh = load_gtfs_data(GTFS_FOLDER_PATH, files=("shapes.txt",))
             shapes_df = sh.get("shapes")
         except OSError as exc:
             logging.warning("shapes.txt unavailable: %s", exc)
 
         extras: dict[str, dict[str, str]] = {
-            "service_types": load_optional_lookup(svc_types_path, "service_type"),
-            "corridors": load_optional_lookup(corridors_path, "corridor"),
-            "last_changed": load_optional_lookup(last_changed_path, "last_changed"),
-            "ridership": load_optional_lookup(ridership_path, "ridership"),
+            "service_types": load_optional_lookup(SERVICE_TYPES_PATH, "service_type"),
+            "corridors": load_optional_lookup(CORRIDORS_PATH, "corridor"),
+            "last_changed": load_optional_lookup(LAST_CHANGED_PATH, "last_changed"),
+            "ridership": load_optional_lookup(RIDERSHIP_PATH, "ridership"),
         }
 
         summary = build_summary(
@@ -677,17 +634,15 @@ def main() -> None:
             calendar_df=core["calendar"],
             calendar_dates_df=calendar_dates_df,
             shapes_df=shapes_df,
-            distance_unit=dist_unit,
+            distance_unit=DISTANCE_UNIT,
             extras=extras,
-            holiday_max_days_per_year=holiday_max,
-            weekday_dow_share=weekday_share,
         )
 
         if summary.empty:
             logging.warning("Summary is empty; nothing to write.")
             return
 
-        export_to_xlsx(summary, os.path.join(out_dir, out_file))
+        export_to_xlsx(summary, os.path.join(BASE_OUTPUT_PATH, OUTPUT_FILENAME))
 
     except (OSError, ValueError, RuntimeError) as exc:
         logging.error("Pipeline failed: %s", exc)
