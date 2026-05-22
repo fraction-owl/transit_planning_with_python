@@ -761,7 +761,32 @@ def extract_config_block(source_file: Path) -> str:
         ValueError: If either marker is missing or they appear out of order.
         OSError: If ``source_file`` cannot be read.
     """
-    lines: List[str] = source_file.read_text(encoding="utf-8").splitlines()
+    return extract_config_block_from_text(
+        source_file.read_text(encoding="utf-8"),
+        str(source_file),
+    )
+
+
+def extract_config_block_from_text(source_text: str, source_label: str) -> str:
+    r"""Return the text between the CONFIG markers in *source_text*.
+
+    Slices out the lines strictly *between* the first occurrence of
+    :data:`CONFIG_BEGIN_MARKER` and the first subsequent occurrence of
+    :data:`CONFIG_END_MARKER`. The marker lines themselves are excluded;
+    whitespace and inline comments inside the block are preserved verbatim.
+
+    Args:
+        source_text: Raw source text to scan (file contents or notebook cell).
+        source_label: Human-readable identifier used in error messages
+            (e.g. a file path or ``"<Jupyter cell>"``).
+
+    Returns:
+        The verbatim text of the configuration block, joined with ``\n``.
+
+    Raises:
+        ValueError: If either marker is missing or they appear out of order.
+    """
+    lines: List[str] = source_text.splitlines()
 
     begin_idx: int | None = None
     end_idx: int | None = None
@@ -775,11 +800,74 @@ def extract_config_block(source_file: Path) -> str:
 
     if begin_idx is None or end_idx is None:
         raise ValueError(
-            f"Config markers not found in '{source_file}'. "
+            f"Config markers not found in '{source_label}'. "
             f"Expected '{CONFIG_BEGIN_MARKER}' and '{CONFIG_END_MARKER}'."
         )
 
     return "\n".join(lines[begin_idx + 1 : end_idx])
+
+
+def _notebook_path(ip: Any) -> str | None:
+    """Return the notebook file path from the IPython kernel namespace, or None.
+
+    Tries the known frontend-specific variables in order:
+      * ``__vsc_ipynb_file__``  – VS Code / Pylance Jupyter extension
+      * ``__session__``         – JupyterLab ≥ 4 kernel session path
+
+    Returns None when running in an environment that doesn't expose a path
+    (classic Notebook, Colab, plain IPython console, etc.).
+    """
+    for var in ("__vsc_ipynb_file__", "__session__"):
+        val = ip.user_ns.get(var)
+        if val:
+            return str(val)
+    return None
+
+
+def _resolve_script_source() -> Tuple[str, str]:
+    """Return ``(source_text, source_label)`` for the running configuration.
+
+    Resolution order:
+
+    1. **Jupyter / IPython kernel** – walks ``In`` history in reverse and
+       returns the most-recent cell that contains both CONFIG markers.
+       This handles the common case where the analyst edits and re-runs
+       configuration cells; the latest version always wins.
+       Label is the notebook path when detectable, otherwise ``"<Jupyter cell>"``.
+
+    2. **Plain script / imported module** – reads ``__file__`` from the
+       module's own globals.  Covers ``python script.py``, scheduled jobs,
+       and ``%run script.py`` (where ``In`` contains no CONFIG markers).
+       Label is the resolved file path.
+
+    Raises:
+        RuntimeError: If neither source can be located.
+    """
+    # --- 1. IPython / Jupyter kernel ---
+    # IPython registers itself in sys.modules when a kernel starts; avoid a
+    # direct import so ty doesn't flag an unresolved-import for a dep that is
+    # intentionally optional.  get_ipython() returns None outside a live kernel.
+    _ipython = sys.modules.get("IPython")
+    ip = _ipython.get_ipython() if _ipython is not None else None  # type: ignore[attr-defined]
+
+    if ip is not None:
+        history: List[str] = ip.user_ns.get("In", [])
+        for cell in reversed(history):
+            if CONFIG_BEGIN_MARKER in cell and CONFIG_END_MARKER in cell:
+                label: str = _notebook_path(ip) or "<Jupyter cell>"
+                return cell, label
+
+    # --- 2. Plain script / imported module ---
+    file_attr: str | None = globals().get("__file__")
+    if file_attr is not None:
+        source_path: Path = Path(file_attr).resolve()
+        return source_path.read_text(encoding="utf-8"), str(source_path)
+
+    raise RuntimeError(
+        "Cannot locate script source for the run log: __file__ is not defined "
+        "and no Jupyter cell containing the config markers was found in In[]. "
+        "Run the cell containing the CONFIGURATION block before writing output."
+    )
 
 
 def write_run_log(output_file: Path) -> bool:
@@ -790,6 +878,10 @@ def write_run_log(output_file: Path) -> bool:
     script verbatim — text between :data:`CONFIG_BEGIN_MARKER` and
     :data:`CONFIG_END_MARKER` — so the log can never drift from the actual
     values used. Comments and whitespace inside the block are preserved.
+
+    Source resolution: Jupyter/IPython kernels are detected first via
+    ``get_ipython()``; the most-recent cell in ``In[]`` that contains both
+    CONFIG markers is used. Plain-script execution falls back to ``__file__``.
 
     The run log is a **required** deliverable for every output workbook
     produced by this script. If ``REQUIRE_RUN_LOG`` is ``True`` (the default),
@@ -804,8 +896,9 @@ def write_run_log(output_file: Path) -> bool:
     log_path: Path = output_file.with_name(f"{output_file.stem}_runlog.txt")
 
     try:
-        config_text: str = extract_config_block(Path(__file__))
-    except (OSError, ValueError) as exc:
+        source_text, source_label = _resolve_script_source()
+        config_text: str = extract_config_block_from_text(source_text, source_label)
+    except (OSError, ValueError, RuntimeError) as exc:
         logging.error("Could not extract config block for run log: %s", exc)
         return False
 
@@ -815,7 +908,7 @@ def write_run_log(output_file: Path) -> bool:
         "=" * 72,
         f"Run timestamp:   {datetime.now().isoformat(timespec='seconds')}",
         f"Output workbook: {output_file}",
-        f"Source script:   {Path(__file__).resolve()}",
+        f"Source script:   {source_label}",
         "",
         "-" * 72,
         "CONFIGURATION (verbatim from source)",

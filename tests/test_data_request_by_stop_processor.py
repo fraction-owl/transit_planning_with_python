@@ -49,7 +49,11 @@ def test_write_run_log_creates_file(tmp_path: Path) -> None:
     output_file = tmp_path / "output.xlsx"
     log_path = tmp_path / "output_runlog.txt"
 
-    with patch("data_request_by_stop_processor.extract_config_block", return_value="KEY = 1"):
+    fake_source = "# === BEGIN CONFIG ===\nKEY = 1\n# === END CONFIG ===\n"
+    with patch(
+        "data_request_by_stop_processor._resolve_script_source",
+        return_value=(fake_source, "<test>"),
+    ):
         result = target.write_run_log(output_file)
 
     assert result is True
@@ -64,8 +68,12 @@ def test_write_run_log_returns_false_on_io_error(tmp_path: Path) -> None:
     """write_run_log returns False (and logs) when the file cannot be written."""
     output_file = tmp_path / "output.xlsx"
 
+    fake_source = "# === BEGIN CONFIG ===\nK=1\n# === END CONFIG ===\n"
     with (
-        patch("data_request_by_stop_processor.extract_config_block", return_value="K=1"),
+        patch(
+            "data_request_by_stop_processor._resolve_script_source",
+            return_value=(fake_source, "<test>"),
+        ),
         patch("pathlib.Path.write_text", side_effect=OSError("disk full")),
     ):
         result = target.write_run_log(output_file)
