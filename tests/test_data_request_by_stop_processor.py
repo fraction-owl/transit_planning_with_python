@@ -250,12 +250,8 @@ def test_main_passes_route_analysis_when_enabled() -> None:
     assert route_analysis is not None
     # Both stops on route 30 must be present even though STOP_IDS filtered to 4004.
     assert set(route_analysis["STOP_ID"].tolist()) == {4004, 4005}
-    assert bool(
-        route_analysis.loc[route_analysis["STOP_ID"] == 4004, "In Filter"].iloc[0]
-    ) is True
-    assert bool(
-        route_analysis.loc[route_analysis["STOP_ID"] == 4005, "In Filter"].iloc[0]
-    ) is False
+    assert bool(route_analysis.loc[route_analysis["STOP_ID"] == 4004, "In Filter"].iloc[0]) is True
+    assert bool(route_analysis.loc[route_analysis["STOP_ID"] == 4005, "In Filter"].iloc[0]) is False
 
 
 def test_main_omits_route_analysis_when_disabled() -> None:

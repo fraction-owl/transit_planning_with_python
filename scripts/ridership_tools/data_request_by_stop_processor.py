@@ -573,19 +573,15 @@ def build_route_level_analysis(
         then by descending route share. Numeric columns are rounded for
         readability when ``APPLY_ROUNDING`` is True.
     """
-    per_stop: pd.DataFrame = (
-        route_filtered_data.groupby(["ROUTE_NAME", "STOP", "STOP_ID"], as_index=False)
-        .agg(Boardings=("BOARD_ALL", "sum"), Alightings=("ALIGHT_ALL", "sum"))
-    )
+    per_stop: pd.DataFrame = route_filtered_data.groupby(
+        ["ROUTE_NAME", "STOP", "STOP_ID"], as_index=False
+    ).agg(Boardings=("BOARD_ALL", "sum"), Alightings=("ALIGHT_ALL", "sum"))
     per_stop["Total"] = per_stop["Boardings"] + per_stop["Alightings"]
 
-    route_totals: pd.DataFrame = (
-        per_stop.groupby("ROUTE_NAME", as_index=False)
-        .agg(
-            Route_Boardings=("Boardings", "sum"),
-            Route_Alightings=("Alightings", "sum"),
-            Route_Total=("Total", "sum"),
-        )
+    route_totals: pd.DataFrame = per_stop.groupby("ROUTE_NAME", as_index=False).agg(
+        Route_Boardings=("Boardings", "sum"),
+        Route_Alightings=("Alightings", "sum"),
+        Route_Total=("Total", "sum"),
     )
 
     merged: pd.DataFrame = per_stop.merge(route_totals, on="ROUTE_NAME", how="left")
@@ -649,11 +645,7 @@ def build_route_level_analysis(
             )
         )
         merged = merged.merge(gtfs_subset, on="_join_key", how="left").drop(columns=["_join_key"])
-        column_order = (
-            column_order[:3]
-            + ["Stop Name", "Latitude", "Longitude"]
-            + column_order[3:]
-        )
+        column_order = column_order[:3] + ["Stop Name", "Latitude", "Longitude"] + column_order[3:]
 
     if APPLY_ROUNDING:
         for col in (
