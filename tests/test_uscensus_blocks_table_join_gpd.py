@@ -95,10 +95,10 @@ def test_load_attributes_trims_24char_geo_id_to_15(tmp_path: Path) -> None:
         }
     ).to_csv(csv_path, index=False)
 
-    df = join_mod.load_attributes(str(csv_path))
+    result = join_mod.load_attributes(str(csv_path))
 
-    assert (df["GEO_ID"].str.len() == 15).all()
-    assert df["GEO_ID"].iloc[0] == "110010001001000"
+    assert (result["GEO_ID"].str.len() == 15).all()
+    assert result["GEO_ID"].iloc[0] == "110010001001000"
 
 
 def test_load_attributes_leaves_15char_geo_id_unchanged(tmp_path: Path) -> None:
@@ -107,9 +107,9 @@ def test_load_attributes_leaves_15char_geo_id_unchanged(tmp_path: Path) -> None:
         csv_path, index=False
     )
 
-    df = join_mod.load_attributes(str(csv_path))
+    result = join_mod.load_attributes(str(csv_path))
 
-    assert df["GEO_ID"].iloc[0] == "110010001001000"
+    assert result["GEO_ID"].iloc[0] == "110010001001000"
 
 
 def test_load_attributes_derives_key_from_geo_id_blk_column(tmp_path: Path) -> None:
@@ -118,10 +118,10 @@ def test_load_attributes_derives_key_from_geo_id_blk_column(tmp_path: Path) -> N
         {"GEO_ID_blk": ["1000000US110010001001000"], "pop": [10]}
     ).to_csv(csv_path, index=False)
 
-    df = join_mod.load_attributes(str(csv_path))
+    result = join_mod.load_attributes(str(csv_path))
 
-    assert "GEO_ID" in df.columns
-    assert df["GEO_ID"].iloc[0] == "110010001001000"
+    assert "GEO_ID" in result.columns
+    assert result["GEO_ID"].iloc[0] == "110010001001000"
 
 
 def test_load_attributes_raises_when_neither_key_present(tmp_path: Path) -> None:
@@ -180,7 +180,7 @@ def test_join_raises_on_duplicate_attribute_keys(
     geoid = blocks_gdf["GEOID20"].iloc[0]
     dup_attrs = pd.DataFrame({"GEO_ID": [geoid, geoid], "total_pop": [1, 2]})
 
-    with pytest.raises(Exception):  # pandas.errors.MergeError (ValueError subclass)
+    with pytest.raises(ValueError):  # pandas.errors.MergeError is a ValueError subclass
         join_mod.join_blocks_to_attributes(blocks_gdf, dup_attrs)
 
 
