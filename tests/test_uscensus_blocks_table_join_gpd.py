@@ -103,9 +103,7 @@ def test_load_attributes_trims_24char_geo_id_to_15(tmp_path: Path) -> None:
 
 def test_load_attributes_leaves_15char_geo_id_unchanged(tmp_path: Path) -> None:
     csv_path = tmp_path / "attrs.csv"
-    pd.DataFrame({"GEO_ID": ["110010001001000", "110010001002000"]}).to_csv(
-        csv_path, index=False
-    )
+    pd.DataFrame({"GEO_ID": ["110010001001000", "110010001002000"]}).to_csv(csv_path, index=False)
 
     result = join_mod.load_attributes(str(csv_path))
 
@@ -114,9 +112,9 @@ def test_load_attributes_leaves_15char_geo_id_unchanged(tmp_path: Path) -> None:
 
 def test_load_attributes_derives_key_from_geo_id_blk_column(tmp_path: Path) -> None:
     csv_path = tmp_path / "attrs.csv"
-    pd.DataFrame(
-        {"GEO_ID_blk": ["1000000US110010001001000"], "pop": [10]}
-    ).to_csv(csv_path, index=False)
+    pd.DataFrame({"GEO_ID_blk": ["1000000US110010001001000"], "pop": [10]}).to_csv(
+        csv_path, index=False
+    )
 
     result = join_mod.load_attributes(str(csv_path))
 
@@ -189,9 +187,7 @@ def test_join_casts_int64_attribute_column_to_float(
 ) -> None:
     block = blocks_gdf.iloc[:1].copy()
     geoid = block["GEOID20"].iloc[0]
-    attrs = pd.DataFrame(
-        {"GEO_ID": [geoid], "count": pd.array([5], dtype="Int64")}
-    )
+    attrs = pd.DataFrame({"GEO_ID": [geoid], "count": pd.array([5], dtype="Int64")})
 
     result = join_mod.join_blocks_to_attributes(block, attrs, how="inner")
 
@@ -253,9 +249,7 @@ def test_cast_int64_to_float_converts_integer_column() -> None:
 
 
 def test_cast_int64_to_float_leaves_string_column_unchanged() -> None:
-    gdf = gpd.GeoDataFrame(
-        {"label": ["a", "b", "c"], "geometry": [Point(0, 0)] * 3}
-    )
+    gdf = gpd.GeoDataFrame({"label": ["a", "b", "c"], "geometry": [Point(0, 0)] * 3})
 
     join_mod._cast_int64_to_float(gdf)
 
