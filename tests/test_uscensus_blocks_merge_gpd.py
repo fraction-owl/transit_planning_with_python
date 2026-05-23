@@ -18,6 +18,12 @@ FIXTURE_ZIPS = (
 # Feature counts in each fixture, in the same order as FIXTURE_ZIPS.
 EXPECTED_COUNTS = (14, 40, 59)
 EXPECTED_TOTAL = sum(EXPECTED_COUNTS)
+# All county FIPS codes present across the three sample fixtures.
+ALL_FIXTURE_FIPS = frozenset({
+    "11001",                          # DC
+    "24017", "24027", "24031", "24033",  # MD counties
+    "51013", "51059", "51107", "51153", "51510", "51600", "51610",  # VA
+})
 
 
 @pytest.fixture
@@ -75,10 +81,7 @@ def test_ensure_fips_column_builds_five_digit_code(tiger_dir: Path) -> None:
 
     assert "FIPS" in result.columns
     assert (result["FIPS"].str.len() == 5).all()
-    # DC (11001), one Maryland county (24031), and an independent VA city (51510)
-    # all appear in the fixtures.
-    for code in ("11001", "24031", "51510"):
-        assert code in set(result["FIPS"])
+    assert set(result["FIPS"].unique()) == ALL_FIXTURE_FIPS
 
 
 def test_ensure_fips_column_is_idempotent(
@@ -104,8 +107,7 @@ def test_filter_by_fips_keeps_only_requested_counties(tiger_dir: Path) -> None:
     wanted = ["11001", "24031", "51510"]
     selected = merge_mod.filter_by_fips(merged, wanted)
 
-    assert not selected.empty
-    assert set(selected["FIPS"].unique()) <= set(wanted)
+    assert set(selected["FIPS"].unique()) == set(wanted)
     assert len(selected) < len(merged)
 
 
@@ -132,4 +134,4 @@ def test_write_output_roundtrip_to_geopackage(tiger_dir: Path, tmp_path: Path) -
     roundtripped = gpd.read_file(out_path)
     assert len(roundtripped) == len(selected)
     assert "FIPS" in roundtripped.columns
-    assert set(roundtripped["FIPS"].unique()) <= {"11001", "24031"}
+    assert set(roundtripped["FIPS"].unique()) == {"11001", "24031"}
