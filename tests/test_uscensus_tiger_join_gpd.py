@@ -319,9 +319,7 @@ def test_load_and_concat_reads_and_skips_label_row(tmp_path: Path) -> None:
 def test_load_and_concat_concatenates_multiple_files(tmp_path: Path) -> None:
     for i, name in enumerate(["a-Data.csv", "b-Data.csv"]):
         (tmp_path / name).write_text(f"GEO_ID,val\nGEO_{i},{i * 10}\n", encoding="utf-8")
-    result = mod._load_and_concat(
-        [str(tmp_path / "a-Data.csv"), str(tmp_path / "b-Data.csv")]
-    )
+    result = mod._load_and_concat([str(tmp_path / "a-Data.csv"), str(tmp_path / "b-Data.csv")])
     assert len(result) == 2
 
 
@@ -403,8 +401,16 @@ def test_apply_fips_filter_df_zero_pads_short_fips() -> None:
 
 def test_derive_income_computes_low_income_sum_and_percentage() -> None:
     bands = [
-        "sub_10k", "10k_15k", "15k_20k", "20k_25k", "25k_30k",
-        "30k_35k", "35k_40k", "40k_45k", "45k_50k", "50k_60k",
+        "sub_10k",
+        "10k_15k",
+        "15k_20k",
+        "20k_25k",
+        "25k_30k",
+        "30k_35k",
+        "35k_40k",
+        "40k_45k",
+        "45k_50k",
+        "50k_60k",
     ]
     data: dict[str, Any] = {b: [10] for b in bands}
     data["total_hh"] = [100]
@@ -420,8 +426,12 @@ def test_derive_ethnicity_computes_minority_sum_and_percentage() -> None:
         {
             "GEO_ID": [_TRACT_GEO_ID],
             "total_pop": [200],
-            "black": [40], "native": [10], "asian": [20],
-            "pac_isl": [5], "other": [5], "multi": [10],
+            "black": [40],
+            "native": [10],
+            "asian": [20],
+            "pac_isl": [5],
+            "other": [5],
+            "multi": [10],
         }
     )
     result = mod._derive_ethnicity(df)
@@ -445,9 +455,7 @@ def test_derive_language_computes_lep_percentage() -> None:
 
 
 def test_derive_language_zero_lang_pop_yields_zero_lep() -> None:
-    df = pd.DataFrame(
-        {"GEO_ID": [_TRACT_GEO_ID], "total_lang_pop": [0], "spanish_engnwell": [0]}
-    )
+    df = pd.DataFrame({"GEO_ID": [_TRACT_GEO_ID], "total_lang_pop": [0], "spanish_engnwell": [0]})
     result = mod._derive_language(df)
     assert result["perc_lep"].iloc[0] == pytest.approx(0.0)
 
@@ -475,16 +483,26 @@ def test_derive_age_computes_youth_and_elderly() -> None:
         {
             "GEO_ID": [_TRACT_GEO_ID],
             "total_pop": [1000],
-            "m_15_17": [20], "f_15_17": [18],
-            "m_18_19": [10], "f_18_19": [10],
-            "m_20": [5], "f_20": [5],
-            "m_21": [4], "f_21": [4],
-            "m_65_66": [30], "f_65_66": [32],
-            "m_67_69": [15], "f_67_69": [17],
-            "m_70_74": [10], "f_70_74": [10],
-            "m_75_79": [8], "f_75_79": [9],
-            "m_80_84": [5], "f_80_84": [6],
-            "m_a_85": [4], "f_a_85": [5],
+            "m_15_17": [20],
+            "f_15_17": [18],
+            "m_18_19": [10],
+            "f_18_19": [10],
+            "m_20": [5],
+            "f_20": [5],
+            "m_21": [4],
+            "f_21": [4],
+            "m_65_66": [30],
+            "f_65_66": [32],
+            "m_67_69": [15],
+            "f_67_69": [17],
+            "m_70_74": [10],
+            "f_70_74": [10],
+            "m_75_79": [8],
+            "f_75_79": [9],
+            "m_80_84": [5],
+            "f_80_84": [6],
+            "m_a_85": [4],
+            "f_a_85": [5],
         }
     )
     result = mod._derive_age(df)
@@ -549,17 +567,37 @@ def test_build_joined_table_with_income_files(tmp_path: Path) -> None:
     hh_path = tmp_path / "H9-Data.csv"
     income_path = tmp_path / "B19001-Data.csv"
 
-    _write_plain_csv(pop_path, _census_csv(
-        "GEO_ID,NAME,P1_001N", "Geography,Area,!!Total:", f"{_BLOCK_GEO_ID},Block,100",
-    ))
-    _write_plain_csv(hh_path, _census_csv(
-        "GEO_ID,H9_001N", "Geography,!!Total:", f"{_BLOCK_GEO_ID},40",
-    ))
-    bands = ",".join([
-        "B19001_001E", "B19001_002E", "B19001_003E", "B19001_004E",
-        "B19001_005E", "B19001_006E", "B19001_007E", "B19001_008E",
-        "B19001_009E", "B19001_010E", "B19001_011E",
-    ])
+    _write_plain_csv(
+        pop_path,
+        _census_csv(
+            "GEO_ID,NAME,P1_001N",
+            "Geography,Area,!!Total:",
+            f"{_BLOCK_GEO_ID},Block,100",
+        ),
+    )
+    _write_plain_csv(
+        hh_path,
+        _census_csv(
+            "GEO_ID,H9_001N",
+            "Geography,!!Total:",
+            f"{_BLOCK_GEO_ID},40",
+        ),
+    )
+    bands = ",".join(
+        [
+            "B19001_001E",
+            "B19001_002E",
+            "B19001_003E",
+            "B19001_004E",
+            "B19001_005E",
+            "B19001_006E",
+            "B19001_007E",
+            "B19001_008E",
+            "B19001_009E",
+            "B19001_010E",
+            "B19001_011E",
+        ]
+    )
     _write_plain_csv(
         income_path,
         _census_csv(
