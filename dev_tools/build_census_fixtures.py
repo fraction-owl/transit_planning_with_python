@@ -1,8 +1,6 @@
 """Generate the full Census fixture set: TIGER blocks + LEHD WAC + Census tables.
 
-Edit the paths in the CONFIG block below, then run from the repo root:
-
-    python dev_tools/sample_census_fixtures.py
+Edit the paths in the CONFIG block below and run from the repo root.
 
 Workflow
 --------
@@ -280,9 +278,7 @@ def _stratified_picks(
     if remaining > 0:
         pool = sub[~sub["GEOID20"].isin(selected)]
         if not pool.empty:
-            picks = pool.sample(
-                n=min(remaining, len(pool)), random_state=RANDOM_SEED
-            )
+            picks = pool.sample(n=min(remaining, len(pool)), random_state=RANDOM_SEED)
             for geoid in picks["GEOID20"]:
                 selected[geoid] = "random"
 
@@ -296,9 +292,7 @@ def _allocate_targets(
     counts: dict[tuple[str, str], int] = {}
     for state_fp, gdf in gdfs.items():
         for county_fp in COUNTIES_BY_STATE[state_fp]:
-            counts[(state_fp, county_fp)] = int(
-                (gdf["COUNTYFP20"] == county_fp).sum()
-            )
+            counts[(state_fp, county_fp)] = int((gdf["COUNTYFP20"] == county_fp).sum())
 
     total = sum(counts.values()) or 1
     targets: dict[tuple[str, str], int] = {}
@@ -336,9 +330,7 @@ def sample_blocks(
                 )
 
     return (
-        pd.DataFrame(rows)
-        .sort_values(["state_fp", "county_fp", "GEOID20"])
-        .reset_index(drop=True)
+        pd.DataFrame(rows).sort_values(["state_fp", "county_fp", "GEOID20"]).reset_index(drop=True)
     )
 
 
@@ -362,8 +354,7 @@ def write_tiger_samples(
             missing = wanted - set(out_gdf["GEOID20"])
             if missing:
                 print(
-                    f"  [warn] state {state_fp}: {len(missing)} manifest "
-                    f"GEOIDs not found in source"
+                    f"  [warn] state {state_fp}: {len(missing)} manifest GEOIDs not found in source"
                 )
 
             # Write the shapefile into its own per-state temp subdir to keep
@@ -371,9 +362,7 @@ def write_tiger_samples(
             shp_filename = OUTPUT_TIGER_TEMPLATE.format(state_fp=state_fp)
             state_tmp = tmp_root / state_fp
             state_tmp.mkdir()
-            out_gdf.to_file(
-                state_tmp / shp_filename, driver="ESRI Shapefile", index=False
-            )
+            out_gdf.to_file(state_tmp / shp_filename, driver="ESRI Shapefile", index=False)
 
             # Bundle every component into a single zip at the output root.
             zip_filename = Path(shp_filename).with_suffix(".zip").name
@@ -393,9 +382,7 @@ def write_tiger_samples(
 def derive_geo_keys(manifest: pd.DataFrame) -> dict[str, set[str]]:
     """Build sets of GEOIDs at each geography level from the manifest."""
     blocks = set(manifest["GEOID20"].astype(str))
-    state_county = (
-        manifest["state_fp"].astype(str) + manifest["county_fp"].astype(str)
-    )
+    state_county = manifest["state_fp"].astype(str) + manifest["county_fp"].astype(str)
     return {
         "block": blocks,
         "block_group": {b[:12] for b in blocks},
@@ -430,10 +417,7 @@ def _filter_data_csv(
     sample_geo = data_rows[GEO_ID_COL].iloc[0]
     match = next((p for p in GEO_PREFIXES if sample_geo.startswith(p)), None)
     if match is None:
-        print(
-            f"  [skip] unrecognized GEO_ID prefix in {data_file.name}: "
-            f"{sample_geo!r}"
-        )
+        print(f"  [skip] unrecognized GEO_ID prefix in {data_file.name}: {sample_geo!r}")
         return None
     keys_name, id_len = GEO_PREFIXES[match]
     wanted = geo_keys[keys_name]
@@ -463,20 +447,14 @@ def filter_census_folder(
         return False
     out_df, keys_name = result
 
-    sidecars = [
-        f for f in bundle_dir.iterdir()
-        if f.is_file() and f.name != data_file.name
-    ]
+    sidecars = [f for f in bundle_dir.iterdir() if f.is_file() and f.name != data_file.name]
     out_bundle = output_root / bundle_dir.relative_to(input_root)
     out_bundle.mkdir(parents=True, exist_ok=True)
     out_df.to_csv(out_bundle / data_file.name, index=False, encoding="utf-8-sig")
     for sidecar in sidecars:
         shutil.copy2(sidecar, out_bundle / sidecar.name)
 
-    print(
-        f"  [census] {bundle_dir.name} ({keys_name}): "
-        f"{len(out_df) - 1:,} rows kept"
-    )
+    print(f"  [census] {bundle_dir.name} ({keys_name}): {len(out_df) - 1:,} rows kept")
     return True
 
 
@@ -500,10 +478,7 @@ def filter_census_zip(
 
         # Snapshot sidecars before adding any new files to the temp dir,
         # otherwise the filtered CSV would loop back in as a sidecar.
-        sidecars = [
-            f for f in bundle_dir.iterdir()
-            if f.is_file() and f.name != data_file.name
-        ]
+        sidecars = [f for f in bundle_dir.iterdir() if f.is_file() and f.name != data_file.name]
 
         result = _filter_data_csv(data_file, geo_keys)
         if result is None:
@@ -522,10 +497,7 @@ def filter_census_zip(
             for sidecar in sidecars:
                 zout.write(sidecar, sidecar.name)
 
-    print(
-        f"  [census] {zip_path.name} ({keys_name}, zipped): "
-        f"{len(out_df) - 1:,} rows kept"
-    )
+    print(f"  [census] {zip_path.name} ({keys_name}, zipped): {len(out_df) - 1:,} rows kept")
     return True
 
 
@@ -575,10 +547,7 @@ def filter_lehd_file(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     compression = "gzip" if path.suffix.lower() == ".gz" else None
     filtered.to_csv(out_path, index=False, compression=compression)
-    print(
-        f"  [lehd]   {path.name} ({geo_col}): "
-        f"{len(filtered):,}/{len(df):,} rows kept"
-    )
+    print(f"  [lehd]   {path.name} ({geo_col}): {len(filtered):,}/{len(df):,} rows kept")
     return True
 
 
@@ -643,19 +612,16 @@ def main() -> int:
         f"{len(geo_keys['county']):,} counties"
     )
 
-    folder_bundles = sorted({
-        f.parent for f in INPUT_DIR.rglob("*-Data.csv")
-        if not _is_under(f, OUTPUT_DIR)
-    })
+    folder_bundles = sorted(
+        {f.parent for f in INPUT_DIR.rglob("*-Data.csv") if not _is_under(f, OUTPUT_DIR)}
+    )
     zip_bundles = sorted(
-        p for p in INPUT_DIR.rglob("*.zip")
+        p
+        for p in INPUT_DIR.rglob("*.zip")
         if not _is_under(p, OUTPUT_DIR) and _zip_contains_census_bundle(p)
     )
 
-    print(
-        f"\nCensus table bundles "
-        f"({len(folder_bundles)} folder, {len(zip_bundles)} zip):"
-    )
+    print(f"\nCensus table bundles ({len(folder_bundles)} folder, {len(zip_bundles)} zip):")
     written_bundles = 0
     for bdir in folder_bundles:
         if filter_census_folder(bdir, geo_keys, INPUT_DIR, OUTPUT_DIR):
@@ -678,15 +644,10 @@ def main() -> int:
         geo_col = _lehd_geo_column(path)
         if geo_col is None:
             continue
-        if filter_lehd_file(
-            path, geo_keys["block"], INPUT_DIR, OUTPUT_DIR, geo_col
-        ):
+        if filter_lehd_file(path, geo_keys["block"], INPUT_DIR, OUTPUT_DIR, geo_col):
             written_lehd += 1
 
-    print(
-        f"\nSummary: {written_bundles} census bundle(s), "
-        f"{written_lehd} LEHD file(s)"
-    )
+    print(f"\nSummary: {written_bundles} census bundle(s), {written_lehd} LEHD file(s)")
     return 0
 
 

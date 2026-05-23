@@ -9,6 +9,7 @@ transit_planning_with_python/
 │       └── tests.yml
 ├── dev_tools/
 │   ├── audit_helper_functions.py
+│   ├── build_census_fixtures.py
 │   ├── export_requirements.py
 │   ├── lint_commit.py
 │   ├── lint_pr.py
