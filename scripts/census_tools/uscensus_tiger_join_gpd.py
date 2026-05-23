@@ -1,4 +1,4 @@
-"""End-to-end open-source pipeline: merge Census CSVs, merge TIGER shapefiles, and join to final output.
+"""End-to-end open-source pipeline: merge Census CSVs, merge TIGER shapefiles, join to output.
 
 GeoPandas equivalent of the ArcPy pipeline.  Runs three stages in one process,
 passing DataFrames between stages in memory — no intermediate disk writes are
@@ -23,7 +23,7 @@ Set INTERMEDIATE_COMBINED_CSV or INTERMEDIATE_MERGED_SHP to an empty string
 to skip writing those intermediate artifacts; the pipeline will still run
 in memory.
 
-Notes
+Notes:
 -----
 * All TIGER input layers must share the same CRS.
 * Shapefile outputs truncate column names to 10 chars; use a GeoPackage
@@ -41,7 +41,6 @@ from __future__ import annotations
 
 import io
 import logging
-import os
 import re
 import sys
 import zipfile
@@ -140,9 +139,7 @@ LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
 _DEFAULT_INPUT_CSV_DIR: str = r"Path\To\Your\Census_Table_Data_Files"
 _DEFAULT_INPUT_SHP_DIR: str = r"Path\To\Your\TIGER_Shapefiles"
 _DEFAULT_INTERMEDIATE_COMBINED_CSV: str = r"Path\To\Your\Output_Folder\joined_blocks.csv"
-_DEFAULT_INTERMEDIATE_MERGED_SHP: str = (
-    r"Path\To\Your\Output_Folder\va_md_dc_blocks_fips_merge.shp"
-)
+_DEFAULT_INTERMEDIATE_MERGED_SHP: str = r"Path\To\Your\Output_Folder\va_md_dc_blocks_fips_merge.shp"
 _DEFAULT_FINAL_JOINED_FEATURES: str = r"Path\To\Your\Output_Folder\va_md_dc_blocks_plus_data.shp"
 
 # =============================================================================
@@ -212,9 +209,7 @@ def _fill_numeric_only(df: pd.DataFrame, value: int | float = 0) -> pd.DataFrame
 def _clean_name_cols(df: pd.DataFrame) -> None:
     """Sanitize NAME-like columns in place (remove CR/LF/TAB)."""
     for col in df.filter(regex=r"^NAME").columns:
-        df[col] = (
-            df[col].astype(str).str.replace(r"[\r\n\t]+", " ", regex=True).str.strip()
-        )
+        df[col] = df[col].astype(str).str.replace(r"[\r\n\t]+", " ", regex=True).str.strip()
 
 
 def _load_and_concat(
@@ -330,8 +325,16 @@ def _build_block_df(inp: _BlockInputs) -> pd.DataFrame:
 
 def _derive_income(df: pd.DataFrame) -> pd.DataFrame:
     bands = [
-        "sub_10k", "10k_15k", "15k_20k", "20k_25k", "25k_30k",
-        "30k_35k", "35k_40k", "40k_45k", "45k_50k", "50k_60k",
+        "sub_10k",
+        "10k_15k",
+        "15k_20k",
+        "20k_25k",
+        "25k_30k",
+        "30k_35k",
+        "35k_40k",
+        "40k_45k",
+        "45k_50k",
+        "50k_60k",
     ]
     df["low_income"] = df[bands].sum(axis=1)
     df["perc_low_income"] = df["low_income"] / df["total_hh"]
@@ -364,11 +367,21 @@ def _derive_vehicle(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _derive_age(df: pd.DataFrame) -> pd.DataFrame:
-    youth = ["m_15_17", "f_15_17", "m_18_19", "f_18_19",
-             "m_20", "f_20", "m_21", "f_21"]
-    elderly = ["m_65_66", "f_65_66", "m_67_69", "f_67_69",
-               "m_70_74", "f_70_74", "m_75_79", "f_75_79",
-               "m_80_84", "f_80_84", "m_a_85", "f_a_85"]
+    youth = ["m_15_17", "f_15_17", "m_18_19", "f_18_19", "m_20", "f_20", "m_21", "f_21"]
+    elderly = [
+        "m_65_66",
+        "f_65_66",
+        "m_67_69",
+        "f_67_69",
+        "m_70_74",
+        "f_70_74",
+        "m_75_79",
+        "f_75_79",
+        "m_80_84",
+        "f_80_84",
+        "m_a_85",
+        "f_a_85",
+    ]
     df["all_youth"] = df[[c for c in youth if c in df]].sum(axis=1)
     df["all_elderly"] = df[[c for c in elderly if c in df]].sum(axis=1)
     if "total_pop" in df.columns:
@@ -397,11 +410,16 @@ def _build_tract_df(inp: _TractInputs) -> pd.DataFrame:
             skiprows=[1],
             rename={
                 "B19001_001E": "total_hh",
-                "B19001_002E": "sub_10k", "B19001_003E": "10k_15k",
-                "B19001_004E": "15k_20k", "B19001_005E": "20k_25k",
-                "B19001_006E": "25k_30k", "B19001_007E": "30k_35k",
-                "B19001_008E": "35k_40k", "B19001_009E": "40k_45k",
-                "B19001_010E": "45k_50k", "B19001_011E": "50k_60k",
+                "B19001_002E": "sub_10k",
+                "B19001_003E": "10k_15k",
+                "B19001_004E": "15k_20k",
+                "B19001_005E": "20k_25k",
+                "B19001_006E": "25k_30k",
+                "B19001_007E": "30k_35k",
+                "B19001_008E": "35k_40k",
+                "B19001_009E": "40k_45k",
+                "B19001_010E": "45k_50k",
+                "B19001_011E": "50k_60k",
             },
         )
         dfs.append(_derive_income(income))
@@ -411,10 +429,14 @@ def _build_tract_df(inp: _TractInputs) -> pd.DataFrame:
             inp.ethnicity_files,
             skiprows=[1],
             rename={
-                "P9_001N": "total_pop", "P9_002N": "all_hisp",
-                "P9_005N": "white", "P9_006N": "black",
-                "P9_007N": "native", "P9_008N": "asian",
-                "P9_009N": "pac_isl", "P9_010N": "other",
+                "P9_001N": "total_pop",
+                "P9_002N": "all_hisp",
+                "P9_005N": "white",
+                "P9_006N": "black",
+                "P9_007N": "native",
+                "P9_008N": "asian",
+                "P9_009N": "pac_isl",
+                "P9_010N": "other",
                 "P9_011N": "multi",
             },
         )
@@ -447,12 +469,17 @@ def _build_tract_df(inp: _TractInputs) -> pd.DataFrame:
             skiprows=[1],
             rename={
                 "B08201_001E": "all_hhs",
-                "B08201_002E": "veh_0_all_hh", "B08201_003E": "veh_1_all_hh",
-                "B08201_008E": "veh_0_hh_1", "B08201_009E": "veh_1_hh_1",
-                "B08201_014E": "veh_0_hh_2", "B08201_015E": "veh_1_hh_2",
-                "B08201_020E": "veh_0_hh_3", "B08201_021E": "veh_1_hh_3",
+                "B08201_002E": "veh_0_all_hh",
+                "B08201_003E": "veh_1_all_hh",
+                "B08201_008E": "veh_0_hh_1",
+                "B08201_009E": "veh_1_hh_1",
+                "B08201_014E": "veh_0_hh_2",
+                "B08201_015E": "veh_1_hh_2",
+                "B08201_020E": "veh_0_hh_3",
+                "B08201_021E": "veh_1_hh_3",
                 "B08201_022E": "veh_2_hh_3",
-                "B08201_026E": "veh_0_hh_4p", "B08201_027E": "veh_1_hh_4p",
+                "B08201_026E": "veh_0_hh_4p",
+                "B08201_027E": "veh_1_hh_4p",
                 "B08201_028E": "veh_2_hh_4p",
             },
         )
@@ -464,16 +491,26 @@ def _build_tract_df(inp: _TractInputs) -> pd.DataFrame:
             skiprows=[1],
             rename={
                 "B01001_001E": "total_pop",
-                "B01001_006E": "m_15_17", "B01001_007E": "m_18_19",
-                "B01001_008E": "m_20", "B01001_009E": "m_21",
-                "B01001_020E": "m_65_66", "B01001_021E": "m_67_69",
-                "B01001_022E": "m_70_74", "B01001_023E": "m_75_79",
-                "B01001_024E": "m_80_84", "B01001_025E": "m_a_85",
-                "B01001_030E": "f_15_17", "B01001_031E": "f_18_19",
-                "B01001_032E": "f_20", "B01001_033E": "f_21",
-                "B01001_044E": "f_65_66", "B01001_045E": "f_67_69",
-                "B01001_046E": "f_70_74", "B01001_047E": "f_75_79",
-                "B01001_048E": "f_80_84", "B01001_049E": "f_a_85",
+                "B01001_006E": "m_15_17",
+                "B01001_007E": "m_18_19",
+                "B01001_008E": "m_20",
+                "B01001_009E": "m_21",
+                "B01001_020E": "m_65_66",
+                "B01001_021E": "m_67_69",
+                "B01001_022E": "m_70_74",
+                "B01001_023E": "m_75_79",
+                "B01001_024E": "m_80_84",
+                "B01001_025E": "m_a_85",
+                "B01001_030E": "f_15_17",
+                "B01001_031E": "f_18_19",
+                "B01001_032E": "f_20",
+                "B01001_033E": "f_21",
+                "B01001_044E": "f_65_66",
+                "B01001_045E": "f_67_69",
+                "B01001_046E": "f_70_74",
+                "B01001_047E": "f_75_79",
+                "B01001_048E": "f_80_84",
+                "B01001_049E": "f_a_85",
             },
         )
         dfs.append(_derive_age(age))
@@ -611,9 +648,7 @@ def discover_tiger_datasets(
             chosen[stem] = p
 
     if not chosen:
-        raise FileNotFoundError(
-            f"No datasets matching '{pattern}' were found under {root}"
-        )
+        raise FileNotFoundError(f"No datasets matching '{pattern}' were found under {root}")
 
     logging.info(
         "Discovered %d TIGER dataset(s) (%d plain, %d zipped)",
@@ -622,10 +657,7 @@ def discover_tiger_datasets(
         sum(p.suffix == ".zip" for p in chosen.values()),
     )
 
-    return sorted(
-        f"zip://{p}" if p.suffix.lower() == ".zip" else str(p)
-        for p in chosen.values()
-    )
+    return sorted(f"zip://{p}" if p.suffix.lower() == ".zip" else str(p) for p in chosen.values())
 
 
 def _read_shapefile(path: str) -> GeoDataFrame:
@@ -645,8 +677,7 @@ def merge_shapefiles(shp_paths: Sequence[str]) -> GeoDataFrame:
     crs_set = {str(gdf.crs) for gdf in gdfs}
     if len(crs_set) != 1:
         raise RuntimeError(
-            "CRS mismatch between input layers: %s. Re-project first."
-            % ", ".join(crs_set)
+            "CRS mismatch between input layers: %s. Re-project first." % ", ".join(crs_set)
         )
 
     merged = gpd.GeoDataFrame(
@@ -678,10 +709,9 @@ def ensure_fips_column(
             % (state_candidates, county_candidates)
         )
 
-    gdf[fips_col] = (
-        gdf[state_field].astype(str).str.zfill(2)
-        + gdf[county_field].astype(str).str.zfill(3)
-    )
+    gdf[fips_col] = gdf[state_field].astype(str).str.zfill(2) + gdf[county_field].astype(
+        str
+    ).str.zfill(3)
     logging.info("Populated new column %s", fips_col)
     return gdf
 
@@ -727,9 +757,7 @@ def normalize_attribute_keys(
     elif derivation_src in df.columns:
         df[key] = df[derivation_src].astype(str).str[-15:]
     else:
-        raise KeyError(
-            f"Neither '{key}' nor '{derivation_src}' found in attribute frame."
-        )
+        raise KeyError(f"Neither '{key}' nor '{derivation_src}' found in attribute frame.")
     return df
 
 
@@ -776,14 +804,10 @@ def _cast_int64_to_float(gdf: GeoDataFrame) -> None:
     Shapefile drivers cannot store pandas' nullable integer extension type.
     """
     int_cols: list[str] = [
-        str(col)
-        for col, dtype in gdf.dtypes.items()
-        if pd.api.types.is_integer_dtype(dtype)
+        str(col) for col, dtype in gdf.dtypes.items() if pd.api.types.is_integer_dtype(dtype)
     ]
     if int_cols:
-        logging.debug(
-            "Casting %d Int64 column(s) → float64: %s", len(int_cols), int_cols
-        )
+        logging.debug("Casting %d Int64 column(s) → float64: %s", len(int_cols), int_cols)
         gdf[int_cols] = gdf[int_cols].astype("float64")
 
 
