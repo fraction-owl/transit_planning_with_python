@@ -19,11 +19,22 @@ FIXTURE_ZIPS = (
 EXPECTED_COUNTS = (14, 40, 59)
 EXPECTED_TOTAL = sum(EXPECTED_COUNTS)
 # All county FIPS codes present across the three sample fixtures.
-ALL_FIXTURE_FIPS = frozenset({
-    "11001",                          # DC
-    "24017", "24027", "24031", "24033",  # MD counties
-    "51013", "51059", "51107", "51153", "51510", "51600", "51610",  # VA
-})
+ALL_FIXTURE_FIPS = frozenset(
+    {
+        "11001",  # DC
+        "24017",
+        "24027",
+        "24031",
+        "24033",  # MD counties
+        "51013",
+        "51059",
+        "51107",
+        "51153",
+        "51510",
+        "51600",
+        "51610",  # VA
+    }
+)
 
 
 @pytest.fixture
