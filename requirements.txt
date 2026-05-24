@@ -26,6 +26,7 @@ xlrd==2.0.1                  # Read legacy Excel .xls files (no .xlsx support)
 
 # Geospatial Libraries (GeoPandas stack — open-source only)
 geopandas==1.1.1             # Geospatial data handling (open-source)
+fiona==1.10.1                # Shapefile I/O engine (used for schema-controlled writes)
 shapely==2.1.1               # Geometry operations
 pyproj==3.7.1                # Coordinate reference systems and transformations
 
