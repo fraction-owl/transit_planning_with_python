@@ -287,6 +287,289 @@ def test_main_scopes_route_analysis_to_routes_serving_filtered_stops() -> None:
     assert set(route_analysis["STOP_ID"].tolist()) == {4004, 4005}
 
 
+# =============================================================================
+# bin_ridership_value
+# =============================================================================
+
+
+def test_bin_ridership_value_first_bucket() -> None:
+    """Values strictly below 5 land in '0-4.9'."""
+    assert target.bin_ridership_value(0) == "0-4.9"
+    assert target.bin_ridership_value(4.9) == "0-4.9"
+    assert target.bin_ridership_value(0.001) == "0-4.9"
+
+
+def test_bin_ridership_value_second_bucket() -> None:
+    """Values in [5, 25) land in '5-24.9'."""
+    assert target.bin_ridership_value(5.0) == "5-24.9"
+    assert target.bin_ridership_value(24.9) == "5-24.9"
+    assert target.bin_ridership_value(10) == "5-24.9"
+
+
+def test_bin_ridership_value_third_bucket() -> None:
+    """Values in [25, 50) land in '25-49.9'."""
+    assert target.bin_ridership_value(25.0) == "25-49.9"
+    assert target.bin_ridership_value(49.9) == "25-49.9"
+
+
+def test_bin_ridership_value_top_bucket() -> None:
+    """Values >= 50 land in '50 or more'."""
+    assert target.bin_ridership_value(50.0) == "50 or more"
+    assert target.bin_ridership_value(100) == "50 or more"
+    assert target.bin_ridership_value(9999) == "50 or more"
+
+
+# =============================================================================
+# aggregate_by_stop
+# =============================================================================
+
+
+def test_aggregate_by_stop_routes_together_sums_and_labels() -> None:
+    """With aggregate_routes_together=True, multi-route stops are summed and ROUTES is set."""
+    df = pd.read_csv(FIXTURE_PATH)
+    # Stop 1001 has routes 10A (12.4/3.2) and 10B (18.1/6.7) in AM PEAK
+    am_df = df[df["TIME_PERIOD"] == "AM PEAK"]
+    result = target.aggregate_by_stop(am_df, aggregate_routes_together=True)
+
+    stop_1001 = result[result["STOP_ID"] == 1001].iloc[0]
+    assert stop_1001["BOARD_ALL_TOTAL"] == pytest.approx(30.5)
+    assert stop_1001["ALIGHT_ALL_TOTAL"] == pytest.approx(9.9)
+    assert stop_1001["ROUTES"] == "10A, 10B"
+    assert "ROUTE_NAME" not in result.columns
+
+
+def test_aggregate_by_stop_routes_together_single_route() -> None:
+    """A stop served by exactly one route still gets a ROUTES string, not a list."""
+    df = pd.read_csv(FIXTURE_PATH)
+    am_df = df[df["TIME_PERIOD"] == "AM PEAK"]
+    result = target.aggregate_by_stop(am_df, aggregate_routes_together=True)
+
+    # Stop 2002 is only served by route 10A in AM PEAK
+    stop_2002 = result[result["STOP_ID"] == 2002].iloc[0]
+    assert stop_2002["ROUTES"] == "10A"
+
+
+def test_aggregate_by_stop_routes_separate() -> None:
+    """With aggregate_routes_together=False, routes produce separate rows."""
+    df = pd.read_csv(FIXTURE_PATH)
+    am_df = df[df["TIME_PERIOD"] == "AM PEAK"]
+    result = target.aggregate_by_stop(am_df, aggregate_routes_together=False)
+
+    assert "ROUTE_NAME" in result.columns
+    assert "ROUTES" not in result.columns
+
+    # Stop 1001 has two routes in AM PEAK → two rows
+    stop_1001_rows = result[result["STOP_ID"] == 1001]
+    assert len(stop_1001_rows) == 2
+
+    row_10a = stop_1001_rows[stop_1001_rows["ROUTE_NAME"] == "10A"].iloc[0]
+    assert row_10a["BOARD_ALL_TOTAL"] == pytest.approx(12.4)
+    assert row_10a["ALIGHT_ALL_TOTAL"] == pytest.approx(3.2)
+
+
+# =============================================================================
+# log_missing_stop_ids
+# =============================================================================
+
+
+def test_log_missing_stop_ids_empty_request() -> None:
+    """Empty requested list is a no-op — warning is never issued."""
+    with patch("logging.warning") as mock_warn:
+        target.log_missing_stop_ids([], [1001, 2002])
+    mock_warn.assert_not_called()
+
+
+def test_log_missing_stop_ids_all_present(caplog: pytest.LogCaptureFixture) -> None:
+    """All requested IDs present → info-level confirmation, no warning."""
+    import logging as _logging
+
+    with caplog.at_level(_logging.INFO):
+        target.log_missing_stop_ids([1001, 2002], [1001, 2002, 3003])
+    assert "All requested STOP_IDs are present" in caplog.text
+
+
+def test_log_missing_stop_ids_some_missing() -> None:
+    """Missing IDs trigger a warning that names them."""
+    with patch("logging.warning") as mock_warn:
+        target.log_missing_stop_ids([1001, 9999], [1001])
+    mock_warn.assert_called_once()
+    # The sorted missing list is passed as the last positional arg
+    assert 9999 in mock_warn.call_args[0][-1]
+
+
+def test_log_missing_stop_ids_invalid_present_ids() -> None:
+    """Non-coercible present_ids raise TypeError."""
+    with pytest.raises(TypeError, match="Unable to evaluate present_ids"):
+        target.log_missing_stop_ids([1001], ["not-a-number"])
+
+
+# =============================================================================
+# build_selection_summary
+# =============================================================================
+
+
+def test_build_selection_summary_unfiltered() -> None:
+    """When filtered equals full, all four percentage rows are 100."""
+    df = pd.read_csv(FIXTURE_PATH)
+    result = target.build_selection_summary(df, df)
+    pcts = result.set_index("Metric")["Percent"]
+    assert pcts["Stops (unique STOP_ID)"] == pytest.approx(100.0)
+    assert pcts["Boardings (BOARD_ALL sum)"] == pytest.approx(100.0)
+    assert pcts["Alightings (ALIGHT_ALL sum)"] == pytest.approx(100.0)
+    assert pcts["Total Ridership (Board + Alight)"] == pytest.approx(100.0)
+
+
+def test_build_selection_summary_subset() -> None:
+    """Filtering to a single route produces correct stop count and boardings."""
+    df = pd.read_csv(FIXTURE_PATH)
+    # Route 10A: stops 1001 and 2002; boards = 12.4+22+30+4.6+7.3+9.8 = 86.1
+    filtered = df[df["ROUTE_NAME"] == "10A"]
+    result = target.build_selection_summary(df, filtered)
+    row = result.set_index("Metric")
+
+    assert row.loc["Stops (unique STOP_ID)", "Selected"] == 2
+    assert row.loc["Stops (unique STOP_ID)", "Total"] == 10
+    assert row.loc["Stops (unique STOP_ID)", "Percent"] == pytest.approx(20.0)
+    assert row.loc["Boardings (BOARD_ALL sum)", "Selected"] == pytest.approx(86.1)
+    assert row.loc["Stops (unique STOP_ID)", "Percent"] < 100.0
+
+
+def test_build_selection_summary_empty_selection() -> None:
+    """An empty filtered DataFrame yields zeros and 0% for all metrics."""
+    df = pd.read_csv(FIXTURE_PATH)
+    empty = df[df["ROUTE_NAME"] == "NONEXISTENT"]
+    result = target.build_selection_summary(df, empty)
+    row = result.set_index("Metric")
+
+    assert row.loc["Stops (unique STOP_ID)", "Selected"] == 0
+    assert row.loc["Stops (unique STOP_ID)", "Percent"] == pytest.approx(0.0)
+    assert row.loc["Boardings (BOARD_ALL sum)", "Percent"] == pytest.approx(0.0)
+    assert row.loc["Total Ridership (Board + Alight)", "Percent"] == pytest.approx(0.0)
+
+
+# =============================================================================
+# filter_data
+# =============================================================================
+
+
+def test_filter_data_no_filters_returns_all() -> None:
+    """No filters → identical row count, no mutation."""
+    df = pd.read_csv(FIXTURE_PATH)
+    result = target.filter_data(df)
+    assert len(result) == len(df)
+
+
+def test_filter_data_routes_keep() -> None:
+    """Routes keep-list retains only rows with a matching ROUTE_NAME."""
+    df = pd.read_csv(FIXTURE_PATH)
+    result = target.filter_data(df, routes=["30"])
+    assert set(result["ROUTE_NAME"].unique()) == {"30"}
+    assert set(result["STOP_ID"].unique()) == {4004, 4005}
+
+
+def test_filter_data_routes_exclude() -> None:
+    """routes_exclude removes matching routes and leaves others intact."""
+    df = pd.read_csv(FIXTURE_PATH)
+    result = target.filter_data(df, routes_exclude=["10A", "10B"])
+    assert "10A" not in result["ROUTE_NAME"].to_numpy()
+    assert "10B" not in result["ROUTE_NAME"].to_numpy()
+    assert "20X" in result["ROUTE_NAME"].to_numpy()
+
+
+def test_filter_data_stop_ids() -> None:
+    """stop_ids keep-list retains only rows with a matching STOP_ID."""
+    df = pd.read_csv(FIXTURE_PATH)
+    result = target.filter_data(df, stop_ids=[1001, 3003])
+    assert set(result["STOP_ID"].unique()) == {1001, 3003}
+
+
+def test_filter_data_routes_then_stop_ids_intersection() -> None:
+    """Routes filter applies before stop_ids; result is their intersection."""
+    df = pd.read_csv(FIXTURE_PATH)
+    # Route 10A only serves stops 1001 and 2002; stop 4004 is on route 30 only
+    result = target.filter_data(df, routes=["10A"], stop_ids=[4004])
+    assert result.empty
+
+
+def test_filter_data_routes_exclude_before_stop_ids() -> None:
+    """routes_exclude removes a route before stop_ids can match its stops."""
+    df = pd.read_csv(FIXTURE_PATH)
+    # Route 30 is excluded; stop 4004 belongs only to route 30 → no rows survive
+    result = target.filter_data(df, routes_exclude=["30"], stop_ids=[4004])
+    assert result.empty
+
+
+# =============================================================================
+# verify_required_columns
+# =============================================================================
+
+
+def test_verify_required_columns_all_present() -> None:
+    """No exception when every required column exists."""
+    df = pd.DataFrame(columns=["A", "B", "C"])
+    target.verify_required_columns(df, ["A", "B"])  # should not raise
+
+
+def test_verify_required_columns_missing_raises_system_exit() -> None:
+    """SystemExit when a required column is absent."""
+    df = pd.DataFrame(columns=["A"])
+    with pytest.raises(SystemExit):
+        target.verify_required_columns(df, ["A", "MISSING"])
+
+
+# =============================================================================
+# enrich_with_gtfs
+# =============================================================================
+
+
+def _make_gtfs_stops() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "stop_id": ["1001", "2002"],
+            "stop_code": ["S1", "S2"],
+            "stop_name": ["Stop One", "Stop Two"],
+            "stop_lat": [38.9, 38.8],
+            "stop_lon": [-77.1, -77.2],
+        }
+    )
+
+
+def test_enrich_with_gtfs_stop_id_join() -> None:
+    """Correct lat/lon is appended when joining on stop_id."""
+    ridership = pd.DataFrame({"STOP_ID": [1001, 2002], "BOARD_ALL": [10, 20]})
+    gtfs = _make_gtfs_stops()
+    result = target.enrich_with_gtfs(ridership, gtfs, "stop_id")
+
+    assert result.loc[result["STOP_ID"] == 1001, "LATITUDE"].iloc[0] == pytest.approx(38.9)
+    assert result.loc[result["STOP_ID"] == 2002, "LONGITUDE"].iloc[0] == pytest.approx(-77.2)
+    assert "_join_key" not in result.columns
+
+
+def test_enrich_with_gtfs_no_match_produces_nan() -> None:
+    """A stop_id absent from GTFS gets NaN coordinates."""
+    ridership = pd.DataFrame({"STOP_ID": [9999], "BOARD_ALL": [5]})
+    gtfs = _make_gtfs_stops()
+    result = target.enrich_with_gtfs(ridership, gtfs, "stop_id")
+    assert pd.isna(result.loc[0, "LATITUDE"])
+    assert pd.isna(result.loc[0, "LONGITUDE"])
+
+
+def test_enrich_with_gtfs_stop_code_join() -> None:
+    """Joining on stop_code uses the stop_code column, not stop_id."""
+    ridership = pd.DataFrame({"STOP_ID": ["S1", "S2"], "BOARD_ALL": [10, 20]})
+    gtfs = _make_gtfs_stops()
+    result = target.enrich_with_gtfs(ridership, gtfs, "stop_code")
+    assert result.loc[result["STOP_ID"] == "S1", "LATITUDE"].iloc[0] == pytest.approx(38.9)
+
+
+def test_enrich_with_gtfs_invalid_join_key() -> None:
+    """ValueError for a join_key that is neither 'stop_id' nor 'stop_code'."""
+    ridership = pd.DataFrame({"STOP_ID": [1001]})
+    gtfs = _make_gtfs_stops()
+    with pytest.raises(ValueError, match="join_key must be"):
+        target.enrich_with_gtfs(ridership, gtfs, "bad_key")
+
+
 def test_main_omits_route_analysis_when_disabled() -> None:
     """main() leaves route_analysis as None when the flag is off (default)."""
     fixture_df = pd.read_csv(FIXTURE_PATH)
