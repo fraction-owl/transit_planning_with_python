@@ -61,11 +61,11 @@ Notes on extensions
 from __future__ import annotations
 
 import re
-import shutil
 import sys
 import tempfile
 import time
 import zipfile
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -84,7 +84,7 @@ import polars as pl
 #: automatically; anything under ``OUTPUT_DIR`` is skipped so re-runs don't
 #: reprocess their own output.
 INPUT_DIR: Final[Path] = Path(r"PATH\TO\CANADA\FIXTURE\INPUTS")  # <<< EDIT ME
- 
+
 #: Directory where the sample shapefile, the manifest, and all filtered
 #: fixtures are written. May be nested inside ``INPUT_DIR``.
 OUTPUT_DIR: Final[Path] = Path(r"PATH\TO\CANADA\FIXTURE\OUTPUT")  # <<< EDIT ME
@@ -97,7 +97,7 @@ CDS_BY_PROVINCE: Final[dict[str, list[str]]] = {
     "35": [  # Ontario
         "06",  # Ottawa (single-tier city CD, CDUID 3506)
     ],
-    "24": [  # Quebec  
+    "24": [  # Quebec
         "81",  # Gatineau (CDUID 2481)
         "82",  # Les Collines-de-l'Outaouais (CDUID 2482)
     ],
@@ -207,8 +207,11 @@ class CensusCsvSource:
 
     @property
     def display(self) -> str:
-        """Human-readable label for log output. For zip members, formats as
-        ``<archive>!<inner>`` so logs disambiguate same-named CSVs in different zips."""
+        """Human-readable label for log output.
+
+        For zip members, formats as ``<archive>!<inner>`` so logs disambiguate
+        same-named CSVs in different zips.
+        """
         if self.inner is not None:
             return f"{self.container.name}!{Path(self.inner).name}"
         return self.container.name
@@ -245,7 +248,7 @@ def _csv_pruids(source: CensusCsvSource) -> frozenset[str]:
 
 
 @contextmanager
-def _open_census_csv(source: CensusCsvSource):
+def _open_census_csv(source: CensusCsvSource) -> Iterator[Path]:
     """Yield a real CSV path, extracting from a zip transparently if needed.
 
     On context exit, the temp directory used for extraction (if any) is
@@ -266,8 +269,7 @@ def _open_census_csv(source: CensusCsvSource):
                 data_members = [
                     m
                     for m in members
-                    if Path(m).suffix.lower() == ".csv"
-                    and CENSUS_CSV_PATTERN.match(Path(m).name)
+                    if Path(m).suffix.lower() == ".csv" and CENSUS_CSV_PATTERN.match(Path(m).name)
                 ]
                 if not data_members:
                     msg = (
@@ -358,9 +360,7 @@ def discover_census_csvs(input_dir: Path, output_dir: Path) -> list[CensusCsvSou
             if member_path.name in sources_by_name:
                 # Already discovered as a direct file; prefer that.
                 continue
-            sources_by_name[member_path.name] = CensusCsvSource(
-                container=path, inner=member
-            )
+            sources_by_name[member_path.name] = CensusCsvSource(container=path, inner=member)
 
     return sorted(sources_by_name.values(), key=lambda s: s.name)
 
@@ -555,9 +555,7 @@ def sample_das(
             if sub.empty:
                 print(f"  [warn] no DAs for PRUID={pruid} CDUID={cduid}")
                 continue
-            for dauid, reason in _stratified_picks(
-                sub, pop_lookup, targets[(pruid, cd_code)]
-            ):
+            for dauid, reason in _stratified_picks(sub, pop_lookup, targets[(pruid, cd_code)]):
                 rows.append(
                     {
                         "DAUID": dauid,
@@ -566,17 +564,11 @@ def sample_das(
                         "CDUID": cduid,
                         "selection_reason": reason,
                         "population_2021": int(pop_lookup.get(dauid, 0)),
-                        "land_area_km2": float(
-                            sub.loc[sub["DAUID"] == dauid, "LANDAREA"].iloc[0]
-                        ),
+                        "land_area_km2": float(sub.loc[sub["DAUID"] == dauid, "LANDAREA"].iloc[0]),
                     }
                 )
 
-    return (
-        pd.DataFrame(rows)
-        .sort_values(["PRUID", "CDUID", "DAUID"])
-        .reset_index(drop=True)
-    )
+    return pd.DataFrame(rows).sort_values(["PRUID", "CDUID", "DAUID"]).reset_index(drop=True)
 
 
 # =============================================================================
@@ -646,9 +638,10 @@ def filter_census_csv(
     t0 = time.monotonic()
     print(f"  filtering {source.display} ...", flush=True)
 
-    with _open_census_csv(source) as real_csv, open(
-        out_path, "w", encoding=CENSUS_ENCODING, newline=""
-    ) as out_f:
+    with (
+        _open_census_csv(source) as real_csv,
+        open(out_path, "w", encoding=CENSUS_ENCODING, newline="") as out_f,
+    ):
         try:
             chunks = pd.read_csv(
                 real_csv,
@@ -668,15 +661,14 @@ def filter_census_csv(
             # (rows with empty DGUID / ALT_GEO_CODE / GEO_LEVEL).
             chunk = chunk.dropna(subset=["DGUID", "GEO_LEVEL"])
 
-            keep_da = (
-                chunk["GEO_LEVEL"].eq(DA_GEO_LEVEL)
-                & chunk["ALT_GEO_CODE"].isin(dauids)
-            )
+            keep_da = chunk["GEO_LEVEL"].eq(DA_GEO_LEVEL) & chunk["ALT_GEO_CODE"].isin(dauids)
             keep_country = chunk["GEO_LEVEL"].eq(COUNTRY_GEO_LEVEL)
             filtered = chunk[keep_da | keep_country]
 
             if not filtered.empty:
-                filtered.to_csv(out_f, index=False, header=not header_written, lineterminator="\r\n")
+                filtered.to_csv(
+                    out_f, index=False, header=not header_written, lineterminator="\r\n"
+                )
                 header_written = True
                 total_kept += len(filtered)
 
@@ -763,7 +755,9 @@ def main() -> int:
         if pop_lookup:
             print(f"  loaded {len(pop_lookup):,} DA->population entries")
         else:
-            print("  no population data found; max_pop and zero_pop strata will fall back to random")
+            print(
+                "  no population data found; max_pop and zero_pop strata will fall back to random"
+            )
 
         print("\nSampling DAs (first run, stratified)...")
         manifest = sample_das(gdf, pop_lookup)
