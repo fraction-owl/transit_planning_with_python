@@ -1,0 +1,99 @@
+stop_id,stop_name,stop_lat,stop_lon
+S_NS_01,North-South Ave & 1st Cross St,38.889011,-77.050000
+S_NS_02,North-South Ave & 2nd Cross St,38.891758,-77.050000
+S_NS_03,North-South Ave & 3rd Cross St,38.894505,-77.050000
+S_NS_04,North-South Ave & 4th Cross St,38.897253,-77.050000
+S_NS_05,North-South Ave & 5th Cross St,38.900000,-77.050000
+S_NS_06,North-South Ave & 6th Cross St,38.902747,-77.050000
+S_NS_07,North-South Ave & 7th Cross St,38.905495,-77.050000
+S_NS_08,North-South Ave & 8th Cross St,38.908242,-77.050000
+S_NS_09,North-South Ave & 9th Cross St,38.910989,-77.050000
+S_NS_10,North-South Ave & 10th Cross St,38.913736,-77.050000
+S_EW_01,Main Corridor & Stop 1,38.900000,-77.056055
+S_EW_02,Main Corridor & Stop 2,38.900000,-77.054325
+S_EW_03,Main Corridor & Stop 3,38.900000,-77.052595
+S_EW_07,Main Corridor & Stop 7,38.900000,-77.045675
+S_EW_08,Main Corridor & Stop 8,38.900000,-77.043945
+S_EW_09,Main Corridor & Stop 9,38.900000,-77.042215
+S_EW_10,Main Corridor & Stop 10,38.900000,-77.040484
+S_EW_11,Main Corridor & Stop 11,38.900000,-77.038754
+S_EW_12,Main Corridor & Stop 12,38.900000,-77.037024
+S_EW_13,Main Corridor & Stop 13,38.900000,-77.035294
+S_EW_14,Main Corridor & Stop 14,38.900000,-77.033564
+S_NWSE_01,Diagonal NW/SE & Marker 1,38.919231,-77.074221
+S_NWSE_02,Diagonal NW/SE & Marker 2,38.913736,-77.067301
+S_NWSE_03,Diagonal NW/SE & Marker 3,38.908242,-77.060381
+S_NWSE_04,Diagonal NW/SE & Marker 4,38.902747,-77.053460
+S_NWSE_05,Diagonal NW/SE & Marker 5,38.897253,-77.046540
+S_NWSE_06,Diagonal NW/SE & Marker 6,38.891758,-77.039619
+S_NWSE_07,Diagonal NW/SE & Marker 7,38.886264,-77.032699
+S_NWSE_08,Diagonal NW/SE & Marker 8,38.880769,-77.025779
+S_NESW_01,Express NE/SW & Point 1,38.909615,-77.037889
+S_NESW_02,Express NE/SW & Point 2,38.906868,-77.041349
+S_NESW_03,Express NE/SW & Point 3,38.904121,-77.044810
+S_NESW_04,Express NE/SW & Point 4,38.901374,-77.048270
+S_NESW_05,Express NE/SW & Point 5,38.898626,-77.051730
+S_NESW_06,Express NE/SW & Point 6,38.895879,-77.055190
+S_NESW_07,Express NE/SW & Point 7,38.893132,-77.058651
+S_NESW_08,Express NE/SW & Point 8,38.890385,-77.062111
+S_SQ_01,Square Loop Stop 1,38.905242,-77.053000
+S_SQ_02,Square Loop Stop 2,38.905242,-77.049540
+S_SQ_03,Square Loop Stop 3,38.905242,-77.046080
+S_SQ_04,Square Loop Stop 4,38.905242,-77.042619
+S_SQ_05,Square Loop Stop 5,38.902495,-77.042619
+S_SQ_06,Square Loop Stop 6,38.899747,-77.042619
+S_SQ_07,Square Loop Stop 7,38.897000,-77.042619
+S_SQ_08,Square Loop Stop 8,38.897000,-77.046080
+S_SQ_09,Square Loop Stop 9,38.897000,-77.049540
+S_SQ_10,Square Loop Stop 10,38.897000,-77.053000
+S_SQ_11,Square Loop Stop 11,38.899747,-77.053000
+S_SQ_12,Square Loop Stop 12,38.902495,-77.053000
+O_NS_01,Chemin Nord-Sud & Rue 1st,45.409011,-75.690000
+O_NS_02,Chemin Nord-Sud & Rue 2nd,45.411758,-75.690000
+O_NS_03,Chemin Nord-Sud & Rue 3rd,45.414505,-75.690000
+O_NS_04,Chemin Nord-Sud & Rue 4th,45.417253,-75.690000
+O_NS_05,Chemin Nord-Sud & Rue 5th,45.420000,-75.690000
+O_NS_06,Chemin Nord-Sud & Rue 6th,45.422747,-75.690000
+O_NS_07,Chemin Nord-Sud & Rue 7th,45.425495,-75.690000
+O_NS_08,Chemin Nord-Sud & Rue 8th,45.428242,-75.690000
+O_NS_09,Chemin Nord-Sud & Rue 9th,45.430989,-75.690000
+O_NS_10,Chemin Nord-Sud & Rue 10th,45.433736,-75.690000
+O_EW_01,Promenade Est-Ouest & Arrêt 1,45.420000,-75.696863
+O_EW_02,Promenade Est-Ouest & Arrêt 2,45.420000,-75.694902
+O_EW_03,Promenade Est-Ouest & Arrêt 3,45.420000,-75.692941
+O_EW_07,Promenade Est-Ouest & Arrêt 7,45.420000,-75.685098
+O_EW_08,Promenade Est-Ouest & Arrêt 8,45.420000,-75.683137
+O_EW_09,Promenade Est-Ouest & Arrêt 9,45.420000,-75.681176
+O_EW_10,Promenade Est-Ouest & Arrêt 10,45.420000,-75.679216
+O_EW_11,Promenade Est-Ouest & Arrêt 11,45.420000,-75.677255
+O_EW_12,Promenade Est-Ouest & Arrêt 12,45.420000,-75.675294
+O_EW_13,Promenade Est-Ouest & Arrêt 13,45.420000,-75.673333
+O_EW_14,Promenade Est-Ouest & Arrêt 14,45.420000,-75.671373
+O_NWSE_01,Diagonale NO/SE & Repère 1,45.439231,-75.717451
+O_NWSE_02,Diagonale NO/SE & Repère 2,45.433736,-75.709608
+O_NWSE_03,Diagonale NO/SE & Repère 3,45.428242,-75.701765
+O_NWSE_04,Diagonale NO/SE & Repère 4,45.422747,-75.693922
+O_NWSE_05,Diagonale NO/SE & Repère 5,45.417253,-75.686078
+O_NWSE_06,Diagonale NO/SE & Repère 6,45.411758,-75.678235
+O_NWSE_07,Diagonale NO/SE & Repère 7,45.406264,-75.670392
+O_NWSE_08,Diagonale NO/SE & Repère 8,45.400769,-75.662549
+O_NESW_01,Express NE/SO & Point 1,45.429615,-75.676275
+O_NESW_02,Express NE/SO & Point 2,45.426868,-75.680196
+O_NESW_03,Express NE/SO & Point 3,45.424121,-75.684118
+O_NESW_04,Express NE/SO & Point 4,45.421374,-75.688039
+O_NESW_05,Express NE/SO & Point 5,45.418626,-75.691961
+O_NESW_06,Express NE/SO & Point 6,45.415879,-75.695882
+O_NESW_07,Express NE/SO & Point 7,45.413132,-75.699804
+O_NESW_08,Express NE/SO & Point 8,45.410385,-75.703725
+O_SQ_01,Boucle Carré Arrêt 1,45.425242,-75.693000
+O_SQ_02,Boucle Carré Arrêt 2,45.425242,-75.689078
+O_SQ_03,Boucle Carré Arrêt 3,45.425242,-75.685157
+O_SQ_04,Boucle Carré Arrêt 4,45.425242,-75.681235
+O_SQ_05,Boucle Carré Arrêt 5,45.422495,-75.681235
+O_SQ_06,Boucle Carré Arrêt 6,45.419747,-75.681235
+O_SQ_07,Boucle Carré Arrêt 7,45.417000,-75.681235
+O_SQ_08,Boucle Carré Arrêt 8,45.417000,-75.685157
+O_SQ_09,Boucle Carré Arrêt 9,45.417000,-75.689078
+O_SQ_10,Boucle Carré Arrêt 10,45.417000,-75.693000
+O_SQ_11,Boucle Carré Arrêt 11,45.419747,-75.693000
+O_SQ_12,Boucle Carré Arrêt 12,45.422495,-75.693000

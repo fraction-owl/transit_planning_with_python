@@ -1,0 +1,3 @@
+agency_id,agency_name,agency_url,agency_timezone,agency_lang
+DC_TRANSIT,DC Metro Transit,https://www.dcmetrotransit.example,America/New_York,en
+OC_TRANSIT,Ottawa City Transit,https://www.ottawacitytransit.example,America/Toronto,en

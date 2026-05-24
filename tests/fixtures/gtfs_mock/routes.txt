@@ -1,0 +1,12 @@
+route_id,agency_id,route_short_name,route_long_name,route_type
+101,DC_TRANSIT,101,North-South Line,3
+102,DC_TRANSIT,102,East-West Corridor,3
+103,DC_TRANSIT,103,Northwest-Southeast Diagonal,3
+104,DC_TRANSIT,104,Northeast-Southwest Express,3
+105,DC_TRANSIT,105,Downtown Square Loop,3
+201,OC_TRANSIT,201,Ligne Nord-Sud,3
+202,OC_TRANSIT,202,Couloir Est-Ouest,3
+203,OC_TRANSIT,203,Diagonale NO-SE,3
+204,OC_TRANSIT,204,Express NE-SO,3
+205,OC_TRANSIT,205,Boucle Centre-Ville,3
+901,DC_TRANSIT,901,Holiday Shuttle,3
