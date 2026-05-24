@@ -315,8 +315,8 @@ def calculate_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 def safe_div_vec(a: pd.Series, b: pd.Series, precision: int = 1) -> pd.Series:
     """Vectorised safe_div for Series."""
-    with pd.option_context("mode.use_inf_as_na", True):
-        result = a.astype(float) / b.astype(float)
+    result = a.astype(float) / b.astype(float)
+    result = result.replace([float("inf"), float("-inf")], float("nan"))
     return result.round(precision)
 
 
