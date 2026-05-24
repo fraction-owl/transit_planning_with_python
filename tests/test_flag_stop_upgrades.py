@@ -3,7 +3,6 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pandas as pd
-import pytest
 
 script_dir = Path("scripts/facilities_tools").resolve()
 sys.path.append(str(script_dir))
@@ -266,24 +265,24 @@ def test_compute_flags_pad_threshold_is_one() -> None:
     """FLAG_PAD is False at 0 boardings and True at 1+ boardings (when no pad)."""
     df = _make_flaggable_df()
     result, _ = target._compute_flags(df)
-    assert result.loc[result["STOP_ID"] == "A", "FLAG_PAD"].iloc[0] == False  # 0 boardings
-    assert result.loc[result["STOP_ID"] == "B", "FLAG_PAD"].iloc[0] == True  # 1 boarding
+    assert not result.loc[result["STOP_ID"] == "A", "FLAG_PAD"].iloc[0]  # 0 boardings
+    assert result.loc[result["STOP_ID"] == "B", "FLAG_PAD"].iloc[0]  # 1 boarding
 
 
 def test_compute_flags_bench_threshold_is_ten() -> None:
     """FLAG_BENCH is True at exactly 10 boardings and False below."""
     df = _make_flaggable_df()
     result, _ = target._compute_flags(df)
-    assert result.loc[result["STOP_ID"] == "B", "FLAG_BENCH"].iloc[0] == False  # 1 boarding
-    assert result.loc[result["STOP_ID"] == "C", "FLAG_BENCH"].iloc[0] == True  # 10 boardings
+    assert not result.loc[result["STOP_ID"] == "B", "FLAG_BENCH"].iloc[0]  # 1 boarding
+    assert result.loc[result["STOP_ID"] == "C", "FLAG_BENCH"].iloc[0]  # 10 boardings
 
 
 def test_compute_flags_shelter_threshold_is_25() -> None:
     """FLAG_SHELTER is True at exactly 25 boardings and False below."""
     df = _make_flaggable_df()
     result, _ = target._compute_flags(df)
-    assert result.loc[result["STOP_ID"] == "C", "FLAG_SHELTER"].iloc[0] == False  # 10 boardings
-    assert result.loc[result["STOP_ID"] == "D", "FLAG_SHELTER"].iloc[0] == True  # 25 boardings
+    assert not result.loc[result["STOP_ID"] == "C", "FLAG_SHELTER"].iloc[0]  # 10 boardings
+    assert result.loc[result["STOP_ID"] == "D", "FLAG_SHELTER"].iloc[0]  # 25 boardings
 
 
 def test_compute_flags_amenity_present_suppresses_flag() -> None:
@@ -299,15 +298,15 @@ def test_compute_flags_amenity_present_suppresses_flag() -> None:
         }
     )
     result, _ = target._compute_flags(df)
-    assert result["NEEDS_IMPROVEMENT"].iloc[0] == False
+    assert not result["NEEDS_IMPROVEMENT"].iloc[0]
 
 
 def test_compute_flags_needs_improvement_is_any_flag() -> None:
     """NEEDS_IMPROVEMENT is True iff at least one FLAG_* is True."""
     df = _make_flaggable_df()
     result, _ = target._compute_flags(df)
-    assert result.loc[result["STOP_ID"] == "A", "NEEDS_IMPROVEMENT"].iloc[0] == False
-    assert result.loc[result["STOP_ID"] == "B", "NEEDS_IMPROVEMENT"].iloc[0] == True
+    assert not result.loc[result["STOP_ID"] == "A", "NEEDS_IMPROVEMENT"].iloc[0]
+    assert result.loc[result["STOP_ID"] == "B", "NEEDS_IMPROVEMENT"].iloc[0]
 
 
 # =============================================================================
