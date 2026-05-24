@@ -808,7 +808,7 @@ def _cast_int64_to_float(gdf: GeoDataFrame) -> None:
     ]
     if int_cols:
         logging.debug("Casting %d Int64 column(s) → float64: %s", len(int_cols), int_cols)
-        gdf[int_cols] = gdf[int_cols].astype("float64")
+        gdf[int_cols] = gdf[int_cols].astype("float64").round(1)
 
 
 def _truncate_field_names(gdf: GeoDataFrame, max_len: int = MAX_FIELD_LEN) -> GeoDataFrame:
