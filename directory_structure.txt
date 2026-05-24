@@ -71,10 +71,10 @@ transit_planning_with_python/
 │   │   ├── stops_ridership_joiner_arcpy.py
 │   │   └── stops_ridership_joiner_gpd.py
 │   └── service_coverage_geotools/
-│       ├── gtfs_census_catchment_analysis_gpd.py
-│       ├── gtfs_census_catchment_arcpy.py
 │       ├── gtfs_service_by_district_arcpy.py
 │       ├── gtfs_service_by_district_gpd.py
+│       ├── gtfs_service_demographics_arcpy.py
+│       ├── gtfs_service_demographics_gpd.py
 │       ├── route_site_coverage_arcpy.py
 │       ├── route_site_coverage_gpd.py
 │       ├── site_route_proximity_arcpy.py
