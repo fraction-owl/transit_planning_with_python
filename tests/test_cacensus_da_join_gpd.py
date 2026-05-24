@@ -103,6 +103,14 @@ _MINIMAL_CHAR_ROWS: list[tuple[str, str, str]] = [
     ("1683", "Total - Visible minority", "520"),
     ("1684", "Total visible minority population", "90"),
     ("1697", "Not a visible minority", "430"),
+    ("2603", "Total - Main mode of commuting", "200"),
+    ("2604", "Car, truck or van", "140"),
+    ("2605", "Car, truck or van - as a driver", "120"),
+    ("2606", "Car, truck or van - as a passenger", "20"),
+    ("2607", "Public transit", "40"),
+    ("2608", "Walked", "15"),
+    ("2609", "Bicycle", "5"),
+    ("2610", "Other method", "0"),
 ]
 
 
@@ -458,6 +466,50 @@ def test_derive_age_without_total_pop_skips_percentages() -> None:
     assert "perc_youth" not in result.columns
 
 
+def test_derive_commute_mode_computes_percentages() -> None:
+    df = pd.DataFrame(
+        {
+            mod.DAUID_COL: [_ON_DAUID],
+            "commute_total": [200.0],
+            "commute_car": [140.0],
+            "commute_car_driver": [120.0],
+            "commute_car_pass": [20.0],
+            "commute_transit": [40.0],
+            "commute_walk": [15.0],
+            "commute_bike": [5.0],
+            "commute_other": [0.0],
+        }
+    )
+    result = mod._derive_commute_mode(df)
+    assert result["perc_car"].iloc[0] == pytest.approx(0.7)
+    assert result["perc_car_driver"].iloc[0] == pytest.approx(0.6)
+    assert result["perc_car_pass"].iloc[0] == pytest.approx(0.1)
+    assert result["perc_transit"].iloc[0] == pytest.approx(0.2)
+    assert result["perc_walk"].iloc[0] == pytest.approx(0.075)
+    assert result["perc_bike"].iloc[0] == pytest.approx(0.025)
+    assert result["perc_cm_other"].iloc[0] == 0.0
+
+
+def test_derive_commute_mode_zero_denom_yields_zero() -> None:
+    df = pd.DataFrame(
+        {
+            mod.DAUID_COL: [_ON_DAUID],
+            "commute_total": [0.0],
+            "commute_car_driver": [0.0],
+            "commute_transit": [0.0],
+        }
+    )
+    result = mod._derive_commute_mode(df)
+    assert result["perc_car_driver"].iloc[0] == 0.0
+    assert result["perc_transit"].iloc[0] == 0.0
+
+
+def test_derive_commute_mode_missing_denom_is_noop() -> None:
+    df = pd.DataFrame({mod.DAUID_COL: [_ON_DAUID], "commute_car_driver": [100.0]})
+    result = mod._derive_commute_mode(df)
+    assert "perc_car_driver" not in result.columns
+
+
 # =============================================================================
 # CDUID filter helpers
 # =============================================================================
@@ -521,6 +573,13 @@ def test_build_da_table_has_derived_columns(plain_csv_dir: Path) -> None:
         "perc_allophone",
         "all_youth",
         "all_elderly",
+        "perc_car",
+        "perc_car_driver",
+        "perc_car_pass",
+        "perc_transit",
+        "perc_walk",
+        "perc_bike",
+        "perc_cm_other",
     )
     for col in expected_derived:
         assert col in df.columns, f"Expected derived column '{col}' missing"
@@ -892,11 +951,18 @@ def test_integration_build_da_table_from_fixture() -> None:
     assert "perc_low_inc" in df.columns
     assert "all_youth" in df.columns
     assert "all_elderly" in df.columns
+    assert "perc_car" in df.columns
+    assert "perc_car_driver" in df.columns
+    assert "perc_transit" in df.columns
 
     # Spot-check a known DA value (Ontario DA 35060207, total_pop = 503).
     row = df[df[mod.DAUID_COL] == _ON_DAUID]
     assert len(row) == 1
     assert row["total_pop"].iloc[0] == pytest.approx(503.0)
+    # Commute: total=170, car_driver=95, transit=40 → perc_car_driver≈0.559
+    assert row["commute_total"].iloc[0] == pytest.approx(170.0)
+    assert row["perc_car_driver"].iloc[0] == pytest.approx(95 / 170, rel=1e-2)
+    assert row["perc_transit"].iloc[0] == pytest.approx(40 / 170, rel=1e-2)
 
 
 @pytest.mark.skipif(
