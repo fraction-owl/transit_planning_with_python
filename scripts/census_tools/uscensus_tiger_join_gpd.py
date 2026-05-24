@@ -116,7 +116,7 @@ FINAL_JOINED_FEATURES: str = r"Path\To\Your\Output_Folder\va_md_dc_blocks_plus_d
 LEFT_KEY: Final[str] = "GEOID20"  # 15-digit block ID in geometry
 RIGHT_KEY: Final[str] = "GEO_ID"  # 24-char Census ID in CSV (last 15 chars used)
 DERIVATION_SRC: Final[str] = "GEO_ID_blk"  # fallback CSV column post-merge
-FORCE_FLOAT: Final[bool] = True  # cast nullable Int64 → float64 for shapefile safety
+FORCE_FLOAT: Final[bool] = True  # cast nullable Int64 → int64 for shapefile safety
 MAX_FIELD_LEN: Final[int] = 10  # DBF column-name limit
 
 # ---- CSV topic signatures ---------------------------------------------------
@@ -799,16 +799,18 @@ def join_blocks_to_attributes(
 
 
 def _cast_int64_to_float(gdf: GeoDataFrame) -> None:
-    """Convert nullable Int64 columns to float64 in place for shapefile safety.
+    """Convert nullable Int64 columns to int64 in place for shapefile safety.
 
     Shapefile drivers cannot store pandas' nullable integer extension type.
+    Filling NaN with 0 and casting to numpy int64 produces integer DBF fields
+    with no decimal places, avoiding the float:24.15 representation.
     """
     int_cols: list[str] = [
         str(col) for col, dtype in gdf.dtypes.items() if pd.api.types.is_integer_dtype(dtype)
     ]
     if int_cols:
-        logging.debug("Casting %d Int64 column(s) → float64: %s", len(int_cols), int_cols)
-        gdf[int_cols] = gdf[int_cols].astype("float64").round(1)
+        logging.debug("Casting %d Int64 column(s) → int64: %s", len(int_cols), int_cols)
+        gdf[int_cols] = gdf[int_cols].fillna(0).astype("int64")
 
 
 def _truncate_field_names(gdf: GeoDataFrame, max_len: int = MAX_FIELD_LEN) -> GeoDataFrame:
