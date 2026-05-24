@@ -19,6 +19,9 @@ pre-commit                   # Local git hooks (ruff)
 # Type checking
 ty                           # Non-blocking type checks
 
+# Data Processing
+polars==0.20.31              # Fast DataFrames (used by dev fixture builders)
+
 # ------------- Typing stubs (temporary) -------------------------------------
 pandas-stubs==2.2.*
 types-openpyxl>=3.1,<5
