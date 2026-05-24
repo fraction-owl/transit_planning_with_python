@@ -880,7 +880,9 @@ def write_geo(gdf: GeoDataFrame, out_path: str) -> None:
     logging.info("Writing %d features → %s", len(gdf), path.resolve())
     if out_path.lower().endswith(".shp"):
         gdf = _truncate_field_names(gdf)
-        gdf.to_file(out_path, driver="ESRI Shapefile", schema=_shp_schema(gdf), engine="fiona", index=False)
+        gdf.to_file(
+            out_path, driver="ESRI Shapefile", schema=_shp_schema(gdf), engine="fiona", index=False
+        )
     else:
         gdf.to_file(out_path, index=False)
 
