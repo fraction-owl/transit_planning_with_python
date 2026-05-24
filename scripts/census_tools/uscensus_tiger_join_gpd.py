@@ -116,7 +116,7 @@ FINAL_JOINED_FEATURES: str = r"Path\To\Your\Output_Folder\va_md_dc_blocks_plus_d
 LEFT_KEY: Final[str] = "GEOID20"  # 15-digit block ID in geometry
 RIGHT_KEY: Final[str] = "GEO_ID"  # 24-char Census ID in CSV (last 15 chars used)
 DERIVATION_SRC: Final[str] = "GEO_ID_blk"  # fallback CSV column post-merge
-FORCE_FLOAT: Final[bool] = True  # cast nullable Int64 → int64 for shapefile safety
+FORCE_FLOAT: Final[bool] = True  # cast nullable Int64 → float64 for shapefile safety
 MAX_FIELD_LEN: Final[int] = 10  # DBF column-name limit
 
 # ---- CSV topic signatures ---------------------------------------------------
@@ -799,18 +799,16 @@ def join_blocks_to_attributes(
 
 
 def _cast_int64_to_float(gdf: GeoDataFrame) -> None:
-    """Convert nullable Int64 columns to int64 in place for shapefile safety.
+    """Convert nullable Int64 columns to float64 in place for shapefile safety.
 
     Shapefile drivers cannot store pandas' nullable integer extension type.
-    Filling NaN with 0 and casting to numpy int64 produces integer DBF fields
-    with no decimal places, avoiding the float:24.15 representation.
     """
     int_cols: list[str] = [
         str(col) for col, dtype in gdf.dtypes.items() if pd.api.types.is_integer_dtype(dtype)
     ]
     if int_cols:
-        logging.debug("Casting %d Int64 column(s) → int64: %s", len(int_cols), int_cols)
-        gdf[int_cols] = gdf[int_cols].fillna(0).astype("int64")
+        logging.debug("Casting %d Int64 column(s) → float64: %s", len(int_cols), int_cols)
+        gdf[int_cols] = gdf[int_cols].astype("float64")
 
 
 def _truncate_field_names(gdf: GeoDataFrame, max_len: int = MAX_FIELD_LEN) -> GeoDataFrame:
@@ -846,23 +844,45 @@ def _truncate_field_names(gdf: GeoDataFrame, max_len: int = MAX_FIELD_LEN) -> Ge
     return gdf
 
 
+def _shp_schema(gdf: GeoDataFrame) -> dict:
+    """Build a fiona write schema capping float fields to 1 decimal place.
+
+    Fiona defaults to float:24.15 for float64, producing 15 trailing zeros for
+    integer-valued fields and excessive precision for estimates. Using float:24.1
+    limits all float columns to 1 decimal place in the DBF output.
+    """
+    geom_type = gdf.geom_type.mode().iloc[0] if not gdf.empty else "Unknown"
+    props: dict[str, str] = {}
+    for col, dtype in gdf.drop(columns=gdf.geometry.name).dtypes.items():
+        col_str = str(col)
+        if pd.api.types.is_float_dtype(dtype):
+            props[col_str] = "float:24.1"
+        elif pd.api.types.is_integer_dtype(dtype):
+            props[col_str] = "int:18"
+        elif pd.api.types.is_bool_dtype(dtype):
+            props[col_str] = "int:1"
+        else:
+            max_len = int(gdf[col].astype(str).str.len().max()) if not gdf.empty else 1
+            props[col_str] = f"str:{max(max_len, 1)}"
+    return {"geometry": geom_type, "properties": props}
+
+
 def write_geo(gdf: GeoDataFrame, out_path: str) -> None:
     """Write *gdf* to disk, creating parent dirs if needed.
 
     Shapefile outputs have field names truncated to 10 chars and the implicit
     pandas index suppressed; other drivers are inferred from the extension.
+    Float columns in shapefiles are written with 1 decimal place.
     """
     path = Path(out_path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
+    logging.info("Writing %d features → %s", len(gdf), path.resolve())
     if out_path.lower().endswith(".shp"):
         gdf = _truncate_field_names(gdf)
-        driver: str | None = "ESRI Shapefile"
+        gdf.to_file(out_path, driver="ESRI Shapefile", schema=_shp_schema(gdf), engine="fiona", index=False)
     else:
-        driver = None
-
-    logging.info("Writing %d features → %s", len(gdf), path.resolve())
-    gdf.to_file(out_path, driver=driver, index=False)
+        gdf.to_file(out_path, index=False)
 
 
 def write_csv(df: DataFrame, out_path: str) -> None:
