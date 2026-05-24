@@ -12,10 +12,10 @@ transit_planning_with_python/
 │   ├── build_cacensus_fixtures.py
 │   ├── build_uscensus_fixtures.py
 │   ├── check_style.py
+│   ├── export_repo_file_tree.py
 │   ├── export_requirements.py
 │   ├── lint_commit.py
-│   ├── lint_pr.py
-│   └── print_repo_file_tree.py
+│   └── lint_pr.py
 ├── scripts/
 │   ├── census_tools/
 │   │   ├── cacensus_da_join_gpd.py
