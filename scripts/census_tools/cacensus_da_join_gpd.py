@@ -156,6 +156,16 @@ CHARACTERISTIC_MAP: dict[str, str] = {
     "1683": "vm_denom",
     "1684": "vm_count",
     "1697": "vm_not",
+    # ---- Main mode of commuting (25% sample data) ----
+    # Denominator: employed labour force 15+ with usual or no-fixed workplace.
+    "2603": "commute_total",
+    "2604": "commute_car",
+    "2605": "commute_car_driver",
+    "2606": "commute_car_pass",
+    "2607": "commute_transit",
+    "2608": "commute_walk",
+    "2609": "commute_bike",
+    "2610": "commute_other",
 }
 
 LOG_LEVEL: int = logging.INFO
@@ -432,6 +442,42 @@ def _derive_age(df: DataFrame) -> DataFrame:
     return df
 
 
+def _derive_commute_mode(df: DataFrame) -> DataFrame:
+    """Add commute-mode percentage columns.
+
+    Uses the 25%-sample 'Main mode of commuting' variables
+    (CHARACTERISTIC_IDs 2603–2610).  The denominator (``commute_total``) is
+    the count of employed people aged 15+ with a usual or no-fixed workplace
+    address.  A DA where most workers drive is very unlikely to have low
+    vehicle access.
+
+    Columns added:
+        ``perc_car``         – combined car/truck/van share (driver + passenger)
+        ``perc_car_driver``  – driver share
+        ``perc_car_pass``    – passenger share
+        ``perc_transit``     – public transit share
+        ``perc_walk``        – walked share
+        ``perc_bike``        – bicycle share
+        ``perc_cm_other``    – other method share
+    """
+    denom = "commute_total"
+    if denom not in df.columns:
+        return df
+    mode_cols: dict[str, str] = {
+        "commute_car": "perc_car",
+        "commute_car_driver": "perc_car_driver",
+        "commute_car_pass": "perc_car_pass",
+        "commute_transit": "perc_transit",
+        "commute_walk": "perc_walk",
+        "commute_bike": "perc_bike",
+        "commute_other": "perc_cm_other",
+    }
+    for raw_col, pct_col in mode_cols.items():
+        if raw_col in df.columns:
+            df[pct_col] = (df[raw_col] / df[denom]).round(3).fillna(0)
+    return df
+
+
 # ---- CDUID filter helpers ---------------------------------------------------
 
 
@@ -485,6 +531,7 @@ def build_da_table(
     df = _derive_visible_minority(df)
     df = _derive_language(df)
     df = _derive_age(df)
+    df = _derive_commute_mode(df)
     df = _apply_cduid_filter_df(df, cduids=cduid_filter)
     _fill_numeric_only(df)
     return df
