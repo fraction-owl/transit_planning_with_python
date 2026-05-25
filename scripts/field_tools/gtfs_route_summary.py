@@ -527,6 +527,7 @@ def export_to_xlsx(data_frame: pd.DataFrame, output_file: str) -> None:
 
     wb = Workbook()
     ws = wb.active
+    assert ws is not None
     ws.title = "Routes"
 
     headers = list(data_frame.columns)
@@ -579,7 +580,7 @@ def export_to_xlsx(data_frame: pd.DataFrame, output_file: str) -> None:
     ws.page_setup.orientation = ws.ORIENTATION_LANDSCAPE
     ws.page_setup.fitToWidth = 1
     ws.page_setup.fitToHeight = 0
-    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.sheet_properties.pageSetUpPr.fitToPage = True  # ty: ignore[invalid-assignment]
     ws.print_title_rows = "1:1"
 
     wb.save(output_file)
