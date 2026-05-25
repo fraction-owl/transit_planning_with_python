@@ -20,9 +20,9 @@ FIXTURE_DA_ZIP = "lda_000b21a_e_sample.zip"
 
 # Known counts from lda_000b21a_e_sample.zip
 _FIXTURE_DA_TOTAL = 35
-_FIXTURE_DA_ON_COUNT = 15   # CDUID 3506 (Ottawa)
+_FIXTURE_DA_ON_COUNT = 15  # CDUID 3506 (Ottawa)
 _FIXTURE_DA_2481_COUNT = 15  # CDUID 2481 (Gatineau)
-_FIXTURE_DA_2482_COUNT = 5   # CDUID 2482 (Les Collines-de-l'Outaouais)
+_FIXTURE_DA_2482_COUNT = 5  # CDUID 2482 (Les Collines-de-l'Outaouais)
 
 # Representative DAUID from the Ontario fixture file.
 _ON_DAUID = "35060207"
@@ -1062,8 +1062,8 @@ def test_fixture_da_zip_cduid_derived_and_four_chars() -> None:
 def test_fixture_da_zip_known_dauids_present() -> None:
     path = mod.discover_da_shapefile(FIXTURE_DIR)
     gdf = mod.load_da_shapefile(path)
-    assert _ON_DAUID in gdf["DAUID"].values
-    assert _QC_DAUID in gdf["DAUID"].values
+    assert _ON_DAUID in gdf["DAUID"].to_numpy()
+    assert _QC_DAUID in gdf["DAUID"].to_numpy()
 
 
 @_da_shp_skipif
