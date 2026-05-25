@@ -231,8 +231,8 @@ def _route_specs() -> Tuple[RouteSpec, ...]:
             avg_speed_mph=AVG_SPEED_EXPRESS_MPH,
             windows_by_service={
                 "weekday": [
-                    ("06:30", "09:00", 5),    # AM peak — direction 0 only
-                    ("15:30", "18:30", 5),    # PM peak — direction 1 only
+                    ("06:30", "09:00", 5),  # AM peak — direction 0 only
+                    ("15:30", "18:30", 5),  # PM peak — direction 1 only
                 ],
             },
             direction_pattern="am_in_pm_out",
@@ -380,14 +380,16 @@ def _bbox_from_fixture(fixture_path: Optional[Path]) -> Optional[Tuple[float, fl
     if fixture_path is None:
         return None
     if not Path(fixture_path).exists():
-        logging.warning("Fixture path does not exist; falling back to default bbox: %s",
-                        fixture_path)
+        logging.warning(
+            "Fixture path does not exist; falling back to default bbox: %s", fixture_path
+        )
         return None
     try:
         import geopandas as gpd  # noqa: PLC0415 — lazy import is intentional
     except ImportError:
-        logging.warning("geopandas not installed; falling back to default bbox for %s",
-                        fixture_path)
+        logging.warning(
+            "geopandas not installed; falling back to default bbox for %s", fixture_path
+        )
         return None
     gdf = gpd.read_file(fixture_path)
     if gdf.empty:
@@ -533,27 +535,47 @@ def _build_calendar_rows() -> List[Dict[str, str]]:
     return [
         {
             "service_id": "weekday",
-            "monday": "1", "tuesday": "1", "wednesday": "1", "thursday": "1", "friday": "1",
-            "saturday": "0", "sunday": "0",
+            "monday": "1",
+            "tuesday": "1",
+            "wednesday": "1",
+            "thursday": "1",
+            "friday": "1",
+            "saturday": "0",
+            "sunday": "0",
             **base,
         },
         {
             "service_id": "saturday",
-            "monday": "0", "tuesday": "0", "wednesday": "0", "thursday": "0", "friday": "0",
-            "saturday": "1", "sunday": "0",
+            "monday": "0",
+            "tuesday": "0",
+            "wednesday": "0",
+            "thursday": "0",
+            "friday": "0",
+            "saturday": "1",
+            "sunday": "0",
             **base,
         },
         {
             "service_id": "sunday",
-            "monday": "0", "tuesday": "0", "wednesday": "0", "thursday": "0", "friday": "0",
-            "saturday": "0", "sunday": "1",
+            "monday": "0",
+            "tuesday": "0",
+            "wednesday": "0",
+            "thursday": "0",
+            "friday": "0",
+            "saturday": "0",
+            "sunday": "1",
             **base,
         },
         {
             "service_id": "holiday",
             # No regular days of week; activated only via calendar_dates.txt.
-            "monday": "0", "tuesday": "0", "wednesday": "0", "thursday": "0", "friday": "0",
-            "saturday": "0", "sunday": "0",
+            "monday": "0",
+            "tuesday": "0",
+            "wednesday": "0",
+            "thursday": "0",
+            "friday": "0",
+            "saturday": "0",
+            "sunday": "0",
             **base,
         },
     ]
@@ -600,9 +622,7 @@ def _route_runtime_seconds(spec: RouteSpec, shape_length_m: float) -> int:
     return int(round(travel_seconds + dwell_seconds))
 
 
-def _allowed_directions_for_window(
-    spec: RouteSpec, window_index: int
-) -> Tuple[int, ...]:
+def _allowed_directions_for_window(spec: RouteSpec, window_index: int) -> Tuple[int, ...]:
     """Return which direction_ids run during a given window of a route."""
     if spec.direction_pattern == "cw_only":
         return (0,)
@@ -641,9 +661,7 @@ def _build_trip_stop_visits(
 
     skip_idx: Optional[int] = None
     if apply_skip:
-        shared_indices = [
-            i for i, (sid, *_rest) in enumerate(ordered) if "_NS_" in sid
-        ]
+        shared_indices = [i for i, (sid, *_rest) in enumerate(ordered) if "_NS_" in sid]
         if shared_indices:
             skip_idx = shared_indices[len(shared_indices) // 2]
 
@@ -766,7 +784,7 @@ def _assign_blocks(trips: List[TripPlan]) -> None:
             # accept this trip without violating layover or duration limits.
             best_idx: Optional[int] = None
             best_end = math.inf
-            for i, (bid, bstart, bend) in enumerate(open_blocks):
+            for i, (_bid, bstart, bend) in enumerate(open_blocks):
                 if trip.start_seconds < bend + layover_seconds:
                     continue
                 if trip.end_seconds - bstart > max_block_seconds:
@@ -806,13 +824,15 @@ def _write_agency(region: Region, out_dir: Path) -> None:
     _write_csv(
         out_dir / "agency.txt",
         ["agency_id", "agency_name", "agency_url", "agency_timezone", "agency_lang"],
-        [{
-            "agency_id": region.agency_id,
-            "agency_name": region.agency_name,
-            "agency_url": region.agency_url,
-            "agency_timezone": region.agency_timezone,
-            "agency_lang": FEED_LANG,
-        }],
+        [
+            {
+                "agency_id": region.agency_id,
+                "agency_name": region.agency_name,
+                "agency_url": region.agency_url,
+                "agency_timezone": region.agency_timezone,
+                "agency_lang": FEED_LANG,
+            }
+        ],
     )
 
 
@@ -820,8 +840,18 @@ def _write_calendar(out_dir: Path) -> None:
     """Write calendar.txt and calendar_dates.txt."""
     _write_csv(
         out_dir / "calendar.txt",
-        ["service_id", "monday", "tuesday", "wednesday", "thursday", "friday",
-         "saturday", "sunday", "start_date", "end_date"],
+        [
+            "service_id",
+            "monday",
+            "tuesday",
+            "wednesday",
+            "thursday",
+            "friday",
+            "saturday",
+            "sunday",
+            "start_date",
+            "end_date",
+        ],
         _build_calendar_rows(),
     )
     _write_csv(
@@ -835,16 +865,24 @@ def _write_feed_info(region: Region, out_dir: Path) -> None:
     """Write feed_info.txt."""
     _write_csv(
         out_dir / "feed_info.txt",
-        ["feed_publisher_name", "feed_publisher_url", "feed_lang",
-         "feed_start_date", "feed_end_date", "feed_version"],
-        [{
-            "feed_publisher_name": region.agency_name,
-            "feed_publisher_url": region.agency_url,
-            "feed_lang": FEED_LANG,
-            "feed_start_date": FEED_START_DATE,
-            "feed_end_date": FEED_END_DATE,
-            "feed_version": FEED_VERSION,
-        }],
+        [
+            "feed_publisher_name",
+            "feed_publisher_url",
+            "feed_lang",
+            "feed_start_date",
+            "feed_end_date",
+            "feed_version",
+        ],
+        [
+            {
+                "feed_publisher_name": region.agency_name,
+                "feed_publisher_url": region.agency_url,
+                "feed_lang": FEED_LANG,
+                "feed_start_date": FEED_START_DATE,
+                "feed_end_date": FEED_END_DATE,
+                "feed_version": FEED_VERSION,
+            }
+        ],
     )
 
 
@@ -852,13 +890,15 @@ def _write_routes(region: Region, specs: Sequence[RouteSpec], out_dir: Path) -> 
     """Write routes.txt."""
     rows = []
     for spec in specs:
-        rows.append({
-            "route_id": f"{region.key.upper()}_R{spec.short_name}",
-            "agency_id": region.agency_id,
-            "route_short_name": spec.short_name,
-            "route_long_name": spec.long_name,
-            "route_type": "3",  # bus
-        })
+        rows.append(
+            {
+                "route_id": f"{region.key.upper()}_R{spec.short_name}",
+                "agency_id": region.agency_id,
+                "route_short_name": spec.short_name,
+                "route_long_name": spec.long_name,
+                "route_type": "3",  # bus
+            }
+        )
     _write_csv(
         out_dir / "routes.txt",
         ["route_id", "agency_id", "route_short_name", "route_long_name", "route_type"],
@@ -879,13 +919,15 @@ def _write_stops(
             if stop_id in seen:
                 continue
             seen[stop_id] = (lat, lon)
-            rows.append({
-                "stop_id": stop_id,
-                "stop_code": stop_id,
-                "stop_name": _stop_name_from_id(stop_id, region_key),
-                "stop_lat": f"{lat:.6f}",
-                "stop_lon": f"{lon:.6f}",
-            })
+            rows.append(
+                {
+                    "stop_id": stop_id,
+                    "stop_code": stop_id,
+                    "stop_name": _stop_name_from_id(stop_id, region_key),
+                    "stop_lat": f"{lat:.6f}",
+                    "stop_lon": f"{lon:.6f}",
+                }
+            )
     rows.sort(key=lambda r: r["stop_id"])
     _write_csv(
         out_dir / "stops.txt",
@@ -911,18 +953,19 @@ def _write_shapes(
         for seq, (lat, lon) in enumerate(densified, start=1):
             if prev is not None:
                 cum_m += _haversine_m(prev[0], prev[1], lat, lon)
-            rows.append({
-                "shape_id": shape_id,
-                "shape_pt_lat": f"{lat:.6f}",
-                "shape_pt_lon": f"{lon:.6f}",
-                "shape_pt_sequence": str(seq),
-                "shape_dist_traveled": f"{cum_m * FEET_PER_METER:.2f}",
-            })
+            rows.append(
+                {
+                    "shape_id": shape_id,
+                    "shape_pt_lat": f"{lat:.6f}",
+                    "shape_pt_lon": f"{lon:.6f}",
+                    "shape_pt_sequence": str(seq),
+                    "shape_dist_traveled": f"{cum_m * FEET_PER_METER:.2f}",
+                }
+            )
             prev = (lat, lon)
     _write_csv(
         out_dir / "shapes.txt",
-        ["shape_id", "shape_pt_lat", "shape_pt_lon", "shape_pt_sequence",
-         "shape_dist_traveled"],
+        ["shape_id", "shape_pt_lat", "shape_pt_lon", "shape_pt_sequence", "shape_dist_traveled"],
         rows,
     )
 
@@ -943,8 +986,15 @@ def _write_trips_and_stop_times(trips: Sequence[TripPlan], out_dir: Path) -> Non
     ]
     _write_csv(
         out_dir / "trips.txt",
-        ["route_id", "service_id", "trip_id", "trip_headsign",
-         "direction_id", "block_id", "shape_id"],
+        [
+            "route_id",
+            "service_id",
+            "trip_id",
+            "trip_headsign",
+            "direction_id",
+            "block_id",
+            "shape_id",
+        ],
         trip_rows,
     )
 
@@ -952,19 +1002,28 @@ def _write_trips_and_stop_times(trips: Sequence[TripPlan], out_dir: Path) -> Non
     for t in trips:
         for seq, (stop_id, arr_s, dist_ft) in enumerate(t.stop_visits, start=1):
             hhmmss = _seconds_to_hhmmss(arr_s)
-            st_rows.append({
-                "trip_id": t.trip_id,
-                "arrival_time": hhmmss,
-                "departure_time": hhmmss,
-                "stop_id": stop_id,
-                "stop_sequence": str(seq),
-                "shape_dist_traveled": f"{dist_ft:.2f}",
-                "timepoint": "1" if seq == 1 or seq == len(t.stop_visits) else "0",
-            })
+            st_rows.append(
+                {
+                    "trip_id": t.trip_id,
+                    "arrival_time": hhmmss,
+                    "departure_time": hhmmss,
+                    "stop_id": stop_id,
+                    "stop_sequence": str(seq),
+                    "shape_dist_traveled": f"{dist_ft:.2f}",
+                    "timepoint": "1" if seq == 1 or seq == len(t.stop_visits) else "0",
+                }
+            )
     _write_csv(
         out_dir / "stop_times.txt",
-        ["trip_id", "arrival_time", "departure_time", "stop_id", "stop_sequence",
-         "shape_dist_traveled", "timepoint"],
+        [
+            "trip_id",
+            "arrival_time",
+            "departure_time",
+            "stop_id",
+            "stop_sequence",
+            "shape_dist_traveled",
+            "timepoint",
+        ],
         st_rows,
     )
 
@@ -1044,8 +1103,7 @@ def _build_region_feed(region: Region, out_dir: Path) -> None:
     _write_shapes(shape_vertices_by_id, region_dir)
     _write_trips_and_stop_times(all_trips, region_dir)
 
-    logging.info("  wrote %d trips across %d routes to %s",
-                 len(all_trips), len(specs), region_dir)
+    logging.info("  wrote %d trips across %d routes to %s", len(all_trips), len(specs), region_dir)
 
 
 def _build_loop_stops_with_shared_east_leg(
@@ -1099,8 +1157,9 @@ def _build_loop_stops_with_shared_east_leg(
             bearing = _initial_bearing_deg(v_start[0], v_start[1], v_end[0], v_end[1])
             leg_stops: List[Tuple[str, float, float, float]] = []
             for i in range(n_intervals + 1):
-                lat, lon = _destination_point(v_start[0], v_start[1], bearing,
-                                              min(i * actual_spacing_m, seg_len))
+                lat, lon = _destination_point(
+                    v_start[0], v_start[1], bearing, min(i * actual_spacing_m, seg_len)
+                )
                 sid = f"{region_key.upper()}_R{spec.short_name}_L{leg_idx}_{i:03d}"
                 leg_stops.append((sid, lat, lon, 0.0))
             legs_out.append(leg_stops)
@@ -1118,7 +1177,7 @@ def _build_loop_stops_with_shared_east_leg(
     cum_m = 0.0
     finished: List[Tuple[str, float, float, float]] = []
     prev: Optional[Tuple[float, float]] = None
-    for (sid, lat, lon, _) in out:
+    for sid, lat, lon, _ in out:
         if prev is not None:
             cum_m += _haversine_m(prev[0], prev[1], lat, lon)
         finished.append((sid, lat, lon, cum_m * FEET_PER_METER))
