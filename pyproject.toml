@@ -107,10 +107,10 @@ python-version = "3.12"
 extra-paths = ["scripts/ridership_tools", "scripts/operations_tools"]
 
 [tool.ty.rules]
-unsupported-operator = "warn"
+unsupported-operator = "error"
 invalid-return-type = "warn"
 unresolved-import = "error"
-invalid-assignment = "warn"
+invalid-assignment = "error"
 invalid-argument-type = "warn"
 not-subscriptable = "warn"
 not-iterable = "warn"

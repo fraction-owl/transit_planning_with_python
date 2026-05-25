@@ -1824,7 +1824,7 @@ def run_segment_comparison(ctx: GTFSContext) -> pd.DataFrame:
             if sequences_are_reversed(base_seq, other_seq):
                 effective_other_seq: Sequence[str] = list(reversed(other_seq))
                 raw_other_shape = ctx.route_shapes_proj.get(other_key)
-                effective_shapes_proj: Mapping[RouteKey, LineString] = {
+                effective_shapes_proj: Mapping[RouteKey, LineString | None] = {
                     **ctx.route_shapes_proj,
                     other_key: (
                         LineString(list(raw_other_shape.coords)[::-1])

@@ -446,7 +446,7 @@ def _timeseries_input(**overrides: object) -> pd.DataFrame:
         "TOTAL_TRIPS": [200.0, 400.0],
         "MTH_REV_MILES": [400.0, 800.0],
     }
-    base.update(overrides)  # type: ignore[arg-type]
+    base.update(overrides)  # type: ignore[arg-type]  # ty: ignore[no-matching-overload]
     return pd.DataFrame(base)
 
 

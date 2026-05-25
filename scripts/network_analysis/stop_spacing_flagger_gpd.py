@@ -427,7 +427,7 @@ def _export_segments_by_route_dir(seg_gdf: gpd.GeoDataFrame, out_dir: Path) -> N
     for (rid, drn), grp in seg_gdf.groupby(["route_id", "direction_id"]):
         suffix = f"dir{drn}"
         fname = f"{rid}_{suffix}.shp"
-        grp_gdf: gpd.GeoDataFrame = grp  # type: ignore[assignment]
+        grp_gdf: gpd.GeoDataFrame = grp  # type: ignore[assignment]  # ty: ignore[invalid-assignment]
         grp_gdf.to_file(out_dir / fname)
         logging.info("Wrote %s", fname)
 
