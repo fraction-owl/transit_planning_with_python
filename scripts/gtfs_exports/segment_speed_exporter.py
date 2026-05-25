@@ -282,8 +282,8 @@ def segment_metrics(grp: pd.DataFrame) -> Tuple[SegSpeeds, float, int]:
         zip(times, times[1:]),
         zip(dists, dists[1:]),
     ):
-        run = None if None in (t0, t1) else t1 - t0
-        dist = None if None in (d0, d1) else d1 - d0
+        run = None if t0 is None or t1 is None else t1 - t0
+        dist = None if d0 is None or d1 is None else d1 - d0
 
         run_min.append(run if run is not None else MISSING_VAL)
         seg_mi.append(round(dist, 3) if dist is not None else MISSING_VAL)

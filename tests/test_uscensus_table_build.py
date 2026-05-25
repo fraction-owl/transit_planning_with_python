@@ -345,7 +345,7 @@ def test_derive_income_computes_low_income_sum_and_percentage() -> None:
         "45k_50k",
         "50k_60k",
     ]
-    data = {b: [10] for b in bands}
+    data: dict[str, list[int | str]] = {b: [10] for b in bands}
     data["total_hh"] = [100]
     data[GEO_ID_COL] = [_TRACT_GEO_ID]
     df = pd.DataFrame(data)
