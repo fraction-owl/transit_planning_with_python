@@ -16,6 +16,13 @@ from scripts.census_tools import cacensus_da_join_gpd as mod
 
 FIXTURE_DIR = Path("tests/fixtures")
 FIXTURE_BUNDLE_ZIP = "98-401-X2021006_eng_CSV.zip"
+FIXTURE_DA_ZIP = "lda_000b21a_e_sample.zip"
+
+# Known counts from lda_000b21a_e_sample.zip
+_FIXTURE_DA_TOTAL = 35
+_FIXTURE_DA_ON_COUNT = 15   # CDUID 3506 (Ottawa)
+_FIXTURE_DA_2481_COUNT = 15  # CDUID 2481 (Gatineau)
+_FIXTURE_DA_2482_COUNT = 5   # CDUID 2482 (Les Collines-de-l'Outaouais)
 
 # Representative DAUID from the Ontario fixture file.
 _ON_DAUID = "35060207"
@@ -664,7 +671,7 @@ def test_load_da_shapefile_has_dauid_and_cduid(da_shp_dir: Path) -> None:
 def test_load_da_shapefile_dauid_is_string(da_shp_dir: Path) -> None:
     path = mod.discover_da_shapefile(da_shp_dir)
     gdf = mod.load_da_shapefile(path)
-    assert gdf["DAUID"].dtype == object
+    assert pd.api.types.is_string_dtype(gdf["DAUID"])
 
 
 def test_load_da_shapefile_cduid_is_four_chars(da_shp_dir: Path) -> None:
@@ -984,7 +991,7 @@ def test_integration_cduid_filter_from_fixture() -> None:
     not (FIXTURE_DIR / FIXTURE_BUNDLE_ZIP).exists(),
     reason=f"Fixture {FIXTURE_BUNDLE_ZIP} not present",
 )
-def test_integration_full_pipeline_with_mock_shapefile(tmp_path: Path) -> None:
+def test_integration_full_pipeline_with_mock_shapefile(tmp_path: Path) -> None:  # noqa: D103
     """End-to-end test: fixture CSVs → pivot → join onto mock DA geometry → write GeoPackage."""
     sources = mod.discover_census_profile_csvs(FIXTURE_DIR)
     fixture_sources = [s for s in sources if FIXTURE_BUNDLE_ZIP in str(s.container)]
@@ -1009,3 +1016,115 @@ def test_integration_full_pipeline_with_mock_shapefile(tmp_path: Path) -> None:
     assert out.exists()
     roundtripped = gpd.read_file(out)
     assert len(roundtripped) == len(joined)
+
+
+# =============================================================================
+# Integration tests using the real fixture DA shapefile (lda_000b21a_e_sample.zip)
+# =============================================================================
+
+_da_shp_present = (FIXTURE_DIR / FIXTURE_DA_ZIP).exists()
+_da_shp_skipif = pytest.mark.skipif(
+    not _da_shp_present,
+    reason=f"Fixture {FIXTURE_DA_ZIP} not present",
+)
+
+
+@_da_shp_skipif
+def test_fixture_da_zip_is_discovered() -> None:
+    path = mod.discover_da_shapefile(FIXTURE_DIR)
+    assert path.startswith("zip://")
+    assert FIXTURE_DA_ZIP in path
+
+
+@_da_shp_skipif
+def test_fixture_da_zip_loads_correct_row_count() -> None:
+    path = mod.discover_da_shapefile(FIXTURE_DIR)
+    gdf = mod.load_da_shapefile(path)
+    assert len(gdf) == _FIXTURE_DA_TOTAL
+
+
+@_da_shp_skipif
+def test_fixture_da_zip_dauid_is_string() -> None:
+    path = mod.discover_da_shapefile(FIXTURE_DIR)
+    gdf = mod.load_da_shapefile(path)
+    assert pd.api.types.is_string_dtype(gdf["DAUID"])
+
+
+@_da_shp_skipif
+def test_fixture_da_zip_cduid_derived_and_four_chars() -> None:
+    path = mod.discover_da_shapefile(FIXTURE_DIR)
+    gdf = mod.load_da_shapefile(path)
+    assert "CDUID" in gdf.columns
+    assert (gdf["CDUID"].str.len() == 4).all()
+
+
+@_da_shp_skipif
+def test_fixture_da_zip_known_dauids_present() -> None:
+    path = mod.discover_da_shapefile(FIXTURE_DIR)
+    gdf = mod.load_da_shapefile(path)
+    assert _ON_DAUID in gdf["DAUID"].values
+    assert _QC_DAUID in gdf["DAUID"].values
+
+
+@_da_shp_skipif
+def test_fixture_da_zip_filter_by_ontario_cduid() -> None:
+    path = mod.discover_da_shapefile(FIXTURE_DIR)
+    gdf = mod.load_da_shapefile(path)
+    filtered = mod.filter_da_by_cduid(gdf, [_ON_CDUID])
+    assert len(filtered) == _FIXTURE_DA_ON_COUNT
+    assert (filtered["CDUID"] == _ON_CDUID).all()
+
+
+@_da_shp_skipif
+def test_fixture_da_zip_filter_by_qc_cduid_2481() -> None:
+    path = mod.discover_da_shapefile(FIXTURE_DIR)
+    gdf = mod.load_da_shapefile(path)
+    filtered = mod.filter_da_by_cduid(gdf, [_QC_CDUID])
+    assert len(filtered) == _FIXTURE_DA_2481_COUNT
+    assert (filtered["CDUID"] == _QC_CDUID).all()
+
+
+@_da_shp_skipif
+def test_fixture_da_zip_filter_multi_cduid() -> None:
+    path = mod.discover_da_shapefile(FIXTURE_DIR)
+    gdf = mod.load_da_shapefile(path)
+    filtered = mod.filter_da_by_cduid(gdf, [_ON_CDUID, _QC_CDUID])
+    assert len(filtered) == _FIXTURE_DA_ON_COUNT + _FIXTURE_DA_2481_COUNT
+    assert set(filtered["CDUID"].unique()) == {_ON_CDUID, _QC_CDUID}
+
+
+@pytest.mark.skipif(
+    not _da_shp_present or not (FIXTURE_DIR / FIXTURE_BUNDLE_ZIP).exists(),
+    reason=f"Fixtures {FIXTURE_DA_ZIP} and/or {FIXTURE_BUNDLE_ZIP} not present",
+)
+def test_integration_census_and_shapefile_fixtures(tmp_path: Path) -> None:
+    """Full pipeline: fixture census CSVs → pivot → join onto fixture DA shapefile → write."""
+    sources = mod.discover_census_profile_csvs(FIXTURE_DIR)
+    fixture_sources = [s for s in sources if FIXTURE_BUNDLE_ZIP in str(s.container)]
+    attrs_df = mod.build_da_table(fixture_sources)
+
+    assert len(attrs_df) == _FIXTURE_DA_TOTAL
+    assert mod.DAUID_COL in attrs_df.columns
+
+    da_path = mod.discover_da_shapefile(FIXTURE_DIR)
+    da_gdf = mod.load_da_shapefile(da_path)
+    assert len(da_gdf) == _FIXTURE_DA_TOTAL
+
+    joined = mod.join_das_to_attributes(da_gdf, attrs_df)
+
+    assert isinstance(joined, gpd.GeoDataFrame)
+    assert len(joined) == _FIXTURE_DA_TOTAL
+    assert "total_pop" in joined.columns
+    assert "perc_transit" in joined.columns
+    assert "perc_vm" in joined.columns
+
+    # Spot-check the known Ontario DA (35060207).
+    row = joined[joined["DAUID"] == _ON_DAUID]
+    assert len(row) == 1
+    assert row["total_pop"].iloc[0] == pytest.approx(503.0)
+
+    out = tmp_path / "da_joined_fixture.gpkg"
+    mod.write_geo(joined, str(out))
+    assert out.exists()
+    roundtripped = gpd.read_file(out)
+    assert len(roundtripped) == _FIXTURE_DA_TOTAL
