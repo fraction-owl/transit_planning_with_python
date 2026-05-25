@@ -1,6 +1,7 @@
 transit_planning_with_python/
 ├── .github/
 │   └── workflows/
+│       ├── .pre-commit-config.yaml
 │       ├── format-lint-autofix-weekly.yml
 │       ├── format-lint-typecheck.yml
 │       ├── helper-audit.yml
@@ -14,6 +15,7 @@ transit_planning_with_python/
 │   ├── check_style.py
 │   ├── export_repo_file_tree.py
 │   ├── export_requirements.py
+│   ├── generate_mock_gtfs.py
 │   ├── lint_commit.py
 │   └── lint_pr.py
 ├── scripts/
@@ -29,11 +31,13 @@ transit_planning_with_python/
 │   │   ├── gtfs_stop_proximity_qc.py
 │   │   ├── gtfs_usps_suffix_validator.py
 │   │   ├── stop_v_conflict_checker_arcpy.py
+│   │   ├── stop_v_conflict_checker_gpd.py
 │   │   ├── stop_vs_roadname_checker_arcpy.py
 │   │   └── stop_vs_roadname_checker_gpd.py
 │   ├── facilities_tools/
 │   │   ├── bay_usage_analyzer.py
-│   │   └── flag_stop_upgrades.py
+│   │   ├── flag_stop_upgrades.py
+│   │   └── stop_improvement_coverage_summary.py
 │   ├── field_tools/
 │   │   ├── gtfs_route_summary.py
 │   │   ├── printable_block_schedules.py
@@ -89,18 +93,39 @@ transit_planning_with_python/
 │   │   │   ├── stops.txt
 │   │   │   └── trips.txt
 │   │   ├── 98-401-X2021006_eng_CSV.zip
+│   │   ├── ACSDT5Y2024.B01001_2026-05-23T135534.zip
+│   │   ├── ACSDT5Y2024.B08201_2026-05-23T135430.zip
+│   │   ├── ACSDT5Y2024.B19001_2026-05-23T135307.zip
+│   │   ├── ACSDT5Y2024.C16001_2026-05-23T135348.zip
 │   │   ├── CLEVER_Runtime_and_OTP_by_Month_sample.csv
+│   │   ├── DECENNIALDHC2020.H1_2026-05-23T134937.zip
+│   │   ├── DECENNIALDHC2020.P9_2026-05-23T135214.zip
+│   │   ├── DECENNIALPL2020.P1_2026-05-23T133835.zip
+│   │   ├── dc_wac_S000_JT00_2023.csv.gz
+│   │   ├── lda_000b21a_e_sample.zip
+│   │   ├── md_wac_S000_JT00_2023.csv.gz
+│   │   ├── mock_dc_gtfs.zip
+│   │   ├── mock_ottawa_gtfs.zip
 │   │   ├── ntd_monthly_multi_month.csv
 │   │   ├── ridership_by_route_and_stop.csv
+│   │   ├── sample_block_geoids.csv
 │   │   ├── statistics_by_route_and_trip.csv
+│   │   ├── stop_usage_by_stop_id_sample.csv
 │   │   ├── stop_visits.csv
-│   │   └── trips_performed.csv
+│   │   ├── tl_2025_11_tabblock20_sample.zip
+│   │   ├── tl_2025_24_tabblock20_sample.zip
+│   │   ├── tl_2025_51_tabblock20_sample.zip
+│   │   ├── trips_performed.csv
+│   │   └── va_wac_S000_JT00_2023.csv.gz
 │   ├── test_cacensus_da_join_gpd.py
 │   ├── test_data_request_by_stop_processor.py
+│   ├── test_flag_stop_upgrades.py
 │   ├── test_gtfs_route_summary.py
+│   ├── test_gtfs_to_shapefile_gpd.py
 │   ├── test_load_factor_monitor.py
 │   ├── test_load_gtfs_data.py
-│   ├── test_ntd_route_trends.py
+│   ├── test_ntd_monthly_summary.py
+│   ├── test_ntd_monthly_trends_export.py
 │   ├── test_otp_monthly_by_timepoint_order.py
 │   ├── test_otp_monthly_trends_export.py
 │   ├── test_trip_event_runtime_diagnostics.py
@@ -108,7 +133,9 @@ transit_planning_with_python/
 │   ├── test_uscensus_tiger_join_gpd.py
 │   └── test_validate_gtfs_files_exist.py
 ├── utils/
-│   └── gtfs_helpers.py
+│   ├── gtfs_helpers.py
+│   └── run_log.py
+├── .gitignore
 ├── CONTRIBUTING.md
 ├── LICENSE
 ├── README.md
