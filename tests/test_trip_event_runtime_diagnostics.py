@@ -34,7 +34,9 @@ def test_load_trip_files_tides_support() -> None:
     assert len(df) == 282, f"Expected 282 rows, got {len(df)}"
 
     # Check Canceled is gone
-    assert "TP20250101_202_0_03" not in df["TripID"].to_numpy(), "Canceled trip should be filtered out"
+    assert "TP20250101_202_0_03" not in df["TripID"].to_numpy(), (
+        "Canceled trip should be filtered out"
+    )
 
     # 4. Assert Time Extraction
     # TP20250102_101_0_00: schedule_trip_start 2025-01-02T05:58:00 -> 05:58
