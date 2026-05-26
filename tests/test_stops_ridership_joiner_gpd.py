@@ -383,11 +383,7 @@ def test_extract_config_block_returns_inner_content(tmp_path: Path) -> None:
 def test_extract_config_block_excludes_markers_and_surrounding_text(tmp_path: Path) -> None:
     src = tmp_path / "script.py"
     src.write_text(
-        "# preamble\n"
-        "# === BEGIN CONFIG ===\n"
-        "KEY = 1\n"
-        "# === END CONFIG ===\n"
-        "# epilogue\n",
+        "# preamble\n# === BEGIN CONFIG ===\nKEY = 1\n# === END CONFIG ===\n# epilogue\n",
         encoding="utf-8",
     )
     block = target.extract_config_block(src)
@@ -424,11 +420,7 @@ def test_write_run_log_file_contains_config_values(tmp_path: Path) -> None:
 
 
 def test_write_run_log_returns_false_on_write_error(tmp_path: Path) -> None:
-    fake_source = (
-        "# === BEGIN CONFIG ===\n"
-        "KEY = 1\n"
-        "# === END CONFIG ===\n"
-    )
+    fake_source = "# === BEGIN CONFIG ===\nKEY = 1\n# === END CONFIG ===\n"
     with (
         patch.object(Path, "read_text", return_value=fake_source),
         patch("pathlib.Path.write_text", side_effect=OSError("disk full")),
