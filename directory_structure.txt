@@ -117,10 +117,14 @@ transit_planning_with_python/
 │   │   ├── tl_2025_51_tabblock20_sample.zip
 │   │   ├── trips_performed.csv
 │   │   └── va_wac_S000_JT00_2023.csv.gz
+│   ├── test_audit_turn_clearance.py
+│   ├── test_block_status_timeline_exporter.py
+│   ├── test_bus_block_exporter.py
 │   ├── test_cacensus_da_join_gpd.py
 │   ├── test_data_request_by_stop_processor.py
 │   ├── test_flag_stop_upgrades.py
 │   ├── test_gtfs_route_summary.py
+│   ├── test_gtfs_stop_compare.py
 │   ├── test_gtfs_to_shapefile_gpd.py
 │   ├── test_load_factor_monitor.py
 │   ├── test_load_gtfs_data.py
@@ -128,6 +132,14 @@ transit_planning_with_python/
 │   ├── test_ntd_monthly_trends_export.py
 │   ├── test_otp_monthly_by_timepoint_order.py
 │   ├── test_otp_monthly_trends_export.py
+│   ├── test_route_direction_classifier.py
+│   ├── test_segment_speed_exporter.py
+│   ├── test_stop_impacts_target_routes.py
+│   ├── test_stop_pattern_exporter.py
+│   ├── test_stop_removal_impact_gpd.py
+│   ├── test_stop_spacing_flagger_gpd.py
+│   ├── test_time_band_exporter.py
+│   ├── test_timepoint_schedule_exporter.py
 │   ├── test_trip_event_runtime_diagnostics.py
 │   ├── test_uscensus_table_build.py
 │   ├── test_uscensus_tiger_join_gpd.py
