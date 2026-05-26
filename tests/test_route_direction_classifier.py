@@ -21,25 +21,25 @@ _FAR = 500_000.0
 
 
 def test_classify_direction_northbound() -> None:
-    line_4326 = LineString([(0.0, 0.0), (0.0, 1.0)])       # lon, lat → going north
+    line_4326 = LineString([(0.0, 0.0), (0.0, 1.0)])  # lon, lat → going north
     line_proj = LineString([(0.0, 0.0), (0.0, _FAR)])
     assert classify_direction(line_4326, line_proj) == "NB"
 
 
 def test_classify_direction_southbound() -> None:
-    line_4326 = LineString([(0.0, 1.0), (0.0, 0.0)])       # going south
+    line_4326 = LineString([(0.0, 1.0), (0.0, 0.0)])  # going south
     line_proj = LineString([(0.0, _FAR), (0.0, 0.0)])
     assert classify_direction(line_4326, line_proj) == "SB"
 
 
 def test_classify_direction_eastbound() -> None:
-    line_4326 = LineString([(0.0, 0.5), (1.0, 0.5)])       # going east
+    line_4326 = LineString([(0.0, 0.5), (1.0, 0.5)])  # going east
     line_proj = LineString([(0.0, 0.0), (_FAR, 0.0)])
     assert classify_direction(line_4326, line_proj) == "EB"
 
 
 def test_classify_direction_westbound() -> None:
-    line_4326 = LineString([(1.0, 0.5), (0.0, 0.5)])       # going west
+    line_4326 = LineString([(1.0, 0.5), (0.0, 0.5)])  # going west
     line_proj = LineString([(_FAR, 0.0), (0.0, 0.0)])
     assert classify_direction(line_4326, line_proj) == "WB"
 

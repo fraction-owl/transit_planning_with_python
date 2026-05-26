@@ -20,40 +20,76 @@ from scripts.network_analysis.stop_impacts_target_routes import (
 
 def test_dow_code_weekday_only() -> None:
     row = pd.Series(
-        {"monday": "1", "tuesday": "1", "wednesday": "1", "thursday": "1",
-         "friday": "1", "saturday": "0", "sunday": "0"}
+        {
+            "monday": "1",
+            "tuesday": "1",
+            "wednesday": "1",
+            "thursday": "1",
+            "friday": "1",
+            "saturday": "0",
+            "sunday": "0",
+        }
     )
     assert _dow_code_from_calendar_row(row) == "M/T/W/R/F"
 
 
 def test_dow_code_saturday_only() -> None:
     row = pd.Series(
-        {"monday": "0", "tuesday": "0", "wednesday": "0", "thursday": "0",
-         "friday": "0", "saturday": "1", "sunday": "0"}
+        {
+            "monday": "0",
+            "tuesday": "0",
+            "wednesday": "0",
+            "thursday": "0",
+            "friday": "0",
+            "saturday": "1",
+            "sunday": "0",
+        }
     )
     assert _dow_code_from_calendar_row(row) == "S"
 
 
 def test_dow_code_sunday_only() -> None:
     row = pd.Series(
-        {"monday": "0", "tuesday": "0", "wednesday": "0", "thursday": "0",
-         "friday": "0", "saturday": "0", "sunday": "1"}
+        {
+            "monday": "0",
+            "tuesday": "0",
+            "wednesday": "0",
+            "thursday": "0",
+            "friday": "0",
+            "saturday": "0",
+            "sunday": "1",
+        }
     )
     assert _dow_code_from_calendar_row(row) == "U"
 
 
 def test_dow_code_no_active_days_returns_empty() -> None:
     row = pd.Series(
-        {"monday": "0", "tuesday": "0", "wednesday": "0", "thursday": "0",
-         "friday": "0", "saturday": "0", "sunday": "0"}
+        {
+            "monday": "0",
+            "tuesday": "0",
+            "wednesday": "0",
+            "thursday": "0",
+            "friday": "0",
+            "saturday": "0",
+            "sunday": "0",
+        }
     )
     assert _dow_code_from_calendar_row(row) == ""
 
 
 def test_dow_code_missing_column_treated_as_zero() -> None:
     # Row with no 'saturday' key: defaults to "0"
-    row = pd.Series({"monday": "1", "tuesday": "0", "wednesday": "0",
-                     "thursday": "0", "friday": "0", "sunday": "0"})
+    row = pd.Series(
+        {
+            "monday": "1",
+            "tuesday": "0",
+            "wednesday": "0",
+            "thursday": "0",
+            "friday": "0",
+            "sunday": "0",
+        }
+    )
     code = _dow_code_from_calendar_row(row)
     assert "M" in code
     assert "S" not in code
@@ -155,9 +191,7 @@ def test_identify_target_route_ids_missing_token_returns_empty(routes_df: pd.Dat
 @pytest.fixture()
 def gtfs_tables() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Minimal GTFS tables: stop S1 served by R1+R2, stop S2 by R1 only."""
-    stop_times = pd.DataFrame(
-        {"trip_id": ["T1", "T1", "T2"], "stop_id": ["S1", "S2", "S1"]}
-    )
+    stop_times = pd.DataFrame({"trip_id": ["T1", "T1", "T2"], "stop_id": ["S1", "S2", "S1"]})
     trips = pd.DataFrame(
         {"trip_id": ["T1", "T2"], "route_id": ["R1", "R2"], "service_id": ["WD", "WD"]}
     )

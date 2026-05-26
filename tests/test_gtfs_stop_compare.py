@@ -102,16 +102,16 @@ def test_haversine_meters_same_point_is_zero() -> None:
 
 def test_haversine_meters_one_degree_latitude() -> None:
     # 1 degree of latitude ≈ 111,195 m at the equator
-    dist = haversine_meters(
-        np.array([0.0]), np.array([0.0]), np.array([1.0]), np.array([0.0])
-    )
+    dist = haversine_meters(np.array([0.0]), np.array([0.0]), np.array([1.0]), np.array([0.0]))
     assert dist[0] == pytest.approx(111_195.0, rel=0.01)
 
 
 def test_haversine_meters_returns_array() -> None:
     dist = haversine_meters(
-        np.array([0.0, 1.0]), np.array([0.0, 0.0]),
-        np.array([1.0, 2.0]), np.array([0.0, 0.0]),
+        np.array([0.0, 1.0]),
+        np.array([0.0, 0.0]),
+        np.array([1.0, 2.0]),
+        np.array([0.0, 0.0]),
     )
     assert len(dist) == 2
     assert all(d > 0 for d in dist)

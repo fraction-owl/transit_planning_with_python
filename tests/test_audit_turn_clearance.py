@@ -162,9 +162,7 @@ def routes_and_trips() -> tuple[pd.DataFrame, pd.DataFrame]:
             "route_short_name": ["101", "202", "9999A"],
         }
     )
-    trips = pd.DataFrame(
-        {"trip_id": ["T1", "T2", "T3"], "route_id": ["R1", "R2", "R3"]}
-    )
+    trips = pd.DataFrame({"trip_id": ["T1", "T2", "T3"], "route_id": ["R1", "R2", "R3"]})
     return routes, trips
 
 
