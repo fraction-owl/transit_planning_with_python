@@ -16,7 +16,6 @@ from scripts.network_analysis.stop_removal_impact_gpd import (
     resolve_deleted_stop_ids,
 )
 
-
 # ---------------------------------------------------------------------------
 # quantize_node
 # ---------------------------------------------------------------------------

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import numpy as np
 import pandas as pd
 import pytest
 
@@ -13,7 +12,6 @@ from scripts.network_analysis.stop_impacts_target_routes import (
     classify_impacts,
     identify_target_route_ids,
 )
-
 
 # ---------------------------------------------------------------------------
 # _dow_code_from_calendar_row

@@ -13,7 +13,6 @@ from scripts.network_analysis.stop_spacing_flagger_gpd import (
     _validate_columns,
 )
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -186,8 +185,8 @@ def test_filter_routes_exclude_removes_route(
 ) -> None:
     routes, trips = routes_and_trips
     r, t = _filter_routes(routes, trips, include_ids=[], exclude_ids=["R3"])
-    assert "R3" not in r["route_id"].values
-    assert "T3" not in t["trip_id"].values
+    assert "R3" not in r["route_id"].to_numpy()
+    assert "T3" not in t["trip_id"].to_numpy()
 
 
 def test_filter_routes_include_restricts_to_listed(

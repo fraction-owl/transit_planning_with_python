@@ -12,7 +12,6 @@ from scripts.network_analysis.route_direction_classifier import (
     flag_suspicious_data,
 )
 
-
 # ---------------------------------------------------------------------------
 # classify_direction
 # ---------------------------------------------------------------------------

@@ -15,7 +15,6 @@ from scripts.network_analysis.gtfs_stop_compare import (
     validate_stop_ids_unique,
 )
 
-
 # ---------------------------------------------------------------------------
 # normalize_text
 # ---------------------------------------------------------------------------
@@ -172,13 +171,17 @@ def test_build_modified_description_relocated_with_distance() -> None:
 
 
 def test_build_modified_description_attr_change_only() -> None:
-    desc = build_modified_description(relocated=False, changed_fields=["stop_name"], distance_ft=None)
+    desc = build_modified_description(
+        relocated=False, changed_fields=["stop_name"], distance_ft=None
+    )
     assert "stop_name" in desc
     assert "Relocated" not in desc
 
 
 def test_build_modified_description_both_changes() -> None:
-    desc = build_modified_description(relocated=True, changed_fields=["stop_name"], distance_ft=50.0)
+    desc = build_modified_description(
+        relocated=True, changed_fields=["stop_name"], distance_ft=50.0
+    )
     assert "Relocated" in desc
     assert "stop_name" in desc
 
@@ -194,7 +197,9 @@ def test_build_modified_description_no_changes_returns_empty() -> None:
 
 
 def _make_stop_df(**kwargs: list) -> pd.DataFrame:
-    return pd.DataFrame({"stop_id": kwargs["ids"], "stop_lat": kwargs["lats"], "stop_lon": kwargs["lons"]})
+    return pd.DataFrame(
+        {"stop_id": kwargs["ids"], "stop_lat": kwargs["lats"], "stop_lon": kwargs["lons"]}
+    )
 
 
 def test_compare_stops_identifies_deleted_stops() -> None:
@@ -234,8 +239,12 @@ def test_compare_stops_unchanged_stop_not_in_modified() -> None:
 
 
 def test_compare_stops_summary_counts_are_consistent() -> None:
-    before = _make_stop_df(ids=["S1", "S2", "S3"], lats=[38.7, 38.8, 38.9], lons=[-77.0, -77.1, -77.2])
-    after = _make_stop_df(ids=["S1", "S3", "S4"], lats=[38.7, 38.9, 39.0], lons=[-77.0, -77.2, -77.3])
+    before = _make_stop_df(
+        ids=["S1", "S2", "S3"], lats=[38.7, 38.8, 38.9], lons=[-77.0, -77.1, -77.2]
+    )
+    after = _make_stop_df(
+        ids=["S1", "S3", "S4"], lats=[38.7, 38.9, 39.0], lons=[-77.0, -77.2, -77.3]
+    )
     _, deleted, new, _, summary, _ = compare_stops(before, after, relocate_threshold_ft=25.0)
     assert summary.deleted_count == len(deleted)
     assert summary.new_count == len(new)
