@@ -27,39 +27,24 @@ def test_load_trip_files_tides_support() -> None:
     assert "trip_start_time" in df.columns, "trip_start_time column should be derived"
 
     # 3. Assert filtering
-    # In fixture:
-    # Row 1: In service, Scheduled -> Keep
-    # Row 2: In service, Scheduled -> Keep
-    # Row 3: Deadhead -> Drop
-    # Row 4: In service, Scheduled -> Keep
-    # Row 5: In service, Scheduled -> Keep
-    # Row 6: In service, Duplicated -> Keep
-    # Row 7: In service, Added -> Keep
-    # Row 8: Pullout -> Drop
-    # Row 9: Pullin -> Drop
-    # Row 10: In service, Canceled -> Drop
+    # Fixture has 288 rows: 282 Scheduled + 6 Canceled (all trip_type = "In service").
+    # Canceled trips are dropped; no Deadhead/Pullout/Pullin rows in this fixture.
+    # Expected kept: 282 rows.
 
-    # Total rows in fixture: 10.
-    # Expected kept: 6 rows.
-    # Dropped: 3 (Deadhead), 8 (Pullout), 9 (Pullin), 10 (Canceled).
-
-    assert len(df) == 6, f"Expected 6 rows, got {len(df)}"
+    assert len(df) == 282, f"Expected 282 rows, got {len(df)}"
 
     # Check Canceled is gone
-    # Row 10 trip_id_performed is TP20250320_010
-    assert "TP20250320_010" not in df["TripID"].to_numpy(), "Canceled trip should be filtered out"
-
-    # Check Deadhead is gone
-    # Row 3 TP20250318_003
-    assert "TP20250318_003" not in df["TripID"].to_numpy(), "Deadhead trip should be filtered out"
+    assert "TP20250101_202_0_03" not in df["TripID"].to_numpy(), (
+        "Canceled trip should be filtered out"
+    )
 
     # 4. Assert Time Extraction
-    # Row 1: 2025-03-18T06:00:00 -> 06:00
-    row1 = df[df["TripID"] == "TP20250318_001"].iloc[0]
-    assert row1["trip_start_time"] == "06:00", f"Expected 06:00, got {row1['trip_start_time']}"
+    # TP20250102_101_0_00: schedule_trip_start 2025-01-02T05:58:00 -> 05:58
+    row1 = df[df["TripID"] == "TP20250102_101_0_00"].iloc[0]
+    assert row1["trip_start_time"] == "05:58", f"Expected 05:58, got {row1['trip_start_time']}"
 
     # 5. Assert Direction is string "0"/"1"
-    # Row 1 direction_id is 0
+    # TP20250102_101_0_00 direction_id is 0
     assert str(row1["Direction"]) == "0", f"Expected direction '0', got {row1['Direction']}"
 
     # 6. Assert Is Tides flag
