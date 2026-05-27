@@ -30,6 +30,9 @@ fiona==1.10.1                # Shapefile I/O engine (used for schema-controlled 
 shapely==2.1.1               # Geometry operations
 pyproj==3.7.1                # Coordinate reference systems and transformations
 
+# HTTP / Web Feeds
+requests==2.32.3             # Fetch GBFS and other web-hosted feeds
+
 # String Matching and Text Utilities
 rapidfuzz==3.13.0            # Fast fuzzy string matching
 

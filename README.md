@@ -32,6 +32,7 @@ Manual data collection that supplements or backstops modern AVL and APC systems 
 
 ### Plus
 - **GTFS Exports** (`gtfs_exports/`) — GTFS-to-shapefile, segment speeds, time-band summaries, stop patterns, and timepoint schedule exports
+- **GBFS Tools** (`gbfs_tools/`) — export GBFS static stations to shapefile and GeoJSON
 - **Facility Tools** (`facilities_tools/`) — bay usage analysis and stop upgrade flagging
 - **Shared utilities** (`utils/gtfs_helpers.py`) and contributor tooling (`dev_tools/`)
 
