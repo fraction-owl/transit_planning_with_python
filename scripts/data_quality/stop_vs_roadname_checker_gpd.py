@@ -367,30 +367,71 @@ def process_typos(
     modifiers: Set[str],
     road_names_clean: Set[str],
     threshold: int,
+    join_gdf: Optional[gpd.GeoDataFrame] = None,
 ) -> pd.DataFrame:
     """Process each stop and perform fuzzy matching to identify potential typos.
+
+    When ``join_gdf`` is supplied, fuzzy comparison is restricted to the roads
+    that intersect each stop's buffer (per-stop local set). When it is
+    ``None``, the comparison falls back to the global ``road_names_clean`` set
+    -- the prior behavior.
 
     Args:
         stops_gdf (gpd.GeoDataFrame): The GeoDataFrame of stops.
         roadways_gdf (gpd.GeoDataFrame): The GeoDataFrame of roadways.
         modifiers (set): A set of known street name modifiers.
-        road_names_clean (set): A set of normalized roadway names.
+        road_names_clean (set): Global set of normalized roadway names; used
+            as the comparison set only when ``join_gdf`` is None.
         threshold (int): The similarity score threshold for fuzzy matching.
+        join_gdf (gpd.GeoDataFrame | None): Output of
+            :func:`spatial_join_stops_roadways`. When provided, each stop is
+            compared only against roads inside its own buffer.
 
     Returns:
-        pd.DataFrame: A deduplicated DataFrame of potential typos, sorted by similarity score.
+        pd.DataFrame: A deduplicated DataFrame of potential typos, sorted by
+        similarity score. Empty DataFrame if no candidates are found.
     """
-    potential_typos = []
+    # Build per-stop nearby-road sets from the spatial join, if provided.
+    nearby_clean_by_stop: Dict[str, Set[str]] = {}
+    if join_gdf is not None:
+        local = join_gdf.dropna(subset=["FULLNAME_clean"])
+        nearby_clean_by_stop = (
+            local.groupby("stop_id")["FULLNAME_clean"].apply(lambda s: set(s.unique())).to_dict()
+        )
+
+    potential_typos: List[Dict[str, Any]] = []
     for _, stop in stops_gdf.iterrows():
         s_id = stop["stop_id"]
         s_name = stop["stop_name"]
         s_streets = extract_street_names(s_name, modifiers)
+
+        if join_gdf is not None:
+            local_road_names = nearby_clean_by_stop.get(s_id, set())
+            if not local_road_names:
+                # No roads within this stop's buffer -- nothing to compare against.
+                continue
+            local_roads_gdf = roadways_gdf[roadways_gdf["FULLNAME_clean"].isin(local_road_names)]
+        else:
+            local_road_names = road_names_clean
+            local_roads_gdf = roadways_gdf
+
         typos = compare_stop_to_roads(
-            s_id, s_name, s_streets, road_names_clean, roadways_gdf, threshold
+            s_id, s_name, s_streets, local_road_names, local_roads_gdf, threshold
         )
         potential_typos.extend(typos)
 
     logging.info("Total potential typos found before deduplication: %d", len(potential_typos))
+    if not potential_typos:
+        return pd.DataFrame(
+            columns=[
+                "stop_id",
+                "stop_name",
+                "street_in_stop_name",
+                "similar_road_name_clean",
+                "similar_road_name_original",
+                "similarity_score",
+            ]
+        )
     typos_df = pd.DataFrame(potential_typos)
     typos_df_sorted = typos_df.sort_values(by="similarity_score", ascending=False).drop_duplicates()
     return typos_df_sorted
@@ -568,6 +609,7 @@ def main() -> None:
         modifiers,
         road_names_clean,
         SIMILARITY_THRESHOLD,
+        join_gdf=join_gdf,
     )
 
     # 11. Save or report results
