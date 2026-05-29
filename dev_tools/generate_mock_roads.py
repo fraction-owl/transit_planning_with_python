@@ -536,8 +536,12 @@ def _build_segments(
     for i in range(len(keys)):
         for j in range(i + 1, len(keys)):
             for pt in _extract_points(lines[keys[i]].intersection(lines[keys[j]])):
-                inter_pts[keys[i]].add((round(pt.x, COORD_DECIMALS_FT), round(pt.y, COORD_DECIMALS_FT)))
-                inter_pts[keys[j]].add((round(pt.x, COORD_DECIMALS_FT), round(pt.y, COORD_DECIMALS_FT)))
+                inter_pts[keys[i]].add(
+                    (round(pt.x, COORD_DECIMALS_FT), round(pt.y, COORD_DECIMALS_FT))
+                )
+                inter_pts[keys[j]].add(
+                    (round(pt.x, COORD_DECIMALS_FT), round(pt.y, COORD_DECIMALS_FT))
+                )
 
     segments: List[_Segment] = []
     for key, line in lines.items():
@@ -607,7 +611,9 @@ def validate_network(segments: Sequence[_Segment], width_ft: float, height_ft: f
     for road_key, parts in by_road.items():
         merged = linemerge(parts)
         if merged.geom_type != "LineString":
-            issues.append(f"road {road_key} is not a single connected polyline ({merged.geom_type})")
+            issues.append(
+                f"road {road_key} is not a single connected polyline ({merged.geom_type})"
+            )
 
     if issues:
         raise ValueError("Network validation failed:\n  - " + "\n  - ".join(issues))
@@ -800,7 +806,9 @@ def _planar_poly_to_wgs(poly: object, planar_to_wgs: Callable[[float, float], Pl
     from shapely.geometry import MultiPolygon, Polygon
     from shapely.ops import transform
 
-    def _tx(x, y, z=None):
+    def _tx(
+        x: float, y: float, z: float | None = None  # noqa: ANN202
+    ) -> tuple[float, float]:
         lon, lat = planar_to_wgs(x, y)
         return (lon, lat)
 
@@ -821,7 +829,7 @@ class RegionGeocoder:
     and outputs are WGS84 ``(lat, lon)``.
     """
 
-    def __init__(self, geom: RegionGeom) -> None:
+    def __init__(self, geom: RegionGeom) -> None:  # noqa: D107
         self._geom = geom
 
     def nearest_road(self, lat: float, lon: float, candidates: Sequence[str]) -> str:
@@ -1120,7 +1128,7 @@ def main() -> None:
 # name is `__main__`, so we additionally publish it under the expected name. When
 # the file IS on disk and imported normally, this assignment is a harmless no-op
 # (it just points the entry at itself).
-import sys as _sys  # noqa: E402
+import sys as _sys  # noqa: E402,I001
 _sys.modules["generate_mock_roads"] = _sys.modules[__name__]
 del _sys
 
