@@ -290,6 +290,7 @@ def corridor_polyline_wgs(region_key: str, route_short: str) -> List[Tuple[float
             out.extend(leg)
     return out
 
+
 # Shared per-key classification (topology is shared across regions, so road tier
 # is too). Arterials A1/A2 are primary, the diagonals A3/A4 secondary, cross
 # streets local. Values mirror the source schema's CFCC / ROAD_CLASS / speed.
@@ -480,8 +481,9 @@ def _extract_points(geom: object) -> List[Point]:
             pts.extend(_extract_points(part))
         return pts
     if isinstance(geom, LineString):
-        logging.warning("Collinear road overlap detected (%s); roads should meet only at points.",
-                        geom.wkt[:60])
+        logging.warning(
+            "Collinear road overlap detected (%s); roads should meet only at points.", geom.wkt[:60]
+        )
         return []
     return []
 
@@ -807,7 +809,9 @@ def _planar_poly_to_wgs(poly: object, planar_to_wgs: Callable[[float, float], Pl
     from shapely.ops import transform
 
     def _tx(
-        x: float, y: float, z: float | None = None  # noqa: ANN202
+        x: float,
+        y: float,
+        z: float | None = None,  # noqa: ANN202
     ) -> tuple[float, float]:
         lon, lat = planar_to_wgs(x, y)
         return (lon, lat)
@@ -984,9 +988,7 @@ def decorate_stops(
     inset = _bbox_with_inset(REGION_BBOXES[region_key], BBOX_INSET_FRACTION)
     centroid_lon = 0.5 * (inset[0] + inset[2])
     utm_epsg = _utm_epsg_for_lon(centroid_lon)
-    asphalt_utm = (
-        build_asphalt_polygons(region_key).to_crs(epsg=utm_epsg).geometry.union_all()
-    )
+    asphalt_utm = build_asphalt_polygons(region_key).to_crs(epsg=utm_epsg).geometry.union_all()
     to_utm = Transformer.from_crs("EPSG:4326", f"EPSG:{utm_epsg}", always_xy=True)
 
     def in_asphalt_proj(lat: float, lon: float) -> bool:
@@ -1129,6 +1131,7 @@ def main() -> None:
 # the file IS on disk and imported normally, this assignment is a harmless no-op
 # (it just points the entry at itself).
 import sys as _sys  # noqa: E402,I001
+
 _sys.modules["generate_mock_roads"] = _sys.modules[__name__]
 del _sys
 
