@@ -122,7 +122,7 @@ TIDES_COLS: list[str] = [
 
 # Required input columns for this converter (excluding optional operator/stops).
 REQ_COLS: list[str] = [
-    COLUMN_MAP[k]
+    v
     for k in (
         "vehicle",
         "route",
@@ -135,6 +135,7 @@ REQ_COLS: list[str] = [
         "actual_start",
         "actual_end",
     )
+    if (v := COLUMN_MAP[k]) is not None
 ]
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
@@ -288,9 +289,11 @@ def convert_to_tides(df: pd.DataFrame) -> pd.DataFrame:
         raise ValueError(f"Missing required input columns: {missing}")
 
     # Optional trip type filter (keep only Revenue, etc.)
+    trip_type_col = COLUMN_MAP["trip_type"]
+    assert trip_type_col is not None
     df, dropped_counts = summarize_trip_type_drops(
         df,
-        COLUMN_MAP["trip_type"],
+        trip_type_col,
         keep_trip_type=KEEP_TRIP_TYPE,
     )
     if dropped_counts:

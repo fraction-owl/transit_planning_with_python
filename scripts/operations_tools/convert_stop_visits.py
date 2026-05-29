@@ -116,11 +116,15 @@ TIDES_COLS: list[str] = [
 ]
 
 # Required input columns to produce a useful stop_visits file.
-REQ_COLS: list[str] = [COLUMN_MAP[k] for k in ("date", "trip", "timepoint_order", "timepoint_id")]
+REQ_COLS: list[str] = [
+    v
+    for k in ("date", "trip", "timepoint_order", "timepoint_id")
+    if (v := COLUMN_MAP[k]) is not None
+]
 
 # Optional input columns (used when present).
 OPT_COLS: list[str] = [
-    COLUMN_MAP[k]
+    v
     for k in (
         "route",
         "direction",
@@ -131,6 +135,7 @@ OPT_COLS: list[str] = [
         "departure_time",
         "scheduled_passing",
     )
+    if (v := COLUMN_MAP[k]) is not None
 ]
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
