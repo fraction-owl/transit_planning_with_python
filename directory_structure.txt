@@ -16,6 +16,8 @@ transit_planning_with_python/
 │   ├── export_repo_file_tree.py
 │   ├── export_requirements.py
 │   ├── generate_mock_gtfs.py
+│   ├── generate_mock_roads.py
+│   ├── generate_mock_tides.py
 │   ├── lint_commit.py
 │   └── lint_pr.py
 ├── scripts/
@@ -106,9 +108,11 @@ transit_planning_with_python/
 │   │   ├── dc_wac_S000_JT00_2023.csv.gz
 │   │   ├── lda_000b21a_e_sample.zip
 │   │   ├── md_wac_S000_JT00_2023.csv.gz
-│   │   ├── mock_dc_gtfs.zip
-│   │   ├── mock_ottawa_gtfs.zip
+│   │   ├── mock_gtfs_dc.zip
+│   │   ├── mock_gtfs_ottawa.zip
 │   │   ├── ntd_monthly_multi_month.csv
+│   │   ├── output_road_shps_dc.zip
+│   │   ├── output_road_shps_ottawa.zip
 │   │   ├── ridership_by_route_and_stop.csv
 │   │   ├── sample_block_geoids.csv
 │   │   ├── statistics_by_route_and_trip.csv
@@ -127,6 +131,7 @@ transit_planning_with_python/
 │   ├── test_flag_stop_upgrades.py
 │   ├── test_gtfs_route_summary.py
 │   ├── test_gtfs_stop_compare.py
+│   ├── test_gtfs_stop_proximity_qc.py
 │   ├── test_gtfs_to_shapefile_gpd.py
 │   ├── test_load_factor_monitor.py
 │   ├── test_load_gtfs_data.py
@@ -134,12 +139,16 @@ transit_planning_with_python/
 │   ├── test_ntd_monthly_trends_export.py
 │   ├── test_otp_monthly_by_timepoint_order.py
 │   ├── test_otp_monthly_trends_export.py
+│   ├── test_printable_block_schedules.py
 │   ├── test_route_direction_classifier.py
 │   ├── test_segment_speed_exporter.py
 │   ├── test_stop_impacts_target_routes.py
 │   ├── test_stop_pattern_exporter.py
 │   ├── test_stop_removal_impact_gpd.py
 │   ├── test_stop_spacing_flagger_gpd.py
+│   ├── test_stop_v_conflict_checker_gpd.py
+│   ├── test_stop_vs_roadname_checker_gpd.py
+│   ├── test_stops_ridership_joiner_gpd.py
 │   ├── test_time_band_exporter.py
 │   ├── test_timepoint_schedule_exporter.py
 │   ├── test_trip_event_runtime_diagnostics.py
