@@ -28,12 +28,12 @@ def _extract_zip(zip_path: Path, dest: Path) -> Path:
 
 @pytest.fixture()
 def dc_gtfs_dir(tmp_path: Path) -> Path:
-    return _extract_zip(FIXTURES / "mock_dc_gtfs.zip", tmp_path)
+    return _extract_zip(FIXTURES / "mock_gtfs_dc.zip", tmp_path)
 
 
 @pytest.fixture()
 def ottawa_gtfs_dir(tmp_path: Path) -> Path:
-    return _extract_zip(FIXTURES / "mock_ottawa_gtfs.zip", tmp_path)
+    return _extract_zip(FIXTURES / "mock_gtfs_ottawa.zip", tmp_path)
 
 
 # ---------------------------------------------------------------------------
@@ -44,13 +44,13 @@ def ottawa_gtfs_dir(tmp_path: Path) -> Path:
 def test_read_stops_dc_row_count(dc_gtfs_dir: Path) -> None:
     """DC fixture loads the expected number of stops."""
     gdf = read_stops(dc_gtfs_dir)
-    assert len(gdf) == 358
+    assert len(gdf) == 395
 
 
 def test_read_stops_ottawa_row_count(ottawa_gtfs_dir: Path) -> None:
     """Ottawa fixture loads the expected number of stops."""
     gdf = read_stops(ottawa_gtfs_dir)
-    assert len(gdf) == 1380
+    assert len(gdf) == 619
 
 
 def test_read_stops_returns_geodataframe(dc_gtfs_dir: Path) -> None:

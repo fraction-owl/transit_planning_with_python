@@ -356,92 +356,9 @@ def _interpolate_along_polyline(
     )
 
 
-def _bbox_with_inset(
-    bbox: Tuple[float, float, float, float], inset_fraction: float
-) -> Tuple[float, float, float, float]:
-    """Inset a bbox by a fractional margin on every side."""
-    min_lon, min_lat, max_lon, max_lat = bbox
-    dlon = max_lon - min_lon
-    dlat = max_lat - min_lat
-    return (
-        min_lon + dlon * inset_fraction,
-        min_lat + dlat * inset_fraction,
-        max_lon - dlon * inset_fraction,
-        max_lat - dlat * inset_fraction,
-    )
-
-
-def _bbox_from_fixture(fixture_path: Optional[Path]) -> Optional[Tuple[float, float, float, float]]:
-    """Return ``(min_lon, min_lat, max_lon, max_lat)`` from a fixture, or None.
-
-    Geopandas is imported lazily so a missing dependency does not break the
-    script when no fixture path is configured.
-    """
-    if fixture_path is None:
-        return None
-    if not Path(fixture_path).exists():
-        logging.warning(
-            "Fixture path does not exist; falling back to default bbox: %s", fixture_path
-        )
-        return None
-    try:
-        import geopandas as gpd  # noqa: PLC0415 — lazy import is intentional
-    except ImportError:
-        logging.warning(
-            "geopandas not installed; falling back to default bbox for %s", fixture_path
-        )
-        return None
-    gdf = gpd.read_file(fixture_path)
-    if gdf.empty:
-        logging.warning("Fixture is empty; falling back to default bbox: %s", fixture_path)
-        return None
-    if gdf.crs is not None and gdf.crs.to_epsg() != 4326:
-        gdf = gdf.to_crs(epsg=4326)
-    min_lon, min_lat, max_lon, max_lat = gdf.total_bounds
-    return float(min_lon), float(min_lat), float(max_lon), float(max_lat)
-
-
 # ==================================================================================================
 # SHAPE / STOP BUILDERS
 # ==================================================================================================
-
-
-def _build_shape_vertices(
-    shape_kind: str, bbox: Tuple[float, float, float, float]
-) -> List[Tuple[float, float]]:
-    """Return a list of (lat, lon) vertices for a shape archetype within a bbox."""
-    min_lon, min_lat, max_lon, max_lat = bbox
-    mid_lon = (min_lon + max_lon) / 2.0
-    mid_lat = (min_lat + max_lat) / 2.0
-
-    if shape_kind == "ns":
-        return [(min_lat, mid_lon), (max_lat, mid_lon)]
-    if shape_kind == "ew":
-        return [(mid_lat, min_lon), (mid_lat, max_lon)]
-    if shape_kind == "nwse":
-        return [(max_lat, min_lon), (min_lat, max_lon)]
-    if shape_kind == "nesw":
-        return [(max_lat, max_lon), (min_lat, min_lon)]
-    if shape_kind == "loop":
-        # The loop's east leg is intentionally aligned with the N-S corridor
-        # (at mid_lon) so the two routes share physical stops on that segment.
-        # The loop sits on the western half of the bbox, with its north and
-        # south extents at 25% / 75% of the bbox latitude span.
-        east_lon = mid_lon
-        west_lon = mid_lon - 0.25 * (max_lon - min_lon)
-        south_lat = min_lat + 0.25 * (max_lat - min_lat)
-        north_lat = min_lat + 0.75 * (max_lat - min_lat)
-        # SW → NW → NE → SE → SW. The NE→SE leg (vertices 2→3) is the
-        # shared east leg; direction-of-travel along the loop is set in
-        # _build_trip_stop_visits.
-        return [
-            (south_lat, west_lon),
-            (north_lat, west_lon),
-            (north_lat, east_lon),
-            (south_lat, east_lon),
-            (south_lat, west_lon),
-        ]
-    raise ValueError(f"Unknown shape_kind: {shape_kind!r}")
 
 
 def _densify_shape(
@@ -910,20 +827,32 @@ def _write_stops(
     stops_by_route: Dict[str, List[Tuple[str, float, float, float]]],
     region_key: str,
     out_dir: Path,
+    stop_meta: Dict[str, Tuple[float, float, str]],
 ) -> None:
-    """Write stops.txt, deduplicating shared stops across routes."""
-    seen: Dict[str, Tuple[float, float]] = {}
+    """Write stops.txt, deduplicating shared stops across routes.
+
+    Coordinates and names come from ``stop_meta`` (produced by the roads module's
+    ``decorate_stops``): the lat/lon is the stop nudged off the roadbed and the
+    name is derived from the adjacent road (plus nearest cross street), with typos
+    seeded on a documented subset.
+    """
+    seen: set = set()
     rows: List[Dict[str, str]] = []
     for stops in stops_by_route.values():
         for stop_id, lat, lon, _dist in stops:
             if stop_id in seen:
                 continue
-            seen[stop_id] = (lat, lon)
+            seen.add(stop_id)
+            meta = stop_meta.get(stop_id)
+            if meta is not None:
+                lat, lon, stop_name = meta
+            else:
+                stop_name = _stop_name_from_id(stop_id, region_key)
             rows.append(
                 {
                     "stop_id": stop_id,
                     "stop_code": stop_id,
-                    "stop_name": _stop_name_from_id(stop_id, region_key),
+                    "stop_name": stop_name,
                     "stop_lat": f"{lat:.6f}",
                     "stop_lon": f"{lon:.6f}",
                 }
@@ -1035,28 +964,28 @@ def _write_trips_and_stop_times(trips: Sequence[TripPlan], out_dir: Path) -> Non
 
 def _build_region_feed(region: Region, out_dir: Path) -> None:
     """Build and write a complete GTFS feed for one region."""
-    logging.info("Building feed for region: %s", region.key)
+    import json  # noqa: PLC0415
 
-    bbox = _bbox_from_fixture(region.fixture_path) or region.default_bbox
-    drawing_bbox = _bbox_with_inset(bbox, BBOX_INSET_FRACTION)
-    logging.info("  bbox: %s", tuple(f"{v:.5f}" for v in drawing_bbox))
+    import generate_mock_roads as roads  # noqa: PLC0415 — couples geometry to the road network
+
+    logging.info("Building feed for region: %s", region.key)
 
     region_dir = out_dir / region.key
     region_dir.mkdir(parents=True, exist_ok=True)
 
     specs = _route_specs()
 
-    # Build the shared N-S stop sequence first so the holiday loop can reuse it
-    # on its east leg (skipped-stop demo and route overlap).
+    # Build the shared N-S stop sequence first (the holiday loop reuses it on its
+    # east leg). The shape *is* the traced A1 centerline, so stops sit on the road.
     ns_spec = next(s for s in specs if s.shape_kind == "ns")
-    ns_vertices = _build_shape_vertices("ns", drawing_bbox)
+    ns_vertices = roads.corridor_polyline_wgs(region.key, ns_spec.short_name)
     ns_stops_raw = _place_stops_along_shape(ns_vertices, ns_spec.stop_spacing_ft)
     ns_stops = [
         (f"{region.key.upper()}_NS_{i:03d}", lat, lon, dist)
         for i, (lat, lon, dist) in enumerate(ns_stops_raw)
     ]
 
-    # Build per-route shape vertices and stops.
+    # Build per-route shape vertices (traced along centerlines) and stops.
     stops_by_route: Dict[str, List[Tuple[str, float, float, float]]] = {}
     shape_vertices_by_id: Dict[str, List[Tuple[float, float]]] = {}
     all_trips: List[TripPlan] = []
@@ -1064,24 +993,21 @@ def _build_region_feed(region: Region, out_dir: Path) -> None:
     for spec in specs:
         route_id = f"{region.key.upper()}_R{spec.short_name}"
         shape_id = f"{route_id}_shp"
+        vertices = roads.corridor_polyline_wgs(region.key, spec.short_name)
 
         if spec.shape_kind == "ns":
             stops = ns_stops
-            vertices = ns_vertices
         elif spec.shape_kind == "loop":
-            vertices = _build_shape_vertices("loop", drawing_bbox)
             stops = _build_loop_stops_with_shared_east_leg(
-                vertices=vertices,
+                legs=roads.corridor_legs_wgs(region.key, spec.short_name),
                 spec=spec,
                 shared_ns_stops=ns_stops,
                 region_key=region.key,
-                ns_vertices=ns_vertices,
             )
         else:
-            vertices = _build_shape_vertices(spec.shape_kind, drawing_bbox)
             stops_raw = _place_stops_along_shape(vertices, spec.stop_spacing_ft)
             stops = [
-                (f"{region.key.upper()}_R{spec.short_name}_{i:03d}", lat, lon, dist)
+                (f"{route_id}_{i:03d}", lat, lon, dist)
                 for i, (lat, lon, dist) in enumerate(stops_raw)
             ]
 
@@ -1094,55 +1020,71 @@ def _build_region_feed(region: Region, out_dir: Path) -> None:
 
     _assign_blocks(all_trips)
 
+    # Decorate stops against the road network: road-derived names, a lateral nudge
+    # off the roadbed, and deterministic typo/conflict positives. The manifest
+    # documents the expected positives for the downstream data-quality checkers.
+    stop_meta, manifest = roads.decorate_stops(
+        region.key, stops_by_route, roads.route_corridor_keys_for_region(region.key)
+    )
+
     # Write all GTFS tables.
     _write_agency(region, region_dir)
     _write_calendar(region_dir)
     _write_feed_info(region, region_dir)
     _write_routes(region, specs, region_dir)
-    _write_stops(stops_by_route, region.key, region_dir)
+    _write_stops(stops_by_route, region.key, region_dir, stop_meta)
     _write_shapes(shape_vertices_by_id, region_dir)
     _write_trips_and_stop_times(all_trips, region_dir)
 
-    logging.info("  wrote %d trips across %d routes to %s", len(all_trips), len(specs), region_dir)
+    manifest["region"] = region.key
+    manifest["counts"] = {
+        "stops": len(stop_meta),
+        "typo_positives": len(manifest["typos"]),
+        "conflict_positives": len(manifest["conflicts"]),
+    }
+    (region_dir / "fixture_manifest.json").write_text(json.dumps(manifest, indent=2))
+
+    logging.info(
+        "  wrote %d trips across %d routes; %d stops (%d typo / %d conflict positives) to %s",
+        len(all_trips),
+        len(specs),
+        len(stop_meta),
+        len(manifest["typos"]),
+        len(manifest["conflicts"]),
+        region_dir,
+    )
 
 
 def _build_loop_stops_with_shared_east_leg(
-    vertices: Sequence[Tuple[float, float]],
+    legs: Sequence[Sequence[Tuple[float, float]]],
     spec: RouteSpec,
     shared_ns_stops: Sequence[Tuple[str, float, float, float]],
     region_key: str,
-    ns_vertices: Sequence[Tuple[float, float]],
 ) -> List[Tuple[str, float, float, float]]:
-    """Build the loop's stop sequence leg by leg.
+    """Build the loop's stop sequence leg by leg along traced centerline legs.
 
-    Layout (vertices from _build_shape_vertices('loop', ...)):
-        Leg 0: SW → NW   (west side, going north)
-        Leg 1: NW → NE   (north side, going east)
-        Leg 2: NE → SE   (east side, going south) — shared with N-S corridor
-        Leg 3: SE → SW   (south side, going west)
+    Args:
+        legs: Per-leg densified ``(lat, lon)`` polylines from the roads module,
+            in corridor order. By construction leg index 2 is the east leg, which
+            rides the N-S corridor (road A1) and is shared with route 10.
+        spec: The loop RouteSpec.
+        shared_ns_stops: The N-S route's stops ``(stop_id, lat, lon, dist_ft)``.
+        region_key: Region identifier.
 
-    On the shared east leg the loop adopts the N-S route's stop ids and
-    locations directly (so the two routes share physical stops). On the
-    other three legs the loop places its own stops at its nominal spacing.
-    The first stop of each new leg duplicates the previous leg's last
-    stop and is dropped to keep the sequence clean.
-
-    The caller passes spec.skip_stop_offset as the number of east-leg
-    stops to skip past before omitting one (skipped-stop demo). The
-    omission is applied later in _build_trip_stop_visits.
+    On the shared east leg the loop adopts the N-S route's stop ids and locations
+    directly (so the two routes share physical stops). On the other three legs it
+    places its own stops at its nominal spacing along the densified leg geometry,
+    so every loop stop sits on the centerline. The first stop of each subsequent
+    leg is dropped when it coincides with the previous leg's last stop.
     """
-    spacing_m = spec.stop_spacing_ft / FEET_PER_METER
     legs_out: List[List[Tuple[str, float, float, float]]] = []
 
-    for leg_idx in range(4):
-        v_start = vertices[leg_idx]
-        v_end = vertices[leg_idx + 1]
+    for leg_idx, leg_pts in enumerate(legs):
         if leg_idx == 2:
-            # Shared east leg — borrow N-S stops whose latitude falls inside
-            # the leg's lat span, ordered to match direction of travel
-            # (NE → SE means north-to-south, descending latitude).
-            lat_min = min(v_start[0], v_end[0])
-            lat_max = max(v_start[0], v_end[0])
+            # Shared east leg — borrow N-S stops whose latitude falls inside the
+            # leg's lat span, ordered north-to-south (direction of travel).
+            lats = [lat for (lat, _lon) in leg_pts]
+            lat_min, lat_max = min(lats), max(lats)
             east_stops = [
                 (sid, lat, lon)
                 for (sid, lat, lon, _d) in shared_ns_stops
@@ -1151,22 +1093,15 @@ def _build_loop_stops_with_shared_east_leg(
             east_stops.sort(key=lambda s: -s[1])
             legs_out.append([(sid, lat, lon, 0.0) for (sid, lat, lon) in east_stops])
         else:
-            seg_len = _haversine_m(v_start[0], v_start[1], v_end[0], v_end[1])
-            n_intervals = max(1, round(seg_len / spacing_m))
-            actual_spacing_m = seg_len / n_intervals
-            bearing = _initial_bearing_deg(v_start[0], v_start[1], v_end[0], v_end[1])
-            leg_stops: List[Tuple[str, float, float, float]] = []
-            for i in range(n_intervals + 1):
-                lat, lon = _destination_point(
-                    v_start[0], v_start[1], bearing, min(i * actual_spacing_m, seg_len)
-                )
-                sid = f"{region_key.upper()}_R{spec.short_name}_L{leg_idx}_{i:03d}"
-                leg_stops.append((sid, lat, lon, 0.0))
+            placed = _place_stops_along_shape(leg_pts, spec.stop_spacing_ft)
+            leg_stops = [
+                (f"{region_key.upper()}_R{spec.short_name}_L{leg_idx}_{i:03d}", lat, lon, 0.0)
+                for i, (lat, lon, _d) in enumerate(placed)
+            ]
             legs_out.append(leg_stops)
 
-    # Concatenate, dropping the first stop of each subsequent leg when it
-    # sits on top of the previous leg's last stop. Then compute cumulative
-    # shape_dist_traveled in feet.
+    # Concatenate, dropping the first stop of each subsequent leg when it sits on
+    # top of the previous leg's last stop. Then compute cumulative dist in feet.
     out: List[Tuple[str, float, float, float]] = []
     for leg in legs_out:
         if not leg:
@@ -1182,8 +1117,6 @@ def _build_loop_stops_with_shared_east_leg(
             cum_m += _haversine_m(prev[0], prev[1], lat, lon)
         finished.append((sid, lat, lon, cum_m * FEET_PER_METER))
         prev = (lat, lon)
-
-    _ = ns_vertices  # informational; not needed after the snap is structural
     return finished
 
 
