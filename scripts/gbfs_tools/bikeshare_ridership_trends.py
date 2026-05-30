@@ -82,8 +82,13 @@ TRIP_FILE_GLOB = "*-capitalbikeshare-tripdata.csv"
 # Columns whose blanks are meaningful (dockless trips) and whose values must
 # not be coerced to floats, so they are read as strings with NA filtering off.
 _STRING_COLUMNS = (
-    "ride_id", "rideable_type", "start_station_name", "start_station_id",
-    "end_station_name", "end_station_id", "member_casual",
+    "ride_id",
+    "rideable_type",
+    "start_station_name",
+    "start_station_id",
+    "end_station_name",
+    "end_station_id",
+    "member_casual",
 )
 
 logger = logging.getLogger(__name__)
@@ -140,7 +145,8 @@ def load_trips(input_path: Path) -> pd.DataFrame:
     if input_path.suffix.lower() == ".zip":
         with zipfile.ZipFile(input_path) as archive:
             members = sorted(
-                name for name in archive.namelist()
+                name
+                for name in archive.namelist()
                 if name.lower().endswith("-capitalbikeshare-tripdata.csv")
             )
             for member in members:
@@ -235,9 +241,7 @@ def build_station_monthly(trips: pd.DataFrame) -> pd.DataFrame:
     )
     station_ids = sorted(names.index)
 
-    grid = pd.MultiIndex.from_product(
-        [months, station_ids], names=["month", "station_id"]
-    )
+    grid = pd.MultiIndex.from_product([months, station_ids], names=["month", "station_id"])
     station = (
         departures.merge(arrivals, on=["month", "station_id"], how="outer")
         .set_index(["month", "station_id"])
@@ -296,9 +300,7 @@ def plot_station_trends(
         The chart paths written, busiest station first.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
-    totals = (
-        station_monthly.groupby("station_id")["total"].sum().sort_values(ascending=False)
-    )
+    totals = station_monthly.groupby("station_id")["total"].sum().sort_values(ascending=False)
     if max_plots and max_plots > 0:
         totals = totals.head(max_plots)
 
@@ -371,13 +373,9 @@ def generate_and_write(
     plots_dir = out_dir / "plots"
     system_plot = plots_dir / "system_ridership_trend.png"
     plot_system_trend(system_monthly, system_plot)
-    station_plots = plot_station_trends(
-        station_monthly, plots_dir / "stations", max_station_plots
-    )
+    station_plots = plot_station_trends(station_monthly, plots_dir / "stations", max_station_plots)
 
-    logger.info(
-        "Wrote 3 tables and %d charts to %s", 1 + len(station_plots), out_dir
-    )
+    logger.info("Wrote 3 tables and %d charts to %s", 1 + len(station_plots), out_dir)
     return {
         "trips": trips,
         "system": system_monthly,
@@ -401,16 +399,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse command-line arguments, defaulting to the CONFIG block values."""
     parser = argparse.ArgumentParser(
         description="Summarize Capital Bikeshare extracts into ridership-over-time "
-                    "tables and charts. Defaults come from the CONFIG block.",
+        "tables and charts. Defaults come from the CONFIG block.",
     )
-    parser.add_argument("--input", default=INPUT,
-                        help="Directory or .zip of monthly trip extracts.")
-    parser.add_argument("--output-dir", default=OUTPUT_DIR,
-                        help="Directory for the tables and charts.")
-    parser.add_argument("--max-station-plots", type=int, default=MAX_STATION_PLOTS,
-                        help="Cap on per-station charts (0 = all, busiest first).")
-    parser.add_argument("--log-level", default=logging.getLevelName(LOG_LEVEL),
-                        help="DEBUG / INFO / WARNING / ERROR.")
+    parser.add_argument(
+        "--input", default=INPUT, help="Directory or .zip of monthly trip extracts."
+    )
+    parser.add_argument(
+        "--output-dir", default=OUTPUT_DIR, help="Directory for the tables and charts."
+    )
+    parser.add_argument(
+        "--max-station-plots",
+        type=int,
+        default=MAX_STATION_PLOTS,
+        help="Cap on per-station charts (0 = all, busiest first).",
+    )
+    parser.add_argument(
+        "--log-level",
+        default=logging.getLevelName(LOG_LEVEL),
+        help="DEBUG / INFO / WARNING / ERROR.",
+    )
     return parser.parse_args(argv)
 
 

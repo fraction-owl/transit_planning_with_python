@@ -86,9 +86,7 @@ def test_system_monthly_totals_reconcile(trips: pd.DataFrame) -> None:
     system = mod.build_system_monthly(trips)
     assert system["total_trips"].sum() == len(trips)
     assert (system["member_trips"] + system["casual_trips"]).equals(system["total_trips"])
-    assert (system["electric_trips"] + system["classic_trips"]).equals(
-        system["total_trips"]
-    )
+    assert (system["electric_trips"] + system["classic_trips"]).equals(system["total_trips"])
 
 
 # ---------------------------------------------------------------------------
