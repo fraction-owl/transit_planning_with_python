@@ -1,4 +1,4 @@
-"""Generate small, deterministic Capital Bikeshare trip-data fixtures over time.
+r"""Generate small, deterministic Capital Bikeshare trip-data fixtures over time.
 
 Writes one CSV per month (named like the real vendor files,
 ``YYYYMM-capitalbikeshare-tripdata.csv``) so tests can exercise scripts that
@@ -56,10 +56,11 @@ import math
 import sys
 import zipfile
 from collections import defaultdict
+from collections.abc import Iterable, Iterator
 from datetime import datetime, timedelta
 from pathlib import Path
 from random import Random
-from typing import NamedTuple
+from typing import NamedTuple, TextIO
 
 # ===========================================================================
 # CONFIG  --  notebook users edit these; CLI flags override them
@@ -74,20 +75,29 @@ INPUT_EXTRACT = r""
 # Directory the per-month fixture CSVs are written to.
 OUTPUT_DIR = r"tests/fixtures/capitalbikeshare"
 
-START_MONTH = "2024-05"        # first month, YYYY-MM
-NUM_MONTHS = 24                # number of consecutive months
-TOTAL_ROWS = 3000              # total trips, apportioned across the months
-SEED = 0                       # RNG seed for reproducible output
-GUARANTEE_EDGE_CASES = True    # force rare edge cases to appear in the span
+START_MONTH = "2024-05"  # first month, YYYY-MM
+NUM_MONTHS = 24  # number of consecutive months
+TOTAL_ROWS = 3000  # total trips, apportioned across the months
+SEED = 0  # RNG seed for reproducible output
+GUARANTEE_EDGE_CASES = True  # force rare edge cases to appear in the span
 
 # ===========================================================================
 # Calibrated constants (from the 202604 full-month profile)
 # ===========================================================================
 
 COLUMNS: tuple[str, ...] = (
-    "ride_id", "rideable_type", "started_at", "ended_at",
-    "start_station_name", "start_station_id", "end_station_name",
-    "end_station_id", "start_lat", "start_lng", "end_lat", "end_lng",
+    "ride_id",
+    "rideable_type",
+    "started_at",
+    "ended_at",
+    "start_station_name",
+    "start_station_id",
+    "end_station_name",
+    "end_station_id",
+    "start_lat",
+    "start_lng",
+    "end_lat",
+    "end_lng",
     "member_casual",
 )
 
@@ -126,6 +136,7 @@ DEFAULT_STATIONS: tuple[tuple[str, str, float, float], ...] = (
 
 class Pool(NamedTuple):
     """Station pool plus the bounding box used for dockless (free-float) points."""
+
     stations: tuple[tuple[str, str, float, float], ...]
     lat_min: float
     lat_max: float
@@ -135,7 +146,7 @@ class Pool(NamedTuple):
 
 DEFAULT_POOL = Pool(DEFAULT_STATIONS, 38.760000, 39.125828, -77.420000, -76.825535)
 
-P_ELECTRIC = 0.6753           # flat over time, per request
+P_ELECTRIC = 0.6753  # flat over time, per request
 MEMBER_CASUAL: tuple[tuple[str, float], ...] = (
     ("member", 0.7051),
     ("casual", 0.2949),
@@ -145,17 +156,38 @@ MEMBER_CASUAL: tuple[tuple[str, float], ...] = (
 # (~14.7% start, ~15.5% end across all trips). Classic bikes never go dockless.
 P_DOCKLESS_START_GIVEN_E = 0.2175
 P_DOCKLESS_END_GIVEN_E = 0.2370
-P_ROUNDTRIP_GIVEN_DOCKED = 0.0363   # ~3.1% overall
-P_NULL_END_COORDS = 0.0007          # rare; guarantee step covers small fixtures
+P_ROUNDTRIP_GIVEN_DOCKED = 0.0363  # ~3.1% overall
+P_NULL_END_COORDS = 0.0007  # rare; guarantee step covers small fixtures
 
 # Coordinate-string precision (decimal places) per rideable_type, from the
 # profile's start_lat tallies. Lat & lng in one row share a precision.
 PRECISION_WEIGHTS: dict[str, dict[int, int]] = {
-    "electric_bike": {1: 19237, 2: 69551, 3: 1337, 4: 18219, 5: 21406, 6: 167775,
-                      7: 11903, 8: 3825, 9: 37950, 12: 1459, 13: 5586, 14: 33208,
-                      15: 16836},
-    "classic_bike": {3: 800, 4: 11393, 5: 18604, 6: 116112, 7: 9295, 12: 1477,
-                     13: 2803, 14: 23386, 15: 12403},
+    "electric_bike": {
+        1: 19237,
+        2: 69551,
+        3: 1337,
+        4: 18219,
+        5: 21406,
+        6: 167775,
+        7: 11903,
+        8: 3825,
+        9: 37950,
+        12: 1459,
+        13: 5586,
+        14: 33208,
+        15: 16836,
+    },
+    "classic_bike": {
+        3: 800,
+        4: 11393,
+        5: 18604,
+        6: 116112,
+        7: 9295,
+        12: 1477,
+        13: 2803,
+        14: 23386,
+        15: 12403,
+    },
 }
 
 # Lognormal duration model (seconds): median ~541s, heavy right tail.
@@ -165,9 +197,9 @@ DURATION_MIN_S = 1.0
 DURATION_MAX_S = 90000.0
 
 # Temporal shape for distributing trips across months.
-SEASONAL_AMPLITUDE = 0.50   # 1 +/- this; peak month ~3x the trough
-SEASONAL_PEAK_MONTH = 7     # July
-ANNUAL_GROWTH = 0.12        # ~12% year-over-year
+SEASONAL_AMPLITUDE = 0.50  # 1 +/- this; peak month ~3x the trough
+SEASONAL_PEAK_MONTH = 7  # July
+ANNUAL_GROWTH = 0.12  # ~12% year-over-year
 
 TIMESTAMP_FMT = "%Y-%m-%d %H:%M:%S.%f"
 
@@ -177,7 +209,7 @@ TIMESTAMP_FMT = "%Y-%m-%d %H:%M:%S.%f"
 # ---------------------------------------------------------------------------
 
 
-def _iter_extract_rows(path: Path):
+def _iter_extract_rows(path: Path) -> Iterator[dict[str, str]]:
     """Yield dict-rows from a .zip of CSVs or a single .csv (streaming)."""
     if path.suffix.lower() == ".zip":
         with zipfile.ZipFile(path) as zf:
@@ -201,7 +233,7 @@ def load_pool_from_extract(path: Path) -> Pool:
     for row in _iter_extract_rows(path):
         for side in ("start", "end"):
             sid = (row.get(f"{side}_station_id") or "").strip()
-            name = row.get(f"{side}_station_name") or ""   # keep trailing ws
+            name = row.get(f"{side}_station_name") or ""  # keep trailing ws
             lat_s = (row.get(f"{side}_lat") or "").strip()
             lng_s = (row.get(f"{side}_lng") or "").strip()
             if not lat_s or not lng_s:
@@ -240,6 +272,7 @@ def _resolve_pool(input_extract: str) -> Pool:
 
 
 def month_span(start_year: int, start_month: int, n: int) -> list[tuple[int, int]]:
+    """Return ``n`` consecutive ``(year, month)`` pairs starting at the given month."""
     span = []
     y, m = start_year, start_month
     for _ in range(n):
@@ -251,9 +284,7 @@ def month_span(start_year: int, start_month: int, n: int) -> list[tuple[int, int
 
 
 def _month_weight(index: int, month: int) -> float:
-    seasonal = 1.0 + SEASONAL_AMPLITUDE * math.cos(
-        2 * math.pi * (month - SEASONAL_PEAK_MONTH) / 12
-    )
+    seasonal = 1.0 + SEASONAL_AMPLITUDE * math.cos(2 * math.pi * (month - SEASONAL_PEAK_MONTH) / 12)
     trend = (1.0 + ANNUAL_GROWTH) ** (index / 12)
     return seasonal * trend
 
@@ -276,7 +307,7 @@ def allocate_counts(total: int, span: list[tuple[int, int]]) -> list[int]:
 # ---------------------------------------------------------------------------
 
 
-def _weighted(rng: Random, pairs) -> object:
+def _weighted(rng: Random, pairs: Iterable[tuple[object, float]]) -> object:
     values, weights = zip(*pairs)
     return rng.choices(values, weights=weights, k=1)[0]
 
@@ -308,9 +339,12 @@ def _dockless_point(rng: Random, pool: Pool) -> tuple[float, float]:
     return rng.uniform(pool.lat_min, pool.lat_max), rng.uniform(pool.lng_min, pool.lng_max)
 
 
-def _pick_station(rng: Random, pool: Pool, exclude_id: str = ""):
-    """Choose a station, optionally excluding one id (avoids accidental round
-    trips from the small fixture pool, which a full 800+ station source lacks)."""
+def _pick_station(rng: Random, pool: Pool, exclude_id: str = "") -> tuple[str, str, float, float]:
+    """Choose a station, optionally excluding one id.
+
+    Excluding ``exclude_id`` avoids accidental round trips from the small fixture
+    pool, which a full 800+ station source would not produce.
+    """
     if not exclude_id:
         return rng.choice(pool.stations)
     return rng.choice([st for st in pool.stations if st[0] != exclude_id])
@@ -326,8 +360,9 @@ def _fmt_coords(rng: Random, lat: float, lng: float, rideable_type: str) -> tupl
 # ---------------------------------------------------------------------------
 
 
-def _build_row(rng: Random, year: int, month: int, seen_ids: set[str],
-               pool: Pool) -> dict[str, str]:
+def _build_row(
+    rng: Random, year: int, month: int, seen_ids: set[str], pool: Pool
+) -> dict[str, str]:
     ride_id = _make_ride_id(rng)
     while ride_id in seen_ids:
         ride_id = _make_ride_id(rng)
@@ -402,20 +437,22 @@ def guarantee_edge_cases(rng: Random, rows: list[dict[str, str]], pool: Pool) ->
     rng.shuffle(e_idx)
     a, b, c, d, e, f = e_idx[:6]
 
-    rows[a]["start_station_name"] = rows[a]["start_station_id"] = ""   # dockless start
+    rows[a]["start_station_name"] = rows[a]["start_station_id"] = ""  # dockless start
     rows[a]["start_lat"], rows[a]["start_lng"] = _fmt_coords(
         rng, *_dockless_point(rng, pool), "electric_bike"
     )
-    rows[b]["end_station_name"] = rows[b]["end_station_id"] = ""        # dockless end
-    rows[c]["end_lat"] = rows[c]["end_lng"] = ""                        # null end coords
-    _force_duration(rows[d], 21600 + rng.uniform(0, 3600))             # ~6h ride
-    _force_duration(rows[e], rng.uniform(3, 29))                        # sub-30s ride
-    st = rng.choice(pool.stations)                                     # name, blank id
+    rows[b]["end_station_name"] = rows[b]["end_station_id"] = ""  # dockless end
+    rows[c]["end_lat"] = rows[c]["end_lng"] = ""  # null end coords
+    _force_duration(rows[d], 21600 + rng.uniform(0, 3600))  # ~6h ride
+    _force_duration(rows[e], rng.uniform(3, 29))  # sub-30s ride
+    st = rng.choice(pool.stations)  # name, blank id
     rows[f]["end_station_name"], rows[f]["end_station_id"] = st[1], ""
 
 
-def generate_dataset(rng: Random, total_rows: int, span: list[tuple[int, int]],
-                     guarantee: bool, pool: Pool) -> list[dict[str, str]]:
+def generate_dataset(
+    rng: Random, total_rows: int, span: list[tuple[int, int]], guarantee: bool, pool: Pool
+) -> list[dict[str, str]]:
+    """Build every trip row across the span, optionally forcing edge cases in."""
     counts = allocate_counts(total_rows, span)
     seen_ids: set[str] = set()
     rows: list[dict[str, str]] = []
@@ -466,7 +503,8 @@ def validate_rows(rows: list[dict[str, str]], span: list[tuple[int, int]]) -> No
 # ---------------------------------------------------------------------------
 
 
-def write_csv(rows: list[dict[str, str]], handle) -> None:
+def write_csv(rows: list[dict[str, str]], handle: TextIO) -> None:
+    """Write ``rows`` to ``handle`` as CSV in canonical column order with CRLF."""
     writer = csv.DictWriter(handle, fieldnames=list(COLUMNS), lineterminator="\r\n")
     writer.writeheader()
     writer.writerows(rows)
@@ -481,6 +519,7 @@ def group_by_start_month(rows: list[dict[str, str]]) -> dict[str, list[dict[str,
 
 
 def write_monthly_files(rows: list[dict[str, str]], out_dir: Path) -> list[Path]:
+    """Write one vendor-named CSV per start month into ``out_dir``; return the paths."""
     out_dir.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
     for yyyymm, mrows in sorted(group_by_start_month(rows).items()):
@@ -492,14 +531,12 @@ def write_monthly_files(rows: list[dict[str, str]], out_dir: Path) -> list[Path]
     return written
 
 
-def _print_summary(rows: list[dict[str, str]], written: list[Path],
-                   out_dir: Path) -> None:
+def _print_summary(rows: list[dict[str, str]], written: list[Path], out_dir: Path) -> None:
     counts: dict[str, int] = defaultdict(int)
     for row in rows:
         counts[row["started_at"][:7].replace("-", "")] += 1
     peak = max(counts.values()) if counts else 1
-    print(f"Wrote {len(rows)} trips across {len(written)} files -> {out_dir}",
-          file=sys.stderr)
+    print(f"Wrote {len(rows)} trips across {len(written)} files -> {out_dir}", file=sys.stderr)
     for yyyymm in sorted(counts):
         bar = "#" * round(counts[yyyymm] / peak * 30)
         print(f"  {yyyymm[:4]}-{yyyymm[4:]}  {counts[yyyymm]:>4}  {bar}", file=sys.stderr)
@@ -510,9 +547,17 @@ def _print_summary(rows: list[dict[str, str]], written: list[Path],
 # ---------------------------------------------------------------------------
 
 
-def generate_and_write(*, input_extract: str, output_dir: str, start_month: str,
-                       num_months: int, total_rows: int, seed: int,
-                       guarantee: bool, to_stdout: bool = False) -> list[Path]:
+def generate_and_write(
+    *,
+    input_extract: str,
+    output_dir: str,
+    start_month: str,
+    num_months: int,
+    total_rows: int,
+    seed: int,
+    guarantee: bool,
+    to_stdout: bool = False,
+) -> list[Path]:
     """Core run used by both the notebook config path and the CLI."""
     if num_months < 1:
         raise ValueError("num_months must be >= 1")
@@ -551,40 +596,51 @@ def run() -> list[Path]:
 
 
 def parse_month(value: str) -> tuple[int, int]:
+    """Parse a ``YYYY-MM`` string into a ``(year, month)`` pair."""
     try:
         dt = datetime.strptime(value, "%Y-%m")
     except ValueError as exc:
-        raise argparse.ArgumentTypeError(
-            f"month must be in YYYY-MM format, got {value!r}"
-        ) from exc
+        raise argparse.ArgumentTypeError(f"month must be in YYYY-MM format, got {value!r}") from exc
     return dt.year, dt.month
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse command-line arguments, defaulting to the CONFIG block values."""
     parser = argparse.ArgumentParser(
         description="Generate deterministic Capital Bikeshare fixtures over time. "
-                    "Defaults come from the CONFIG block in this file.",
+        "Defaults come from the CONFIG block in this file.",
     )
-    parser.add_argument("--input-extract", default=INPUT_EXTRACT,
-                        help="Real .zip/.csv extract to harvest stations+bbox from.")
-    parser.add_argument("--output-dir", default=OUTPUT_DIR,
-                        help="Directory for the per-month CSV files.")
-    parser.add_argument("--start", default=START_MONTH, metavar="YYYY-MM",
-                        help="First month.")
-    parser.add_argument("--months", type=int, default=NUM_MONTHS,
-                        help="Number of consecutive months.")
-    parser.add_argument("--rows", type=int, default=TOTAL_ROWS,
-                        help="Total trips across all months.")
+    parser.add_argument(
+        "--input-extract",
+        default=INPUT_EXTRACT,
+        help="Real .zip/.csv extract to harvest stations+bbox from.",
+    )
+    parser.add_argument(
+        "--output-dir", default=OUTPUT_DIR, help="Directory for the per-month CSV files."
+    )
+    parser.add_argument("--start", default=START_MONTH, metavar="YYYY-MM", help="First month.")
+    parser.add_argument(
+        "--months", type=int, default=NUM_MONTHS, help="Number of consecutive months."
+    )
+    parser.add_argument(
+        "--rows", type=int, default=TOTAL_ROWS, help="Total trips across all months."
+    )
     parser.add_argument("--seed", type=int, default=SEED, help="RNG seed.")
-    parser.add_argument("--no-guarantee", dest="guarantee", action="store_false",
-                        default=GUARANTEE_EDGE_CASES,
-                        help="Do not force rare edge cases into the output.")
-    parser.add_argument("--stdout", action="store_true",
-                        help="Write one combined CSV to stdout instead of files.")
+    parser.add_argument(
+        "--no-guarantee",
+        dest="guarantee",
+        action="store_false",
+        default=GUARANTEE_EDGE_CASES,
+        help="Do not force rare edge cases into the output.",
+    )
+    parser.add_argument(
+        "--stdout", action="store_true", help="Write one combined CSV to stdout instead of files."
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Command-line entry point. Returns a process exit code."""
     args = parse_args(argv)
     try:
         generate_and_write(
