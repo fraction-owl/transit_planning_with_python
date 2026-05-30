@@ -50,6 +50,7 @@ import zipfile
 from pathlib import Path
 from typing import IO
 
+import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import pandas as pd
 
@@ -217,7 +218,7 @@ def build_station_monthly(trips: pd.DataFrame) -> pd.DataFrame:
     """
     months = sorted(trips["month"].unique())
 
-    def _counts(id_col: str, name_col: str, label: str) -> pd.DataFrame:
+    def _counts(id_col: str, name_col: str, label: str) -> tuple[pd.DataFrame, pd.DataFrame]:
         docked = trips[trips[id_col].str.len() > 0]
         out = (
             docked.groupby(["month", id_col], sort=False)
@@ -269,17 +270,17 @@ def plot_system_trend(system_monthly: pd.DataFrame, out_path: Path) -> None:
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=(11, 5))
-    months = system_monthly["month"]
-    ax.plot(months, system_monthly["total_trips"], marker="o", label="All trips")
-    ax.plot(months, system_monthly["member_trips"], marker=".", label="Member")
-    ax.plot(months, system_monthly["casual_trips"], marker=".", label="Casual")
+    x = pd.to_datetime(system_monthly["month"], format="%Y-%m")
+    ax.plot(x, system_monthly["total_trips"], marker="o", label="All trips")
+    ax.plot(x, system_monthly["member_trips"], marker=".", label="Member")
+    ax.plot(x, system_monthly["casual_trips"], marker=".", label="Casual")
     ax.set_title("System ridership over time")
     ax.set_xlabel("Month")
     ax.set_ylabel("Trips")
     ax.set_ylim(bottom=0)
     ax.grid(True, axis="y", alpha=0.3)
     ax.legend()
-    _thin_month_ticks(ax, months)
+    _format_month_axis(fig, ax, len(system_monthly))
     fig.tight_layout()
     fig.savefig(out_path, dpi=120)
     plt.close(fig)
@@ -309,16 +310,17 @@ def plot_station_trends(
         rows = station_monthly[station_monthly["station_id"] == station_id]
         name = str(rows["station_name"].iloc[0]).strip()
         fig, ax = plt.subplots(figsize=(11, 4.5))
-        ax.plot(rows["month"], rows["total"], marker="o", label="Total")
-        ax.plot(rows["month"], rows["departures"], marker=".", label="Departures")
-        ax.plot(rows["month"], rows["arrivals"], marker=".", label="Arrivals")
+        x = pd.to_datetime(rows["month"], format="%Y-%m")
+        ax.plot(x, rows["total"], marker="o", label="Total")
+        ax.plot(x, rows["departures"], marker=".", label="Departures")
+        ax.plot(x, rows["arrivals"], marker=".", label="Arrivals")
         ax.set_title(f"Ridership over time -- {name} ({station_id})")
         ax.set_xlabel("Month")
         ax.set_ylabel("Trips")
         ax.set_ylim(bottom=0)
         ax.grid(True, axis="y", alpha=0.3)
         ax.legend()
-        _thin_month_ticks(ax, rows["month"])
+        _format_month_axis(fig, ax, len(rows))
         fig.tight_layout()
         path = out_dir / f"station_{_safe_name(station_id)}.png"
         fig.savefig(path, dpi=120)
@@ -327,12 +329,12 @@ def plot_station_trends(
     return written
 
 
-def _thin_month_ticks(ax: plt.Axes, months: pd.Series) -> None:
-    """Rotate month labels and thin them to at most ~12 ticks for legibility."""
-    labels = list(months)
-    step = max(1, len(labels) // 12)
-    ax.set_xticks(range(0, len(labels), step))
-    ax.set_xticklabels(labels[::step], rotation=45, ha="right")
+def _format_month_axis(fig: plt.Figure, ax: plt.Axes, n_months: int) -> None:
+    """Label the x-axis by month, thinning ticks to at most ~12 for legibility."""
+    interval = max(1, n_months // 12)
+    ax.xaxis.set_major_locator(mdates.MonthLocator(interval=interval))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%b-%y"))
+    fig.autofmt_xdate(rotation=45)
 
 
 def _safe_name(value: str) -> str:
@@ -442,11 +444,7 @@ def main(argv: list[str] | None = None) -> int:
 
 def _in_ipython() -> bool:
     """Return True when running inside an IPython/Jupyter kernel."""
-    try:
-        get_ipython  # type: ignore[name-defined]  # noqa: B018
-        return True
-    except NameError:
-        return "ipykernel" in sys.modules
+    return "ipykernel" in sys.modules or "IPython" in sys.modules
 
 
 if __name__ == "__main__":
