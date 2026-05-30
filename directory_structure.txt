@@ -15,6 +15,7 @@ transit_planning_with_python/
 │   ├── check_style.py
 │   ├── export_repo_file_tree.py
 │   ├── export_requirements.py
+│   ├── generate_mock_bikeshare_trips.py
 │   ├── generate_mock_gtfs.py
 │   ├── generate_mock_roads.py
 │   ├── generate_mock_tides.py
@@ -72,6 +73,7 @@ transit_planning_with_python/
 │   │   ├── runtime_by_segment_pivot.py
 │   │   └── trip_event_runtime_diagnostics.py
 │   ├── ridership_tools/
+│   │   ├── bikeshare_ridership_trends.py
 │   │   ├── data_request_by_stop_processor.py
 │   │   ├── load_factor_monitor.py
 │   │   ├── ntd_monthly_summary.py
@@ -105,6 +107,7 @@ transit_planning_with_python/
 │   │   ├── DECENNIALDHC2020.H1_2026-05-23T134937.zip
 │   │   ├── DECENNIALDHC2020.P9_2026-05-23T135214.zip
 │   │   ├── DECENNIALPL2020.P1_2026-05-23T133835.zip
+│   │   ├── capitalbikeshare_fixtures_24mo.zip
 │   │   ├── dc_wac_S000_JT00_2023.csv.gz
 │   │   ├── lda_000b21a_e_sample.zip
 │   │   ├── md_wac_S000_JT00_2023.csv.gz
@@ -124,6 +127,7 @@ transit_planning_with_python/
 │   │   ├── trips_performed.csv
 │   │   └── va_wac_S000_JT00_2023.csv.gz
 │   ├── test_audit_turn_clearance.py
+│   ├── test_bikeshare_ridership_trends.py
 │   ├── test_block_status_timeline_exporter.py
 │   ├── test_bus_block_exporter.py
 │   ├── test_cacensus_da_join_gpd.py
