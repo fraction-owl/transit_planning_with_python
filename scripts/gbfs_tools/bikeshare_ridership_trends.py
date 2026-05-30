@@ -13,7 +13,7 @@ Notebook / manual: edit the CONFIG block below, then run the file (or call
 ``run()``). No command-line arguments are needed.
 
 Command line: every CONFIG value has a matching flag that overrides it, e.g.
-    python scripts/ridership_tools/bikeshare_ridership_trends.py \\
+    python scripts/gbfs_tools/bikeshare_ridership_trends.py \\
         --input tests/fixtures/capitalbikeshare_fixtures_24mo.zip \\
         --output-dir out/bikeshare_trends
 

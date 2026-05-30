@@ -10,7 +10,7 @@ import pytest
 
 matplotlib.use("Agg")  # headless: no display needed for savefig
 
-from scripts.ridership_tools import bikeshare_ridership_trends as mod
+from scripts.gbfs_tools import bikeshare_ridership_trends as mod
 
 FIXTURE_ZIP = Path("tests/fixtures/capitalbikeshare_fixtures_24mo.zip")
 

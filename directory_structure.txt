@@ -47,6 +47,7 @@ transit_planning_with_python/
 │   │   ├── ridecheck_cluster_checklists.py
 │   │   └── ridecheck_results_processor.py
 │   ├── gbfs_tools/
+│   │   ├── bikeshare_ridership_trends.py
 │   │   └── gbfs_stations_exporter.py
 │   ├── gtfs_exports/
 │   │   ├── block_status_timeline_exporter.py
@@ -73,7 +74,6 @@ transit_planning_with_python/
 │   │   ├── runtime_by_segment_pivot.py
 │   │   └── trip_event_runtime_diagnostics.py
 │   ├── ridership_tools/
-│   │   ├── bikeshare_ridership_trends.py
 │   │   ├── data_request_by_stop_processor.py
 │   │   ├── load_factor_monitor.py
 │   │   ├── ntd_monthly_summary.py
