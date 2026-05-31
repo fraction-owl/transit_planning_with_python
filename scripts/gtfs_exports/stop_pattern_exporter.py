@@ -816,7 +816,7 @@ def export_patterns_to_excel(
         try:
             workbook.save(full_filepath)
             logging.info("Saved workbook: %s", full_filepath)
-        except Exception as exc:
+        except OSError as exc:
             logging.error("Could not save workbook '%s': %s", filename, exc)
 
 
@@ -961,7 +961,7 @@ def main() -> None:
             )
             calendar_df = None
 
-        except Exception as exc:
+        except (OSError, ValueError, pd.errors.ParserError) as exc:
             logging.warning("Could not load calendar.txt from %s: %s", calendar_file_path, exc)
             calendar_df = None
 

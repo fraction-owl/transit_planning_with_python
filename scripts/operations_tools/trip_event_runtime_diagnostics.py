@@ -224,7 +224,7 @@ def _discover_route_csvs(
                 non_id = [c for c in route_like if not re.search(r"id\s*$", c, flags=re.I)]
                 route_col = non_id[0] if non_id else route_like[0]
 
-        except Exception as e:
+        except (OSError, ValueError, KeyError, UnicodeDecodeError) as e:
             logging.warning("!! %s: %s; skipped", p.name, e)
             continue
 
@@ -241,7 +241,7 @@ def _discover_route_csvs(
                 .unique()
             )
             ids = {_clean_route_id(r) for r in routes}
-        except Exception as e:
+        except (OSError, ValueError, KeyError, UnicodeDecodeError) as e:
             logging.warning("!! %s: %s; skipped", p.name, e)
             continue
 

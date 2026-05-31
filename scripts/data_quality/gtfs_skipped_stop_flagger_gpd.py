@@ -35,6 +35,7 @@ import geopandas as gpd
 import matplotlib.pyplot as plt
 import pandas as pd
 from matplotlib.axes import Axes
+from shapely.errors import GEOSException
 from shapely.geometry import LineString, Point
 from shapely.ops import substring
 
@@ -753,7 +754,7 @@ def segment_hausdorff_distance(
     try:
         seg_base = substring(base_shape, m0_base, m1_base)
         seg_other = substring(other_shape, m0_other, m1_other)
-    except Exception:  # defensive: geometries can sometimes be weird
+    except (GEOSException, ValueError, TypeError):  # defensive: geometries can be weird
         return None
 
     if seg_base.is_empty or seg_other.is_empty:
