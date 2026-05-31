@@ -357,7 +357,7 @@ def snap_stops_to_segments(
             if eid is None:
                 try:
                     eid = int(segments.loc[segments.geometry.wkb == seg.wkb, "edge_id"].iloc[0])
-                except Exception:
+                except (IndexError, KeyError, ValueError):
                     rows.append(
                         dict(
                             stop_id=sid,

@@ -150,7 +150,7 @@ def parse_trip_time(trip_str: str) -> Optional[int]:
     try:
         t = pd.to_datetime(token).time()
         return t.hour * 60 + t.minute
-    except Exception:
+    except (ValueError, TypeError):
         return None
 
 

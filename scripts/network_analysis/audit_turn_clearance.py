@@ -44,6 +44,7 @@ import geopandas as gpd
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from shapely.errors import GEOSException
 from shapely.geometry import LineString, Point, box
 from shapely.ops import substring
 
@@ -470,7 +471,7 @@ def _export_flagged_pngs(
         turn_pt = line.interpolate(d_turn)
         try:
             seg = substring(line, d_stop, d_turn, normalized=False)
-        except Exception:
+        except (GEOSException, ValueError, TypeError):
             seg = LineString([stop_pt, turn_pt])
 
         # plotting window

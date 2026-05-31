@@ -25,6 +25,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from pyproj import CRS
+from pyproj.exceptions import CRSError
 from rapidfuzz import fuzz
 from rapidfuzz.distance import Levenshtein
 from shapely.geometry import LineString, MultiLineString, Point
@@ -119,7 +120,7 @@ def _axis_unit_info(crs_obj: Union[str, int, CRS, object]) -> tuple[Optional[str
         if crs.axis_info:
             ax = crs.axis_info[0]
             return (ax.unit_name or "").lower(), float(ax.unit_conversion_factor or 1.0)
-    except Exception:
+    except (CRSError, ValueError, TypeError):
         pass
     return None, None
 
