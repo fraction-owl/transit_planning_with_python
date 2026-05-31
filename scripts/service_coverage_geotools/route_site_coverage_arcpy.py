@@ -860,7 +860,7 @@ def _build_route_geometry_from_stops(
         try:
             lon = float(row["stop_lon"])
             lat = float(row["stop_lat"])
-        except Exception:
+        except (ValueError, TypeError):
             continue
         points.append(arcpy.Point(lon, lat))
 

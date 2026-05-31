@@ -98,7 +98,7 @@ try:
     from rapidfuzz.distance import Levenshtein as RF_Levenshtein  # type: ignore
 
     _HAS_RAPIDFUZZ = True
-except Exception:
+except ImportError:
     _HAS_RAPIDFUZZ = False
 
 
@@ -553,7 +553,7 @@ def _directed_line_to_line_distances(
     for p in _sample_points_along_polyline(src_line, step):
         try:
             d_all.append(float(p.distanceTo(ref_line)))
-        except Exception:
+        except (RuntimeError, ValueError, TypeError):
             continue
     return np.array(d_all, dtype=float)
 
@@ -566,7 +566,7 @@ def _point_set_to_line_distances(
     for p in points:
         try:
             vals.append(float(p.distanceTo(ref_line)))
-        except Exception:
+        except (RuntimeError, ValueError, TypeError):
             continue
     return np.array(vals, dtype=float)
 

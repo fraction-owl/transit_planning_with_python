@@ -221,7 +221,7 @@ def safe_project_or_copy(in_fc: str, out_fc: str, out_sr: int) -> None:
             arcpy.management.CopyFeatures(in_fc, out_fc)
         else:
             arcpy.management.Project(in_fc, out_fc, tgt_sr)
-    except Exception as exc:
+    except arcpy.ExecuteError as exc:
         logging.warning("Project failed (%s). Copying features instead.", exc)
         arcpy.management.CopyFeatures(in_fc, out_fc)
 
