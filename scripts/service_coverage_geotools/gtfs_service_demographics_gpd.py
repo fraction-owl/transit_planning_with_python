@@ -1,17 +1,30 @@
 """Performs spatial analysis on GTFS transit data and demographic shapefiles.
 
-Generates service area buffers around transit stops and estimates population,
-household, and employment characteristics within those areas. Supports three
-analysis modes: 'network', 'route', and 'stop'. Buffer sizes and stop filters
-are configurable.
+Generates a transit *service area* and estimates the population, household, and
+employment characteristics that fall within it. The script offers two
+independent choices:
 
-Intended for use in Jupyter notebooks with appropriate EPSG settings.
+* **Analysis mode** — how results are grouped: ``"network"`` (one combined
+  surface), ``"route"`` (one surface per route), or ``"stop"`` (one surface per
+  stop).
+* **Service-area method** — how each catchment polygon is built:
+    - ``"stop_buffer"``: a fixed-radius buffer around each transit stop
+      (the original behaviour, with optional per-stop large buffers).
+    - ``"route_buffer"``: a fixed-radius buffer around the route-line geometry
+      taken from GTFS ``shapes.txt``.
+    - ``"isochrone"``: a walk-time isochrone (walkshed) around each stop,
+      traced over a pedestrian centerline network.
+
+Intended for use in Jupyter notebooks with appropriate EPSG settings. The
+projected CRS (``CRS_EPSG_CODE``) is assumed to use **metres** as its linear
+unit, matching the miles-to-metres conversions used throughout.
 
 Typical inputs:
     - GTFS folder containing: trips.txt, stop_times.txt, routes.txt,
-      stops.txt, calendar.txt.
+      stops.txt, calendar.txt (and shapes.txt for the ``route_buffer`` method).
     - Demographic shapefile with fields to estimate.
-    - Configurable filter lists and buffer settings in the script.
+    - A pedestrian centerline shapefile (only for the ``isochrone`` method).
+    - Configurable filter lists, buffer, and isochrone settings in the script.
 
 Outputs:
     - Shapefiles (.shp) and Excel summaries (.xlsx) for each analysis unit.
@@ -22,12 +35,16 @@ import logging
 import os
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, Final, Optional
+from typing import Any, Final, Optional, Tuple
 
 import geopandas as gpd
 import matplotlib.pyplot as plt
+import networkx as nx
+import numpy as np
 import pandas as pd
-from shapely.geometry import Point
+from scipy.spatial import cKDTree
+from shapely.geometry import LineString, Point
+from shapely.ops import unary_union
 
 # =============================================================================
 # CONFIGURATION
@@ -36,10 +53,25 @@ from shapely.geometry import Point
 # Select analysis mode: "network", "route", or "stop"
 ANALYSIS_MODE = "network"  # Options: "network", "route", "stop"
 
+# Select how the service-area polygon is built around the transit it serves:
+#   "stop_buffer"  → fixed-radius buffer around each stop (uses BUFFER_DISTANCE
+#                    and the optional large-buffer settings below).
+#   "route_buffer" → fixed-radius buffer around the route-line geometry from
+#                    shapes.txt (uses BUFFER_DISTANCE). Falls back to
+#                    "stop_buffer" when route geometry is unavailable.
+#   "isochrone"    → walk-time isochrone around each stop traced over the
+#                    pedestrian network (uses the ISOCHRONE_* settings below).
+SERVICE_AREA_METHOD = "stop_buffer"  # Options: "stop_buffer", "route_buffer", "isochrone"
+
 # Paths
 GTFS_DATA_PATH = r"Path\To\GTFS_data_folder"
 DEMOGRAPHICS_SHP_PATH = r"Path\To\census_blocks.shp"
 OUTPUT_DIRECTORY = r"Path\To\Output"
+
+# Pedestrian centerline (sidewalk/road) shapefile — only used when
+# SERVICE_AREA_METHOD == "isochrone". Lines should be routable (split at
+# intersections) for best results.
+PEDESTRIAN_NETWORK_PATH = r"Path\To\centerlines.shp"
 
 # Calendar / service-pattern filter
 SERVICE_IDS_TO_INCLUDE: Final[list[str]] = ["3"]  # ← NEW
@@ -63,12 +95,17 @@ STOP_IDS_TO_EXCLUDE: list[
     str
 ] = []  # e.g. [] for no include filter or [1010, 1011] for exclude filter
 
-# Buffer distances in miles
+# Buffer distances in miles (used by the "stop_buffer" and "route_buffer" methods)
 BUFFER_DISTANCE = 0.25  # Standard buffer distance
 LARGE_BUFFER_DISTANCE = 2.0  # Larger buffer distance for specified stops
 
 # If a stop_id is in this list, use LARGE_BUFFER_DISTANCE instead.
+# (Applies to the "stop_buffer" method only.)
 STOP_IDS_LARGE_BUFFER: list[str] = []
+
+# Isochrone settings (only used when SERVICE_AREA_METHOD == "isochrone")
+ISOCHRONE_WALK_TIME_MIN = 10.0  # Walk-time budget in minutes
+WALK_SPEED_MPH = 3.0  # Assumed pedestrian walking speed
 
 # Optional FIPS filter (list of codes). Empty list = no filter.
 FIPS_FILTER: list[str] = []  # Replace with FIPS code(s) for desired jurisdictions (e.g. "11001")
@@ -93,7 +130,7 @@ SYNTHETIC_FIELDS = [
 # EPSG code for projected coordinate system used in area calculations
 CRS_EPSG_CODE = 3395  # Replace with EPSG for your study area
 
-# GTFS files expected
+# GTFS files always required
 REQUIRED_GTFS_FILES = [
     "trips.txt",
     "stop_times.txt",
@@ -101,6 +138,13 @@ REQUIRED_GTFS_FILES = [
     "stops.txt",
     "calendar.txt",
 ]
+
+# Additional GTFS file required only for the "route_buffer" service-area method.
+# Loaded opportunistically; if absent the method falls back to "stop_buffer".
+ROUTE_GEOMETRY_GTFS_FILE = "shapes.txt"
+
+# Conversion factor: metres per mile (the projected CRS is assumed metric).
+METERS_PER_MILE: Final[float] = 1609.34
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
 
@@ -206,6 +250,363 @@ def pick_buffer_distance(
         return normal_buffer
 
 
+# -----------------------------------------------------------------------------
+# PEDESTRIAN NETWORK HELPERS
+#
+# The two functions below are copied verbatim from utils/network_helpers.py so
+# this script stays self-contained (see utils/run_log.py for the same
+# convention). The canonical versions live in utils/network_helpers.py — keep
+# these copies in sync when updating either. Only the walking-network builder
+# is reproduced; the isochrone method walks this graph from each stop.
+# -----------------------------------------------------------------------------
+
+FT_PER_MILE: float = 5_280.0
+SECONDS_PER_HOUR: float = 3_600.0
+DEFAULT_WALK_SPEED_MPH: float = 3.0
+DEFAULT_WALK_SPEED_FT_PER_S: float = DEFAULT_WALK_SPEED_MPH * FT_PER_MILE / SECONDS_PER_HOUR
+DEFAULT_NODE_GRID_FT: float = 5.0
+
+NodeKey = Tuple[float, float]  # quantized (x, y)
+EdgeID = int
+
+
+def quantize_node(x: float, y: float, step: float = DEFAULT_NODE_GRID_FT) -> NodeKey:
+    """Snap an ``(x, y)`` coordinate to a square grid of size ``step``.
+
+    Args:
+        x: X coordinate in the layer's CRS units.
+        y: Y coordinate in the layer's CRS units.
+        step: Grid size used to merge near-coincident endpoints into a shared
+            node. Expressed in the same linear units as the coordinates.
+
+    Returns:
+        The grid-snapped ``(x, y)`` tuple, suitable as a hashable node key.
+    """
+    return (round(float(x) / step) * step, round(float(y) / step) * step)
+
+
+def build_pedestrian_time_network(
+    centerlines: gpd.GeoDataFrame,
+    *,
+    walk_speed: float = DEFAULT_WALK_SPEED_FT_PER_S,
+    node_grid: float = DEFAULT_NODE_GRID_FT,
+) -> tuple[nx.MultiGraph, dict[EdgeID, Tuple[NodeKey, NodeKey]]]:
+    """Build a walking travel-time graph from a centerline layer.
+
+    Each input centerline is exploded into simple :class:`LineString` segments,
+    and every segment becomes one undirected edge whose endpoints are snapped to
+    a grid (see :func:`quantize_node`) so adjacent segments share nodes. Edges
+    carry the segment ``geometry``, its ``length`` (CRS units), and ``time_s``,
+    the walking time in seconds (``length / walk_speed``).
+
+    Args:
+        centerlines: Sidewalk or road centerlines in a projected CRS. The CRS
+            must be set; a geographic CRS triggers a warning because lengths
+            would be measured in degrees.
+        walk_speed: Walking speed in the layer's linear CRS units **per second**
+            (defaults to ~3 mph in feet, for a US-foot CRS). Must be positive.
+        node_grid: Grid size for merging near-coincident endpoints, in the
+            layer's linear CRS units.
+
+    Returns:
+        A tuple of:
+            * the undirected :class:`networkx.MultiGraph`; each node has ``x``
+              and ``y`` attributes, each edge has ``edge_id``, ``geometry``,
+              ``length``, and ``time_s``.
+            * a mapping of ``edge_id`` to its ``(u_node, v_node)`` endpoint keys,
+              for callers that need to relate edges back to graph nodes.
+
+    Raises:
+        ValueError: If ``centerlines`` has no CRS or ``walk_speed`` is not
+            positive.
+    """
+    if centerlines.crs is None:
+        raise ValueError("centerlines has no CRS; cannot build a metric walking network.")
+    if walk_speed <= 0:
+        raise ValueError(f"walk_speed must be positive, got {walk_speed}.")
+    if centerlines.crs.is_geographic:
+        logging.warning(
+            "centerlines CRS '%s' is geographic; segment lengths and travel "
+            "times will be meaningless. Reproject to a projected CRS first.",
+            centerlines.crs,
+        )
+
+    segments = centerlines.explode(index_parts=False, ignore_index=True)
+    segments = segments[segments.geometry.notna()]
+    segments = segments[segments.geom_type == "LineString"]
+
+    graph = nx.MultiGraph()
+    edge_endpoints: dict[EdgeID, Tuple[NodeKey, NodeKey]] = {}
+
+    edge_id = 0
+    for geom in segments.geometry.to_numpy():
+        length = float(geom.length)
+        if length == 0.0:
+            continue
+
+        x1, y1 = geom.coords[0]
+        x2, y2 = geom.coords[-1]
+        u = quantize_node(x1, y1, node_grid)
+        v = quantize_node(x2, y2, node_grid)
+        if u == v:
+            continue  # degenerate loop after snapping
+
+        for node, (xx, yy) in ((u, u), (v, v)):
+            if node not in graph:
+                graph.add_node(node, x=xx, y=yy)
+
+        graph.add_edge(
+            u,
+            v,
+            edge_id=edge_id,
+            geometry=geom,
+            length=length,
+            time_s=length / walk_speed,
+        )
+        edge_endpoints[edge_id] = (u, v)
+        edge_id += 1
+
+    logging.info(
+        "Built pedestrian time network: %d nodes, %d edges (walk_speed=%.3f units/s).",
+        graph.number_of_nodes(),
+        graph.number_of_edges(),
+        walk_speed,
+    )
+    return graph, edge_endpoints
+
+
+# -----------------------------------------------------------------------------
+# SERVICE-AREA GEOMETRY BUILDERS
+# -----------------------------------------------------------------------------
+
+
+def build_route_shapes_gdf(
+    shapes_df: Optional[pd.DataFrame],
+    trips: pd.DataFrame,
+    final_routes_df: pd.DataFrame,
+    crs_epsg_code: int,
+) -> gpd.GeoDataFrame:
+    """Build dissolved route-line geometry, keyed by ``route_short_name``.
+
+    Reconstructs a :class:`~shapely.geometry.LineString` for each ``shape_id``
+    in *shapes_df*, attributes it to a route via *trips*/*final_routes_df*, and
+    dissolves to one (multi)line per ``route_short_name`` in the projected CRS.
+
+    Args:
+        shapes_df: GTFS ``shapes.txt`` table, or ``None`` if unavailable.
+        trips: GTFS ``trips`` table (must include ``route_id`` and ``shape_id``).
+        final_routes_df: Already-filtered routes (``route_id``,
+            ``route_short_name``).
+        crs_epsg_code: EPSG code of the projected CRS to return geometry in.
+
+    Returns:
+        A GeoDataFrame with columns ``route_short_name`` and ``geometry``.
+        Empty (but validly typed) when route geometry cannot be derived.
+    """
+    empty = gpd.GeoDataFrame(
+        {"route_short_name": pd.Series(dtype=str)},
+        geometry=gpd.GeoSeries([], crs=f"EPSG:{crs_epsg_code}"),
+    )
+
+    needed = {"shape_id", "shape_pt_lat", "shape_pt_lon", "shape_pt_sequence"}
+    if shapes_df is None or shapes_df.empty:
+        logging.warning("No shapes.txt data available; route geometry cannot be built.")
+        return empty
+    if not needed <= set(shapes_df.columns):
+        logging.warning(
+            "shapes.txt is missing required columns %s; route geometry unavailable.",
+            sorted(needed - set(shapes_df.columns)),
+        )
+        return empty
+    if "shape_id" not in trips.columns:
+        logging.warning("trips.txt has no 'shape_id' column; route geometry unavailable.")
+        return empty
+
+    # Map each shape_id to a route_short_name through the filtered trips.
+    trip_routes = trips.merge(final_routes_df[["route_id", "route_short_name"]], on="route_id")
+    shape_to_route = (
+        trip_routes.dropna(subset=["shape_id"])
+        .drop_duplicates(subset=["shape_id"])[["shape_id", "route_short_name"]]
+        .astype({"shape_id": str})
+    )
+    if shape_to_route.empty:
+        logging.warning("No shape_id values map to the selected routes.")
+        return empty
+
+    pts = shapes_df.copy()
+    pts["shape_id"] = pts["shape_id"].astype(str)
+    for col in ("shape_pt_lat", "shape_pt_lon", "shape_pt_sequence"):
+        pts[col] = pd.to_numeric(pts[col], errors="coerce")
+    pts = pts.dropna(subset=["shape_pt_lat", "shape_pt_lon", "shape_pt_sequence"])
+    pts = pts.sort_values(["shape_id", "shape_pt_sequence"])
+
+    lines: list[dict[str, Any]] = []
+    for shape_id, group in pts.groupby("shape_id", sort=False):
+        if len(group) < 2:
+            continue  # need at least two points for a line
+        coords = list(zip(group["shape_pt_lon"], group["shape_pt_lat"]))
+        lines.append({"shape_id": str(shape_id), "geometry": LineString(coords)})
+
+    if not lines:
+        logging.warning("No usable line geometry reconstructed from shapes.txt.")
+        return empty
+
+    shapes_gdf = gpd.GeoDataFrame(lines, geometry="geometry", crs="EPSG:4326").to_crs(
+        epsg=crs_epsg_code
+    )
+    shapes_gdf = shapes_gdf.merge(shape_to_route, on="shape_id", how="inner")
+    if shapes_gdf.empty:
+        logging.warning("No route shapes remain after joining shapes to routes.")
+        return empty
+
+    dissolved = shapes_gdf.dissolve(by="route_short_name").reset_index()
+    return dissolved[["route_short_name", "geometry"]]
+
+
+def build_walk_isochrone(
+    stop_points_gdf: gpd.GeoDataFrame,
+    ped_graph: nx.MultiGraph,
+    *,
+    walk_time_min: float,
+    walk_speed_units_per_s: float,
+) -> Optional[gpd.GeoDataFrame]:
+    """Build a walk-time isochrone (walkshed) around the given stop points.
+
+    Each stop is snapped to the nearest pedestrian-network node, and Dijkstra
+    expands outward up to ``walk_time_min`` minutes. Every reachable node is
+    buffered by the distance still walkable with its leftover time budget, and
+    the union of those buffers forms the walkshed. Stops without a reachable
+    node (e.g. an empty graph) are skipped.
+
+    Args:
+        stop_points_gdf: Stop *point* geometry in the projected CRS.
+        ped_graph: Walking graph from :func:`build_pedestrian_time_network`
+            (edges weighted by ``time_s``; nodes carry ``x``/``y``).
+        walk_time_min: Walk-time budget in minutes.
+        walk_speed_units_per_s: Walking speed in projected-CRS units per second
+            (must match the speed used to build ``ped_graph``).
+
+    Returns:
+        A single-row GeoDataFrame holding the dissolved walkshed polygon, or
+        ``None`` if nothing was reachable.
+    """
+    if ped_graph.number_of_nodes() == 0:
+        logging.warning("Pedestrian network is empty; cannot build an isochrone.")
+        return None
+
+    cutoff_s = walk_time_min * 60.0
+    node_keys = list(ped_graph.nodes)
+    node_xy = np.array([(ped_graph.nodes[n]["x"], ped_graph.nodes[n]["y"]) for n in node_keys])
+    tree = cKDTree(node_xy)
+
+    polygons: list[Any] = []
+    for geom in stop_points_gdf.geometry:
+        if geom is None or geom.is_empty:
+            continue
+        _, idx = tree.query((geom.x, geom.y))
+        source = node_keys[int(idx)]
+
+        # Reachable nodes (and their walk time) within the budget.
+        lengths = nx.single_source_dijkstra_path_length(
+            ped_graph, source, cutoff=cutoff_s, weight="time_s"
+        )
+        for node, time_s in lengths.items():
+            residual_units = (cutoff_s - time_s) * walk_speed_units_per_s
+            if residual_units <= 0:
+                continue
+            node_x = ped_graph.nodes[node]["x"]
+            node_y = ped_graph.nodes[node]["y"]
+            polygons.append(Point(node_x, node_y).buffer(residual_units))
+
+    if not polygons:
+        logging.warning("No pedestrian-network nodes were reachable from the stops.")
+        return None
+
+    iso = unary_union(polygons)
+    return gpd.GeoDataFrame(geometry=[iso], crs=stop_points_gdf.crs)
+
+
+def build_service_area_polygon(
+    stop_points_gdf: gpd.GeoDataFrame,
+    *,
+    method: str,
+    buffer_distance_mi: float,
+    large_buffer_distance_mi: float,
+    stop_ids_large_buffer: list[str],
+    route_shapes_gdf: Optional[gpd.GeoDataFrame] = None,
+    ped_graph: Optional[nx.MultiGraph] = None,
+    walk_time_min: float = 0.0,
+    walk_speed_units_per_s: float = 0.0,
+) -> Optional[gpd.GeoDataFrame]:
+    """Build a single dissolved service-area polygon for a set of stops.
+
+    Dispatches on ``method`` to produce the catchment geometry for one analysis
+    unit (the whole network, a single route, or a single stop):
+
+    * ``"stop_buffer"``: variable-radius buffer around each stop, dissolved.
+    * ``"route_buffer"``: fixed-radius buffer around *route_shapes_gdf*; falls
+      back to ``"stop_buffer"`` when no route geometry is supplied.
+    * ``"isochrone"``: walk-time walkshed via :func:`build_walk_isochrone`.
+
+    Args:
+        stop_points_gdf: Stop *point* geometry in the projected CRS.
+        method: One of ``"stop_buffer"``, ``"route_buffer"``, ``"isochrone"``.
+        buffer_distance_mi: Standard buffer radius in miles.
+        large_buffer_distance_mi: Larger buffer radius in miles for select stops.
+        stop_ids_large_buffer: Stop IDs that should use the larger radius.
+        route_shapes_gdf: Route-line geometry for the ``"route_buffer"`` method.
+        ped_graph: Pedestrian graph for the ``"isochrone"`` method.
+        walk_time_min: Walk-time budget (minutes) for the ``"isochrone"`` method.
+        walk_speed_units_per_s: Walking speed (CRS units/s) for the isochrone.
+
+    Returns:
+        A single-row GeoDataFrame with the dissolved service area, or ``None``
+        if no geometry could be produced.
+    """
+    if method == "isochrone":
+        if ped_graph is None:
+            logging.warning(
+                "Isochrone method selected but no pedestrian network is loaded; "
+                "falling back to stop buffers."
+            )
+        else:
+            return build_walk_isochrone(
+                stop_points_gdf,
+                ped_graph,
+                walk_time_min=walk_time_min,
+                walk_speed_units_per_s=walk_speed_units_per_s,
+            )
+
+    if method == "route_buffer":
+        if route_shapes_gdf is None or route_shapes_gdf.empty:
+            logging.warning(
+                "Route-buffer method selected but no route geometry is available; "
+                "falling back to stop buffers."
+            )
+        else:
+            buffered = route_shapes_gdf.geometry.buffer(buffer_distance_mi * METERS_PER_MILE)
+            area = unary_union(list(buffered.values))
+            return gpd.GeoDataFrame(geometry=[area], crs=stop_points_gdf.crs)
+
+    # Default / fallback: per-stop buffers, dissolved into one polygon.
+    if stop_points_gdf.empty:
+        return None
+    buffer_m = stop_points_gdf["stop_id"].map(
+        lambda sid: (
+            pick_buffer_distance(
+                sid,
+                normal_buffer=buffer_distance_mi,
+                large_buffer=large_buffer_distance_mi,
+                large_buffer_ids=stop_ids_large_buffer,
+            )
+            * METERS_PER_MILE
+        )
+    )
+    buffered = stop_points_gdf.geometry.buffer(buffer_m)
+    area = unary_union(list(buffered.values))
+    return gpd.GeoDataFrame(geometry=[area], crs=stop_points_gdf.crs)
+
+
 def clip_and_calculate_synthetic_fields(
     demographics_gdf: gpd.GeoDataFrame,
     buffer_gdf: gpd.GeoDataFrame,
@@ -276,6 +677,46 @@ def export_summary_to_excel(totals_dict: dict, output_path: str) -> None:
     logging.info("Exported Excel summary: %s", output_path)
 
 
+def _stops_to_points_gdf(
+    trips: pd.DataFrame,
+    stop_times: pd.DataFrame,
+    stops_df: pd.DataFrame,
+    final_routes_df: pd.DataFrame,
+    stop_ids_to_include: list[str],
+    stop_ids_to_exclude: list[str],
+) -> Optional[gpd.GeoDataFrame]:
+    """Merge GTFS tables and return filtered stop *points* in the projected CRS.
+
+    Args:
+        trips: GTFS ``trips`` table (already calendar-filtered).
+        stop_times: GTFS ``stop_times`` table.
+        stops_df: GTFS ``stops`` table.
+        final_routes_df: Already route-filtered routes (``route_id``,
+            ``route_short_name``).
+        stop_ids_to_include: Stop IDs to include (empty = no include filter).
+        stop_ids_to_exclude: Stop IDs to exclude (empty = no exclude filter).
+
+    Returns:
+        A GeoDataFrame of stop points with ``route_short_name`` and ``stop_id``
+        columns, or ``None`` if no stops survive the filters.
+    """
+    trips_merged = trips.merge(final_routes_df[["route_id", "route_short_name"]], on="route_id")
+    merged_data = stop_times.merge(trips_merged, on="trip_id")
+    merged_data = merged_data.merge(stops_df, on="stop_id")
+
+    final_stops_df = get_included_stops(merged_data, stop_ids_to_include, stop_ids_to_exclude)
+    if final_stops_df.empty:
+        return None
+
+    final_stops_df["geometry"] = final_stops_df.apply(
+        lambda row: Point(float(row["stop_lon"]), float(row["stop_lat"])),
+        axis=1,
+    )
+    return gpd.GeoDataFrame(final_stops_df, geometry="geometry", crs="EPSG:4326").to_crs(
+        epsg=CRS_EPSG_CODE
+    )
+
+
 def do_network_analysis(
     trips: pd.DataFrame,
     stop_times: pd.DataFrame,
@@ -291,12 +732,18 @@ def do_network_analysis(
     stop_ids_large_buffer: list[str],
     output_dir: str,
     synthetic_fields: list[str],
+    *,
+    service_area_method: str = "stop_buffer",
+    shapes_df: Optional[pd.DataFrame] = None,
+    ped_graph: Optional[nx.MultiGraph] = None,
+    walk_time_min: float = 0.0,
+    walk_speed_units_per_s: float = 0.0,
 ) -> None:
-    """Run a single network-wide buffer/clip analysis.
+    """Run a single network-wide service-area/clip analysis.
 
-    The function filters routes and stops, applies variable buffer radii,
-    dissolves individual buffers into a single surface, clips demographic
-    polygons, and exports both geometry and Excel summaries.
+    The function filters routes and stops, builds one combined service area
+    using the selected ``service_area_method``, clips demographic polygons, and
+    exports both geometry and an Excel summary.
 
     Args:
         trips: DataFrame from *trips.txt*.
@@ -313,70 +760,52 @@ def do_network_analysis(
         stop_ids_large_buffer: List of stop_ids that should use the large buffer distance.
         output_dir: Directory to save output files.
         synthetic_fields: List of demographic fields to synthesize.
+        service_area_method: ``"stop_buffer"``, ``"route_buffer"``, or
+            ``"isochrone"``.
+        shapes_df: GTFS ``shapes.txt`` (for the ``route_buffer`` method).
+        ped_graph: Pedestrian network (for the ``isochrone`` method).
+        walk_time_min: Walk-time budget in minutes (isochrone method).
+        walk_speed_units_per_s: Walking speed in CRS units/s (isochrone method).
 
     Returns:
         - A single shapefile (all_routes_service_buffer_data.shp)
         - A single Excel summary (all_routes_service_buffer_data.xlsx)
     """
-    logging.info("\n=== Network-wide Analysis ===")
+    logging.info("\n=== Network-wide Analysis (%s) ===", service_area_method)
 
-    # 1) Filter routes
     final_routes_df = get_included_routes(routes_df, routes_to_include, routes_to_exclude)
     if final_routes_df.empty:
         logging.info("No routes remain after route filters. Aborting network analysis.")
         return
 
-    # 2) Subset trips to only final routes
-    trips_merged = trips.merge(
-        final_routes_df[["route_id", "route_short_name"]],
-        on="route_id",
+    stops_gdf = _stops_to_points_gdf(
+        trips, stop_times, stops_df, final_routes_df, stop_ids_to_include, stop_ids_to_exclude
     )
-
-    # 3) Merge trips with stop_times
-    merged_data = stop_times.merge(trips_merged, on="trip_id")
-
-    # 4) Merge with stops
-    merged_data = merged_data.merge(stops_df, on="stop_id")
-
-    # 5) Filter final stops
-    final_stops_df = get_included_stops(merged_data, stop_ids_to_include, stop_ids_to_exclude)
-    if final_stops_df.empty:
+    if stops_gdf is None:
         logging.info("No stops remain after stop filters. Aborting network analysis.")
         return
+    unique_stops_gdf = stops_gdf.drop_duplicates(subset="stop_id")
 
-    # 6) Convert to GeoDataFrame in projected CRS
-    final_stops_df["geometry"] = final_stops_df.apply(
-        lambda row: Point(row["stop_lon"], row["stop_lat"]),
-        axis=1,
+    route_shapes_gdf = build_route_shapes_gdf(shapes_df, trips, final_routes_df, CRS_EPSG_CODE)
+
+    service_area_gdf = build_service_area_polygon(
+        unique_stops_gdf,
+        method=service_area_method,
+        buffer_distance_mi=buffer_distance_mi,
+        large_buffer_distance_mi=large_buffer_distance_mi,
+        stop_ids_large_buffer=stop_ids_large_buffer,
+        route_shapes_gdf=route_shapes_gdf,
+        ped_graph=ped_graph,
+        walk_time_min=walk_time_min,
+        walk_speed_units_per_s=walk_speed_units_per_s,
     )
-    stops_gdf = gpd.GeoDataFrame(final_stops_df, geometry="geometry", crs="EPSG:4326").to_crs(
-        epsg=CRS_EPSG_CODE
-    )
+    if service_area_gdf is None or service_area_gdf.empty:
+        logging.info("Could not build a network service area. Aborting network analysis.")
+        return
 
-    # 7) Compute variable buffer distances
-    buffer_m = (
-        stops_gdf["stop_id"].map(
-            lambda sid: pick_buffer_distance(
-                sid,
-                normal_buffer=buffer_distance_mi,
-                large_buffer=large_buffer_distance_mi,
-                large_buffer_ids=stop_ids_large_buffer,
-            )
-        )
-        * 1609.34
-    )
-
-    stops_gdf = stops_gdf.assign(buffer_distance_meters=buffer_m).set_geometry(
-        stops_gdf.geometry.buffer(buffer_m)
-    )
-
-    # 8) Dissolve all buffers to create a single “network” buffer
-    network_buffer_gdf = stops_gdf.dissolve().reset_index(drop=True)
-
-    # 9) Clip and export
     clipped_result = clip_and_calculate_synthetic_fields(
         demographics_gdf,
-        network_buffer_gdf,
+        service_area_gdf,
         synthetic_fields,
     )
     synthetic_cols = [f"synthetic_{fld}" for fld in synthetic_fields]
@@ -397,9 +826,9 @@ def do_network_analysis(
     export_summary_to_excel(final_dict, xlsx_path)
 
     fig, ax = plt.subplots(figsize=(10, 10))
-    network_buffer_gdf.plot(ax=ax, alpha=0.5, label="Network Buffer")
-    stops_gdf.boundary.plot(ax=ax, linewidth=0.5, label="Stop Buffers")
-    plt.title("Network Buffer")
+    service_area_gdf.plot(ax=ax, alpha=0.5, label="Service Area")
+    unique_stops_gdf.plot(ax=ax, color="black", markersize=2, label="Stops")
+    plt.title(f"Network Service Area ({service_area_method})")
     plt.legend()
     plt.show()
 
@@ -419,76 +848,73 @@ def do_route_by_route_analysis(
     stop_ids_large_buffer: list[str],
     output_dir: str,
     synthetic_fields: list[str],
+    *,
+    service_area_method: str = "stop_buffer",
+    shapes_df: Optional[pd.DataFrame] = None,
+    ped_graph: Optional[nx.MultiGraph] = None,
+    walk_time_min: float = 0.0,
+    walk_speed_units_per_s: float = 0.0,
 ) -> None:
-    """Perform buffer/clip analysis for each individual route.
+    """Perform a service-area/clip analysis for each individual route.
 
-    The procedure repeats the buffer workflow for every `route_short_name`
-    in the filtered set, exporting per-route shapefiles and Excel totals.
+    The procedure repeats the selected ``service_area_method`` workflow for
+    every ``route_short_name`` in the filtered set, exporting per-route
+    shapefiles and Excel totals.
 
     Exports, for each route_short_name R:
       - A shapefile named R_service_buffer_data.shp
       - A summary Excel named R_service_buffer_data.xlsx
     """
-    logging.info("\n=== Route-by-Route Analysis ===")
+    logging.info("\n=== Route-by-Route Analysis (%s) ===", service_area_method)
 
     final_routes_df = get_included_routes(routes_df, routes_to_include, routes_to_exclude)
     if final_routes_df.empty:
         logging.info("No routes remain after route filters. Aborting route-by-route analysis.")
         return
 
-    # Merge the relevant GTFS data
-    trips_merged = trips.merge(final_routes_df[["route_id", "route_short_name"]], on="route_id")
-    merged_data = stop_times.merge(trips_merged, on="trip_id")
-    merged_data = merged_data.merge(stops_df, on="stop_id")
-
-    # Filter stops per user-specified ID filters
-    final_stops_df = get_included_stops(merged_data, stop_ids_to_include, stop_ids_to_exclude)
-    if final_stops_df.empty:
+    stops_gdf = _stops_to_points_gdf(
+        trips, stop_times, stops_df, final_routes_df, stop_ids_to_include, stop_ids_to_exclude
+    )
+    if stops_gdf is None:
         logging.info("No stops remain after stop filters. Aborting route-by-route analysis.")
         return
 
-    # Convert to GeoDataFrame in projected CRS
-    final_stops_df["geometry"] = final_stops_df.apply(
-        lambda row: Point(row["stop_lon"], row["stop_lat"]), axis=1
-    )
-    stops_gdf = gpd.GeoDataFrame(final_stops_df, geometry="geometry", crs="EPSG:4326").to_crs(
-        epsg=CRS_EPSG_CODE
-    )
+    # Route-line geometry (used only by the "route_buffer" method).
+    route_shapes_gdf = build_route_shapes_gdf(shapes_df, trips, final_routes_df, CRS_EPSG_CODE)
 
-    # Apply variable buffer logic
-    stops_gdf["buffer_distance_meters"] = stops_gdf["stop_id"].apply(
-        lambda sid: (
-            pick_buffer_distance(
-                sid,
-                normal_buffer=buffer_distance_mi,
-                large_buffer=large_buffer_distance_mi,
-                large_buffer_ids=stop_ids_large_buffer,
-            )
-            * 1609.34
-        )
-    )
-    stops_gdf["geometry"] = stops_gdf.apply(
-        lambda row: row.geometry.buffer(row["buffer_distance_meters"]), axis=1
-    )
-
-    # Keep only necessary columns and remove duplicates
-    stops_gdf = stops_gdf[["route_short_name", "stop_id", "geometry"]].drop_duplicates()
-
-    # Dissolve buffers by route
-    dissolved_by_route_gdf = stops_gdf.dissolve(by="route_short_name").reset_index()
-    unique_route_names = dissolved_by_route_gdf["route_short_name"].unique()
-
-    for route_name in unique_route_names:
+    os.makedirs(output_dir, exist_ok=True)
+    for route_name in stops_gdf["route_short_name"].unique():
         logging.info("\nProcessing route: %s", route_name)
-        route_buffer_gdf = dissolved_by_route_gdf[
-            dissolved_by_route_gdf["route_short_name"] == route_name
-        ]
-        if route_buffer_gdf.empty:
+        route_stops_gdf = stops_gdf[stops_gdf["route_short_name"] == route_name].drop_duplicates(
+            subset="stop_id"
+        )
+        if route_stops_gdf.empty:
             logging.info("No stops found for route '%s' - skipping.", route_name)
             continue
 
+        route_only_shapes = (
+            route_shapes_gdf[route_shapes_gdf["route_short_name"] == route_name]
+            if not route_shapes_gdf.empty
+            else route_shapes_gdf
+        )
+
+        service_area_gdf = build_service_area_polygon(
+            route_stops_gdf,
+            method=service_area_method,
+            buffer_distance_mi=buffer_distance_mi,
+            large_buffer_distance_mi=large_buffer_distance_mi,
+            stop_ids_large_buffer=stop_ids_large_buffer,
+            route_shapes_gdf=route_only_shapes,
+            ped_graph=ped_graph,
+            walk_time_min=walk_time_min,
+            walk_speed_units_per_s=walk_speed_units_per_s,
+        )
+        if service_area_gdf is None or service_area_gdf.empty:
+            logging.info("Could not build a service area for route '%s' - skipping.", route_name)
+            continue
+
         clipped_result = clip_and_calculate_synthetic_fields(
-            demographics_gdf, route_buffer_gdf, synthetic_fields
+            demographics_gdf, service_area_gdf, synthetic_fields
         )
 
         synthetic_cols = [f"synthetic_{f}" for f in synthetic_fields]
@@ -497,21 +923,18 @@ def do_route_by_route_analysis(
             display_col = str(col).replace("synthetic_", "").replace("_", " ").title()
             logging.info("  Total Synthetic %s for route %s: %d", display_col, route_name, int(val))
 
-        # Shapefile export
-        os.makedirs(output_dir, exist_ok=True)
         shp_path = os.path.join(output_dir, f"{route_name}_service_buffer_data.shp")
         clipped_result.to_file(shp_path)
         logging.info("Exported shapefile for route %s: %s", route_name, shp_path)
 
-        # Export summary to Excel
         xlsx_path = os.path.join(output_dir, f"{route_name}_service_buffer_data.xlsx")
         final_dict = {col: int(val) for col, val in totals.items()}
         export_summary_to_excel(final_dict, xlsx_path)
 
-        # Optional plot
         fig, ax = plt.subplots(figsize=(10, 10))
-        route_buffer_gdf.plot(ax=ax, alpha=0.5, label=f"Route {route_name} Buffer")
-        plt.title(f"Route {route_name} Buffer Overlay")
+        service_area_gdf.plot(ax=ax, alpha=0.5, label=f"Route {route_name} Service Area")
+        route_stops_gdf.plot(ax=ax, color="black", markersize=2, label="Stops")
+        plt.title(f"Route {route_name} Service Area ({service_area_method})")
         plt.legend()
         plt.show()
 
@@ -531,76 +954,70 @@ def do_stop_by_stop_analysis(
     stop_ids_large_buffer: list[str],
     output_dir: str,
     synthetic_fields: list[str],
+    *,
+    service_area_method: str = "stop_buffer",
+    shapes_df: Optional[pd.DataFrame] = None,
+    ped_graph: Optional[nx.MultiGraph] = None,
+    walk_time_min: float = 0.0,
+    walk_speed_units_per_s: float = 0.0,
 ) -> None:
-    """Compute buffers and demographic catchments for each stop.
+    """Compute a service area and demographic catchment for each stop.
 
-    Each GTFS stop that survives the route, trip, and stop filters is
-    buffered (variable radius), clipped against the demographic layer, and
-    written to individual shapefile/Excel pairs.
+    Each GTFS stop that survives the route, trip, and stop filters gets its own
+    service area built with the selected ``service_area_method``, clipped
+    against the demographic layer, and written to individual shapefile/Excel
+    pairs. The ``"route_buffer"`` method is not meaningful for a single stop, so
+    it is treated as ``"stop_buffer"`` here.
 
     Exports, for each stop_id S:
       - A shapefile named stop_S_service_buffer_data.shp
       - A summary Excel named stop_S_service_buffer_data.xlsx
     """
-    logging.info("\n=== Stop-by-Stop Analysis ===")
+    logging.info("\n=== Stop-by-Stop Analysis (%s) ===", service_area_method)
+
+    effective_method = service_area_method
+    if effective_method == "route_buffer":
+        logging.warning(
+            "'route_buffer' is not meaningful per stop; using 'stop_buffer' for "
+            "stop-by-stop analysis."
+        )
+        effective_method = "stop_buffer"
 
     final_routes_df = get_included_routes(routes_df, routes_to_include, routes_to_exclude)
     if final_routes_df.empty:
         logging.info("No routes remain after route filters. Aborting stop-by-stop analysis.")
         return
 
-    # Merge the relevant GTFS data
-    trips_merged = trips.merge(final_routes_df[["route_id", "route_short_name"]], on="route_id")
-    merged_data = stop_times.merge(trips_merged, on="trip_id")
-    merged_data = merged_data.merge(stops_df, on="stop_id")
-
-    # Filter stops per user-specified ID filters
-    final_stops_df = get_included_stops(merged_data, stop_ids_to_include, stop_ids_to_exclude)
-    if final_stops_df.empty:
+    stops_gdf = _stops_to_points_gdf(
+        trips, stop_times, stops_df, final_routes_df, stop_ids_to_include, stop_ids_to_exclude
+    )
+    if stops_gdf is None:
         logging.info("No stops remain after stop filters. Aborting stop-by-stop analysis.")
         return
 
-    # Convert to GeoDataFrame in projected CRS
-    final_stops_df["geometry"] = final_stops_df.apply(
-        lambda row: Point(row["stop_lon"], row["stop_lat"]), axis=1
-    )
-    stops_gdf = gpd.GeoDataFrame(final_stops_df, geometry="geometry", crs="EPSG:4326").to_crs(
-        epsg=CRS_EPSG_CODE
-    )
-
-    # Apply variable buffer logic
-    stops_gdf["buffer_distance_meters"] = stops_gdf["stop_id"].apply(
-        lambda sid: (
-            pick_buffer_distance(
-                sid,
-                normal_buffer=buffer_distance_mi,
-                large_buffer=large_buffer_distance_mi,
-                large_buffer_ids=stop_ids_large_buffer,
-            )
-            * 1609.34
-        )
-    )
-
-    # For each stop, create a buffer, clip, and store results
-    unique_stops = stops_gdf["stop_id"].unique()
     os.makedirs(output_dir, exist_ok=True)
-
-    for sid in unique_stops:
-        single_stop_gdf = stops_gdf[stops_gdf["stop_id"] == sid]
+    for sid in stops_gdf["stop_id"].unique():
+        single_stop_gdf = stops_gdf[stops_gdf["stop_id"] == sid].drop_duplicates(subset="stop_id")
         if single_stop_gdf.empty:
             continue
 
         stop_id_str = str(sid)
-        # Buffer
-        single_stop_gdf["geometry"] = single_stop_gdf.apply(
-            lambda row: row.geometry.buffer(row["buffer_distance_meters"]), axis=1
+        service_area_gdf = build_service_area_polygon(
+            single_stop_gdf,
+            method=effective_method,
+            buffer_distance_mi=buffer_distance_mi,
+            large_buffer_distance_mi=large_buffer_distance_mi,
+            stop_ids_large_buffer=stop_ids_large_buffer,
+            ped_graph=ped_graph,
+            walk_time_min=walk_time_min,
+            walk_speed_units_per_s=walk_speed_units_per_s,
         )
-        # Dissolve in case stop appears in multiple trips
-        single_stop_buffer = single_stop_gdf.dissolve().reset_index(drop=True)
+        if service_area_gdf is None or service_area_gdf.empty:
+            logging.info("Could not build a service area for stop %s - skipping.", stop_id_str)
+            continue
 
-        # Clip
         clipped_result = clip_and_calculate_synthetic_fields(
-            demographics_gdf, single_stop_buffer, synthetic_fields
+            demographics_gdf, service_area_gdf, synthetic_fields
         )
         synthetic_cols = [f"synthetic_{f}" for f in synthetic_fields]
         totals = clipped_result[synthetic_cols].sum().round(0)
@@ -610,20 +1027,18 @@ def do_stop_by_stop_analysis(
             display_col = str(col).replace("synthetic_", "").replace("_", " ").title()
             logging.info("  Total Synthetic %s: %d", display_col, int(val))
 
-        # Export shapefile
         shp_path = os.path.join(output_dir, f"stop_{stop_id_str}_service_buffer_data.shp")
         clipped_result.to_file(shp_path)
         logging.info("Exported shapefile for stop %s: %s", stop_id_str, shp_path)
 
-        # Export summary to Excel
         xlsx_path = os.path.join(output_dir, f"stop_{stop_id_str}_service_buffer_data.xlsx")
         final_dict = {col: int(val) for col, val in totals.items()}
         export_summary_to_excel(final_dict, xlsx_path)
 
-        # Optional plot
         fig, ax = plt.subplots(figsize=(8, 8))
-        single_stop_buffer.plot(ax=ax, alpha=0.5, label=f"Stop {stop_id_str} Buffer")
-        plt.title(f"Stop {stop_id_str} Buffer Overlay")
+        service_area_gdf.plot(ax=ax, alpha=0.5, label=f"Stop {stop_id_str} Service Area")
+        single_stop_gdf.plot(ax=ax, color="black", markersize=8, label="Stop")
+        plt.title(f"Stop {stop_id_str} Service Area ({effective_method})")
         plt.legend()
         plt.show()
 
@@ -775,6 +1190,17 @@ def main() -> None:
 
     try:
         # --------------------------------------------------------------
+        # 0) VALIDATE SERVICE-AREA METHOD
+        # --------------------------------------------------------------
+        service_area_method = SERVICE_AREA_METHOD.lower()
+        valid_methods = {"stop_buffer", "route_buffer", "isochrone"}
+        if service_area_method not in valid_methods:
+            raise ValueError(
+                f"Invalid SERVICE_AREA_METHOD: {SERVICE_AREA_METHOD!r}. "
+                f"Choose one of {sorted(valid_methods)}."
+            )
+
+        # --------------------------------------------------------------
         # 1) LOAD GTFS
         # --------------------------------------------------------------
         gtfs_raw = load_gtfs_data(
@@ -786,6 +1212,40 @@ def main() -> None:
         stop_times = gtfs_raw["stop_times"]
         routes_df = gtfs_raw["routes"]
         stops_df = gtfs_raw["stops"]
+
+        # Route geometry from shapes.txt — required for the "route_buffer"
+        # method, optional otherwise. Loaded opportunistically.
+        shapes_df: Optional[pd.DataFrame] = None
+        shapes_path = os.path.join(str(GTFS_DATA_PATH), ROUTE_GEOMETRY_GTFS_FILE)
+        if os.path.exists(shapes_path):
+            shapes_df = pd.read_csv(shapes_path, dtype=str, low_memory=False)
+            logging.info("Loaded %s (%d records).", ROUTE_GEOMETRY_GTFS_FILE, len(shapes_df))
+        elif service_area_method == "route_buffer":
+            logging.warning(
+                "SERVICE_AREA_METHOD is 'route_buffer' but %s was not found in %s; "
+                "the analysis will fall back to stop buffers.",
+                ROUTE_GEOMETRY_GTFS_FILE,
+                GTFS_DATA_PATH,
+            )
+
+        # --------------------------------------------------------------
+        # 1b) PEDESTRIAN NETWORK (only for the "isochrone" method)
+        # --------------------------------------------------------------
+        ped_graph: Optional[nx.MultiGraph] = None
+        # Walking speed expressed in projected-CRS units per second (metres/s,
+        # since CRS_EPSG_CODE is assumed metric).
+        walk_speed_units_per_s = WALK_SPEED_MPH * METERS_PER_MILE / 3_600.0
+        if service_area_method == "isochrone":
+            ped_path = Path(PEDESTRIAN_NETWORK_PATH)
+            if not ped_path.is_file():
+                raise FileNotFoundError(
+                    f"Pedestrian network shapefile not found: {ped_path}. "
+                    "It is required for the 'isochrone' method."
+                )
+            centerlines = gpd.read_file(ped_path).to_crs(epsg=CRS_EPSG_CODE)
+            ped_graph, _ = build_pedestrian_time_network(
+                centerlines, walk_speed=walk_speed_units_per_s
+            )
 
         # --------------------------------------------------------------
         # 2) OPTIONAL CALENDAR FILTER
@@ -817,59 +1277,35 @@ def main() -> None:
         # 4) ANALYSIS DISPATCH
         # --------------------------------------------------------------
         mode = ANALYSIS_MODE.lower()
-        if mode == "network":
-            do_network_analysis(
-                trips,
-                stop_times,
-                routes_df,
-                stops_df,
-                demographics_gdf,
-                ROUTES_TO_INCLUDE,
-                ROUTES_TO_EXCLUDE,
-                STOP_IDS_TO_INCLUDE,
-                STOP_IDS_TO_EXCLUDE,
-                BUFFER_DISTANCE,
-                LARGE_BUFFER_DISTANCE,
-                STOP_IDS_LARGE_BUFFER,
-                str(OUTPUT_DIRECTORY),
-                SYNTHETIC_FIELDS,
-            )
-        elif mode == "route":
-            do_route_by_route_analysis(
-                trips,
-                stop_times,
-                routes_df,
-                stops_df,
-                demographics_gdf,
-                ROUTES_TO_INCLUDE,
-                ROUTES_TO_EXCLUDE,
-                STOP_IDS_TO_INCLUDE,
-                STOP_IDS_TO_EXCLUDE,
-                BUFFER_DISTANCE,
-                LARGE_BUFFER_DISTANCE,
-                STOP_IDS_LARGE_BUFFER,
-                str(OUTPUT_DIRECTORY),
-                SYNTHETIC_FIELDS,
-            )
-        elif mode == "stop":
-            do_stop_by_stop_analysis(
-                trips,
-                stop_times,
-                routes_df,
-                stops_df,
-                demographics_gdf,
-                ROUTES_TO_INCLUDE,
-                ROUTES_TO_EXCLUDE,
-                STOP_IDS_TO_INCLUDE,
-                STOP_IDS_TO_EXCLUDE,
-                BUFFER_DISTANCE,
-                LARGE_BUFFER_DISTANCE,
-                STOP_IDS_LARGE_BUFFER,
-                str(OUTPUT_DIRECTORY),
-                SYNTHETIC_FIELDS,
-            )
-        else:
+        analysis_dispatch = {
+            "network": do_network_analysis,
+            "route": do_route_by_route_analysis,
+            "stop": do_stop_by_stop_analysis,
+        }
+        if mode not in analysis_dispatch:
             raise ValueError(f"Invalid ANALYSIS_MODE: {ANALYSIS_MODE}")
+
+        analysis_dispatch[mode](
+            trips,
+            stop_times,
+            routes_df,
+            stops_df,
+            demographics_gdf,
+            ROUTES_TO_INCLUDE,
+            ROUTES_TO_EXCLUDE,
+            STOP_IDS_TO_INCLUDE,
+            STOP_IDS_TO_EXCLUDE,
+            BUFFER_DISTANCE,
+            LARGE_BUFFER_DISTANCE,
+            STOP_IDS_LARGE_BUFFER,
+            str(OUTPUT_DIRECTORY),
+            SYNTHETIC_FIELDS,
+            service_area_method=service_area_method,
+            shapes_df=shapes_df,
+            ped_graph=ped_graph,
+            walk_time_min=ISOCHRONE_WALK_TIME_MIN,
+            walk_speed_units_per_s=walk_speed_units_per_s,
+        )
 
         logging.info("\nAnalysis completed successfully.")
 
