@@ -214,7 +214,7 @@ JupyterLab is an advanced interactive development environment for data science a
 
 ## 🤝 Contributing
 
-We welcome your contributions! Feel free to open an issue or submit a pull request.
+Contributions are welcome — bug reports, new scripts, or improvements to existing ones. Please read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request; it covers branch naming, commit message conventions, testing requirements, and code style expectations.
 
 ## 📄 License
 
