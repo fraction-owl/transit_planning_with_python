@@ -525,7 +525,7 @@ def _normalize_pct(x: float) -> float:
         return 0.0
     try:
         v = float(x)
-    except Exception:
+    except (ValueError, TypeError):
         return 0.0
     if v < 0:
         return 0.0
@@ -693,7 +693,7 @@ def add_synthetic_fields(
             for (v,) in cur2:
                 try:
                     vals.append(float(v))
-                except Exception:
+                except (ValueError, TypeError):
                     pass
         if vals:
             logging.info(
@@ -913,7 +913,7 @@ def clip_demographics_to_buffers(
     # Make sure large FCs have a spatial index (idempotent)
     try:
         arcpy.management.AddSpatialIndex(demographics_fc)
-    except Exception:
+    except arcpy.ExecuteError:
         pass
 
     # Ensure output container exists and is writable
@@ -933,7 +933,7 @@ def clip_demographics_to_buffers(
         else:
             logging.info("Running Clip …")
             arcpy.analysis.Clip(demographics_fc, buffers_for_clip, result_path)
-    except Exception as exc1:
+    except arcpy.ExecuteError as exc1:
         logging.warning("Primary clip failed: %s", exc1)
         # Fallback: Intersect polygons with buffer
         try:
@@ -1094,7 +1094,7 @@ def calc_original_area_for_intersecting(
         try:
             if arcpy.Exists(sel_buf):
                 arcpy.management.Delete(sel_buf)
-        except Exception:
+        except arcpy.ExecuteError:
             pass
 
 

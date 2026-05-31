@@ -314,7 +314,7 @@ def _make_stops_fc_from_gtfs(stops_df: pd.DataFrame, sr_proj: arcpy.SpatialRefer
             try:
                 x = float(r["stop_lon"])
                 y = float(r["stop_lat"])
-            except Exception:
+            except (ValueError, TypeError):
                 continue
             icur.insertRow(((x, y), str(r["stop_id"])))
 
@@ -480,7 +480,7 @@ def _quick_plot_site(
         elif gi["type"] == "MultiPolygon":
             for poly in gi["coordinates"]:
                 outlines.append(poly)
-    except Exception:
+    except (AttributeError, KeyError, TypeError):
         outlines = []
 
     fig, ax = plt.subplots(figsize=(6, 6), dpi=dpi)
@@ -533,7 +533,7 @@ def _in_ipython() -> bool:
         from IPython import get_ipython  # type: ignore
 
         return get_ipython() is not None
-    except Exception:
+    except ImportError:
         return False
 
 
