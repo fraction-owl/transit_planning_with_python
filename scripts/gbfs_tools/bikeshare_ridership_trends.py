@@ -1,4 +1,4 @@
-"""Summarize Capital Bikeshare trip extracts into ridership-over-time outputs.
+r"""Summarize Capital Bikeshare trip extracts into ridership-over-time outputs.
 
 Reads a set of per-month Capital Bikeshare trip CSVs -- the vendor extracts
 named ``YYYYMM-capitalbikeshare-tripdata.csv``, as produced by

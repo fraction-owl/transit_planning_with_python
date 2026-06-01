@@ -27,16 +27,6 @@ transit_planning_with_python/
 │   │   ├── uscensus_table_build.py
 │   │   ├── uscensus_tiger_join_arcpy.py
 │   │   └── uscensus_tiger_join_gpd.py
-│   ├── data_quality/
-│   │   ├── compare_gtfs_to_shapefile_arcpy.py
-│   │   ├── compare_gtfs_to_shapefile_gpd.py
-│   │   ├── gtfs_skipped_stop_flagger_gpd.py
-│   │   ├── gtfs_stop_proximity_qc.py
-│   │   ├── gtfs_usps_suffix_validator.py
-│   │   ├── stop_v_conflict_checker_arcpy.py
-│   │   ├── stop_v_conflict_checker_gpd.py
-│   │   ├── stop_vs_roadname_checker_arcpy.py
-│   │   └── stop_vs_roadname_checker_gpd.py
 │   ├── facilities_tools/
 │   │   ├── bay_usage_analyzer.py
 │   │   ├── flag_stop_upgrades.py
@@ -49,6 +39,16 @@ transit_planning_with_python/
 │   ├── gbfs_tools/
 │   │   ├── bikeshare_ridership_trends.py
 │   │   └── gbfs_stations_exporter.py
+│   ├── gtfs_data_quality/
+│   │   ├── compare_gtfs_to_shapefile_arcpy.py
+│   │   ├── compare_gtfs_to_shapefile_gpd.py
+│   │   ├── gtfs_skipped_stop_flagger_gpd.py
+│   │   ├── gtfs_stop_proximity_qc.py
+│   │   ├── gtfs_usps_suffix_validator.py
+│   │   ├── stop_v_conflict_checker_arcpy.py
+│   │   ├── stop_v_conflict_checker_gpd.py
+│   │   ├── stop_vs_roadname_checker_arcpy.py
+│   │   └── stop_vs_roadname_checker_gpd.py
 │   ├── gtfs_exports/
 │   │   ├── block_status_timeline_exporter.py
 │   │   ├── bus_block_exporter.py

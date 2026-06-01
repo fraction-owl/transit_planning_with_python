@@ -20,7 +20,7 @@ Generate GTFS-to-Census catchment areas and calculate service coverage by distri
 
 ### GTFS Data Quality & Validation *(arcpy + GeoPandas)*
 Catch errors before they go live. Cross-check GTFS stops against road centerlines, flag skipped stops, validate stop spacing and proximity, check USPS suffix conventions, and identify stops that conflict with road geometry.
-*Folder:* `data_quality/`
+*Folder:* `gtfs_data_quality/`
 
 ### Network & Stop Impact Analysis *(arcpy + GeoPandas)*
 Quantify what changes when you remove or relocate a stop. Score the downstream impact of stop removals on target routes, flag stop-spacing outliers, and compare GTFS stop sets across versions.

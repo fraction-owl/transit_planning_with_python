@@ -98,7 +98,7 @@ MIN_SEG_FT = 10.0  # reject slivers shorter than this
 
 # --- Asphalt (road-surface) polygons -------------------------------------------------------------
 # Per road-class half-width (feet) used to buffer centerlines into road-surface
-# polygons. Consumed by scripts/data_quality/stop_v_conflict_checker_gpd.py, which
+# polygons. Consumed by scripts/gtfs_data_quality/stop_v_conflict_checker_gpd.py, which
 # flags GTFS stops that INTERSECT the road surface (i.e., sit in the roadbed).
 ASPHALT_HALF_WIDTH_FT: Dict[str, float] = {
     "PRI": 24.0,  # primary arterial: ~4 lanes + median
