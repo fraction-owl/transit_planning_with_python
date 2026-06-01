@@ -1,4 +1,4 @@
-"""Tests for scripts/data_quality/stop_v_conflict_checker_gpd.py."""
+"""Tests for scripts/gtfs_data_quality/stop_v_conflict_checker_gpd.py."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import pandas as pd
 import pytest
 from shapely.geometry import Point
 
-script_dir = Path("scripts/data_quality").resolve()
+script_dir = Path("scripts/gtfs_data_quality").resolve()
 if str(script_dir) not in sys.path:
     sys.path.append(str(script_dir))
 

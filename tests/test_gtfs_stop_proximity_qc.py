@@ -1,4 +1,4 @@
-"""Tests for scripts/data_quality/gtfs_stop_proximity_qc.py."""
+"""Tests for scripts/gtfs_data_quality/gtfs_stop_proximity_qc.py."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-script_dir = Path("scripts/data_quality").resolve()
+script_dir = Path("scripts/gtfs_data_quality").resolve()
 if str(script_dir) not in sys.path:
     sys.path.append(str(script_dir))
 
