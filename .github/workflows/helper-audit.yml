@@ -1,0 +1,59 @@
+# .github/workflows/helper-audit.yml
+name: helper-audit
+
+on:
+  pull_request:
+    paths:                     # optional — limit to Python changes
+      - '**/*.py'
+      - '.github/workflows/helper-audit.yml'
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 🛎️  Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🐍  Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'     # keep in sync with your runtime
+
+      - name: 📦  Install dependencies (if any)
+        run: |
+          python -m pip install --upgrade pip
+          # pip install -r requirements.txt  # uncomment if you rely on deps
+
+      - name: 🔍  Run helper‑function consistency audit
+        id: audit
+        run: python dev_tools/audit_helper_functions.py
+
+      - name: 💬  Post PR comment on divergence
+        if: failure() && steps.audit.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          AUDIT_RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          cat > /tmp/helper_audit_comment.md << EOF
+### ⚠️ Helper-function divergences detected — PR blocked
+
+At least one script contains a local copy of a helper function that has drifted from the canonical version in \`utils/\`.
+
+**Fix:** re-copy the affected function(s) from \`utils/\` into the script(s) flagged above, then push again.
+
+See the **Run helper-function consistency audit** step in the [workflow run](${AUDIT_RUN_URL}) for the exact diff.
+
+> Per [CONTRIBUTING.md](CONTRIBUTING.md): copy helpers from \`utils/\`, don't import them at runtime — and keep copies in sync.
+EOF
+          gh pr comment "${{ github.event.pull_request.number }}" \
+            --repo "${{ github.repository }}" \
+            --edit-last \
+            --body-file /tmp/helper_audit_comment.md 2>/dev/null \
+          || gh pr comment "${{ github.event.pull_request.number }}" \
+            --repo "${{ github.repository }}" \
+            --body-file /tmp/helper_audit_comment.md

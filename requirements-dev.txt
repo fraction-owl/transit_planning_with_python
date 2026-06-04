@@ -1,0 +1,30 @@
+
+# =============================================================================
+# Dev / Test tooling — not needed to run the project
+# =============================================================================
+# Install after requirements.txt:
+#   pip install -r requirements.txt -r requirements-dev.txt
+# -----------------------------------------------------------------------------
+
+# Testing
+faker==25.8.0                # Fake data generation for tests
+pytest==8.3.5                # Unit testing framework
+pytest-cov                   # Test coverage reporting
+
+# Linting & formatting
+# Keep this version in sync with `rev` in .pre-commit-config.yaml.
+ruff==0.15.12                # Linting & formatting
+pre-commit                   # Local git hooks (ruff)
+
+# Type checking
+ty                           # Non-blocking type checks
+
+# Data Processing
+polars==0.20.31              # Fast DataFrames (used by dev fixture builders)
+
+# ------------- Typing stubs (temporary) -------------------------------------
+pandas-stubs==2.2.*
+types-openpyxl>=3.1,<5
+types-networkx>=3.4,<4
+#types-faker>=25,<26
+#types-rapidfuzz>=3.11,<4

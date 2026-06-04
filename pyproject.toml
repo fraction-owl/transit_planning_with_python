@@ -1,0 +1,127 @@
+# pyproject.toml
+
+# ================================================================
+# PYTHON LINTING, FORMATTING & TYPE CHECKING
+# ================================================================
+# ----------------------------------------------------------------
+# ruff
+# ----------------------------------------------------------------
+[tool.ruff]
+target-version = "py312"
+line-length    = 100
+
+[tool.ruff.lint]
+# ----------------------------------------------------------------
+# Rule selection
+# ----------------------------------------------------------------
+select = [
+    # --- Import hygiene ---
+    "I",    # isort: enforces a consistent import order (stdlib →
+            #   third-party → first-party), grouped and alphabetized.
+    "F",    # Pyflakes: catches unused imports, undefined names,
+            #   redefinitions, unused variables
+
+    # --- Documentation ---
+    "D",    # pydocstyle: enforces docstring presence and formatting.
+            #   Convention is pinned to Google style below.
+
+    # --- Typing ---
+    "ANN",  # flake8-annotations: requires type hints on function
+            #   signatures
+    "TC",   # flake8-type-checking: flags imports used *only* in
+            #   annotations and suggests moving them under
+            #   `if TYPE_CHECKING:` to avoid runtime cost.
+
+    # --- General code quality ---
+    "B",    # flake8-bugbear: opinionated checks for likely bugs
+            #   and design problems
+    "E",    # pycodestyle errors: PEP 8 layout rules
+            #   (indentation, whitespace, statement structure).
+    "W",    # pycodestyle warnings: softer PEP 8 issues
+            #   (trailing whitespace, deprecated syntax).
+
+    # --- Domain-specific ---
+    "PD",   # pandas-vet: catches common pandas anti-patterns —
+            #   chained .ix/.iat misuse, inplace=True,
+            #   df.values over df.to_numpy(), etc.
+            #   High value here because most of the repo is
+            #   pandas/geopandas pipelines.
+    "T20",  # flake8-print: bans print() and pprint()
+            #   (T201, T203). CONTRIBUTING.md mandates logging
+            #   instead, so this enforces the stated policy in CI
+            #   rather than relying on reviewer memory.
+]
+
+# ----------------------------------------------------------------
+# Auto-fixable rules
+# ----------------------------------------------------------------
+# Ruff *can* auto-fix many rules, but this list restricts which
+# ones it's *allowed* to touch via `--fix`. The intent is "fix
+# only changes that are mechanical and unambiguous"; everything
+# else should require a human decision.
+fixable = [
+    "F401", # Unused imports — safe to remove automatically.
+    "D",    # Docstring formatting (quote style, period at end of
+            #   summary line, blank-line placement).
+    "I",    # Import ordering — purely a sort operation.
+]
+
+# ----------------------------------------------------------------
+# Suppressed rules
+# ----------------------------------------------------------------
+ignore = [
+    "ANN401", # Allow `typing.Any`. Strict typing is the goal, but
+              #   wrapping arcpy/geopandas/3rd-party return values
+              #   in `Any` is sometimes the only honest annotation.
+    "TC002",  # Don't force third-party imports used only in type
+              #   hints into a `TYPE_CHECKING` block. The runtime
+              #   cost is negligible for this repo and the
+              #   refactor noise isn't worth it.
+    "TC003",  # Same rationale for standard-library imports.
+    "B905",   # zip() without strict= is intentional: strict= was
+              #   added in Python 3.10 and this codebase targets
+              #   3.9+.
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Keep tests lean: skip module docstrings and param annotations for fixtures.
+"tests/**/*" = ["D100", "D101", "D102", "D103", "D104", "D105", "D106", "D107", "ANN001"]
+# dev_tools are CLI scripts where print() is the intended output mechanism.
+"dev_tools/**/*" = ["T201"]
+# arcpy scripts target the ArcPy-bundled Python (<3.10) where zip() has no strict= parameter.
+"**/*arcpy*" = ["B905"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+# ----------------------------------------------------------------
+# ty
+# ----------------------------------------------------------------
+[tool.ty]
+
+[tool.ty.src]
+exclude = ["**/*arcpy*"]
+
+[tool.ty.environment]
+python-version = "3.12"
+extra-paths = ["scripts/ridership_tools", "scripts/operations_tools"]
+
+[tool.ty.rules]
+unsupported-operator = "error"
+invalid-return-type = "warn"
+unresolved-import = "error"
+invalid-assignment = "error"
+invalid-argument-type = "warn"
+not-subscriptable = "warn"
+not-iterable = "warn"
+no-matching-overload = "warn"
+invalid-parameter-default = "error"
+possibly-missing-attribute = "warn"
+redundant-cast = "error"
+unresolved-reference = "error"
+unresolved-attribute = "warn"
+unresolved-global = "warn"
+
+# ================================================================
+# COMMIT MESSAGE LINTING
+# ================================================================
