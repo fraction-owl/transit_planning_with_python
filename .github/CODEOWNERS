@@ -1,0 +1,9 @@
+# Code owners for transit_planning_with_python
+#
+# The repository owner is the default reviewer for every path. With a branch
+# ruleset that has "Require review from Code Owners" enabled, changes to any
+# file will request—and require—review from @fraction-owl.
+#
+# Docs: https://docs.github.com/articles/about-code-owners
+
+*       @fraction-owl
