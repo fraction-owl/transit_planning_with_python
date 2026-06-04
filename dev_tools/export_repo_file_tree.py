@@ -117,7 +117,7 @@ def main(
     output_path = os.path.join(output_dir, output_filename)
     try:
         with open(output_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines))
+            f.write("\n".join(lines) + "\n")
         print(f"\nWrote structure to {output_path}")
     except OSError as e:
         print(f"Error writing to {output_path}: {e}", file=sys.stderr)
