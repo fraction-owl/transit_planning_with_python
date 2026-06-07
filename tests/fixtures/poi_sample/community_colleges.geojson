@@ -1,0 +1,10 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {"name": "Northern Virginia Community College - Ox Campus"},
+      "geometry": {"type": "Point", "coordinates": [-77.0879, 38.7639]}
+    }
+  ]
+}

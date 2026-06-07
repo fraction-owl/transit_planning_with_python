@@ -1,0 +1,15 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {"name": "Robin Hood Market"},
+      "geometry": {"type": "Point", "coordinates": [-77.0822, 38.7462]}
+    },
+    {
+      "type": "Feature",
+      "properties": {"name": "Doe St Grocery"},
+      "geometry": {"type": "Point", "coordinates": [-77.0839, 38.7519]}
+    }
+  ]
+}

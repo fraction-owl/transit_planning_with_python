@@ -1,0 +1,10 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {"name": "Mt Vernon Community Center"},
+      "geometry": {"type": "Point", "coordinates": [-77.0802, 38.7402]}
+    }
+  ]
+}

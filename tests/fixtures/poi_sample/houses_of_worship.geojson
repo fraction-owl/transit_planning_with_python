@@ -1,0 +1,20 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {"name": "Mt Vernon Community Church", "weekday": "Sunday"},
+      "geometry": {"type": "Point", "coordinates": [-77.0801, 38.7401]}
+    },
+    {
+      "type": "Feature",
+      "properties": {"name": "Beth Shalom Synagogue", "weekday": "Saturday"},
+      "geometry": {"type": "Point", "coordinates": [-77.0841, 38.7521]}
+    },
+    {
+      "type": "Feature",
+      "properties": {"name": "Al-Noor Mosque", "weekday": "Friday"},
+      "geometry": {"type": "Point", "coordinates": [-77.0951, 38.7521]}
+    }
+  ]
+}

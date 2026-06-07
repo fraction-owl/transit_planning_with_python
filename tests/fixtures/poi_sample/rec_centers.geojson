@@ -1,0 +1,10 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {"name": "Lockheed Recreation Center"},
+      "geometry": {"type": "Point", "coordinates": [-77.0859, 38.7579]}
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {"name": "Potomac State University"},
+      "geometry": {"type": "Point", "coordinates": [-77.0861, 38.7581]}
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {"name": "Mount Vernon General Hospital"},
+      "geometry": {"type": "Point", "coordinates": [-77.0799, 38.7399]}
+    }
+  ]
+}

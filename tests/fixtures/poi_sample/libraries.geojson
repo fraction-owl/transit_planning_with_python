@@ -1,0 +1,15 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {"name": "Robin Hood Branch Library"},
+      "geometry": {"type": "Point", "coordinates": [-77.0819, 38.7459]}
+    },
+    {
+      "type": "Feature",
+      "properties": {"name": "Beacon Hill Branch Library"},
+      "geometry": {"type": "Point", "coordinates": [-77.0901, 38.7701]}
+    }
+  ]
+}
