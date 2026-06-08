@@ -204,7 +204,7 @@ def clean_series(df: pd.DataFrame, *, use_long_names: bool = USE_LONG_NAMES) -> 
     date_col = _resolve_date_col(df.columns)
     df[date_col] = pd.to_datetime(df[date_col], format=DATE_FORMAT)
     df = df.sort_values(date_col).reset_index(drop=True)
-    date_pos = df.columns.get_loc(date_col)
+    date_pos = int(df.columns.get_loc(date_col))
     df.insert(date_pos + 1, "YEAR", df[date_col].dt.year.astype("int16"))
     df.insert(date_pos + 2, "MONTH", df[date_col].dt.month.astype("int8"))
     df.insert(date_pos + 3, "QUARTER", df[date_col].dt.quarter.astype("int8"))

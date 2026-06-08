@@ -149,7 +149,7 @@ def clean_weather(df: pd.DataFrame, *, use_long_names: bool = USE_LONG_NAMES) ->
     # 2. Parse and order the date axis, then add calendar columns next to it.
     df["DATE"] = pd.to_datetime(df["DATE"], format=DATE_FORMAT)
     df = df.sort_values("DATE").reset_index(drop=True)
-    date_pos = df.columns.get_loc("DATE")
+    date_pos = int(df.columns.get_loc("DATE"))
     df.insert(date_pos + 1, "YEAR", df["DATE"].dt.year.astype("int16"))
     df.insert(date_pos + 2, "MONTH", df["DATE"].dt.month.astype("int8"))
     df.insert(date_pos + 3, "DAY_OF_WEEK", df["DATE"].dt.day_name())
