@@ -80,15 +80,20 @@ EIA_DATE_FORMATS = ("%d-%b-%y", "%b %d, %Y", "%Y-%m-%d", "%m/%d/%Y")
 
 
 def _add_file_log(path: Path) -> logging.FileHandler:
-    """Attach a .txt file handler to this module's logger, replacing any stale
-    one from a prior run so repeated notebook calls don't duplicate lines."""
+    """Attach a .txt file handler to this module's logger.
+
+    Replaces any stale handler from a prior run so repeated notebook calls
+    don't duplicate lines.
+    """
     for handler in list(logger.handlers):
         if isinstance(handler, logging.FileHandler):
             logger.removeHandler(handler)
             handler.close()
     path.parent.mkdir(parents=True, exist_ok=True)
     fh = logging.FileHandler(path, mode="w", encoding="utf-8")
-    fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S"))
+    fh.setFormatter(
+        logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S")
+    )
     fh.setLevel(logging.INFO)
     logger.addHandler(fh)
     return fh
@@ -109,8 +114,11 @@ def _prompt_path(label: str, *, must_exist: bool) -> Path:
 
 
 def _in_ipython_kernel() -> bool:
-    """True inside a Jupyter/IPython kernel, where sys.argv holds the kernel
-    launcher args (e.g. ``-f ...kernel.json``) rather than user CLI args."""
+    """Return True inside a Jupyter/IPython kernel.
+
+    There ``sys.argv`` holds the kernel launcher args (e.g. ``-f
+    ...kernel.json``) rather than user CLI args.
+    """
     return "ipykernel" in sys.modules or Path(sys.argv[0]).name == "ipykernel_launcher.py"
 
 
@@ -128,7 +136,8 @@ def _parse_dates(s: pd.Series) -> pd.Series:
     If DATE_FORMAT is set, honor it. Otherwise try each known EIA format in turn
     and accept the first that parses >=99% of non-blank values, then fall back to
     pandas inference. Blank cells (NOAA-style trailing padding) become NaT and are
-    dropped by the caller."""
+    dropped by the caller.
+    """
     raw = s.astype("string").str.strip()
     nonblank = raw.notna() & (raw != "")
     n = int(nonblank.sum())
@@ -154,8 +163,11 @@ def _parse_dates(s: pd.Series) -> pd.Series:
 
 
 def _check_missing_weeks(dates: pd.Series) -> None:
-    """Warn about missing weekly surveys. EIA posts every Monday, so the date
-    axis should be a contiguous run of Mondays; gaps mean a skipped survey."""
+    """Warn about missing weekly surveys.
+
+    EIA posts every Monday, so the date axis should be a contiguous run of
+    Mondays; gaps mean a skipped survey.
+    """
     days = pd.to_datetime(dates).dt.normalize()
     start, end = days.min(), days.max()
     full = pd.date_range(start, end, freq="W-MON")
@@ -166,13 +178,19 @@ def _check_missing_weeks(dates: pd.Series) -> None:
         return
     logger.warning(
         "%d of %d weekly surveys missing in %s..%s (%.1f%% of range)",
-        len(missing), total, start.date(), end.date(), 100 * len(missing) / total,
+        len(missing),
+        total,
+        start.date(),
+        end.date(),
+        100 * len(missing) / total,
     )
     listed = [d.date().isoformat() for d in missing]
     if len(listed) <= 20:
         logger.warning("missing weeks: %s", ", ".join(listed))
     else:
-        logger.warning("missing weeks (first 20 of %d): %s ...", len(listed), ", ".join(listed[:20]))
+        logger.warning(
+            "missing weeks (first 20 of %d): %s ...", len(listed), ", ".join(listed[:20])
+        )
 
 
 def _coverage_report(df: pd.DataFrame, value_cols: list[str]) -> None:
@@ -180,7 +198,8 @@ def _coverage_report(df: pd.DataFrame, value_cols: list[str]) -> None:
 
     Series start at different times (RFG post-1995, ULSD ~2007), so a column can
     be mostly empty over the full file yet dense over a recent model window. The
-    point is to make 'which series are usable over my window' visible up front."""
+    point is to make 'which series are usable over my window' visible up front.
+    """
     dates = df["DATE"]
     logger.info("per-series coverage (first reading .. last reading | n | density in span):")
     for col in value_cols:
@@ -201,7 +220,8 @@ def load_eia_weekly(path: Path, *, use_long_names: bool = USE_LONG_NAMES) -> pd.
     The file has three header lines: a banner, a ``Sourcekey`` row, and a
     long-name row. We read the long-name row as the header (row 3) and pull the
     sourcekey row separately; the two align column-for-column by position, which
-    is how each long label is mapped back to its stable sourcekey -> token."""
+    is how each long label is mapped back to its stable sourcekey -> token.
+    """
     keys = pd.read_csv(path, skiprows=1, nrows=1, header=None).iloc[0].tolist()
     df = pd.read_csv(path, skiprows=2)
 
@@ -229,7 +249,9 @@ def load_eia_weekly(path: Path, *, use_long_names: bool = USE_LONG_NAMES) -> pd.
         keep.append(df.columns[i])
 
     if dropped:
-        logger.info("dropping %d header-artifact column(s) with no sourcekey: %s", len(dropped), dropped)
+        logger.info(
+            "dropping %d header-artifact column(s) with no sourcekey: %s", len(dropped), dropped
+        )
     if unknown:
         logger.warning("unmapped EIA sourcekeys (kept as raw keys): %s", unknown)
     logger.info("EIA series mapping (%d price columns):", len(mapping))
@@ -245,8 +267,11 @@ def load_eia_weekly(path: Path, *, use_long_names: bool = USE_LONG_NAMES) -> pd.
 
 
 def clean_weekly(df: pd.DataFrame) -> pd.DataFrame:
-    """Return a faithful, analysis-ready *weekly* copy: parsed dates, numeric
-    prices, coverage logged, all-empty series dropped."""
+    """Return a faithful, analysis-ready *weekly* copy.
+
+    Dates are parsed, prices coerced to numeric, coverage logged, and
+    all-empty series dropped.
+    """
     df = df.copy()
 
     # 1. Parse and order the date axis.
@@ -277,7 +302,8 @@ def to_monthly(weekly: pd.DataFrame) -> pd.DataFrame:
 
     Month value = mean of that month's weekly readings (per series, skipping
     weeks with no reading). ``N_WEEKS`` is the count of survey weeks landing in
-    the month -- use it to drop thin partial months at the series boundaries."""
+    the month -- use it to drop thin partial months at the series boundaries.
+    """
     m = weekly.copy()
     m["YEAR"] = m["DATE"].dt.year.astype("int16")
     m["MONTH"] = m["DATE"].dt.month.astype("int8")
@@ -288,7 +314,8 @@ def to_monthly(weekly: pd.DataFrame) -> pd.DataFrame:
     monthly["N_WEEKS"] = grouped.size().to_numpy()
 
     monthly.insert(
-        0, "MONTH_START",
+        0,
+        "MONTH_START",
         pd.to_datetime(dict(year=monthly["YEAR"], month=monthly["MONTH"], day=1)),
     )
     monthly["YEAR"] = monthly["YEAR"].astype("int16")
@@ -333,7 +360,8 @@ def run(
 
     Unset args fall back to the config block, resolved at call time -- so
     ``m.INPUT_PATH = ...; m.run()`` works as expected after a plain import.
-    Returns the monthly frame."""
+    Returns the monthly frame.
+    """
     _ensure_logging()
     input_path = INPUT_PATH if input_path is None else Path(input_path)
     output_path = OUTPUT_PATH if output_path is None else Path(output_path)
@@ -379,7 +407,8 @@ def main(argv: list[str] | None = None) -> None:
     argv (``-f kernel.json``), which argparse would reject, so we skip parsing
     and let ``run()`` resolve from the config block or prompt. On the command
     line, ``--input`` / ``--output`` override the config; omit them (with config
-    left as None) to be prompted."""
+    left as None) to be prompted.
+    """
     _ensure_logging()
     if argv is None and _in_ipython_kernel():
         logger.info("kernel detected; resolving paths from config block or prompt")
@@ -388,7 +417,9 @@ def main(argv: list[str] | None = None) -> None:
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--input", type=Path, default=INPUT_PATH, help="input EIA CSV path")
-    parser.add_argument("--output", type=Path, default=OUTPUT_PATH, help="output path (.parquet/.csv)")
+    parser.add_argument(
+        "--output", type=Path, default=OUTPUT_PATH, help="output path (.parquet/.csv)"
+    )
     parser.add_argument(
         "--long-names",
         action=argparse.BooleanOptionalAction,
@@ -409,8 +440,11 @@ def main(argv: list[str] | None = None) -> None:
     )
     args = parser.parse_args(argv)
     run(
-        args.input, args.output,
-        use_long_names=args.long_names, write_log=args.log, write_weekly=args.weekly,
+        args.input,
+        args.output,
+        use_long_names=args.long_names,
+        write_log=args.log,
+        write_weekly=args.weekly,
     )
 
 

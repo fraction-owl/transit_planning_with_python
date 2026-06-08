@@ -52,15 +52,20 @@ SERIES_LONG_NAMES = {
 
 
 def _add_file_log(path: Path) -> logging.FileHandler:
-    """Attach a .txt file handler to this module's logger, replacing any stale
-    one from a prior run so repeated notebook calls don't duplicate lines."""
+    """Attach a .txt file handler to this module's logger.
+
+    Replaces any stale handler from a prior run so repeated notebook calls
+    don't duplicate lines.
+    """
     for handler in list(logger.handlers):
         if isinstance(handler, logging.FileHandler):
             logger.removeHandler(handler)
             handler.close()
     path.parent.mkdir(parents=True, exist_ok=True)
     fh = logging.FileHandler(path, mode="w", encoding="utf-8")
-    fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S"))
+    fh.setFormatter(
+        logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S")
+    )
     fh.setLevel(logging.INFO)
     logger.addHandler(fh)
     return fh
@@ -81,8 +86,11 @@ def _prompt_path(label: str, *, must_exist: bool) -> Path:
 
 
 def _in_ipython_kernel() -> bool:
-    """True inside a Jupyter/IPython kernel, where sys.argv holds the kernel
-    launcher args (e.g. ``-f ...kernel.json``) rather than user CLI args."""
+    """Return True inside a Jupyter/IPython kernel.
+
+    There ``sys.argv`` holds the kernel launcher args (e.g. ``-f
+    ...kernel.json``) rather than user CLI args.
+    """
     return "ipykernel" in sys.modules or Path(sys.argv[0]).name == "ipykernel_launcher.py"
 
 
@@ -99,12 +107,17 @@ def _resolve_date_col(columns: pd.Index) -> str:
 
     FRED's modern web download labels it ``observation_date``; legacy fredgraph
     and ALFRED exports use ``DATE``. We fall back to the leftmost column rather
-    than fail, since FRED always puts the date first."""
+    than fail, since FRED always puts the date first.
+    """
     for cand in DATE_COL_CANDIDATES:
         if cand in columns:
             return cand
     first = columns[0]
-    logger.warning("no %s column found; treating leftmost column %r as the date axis", " / ".join(DATE_COL_CANDIDATES), first)
+    logger.warning(
+        "no %s column found; treating leftmost column %r as the date axis",
+        " / ".join(DATE_COL_CANDIDATES),
+        first,
+    )
     return first
 
 
@@ -115,7 +128,8 @@ def _infer_frequency(dates: pd.Series) -> str | None:
     expected period index, or None if the cadence is irregular and a gap check
     would be meaningless. Daily classification is best-effort: a business-day
     series (no weekend observations) is reported as ``B``, so market holidays
-    will read as small gaps -- visibility, not an assertion of data loss."""
+    will read as small gaps -- visibility, not an assertion of data loss.
+    """
     days = dates.sort_values().diff().dropna().dt.days
     if days.empty:
         return None
@@ -140,29 +154,40 @@ def _check_missing_periods(dates: pd.Series) -> None:
     This is about *absent rows*, not present rows with a NaN value -- the latter
     is reported separately as missing observations. The headline is a WARNING
     with count and percentage of the full span, mirroring the daily check but in
-    the series' own native cadence (months for UNRATE, quarters for GDP, ...)."""
+    the series' own native cadence (months for UNRATE, quarters for GDP, ...).
+    """
     days = pd.to_datetime(dates).dt.normalize()
     freq = _infer_frequency(days)
     start, end = days.min(), days.max()
     if freq is None:
-        logger.info("irregular cadence in %s..%s; skipping missing-period check", start.date(), end.date())
+        logger.info(
+            "irregular cadence in %s..%s; skipping missing-period check", start.date(), end.date()
+        )
         return
     full = pd.date_range(start, end, freq=freq)
     missing = full.difference(pd.DatetimeIndex(days.unique()))
     total = len(full)
-    logger.info("inferred cadence %s over %s..%s (%d periods)", freq, start.date(), end.date(), total)
+    logger.info(
+        "inferred cadence %s over %s..%s (%d periods)", freq, start.date(), end.date(), total
+    )
     if len(missing) == 0:
         logger.info("no missing periods")
         return
     logger.warning(
         "%d of %d periods missing in %s..%s (%.1f%% of range)",
-        len(missing), total, start.date(), end.date(), 100 * len(missing) / total,
+        len(missing),
+        total,
+        start.date(),
+        end.date(),
+        100 * len(missing) / total,
     )
     listed = [d.date().isoformat() for d in missing]
     if len(listed) <= 20:
         logger.warning("missing periods: %s", ", ".join(listed))
     else:
-        logger.warning("missing periods (first 20 of %d): %s ...", len(listed), ", ".join(listed[:20]))
+        logger.warning(
+            "missing periods (first 20 of %d): %s ...", len(listed), ", ".join(listed[:20])
+        )
 
 
 def clean_series(df: pd.DataFrame, *, use_long_names: bool = USE_LONG_NAMES) -> pd.DataFrame:
@@ -217,7 +242,11 @@ def clean_series(df: pd.DataFrame, *, use_long_names: bool = USE_LONG_NAMES) -> 
     #    then optionally apply it. Mapping is logged regardless of the choice.
     present = {c: SERIES_LONG_NAMES[c] for c in value_cols if c in SERIES_LONG_NAMES}
     unknown = [c for c in value_cols if c not in SERIES_LONG_NAMES]
-    logger.info("FRED series-id -> title mapping (%d of %d value columns known):", len(present), len(value_cols))
+    logger.info(
+        "FRED series-id -> title mapping (%d of %d value columns known):",
+        len(present),
+        len(value_cols),
+    )
     for code, title in present.items():
         logger.info("  %s -> %s", code, title)
     if unknown:
@@ -241,7 +270,8 @@ def run(
     """Notebook entry point: clean ``input_path`` and write ``output_path``.
 
     Unset args fall back to the config block, resolved at call time -- so
-    ``m.INPUT_PATH = ...; m.run()`` works as expected after a plain import."""
+    ``m.INPUT_PATH = ...; m.run()`` works as expected after a plain import.
+    """
     _ensure_logging()
     input_path = INPUT_PATH if input_path is None else Path(input_path)
     output_path = OUTPUT_PATH if output_path is None else Path(output_path)
@@ -287,7 +317,8 @@ def main(argv: list[str] | None = None) -> None:
     argv (``-f kernel.json``), which argparse would reject, so we skip parsing
     and let ``run()`` resolve from the config block or prompt. On the command
     line, ``--input`` / ``--output`` override the config; omit them (with config
-    left as None) to be prompted."""
+    left as None) to be prompted.
+    """
     _ensure_logging()
     if argv is None and _in_ipython_kernel():
         logger.info("kernel detected; resolving paths from config block or prompt")
@@ -296,7 +327,9 @@ def main(argv: list[str] | None = None) -> None:
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--input", type=Path, default=INPUT_PATH, help="input CSV path")
-    parser.add_argument("--output", type=Path, default=OUTPUT_PATH, help="output path (.parquet/.csv)")
+    parser.add_argument(
+        "--output", type=Path, default=OUTPUT_PATH, help="output path (.parquet/.csv)"
+    )
     parser.add_argument(
         "--long-names",
         action=argparse.BooleanOptionalAction,

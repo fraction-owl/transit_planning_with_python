@@ -60,15 +60,20 @@ COLUMN_LONG_NAMES = {
 
 
 def _add_file_log(path: Path) -> logging.FileHandler:
-    """Attach a .txt file handler to this module's logger, replacing any stale
-    one from a prior run so repeated notebook calls don't duplicate lines."""
+    """Attach a .txt file handler to this module's logger.
+
+    Replaces any stale handler from a prior run so repeated notebook calls
+    don't duplicate lines.
+    """
     for handler in list(logger.handlers):
         if isinstance(handler, logging.FileHandler):
             logger.removeHandler(handler)
             handler.close()
     path.parent.mkdir(parents=True, exist_ok=True)
     fh = logging.FileHandler(path, mode="w", encoding="utf-8")
-    fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S"))
+    fh.setFormatter(
+        logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S")
+    )
     fh.setLevel(logging.INFO)
     logger.addHandler(fh)
     return fh
@@ -89,8 +94,11 @@ def _prompt_path(label: str, *, must_exist: bool) -> Path:
 
 
 def _in_ipython_kernel() -> bool:
-    """True inside a Jupyter/IPython kernel, where sys.argv holds the kernel
-    launcher args (e.g. ``-f ...kernel.json``) rather than user CLI args."""
+    """Return True inside a Jupyter/IPython kernel.
+
+    There ``sys.argv`` holds the kernel launcher args (e.g. ``-f
+    ...kernel.json``) rather than user CLI args.
+    """
     return "ipykernel" in sys.modules or Path(sys.argv[0]).name == "ipykernel_launcher.py"
 
 
@@ -106,7 +114,8 @@ def _check_missing_days(dates: pd.Series) -> None:
     """Warn about calendar days with no row inside the observed date range.
 
     A day or two missing is usually benign; the point is visibility, so the
-    headline is a WARNING with count and percentage of the full span."""
+    headline is a WARNING with count and percentage of the full span.
+    """
     days = pd.to_datetime(dates).dt.normalize()
     start, end = days.min(), days.max()
     full = pd.date_range(start, end, freq="D")
@@ -117,7 +126,11 @@ def _check_missing_days(dates: pd.Series) -> None:
         return
     logger.warning(
         "%d of %d days missing in %s..%s (%.1f%% of range)",
-        len(missing), total, start.date(), end.date(), 100 * len(missing) / total,
+        len(missing),
+        total,
+        start.date(),
+        end.date(),
+        100 * len(missing) / total,
     )
     listed = [d.date().isoformat() for d in missing]
     if len(listed) <= 20:
@@ -188,7 +201,8 @@ def run(
     """Notebook entry point: clean ``input_path`` and write ``output_path``.
 
     Unset args fall back to the config block, resolved at call time -- so
-    ``m.INPUT_PATH = ...; m.run()`` works as expected after a plain import."""
+    ``m.INPUT_PATH = ...; m.run()`` works as expected after a plain import.
+    """
     _ensure_logging()
     input_path = INPUT_PATH if input_path is None else Path(input_path)
     output_path = OUTPUT_PATH if output_path is None else Path(output_path)
@@ -234,7 +248,8 @@ def main(argv: list[str] | None = None) -> None:
     argv (``-f kernel.json``), which argparse would reject, so we skip parsing
     and let ``run()`` resolve from the config block or prompt. On the command
     line, ``--input`` / ``--output`` override the config; omit them (with config
-    left as None) to be prompted."""
+    left as None) to be prompted.
+    """
     _ensure_logging()
     if argv is None and _in_ipython_kernel():
         logger.info("kernel detected; resolving paths from config block or prompt")
@@ -243,7 +258,9 @@ def main(argv: list[str] | None = None) -> None:
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--input", type=Path, default=INPUT_PATH, help="input CSV path")
-    parser.add_argument("--output", type=Path, default=OUTPUT_PATH, help="output path (.parquet/.csv)")
+    parser.add_argument(
+        "--output", type=Path, default=OUTPUT_PATH, help="output path (.parquet/.csv)"
+    )
     parser.add_argument(
         "--long-names",
         action=argparse.BooleanOptionalAction,
