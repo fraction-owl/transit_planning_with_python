@@ -88,6 +88,8 @@ ignore = [
 "tests/**/*" = ["D100", "D101", "D102", "D103", "D104", "D105", "D106", "D107", "ANN001"]
 # dev_tools are CLI scripts where print() is the intended output mechanism.
 "dev_tools/**/*" = ["T201"]
+# exogenous_tools prompt interactively; print() is feedback paired with input(), not logging.
+"scripts/exogenous_tools/**/*" = ["T201"]
 # arcpy scripts target the ArcPy-bundled Python (<3.10) where zip() has no strict= parameter.
 "**/*arcpy*" = ["B905"]
 
