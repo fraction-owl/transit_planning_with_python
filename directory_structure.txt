@@ -31,6 +31,10 @@ transit_planning_with_python/
 │   │   ├── uscensus_table_build.py
 │   │   ├── uscensus_tiger_join_arcpy.py
 │   │   └── uscensus_tiger_join_gpd.py
+│   ├── exogenous_tools/
+│   │   ├── clean_eia_gas_prices.py
+│   │   ├── clean_fred_unrate.py
+│   │   └── clean_noaa_weather.py
 │   ├── facilities_tools/
 │   │   ├── bay_usage_analyzer.py
 │   │   ├── flag_stop_upgrades.py
@@ -99,6 +103,7 @@ transit_planning_with_python/
 │   │   │   ├── stop_times.txt
 │   │   │   ├── stops.txt
 │   │   │   └── trips.txt
+│   │   ├── 4331222_sample.csv
 │   │   ├── 98-401-X2021006_eng_CSV.zip
 │   │   ├── ACSDT5Y2024.B01001_2026-05-23T135534.zip
 │   │   ├── ACSDT5Y2024.B08201_2026-05-23T135430.zip
@@ -108,6 +113,8 @@ transit_planning_with_python/
 │   │   ├── DECENNIALDHC2020.H1_2026-05-23T134937.zip
 │   │   ├── DECENNIALDHC2020.P9_2026-05-23T135214.zip
 │   │   ├── DECENNIALPL2020.P1_2026-05-23T133835.zip
+│   │   ├── PET_PRI_GND_DCUS_NUS_W_Data_1__sample.csv
+│   │   ├── UNRATE_sample.csv
 │   │   ├── capitalbikeshare_fixtures_24mo.zip
 │   │   ├── dc_wac_S000_JT00_2023.csv.gz
 │   │   ├── lda_000b21a_e_sample.zip
@@ -132,6 +139,9 @@ transit_planning_with_python/
 │   ├── test_block_status_timeline_exporter.py
 │   ├── test_bus_block_exporter.py
 │   ├── test_cacensus_da_join_gpd.py
+│   ├── test_clean_eia_gas_prices.py
+│   ├── test_clean_fred_unrate.py
+│   ├── test_clean_noaa_weather.py
 │   ├── test_data_request_by_stop_processor.py
 │   ├── test_flag_stop_upgrades.py
 │   ├── test_gbfs_ridership_join.py
