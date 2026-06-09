@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from scripts.ridership_tools import ridership_regression_model as rrm
+from scripts.modeling import ridership_regression_model as rrm
 
 
 @pytest.fixture

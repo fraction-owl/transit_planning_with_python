@@ -62,6 +62,8 @@ transit_planning_with_python/
 │   │   ├── stop_pattern_exporter.py
 │   │   ├── time_band_exporter.py
 │   │   └── timepoint_schedule_exporter.py
+│   ├── modeling/
+│   │   └── ridership_regression_model.py
 │   ├── operations_tools/
 │   │   ├── convert_to_tides_stop_visits.py
 │   │   ├── convert_to_tides_trips_performed.py
@@ -75,7 +77,6 @@ transit_planning_with_python/
 │   │   ├── load_factor_monitor.py
 │   │   ├── ntd_monthly_summary.py
 │   │   ├── ntd_monthly_trends_export.py
-│   │   ├── ridership_regression_model.py
 │   │   ├── stops_ridership_joiner_arcpy.py
 │   │   └── stops_ridership_joiner_gpd.py
 │   ├── service_coverage/

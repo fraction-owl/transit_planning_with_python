@@ -7,8 +7,12 @@ Welcome to **Transit Planning With Python**, a toolkit of off‑the‑shelf Pyth
 A toolkit for transit planners and analysts. Most spatial tools ship in both `arcpy` and GeoPandas flavors, so the repo is usable whether or not your agency licenses ArcGIS Pro.
 
 ### Ridership & NTD Trend Analysis *(arcpy + GeoPandas)*
-Turn NTD-format monthly summaries into route-level trend reports, process ridership by stop, and join ridership figures to stop geometries. Load factor monitoring is also included, built on ridecheck outputs — the data shape varies between agencies, but the underlying structure is robust and adaptable. A no-dependencies OLS ridership model (`ridership_regression_model.py`) ties NTD ridership to the service supplied (scheduled hours/miles), exogenous context (gas, unemployment, weather), and demographic and points-of-interest coverage — built entirely on the ArcGIS Pro `numpy`/`scipy` stack, so it needs no machine-learning package.
+Turn NTD-format monthly summaries into route-level trend reports, process ridership by stop, and join ridership figures to stop geometries. Load factor monitoring is also included, built on ridecheck outputs — the data shape varies between agencies, but the underlying structure is robust and adaptable.
 *Folder:* `ridership_tools/`
+
+### Demand Modeling *(advanced)*
+For analysts comfortable assembling their own modeling tables. A multiple-regression ridership model (`ridership_regression_model.py`) ties NTD ridership to the service supplied (scheduled hours/miles), exogenous context (gas, unemployment, weather), and demographic and points-of-interest coverage. It hand-rolls OLS — coefficients, robust standard errors, VIFs, and the usual diagnostics — entirely on the ArcGIS Pro `numpy`/`scipy` stack, so it needs no machine-learning package.
+*Folder:* `modeling/`
 
 ### OTP & Runtime Diagnostics
 Stop guessing where buses are getting delayed. Pivot route-level OTP trends, diagnose runtime by trip event, and analyze segment-level runtimes. Includes CleverWorks-to-TIDES converters for stop visits and trips performed.
