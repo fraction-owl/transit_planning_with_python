@@ -34,7 +34,8 @@ transit_planning_with_python/
 │   ├── exogenous_tools/
 │   │   ├── clean_eia_gas_prices.py
 │   │   ├── clean_fred_unrate.py
-│   │   └── clean_noaa_weather.py
+│   │   ├── clean_noaa_weather.py
+│   │   └── schools_prep_join.py
 │   ├── facilities_tools/
 │   │   ├── bay_usage_analyzer.py
 │   │   ├── flag_stop_upgrades.py
