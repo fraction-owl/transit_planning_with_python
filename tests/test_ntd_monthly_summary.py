@@ -502,6 +502,121 @@ def test_build_monthly_timeseries_pph() -> None:
 
 
 # ---------------------------------------------------------------------------
+# weekday_holiday_counts
+# ---------------------------------------------------------------------------
+
+
+def test_weekday_holiday_counts_groups_by_month() -> None:
+    # Jul 4 2024 (Thu) and Sep 2 2024 (Mon) are both weekdays.
+    holidays = [datetime(2024, 7, 4), datetime(2024, 9, 2)]
+    assert mod.weekday_holiday_counts(holidays) == {"Jul-2024": 1, "Sep-2024": 1}
+
+
+def test_weekday_holiday_counts_ignores_weekend_holidays() -> None:
+    # Jul 6 2024 is a Saturday, Jul 7 2024 is a Sunday — both ignored.
+    holidays = [datetime(2024, 7, 6), datetime(2024, 7, 7)]
+    assert mod.weekday_holiday_counts(holidays) == {}
+
+
+def test_weekday_holiday_counts_accumulates_same_month() -> None:
+    holidays = [datetime(2024, 11, 28), datetime(2024, 11, 29)]  # Thu + Fri
+    assert mod.weekday_holiday_counts(holidays) == {"Nov-2024": 2}
+
+
+def test_weekday_holiday_counts_empty() -> None:
+    assert mod.weekday_holiday_counts([]) == {}
+
+
+# ---------------------------------------------------------------------------
+# summarize_service_days
+# ---------------------------------------------------------------------------
+
+
+def test_summarize_service_days_representative_days(minimal_ntd_df: pd.DataFrame) -> None:
+    with patch.object(mod, "ORDERED_PERIODS", ["Jul-2024"]):
+        result = mod.summarize_service_days(minimal_ntd_df, {"Jul-2024": 1})
+    row = result[result["period"] == "Jul-2024"].iloc[0]
+    assert row["Weekday"] == 22
+    assert row["Saturday"] == 4
+    assert row["Sunday"] == 5
+    assert row["Holidays"] == 1
+
+
+def test_summarize_service_days_no_holidays_defaults_zero(minimal_ntd_df: pd.DataFrame) -> None:
+    with patch.object(mod, "ORDERED_PERIODS", ["Jul-2024"]):
+        result = mod.summarize_service_days(minimal_ntd_df)
+    assert result["Holidays"].iloc[0] == 0
+
+
+def test_summarize_service_days_columns() -> None:
+    with patch.object(mod, "ORDERED_PERIODS", ["Jul-2024"]):
+        result = mod.summarize_service_days(
+            pd.DataFrame(columns=["period", "SERVICE_PERIOD", "DAYS"])
+        )
+    assert list(result.columns) == ["period", "Weekday", "Saturday", "Sunday", "Holidays"]
+
+
+# ---------------------------------------------------------------------------
+# with_weekday_ex_holiday_columns
+# ---------------------------------------------------------------------------
+
+
+def _weekday_routes_df() -> pd.DataFrame:
+    """Two weekday months for one route: 22 + 20 = 42 weekday DAYS, 8800 boards."""
+    return pd.DataFrame(
+        {
+            "service_type": ["local", "local"],
+            "ROUTE_NAME": ["101", "101"],
+            "period": ["Jul-2024", "Aug-2024"],
+            "SERVICE_PERIOD": ["Weekday", "Weekday"],
+            "MTH_BOARD": [4400.0, 4400.0],
+            "DAYS": [22.0, 20.0],
+            "MTH_REV_HOURS": [400.0, 360.0],
+            "MTH_PASS_MILES": [10000.0, 9000.0],
+            "REV_MILES": [500.0, 500.0],
+            "MTH_REV_MILES": [11000.0, 10000.0],
+            "TOTAL_TRIPS": [1000.0, 900.0],
+        }
+    )
+
+
+def test_with_weekday_ex_holiday_columns_adds_adjusted_columns() -> None:
+    weekday_df = _weekday_routes_df()
+    summary = mod.route_level_summary(weekday_df)
+    # 3 weekday holidays across the two months → denominator 42 - 3 = 39.
+    result = mod.with_weekday_ex_holiday_columns(
+        summary, weekday_df, {"Jul-2024": 2, "Aug-2024": 1}
+    )
+    row = result[result["ROUTE_NAME"] == "101"].iloc[0]
+    assert row["DAYS_EX_HOLIDAYS"] == pytest.approx(39.0)
+    assert row["DAILY_AVG_EX_HOLIDAYS"] == pytest.approx(round(8800 / 39, 1))
+    # The raw DAILY_AVG column is left untouched.
+    assert row["DAILY_AVG"] == pytest.approx(round(8800 / 42, 1))
+
+
+def test_with_weekday_ex_holiday_columns_unchanged_when_no_holiday_in_range() -> None:
+    weekday_df = _weekday_routes_df()
+    summary = mod.route_level_summary(weekday_df)
+    result = mod.with_weekday_ex_holiday_columns(summary, weekday_df, {"Dec-2024": 2})
+    assert "DAYS_EX_HOLIDAYS" not in result.columns
+    assert "DAILY_AVG_EX_HOLIDAYS" not in result.columns
+
+
+def test_with_weekday_ex_holiday_columns_unchanged_when_no_holidays() -> None:
+    weekday_df = _weekday_routes_df()
+    summary = mod.route_level_summary(weekday_df)
+    result = mod.with_weekday_ex_holiday_columns(summary, weekday_df, {})
+    assert "DAYS_EX_HOLIDAYS" not in result.columns
+
+
+def test_with_weekday_ex_holiday_columns_empty_input() -> None:
+    empty = _weekday_routes_df().iloc[0:0]
+    summary = mod.route_level_summary(empty)
+    result = mod.with_weekday_ex_holiday_columns(summary, empty, {"Jul-2024": 2})
+    assert "DAYS_EX_HOLIDAYS" not in result.columns
+
+
+# ---------------------------------------------------------------------------
 # detect_negative_trends_12m
 # ---------------------------------------------------------------------------
 
@@ -670,3 +785,26 @@ def test_write_run_log_content_includes_config(tmp_path: Path) -> None:
     mod.write_run_log(tmp_path)
     content = (tmp_path / "ntd_monthly_summary_runlog.txt").read_text()
     assert "DATA_ROOT" in content
+
+
+def test_write_run_log_omits_service_day_section_when_none(tmp_path: Path) -> None:
+    mod.write_run_log(tmp_path)
+    content = (tmp_path / "ntd_monthly_summary_runlog.txt").read_text()
+    assert "SERVICE-DAY COUNTS PER MONTH" not in content
+
+
+def test_write_run_log_includes_service_day_table(tmp_path: Path) -> None:
+    service_days = pd.DataFrame(
+        {
+            "period": ["Jul-2024"],
+            "Weekday": [22],
+            "Saturday": [4],
+            "Sunday": [5],
+            "Holidays": [1],
+        }
+    )
+    mod.write_run_log(tmp_path, service_days)
+    content = (tmp_path / "ntd_monthly_summary_runlog.txt").read_text()
+    assert "SERVICE-DAY COUNTS PER MONTH" in content
+    assert "Holidays" in content
+    assert "Jul-2024" in content
