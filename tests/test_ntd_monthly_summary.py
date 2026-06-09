@@ -557,70 +557,53 @@ def test_summarize_service_days_columns() -> None:
 
 
 # ---------------------------------------------------------------------------
-# build_monthly_timeseries — holiday subtraction
+# route_level_summary_ex_holidays
 # ---------------------------------------------------------------------------
 
 
-def _weekday_avg_input() -> pd.DataFrame:
+def _weekday_routes_df() -> pd.DataFrame:
+    """Two weekday months for one route: 22 + 20 = 42 weekday DAYS, 8800 boards."""
     return pd.DataFrame(
         {
-            "period": ["Jul-2024"],
-            "ROUTE_NAME": ["101"],
-            "SERVICE_PERIOD": ["Weekday"],
-            "MTH_BOARD": [2200.0],
-            "DAYS": [22.0],
-            "MTH_REV_HOURS": [100.0],
-            "TOTAL_TRIPS": [200.0],
-            "MTH_REV_MILES": [400.0],
+            "service_type": ["local", "local"],
+            "ROUTE_NAME": ["101", "101"],
+            "period": ["Jul-2024", "Aug-2024"],
+            "SERVICE_PERIOD": ["Weekday", "Weekday"],
+            "MTH_BOARD": [4400.0, 4400.0],
+            "DAYS": [22.0, 20.0],
+            "MTH_REV_HOURS": [400.0, 360.0],
+            "MTH_PASS_MILES": [10000.0, 9000.0],
+            "REV_MILES": [500.0, 500.0],
+            "MTH_REV_MILES": [11000.0, 10000.0],
+            "TOTAL_TRIPS": [1000.0, 900.0],
         }
     )
 
 
-def test_build_monthly_timeseries_subtracts_weekday_holidays() -> None:
-    with patch.object(mod, "ORDERED_PERIODS", ["Jul-2024"]):
-        result = mod.build_monthly_timeseries(
-            _weekday_avg_input(), {"Jul-2024": 2}, subtract_holidays=True
-        )
-    row = result[result["route"] == "101"].iloc[0]
-    # denominator 22 - 2 = 20 → 2200 / 20 = 110
-    assert row["weekday_avg"] == pytest.approx(110.0)
-
-
-def test_build_monthly_timeseries_no_subtract_when_flag_off() -> None:
-    with patch.object(mod, "ORDERED_PERIODS", ["Jul-2024"]):
-        result = mod.build_monthly_timeseries(
-            _weekday_avg_input(), {"Jul-2024": 2}, subtract_holidays=False
-        )
-    row = result[result["route"] == "101"].iloc[0]
-    assert row["weekday_avg"] == pytest.approx(round(2200 / 22, 1))
-
-
-def test_build_monthly_timeseries_saturday_avg_never_adjusted() -> None:
-    df = pd.DataFrame(
-        {
-            "period": ["Jul-2024"],
-            "ROUTE_NAME": ["101"],
-            "SERVICE_PERIOD": ["Saturday"],
-            "MTH_BOARD": [400.0],
-            "DAYS": [4.0],
-            "MTH_REV_HOURS": [20.0],
-            "TOTAL_TRIPS": [40.0],
-            "MTH_REV_MILES": [80.0],
-        }
+def test_route_level_summary_ex_holidays_adjusts_daily_avg() -> None:
+    # 3 weekday holidays across the two months → denominator 42 - 3 = 39.
+    result = mod.route_level_summary_ex_holidays(
+        _weekday_routes_df(), {"Jul-2024": 2, "Aug-2024": 1}
     )
-    with patch.object(mod, "ORDERED_PERIODS", ["Jul-2024"]):
-        result = mod.build_monthly_timeseries(df, {"Jul-2024": 2}, subtract_holidays=True)
-    row = result[result["route"] == "101"].iloc[0]
-    # Saturday denominator is left untouched: 400 / 4 = 100
-    assert row["saturday_avg"] == pytest.approx(100.0)
+    assert result is not None
+    row = result[result["ROUTE_NAME"] == "101"].iloc[0]
+    assert row["WEEKDAY_HOLIDAYS"] == pytest.approx(3.0)
+    assert row["DAILY_AVG"] == pytest.approx(round(8800 / 39, 1))
 
 
-def test_build_monthly_timeseries_default_holiday_args() -> None:
-    """Called with no holiday args, behaviour matches the legacy unadjusted path."""
-    with patch.object(mod, "ORDERED_PERIODS", ["Jul-2024"]):
-        result = mod.build_monthly_timeseries(_weekday_avg_input())
-    row = result[result["route"] == "101"].iloc[0]
-    assert row["weekday_avg"] == pytest.approx(round(2200 / 22, 1))
+def test_route_level_summary_ex_holidays_none_when_no_holiday_in_range() -> None:
+    # Holidays exist but none fall in the covered months → nothing to export.
+    result = mod.route_level_summary_ex_holidays(_weekday_routes_df(), {"Dec-2024": 2})
+    assert result is None
+
+
+def test_route_level_summary_ex_holidays_none_when_no_holidays() -> None:
+    assert mod.route_level_summary_ex_holidays(_weekday_routes_df(), {}) is None
+
+
+def test_route_level_summary_ex_holidays_empty_input() -> None:
+    empty = _weekday_routes_df().iloc[0:0]
+    assert mod.route_level_summary_ex_holidays(empty, {"Jul-2024": 2}) is None
 
 
 # ---------------------------------------------------------------------------
@@ -810,7 +793,7 @@ def test_write_run_log_includes_service_day_table(tmp_path: Path) -> None:
             "Holidays": [1],
         }
     )
-    mod.write_run_log(tmp_path, service_days, subtract_holidays=True)
+    mod.write_run_log(tmp_path, service_days)
     content = (tmp_path / "ntd_monthly_summary_runlog.txt").read_text()
     assert "SERVICE-DAY COUNTS PER MONTH" in content
     assert "Holidays" in content
