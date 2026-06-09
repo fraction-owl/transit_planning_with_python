@@ -13,7 +13,7 @@ Typical predictors:
     - Demographic service coverage: population, low-income, minority, zero-car
       households reached by each route (``service_coverage`` outputs).
     - Points-of-interest coverage: strategic sites / jobs reached by each route
-      (``route_site_coverage`` outputs).
+      (``points_of_interest_coverage`` outputs).
 
 Features:
     - Joins an "anchor" ridership table to any number of feature tables on a
@@ -116,7 +116,7 @@ FEATURE_TABLES: Final[list[FeatureTable]] = [
     ),
     FeatureTable(
         label="poi_coverage",
-        path=Path(r"Path\To\Your\route_site_coverage.csv"),
+        path=Path(r"Path\To\Your\points_of_interest_coverage.csv"),
         join_keys=("route_id",),
         keep_cols=("sites_served", "jobs_served"),
     ),
