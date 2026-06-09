@@ -7,6 +7,8 @@ structural and semantic defects only (blank padding rows, WT event-flag
 semantics, dtypes, date axis) and adds calendar columns. Feature engineering and
 feature selection -- including which weather variables matter for ridership --
 live in separate downstream steps, so this frame stays reusable across consumers.
+
+Source: https://www.ncei.noaa.gov/cdo-web/search
 """
 
 from __future__ import annotations

@@ -7,6 +7,8 @@ Standalone script: edit the config block and call ``run()`` (notebook) or run as
 ``Sourcekey`` row, a long-name row) over weekly Monday observations in
 ``DD-Mon-YY`` format.
 
+Source: https://www.eia.gov/dnav/pet/pet_pri_gnd_dcus_nus_w.htm
+
 Cleaning here is deliberately *faithful and non-opinionated*: it repairs
 structural defects (the EIA header block, dtypes, date axis), renames the
 opaque sourcekeys to compact tokens, reports per-series coverage, and rolls the
