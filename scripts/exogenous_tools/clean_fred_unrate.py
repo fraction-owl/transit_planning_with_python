@@ -13,6 +13,8 @@ reusable across consumers and across series (UNRATE, PAYEMS, CPIAUCSL, ...).
 The script is generic over a single FRED series export and over the multi-series
 ``fredgraph`` shape (one date column, N value columns); it is not specific to
 UNRATE. The value column(s) are detected as everything that is not the date axis.
+
+Source (UNRATE): https://fred.stlouisfed.org/series/UNRATE
 """
 
 from __future__ import annotations
