@@ -557,7 +557,7 @@ def test_summarize_service_days_columns() -> None:
 
 
 # ---------------------------------------------------------------------------
-# route_level_summary_ex_holidays
+# with_weekday_ex_holiday_columns
 # ---------------------------------------------------------------------------
 
 
@@ -580,30 +580,40 @@ def _weekday_routes_df() -> pd.DataFrame:
     )
 
 
-def test_route_level_summary_ex_holidays_adjusts_daily_avg() -> None:
+def test_with_weekday_ex_holiday_columns_adds_adjusted_columns() -> None:
+    weekday_df = _weekday_routes_df()
+    summary = mod.route_level_summary(weekday_df)
     # 3 weekday holidays across the two months → denominator 42 - 3 = 39.
-    result = mod.route_level_summary_ex_holidays(
-        _weekday_routes_df(), {"Jul-2024": 2, "Aug-2024": 1}
+    result = mod.with_weekday_ex_holiday_columns(
+        summary, weekday_df, {"Jul-2024": 2, "Aug-2024": 1}
     )
-    assert result is not None
     row = result[result["ROUTE_NAME"] == "101"].iloc[0]
-    assert row["WEEKDAY_HOLIDAYS"] == pytest.approx(3.0)
-    assert row["DAILY_AVG"] == pytest.approx(round(8800 / 39, 1))
+    assert row["DAYS_EX_HOLIDAYS"] == pytest.approx(39.0)
+    assert row["DAILY_AVG_EX_HOLIDAYS"] == pytest.approx(round(8800 / 39, 1))
+    # The raw DAILY_AVG column is left untouched.
+    assert row["DAILY_AVG"] == pytest.approx(round(8800 / 42, 1))
 
 
-def test_route_level_summary_ex_holidays_none_when_no_holiday_in_range() -> None:
-    # Holidays exist but none fall in the covered months → nothing to export.
-    result = mod.route_level_summary_ex_holidays(_weekday_routes_df(), {"Dec-2024": 2})
-    assert result is None
+def test_with_weekday_ex_holiday_columns_unchanged_when_no_holiday_in_range() -> None:
+    weekday_df = _weekday_routes_df()
+    summary = mod.route_level_summary(weekday_df)
+    result = mod.with_weekday_ex_holiday_columns(summary, weekday_df, {"Dec-2024": 2})
+    assert "DAYS_EX_HOLIDAYS" not in result.columns
+    assert "DAILY_AVG_EX_HOLIDAYS" not in result.columns
 
 
-def test_route_level_summary_ex_holidays_none_when_no_holidays() -> None:
-    assert mod.route_level_summary_ex_holidays(_weekday_routes_df(), {}) is None
+def test_with_weekday_ex_holiday_columns_unchanged_when_no_holidays() -> None:
+    weekday_df = _weekday_routes_df()
+    summary = mod.route_level_summary(weekday_df)
+    result = mod.with_weekday_ex_holiday_columns(summary, weekday_df, {})
+    assert "DAYS_EX_HOLIDAYS" not in result.columns
 
 
-def test_route_level_summary_ex_holidays_empty_input() -> None:
+def test_with_weekday_ex_holiday_columns_empty_input() -> None:
     empty = _weekday_routes_df().iloc[0:0]
-    assert mod.route_level_summary_ex_holidays(empty, {"Jul-2024": 2}) is None
+    summary = mod.route_level_summary(empty)
+    result = mod.with_weekday_ex_holiday_columns(summary, empty, {"Jul-2024": 2})
+    assert "DAYS_EX_HOLIDAYS" not in result.columns
 
 
 # ---------------------------------------------------------------------------

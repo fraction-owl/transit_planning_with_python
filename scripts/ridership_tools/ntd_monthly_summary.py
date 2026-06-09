@@ -110,10 +110,10 @@ TIME_WINDOWS: Final[list[TimeWindow]] = [
 # NTD workbooks report service days only as Weekday / Saturday / Sunday and do
 # not flag holidays separately. List holiday dates here so the script can
 # (a) report how many weekday holidays fell in each month and (b) when any
-# weekday holiday falls inside the covered months, export a second weekday
-# route summary whose daily average excludes those holidays, alongside the
-# regular one. Only holidays that fall on a weekday are considered; holidays
-# landing on a Saturday or Sunday are ignored.
+# weekday holiday falls inside the covered months, add DAYS_EX_HOLIDAYS and
+# DAILY_AVG_EX_HOLIDAYS columns to the weekday route summary. Only holidays that
+# fall on a weekday are considered; holidays landing on a Saturday or Sunday are
+# ignored.
 
 HOLIDAYS: Final[list[datetime]] = [
     datetime(2026, 1, 19),  # Martin Luther King, Jr. Day
@@ -409,22 +409,26 @@ def route_level_summary(df: pd.DataFrame) -> pd.DataFrame:
     return totals
 
 
-def route_level_summary_ex_holidays(
+def with_weekday_ex_holiday_columns(
+    weekday_summary: pd.DataFrame,
     weekday_df: pd.DataFrame,
     holiday_counts: dict[str, int],
-) -> pd.DataFrame | None:
-    """Weekday route summary with ``DAILY_AVG`` over holiday-free weekdays.
+) -> pd.DataFrame:
+    """Append holiday-free weekday columns to a weekday route summary.
 
-    *weekday_df* must already be filtered to ``SERVICE_PERIOD == "Weekday"``.
-    Each route's weekday ``DAYS`` total loses the weekday holidays that fell in
-    the months it operated, and ``DAILY_AVG`` is recomputed on that reduced
-    denominator. A ``WEEKDAY_HOLIDAYS`` column records how many days were removed.
+    *weekday_summary* is the output of :func:`route_level_summary` for the
+    weekday subset; *weekday_df* is that same subset (filtered to
+    ``SERVICE_PERIOD == "Weekday"``). Adds two columns:
 
-    Returns ``None`` when no weekday holiday falls inside the covered months, so
-    callers can skip writing a file that would be identical to the raw summary.
+    * ``DAYS_EX_HOLIDAYS`` — weekday service days minus the weekday holidays that
+      fell in the months each route operated.
+    * ``DAILY_AVG_EX_HOLIDAYS`` — boardings over those holiday-free days.
+
+    The summary is returned unchanged when no weekday holiday falls inside the
+    covered months, so the extra columns appear only when they carry information.
     """
     if weekday_df.empty or not holiday_counts:
-        return None
+        return weekday_summary
 
     # Holidays removed per route: sum over each route's distinct service months.
     removed = (
@@ -434,14 +438,15 @@ def route_level_summary_ex_holidays(
         .sum()
     )
     if removed.sum() == 0:
-        return None
+        return weekday_summary
 
-    out = route_level_summary(weekday_df)
-    out = out.merge(removed.rename("WEEKDAY_HOLIDAYS").reset_index(), on="ROUTE_NAME", how="left")
-    out["WEEKDAY_HOLIDAYS"] = out["WEEKDAY_HOLIDAYS"].fillna(0)
-    adjusted_days = (out["DAYS"] - out["WEEKDAY_HOLIDAYS"]).clip(lower=0)
-    out["DAILY_AVG"] = safe_div_vec(out["MTH_BOARD"], adjusted_days)
-    return out
+    out = weekday_summary.merge(
+        removed.rename("_removed").reset_index(), on="ROUTE_NAME", how="left"
+    )
+    out["_removed"] = out["_removed"].fillna(0)
+    out["DAYS_EX_HOLIDAYS"] = (out["DAYS"] - out["_removed"]).clip(lower=0)
+    out["DAILY_AVG_EX_HOLIDAYS"] = safe_div_vec(out["MTH_BOARD"], out["DAYS_EX_HOLIDAYS"])
+    return out.drop(columns="_removed")
 
 
 def detect_negative_trends_12m(
@@ -913,16 +918,13 @@ def main() -> None:
     }
     for label, subset in subsets.items():
         out = route_level_summary(subset)
+        # The weekday summary also carries holiday-free columns when any weekday
+        # holiday falls inside the covered months.
+        if label == "Weekday":
+            out = with_weekday_ex_holiday_columns(out, subset, holiday_counts)
         with pd.ExcelWriter(OUTPUT_DIR / f"RouteLevelSummary_{label}.xlsx") as xw:
             out.to_excel(xw, sheet_name=f"{label}_Route_Level", index=False)
         logging.info("%s summary exported.", label)
-
-    # 4.1  Weekday summary excluding holidays (only when holidays apply)
-    weekday_ex = route_level_summary_ex_holidays(subsets["Weekday"], holiday_counts)
-    if weekday_ex is not None:
-        with pd.ExcelWriter(OUTPUT_DIR / "RouteLevelSummary_Weekday_ExHolidays.xlsx") as xw:
-            weekday_ex.to_excel(xw, sheet_name="Weekday_ExHolidays_Route_Level", index=False)
-        logging.info("Weekday (excluding holidays) summary exported.")
 
     # === STEP 5: TIME-SERIES PLOTS ===========================================
     logging.info("\n=== STEP 5: TIME-SERIES PLOTS ===")
@@ -967,14 +969,6 @@ def main() -> None:
             rl = route_level_summary(df_sub)
             rl.to_excel(
                 w_dir / f"RouteLevelSummary_{lbl}.xlsx",
-                index=False,
-            )
-
-        # 6.2b  Weekday summary excluding holidays (only when holidays apply)
-        weekday_ex_tw = route_level_summary_ex_holidays(subsets_tw["Weekday"], holiday_counts)
-        if weekday_ex_tw is not None:
-            weekday_ex_tw.to_excel(
-                w_dir / "RouteLevelSummary_Weekday_ExHolidays.xlsx",
                 index=False,
             )
 
