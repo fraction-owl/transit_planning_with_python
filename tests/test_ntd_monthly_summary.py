@@ -502,6 +502,128 @@ def test_build_monthly_timeseries_pph() -> None:
 
 
 # ---------------------------------------------------------------------------
+# weekday_holiday_counts
+# ---------------------------------------------------------------------------
+
+
+def test_weekday_holiday_counts_groups_by_month() -> None:
+    # Jul 4 2024 (Thu) and Sep 2 2024 (Mon) are both weekdays.
+    holidays = [datetime(2024, 7, 4), datetime(2024, 9, 2)]
+    assert mod.weekday_holiday_counts(holidays) == {"Jul-2024": 1, "Sep-2024": 1}
+
+
+def test_weekday_holiday_counts_ignores_weekend_holidays() -> None:
+    # Jul 6 2024 is a Saturday, Jul 7 2024 is a Sunday — both ignored.
+    holidays = [datetime(2024, 7, 6), datetime(2024, 7, 7)]
+    assert mod.weekday_holiday_counts(holidays) == {}
+
+
+def test_weekday_holiday_counts_accumulates_same_month() -> None:
+    holidays = [datetime(2024, 11, 28), datetime(2024, 11, 29)]  # Thu + Fri
+    assert mod.weekday_holiday_counts(holidays) == {"Nov-2024": 2}
+
+
+def test_weekday_holiday_counts_empty() -> None:
+    assert mod.weekday_holiday_counts([]) == {}
+
+
+# ---------------------------------------------------------------------------
+# summarize_service_days
+# ---------------------------------------------------------------------------
+
+
+def test_summarize_service_days_representative_days(minimal_ntd_df: pd.DataFrame) -> None:
+    with patch.object(mod, "ORDERED_PERIODS", ["Jul-2024"]):
+        result = mod.summarize_service_days(minimal_ntd_df, {"Jul-2024": 1})
+    row = result[result["period"] == "Jul-2024"].iloc[0]
+    assert row["Weekday"] == 22
+    assert row["Saturday"] == 4
+    assert row["Sunday"] == 5
+    assert row["Holidays"] == 1
+
+
+def test_summarize_service_days_no_holidays_defaults_zero(minimal_ntd_df: pd.DataFrame) -> None:
+    with patch.object(mod, "ORDERED_PERIODS", ["Jul-2024"]):
+        result = mod.summarize_service_days(minimal_ntd_df)
+    assert result["Holidays"].iloc[0] == 0
+
+
+def test_summarize_service_days_columns() -> None:
+    with patch.object(mod, "ORDERED_PERIODS", ["Jul-2024"]):
+        result = mod.summarize_service_days(
+            pd.DataFrame(columns=["period", "SERVICE_PERIOD", "DAYS"])
+        )
+    assert list(result.columns) == ["period", "Weekday", "Saturday", "Sunday", "Holidays"]
+
+
+# ---------------------------------------------------------------------------
+# build_monthly_timeseries — holiday subtraction
+# ---------------------------------------------------------------------------
+
+
+def _weekday_avg_input() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "period": ["Jul-2024"],
+            "ROUTE_NAME": ["101"],
+            "SERVICE_PERIOD": ["Weekday"],
+            "MTH_BOARD": [2200.0],
+            "DAYS": [22.0],
+            "MTH_REV_HOURS": [100.0],
+            "TOTAL_TRIPS": [200.0],
+            "MTH_REV_MILES": [400.0],
+        }
+    )
+
+
+def test_build_monthly_timeseries_subtracts_weekday_holidays() -> None:
+    with patch.object(mod, "ORDERED_PERIODS", ["Jul-2024"]):
+        result = mod.build_monthly_timeseries(
+            _weekday_avg_input(), {"Jul-2024": 2}, subtract_holidays=True
+        )
+    row = result[result["route"] == "101"].iloc[0]
+    # denominator 22 - 2 = 20 → 2200 / 20 = 110
+    assert row["weekday_avg"] == pytest.approx(110.0)
+
+
+def test_build_monthly_timeseries_no_subtract_when_flag_off() -> None:
+    with patch.object(mod, "ORDERED_PERIODS", ["Jul-2024"]):
+        result = mod.build_monthly_timeseries(
+            _weekday_avg_input(), {"Jul-2024": 2}, subtract_holidays=False
+        )
+    row = result[result["route"] == "101"].iloc[0]
+    assert row["weekday_avg"] == pytest.approx(round(2200 / 22, 1))
+
+
+def test_build_monthly_timeseries_saturday_avg_never_adjusted() -> None:
+    df = pd.DataFrame(
+        {
+            "period": ["Jul-2024"],
+            "ROUTE_NAME": ["101"],
+            "SERVICE_PERIOD": ["Saturday"],
+            "MTH_BOARD": [400.0],
+            "DAYS": [4.0],
+            "MTH_REV_HOURS": [20.0],
+            "TOTAL_TRIPS": [40.0],
+            "MTH_REV_MILES": [80.0],
+        }
+    )
+    with patch.object(mod, "ORDERED_PERIODS", ["Jul-2024"]):
+        result = mod.build_monthly_timeseries(df, {"Jul-2024": 2}, subtract_holidays=True)
+    row = result[result["route"] == "101"].iloc[0]
+    # Saturday denominator is left untouched: 400 / 4 = 100
+    assert row["saturday_avg"] == pytest.approx(100.0)
+
+
+def test_build_monthly_timeseries_default_holiday_args() -> None:
+    """Called with no holiday args, behaviour matches the legacy unadjusted path."""
+    with patch.object(mod, "ORDERED_PERIODS", ["Jul-2024"]):
+        result = mod.build_monthly_timeseries(_weekday_avg_input())
+    row = result[result["route"] == "101"].iloc[0]
+    assert row["weekday_avg"] == pytest.approx(round(2200 / 22, 1))
+
+
+# ---------------------------------------------------------------------------
 # detect_negative_trends_12m
 # ---------------------------------------------------------------------------
 
@@ -670,3 +792,26 @@ def test_write_run_log_content_includes_config(tmp_path: Path) -> None:
     mod.write_run_log(tmp_path)
     content = (tmp_path / "ntd_monthly_summary_runlog.txt").read_text()
     assert "DATA_ROOT" in content
+
+
+def test_write_run_log_omits_service_day_section_when_none(tmp_path: Path) -> None:
+    mod.write_run_log(tmp_path)
+    content = (tmp_path / "ntd_monthly_summary_runlog.txt").read_text()
+    assert "SERVICE-DAY COUNTS PER MONTH" not in content
+
+
+def test_write_run_log_includes_service_day_table(tmp_path: Path) -> None:
+    service_days = pd.DataFrame(
+        {
+            "period": ["Jul-2024"],
+            "Weekday": [22],
+            "Saturday": [4],
+            "Sunday": [5],
+            "Holidays": [1],
+        }
+    )
+    mod.write_run_log(tmp_path, service_days, subtract_holidays=True)
+    content = (tmp_path / "ntd_monthly_summary_runlog.txt").read_text()
+    assert "SERVICE-DAY COUNTS PER MONTH" in content
+    assert "Holidays" in content
+    assert "Jul-2024" in content

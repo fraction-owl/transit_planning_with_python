@@ -105,6 +105,40 @@ TIME_WINDOWS: Final[list[TimeWindow]] = [
 ]
 
 # -----------------------------------------------------------------------------
+#  Holiday calendar & service-day accounting
+# -----------------------------------------------------------------------------
+# NTD workbooks report service days only as Weekday / Saturday / Sunday and do
+# not flag holidays separately. List holiday dates here so the script can
+# (a) report how many weekday holidays fell in each month and (b) optionally
+# remove those holidays from the weekday day count before computing the weekday
+# per-day average. Only holidays that fall on a weekday are considered; holidays
+# landing on a Saturday or Sunday are ignored.
+
+HOLIDAYS: Final[list[datetime]] = [
+    datetime(2026, 1, 19),  # Martin Luther King, Jr. Day
+    datetime(2026, 2, 16),  # George Washington Day
+    datetime(2026, 5, 25),  # Memorial Day
+    datetime(2026, 6, 19),  # Juneteenth
+    datetime(2026, 7, 3),  # Independence Day (observed)
+    datetime(2026, 9, 7),  # Labor Day
+    datetime(2026, 10, 12),  # Columbus Day / Indigenous Peoples' Day
+    datetime(2026, 11, 3),  # Election Day
+    datetime(2026, 11, 11),  # Veterans Day
+    datetime(2026, 11, 26),  # Thanksgiving
+    datetime(2026, 11, 27),  # Day after Thanksgiving
+    datetime(2026, 12, 25),  # Christmas Day
+    datetime(2026, 12, 31),  # New Year's Eve
+    datetime(2027, 1, 1),  # New Year's Day
+]
+
+# When True (default), weekday holidays above are removed from the weekday day
+# count before the weekday per-day average (weekday_avg) is computed, so the
+# average reflects normal-service weekdays only. This assumes the reported DAYS
+# still include the holiday; set to False to average over every reported
+# weekday instead.
+SUBTRACT_HOLIDAYS_FROM_AVERAGES: bool = True
+
+# -----------------------------------------------------------------------------
 #  Classification dictionaries
 # -----------------------------------------------------------------------------
 
@@ -474,7 +508,52 @@ def write_trend_log(df_flags: pd.DataFrame, output_dir: Path = OUTPUT_DIR) -> Pa
     return out_path
 
 
-def build_monthly_timeseries(all_data: pd.DataFrame) -> pd.DataFrame:
+def weekday_holiday_counts(holidays: Iterable[datetime]) -> dict[str, int]:
+    """Count weekday holidays per month.
+
+    Returns a mapping ``period -> n`` where *period* is a ``"MMM-YYYY"`` key and
+    *n* is the number of holidays falling on a weekday (Monday–Friday) that
+    month. Holidays landing on a Saturday or Sunday are ignored.
+    """
+    counts: dict[str, int] = {}
+    for holiday in holidays:
+        if holiday.weekday() >= 5:  # Saturday=5, Sunday=6
+            continue
+        period = holiday.strftime("%b-%Y")
+        counts[period] = counts.get(period, 0) + 1
+    return counts
+
+
+def summarize_service_days(
+    all_data: pd.DataFrame,
+    holiday_counts: dict[str, int] | None = None,
+) -> pd.DataFrame:
+    """Build one systemwide row per month of reported service-day counts.
+
+    The Weekday/Saturday/Sunday columns hold the representative (most common)
+    ``DAYS`` value reported across routes for that service period — i.e. the
+    number of service days filed for the month. ``Holidays`` is the number of
+    weekday holidays configured for that month.
+    """
+    rows: list[dict[str, Any]] = []
+    for period in ORDERED_PERIODS:
+        dfp = all_data[all_data["period"] == period]
+        row: dict[str, Any] = {"period": period}
+        for service_period in SERVICE_PERIODS:
+            days = dfp.loc[dfp["SERVICE_PERIOD"] == service_period, "DAYS"].dropna()
+            # value_counts().idxmax() returns the most frequently reported count,
+            # which ignores routes with partial-month or no service.
+            row[service_period] = int(days.value_counts().idxmax()) if not days.empty else 0
+        row["Holidays"] = int((holiday_counts or {}).get(period, 0))
+        rows.append(row)
+    return pd.DataFrame(rows, columns=["period", *SERVICE_PERIODS, "Holidays"])
+
+
+def build_monthly_timeseries(
+    all_data: pd.DataFrame,
+    holiday_counts: dict[str, int] | None = None,
+    subtract_holidays: bool = SUBTRACT_HOLIDAYS_FROM_AVERAGES,
+) -> pd.DataFrame:
     """Convert the year-to-date table into a plotting-ready time series.
 
     The result has one row per (period, route) plus a *SYSTEMWIDE* row,
@@ -496,13 +575,29 @@ def build_monthly_timeseries(all_data: pd.DataFrame) -> pd.DataFrame:
         }
     )
 
+    # Holiday-adjusted denominator used for the weekday per-day average. When
+    # enabled, each route's reported weekday days lose the weekday holidays that
+    # month (clamped at zero). Saturday/Sunday days and all other metrics keep
+    # the raw DAYS, so trips and mileage are untouched.
+    counts = holiday_counts if (subtract_holidays and holiday_counts) else None
+
+    def _adjusted_days(period: str, daytype: str, days: float) -> float:
+        if counts is None or daytype != "Weekday":
+            return days
+        return max(days - counts.get(period, 0), 0.0)
+
+    agg["DAYS_ADJ"] = [
+        _adjusted_days(period, daytype, float(days))
+        for period, daytype, days in zip(agg["period"], agg["SERVICE_PERIOD"], agg["DAYS"])
+    ]
+
     def _sum_pair(dfsub: pd.DataFrame, daytype: str) -> tuple[float, float]:
         row = dfsub.loc[dfsub["SERVICE_PERIOD"] == daytype]
         if not row.empty:
             # iat[0] returns a scalar that MyPy sees as very broad.
             # Explicit cast or float conversion helps.
             board_val = row["MTH_BOARD"].iloc[0]
-            days_val = row["DAYS"].iloc[0]
+            days_val = row["DAYS_ADJ"].iloc[0]
             # Ensure we are converting something float-compatible
             return float(board_val), float(days_val)
         return 0.0, 0.0
@@ -555,9 +650,9 @@ def build_monthly_timeseries(all_data: pd.DataFrame) -> pd.DataFrame:
                 "period": period,
                 "route": "SYSTEMWIDE",
                 "total_ridership": tr,
-                "weekday_avg": safe_div(agg_wd["MTH_BOARD"].sum(), agg_wd["DAYS"].sum()),
-                "saturday_avg": safe_div(agg_sa["MTH_BOARD"].sum(), agg_sa["DAYS"].sum()),
-                "sunday_avg": safe_div(agg_su["MTH_BOARD"].sum(), agg_su["DAYS"].sum()),
+                "weekday_avg": safe_div(agg_wd["MTH_BOARD"].sum(), agg_wd["DAYS_ADJ"].sum()),
+                "saturday_avg": safe_div(agg_sa["MTH_BOARD"].sum(), agg_sa["DAYS_ADJ"].sum()),
+                "sunday_avg": safe_div(agg_su["MTH_BOARD"].sum(), agg_su["DAYS_ADJ"].sum()),
                 "revenue_hours": hrs,
                 "trips": trips,
                 "revenue_miles": miles,
@@ -665,8 +760,17 @@ def extract_config_block(source_file: Path) -> str:
     return "\n".join(lines[begin_idx + 1 : end_idx])
 
 
-def write_run_log(output_dir: Path) -> bool:
+def write_run_log(
+    output_dir: Path,
+    service_days: pd.DataFrame | None = None,
+    subtract_holidays: bool = SUBTRACT_HOLIDAYS_FROM_AVERAGES,
+) -> bool:
     """Write a run log of the configuration block into *output_dir*.
+
+    If *service_days* is provided (see :func:`summarize_service_days`), a table
+    of the number of weekdays, Saturdays, Sundays, and weekday holidays in
+    service for each month is appended so the counts can be verified against
+    another source.
 
     Returns:
         ``True`` if the log was written successfully, ``False`` otherwise.
@@ -691,8 +795,22 @@ def write_run_log(output_dir: Path) -> bool:
         "CONFIGURATION (verbatim from source)",
         "-" * 72,
         config_text,
-        "=" * 72,
     ]
+
+    if service_days is not None and not service_days.empty:
+        lines += [
+            "",
+            "-" * 72,
+            "SERVICE-DAY COUNTS PER MONTH",
+            "-" * 72,
+            "Weekday/Saturday/Sunday = representative reported DAYS per month.",
+            "Holidays = holidays falling on a weekday in the month.",
+            f"Weekday holidays subtracted from weekday average: {subtract_holidays}",
+            "",
+            service_days.to_string(index=False),
+        ]
+
+    lines.append("=" * 72)
 
     try:
         log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -790,7 +908,8 @@ def main() -> None:
 
     # === STEP 5: TIME-SERIES PLOTS ===========================================
     logging.info("\n=== STEP 5: TIME-SERIES PLOTS ===")
-    ts = build_monthly_timeseries(all_data)
+    holiday_counts = weekday_holiday_counts(HOLIDAYS)
+    ts = build_monthly_timeseries(all_data, holiday_counts)
     generate_all_plots(ts)
 
     # === STEP 5B: TREND FLAGGING (12‑mo baseline) ============================
@@ -843,7 +962,8 @@ def main() -> None:
 
         logging.info("%s: %d rows → %s", tw.label, len(subset), w_dir.relative_to(OUTPUT_DIR))
 
-    if not write_run_log(OUTPUT_DIR) and REQUIRE_RUN_LOG:
+    service_days = summarize_service_days(all_data, holiday_counts)
+    if not write_run_log(OUTPUT_DIR, service_days) and REQUIRE_RUN_LOG:
         logging.error(
             "Run log could not be written. Set REQUIRE_RUN_LOG = False to "
             "suppress this error when a sidecar file is genuinely impossible."
