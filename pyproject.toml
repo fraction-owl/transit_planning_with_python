@@ -90,7 +90,7 @@ ignore = [
 "dev_tools/**/*" = ["T201"]
 # These national_data_tools scripts prompt interactively; print() is feedback paired with input(), not logging.
 "scripts/national_data_tools/clean_*.py" = ["T201"]
-"scripts/national_data_tools/schools_prep_join.py" = ["T201"]
+"scripts/national_data_tools/schools_prep_join_gpd.py" = ["T201"]
 # arcpy scripts target the ArcPy-bundled Python (<3.10) where zip() has no strict= parameter.
 "**/*arcpy*" = ["B905"]
 

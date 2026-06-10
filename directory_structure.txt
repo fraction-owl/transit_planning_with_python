@@ -61,7 +61,7 @@ transit_planning_with_python/
 │   │   ├── clean_eia_gas_prices.py
 │   │   ├── clean_fred_unrate.py
 │   │   ├── clean_noaa_weather.py
-│   │   ├── schools_prep_join.py
+│   │   ├── schools_prep_join_gpd.py
 │   │   ├── uscensus_table_build.py
 │   │   ├── uscensus_tiger_join_arcpy.py
 │   │   └── uscensus_tiger_join_gpd.py

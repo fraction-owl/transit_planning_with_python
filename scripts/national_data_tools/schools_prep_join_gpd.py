@@ -1,7 +1,7 @@
 """Join school enrollment to EDGE school-location points (public, private, college).
 
 Standalone script: edit the config block and call ``run()`` (notebook) or run as
-``python schools_prep_join.py [--input-dir ...] [--output-dir ...]
+``python schools_prep_join_gpd.py [--input-dir ...] [--output-dir ...]
 [--school-type public|private|postsec|both|all]
 [--enrollment-source auto|ccd|elsi|ipeds] [--states VA MD DC]`` (CLI). Produces a
 point GeoPackage (plus an attribute-only CSV companion) for the target
