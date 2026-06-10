@@ -1,4 +1,4 @@
-"""Tests for scripts/exogenous_tools/clean_noaa_weather.py.
+"""Tests for scripts/national_data_tools/clean_noaa_weather.py.
 
 Exercised against a trimmed NOAA CDO daily-summaries export for a single
 station. The fixture carries the semantics the cleaner must respect: WT* event
@@ -11,7 +11,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from scripts.exogenous_tools import clean_noaa_weather as mod
+from scripts.national_data_tools import clean_noaa_weather as mod
 
 FIXTURE_CSV = Path("tests/fixtures/4331222_sample.csv")
 

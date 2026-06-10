@@ -26,16 +26,6 @@ transit_planning_with_python/
 │   ├── lint_commit.py
 │   └── lint_pr.py
 ├── scripts/
-│   ├── census_tools/
-│   │   ├── cacensus_da_join_gpd.py
-│   │   ├── uscensus_table_build.py
-│   │   ├── uscensus_tiger_join_arcpy.py
-│   │   └── uscensus_tiger_join_gpd.py
-│   ├── exogenous_tools/
-│   │   ├── clean_eia_gas_prices.py
-│   │   ├── clean_fred_unrate.py
-│   │   ├── clean_noaa_weather.py
-│   │   └── schools_prep_join.py
 │   ├── facilities_tools/
 │   │   ├── bay_usage_analyzer.py
 │   │   ├── flag_stop_upgrades.py
@@ -66,6 +56,15 @@ transit_planning_with_python/
 │   ├── modeling/
 │   │   ├── ridership_ml_model.py
 │   │   └── ridership_regression_model.py
+│   ├── national_data_tools/
+│   │   ├── cacensus_da_join_gpd.py
+│   │   ├── clean_eia_gas_prices.py
+│   │   ├── clean_fred_unrate.py
+│   │   ├── clean_noaa_weather.py
+│   │   ├── schools_prep_join.py
+│   │   ├── uscensus_table_build.py
+│   │   ├── uscensus_tiger_join_arcpy.py
+│   │   └── uscensus_tiger_join_gpd.py
 │   ├── operations_tools/
 │   │   ├── convert_to_tides_stop_visits.py
 │   │   ├── convert_to_tides_trips_performed.py

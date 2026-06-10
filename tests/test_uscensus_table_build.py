@@ -1,4 +1,4 @@
-"""Tests for scripts/census_tools/uscensus_table_build.py."""
+"""Tests for scripts/national_data_tools/uscensus_table_build.py."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from scripts.census_tools.uscensus_table_build import (
+from scripts.national_data_tools.uscensus_table_build import (
     GEO_ID_COL,
     _apply_fips_filter,
     _clean_name_cols,

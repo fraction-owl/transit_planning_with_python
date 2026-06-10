@@ -33,7 +33,7 @@ import geopandas as gpd
 import pandas as pd
 from shapely.geometry import Point
 
-from scripts.exogenous_tools import schools_prep_join as sj
+from scripts.national_data_tools import schools_prep_join as sj
 
 # =============================================================================
 # CONFIG
