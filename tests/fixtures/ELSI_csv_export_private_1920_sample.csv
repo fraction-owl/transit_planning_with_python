@@ -1,0 +1,19 @@
+ELSI Export
+
+National Center for Education Statistics - http://nces.ed.gov/ccd/elsi/
+
+This is a Private School based table with the following filters applied: State(s) (All Years): DISTRICT OF COLUMBIA MARYLAND VIRGINIA
+
+Private School Name,State Name [Private School] Latest available year,Total Students (Ungraded & PK-12) [Private School] 2019-20,Total Students (Ungraded & K-12) [Private School] 2019-20,Grades 1-8 Students [Private School] 2019-20,Grades 9-12 Students [Private School] 2019-20,State Name [Private School] 2019-20,ANSI/FIPS State Code [Private School] Latest available year,School ID - NCES Assigned [Private School] Latest available year,County Name [Private School] 2019-20,Private School Name [Private School] 2019-20,ANSI/FIPS County Code [Private School] 2019-20
+BLESSED SACRAMENT SCHOOL,DISTRICT OF COLUMBIA,240,235,160,†,DISTRICT OF COLUMBIA,11,00253029,DISTRICT OF COLUMBIA,BLESSED SACRAMENT SCHOOL,11001
+BUTLER MONTESSORI,MARYLAND,95,90,40,†,MARYLAND,24,BB181325,MONTGOMERY,BUTLER MONTESSORI,24031
+CHILDREN'S MANOR MONTESSORI SCHOOL,MARYLAND,130,125,†,†,MARYLAND,24,BB181326,MONTGOMERY,CHILDREN'S MANOR MONTESSORI SCHOOL,24031
+GHOST ACADEMY,VIRGINIA,50,48,30,†,VIRGINIA,51,BB999999,NOWHERE,GHOST ACADEMY,51999
+
+
+Data Source: U.S. Department of Education National Center for Education Statistics Common Core of Data (CCD) 2019-20 v.1a.
+
+† indicates that the data are not applicable.
+– indicates that the data are missing.
+‡ indicates that the data do not meet NCES data quality standards.
+

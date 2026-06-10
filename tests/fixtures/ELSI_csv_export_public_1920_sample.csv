@@ -1,0 +1,19 @@
+ELSI Export
+
+National Center for Education Statistics - http://nces.ed.gov/ccd/elsi/
+
+This is a Public School based table with the following filters applied: State(s) (All Years): DISTRICT OF COLUMBIA MARYLAND VIRGINIA
+
+School Name,State Name [Public School] Latest available year,State Abbr [Public School] Latest available year,School ID (12-digit) - NCES Assigned [Public School] Latest available year,Agency ID - NCES Assigned [Public School] Latest available year,ANSI/FIPS State Code [Public School] Latest available year,State Name [Public School] 2019-20,School Name [Public School] 2019-20,School ID (7-digit) – NCES Assigned [Public School] 2019-20,Agency Name [Public School] 2019-20,County Name [Public School] 2019-20,County Number [Public School] 2019-20,Total Students All Grades (Excludes AE) [Public School] 2019-20,Total Students All Grades (Includes AE) [Public School] 2019-20,Grades 1-8 Students [Public School] 2019-20,Grades 9-12 Students [Public School] 2019-20
+THE ACADEMY OF INTERNATIONAL STUDIES AT ROSEMONT,Virginia,VA ,510267002843,5102670,51,VIRGINIA,THE ACADEMY OF INTERNATIONAL STUDIES AT ROSEMONT,5102843,NORFOLK CITY PBLC SCHS,Norfolk city,51710,612,612,420,†
+Dodge Park Elementary,Maryland,MD ,240051001208,2400510,24,MARYLAND,Dodge Park Elementary,2401208,Prince George's County Public Schools,Prince George's County,24033,455,455,455,†
+G. James Gholson Middle,Maryland,MD ,240051001211,2400510,24,MARYLAND,G. James Gholson Middle,2401211,Prince George's County Public Schools,Prince George's County,24033,980,980,980,†
+PHANTOM ELEMENTARY,Virginia,VA ,519999000099,5199990,51,VIRGINIA,PHANTOM ELEMENTARY,5199099,SOMEWHERE CO PBLC SCHS,Nowhere County,51999,100,100,–,20
+
+
+Data Source: U.S. Department of Education National Center for Education Statistics Common Core of Data (CCD) 2019-20 v.1a.
+
+† indicates that the data are not applicable.
+– indicates that the data are missing.
+‡ indicates that the data do not meet NCES data quality standards.
+
