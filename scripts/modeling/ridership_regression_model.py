@@ -9,7 +9,7 @@ package (``scikit-learn``, ``statsmodels``) is required.
 
 Typical predictors:
     - Service supplied: scheduled / revenue hours and revenue miles (from NTD).
-    - Exogenous context: gas prices, unemployment, weather (``exogenous_tools``).
+    - Exogenous context: gas prices, unemployment, weather (``national_data_tools``).
     - Demographic service coverage: population, low-income, minority, zero-car
       households reached by each route (``service_coverage`` outputs).
     - Points-of-interest coverage: strategic sites reached by each route

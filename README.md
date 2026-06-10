@@ -20,7 +20,7 @@ Stop guessing where buses are getting delayed. Pivot route-level OTP trends, dia
 
 ### Service Coverage & Catchments *(arcpy + GeoPandas)*
 Generate GTFS-to-Census catchment areas and calculate service coverage by district — built for **Title VI** equity/demographic analysis and service planning. Site-to-route proximity tools support site planning collaboration with developers, elected officials, and partner agencies.
-*Folders:* `service_coverage/`, `census_tools/`
+*Folders:* `service_coverage/`, `national_data_tools/`
 
 ### GTFS Data Quality & Validation *(arcpy + GeoPandas)*
 Catch errors before they go live. Cross-check GTFS stops against road centerlines, flag skipped stops, validate stop spacing and proximity, check USPS suffix conventions, and identify stops that conflict with road geometry.
@@ -38,6 +38,7 @@ Manual data collection that supplements or backstops modern AVL and APC systems 
 - **GTFS Exports** (`gtfs_exports/`) — GTFS-to-shapefile, segment speeds, time-band summaries, stop patterns, and timepoint schedule exports
 - **GBFS Tools** (`gbfs_tools/`) — export GBFS static stations to shapefile and GeoJSON
 - **Facility Tools** (`facilities_tools/`) — bay usage analysis and stop upgrade flagging
+- **National Data Tools** (`national_data_tools/`) — prep and join national/external reference datasets that feed coverage and demand work: US Census/TIGER and Canadian census geographies, plus exogenous context (EIA gas prices, FRED unemployment, NOAA weather, NCES schools)
 - **Shared utilities** (`utils/gtfs_helpers.py`) and contributor tooling (`dev_tools/`)
 
 ## 📂 Repository Structure

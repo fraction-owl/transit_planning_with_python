@@ -1,4 +1,4 @@
-"""Tests for scripts/census_tools/cacensus_da_join_gpd.py."""
+"""Tests for scripts/national_data_tools/cacensus_da_join_gpd.py."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ import pandas as pd
 import pytest
 from shapely.geometry import box
 
-from scripts.census_tools import cacensus_da_join_gpd as mod
+from scripts.national_data_tools import cacensus_da_join_gpd as mod
 
 FIXTURE_DIR = Path("tests/fixtures")
 FIXTURE_BUNDLE_ZIP = "98-401-X2021006_eng_CSV.zip"

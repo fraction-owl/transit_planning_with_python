@@ -1,4 +1,4 @@
-"""Tests for scripts/exogenous_tools/clean_fred_unrate.py.
+"""Tests for scripts/national_data_tools/clean_fred_unrate.py.
 
 Exercised against a trimmed FRED UNRATE export (``observation_date,UNRATE``)
 carrying the quirks the cleaner is meant to absorb: a not-yet-released month
@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from scripts.exogenous_tools import clean_fred_unrate as mod
+from scripts.national_data_tools import clean_fred_unrate as mod
 
 FIXTURE_CSV = Path("tests/fixtures/UNRATE_sample.csv")
 

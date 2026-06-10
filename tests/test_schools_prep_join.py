@@ -1,4 +1,4 @@
-"""Tests for scripts/exogenous_tools/schools_prep_join.py.
+"""Tests for scripts/national_data_tools/schools_prep_join.py.
 
 Fixtures (in ``tests/fixtures``) are small, ID-aligned samples of the 2019-20
 NCES collections this script consumes:
@@ -29,7 +29,7 @@ import pandas as pd
 import pytest
 from shapely.geometry import Point
 
-from scripts.exogenous_tools import schools_prep_join as mod
+from scripts.national_data_tools import schools_prep_join as mod
 
 FIXTURE_DIR = Path("tests/fixtures")
 SCHOOL_FIXTURES = (

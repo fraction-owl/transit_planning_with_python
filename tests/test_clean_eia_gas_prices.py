@@ -1,4 +1,4 @@
-"""Tests for scripts/exogenous_tools/clean_eia_gas_prices.py.
+"""Tests for scripts/national_data_tools/clean_eia_gas_prices.py.
 
 Exercised against a trimmed EIA "Data 1" weekly retail price export. The
 fixture reproduces the structural quirks the cleaner must handle: a three-row
@@ -12,7 +12,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from scripts.exogenous_tools import clean_eia_gas_prices as mod
+from scripts.national_data_tools import clean_eia_gas_prices as mod
 
 FIXTURE_CSV = Path("tests/fixtures/PET_PRI_GND_DCUS_NUS_W_Data_1__sample.csv")
 
