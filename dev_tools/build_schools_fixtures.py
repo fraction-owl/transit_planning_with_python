@@ -24,6 +24,7 @@ something to drop.
 from __future__ import annotations
 
 import csv
+import io
 import tempfile
 import zipfile
 from dataclasses import dataclass, field
@@ -102,21 +103,38 @@ SCHOOL_TYPES: Final[dict[str, SchoolType]] = {
 
 
 def _find_elsi_csv(input_dir: Path, school_type: SchoolType) -> Path | None:
-    """Return the ELSI export CSV for ``school_type``, or None if absent."""
+    """Return the ELSI export CSV or ZIP containing it for ``school_type``, or None."""
     marker = f"This is a {school_type.elsi_kind} based table"
     for csv_path in sorted(input_dir.glob("*.csv")):
         try:
-            head = "".join(csv_path.open(encoding="utf-8-sig").readlines()[:10])
+            with csv_path.open(encoding="utf-8-sig", errors="replace") as fh:
+                head = "".join(fh.readline() for _ in range(20))
         except OSError:  # pragma: no cover
             continue
-        if head.startswith("ELSI Export") and marker in head:
+        if "ELSI Export" in head and marker in head:
             return csv_path
+    for zip_path in sorted(input_dir.glob("*.zip")):
+        try:
+            with zipfile.ZipFile(zip_path) as zf:
+                for member in zf.namelist():
+                    if not member.lower().endswith(".csv"):
+                        continue
+                    with zf.open(member) as raw:
+                        head = raw.read(8192).decode("utf-8-sig", errors="replace")
+                    if "ELSI Export" in head and marker in head:
+                        return zip_path
+        except (OSError, zipfile.BadZipFile):  # pragma: no cover
+            continue
     return None
 
 
 def _find_ipeds_file(input_dir: Path) -> Path | None:
-    """Return the IPEDS EFFY enrollment file (csv preferred over xlsx), or None."""
+    """Return the IPEDS EFFY enrollment file (csv/xlsx preferred, then zip), or None."""
     for pattern in IPEDS_GLOBS:
+        matches = sorted(input_dir.glob(pattern))
+        if matches:
+            return matches[0]
+    for pattern in ("effy*.zip", "EFFY*.zip"):
         matches = sorted(input_dir.glob(pattern))
         if matches:
             return matches[0]
@@ -197,8 +215,15 @@ def read_elsi_rows(input_dir: Path, st: SchoolType) -> tuple[list[list[str]], in
     path = _find_elsi_csv(input_dir, st)
     if path is None:
         raise FileNotFoundError(f"No {st.elsi_kind} ELSI export in {input_dir}")
-    with path.open(encoding="utf-8-sig", newline="") as fh:
-        rows = list(csv.reader(fh))
+    if path.suffix.lower() == ".zip":
+        with zipfile.ZipFile(path) as zf:
+            csv_members = [m for m in zf.namelist() if m.lower().endswith(".csv")]
+            with zf.open(csv_members[0]) as raw:
+                content = raw.read().decode("utf-8-sig", errors="replace")
+        rows = list(csv.reader(io.StringIO(content)))
+    else:
+        with path.open(encoding="utf-8-sig", newline="") as fh:
+            rows = list(csv.reader(fh))
     header_labels = {"School Name", "Private School Name"}
     header_idx = next(i for i, r in enumerate(rows) if r and r[0].strip() in header_labels)
     key_idx = next(i for i, c in enumerate(rows[header_idx]) if st.elsi_id_substr in c)
@@ -247,11 +272,21 @@ def write_elsi_csv(
 
 
 def read_ipeds(input_dir: Path) -> pd.DataFrame:
-    """Read the IPEDS EFFY file (csv or xlsx) as strings, restricted to used levels."""
+    """Read the IPEDS EFFY file (csv/xlsx, or zip containing either) as strings."""
     path = _find_ipeds_file(input_dir)
     if path is None:
-        raise FileNotFoundError(f"No IPEDS EFFY file (effy*.csv/.xlsx) in {input_dir}")
-    if path.suffix.lower() in {".xlsx", ".xls"}:
+        raise FileNotFoundError(f"No IPEDS EFFY file (effy*.csv/.xlsx/.zip) in {input_dir}")
+    if path.suffix.lower() == ".zip":
+        with zipfile.ZipFile(path) as zf:
+            member = next(
+                m for m in zf.namelist() if Path(m).suffix.lower() in {".csv", ".xlsx", ".xls"}
+            )
+            data = zf.open(member).read()
+        if Path(member).suffix.lower() in {".xlsx", ".xls"}:
+            df = pd.read_excel(io.BytesIO(data), dtype=str)
+        else:
+            df = pd.read_csv(io.BytesIO(data), dtype=str)
+    elif path.suffix.lower() in {".xlsx", ".xls"}:
         df = pd.read_excel(path, dtype=str)
     else:
         df = pd.read_csv(path, dtype=str)
