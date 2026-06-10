@@ -11,7 +11,7 @@ Turn NTD-format monthly summaries into route-level trend reports, process riders
 *Folder:* `ridership_tools/`
 
 ### Demand Modeling *(advanced)*
-For analysts comfortable assembling their own modeling tables. A multiple-regression ridership model (`ridership_regression_model.py`) ties NTD ridership to the service supplied (scheduled hours/miles), exogenous context (gas, unemployment, weather), and demographic and points-of-interest coverage. It hand-rolls OLS — coefficients, robust standard errors, VIFs, and the usual diagnostics — entirely on the ArcGIS Pro `numpy`/`scipy` stack, so it needs no machine-learning package.
+For analysts comfortable assembling their own modeling tables. A multiple-regression ridership model (`ridership_regression_model.py`) ties NTD ridership to the service supplied (scheduled hours/miles), exogenous context (gas, unemployment, weather), and demographic and points-of-interest coverage. It hand-rolls OLS — coefficients, robust standard errors, VIFs, and the usual diagnostics — entirely on the ArcGIS Pro `numpy`/`scipy` stack, so it needs no machine-learning package. A machine-learning counterpart (`ridership_ml_model.py`) ingests the *same* modeling table but swaps OLS for random-forest and gradient-boosting ensembles, comparing both against the linear baseline on cross-validated, out-of-sample accuracy and adding permutation importance and partial-dependence plots for interpretability. It captures the nonlinearities and interactions OLS can't — at the cost of a `scikit-learn` dependency (not bundled with ArcGIS Pro).
 *Folder:* `modeling/`
 
 ### OTP & Runtime Diagnostics

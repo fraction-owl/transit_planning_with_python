@@ -13,6 +13,12 @@ pandas==2.2.3                # Data manipulation and analysis
 numpy==1.26.4                # Numerical computing
 scipy==1.12.0                # Scientific computing and optimization
 
+# Machine Learning (open-source stack only — NOT bundled with ArcGIS Pro)
+# Required by scripts/modeling/ridership_ml_model.py (random-forest + gradient-
+# boosting ridership models). The linear ridership_regression_model.py needs
+# none of this and still runs on the bare ArcGIS Pro numpy/scipy stack.
+scikit-learn==1.5.1          # Tree-ensemble ridership models + model selection
+
 # Network Analysis (also listed in requirements_arcpro.txt)
 networkx==2.8.4              # Graph and network analysis
 
