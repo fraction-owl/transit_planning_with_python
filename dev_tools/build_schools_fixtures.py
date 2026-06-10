@@ -26,6 +26,7 @@ from __future__ import annotations
 import csv
 import tempfile
 import zipfile
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final
 
@@ -33,7 +34,94 @@ import geopandas as gpd
 import pandas as pd
 from shapely.geometry import Point
 
-from scripts.national_data_tools import schools_prep_join_gpd as sj
+# =============================================================================
+# SCHOOL-TYPE REGISTRY  (reproduced from scripts/national_data_tools/schools_prep_join_gpd.py)
+# =============================================================================
+
+STATE_COL: Final[str] = "STATE"
+
+IPEDS_GLOBS: Final[tuple[str, ...]] = ("effy*.csv", "EFFY*.csv", "effy*.xlsx", "EFFY*.xlsx")
+IPEDS_ID_COL: Final[str] = "UNITID"
+IPEDS_LEVEL_COL: Final[str] = "EFFYLEV"
+IPEDS_LEVEL_MAP: Final[dict[str, str]] = {
+    "1": "enroll_total",
+    "2": "g_undergrad",
+    "4": "g_graduate",
+}
+
+
+@dataclass(frozen=True)
+class SchoolType:
+    """Per-school-type wiring for geocodes and the applicable enrollment sources."""
+
+    name: str
+    geocode_glob: str
+    id_col: str
+    id_width: int
+    sources: tuple[str, ...]
+    elsi_kind: str = ""
+    elsi_id_substr: str = ""
+    elsi_total_substrs: tuple[str, ...] = field(default_factory=tuple)
+
+
+SCHOOL_TYPES: Final[dict[str, SchoolType]] = {
+    "public": SchoolType(
+        name="public",
+        geocode_glob="EDGE_GEOCODE_PUBLICSCH_*.zip",
+        id_col="NCESSCH",
+        id_width=12,
+        sources=("ccd", "elsi"),
+        elsi_kind="Public School",
+        elsi_id_substr="School ID (12-digit)",
+        elsi_total_substrs=(
+            "Total Students All Grades (Excludes AE)",
+            "Total Students All Grades (Includes AE)",
+        ),
+    ),
+    "private": SchoolType(
+        name="private",
+        geocode_glob="EDGE_GEOCODE_PRIVATESCH_*.zip",
+        id_col="PPIN",
+        id_width=8,
+        sources=("elsi",),
+        elsi_kind="Private School",
+        elsi_id_substr="School ID - NCES Assigned",
+        elsi_total_substrs=(
+            "Total Students (Ungraded & PK-12)",
+            "Total Students (Ungraded & K-12)",
+        ),
+    ),
+    "postsec": SchoolType(
+        name="postsec",
+        geocode_glob="EDGE_GEOCODE_POSTSEC_*.zip",
+        id_col="UNITID",
+        id_width=6,
+        sources=("ipeds",),
+    ),
+}
+
+
+def _find_elsi_csv(input_dir: Path, school_type: SchoolType) -> Path | None:
+    """Return the ELSI export CSV for ``school_type``, or None if absent."""
+    marker = f"This is a {school_type.elsi_kind} based table"
+    for csv_path in sorted(input_dir.glob("*.csv")):
+        try:
+            head = "".join(csv_path.open(encoding="utf-8-sig").readlines()[:10])
+        except OSError:  # pragma: no cover
+            continue
+        if head.startswith("ELSI Export") and marker in head:
+            return csv_path
+    return None
+
+
+def _find_ipeds_file(input_dir: Path) -> Path | None:
+    """Return the IPEDS EFFY enrollment file (csv preferred over xlsx), or None."""
+    for pattern in IPEDS_GLOBS:
+        matches = sorted(input_dir.glob(pattern))
+        if matches:
+            return matches[0]
+    return None
+
 
 # =============================================================================
 # CONFIG
@@ -73,7 +161,7 @@ IPEDS_OUT: Final[str] = "effy2019_sample.csv"
 # =============================================================================
 
 
-def read_geocode_points(input_dir: Path, st: sj.SchoolType) -> gpd.GeoDataFrame:
+def read_geocode_points(input_dir: Path, st: SchoolType) -> gpd.GeoDataFrame:
     """Read EDGE points for ``st`` from a zip, a shapefile, or a bare .dbf."""
     zips = sorted(input_dir.glob(st.geocode_glob))
     if zips:
@@ -98,15 +186,15 @@ def read_geocode_points(input_dir: Path, st: sj.SchoolType) -> gpd.GeoDataFrame:
             raise FileNotFoundError(f"No EDGE geocode for {st.name} in {input_dir}")
 
     gdf[st.id_col] = gdf[st.id_col].astype(str).str.strip().str.zfill(st.id_width)
-    gdf = gdf[gdf[sj.STATE_COL].isin(STATES)].copy()
+    gdf = gdf[gdf[STATE_COL].isin(STATES)].copy()
     if gdf.crs is None:
         gdf = gdf.set_crs(epsg=4269)
     return gdf
 
 
-def read_elsi_rows(input_dir: Path, st: sj.SchoolType) -> tuple[list[list[str]], int, int]:
+def read_elsi_rows(input_dir: Path, st: SchoolType) -> tuple[list[list[str]], int, int]:
     """Return (all_csv_rows, header_index, key_column_index) for the ELSI export."""
-    path = sj._find_elsi_csv(input_dir, st)
+    path = _find_elsi_csv(input_dir, st)
     if path is None:
         raise FileNotFoundError(f"No {st.elsi_kind} ELSI export in {input_dir}")
     with path.open(encoding="utf-8-sig", newline="") as fh:
@@ -160,25 +248,25 @@ def write_elsi_csv(
 
 def read_ipeds(input_dir: Path) -> pd.DataFrame:
     """Read the IPEDS EFFY file (csv or xlsx) as strings, restricted to used levels."""
-    path = sj._find_ipeds_file(input_dir)
+    path = _find_ipeds_file(input_dir)
     if path is None:
         raise FileNotFoundError(f"No IPEDS EFFY file (effy*.csv/.xlsx) in {input_dir}")
     if path.suffix.lower() in {".xlsx", ".xls"}:
         df = pd.read_excel(path, dtype=str)
     else:
         df = pd.read_csv(path, dtype=str)
-    df[sj.IPEDS_ID_COL] = df[sj.IPEDS_ID_COL].astype(str).str.strip().str.zfill(6)
-    return df[df[sj.IPEDS_LEVEL_COL].isin(sj.IPEDS_LEVEL_MAP)].copy()
+    df[IPEDS_ID_COL] = df[IPEDS_ID_COL].astype(str).str.strip().str.zfill(6)
+    return df[df[IPEDS_LEVEL_COL].isin(IPEDS_LEVEL_MAP)].copy()
 
 
-def build_postsec(st: sj.SchoolType, manifest: list[dict[str, str]]) -> None:
+def build_postsec(st: SchoolType, manifest: list[dict[str, str]]) -> None:
     """Build college fixtures (EDGE POSTSEC geocode + trimmed IPEDS EFFY)."""
     print(f"\n=== {st.name} ===")
     points = read_geocode_points(INPUT_DIR, st)
     effy = read_ipeds(INPUT_DIR)
 
     point_ids = set(points[st.id_col])
-    effy_ids = set(effy[sj.IPEDS_ID_COL])
+    effy_ids = set(effy[IPEDS_ID_COL])
 
     matched = sorted(point_ids & effy_ids)[:N_MATCHED]
     unmatched_points = sorted(point_ids - effy_ids)[:N_UNMATCHED_POINTS]
@@ -189,9 +277,7 @@ def build_postsec(st: sj.SchoolType, manifest: list[dict[str, str]]) -> None:
     write_geocode_zip(out_points, OUTPUT_DIR / GEOCODE_OUT["postsec"])
 
     keep_ids = set(matched) | set(orphans)
-    out_effy = effy[effy[sj.IPEDS_ID_COL].isin(keep_ids)].sort_values(
-        [sj.IPEDS_ID_COL, sj.IPEDS_LEVEL_COL]
-    )
+    out_effy = effy[effy[IPEDS_ID_COL].isin(keep_ids)].sort_values([IPEDS_ID_COL, IPEDS_LEVEL_COL])
     out_effy.to_csv(OUTPUT_DIR / IPEDS_OUT, index=False)
     print(f"  wrote {GEOCODE_OUT['postsec']} ({len(out_points)} pts) and {IPEDS_OUT}")
 
@@ -229,7 +315,7 @@ def trim_ccd_zip(input_dir: Path, keep_ids: set[str], out_zip: Path) -> bool:
 # =============================================================================
 
 
-def build_school_type(st: sj.SchoolType, manifest: list[dict[str, str]]) -> set[str]:
+def build_school_type(st: SchoolType, manifest: list[dict[str, str]]) -> set[str]:
     """Build fixtures for one school type; return the geocode IDs kept (for CCD)."""
     print(f"\n=== {st.name} ===")
     points = read_geocode_points(INPUT_DIR, st)
@@ -277,7 +363,7 @@ def main() -> int:
     manifest: list[dict[str, str]] = []
     public_keep: set[str] = set()
     for name in SCHOOL_TYPES_TO_BUILD:
-        st = sj.SCHOOL_TYPES[name]
+        st = SCHOOL_TYPES[name]
         if name == "postsec":
             build_postsec(st, manifest)
             continue
