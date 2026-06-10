@@ -5,14 +5,17 @@ NCES collections this script consumes:
 
     - ``EDGE_GEOCODE_PUBLICSCH_1920_sample.zip``   EDGE public-school points (5)
     - ``EDGE_GEOCODE_PRIVATESCH_1920_sample.zip``  EDGE private-school points (5)
+    - ``EDGE_GEOCODE_POSTSEC_1920_sample.zip``     EDGE college points (5)
     - ``ELSI_csv_export_public_1920_sample.csv``   ELSI public enrollment export
     - ``ELSI_csv_export_private_1920_sample.csv``  ELSI private enrollment export
     - ``ccd_sch_052_1920_sample.zip``              CCD public membership (long)
+    - ``effy2019_sample.csv``                      IPEDS 12-month enrollment (colleges)
 
 Enrollment keys are aligned to the EDGE point IDs so the join exercises matched,
 unmatched-point, and orphan-enrollment paths. The geocode zips were rebuilt from
 the EDGE ``.dbf`` distribution samples (geometry reconstructed from LAT/LON); the
-ELSI/CCD enrollment values are illustrative. Regenerate larger fixtures from full
+ELSI/CCD values are illustrative, while the IPEDS rows are real 2019 EFFY records
+for the colleges that overlap the geocode. Regenerate larger fixtures from full
 downloads with ``dev_tools/build_schools_fixtures.py``.
 """
 
@@ -32,20 +35,26 @@ FIXTURE_DIR = Path("tests/fixtures")
 SCHOOL_FIXTURES = (
     "EDGE_GEOCODE_PUBLICSCH_1920_sample.zip",
     "EDGE_GEOCODE_PRIVATESCH_1920_sample.zip",
+    "EDGE_GEOCODE_POSTSEC_1920_sample.zip",
     "ELSI_csv_export_public_1920_sample.csv",
     "ELSI_csv_export_private_1920_sample.csv",
     "ccd_sch_052_1920_sample.zip",
+    "effy2019_sample.csv",
 )
 
 # Points kept after the VA/MD/DC filter (each geocode sample also has one AL row).
 PUBLIC_POINT_IDS = {"510267002843", "240051001208", "240051001211", "110000500377"}
 PRIVATE_POINT_IDS = {"00253029", "BB181325", "BB181326", "00735363"}
+POSTSEC_POINT_IDS = {"131283", "232186", "163347", "163426"}
 
 # Public enrollment overlap: ELSI omits the DC point and adds one orphan.
 PUBLIC_ELSI_MATCHED = {"510267002843", "240051001208", "240051001211"}
 PUBLIC_ELSI_ORPHAN = "519999000099"
 PRIVATE_ELSI_MATCHED = {"00253029", "BB181325", "BB181326"}
 PRIVATE_ELSI_ORPHAN = "BB999999"
+# IPEDS overlap: EFFY omits the MD point 163347 and adds orphan 100663.
+POSTSEC_IPEDS_MATCHED = {"131283", "232186", "163426"}
+POSTSEC_IPEDS_ORPHAN = "100663"
 
 
 # =============================================================================
@@ -83,6 +92,7 @@ def elsi_only_dir(tmp_path: Path) -> Path:
 def test_resolve_school_type_by_name() -> None:
     assert mod.resolve_school_type("public").id_col == "NCESSCH"
     assert mod.resolve_school_type("private").id_col == "PPIN"
+    assert mod.resolve_school_type("postsec").id_col == "UNITID"
 
 
 def test_resolve_school_type_passes_through_instance() -> None:
@@ -239,7 +249,8 @@ def test_enrollment_ccd_nulls_negative_sentinel(staged_dir: Path) -> None:
 
 
 def test_enrollment_ccd_for_private_raises(staged_dir: Path) -> None:
-    with pytest.raises(ValueError, match="CCD"):
+    # Private declares only the ELSI source, so forcing CCD is rejected.
+    with pytest.raises(ValueError, match="private"):
         mod.load_enrollment_wide(staged_dir, "private", source="ccd")
 
 
@@ -256,6 +267,66 @@ def test_enrollment_invalid_source_raises(staged_dir: Path) -> None:
 def test_enrollment_missing_source_raises(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
         mod.load_enrollment_wide(tmp_path, "public")
+
+
+# =============================================================================
+# IPEDS / postsec  (third enrollment source)
+# =============================================================================
+
+
+def test_find_ipeds_file_locates_effy(staged_dir: Path) -> None:
+    found = mod._find_ipeds_file(staged_dir)
+    assert found is not None and found.name == "effy2019_sample.csv"
+
+
+def test_find_ipeds_file_returns_none_when_absent(tmp_path: Path) -> None:
+    assert mod._find_ipeds_file(tmp_path) is None
+
+
+def test_load_ipeds_wide_schema_and_levels(staged_dir: Path) -> None:
+    st = mod.SCHOOL_TYPES["postsec"]
+    df = mod._load_ipeds_wide(staged_dir / "effy2019_sample.csv", st)
+    assert set(df.columns) == {"UNITID", "enroll_total", "g_undergrad", "g_graduate"}
+    row = df.set_index("UNITID").loc["232186"]
+    assert row["enroll_total"] == 48678  # EFFYLEV 1 (all students)
+    assert row["g_undergrad"] == 34722  # EFFYLEV 2
+    assert row["g_graduate"] == 13956  # EFFYLEV 4
+
+
+def test_load_ipeds_wide_missing_graduate_level_is_nan(staged_dir: Path) -> None:
+    st = mod.SCHOOL_TYPES["postsec"]
+    df = mod._load_ipeds_wide(staged_dir / "effy2019_sample.csv", st)
+    # 163426 reports no EFFYLEV-4 (graduate) row in the source.
+    assert pd.isna(df.set_index("UNITID").loc["163426", "g_graduate"])
+
+
+def test_enrollment_postsec_auto_uses_ipeds(staged_dir: Path) -> None:
+    df = mod.load_enrollment_wide(staged_dir, "postsec", source="auto")
+    assert set(df["UNITID"]) == POSTSEC_IPEDS_MATCHED | {POSTSEC_IPEDS_ORPHAN}
+
+
+def test_enrollment_postsec_rejects_non_ipeds_source(staged_dir: Path) -> None:
+    with pytest.raises(ValueError, match="postsec"):
+        mod.load_enrollment_wide(staged_dir, "postsec", source="ccd")
+
+
+def test_load_school_points_postsec_uses_unitid(staged_dir: Path) -> None:
+    gdf = mod.load_school_points(staged_dir, "postsec")
+    assert set(gdf["UNITID"]) == POSTSEC_POINT_IDS  # AL row dropped
+
+
+def test_join_postsec_ipeds_overlap(staged_dir: Path) -> None:
+    points = mod.load_school_points(staged_dir, "postsec")
+    enroll = mod.load_enrollment_wide(staged_dir, "postsec")
+    out = mod.join_and_validate(points, enroll, id_col="UNITID")
+    assert len(out) == len(POSTSEC_POINT_IDS)
+    assert out["enroll_total"].notna().sum() == len(POSTSEC_IPEDS_MATCHED)
+
+
+def test_run_postsec_writes_outputs(staged_dir: Path, tmp_path: Path) -> None:
+    out_dir = tmp_path / "out"
+    mod.run(staged_dir, out_dir, school_type="postsec")
+    assert (out_dir / "va_md_dc_postsec_schools_enrollment.gpkg").exists()
 
 
 # =============================================================================
@@ -372,3 +443,11 @@ def test_main_defaults_to_public(staged_dir: Path, tmp_path: Path) -> None:
     out_dir = tmp_path / "out"
     mod.main(["--input-dir", str(staged_dir), "--output-dir", str(out_dir)])
     assert (out_dir / "va_md_dc_public_schools_enrollment.gpkg").exists()
+
+
+def test_main_all_processes_every_school_type(staged_dir: Path, tmp_path: Path) -> None:
+    out_dir = tmp_path / "out"
+    mod.main(["--input-dir", str(staged_dir), "--output-dir", str(out_dir), "--school-type", "all"])
+    produced = {p.name for p in out_dir.iterdir()}
+    for kind in ("public", "private", "postsec"):
+        assert f"va_md_dc_{kind}_schools_enrollment.gpkg" in produced

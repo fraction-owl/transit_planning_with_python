@@ -45,7 +45,7 @@ INPUT_DIR: Final[Path] = Path(r"PATH\TO\SCHOOLS\FIXTURE\INPUTS")  # <<< EDIT ME
 #: Where to write the trimmed fixtures (the repo's test fixtures directory).
 OUTPUT_DIR: Final[Path] = Path("tests/fixtures")  # <<< EDIT ME if needed
 
-SCHOOL_TYPES_TO_BUILD: Final[tuple[str, ...]] = ("public", "private")
+SCHOOL_TYPES_TO_BUILD: Final[tuple[str, ...]] = ("public", "private", "postsec")
 STATES: Final[set[str]] = {"VA", "MD", "DC"}
 
 N_MATCHED: Final[int] = 3  # schools in both geocode and ELSI
@@ -58,12 +58,14 @@ MANIFEST_FILENAME: Final[str] = "schools_fixture_manifest.csv"
 GEOCODE_OUT: Final[dict[str, str]] = {
     "public": "EDGE_GEOCODE_PUBLICSCH_1920_sample.zip",
     "private": "EDGE_GEOCODE_PRIVATESCH_1920_sample.zip",
+    "postsec": "EDGE_GEOCODE_POSTSEC_1920_sample.zip",
 }
 ELSI_OUT: Final[dict[str, str]] = {
     "public": "ELSI_csv_export_public_1920_sample.csv",
     "private": "ELSI_csv_export_private_1920_sample.csv",
 }
 CCD_OUT: Final[str] = "ccd_sch_052_1920_sample.zip"
+IPEDS_OUT: Final[str] = "effy2019_sample.csv"
 
 
 # =============================================================================
@@ -156,6 +158,51 @@ def write_elsi_csv(
         csv.writer(fh).writerows([*preamble, header, *kept_data, *footer])
 
 
+def read_ipeds(input_dir: Path) -> pd.DataFrame:
+    """Read the IPEDS EFFY file (csv or xlsx) as strings, restricted to used levels."""
+    path = sj._find_ipeds_file(input_dir)
+    if path is None:
+        raise FileNotFoundError(f"No IPEDS EFFY file (effy*.csv/.xlsx) in {input_dir}")
+    if path.suffix.lower() in {".xlsx", ".xls"}:
+        df = pd.read_excel(path, dtype=str)
+    else:
+        df = pd.read_csv(path, dtype=str)
+    df[sj.IPEDS_ID_COL] = df[sj.IPEDS_ID_COL].astype(str).str.strip().str.zfill(6)
+    return df[df[sj.IPEDS_LEVEL_COL].isin(sj.IPEDS_LEVEL_MAP)].copy()
+
+
+def build_postsec(st: sj.SchoolType, manifest: list[dict[str, str]]) -> None:
+    """Build college fixtures (EDGE POSTSEC geocode + trimmed IPEDS EFFY)."""
+    print(f"\n=== {st.name} ===")
+    points = read_geocode_points(INPUT_DIR, st)
+    effy = read_ipeds(INPUT_DIR)
+
+    point_ids = set(points[st.id_col])
+    effy_ids = set(effy[sj.IPEDS_ID_COL])
+
+    matched = sorted(point_ids & effy_ids)[:N_MATCHED]
+    unmatched_points = sorted(point_ids - effy_ids)[:N_UNMATCHED_POINTS]
+    orphans = sorted(effy_ids - point_ids)[:N_ORPHAN_ENROLLMENT]
+    print(f"  matched={len(matched)} unmatched_point={len(unmatched_points)} orphan={len(orphans)}")
+
+    out_points = points[points[st.id_col].isin(set(matched) | set(unmatched_points))].copy()
+    write_geocode_zip(out_points, OUTPUT_DIR / GEOCODE_OUT["postsec"])
+
+    keep_ids = set(matched) | set(orphans)
+    out_effy = effy[effy[sj.IPEDS_ID_COL].isin(keep_ids)].sort_values(
+        [sj.IPEDS_ID_COL, sj.IPEDS_LEVEL_COL]
+    )
+    out_effy.to_csv(OUTPUT_DIR / IPEDS_OUT, index=False)
+    print(f"  wrote {GEOCODE_OUT['postsec']} ({len(out_points)} pts) and {IPEDS_OUT}")
+
+    for key in matched:
+        manifest.append({"school_type": st.name, "id": key, "role": "matched"})
+    for key in unmatched_points:
+        manifest.append({"school_type": st.name, "id": key, "role": "unmatched_point"})
+    for key in orphans:
+        manifest.append({"school_type": st.name, "id": key, "role": "orphan_enrollment"})
+
+
 def trim_ccd_zip(input_dir: Path, keep_ids: set[str], out_zip: Path) -> bool:
     """Filter the CCD ``ccd_sch_052`` membership zip to ``keep_ids``. Returns written?"""
     ccd = sorted(input_dir.glob("ccd_sch_052_*.zip"))
@@ -231,6 +278,9 @@ def main() -> int:
     public_keep: set[str] = set()
     for name in SCHOOL_TYPES_TO_BUILD:
         st = sj.SCHOOL_TYPES[name]
+        if name == "postsec":
+            build_postsec(st, manifest)
+            continue
         keep = build_school_type(st, manifest)
         if name == "public":
             public_keep = keep

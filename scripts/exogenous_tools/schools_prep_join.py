@@ -1,31 +1,39 @@
-"""Join school enrollment to EDGE school-location points (public or private).
+"""Join school enrollment to EDGE school-location points (public, private, college).
 
 Standalone script: edit the config block and call ``run()`` (notebook) or run as
 ``python schools_prep_join.py [--input-dir ...] [--output-dir ...]
-[--school-type public|private|both] [--enrollment-source auto|ccd|elsi]
-[--states VA MD DC]`` (CLI). Produces a point GeoPackage (plus an attribute-only
-CSV companion) for the target jurisdictions -- Virginia, Maryland, and the
-District of Columbia by default -- with total enrollment plus a per-grade
-breakout joined to each EDGE school point.
+[--school-type public|private|postsec|both|all]
+[--enrollment-source auto|ccd|elsi|ipeds] [--states VA MD DC]`` (CLI). Produces a
+point GeoPackage (plus an attribute-only CSV companion) for the target
+jurisdictions -- Virginia, Maryland, and the District of Columbia by default --
+with total enrollment plus a breakout joined to each EDGE point.
 
-Two enrollment sources are supported and auto-detected (``--enrollment-source``):
+Three enrollment sources are supported, each applying to certain school types and
+auto-detected (``--enrollment-source``). ``auto`` picks the first source a type
+declares whose file is present:
     - CCD school membership (``ccd_sch_052_<year>_l_1a_<date>.zip``), long format,
-      keyed on NCESSCH. Public schools only. Richer per-grade detail.
+      keyed on NCESSCH. Public schools only. Richest per-grade detail.
     - ELSI table-generator exports (``ELSI_csv_export_*.csv``), wide format, with
-      a preamble/footer and total + Grades 1-8 / Grades 9-12 columns. Available
-      for both public and private schools. Use this when a full CCD download is
-      impractical (the ELSI generator lets you pre-filter to a few states).
+      a preamble/footer and total + Grades 1-8 / Grades 9-12 columns. Public and
+      private schools. Use this when a full CCD download is impractical (the ELSI
+      generator lets you pre-filter to a few states).
+    - IPEDS 12-month enrollment (``effy<year>.csv``/``.xlsx``, the EFFY survey),
+      keyed on UNITID. Postsecondary (colleges) only. Total headcount plus an
+      undergraduate / graduate breakout.
 
 Inputs (placed in the input directory, read straight from their distribution form):
     - EDGE_GEOCODE_PUBLICSCH_<year>.zip      EDGE public-school point shapefile
     - EDGE_GEOCODE_PRIVATESCH_<year>.zip     EDGE private-school point shapefile
+    - EDGE_GEOCODE_POSTSEC_<year>.zip        EDGE college point shapefile
     - ccd_sch_052_<year>_l_1a_<date>.zip     CCD school membership (public, long)
     - ELSI_csv_export_*.csv                  ELSI export (public and/or private)
+    - effy<year>.csv / effy<year>.xlsx       IPEDS 12-month enrollment (colleges)
 
 Sources:
     - CCD school membership (fiscal files):
       https://nces.ed.gov/ccd/files.asp#Fiscal:2,LevelId:7,SchoolYearId:39,Page:1
     - ELSI table generator: https://nces.ed.gov/ccd/elsi/tableGenerator.aspx
+    - IPEDS data center (EFFY survey): https://nces.ed.gov/ipeds/use-the-data
     - EDGE school geocodes:
       https://nces.ed.gov/programs/edge/geographic/schoollocations
 
@@ -36,8 +44,6 @@ Notes:
       file is present.
     - Keep the geocode and enrollment years on the same vintage, or the join will
       silently drop schools that opened or closed between the two collections.
-    - Postsecondary (college) geocodes carry no enrollment field, so they are out of
-      scope here; the EDGE_GEOCODE_POSTSEC file would need an IPEDS join for counts.
 """
 
 from __future__ import annotations
@@ -83,16 +89,17 @@ GRADE_SUBTOTAL = "Subtotal 4 - By Grade"
 
 @dataclass(frozen=True)
 class SchoolType:
-    """Per-school-type wiring for geocodes and the two enrollment sources.
+    """Per-school-type wiring for geocodes and the applicable enrollment sources.
 
     Attributes:
-        name: Short key (``"public"`` / ``"private"``) used in CLI args and outputs.
+        name: Short key (``"public"``/``"private"``/``"postsec"``) used in CLI args
+            and output filenames.
         geocode_glob: Glob for the EDGE point-shapefile zip in the input directory.
         id_col: Join key column in the EDGE point file (and the enrollment output).
         id_width: Zero-pad width for the ID, guarding against leading-zero loss in
             CSV round-trips. Alphanumeric IDs at this width are left unchanged.
-        supports_ccd: Whether a CCD ``ccd_sch_052`` membership file applies (public
-            only; the CCD fiscal collection has no private-school equivalent).
+        sources: Enrollment sources that apply to this type, in ``"auto"`` preference
+            order. One or more of ``"ccd"`` / ``"elsi"`` / ``"ipeds"``.
         elsi_kind: Phrase identifying the ELSI export ("Public School" /
             "Private School"), matched against the export's preamble.
         elsi_id_substr: Substring identifying the ELSI key column for this type.
@@ -104,9 +111,9 @@ class SchoolType:
     geocode_glob: str
     id_col: str
     id_width: int
-    supports_ccd: bool
-    elsi_kind: str
-    elsi_id_substr: str
+    sources: tuple[str, ...]
+    elsi_kind: str = ""
+    elsi_id_substr: str = ""
     elsi_total_substrs: tuple[str, ...] = field(default_factory=tuple)
 
 
@@ -116,7 +123,7 @@ SCHOOL_TYPES: dict[str, SchoolType] = {
         geocode_glob="EDGE_GEOCODE_PUBLICSCH_*.zip",
         id_col="NCESSCH",
         id_width=12,
-        supports_ccd=True,
+        sources=("ccd", "elsi"),
         elsi_kind="Public School",
         elsi_id_substr="School ID (12-digit)",
         elsi_total_substrs=(
@@ -129,7 +136,7 @@ SCHOOL_TYPES: dict[str, SchoolType] = {
         geocode_glob="EDGE_GEOCODE_PRIVATESCH_*.zip",
         id_col="PPIN",
         id_width=8,
-        supports_ccd=False,
+        sources=("elsi",),
         elsi_kind="Private School",
         elsi_id_substr="School ID - NCES Assigned",
         elsi_total_substrs=(
@@ -137,7 +144,24 @@ SCHOOL_TYPES: dict[str, SchoolType] = {
             "Total Students (Ungraded & K-12)",
         ),
     ),
+    "postsec": SchoolType(
+        name="postsec",
+        geocode_glob="EDGE_GEOCODE_POSTSEC_*.zip",
+        id_col="UNITID",
+        id_width=6,
+        sources=("ipeds",),
+    ),
 }
+
+# IPEDS 12-month enrollment (EFFY survey) wiring -- the postsec enrollment source.
+# EFFYLEV codes the student level the row totals: 1 = all students (the headcount
+# used as enroll_total), 2 = undergraduate, 4 = graduate. EFYTOTLT is the men+women
+# total; the X-prefixed columns are imputation flags and are ignored here.
+IPEDS_GLOBS = ("effy*.csv", "EFFY*.csv", "effy*.xlsx", "EFFY*.xlsx")
+IPEDS_ID_COL = "UNITID"
+IPEDS_LEVEL_COL = "EFFYLEV"
+IPEDS_TOTAL_COL = "EFYTOTLT"
+IPEDS_LEVEL_MAP = {"1": "enroll_total", "2": "g_undergrad", "4": "g_graduate"}
 
 
 def _in_ipython_kernel() -> bool:
@@ -438,6 +462,57 @@ def _load_elsi_wide(path: Path, school_type: SchoolType) -> pd.DataFrame:
     return out
 
 
+def _find_ipeds_file(input_dir: Path) -> Path | None:
+    """Return the IPEDS EFFY enrollment file (csv preferred over xlsx), or None."""
+    for pattern in IPEDS_GLOBS:
+        matches = sorted(input_dir.glob(pattern))
+        if matches:
+            return matches[0]
+    return None
+
+
+def _load_ipeds_wide(path: Path, school_type: SchoolType) -> pd.DataFrame:
+    """Parse an IPEDS EFFY file into the shared wide enrollment schema.
+
+    Output columns: ``UNITID``, ``enroll_total`` (EFFYLEV 1, all students), and the
+    level breakout ``g_undergrad`` (EFFYLEV 2) / ``g_graduate`` (EFFYLEV 4). For
+    colleges the breakout is by student level rather than by grade, but it occupies
+    the same ``g_*`` columns the rest of the pipeline expects.
+
+    Args:
+        path: Path to the IPEDS EFFY ``.csv`` or ``.xlsx`` file.
+        school_type: The resolved postsecondary :class:`SchoolType`.
+
+    Returns:
+        Wide enrollment DataFrame keyed on a zero-padded string ``UNITID``.
+    """
+    logger.info("Reading IPEDS enrollment from %s", path.name)
+    if path.suffix.lower() in {".xlsx", ".xls"}:
+        raw = pd.read_excel(path, dtype=str)
+    else:
+        raw = pd.read_csv(path, dtype=str)
+
+    raw = raw[[IPEDS_ID_COL, IPEDS_LEVEL_COL, IPEDS_TOTAL_COL]]
+    raw = raw[raw[IPEDS_LEVEL_COL].isin(IPEDS_LEVEL_MAP)].copy()
+    raw["count"] = pd.to_numeric(raw[IPEDS_TOTAL_COL], errors="coerce")
+    wide = (
+        raw.pivot_table(index=IPEDS_ID_COL, columns=IPEDS_LEVEL_COL, values="count", aggfunc="sum")
+        .rename(columns=IPEDS_LEVEL_MAP)
+        .reset_index()
+    )
+    wide.columns.name = None
+    wide[school_type.id_col] = wide[IPEDS_ID_COL].astype(str).str.strip().str.zfill(
+        school_type.id_width
+    )
+    # Order columns: id, enroll_total, then the level breakouts present.
+    ordered = [school_type.id_col] + [c for c in IPEDS_LEVEL_MAP.values() if c in wide.columns]
+    out = wide[ordered]
+    if out.empty:
+        raise ValueError(f"IPEDS file {path.name} produced no enrollment rows")
+    logger.info("Built IPEDS enrollment for %d institutions", len(out))
+    return out
+
+
 def _find_elsi_csv(input_dir: Path, school_type: SchoolType) -> Path | None:
     """Return the ELSI export CSV for ``school_type``, or None if absent.
 
@@ -461,60 +536,68 @@ def load_enrollment_wide(
     *,
     source: str = DEFAULT_ENROLLMENT_SOURCE,
 ) -> pd.DataFrame:
-    """Load enrollment from a CCD membership zip or an ELSI export, auto-detected.
+    """Load enrollment from the source(s) that apply to ``school_type``, auto-detected.
 
-    With ``source="auto"`` a CCD ``ccd_sch_052`` zip wins when present (it carries
-    the finer per-grade detail and is public-only); otherwise the matching ELSI
-    export is used. ``source="ccd"`` or ``"elsi"`` forces one path.
+    Each school type declares its applicable sources in ``SchoolType.sources``
+    (public: CCD then ELSI; private: ELSI; postsec: IPEDS). With ``source="auto"``
+    the first declared source whose file is present wins -- so for public schools a
+    CCD ``ccd_sch_052`` zip beats an ELSI export when both are staged. Passing an
+    explicit ``"ccd"``/``"elsi"``/``"ipeds"`` forces that path.
 
     Args:
         input_dir: Folder holding the enrollment file(s).
-        school_type: ``"public"``/``"private"`` (or a :class:`SchoolType`).
-        source: ``"auto"`` | ``"ccd"`` | ``"elsi"``.
+        school_type: ``"public"``/``"private"``/``"postsec"`` (or a :class:`SchoolType`).
+        source: ``"auto"`` or one of the type's declared sources.
 
     Returns:
         Wide enrollment DataFrame keyed on ``school_type.id_col``.
 
     Raises:
-        ValueError: If ``source`` is not one of the accepted values, or ``"ccd"``
-            is requested for a school type with no CCD collection.
-        FileNotFoundError: If the requested (or any) enrollment source is missing.
+        ValueError: If ``source`` is not ``"auto"`` or a source the type supports.
+        FileNotFoundError: If no usable enrollment file is found.
     """
     st = resolve_school_type(school_type)
-    if source not in {"auto", "ccd", "elsi"}:
-        raise ValueError(f"source must be 'auto', 'ccd', or 'elsi'; got {source!r}")
-    if source == "ccd" and not st.supports_ccd:
-        raise ValueError(f"No CCD membership collection exists for {st.name} schools")
+    if source != "auto" and source not in st.sources:
+        raise ValueError(
+            f"source for {st.name} schools must be 'auto' or one of "
+            f"{list(st.sources)}; got {source!r}"
+        )
 
-    ccd_zips = sorted(input_dir.glob("ccd_sch_052_*.zip")) if st.supports_ccd else []
-    elsi_csv = _find_elsi_csv(input_dir, st)
+    available: dict[str, Path] = {}
+    if "ccd" in st.sources:
+        ccd_zips = sorted(input_dir.glob("ccd_sch_052_*.zip"))
+        if ccd_zips:
+            available["ccd"] = ccd_zips[0]
+    if "elsi" in st.sources:
+        elsi_csv = _find_elsi_csv(input_dir, st)
+        if elsi_csv is not None:
+            available["elsi"] = elsi_csv
+    if "ipeds" in st.sources:
+        ipeds = _find_ipeds_file(input_dir)
+        if ipeds is not None:
+            available["ipeds"] = ipeds
 
-    chosen = source
-    if source == "auto":
-        chosen = "ccd" if ccd_zips else "elsi"
+    chosen = source if source != "auto" else next((s for s in st.sources if s in available), None)
+
+    if chosen is None or chosen not in available:
+        if chosen == "ccd" or (chosen is None and "ccd" in st.sources):
+            lea = list(input_dir.glob("ccd_lea_052_*.zip"))
+            if lea:
+                raise FileNotFoundError(
+                    f"No CCD membership file (ccd_sch_052_*.zip) in {input_dir}. Found a "
+                    "district-level file (ccd_lea_052) instead; that one is keyed on LEAID "
+                    "and cannot join to school points. Download ccd_sch_052 for the same year."
+                )
+        raise FileNotFoundError(
+            f"No enrollment source for {st.name} schools in {input_dir}; "
+            f"expected one of {list(st.sources)}"
+        )
 
     if chosen == "ccd":
-        if not ccd_zips:
-            lea = list(input_dir.glob("ccd_lea_052_*.zip"))
-            hint = (
-                " Found a district-level file (ccd_lea_052) instead; that one is keyed on "
-                "LEAID and cannot join to school points. Download ccd_sch_052 for the same "
-                "year."
-                if lea
-                else ""
-            )
-            raise FileNotFoundError(
-                f"No CCD membership file (ccd_sch_052_*.zip) in {input_dir}." + hint
-            )
-        return _load_ccd_long(_find_one(input_dir, "ccd_sch_052_*.zip"), st.id_col)
-
-    if elsi_csv is None:
-        raise FileNotFoundError(
-            f"No enrollment source for {st.name} schools in {input_dir}: expected a "
-            f"{st.elsi_kind} ELSI export (ELSI_csv_export_*.csv)"
-            + (" or ccd_sch_052_*.zip" if st.supports_ccd else "")
-        )
-    return _load_elsi_wide(elsi_csv, st)
+        return _load_ccd_long(available["ccd"], st.id_col)
+    if chosen == "elsi":
+        return _load_elsi_wide(available["elsi"], st)
+    return _load_ipeds_wide(available["ipeds"], st)
 
 
 def join_and_validate(
@@ -614,15 +697,16 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument(
         "--school-type",
-        choices=[*SCHOOL_TYPES, "both"],
+        choices=[*SCHOOL_TYPES, "both", "all"],
         default=DEFAULT_SCHOOL_TYPE,
-        help="school type to process (default: %(default)s)",
+        help="school type to process; 'both' = public+private, 'all' adds postsec "
+        "(default: %(default)s)",
     )
     parser.add_argument(
         "--enrollment-source",
-        choices=["auto", "ccd", "elsi"],
+        choices=["auto", "ccd", "elsi", "ipeds"],
         default=DEFAULT_ENROLLMENT_SOURCE,
-        help="enrollment source; auto prefers CCD when present (default: %(default)s)",
+        help="enrollment source; auto picks the first the type declares (default: %(default)s)",
     )
     parser.add_argument(
         "--states",
@@ -639,7 +723,12 @@ def main(argv: list[str] | None = None) -> None:
     )
     args = parser.parse_args(argv)
 
-    types = list(SCHOOL_TYPES) if args.school_type == "both" else [args.school_type]
+    if args.school_type == "all":
+        types = list(SCHOOL_TYPES)
+    elif args.school_type == "both":
+        types = ["public", "private"]
+    else:
+        types = [args.school_type]
     for type_name in types:
         run(
             args.input_dir,
