@@ -64,6 +64,7 @@ transit_planning_with_python/
 │   │   ├── time_band_exporter.py
 │   │   └── timepoint_schedule_exporter.py
 │   ├── modeling/
+│   │   ├── ridership_ml_model.py
 │   │   └── ridership_regression_model.py
 │   ├── operations_tools/
 │   │   ├── convert_to_tides_stop_visits.py
@@ -161,6 +162,7 @@ transit_planning_with_python/
 │   ├── test_otp_by_timepoint.py
 │   ├── test_otp_monthly_tides.py
 │   ├── test_printable_block_schedules.py
+│   ├── test_ridership_ml_model.py
 │   ├── test_ridership_regression_model.py
 │   ├── test_route_direction_classifier.py
 │   ├── test_segment_runtime_tides.py
