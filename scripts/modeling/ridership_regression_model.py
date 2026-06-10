@@ -119,7 +119,7 @@ FEATURE_TABLES: Final[list[FeatureTable]] = [
             # Daily-derived weather aggregates (from clean_noaa_weather.aggregate_monthly).
             # These capture event intensity and frequency rather than bare monthly totals.
             "avg_temp_f",  # mean daily temperature
-            "max_daily_precip_in",  # peak single-day rain (one very wet day vs. light drizzle spread)
+            "max_daily_precip_in",  # peak single-day rain (severity, not monthly total)
             "days_with_precip",  # count of rainy days
             "total_snow_in",  # total monthly snowfall
             "max_daily_snow_in",  # peak single-day snowfall
