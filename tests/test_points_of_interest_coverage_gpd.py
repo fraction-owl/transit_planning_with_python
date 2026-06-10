@@ -17,7 +17,6 @@ from scripts.service_coverage.points_of_interest_coverage_gpd import (
     _prepare_route_buffers,
 )
 
-
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
@@ -155,7 +154,7 @@ def test_prepare_route_buffers_route_filter_excludes_unspecified_routes() -> Non
 
 
 def test_prepare_route_buffers_missing_shape_columns_raises() -> None:
-    """shapes table missing required columns should raise ValueError."""
+    """Shapes table missing required columns should raise ValueError."""
     tables = _minimal_tables()
     tables["shapes"] = pd.DataFrame({"shape_id": ["SH1"]})
     with pytest.raises(ValueError, match="missing required columns"):

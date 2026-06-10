@@ -185,6 +185,7 @@ def _load_layers(
     Args:
         layer_specs: Tuples of (filename, id_column).
         shp_dir: Root directory to search.
+        projected_crs: CRS string used to reproject each loaded layer.
 
     Returns:
     -------
