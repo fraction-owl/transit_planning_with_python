@@ -287,8 +287,7 @@ def load_school_points(
         )
     if st.id_col not in gdf.columns:
         raise KeyError(
-            f"ID column {st.id_col!r} not in geocode file; "
-            f"available columns: {list(gdf.columns)}"
+            f"ID column {st.id_col!r} not in geocode file; available columns: {list(gdf.columns)}"
         )
 
     # IDs are strings; preserve leading zeros and pad to the expected width.
@@ -501,8 +500,8 @@ def _load_ipeds_wide(path: Path, school_type: SchoolType) -> pd.DataFrame:
         .reset_index()
     )
     wide.columns.name = None
-    wide[school_type.id_col] = wide[IPEDS_ID_COL].astype(str).str.strip().str.zfill(
-        school_type.id_width
+    wide[school_type.id_col] = (
+        wide[IPEDS_ID_COL].astype(str).str.strip().str.zfill(school_type.id_width)
     )
     # Order columns: id, enroll_total, then the level breakouts present.
     ordered = [school_type.id_col] + [c for c in IPEDS_LEVEL_MAP.values() if c in wide.columns]
