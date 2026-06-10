@@ -17,6 +17,7 @@ import argparse
 import logging
 import sys
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
@@ -25,6 +26,9 @@ import pandas as pd
 # pass --input / --output on the command line.
 INPUT_PATH: Path | None = None
 OUTPUT_PATH: Path | None = None
+MONTHLY_OUTPUT_PATH: Path | None = (
+    None  # set to write the monthly aggregates alongside the daily output
+)
 DATE_FORMAT: str | None = None  # None = infer (handles ISO 2021-01-01 and 1/1/2021)
 USE_LONG_NAMES = False  # rename code headers (TMAX) to long names; logged either way
 WRITE_LOG = True  # also write a .txt processing log next to the output
@@ -193,14 +197,78 @@ def clean_weather(df: pd.DataFrame, *, use_long_names: bool = USE_LONG_NAMES) ->
     return df
 
 
+def aggregate_monthly(df: pd.DataFrame) -> pd.DataFrame:
+    """Collapse a cleaned daily NOAA frame into monthly ridership-model inputs.
+
+    Returns one row per calendar month with a ``period`` key (``"YYYY-MM"``),
+    plus daily-derived aggregates that capture both the intensity and the
+    frequency of weather events within a month — more informative for ridership
+    models than a simple monthly total.
+
+    Columns produced (whichever source columns are present):
+        period            — ``"YYYY-MM"`` join key for the exogenous feature table
+        avg_temp_f        — mean daily temperature (TAVG, or midpoint of TMAX/TMIN)
+        max_daily_precip_in — peak single-day precipitation (captures one very wet day)
+        days_with_precip  — count of days with measurable precipitation (PRCP > 0)
+        total_snow_in     — sum of daily snowfall
+        max_daily_snow_in — peak single-day snowfall
+    """
+    df = df.copy()
+    df["period"] = df["DATE"].dt.to_period("M").astype(str)
+
+    agg: dict[str, Any] = {}
+
+    if "TAVG" in df.columns:
+        agg["avg_temp_f"] = pd.NamedAgg(column="TAVG", aggfunc="mean")
+    elif "TMAX" in df.columns and "TMIN" in df.columns:
+        df["_tmid"] = (df["TMAX"] + df["TMIN"]) / 2.0
+        agg["avg_temp_f"] = pd.NamedAgg(column="_tmid", aggfunc="mean")
+
+    if "PRCP" in df.columns:
+        agg["max_daily_precip_in"] = pd.NamedAgg(column="PRCP", aggfunc="max")
+        agg["days_with_precip"] = pd.NamedAgg(column="PRCP", aggfunc=lambda x: int((x > 0).sum()))
+
+    if "SNOW" in df.columns:
+        agg["total_snow_in"] = pd.NamedAgg(column="SNOW", aggfunc="sum")
+        agg["max_daily_snow_in"] = pd.NamedAgg(column="SNOW", aggfunc="max")
+
+    if not agg:
+        raise ValueError(
+            "No recognised weather columns (TAVG, TMAX/TMIN, PRCP, SNOW) found in frame."
+        )
+
+    monthly = df.groupby("period").agg(**agg).reset_index()
+
+    rounding = {
+        "avg_temp_f": 1,
+        "max_daily_precip_in": 2,
+        "total_snow_in": 1,
+        "max_daily_snow_in": 1,
+    }
+    monthly = monthly.round({k: v for k, v in rounding.items() if k in monthly.columns})
+    logger.info(
+        "Monthly aggregates: %d months, columns: %s",
+        len(monthly),
+        list(monthly.columns),
+    )
+    return monthly
+
+
 def run(
     input_path: Path | None = None,
     output_path: Path | None = None,
+    monthly_output_path: Path | None = None,
     *,
     use_long_names: bool | None = None,
     write_log: bool | None = None,
 ) -> pd.DataFrame:
     """Notebook entry point: clean ``input_path`` and write ``output_path``.
+
+    If ``monthly_output_path`` (or the module-level ``MONTHLY_OUTPUT_PATH``) is
+    set, a second CSV of monthly aggregates is written alongside the daily
+    output.  Those monthly columns (``avg_temp_f``, ``max_daily_precip_in``,
+    ``days_with_precip``, ``total_snow_in``, ``max_daily_snow_in``) are what the
+    ridership models expect in the exogenous feature table.
 
     Unset args fall back to the config block, resolved at call time -- so
     ``m.INPUT_PATH = ...; m.run()`` works as expected after a plain import.
@@ -208,6 +276,9 @@ def run(
     _ensure_logging()
     input_path = INPUT_PATH if input_path is None else Path(input_path)
     output_path = OUTPUT_PATH if output_path is None else Path(output_path)
+    monthly_output_path = (
+        MONTHLY_OUTPUT_PATH if monthly_output_path is None else Path(monthly_output_path)
+    )
     use_long_names = USE_LONG_NAMES if use_long_names is None else use_long_names
     write_log = WRITE_LOG if write_log is None else write_log
 
@@ -235,6 +306,11 @@ def run(
             clean.to_csv(output_path, index=False)
 
         logger.info("%d rows x %d cols -> %s", len(clean), clean.shape[1], output_path)
+
+        if monthly_output_path is not None:
+            monthly = aggregate_monthly(clean)
+            monthly.to_csv(monthly_output_path, index=False)
+            logger.info("%d monthly rows -> %s", len(monthly), monthly_output_path)
     finally:
         if fh is not None:
             logger.removeHandler(fh)
