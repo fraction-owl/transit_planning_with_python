@@ -12,8 +12,15 @@ Typical predictors:
     - Exogenous context: gas prices, unemployment, weather (``exogenous_tools``).
     - Demographic service coverage: population, low-income, minority, zero-car
       households reached by each route (``service_coverage`` outputs).
-    - Points-of-interest coverage: strategic sites / jobs reached by each route
-      (``points_of_interest_coverage`` outputs).
+    - Points-of-interest coverage: strategic sites reached by each route
+      (``points_of_interest_coverage`` outputs). These are presence-only
+      counts — we know a library or community center falls within reach, but
+      nothing about how big or busy it is.
+    - Magnitude-weighted POI coverage: school points carry enrollment and
+      Capital Bikeshare (CABI) stations carry weekday average ridership, so
+      each route gets both a count of points served and the demand (students /
+      riders) those points represent — something we cannot say for a generic
+      POI.
 
 Features:
     - Joins an "anchor" ridership table to any number of feature tables on a
@@ -120,6 +127,24 @@ FEATURE_TABLES: Final[list[FeatureTable]] = [
         join_keys=("route_id",),
         keep_cols=("sites_served", "jobs_served"),
     ),
+    # School points reached by each route. Unlike a generic POI, a school
+    # carries a size we can measure, so we bring in both the count served and
+    # the total enrollment those schools represent.
+    FeatureTable(
+        label="school_coverage",
+        path=Path(r"Path\To\Your\school_coverage_by_route.csv"),
+        join_keys=("route_id",),
+        keep_cols=("schools_served", "enrollment_served"),
+    ),
+    # Capital Bikeshare (CABI) stations reached by each route. Like schools,
+    # these come with a measurable level of activity, so we bring in both the
+    # count served and the weekday average ridership those stations carry.
+    FeatureTable(
+        label="cabi_coverage",
+        path=Path(r"Path\To\Your\cabi_coverage_by_route.csv"),
+        join_keys=("route_id",),
+        keep_cols=("cabi_stations_served", "cabi_weekday_riders_served"),
+    ),
 ]
 
 # -----------------------------------------------------------------------------
@@ -138,7 +163,15 @@ PREDICTORS: Final[tuple[str, ...]] = (
     "unemployment_rate",
     "pop_served",
     "low_income_served",
+    # Generic POI coverage is presence-only: just how many sites a route
+    # reaches, with no sense of their size.
     "sites_served",
+    # Schools and CABI stations add a magnitude alongside the count: enrollment
+    # reached and weekday ridership reached, respectively.
+    "schools_served",
+    "enrollment_served",
+    "cabi_stations_served",
+    "cabi_weekday_riders_served",
 )
 
 # Categorical columns to one-hot encode (first level dropped as the reference).
@@ -160,6 +193,10 @@ LOG_PREDICTORS: Final[tuple[str, ...]] = (
     "pop_served",
     "low_income_served",
     "sites_served",
+    "schools_served",
+    "enrollment_served",
+    "cabi_stations_served",
+    "cabi_weekday_riders_served",
 )
 
 # Standardize predictors to mean 0 / unit variance before fitting. Useful for
