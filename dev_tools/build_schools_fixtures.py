@@ -106,10 +106,11 @@ def _find_elsi_csv(input_dir: Path, school_type: SchoolType) -> Path | None:
     marker = f"This is a {school_type.elsi_kind} based table"
     for csv_path in sorted(input_dir.glob("*.csv")):
         try:
-            head = "".join(csv_path.open(encoding="utf-8-sig").readlines()[:10])
+            with csv_path.open(encoding="utf-8-sig", errors="replace") as fh:
+                head = "".join(fh.readline() for _ in range(20))
         except OSError:  # pragma: no cover
             continue
-        if head.startswith("ELSI Export") and marker in head:
+        if "ELSI Export" in head and marker in head:
             return csv_path
     return None
 
