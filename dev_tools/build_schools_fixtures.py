@@ -33,7 +33,7 @@ import geopandas as gpd
 import pandas as pd
 from shapely.geometry import Point
 
-from scripts.national_data_tools import schools_prep_join as sj
+from scripts.national_data_tools import schools_prep_join_gpd as sj
 
 # =============================================================================
 # CONFIG
@@ -54,7 +54,7 @@ N_ORPHAN_ENROLLMENT: Final[int] = 1  # ELSI rows with no matching point
 
 MANIFEST_FILENAME: Final[str] = "schools_fixture_manifest.csv"
 
-#: Output filenames per school type (matches what test_schools_prep_join expects).
+#: Output filenames per school type (matches what test_schools_prep_join_gpd expects).
 GEOCODE_OUT: Final[dict[str, str]] = {
     "public": "EDGE_GEOCODE_PUBLICSCH_1920_sample.zip",
     "private": "EDGE_GEOCODE_PRIVATESCH_1920_sample.zip",
