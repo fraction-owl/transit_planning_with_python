@@ -1,8 +1,8 @@
 """Analyze transit service coverage of strategic sites using GTFS and GIS data.
 
 This script evaluates how well individual transit routes serve strategically important
-locations—such as public housing developments, high schools, hospitals, parks, and other
-community facilities—based on spatial proximity.
+locations—such as public housing developments, high schools, hospitals, parks, metro/rail
+stations, and other community facilities—based on spatial proximity.
 
 Intended Use
 ------------
@@ -43,6 +43,7 @@ LAYER_SPECS: list[tuple[str, str]] = [
     ("Hospitals_and_Urgent_Care_Facilities.shp", "DESCRIPTIO"),
     ("School_Facilities.shp", "SCHOOL_NAM"),
     ("Libraries.shp", "DESCRIPTIO"),
+    ("Metrorail_Stations.shp", "NAME"),
 ]
 
 # Optional filter: only analyze these route_id values.
@@ -53,6 +54,11 @@ ROUTE_FILTER: list[str] = []
 USE_SHAPE_BUFFER = True  # True → buffer route geometry; False → buffer stops
 BUFFER_DIST_FT = 1320.0  # ¼ mile in feet
 PLOT_FIG_DPI = 250  # resolution for PNG exports
+
+# Projected CRS used for buffering and spatial joins.
+# EPSG:3857 (Web Mercator) works globally; swap for a local CRS (e.g. "EPSG:2283"
+# for northern Virginia in feet) when higher spatial accuracy is needed.
+PROJECTED_CRS = "EPSG:3857"
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
 
@@ -84,6 +90,8 @@ def _prepare_route_buffers(
     tables: Mapping[str, pd.DataFrame],
     use_shape_buffer: bool,
     buffer_dist_ft: float,
+    route_filter: list[str] | None = None,
+    projected_crs: str = "EPSG:3857",
 ) -> gpd.GeoDataFrame:
     """Return a GeoDataFrame with one buffered geometry per route_id.
 
@@ -129,14 +137,13 @@ def _prepare_route_buffers(
     )
 
     # Choose projected CRS (meters) to allow buffering
-    projected_crs = "EPSG:3857"
     shapes_gdf = shapes_gdf.to_crs(projected_crs)
     stops = stops.to_crs(projected_crs)
     buff_dist_m = buffer_dist_ft * 0.3048  # convert to meters
 
     buffers: List[dict[str, object]] = []
     for route_id, shp_ids in route_shapes.items():
-        if ROUTE_FILTER and route_id not in ROUTE_FILTER:
+        if route_filter and route_id not in route_filter:
             continue
 
         if use_shape_buffer:
@@ -167,6 +174,7 @@ def _prepare_route_buffers(
 def _load_layers(
     layer_specs: Iterable[tuple[str, str]],
     shp_dir: Path,
+    projected_crs: str = "EPSG:3857",
 ) -> dict[str, gpd.GeoDataFrame]:
     """Recursively load each designated shapefile (case‑insensitive search).
 
@@ -207,7 +215,7 @@ def _load_layers(
             logging.warning("Column %s missing in %s – skipped", id_col, path)
             continue
 
-        layers[filename] = gdf[[id_col, "geometry"]].to_crs("EPSG:3857")
+        layers[filename] = gdf[[id_col, "geometry"]].to_crs(projected_crs)
         logging.info("Loaded %s (%d features)", path.relative_to(shp_dir), len(gdf))
 
     return layers
@@ -218,6 +226,7 @@ def _count_features(
     layers: Mapping[str, gpd.GeoDataFrame],
     layer_specs: Iterable[tuple[str, str]],
     output_dir: Path,
+    plot_fig_dpi: int = 250,
 ) -> pd.DataFrame:
     """For each route, count intersecting features and write per‑route CSV/PNG.
 
@@ -254,7 +263,7 @@ def _count_features(
         pd.DataFrame(csv_rows).to_csv(output_dir / f"{route_id}_feature_summary.csv", index=False)
 
         # Plot quick map
-        fig, ax = plt.subplots(figsize=(6, 6), dpi=PLOT_FIG_DPI)
+        fig, ax = plt.subplots(figsize=(6, 6), dpi=plot_fig_dpi)
         gpd.GeoSeries([buf_geom]).plot(ax=ax, facecolor="none", edgecolor="black")
         for fname in feature_name_lists:
             layers[fname][layers[fname].intersects(buf_geom)].plot(ax=ax, label=fname.split(".")[0])
@@ -290,21 +299,33 @@ def main() -> None:
     tables = _load_gtfs_tables(GTFS_DIR)
 
     logging.info("Building route buffers (use_shape_buffer=%s)", USE_SHAPE_BUFFER)
-    route_buffers = _prepare_route_buffers(tables, USE_SHAPE_BUFFER, BUFFER_DIST_FT)
+    route_buffers = _prepare_route_buffers(
+        tables,
+        USE_SHAPE_BUFFER,
+        BUFFER_DIST_FT,
+        route_filter=ROUTE_FILTER,
+        projected_crs=PROJECTED_CRS,
+    )
 
     if route_buffers.empty:
         logging.error("No buffers produced – nothing to do")
         return
 
     logging.info("Loading designated shapefiles")
-    layers = _load_layers(LAYER_SPECS, SHP_INPUT_DIR)
+    layers = _load_layers(LAYER_SPECS, SHP_INPUT_DIR, projected_crs=PROJECTED_CRS)
 
     if not layers:
         logging.error("No valid layers loaded – nothing to analyze")
         return
 
     logging.info("Counting features per route")
-    summary_df = _count_features(route_buffers, layers, LAYER_SPECS, OUTPUT_DIR)
+    summary_df = _count_features(
+        route_buffers,
+        layers,
+        LAYER_SPECS,
+        OUTPUT_DIR,
+        plot_fig_dpi=PLOT_FIG_DPI,
+    )
 
     # Save summary CSV
     summary_path = OUTPUT_DIR / "all_routes_feature_summary.csv"
