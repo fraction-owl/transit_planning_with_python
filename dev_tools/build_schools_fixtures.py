@@ -279,8 +279,7 @@ def read_ipeds(input_dir: Path) -> pd.DataFrame:
     if path.suffix.lower() == ".zip":
         with zipfile.ZipFile(path) as zf:
             member = next(
-                m for m in zf.namelist()
-                if Path(m).suffix.lower() in {".csv", ".xlsx", ".xls"}
+                m for m in zf.namelist() if Path(m).suffix.lower() in {".csv", ".xlsx", ".xls"}
             )
             data = zf.open(member).read()
         if Path(member).suffix.lower() in {".xlsx", ".xls"}:
