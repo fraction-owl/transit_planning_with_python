@@ -8,7 +8,9 @@ import pytest
 from shapely.geometry import Point
 
 from scripts.service_coverage.school_coverage_by_route_gpd import (
+    _band_of_grade_column,
     _load_gtfs_tables,
+    _normalize_enrollment,
     _prepare_route_buffers,
     load_schools_layer,
     run,
@@ -46,13 +48,13 @@ def _minimal_tables() -> dict[str, pd.DataFrame]:
 
 
 def _schools_layer(*points: tuple[float, float, float]) -> gpd.GeoDataFrame:
-    """Build an EPSG:3857 schools layer from (lon, lat, enroll_total) triples."""
+    """Build a normalized EPSG:3857 schools layer from (lon, lat, enroll_total) triples."""
     gdf = gpd.GeoDataFrame(
         {"enroll_total": [p[2] for p in points]},
         geometry=[Point(p[0], p[1]) for p in points],
         crs="EPSG:4326",
-    ).to_crs("EPSG:3857")
-    return gdf
+    )
+    return _normalize_enrollment(gdf, "enroll_total").to_crs("EPSG:3857")
 
 
 def _write_schools_gpkg(directory: Path, name: str, *points: tuple[float, float, float]) -> Path:
@@ -62,6 +64,20 @@ def _write_schools_gpkg(directory: Path, name: str, *points: tuple[float, float,
         geometry=[Point(p[0], p[1]) for p in points],
         crs="EPSG:4326",
     )
+    path = directory / name
+    gdf.to_file(path, driver="GPKG")
+    return path
+
+
+def _write_schools_gpkg_cols(directory: Path, name: str, rows: list[dict]) -> Path:
+    """Write a schools GeoPackage from per-school attribute dicts (with grade cols).
+
+    Each row dict supplies a ``lon``/``lat`` and any enrollment columns
+    (``enroll_total``, ``g_grades_1_8``, ``g_grade_3``, ``g_undergrad`` …).
+    """
+    geom = [Point(r["lon"], r["lat"]) for r in rows]
+    attrs = [{k: v for k, v in r.items() if k not in {"lon", "lat"}} for r in rows]
+    gdf = gpd.GeoDataFrame(pd.DataFrame(attrs), geometry=geom, crs="EPSG:4326")
     path = directory / name
     gdf.to_file(path, driver="GPKG")
     return path
@@ -138,6 +154,59 @@ def test_load_schools_layer_missing_dir_raises(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# grade-band classification + normalization
+# ---------------------------------------------------------------------------
+
+
+def test_band_of_grade_column_elsi_and_ccd_forms() -> None:
+    """Both ELSI banded and CCD per-grade column names map to the right band."""
+    assert _band_of_grade_column("g_grades_1_8") == "1_8"
+    assert _band_of_grade_column("g_grades_9_12") == "9_12"
+    assert _band_of_grade_column("g_grade_3") == "1_8"
+    assert _band_of_grade_column("g_grade_11") == "9_12"
+    assert _band_of_grade_column("g_kindergarten") is None
+    assert _band_of_grade_column("g_undergrad") is None
+
+
+def test_normalize_enrollment_elsi_bands() -> None:
+    """ELSI banded columns flow into the 1-8 and 9-12 bands; postsec stays 0."""
+    gdf = gpd.GeoDataFrame(
+        {"enroll_total": [612], "g_grades_1_8": [420], "g_grades_9_12": [192]},
+        geometry=[Point(0, 0)],
+        crs="EPSG:4326",
+    )
+    out = _normalize_enrollment(gdf, "enroll_total")
+    assert out.loc[0, "enroll_1_8"] == 420
+    assert out.loc[0, "enroll_9_12"] == 192
+    assert out.loc[0, "enroll_postsec"] == 0
+
+
+def test_normalize_enrollment_ccd_per_grade_summed() -> None:
+    """CCD per-grade columns are summed into the two K-12 bands."""
+    gdf = gpd.GeoDataFrame(
+        {"enroll_total": [100], "g_grade_2": [30], "g_grade_8": [20], "g_grade_10": [50]},
+        geometry=[Point(0, 0)],
+        crs="EPSG:4326",
+    )
+    out = _normalize_enrollment(gdf, "enroll_total")
+    assert out.loc[0, "enroll_1_8"] == 50  # grades 2 + 8
+    assert out.loc[0, "enroll_9_12"] == 50  # grade 10
+
+
+def test_normalize_enrollment_postsec_routes_total() -> None:
+    """A postsec layer (g_undergrad/g_graduate) routes its total to enroll_postsec."""
+    gdf = gpd.GeoDataFrame(
+        {"enroll_total": [48678], "g_undergrad": [34722], "g_graduate": [13956]},
+        geometry=[Point(0, 0)],
+        crs="EPSG:4326",
+    )
+    out = _normalize_enrollment(gdf, "enroll_total")
+    assert out.loc[0, "enroll_postsec"] == 48678
+    assert out.loc[0, "enroll_1_8"] == 0
+    assert out.loc[0, "enroll_9_12"] == 0
+
+
+# ---------------------------------------------------------------------------
 # summarize_schools_by_route
 # ---------------------------------------------------------------------------
 
@@ -191,9 +260,7 @@ def test_run_writes_route_keyed_csv(tmp_path: Path) -> None:
     _write_gtfs_files(gtfs_dir)
     schools_dir = tmp_path / "schools"
     schools_dir.mkdir()
-    _write_schools_gpkg(
-        schools_dir, "va_md_dc_public_schools_enrollment.gpkg", (0.0, 0.001, 500)
-    )
+    _write_schools_gpkg(schools_dir, "va_md_dc_public_schools_enrollment.gpkg", (0.0, 0.001, 500))
     out_dir = tmp_path / "out"
 
     summary = run(gtfs_dir=gtfs_dir, schools_path=schools_dir, output_dir=out_dir)
@@ -204,3 +271,42 @@ def test_run_writes_route_keyed_csv(tmp_path: Path) -> None:
     assert {"route_id", "schools_served", "enrollment_served"} <= set(written.columns)
     assert written.set_index("route_id").loc["R1", "enrollment_served"] == 500
     assert "route_short_name" in summary.columns
+
+
+def test_run_breaks_enrollment_into_bands(tmp_path: Path) -> None:
+    """A combined K-12 + postsec input yields separate 1-8/9-12/postsec columns."""
+    gtfs_dir = tmp_path / "gtfs"
+    gtfs_dir.mkdir()
+    _write_gtfs_files(gtfs_dir)
+    schools_dir = tmp_path / "schools"
+    schools_dir.mkdir()
+    # K-12 (ELSI banded) school inside the catchment.
+    _write_schools_gpkg_cols(
+        schools_dir,
+        "va_md_dc_public_schools_enrollment.gpkg",
+        [
+            {
+                "lon": 0.0,
+                "lat": 0.001,
+                "enroll_total": 612,
+                "g_grades_1_8": 420,
+                "g_grades_9_12": 192,
+            }
+        ],
+    )
+    # Postsec college inside the catchment.
+    _write_schools_gpkg_cols(
+        schools_dir,
+        "va_md_dc_postsec_schools_enrollment.gpkg",
+        [{"lon": 0.0, "lat": 0.002, "enroll_total": 5000, "g_undergrad": 4000, "g_graduate": 1000}],
+    )
+    out_dir = tmp_path / "out"
+
+    run(gtfs_dir=gtfs_dir, schools_path=schools_dir, output_dir=out_dir)
+
+    row = pd.read_csv(out_dir / "school_coverage_by_route.csv").set_index("route_id").loc["R1"]
+    assert row["schools_served"] == 2
+    assert row["enrollment_served"] == 5612
+    assert row["enrollment_1_8_served"] == 420
+    assert row["enrollment_9_12_served"] == 192
+    assert row["enrollment_postsec_served"] == 5000

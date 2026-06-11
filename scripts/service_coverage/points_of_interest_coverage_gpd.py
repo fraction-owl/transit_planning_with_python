@@ -299,9 +299,7 @@ def _count_features(
             plt.close(fig)
 
         summary_records.append(per_route_counts)
-        logging.info(
-            "Processed route %s - CSV written%s", route_id, " & PNG" if make_plots else ""
-        )
+        logging.info("Processed route %s - CSV written%s", route_id, " & PNG" if make_plots else "")
 
     summary_df = pd.DataFrame(summary_records).set_index("route_id").fillna(0).astype(int)
     return summary_df

@@ -40,7 +40,8 @@
               "--output-dir", "{output}"],
       "outputs": [
         {"file": "school_coverage_by_route.csv", "join_keys": ["route_id"],
-         "keep_cols": ["schools_served", "enrollment_served"]}
+         "keep_cols": ["schools_served", "enrollment_served", "enrollment_1_8_served",
+                       "enrollment_9_12_served", "enrollment_postsec_served"]}
       ]
     },
     {
@@ -68,7 +69,8 @@
     {"file": "points_of_interest_coverage.csv", "join_keys": ["route_id"],
      "keep_cols": ["sites_served", "jobs_served"]},
     {"file": "school_coverage_by_route.csv", "join_keys": ["route_id"],
-     "keep_cols": ["schools_served", "enrollment_served"]},
+     "keep_cols": ["schools_served", "enrollment_served", "enrollment_1_8_served",
+                   "enrollment_9_12_served", "enrollment_postsec_served"]},
     {"file": "cabi_coverage_by_route.csv", "join_keys": ["route_id"],
      "keep_cols": ["cabi_stations_served", "cabi_weekday_riders_served"]},
     {"file": "headway_span_by_route.csv", "join_keys": ["route_id"],

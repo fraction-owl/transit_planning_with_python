@@ -26,7 +26,9 @@ Inputs
 Output
 ------
 - ``school_coverage_by_route.csv`` — columns ``route_id``, ``route_short_name``
-  (when available), ``schools_served``, ``enrollment_served``.
+  (when available), ``schools_served``, ``enrollment_served`` (grand total), and
+  the grade-band breakout ``enrollment_1_8_served``, ``enrollment_9_12_served``,
+  ``enrollment_postsec_served``.
 
 Assumptions
 -----------
@@ -40,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import re
 import sys
 from pathlib import Path
 from typing import List, Mapping, Sequence
@@ -70,6 +73,19 @@ SCHOOLS_GLOBS: tuple[str, ...] = (
 # Column on the school layer holding total enrollment. This is the name
 # schools_prep_join_gpd.py writes for every source (CCD / ELSI / IPEDS).
 ENROLLMENT_COLUMN = "enroll_total"
+
+# Enrollment is also broken into grade bands, summed from the per-source ``g_*``
+# columns schools_prep_join_gpd.py emits, so the rollup ships separate
+# grades-1-8, grades-9-12, and postsecondary totals alongside the grand total:
+#   - ELSI (public/private): g_grades_1_8 -> 1-8, g_grades_9_12 -> 9-12
+#   - CCD (public): g_grade_1..g_grade_8 -> 1-8, g_grade_9..g_grade_12 -> 9-12
+#   - IPEDS (postsec, detected via g_undergrad/g_graduate): enroll_total -> postsec
+# Pre-K / kindergarten / ungraded counts stay in the grand total but fall in no
+# band. These canonical band names are intentionally not configurable.
+ENROLL_TOTAL_COL = "enroll_total"
+ENROLL_1_8_COL = "enroll_1_8"
+ENROLL_9_12_COL = "enroll_9_12"
+ENROLL_POSTSEC_COL = "enroll_postsec"
 
 # Optional filter: only analyze these route_id values.
 # Leave empty (`[]`) to process every route in routes.txt
@@ -167,9 +183,7 @@ def _prepare_route_buffers(
         lines = (
             shapes_df.groupby("shape_id")
             .apply(
-                lambda grp: LineString(
-                    grp[["shape_pt_lon", "shape_pt_lat"]].to_numpy(dtype=float)
-                )
+                lambda grp: LineString(grp[["shape_pt_lon", "shape_pt_lat"]].to_numpy(dtype=float))
             )
             .to_frame(name="geometry")
         )
@@ -227,19 +241,111 @@ def _crs_is_metric(crs: object) -> bool:
     return "metre" in unit or "meter" in unit
 
 
+def _band_of_grade_column(column: str) -> str | None:
+    """Map a ``schools_prep_join_gpd.py`` grade column to a band, or None.
+
+    Handles both the ELSI banded form (``g_grades_1_8`` / ``g_grades_9_12``) and
+    the CCD per-grade form (``g_grade_1`` … ``g_grade_12``). Pre-K, kindergarten,
+    and ungraded columns return None (they belong to no requested band).
+
+    Returns:
+        ``"1_8"``, ``"9_12"``, or ``None``.
+    """
+    name = column.lower()
+    if "grades_1_8" in name:
+        return "1_8"
+    if "grades_9_12" in name:
+        return "9_12"
+    match = re.fullmatch(r"g_grade_(\d+)", name)
+    if match:
+        grade = int(match.group(1))
+        if 1 <= grade <= 8:
+            return "1_8"
+        if 9 <= grade <= 12:
+            return "9_12"
+    return None
+
+
+def _normalize_enrollment(gdf: gpd.GeoDataFrame, enrollment_column: str) -> gpd.GeoDataFrame:
+    """Add the four canonical enrollment columns to one school layer.
+
+    Computes ``enroll_total`` plus the grade-band breakout (``enroll_1_8``,
+    ``enroll_9_12``, ``enroll_postsec``) from whatever ``g_*`` columns the layer
+    carries. Postsecondary layers are detected by their ``g_undergrad`` /
+    ``g_graduate`` columns and routed wholesale into ``enroll_postsec``; every
+    other layer is treated as K-12 and binned by grade. NaN counts contribute 0.
+
+    Args:
+        gdf: One school layer as read from disk.
+        enrollment_column: Column holding total enrollment on this layer.
+
+    Returns:
+        The layer with the four canonical numeric columns added.
+    """
+    out = gdf.copy()
+    if enrollment_column in out.columns:
+        total = pd.to_numeric(out[enrollment_column], errors="coerce")
+    else:
+        total = pd.Series(0.0, index=out.index)
+
+    cols_lower = {c.lower() for c in out.columns}
+    is_postsec = "g_undergrad" in cols_lower or "g_graduate" in cols_lower
+
+    band_1_8 = pd.Series(0.0, index=out.index)
+    band_9_12 = pd.Series(0.0, index=out.index)
+    band_postsec = pd.Series(0.0, index=out.index)
+
+    if is_postsec:
+        band_postsec = total.fillna(0.0)
+    else:
+        for col in out.columns:
+            band = _band_of_grade_column(str(col))
+            if band is None:
+                continue
+            values = pd.to_numeric(out[col], errors="coerce").fillna(0.0)
+            if band == "1_8":
+                band_1_8 = band_1_8 + values
+            else:
+                band_9_12 = band_9_12 + values
+
+    out[ENROLL_TOTAL_COL] = total
+    out[ENROLL_1_8_COL] = band_1_8
+    out[ENROLL_9_12_COL] = band_9_12
+    out[ENROLL_POSTSEC_COL] = band_postsec
+    return out
+
+
+# Canonical enrollment columns carried through the join, in output order.
+_BAND_COLUMNS: tuple[str, ...] = (
+    ENROLL_TOTAL_COL,
+    ENROLL_1_8_COL,
+    ENROLL_9_12_COL,
+    ENROLL_POSTSEC_COL,
+)
+
+# Maps each canonical enrollment column to its route-level output column name.
+_OUTPUT_ENROLLMENT_COLUMNS: dict[str, str] = {
+    ENROLL_TOTAL_COL: "enrollment_served",
+    ENROLL_1_8_COL: "enrollment_1_8_served",
+    ENROLL_9_12_COL: "enrollment_9_12_served",
+    ENROLL_POSTSEC_COL: "enrollment_postsec_served",
+}
+
+
 def load_schools_layer(
     schools_path: Path,
     schools_globs: Sequence[str] = SCHOOLS_GLOBS,
     enrollment_column: str = ENROLLMENT_COLUMN,
     projected_crs: str = "EPSG:3857",
 ) -> gpd.GeoDataFrame:
-    """Load school point layer(s), combine them, and reproject.
+    """Load school point layer(s), normalize enrollment, combine, and reproject.
 
     Accepts either a single vector file or a folder. For a folder, every file
     matching *schools_globs* (recursively) is read and concatenated, so the
     public / private / postsec outputs of ``schools_prep_join_gpd.py`` roll up
-    together. The enrollment column is coerced to numeric; a layer missing it is
-    kept (its rows still count as schools) with enrollment treated as 0.
+    together. Each layer is normalized to the four canonical enrollment columns
+    (total + grades-1-8 / grades-9-12 / postsecondary bands) so layers with
+    different source schemas stack cleanly.
 
     Args:
         schools_path: A school vector file, or a folder containing such files.
@@ -248,15 +354,14 @@ def load_schools_layer(
         projected_crs: CRS to reproject the combined layer into.
 
     Returns:
-        Point GeoDataFrame in *projected_crs* with a numeric enrollment column.
+        Point GeoDataFrame in *projected_crs* with the four canonical enrollment
+        columns.
 
     Raises:
         FileNotFoundError: If no school layer is found.
     """
     if schools_path.is_dir():
-        paths = sorted(
-            {p for pattern in schools_globs for p in schools_path.rglob(pattern)}
-        )
+        paths = sorted({p for pattern in schools_globs for p in schools_path.rglob(pattern)})
         if not paths:
             raise FileNotFoundError(
                 f"No school layers matching {list(schools_globs)} under {schools_path}"
@@ -269,18 +374,16 @@ def load_schools_layer(
     frames: list[gpd.GeoDataFrame] = []
     for path in paths:
         gdf = gpd.read_file(path)
-        if enrollment_column in gdf.columns:
-            gdf[enrollment_column] = pd.to_numeric(gdf[enrollment_column], errors="coerce")
-        else:
+        if enrollment_column not in gdf.columns:
             logging.warning(
                 "Enrollment column %r missing in %s; counts only.",
                 enrollment_column,
                 path.name,
             )
-            gdf[enrollment_column] = 0.0
+        gdf = _normalize_enrollment(gdf, enrollment_column)
         if gdf.crs is None:
             gdf = gdf.set_crs(epsg=4326)
-        frames.append(gdf[[enrollment_column, "geometry"]].to_crs(projected_crs))
+        frames.append(gdf[[*_BAND_COLUMNS, "geometry"]].to_crs(projected_crs))
         logging.info("Loaded %d schools from %s", len(gdf), path.name)
 
     combined = gpd.GeoDataFrame(
@@ -293,22 +396,23 @@ def load_schools_layer(
 def summarize_schools_by_route(
     route_buffers: gpd.GeoDataFrame,
     schools_gdf: gpd.GeoDataFrame,
-    enrollment_column: str = ENROLLMENT_COLUMN,
 ) -> pd.DataFrame:
-    """Count schools and sum enrollment falling inside each route catchment.
+    """Count schools and sum enrollment (overall + by band) per route catchment.
 
     Args:
         route_buffers: One buffered catchment per route_id (from
             :func:`_prepare_route_buffers`).
-        schools_gdf: School points with a numeric enrollment column, in the same
-            CRS as *route_buffers*.
-        enrollment_column: Column on *schools_gdf* holding total enrollment.
+        schools_gdf: School points carrying the canonical enrollment columns
+            (from :func:`load_schools_layer`), in the same CRS as *route_buffers*.
 
     Returns:
-        DataFrame with one row per route_id and columns ``schools_served`` and
-        ``enrollment_served``. Routes with no schools nearby report zeros.
+        DataFrame with one row per route_id and columns ``schools_served``,
+        ``enrollment_served``, ``enrollment_1_8_served``,
+        ``enrollment_9_12_served``, and ``enrollment_postsec_served``. Routes
+        with no schools nearby report zeros.
     """
     routes = route_buffers[["route_id"]].drop_duplicates().reset_index(drop=True)
+    count_cols = list(_OUTPUT_ENROLLMENT_COLUMNS.values())
 
     if not schools_gdf.empty:
         joined = gpd.sjoin(
@@ -317,22 +421,22 @@ def summarize_schools_by_route(
             predicate="intersects",
             how="inner",
         )
-        grouped = joined.groupby("route_id").agg(
-            schools_served=(enrollment_column, "size"),
-            enrollment_served=(enrollment_column, "sum"),
+        agg = {"schools_served": (ENROLL_TOTAL_COL, "size")}
+        agg.update(
+            {out_col: (band_col, "sum") for band_col, out_col in _OUTPUT_ENROLLMENT_COLUMNS.items()}
         )
+        grouped = joined.groupby("route_id").agg(**agg)
         summary = routes.merge(grouped, on="route_id", how="left")
     else:
-        summary = routes.assign(schools_served=0, enrollment_served=0.0)
+        summary = routes.assign(schools_served=0, **{c: 0.0 for c in count_cols})
 
     summary["schools_served"] = summary["schools_served"].fillna(0).astype(int)
-    summary["enrollment_served"] = summary["enrollment_served"].fillna(0).round(0).astype(int)
+    for out_col in count_cols:
+        summary[out_col] = summary[out_col].fillna(0).round(0).astype(int)
     return summary
 
 
-def _attach_route_short_name(
-    summary: pd.DataFrame, routes_df: pd.DataFrame
-) -> pd.DataFrame:
+def _attach_route_short_name(summary: pd.DataFrame, routes_df: pd.DataFrame) -> pd.DataFrame:
     """Add a readable ``route_short_name`` column when routes.txt carries one."""
     if "route_short_name" not in routes_df.columns:
         return summary
@@ -340,7 +444,12 @@ def _attach_route_short_name(
         ["route_id", "route_short_name"]
     ].drop_duplicates(subset="route_id")
     merged = summary.merge(lookup, on="route_id", how="left")
-    cols = ["route_id", "route_short_name", "schools_served", "enrollment_served"]
+    cols = [
+        "route_id",
+        "route_short_name",
+        "schools_served",
+        *_OUTPUT_ENROLLMENT_COLUMNS.values(),
+    ]
     return merged[cols]
 
 
@@ -403,7 +512,7 @@ def run(
     )
 
     logging.info("Rolling schools up to %d routes", len(route_buffers))
-    summary = summarize_schools_by_route(route_buffers, schools_gdf, enrollment_column)
+    summary = summarize_schools_by_route(route_buffers, schools_gdf)
     summary = _attach_route_short_name(summary, tables["routes"])
 
     out_path = output_dir / output_csv_name
