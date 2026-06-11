@@ -187,6 +187,13 @@ FEATURE_TABLES: Final[list[FeatureTable]] = [
         join_keys=("route_id",),
         keep_cols=("cabi_stations_served", "cabi_weekday_riders_served"),
     ),
+    # Headway and span from headway_span_exporter.py (weekday default).
+    FeatureTable(
+        label="headway_span",
+        path=Path(r"Path\To\Your\headway_span_by_route.csv"),
+        join_keys=("route_id",),
+        keep_cols=("avg_headway_min", "span_hrs"),
+    ),
 ]
 
 # -----------------------------------------------------------------------------
@@ -201,6 +208,8 @@ DEPENDENT_VAR: Final[str] = "ntd_boardings"
 PREDICTORS: Final[tuple[str, ...]] = (
     "scheduled_hours",
     "revenue_miles",
+    "avg_headway_min",  # mean gap between trips (from headway_span_exporter.py)
+    "span_hrs",  # service span first to last departure
     "gas_price",
     "unemployment_rate",
     # Daily-derived monthly weather aggregates.
@@ -243,6 +252,8 @@ LOG_DEPENDENT: Final[bool] = True
 LOG_PREDICTORS: Final[tuple[str, ...]] = (
     "scheduled_hours",
     "revenue_miles",
+    "avg_headway_min",
+    "span_hrs",
     # Precipitation/snow are right-skewed counts and magnitudes; log1p handles
     # the many zero-snow months gracefully. avg_temp_f is left linear because
     # temperature has a natural zero and can be negative.
