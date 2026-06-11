@@ -30,6 +30,7 @@ from scripts.service_coverage.gtfs_service_demographics_gpd import (
     load_gtfs_data,
     pick_buffer_distance,
     quantize_node,
+    run,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -548,6 +549,20 @@ def test_load_gtfs_data_missing_folder_raises() -> None:
 def test_load_gtfs_data_missing_file_raises(dc_gtfs_dir: Path) -> None:
     with pytest.raises(OSError, match="Missing GTFS files"):
         load_gtfs_data(str(dc_gtfs_dir), files=["nonexistent.txt"])
+
+
+def test_run_raises_on_missing_demographics(tmp_path: Path, dc_gtfs_dir: Path) -> None:
+    # run() used to catch every error and return, so a missing demographics
+    # input exited 0 and looked identical to "produced nothing" under the
+    # prep_features orchestrator. It must now surface the failure instead.
+    with pytest.raises(FileNotFoundError, match="Demographics shapefile not found"):
+        run(
+            analysis_mode="route",
+            service_area_method="stop_buffer",
+            gtfs_data_path=str(dc_gtfs_dir),
+            demographics_shp_path=str(tmp_path / "does_not_exist.shp"),
+            output_directory=str(tmp_path / "out"),
+        )
 
 
 # ---------------------------------------------------------------------------

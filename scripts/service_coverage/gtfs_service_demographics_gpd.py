@@ -1388,8 +1388,12 @@ def run(
 
         logging.info("\nAnalysis completed successfully.")
 
-    except Exception as exc:  # catch and log any error
-        logging.error("Analysis terminated due to an error: %s", exc, exc_info=True)
+    except Exception:
+        # Re-raise after logging: a swallowed error here exits 0 and looks
+        # identical to "legitimately produced nothing" to the prep_features
+        # orchestrator, which is what hid a missing-demographics-input chain.
+        logging.error("Analysis terminated due to an error", exc_info=True)
+        raise
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -1521,26 +1525,31 @@ def main(argv: Sequence[str] | None = None) -> None:
         format="%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-    run(
-        analysis_mode=args.analysis_mode,
-        service_area_method=args.service_area_method,
-        gtfs_data_path=args.gtfs_path,
-        demographics_shp_path=args.demographics_shp,
-        output_directory=args.output_dir,
-        pedestrian_network_path=args.pedestrian_network,
-        service_ids_to_include=args.service_ids,
-        routes_to_include=args.routes_include,
-        routes_to_exclude=args.routes_exclude,
-        stop_ids_to_include=args.stops_include,
-        stop_ids_to_exclude=args.stops_exclude,
-        buffer_distance=args.buffer_distance,
-        large_buffer_distance=args.large_buffer_distance,
-        stop_ids_large_buffer=args.stops_large_buffer,
-        isochrone_walk_time_min=args.isochrone_walk_time,
-        walk_speed_mph=args.walk_speed_mph,
-        fips_filter=args.fips,
-        crs_epsg_code=args.crs_epsg,
-    )
+    try:
+        run(
+            analysis_mode=args.analysis_mode,
+            service_area_method=args.service_area_method,
+            gtfs_data_path=args.gtfs_path,
+            demographics_shp_path=args.demographics_shp,
+            output_directory=args.output_dir,
+            pedestrian_network_path=args.pedestrian_network,
+            service_ids_to_include=args.service_ids,
+            routes_to_include=args.routes_include,
+            routes_to_exclude=args.routes_exclude,
+            stop_ids_to_include=args.stops_include,
+            stop_ids_to_exclude=args.stops_exclude,
+            buffer_distance=args.buffer_distance,
+            large_buffer_distance=args.large_buffer_distance,
+            stop_ids_large_buffer=args.stops_large_buffer,
+            isochrone_walk_time_min=args.isochrone_walk_time,
+            walk_speed_mph=args.walk_speed_mph,
+            fips_filter=args.fips,
+            crs_epsg_code=args.crs_epsg,
+        )
+    except Exception:
+        # run() already logged the traceback; exit non-zero so the orchestrator
+        # records a real failure instead of "produced no tables".
+        sys.exit(1)
 
 
 def _in_ipython() -> bool:
