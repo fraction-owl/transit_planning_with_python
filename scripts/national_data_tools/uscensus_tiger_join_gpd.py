@@ -134,6 +134,27 @@ TOPIC_SIGNATURES: dict[str, Sequence[str] | str] = {
     "AGE_FILES": ("B01001",),
 }
 
+# ---- Tract -> block disaggregation ------------------------------------------
+#: Income, ethnicity, language, vehicle and age tables arrive at the tract level, so
+#: after the block<->tract join every block in a tract carries that tract's totals
+#: verbatim. For an *additive count* that over-counts — each block claims the whole
+#: tract figure — so each configured count is split across the tract's blocks in
+#: proportion to a block-level weight (population for person counts, households for
+#: household counts): ``tract_total * block_weight / sum(block_weight over the tract)``.
+#: The parts then sum back to the tract total, and a partial-area service-area clip
+#: downstream keeps a proportional slice. Each entry maps the derived tract column to
+#: ``(weight_column, output_column)``; output names stay <=10 chars so the Shapefile
+#: writer does not truncate them. ``perc_*`` ratio columns are intentionally excluded —
+#: percentages are not additive and must never be area-weighted.
+TRACT_COUNT_DISAGG: dict[str, tuple[str, str]] = {
+    "low_income": ("total_hh", "low_income"),  # households under the low-income bands
+    "minority": ("total_pop", "minority"),  # non-white-alone residents
+    "all_nwell": ("total_pop", "lep"),  # limited-English-proficiency residents
+    "all_lo_veh_hh": ("total_hh", "lo_veh_hh"),  # households with 0-1 vehicles
+    "all_youth": ("total_pop", "youth"),  # residents age 15-21
+    "all_elderly": ("total_pop", "elderly"),  # residents age 65+
+}
+
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
 
 # ---- Sentinel defaults — detect un-edited placeholder paths ----------------
@@ -620,6 +641,50 @@ def _apply_fips_filter_df(
     return df[df[dst_col].isin(wanted)].copy()
 
 
+# ----- Tract -> block disaggregation -----------------------------------------
+
+
+def disaggregate_tract_counts_to_blocks(
+    df: pd.DataFrame,
+    *,
+    tract_key: str = "tract_id_synth",
+    field_weights: Mapping[str, tuple[str, str]] = TRACT_COUNT_DISAGG,
+) -> pd.DataFrame:
+    """Split each tract-level count across its blocks in proportion to a block weight.
+
+    After the block<->tract merge, every block in a tract carries that tract's totals
+    verbatim. For an additive count (households below an income threshold, minority
+    residents, ...) that copy-down over-counts: each block claims the whole tract
+    figure. This rewrites each configured count to the block's share —
+    ``tract_total * block_weight / sum(block_weight over the tract)`` — so the parts sum
+    back to the tract total and a partial-area clip downstream keeps a proportional
+    slice. Tracts whose weight sums to zero receive zero (no basis to apportion). The
+    result is written under the configured output column (the source column is dropped
+    when the name changes); ``perc_*`` ratio columns are never touched.
+
+    Args:
+        df: The merged block+tract frame, keyed per block, with ``tract_key`` present.
+        tract_key: Column grouping blocks by their tract (block GEO_ID's tract slice).
+        field_weights: ``{source_count: (weight_column, output_column)}``.
+
+    Returns:
+        ``df`` with each available count column disaggregated and renamed in place.
+    """
+    if tract_key not in df.columns:
+        return df
+    for src, (weight, out) in field_weights.items():
+        if src not in df.columns or weight not in df.columns:
+            continue
+        values = pd.to_numeric(df[src], errors="coerce").fillna(0.0)
+        weights = pd.to_numeric(df[weight], errors="coerce").fillna(0.0)
+        tract_weight = weights.groupby(df[tract_key]).transform("sum")
+        share = np.where(tract_weight > 0, weights / tract_weight, 0.0)
+        df[out] = values * share
+        if out != src:
+            df = df.drop(columns=src)
+    return df
+
+
 # ----- Stage 1 public entry point --------------------------------------------
 
 
@@ -648,6 +713,20 @@ def build_joined_table(
         )
     )
 
+    # Filter each frame to the requested counties BEFORE the block<->tract join. Both
+    # carry a county FIPS inside their GEO_ID, so each filters on its own key; the
+    # temporary column is dropped so it cannot collide under the merge suffixes. This
+    # is output-equivalent to filtering after the merge but keeps the one-to-many join
+    # (and the disaggregation below) off every out-of-area block in a full-state input.
+    if county_fips_filter:
+        block_df = _apply_fips_filter_df(block_df, fips=county_fips_filter).drop(
+            columns="FIPS", errors="ignore"
+        )
+        if not tract_df.empty:
+            tract_df = _apply_fips_filter_df(tract_df, fips=county_fips_filter).drop(
+                columns="FIPS", errors="ignore"
+            )
+
     combined = (
         block_df
         if tract_df.empty
@@ -663,8 +742,12 @@ def build_joined_table(
     if _clean_columns:
         combined = _drop_unfriendly_cols(combined)
 
+    # Re-attach the single 'FIPS' column (the per-frame ones were dropped above). With
+    # both inputs already filtered this is a cheap no-op filter, but it keeps one 'FIPS'
+    # on the output and drops any tract row the outer merge left unmatched to a block.
     combined = _apply_fips_filter_df(combined, fips=county_fips_filter)
     _fill_numeric_only(combined)
+    combined = disaggregate_tract_counts_to_blocks(combined)
     return combined
 
 

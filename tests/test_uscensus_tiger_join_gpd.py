@@ -702,6 +702,93 @@ def test_build_joined_table_duplicate_topic_files_do_not_explode(tmp_path: Path)
     assert "low_income" in df.columns
 
 
+def test_build_joined_table_disaggregates_tract_count_to_blocks(tmp_path: Path) -> None:
+    """A tract-level count is split across its blocks by population and sums back.
+
+    The two blocks share one tract carrying 40 minority residents. Disaggregation must
+    apportion that by block population (100 vs 300) into 10 and 30 -- not copy 40 onto
+    each block -- so the parts still total the tract figure.
+    """
+    blocks = [("1000000US110010001001001", 100), ("1000000US110010001001002", 300)]
+    pop_path = tmp_path / "P1-Data.csv"
+    _write_plain_csv(
+        pop_path,
+        _census_csv(
+            "GEO_ID,NAME,P1_001N",
+            "Geo,Name,!!Total:",
+            *[f"{g},Block,{p}" for g, p in blocks],
+        ),
+    )
+    hh_path = tmp_path / "H9-Data.csv"
+    _write_plain_csv(
+        hh_path,
+        _census_csv("GEO_ID,H9_001N", "Geo,!!Total:", *[f"{g},{p // 2}" for g, p in blocks]),
+    )
+    eth_cols = "P9_001N,P9_002N,P9_005N,P9_006N,P9_007N,P9_008N,P9_009N,P9_010N,P9_011N"
+    eth_path = tmp_path / "P9-Data.csv"
+    _write_plain_csv(
+        eth_path,
+        _census_csv(
+            f"GEO_ID,NAME,{eth_cols}",
+            "Geo,Name," + ",".join(["lab"] * 9),
+            # total_pop=200, all_hisp=0, white=160, black=40, rest 0 -> minority=40.
+            f"{_TRACT_GEO_ID},Tract,200,0,160,40,0,0,0,0,0",
+        ),
+    )
+    df = mod.build_joined_table(
+        pop_files=[str(pop_path)],
+        hh_files=[str(hh_path)],
+        jobs_files=[],
+        ethnicity_files=[str(eth_path)],
+    ).sort_values("total_pop")
+    assert df["minority"].tolist() == pytest.approx([10.0, 30.0])
+    assert df["minority"].sum() == pytest.approx(40.0)
+
+
+# =============================================================================
+# disaggregate_tract_counts_to_blocks
+# =============================================================================
+
+
+def test_disaggregate_splits_count_by_weight_and_sums_back() -> None:
+    df = pd.DataFrame(
+        {
+            "tract_id_synth": ["T", "T", "T"],
+            "total_pop": [100, 300, 0],
+            "minority": [40, 40, 40],  # tract total copied onto each block
+        }
+    )
+    out = mod.disaggregate_tract_counts_to_blocks(df)
+    assert out["minority"].tolist() == pytest.approx([10.0, 30.0, 0.0])
+    assert out["minority"].sum() == pytest.approx(40.0)
+
+
+def test_disaggregate_renames_source_to_output_column() -> None:
+    df = pd.DataFrame({"tract_id_synth": ["T", "T"], "total_pop": [1, 1], "all_youth": [10, 10]})
+    out = mod.disaggregate_tract_counts_to_blocks(df)
+    assert "youth" in out.columns
+    assert "all_youth" not in out.columns
+    assert out["youth"].tolist() == pytest.approx([5.0, 5.0])
+
+
+def test_disaggregate_zero_weight_tract_yields_zero() -> None:
+    df = pd.DataFrame({"tract_id_synth": ["Z", "Z"], "total_pop": [0, 0], "minority": [10, 10]})
+    out = mod.disaggregate_tract_counts_to_blocks(df)
+    assert out["minority"].tolist() == [0.0, 0.0]
+
+
+def test_disaggregate_skips_field_when_weight_column_missing() -> None:
+    df = pd.DataFrame({"tract_id_synth": ["T"], "minority": [40]})  # no total_pop weight
+    out = mod.disaggregate_tract_counts_to_blocks(df)
+    assert out["minority"].tolist() == [40]
+
+
+def test_disaggregate_noop_without_tract_key() -> None:
+    df = pd.DataFrame({"total_pop": [100], "minority": [40]})
+    out = mod.disaggregate_tract_counts_to_blocks(df)
+    assert out["minority"].tolist() == [40]
+
+
 # =============================================================================
 # discover_tiger_datasets  (Stage 2)
 # =============================================================================

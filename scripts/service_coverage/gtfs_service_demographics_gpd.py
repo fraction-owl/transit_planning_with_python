@@ -112,7 +112,12 @@ WALK_SPEED_MPH = 3.0  # Assumed pedestrian walking speed
 # Optional FIPS filter (list of codes). Empty list = no filter.
 FIPS_FILTER: list[str] = []  # Replace with FIPS code(s) for desired jurisdictions (e.g. "11001")
 
-# Fields in demographics shapefile to multiply by area ratio
+# Fields in the demographics shapefile to multiply by the area ratio. Each must be an
+# additive block-level COUNT (never a percentage). The first group is block-native
+# (decennial population/households, LEHD jobs); the second is tract-level estimates that
+# uscensus_tiger_join_gpd disaggregates down to blocks (see TRACT_COUNT_DISAGG there), so
+# they are area-weightable too. A field absent from the layer is reported once and
+# skipped, so this list can stay ambitious even when an input table was not supplied.
 SYNTHETIC_FIELDS = [
     "total_pop",
     "total_hh",
@@ -120,13 +125,12 @@ SYNTHETIC_FIELDS = [
     "low_wage",
     "mid_wage",
     "high_wage",
-    #    "minority",
-    #    "est_lep",
-    #    "est_lo_veh",
-    #    "est_lo_v_1",
-    #    "est_youth",
-    #    "est_elderl",
-    #    "est_low_in",
+    "low_income",  # households under the low-income bands
+    "minority",  # non-white-alone residents
+    "lep",  # limited-English-proficiency residents
+    "lo_veh_hh",  # households with 0-1 vehicles
+    "youth",  # residents age 15-21
+    "elderly",  # residents age 65+
 ]
 
 # EPSG code for projected coordinate system used in area calculations
