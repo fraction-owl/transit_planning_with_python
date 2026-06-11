@@ -174,9 +174,7 @@ def _prepare_route_buffers(
     stops = stops.to_crs(projected_crs)
     buff_dist_m = buffer_dist_ft * 0.3048  # convert to meters
 
-    selected_routes = [
-        rid for rid in route_shapes.index if not route_filter or rid in route_filter
-    ]
+    selected_routes = [rid for rid in route_shapes.index if not route_filter or rid in route_filter]
     logging.info(
         "Buffering %d route(s) (buffer=%.1f ft -> %.1f m)...",
         len(selected_routes),
