@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import geopandas as gpd
@@ -180,11 +181,18 @@ def test_load_layers_missing_file_excluded_from_result(tmp_path: Path) -> None:
     assert "Missing.shp" not in layers
 
 
-def test_load_layers_wrong_id_column_excluded_from_result(tmp_path: Path) -> None:
+def test_load_layers_wrong_id_column_excluded_from_result(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     """A shapefile that lacks the expected id column should be excluded from the result."""
     _write_point_shp(tmp_path, "Station.shp", lon=0.001, lat=0.001)
-    layers = _load_layers([("Station.shp", "WRONG_COL")], tmp_path)
+    with caplog.at_level(logging.WARNING):
+        layers = _load_layers([("Station.shp", "WRONG_COL")], tmp_path)
     assert "Station.shp" not in layers
+    # The warning should surface the actual attribute columns (here, NAME) so the
+    # configured id_col can be corrected without inspecting the shapefile by hand.
+    assert "NAME" in caplog.text
+    assert "geometry" not in caplog.text
 
 
 def test_load_layers_finds_shapefile_in_subdirectory(tmp_path: Path) -> None:
