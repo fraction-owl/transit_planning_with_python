@@ -198,7 +198,8 @@ PREDICTORS: Final[tuple[str, ...]] = (
 )
 
 # Categorical columns to one-hot encode (first level dropped as the reference).
-CATEGORICAL_PREDICTORS: Final[tuple[str, ...]] = ()
+# "month" is derived automatically from the "period" column after table assembly.
+CATEGORICAL_PREDICTORS: Final[tuple[str, ...]] = ("month",)
 
 # -----------------------------------------------------------------------------
 #  Transforms & estimator options
@@ -1002,6 +1003,18 @@ def main() -> None:
     if DEPENDENT_VAR not in table.columns:
         logging.error("Dependent variable '%s' not found in the assembled table.", DEPENDENT_VAR)
         sys.exit(1)
+
+    if "month" in CATEGORICAL_PREDICTORS:
+        if "period" in table.columns:
+            table["month"] = pd.to_datetime(table["period"], format="%Y-%m").dt.strftime("%b")
+            logging.info(
+                "Derived 'month' column from 'period' (%d unique values).",
+                table["month"].nunique(),
+            )
+        else:
+            logging.warning(
+                "'month' is in CATEGORICAL_PREDICTORS but 'period' is not in the table — skipping."
+            )
 
     # === STEP 2: BUILD DESIGN MATRIX =========================================
     logging.info("=== STEP 2: BUILD DESIGN MATRIX ===")
