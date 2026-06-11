@@ -117,14 +117,41 @@ def _prepare_route_buffers(
     ):
         raise ValueError("shapes.txt missing required columns")
 
-    # Convert shape points to LineStrings
-    shapes_df = shapes_df.sort_values(["shape_id", "shape_pt_sequence"])
-    lines = (
-        shapes_df.groupby("shape_id")
-        .apply(lambda grp: LineString(grp[["shape_pt_lon", "shape_pt_lat"]].to_numpy(dtype=float)))
-        .to_frame(name="geometry")
+    # Convert shape points to LineStrings. This is a per-shape, Python-level
+    # build over every row of shapes.txt, so on a large regional feed it is the
+    # slowest step here — log before/after (and the row/shape counts) so a long
+    # run is visibly progressing rather than appearing frozen.
+    logging.info(
+        "Building shape geometries from %d shape point(s) across %d shape_id(s)...",
+        len(shapes_df),
+        shapes_df["shape_id"].nunique(),
     )
-    shapes_gdf = gpd.GeoDataFrame(lines, geometry="geometry", crs="EPSG:4326")
+    shapes_df = shapes_df.sort_values(["shape_id", "shape_pt_sequence"])
+
+    geom_by_shape: dict[object, LineString] = {}
+    skipped_degenerate = 0
+    for shape_id, grp in shapes_df.groupby("shape_id", sort=False):
+        coords = grp[["shape_pt_lon", "shape_pt_lat"]].to_numpy(dtype=float)
+        # LineString needs >= 2 distinct points; a 1-point (or empty) shape
+        # otherwise raises and would abort the whole run.
+        if len(coords) < 2:
+            skipped_degenerate += 1
+            continue
+        geom_by_shape[shape_id] = LineString(coords)
+
+    if skipped_degenerate:
+        logging.warning(
+            "Skipped %d shape_id(s) with fewer than 2 points (cannot form a line).",
+            skipped_degenerate,
+        )
+
+    shapes_gdf = gpd.GeoDataFrame(
+        {"geometry": list(geom_by_shape.values())},
+        index=pd.Index(list(geom_by_shape.keys()), name="shape_id"),
+        geometry="geometry",
+        crs="EPSG:4326",
+    )
+    logging.info("Built %d shape geometries; reprojecting to %s...", len(shapes_gdf), projected_crs)
 
     # Trips to route mapping
     trips = tables["trips"][["route_id", "trip_id", "shape_id"]]
@@ -147,13 +174,26 @@ def _prepare_route_buffers(
     stops = stops.to_crs(projected_crs)
     buff_dist_m = buffer_dist_ft * 0.3048  # convert to meters
 
+    selected_routes = [
+        rid for rid in route_shapes.index if not route_filter or rid in route_filter
+    ]
+    logging.info(
+        "Buffering %d route(s) (buffer=%.1f ft -> %.1f m)...",
+        len(selected_routes),
+        buffer_dist_ft,
+        buff_dist_m,
+    )
+    log_every = max(1, len(selected_routes) // 20)  # ~20 progress lines
+
     buffers: List[dict[str, object]] = []
-    for route_id, shp_ids in route_shapes.items():
-        if route_filter and route_id not in route_filter:
-            continue
+    for processed, route_id in enumerate(selected_routes, start=1):
+        shp_ids = route_shapes.loc[route_id]
 
         if use_shape_buffer:
-            geoms = shapes_gdf.loc[shp_ids, "geometry"]
+            # Drop any shape_ids the route references but that produced no
+            # geometry (missing from shapes.txt or skipped as degenerate).
+            present = [s for s in shp_ids if s in shapes_gdf.index]
+            geoms = shapes_gdf.loc[present, "geometry"]
         else:
             trip_stops = (
                 tables["stop_times"]
@@ -173,7 +213,11 @@ def _prepare_route_buffers(
         buf = unary_union(list(geoms)).buffer(buff_dist_m)
         buffers.append({"route_id": route_id, "geometry": buf})
 
+        if processed % log_every == 0 or processed == len(selected_routes):
+            logging.info("  buffered %d/%d route(s)", processed, len(selected_routes))
+
     buffer_gdf = gpd.GeoDataFrame(buffers, geometry="geometry", crs=projected_crs)
+    logging.info("Built %d route buffer(s).", len(buffer_gdf))
     return buffer_gdf
 
 
