@@ -54,6 +54,12 @@ ROUTE_FILTER: list[str] = []
 # Analysis options
 USE_SHAPE_BUFFER = True  # True → buffer route geometry; False → buffer stops
 BUFFER_DIST_FT = 1320.0  # ¼ mile in feet
+# Simplify each route's geometry (Douglas-Peucker, in projected meters) before
+# buffering. Buffering full-resolution shapes (GTFS shapes can carry thousands
+# of vertices per route) is the slowest step here; a tolerance this small is
+# negligible against a 402 m (1/4 mile) buffer but cuts buffer time many-fold.
+# Set to 0.0 to disable simplification.
+SIMPLIFY_TOLERANCE_M = 10.0
 # Per-route map PNGs are OFF by default: rendering one matplotlib figure per
 # route is slow and stalls headless/orchestrator runs (the script appeared to
 # "get stuck"). Flip MAKE_PLOTS to True (or pass --plots) for the maps; the CSV
@@ -98,6 +104,7 @@ def _prepare_route_buffers(
     buffer_dist_ft: float,
     route_filter: list[str] | None = None,
     projected_crs: str = "EPSG:3857",
+    simplify_tolerance_m: float = SIMPLIFY_TOLERANCE_M,
 ) -> gpd.GeoDataFrame:
     """Return a GeoDataFrame with one buffered geometry per route_id.
 
@@ -106,6 +113,20 @@ def _prepare_route_buffers(
 
     The returned GDF is in the CRS of the original GTFS shapes; if that CRS
     uses meters, the function converts *buffer_dist_ft* accordingly.
+
+    Args:
+        tables: GTFS tables keyed by name (needs ``shapes``, ``trips``,
+            ``stops``, and ``stop_times`` for stop-buffer mode).
+        use_shape_buffer: Buffer the route's shape geometry when True, else the
+            union of its stops.
+        buffer_dist_ft: Buffer distance in feet (converted to meters internally).
+        route_filter: Only build buffers for these route_ids; empty/None means all.
+        projected_crs: CRS used for buffering and the returned geometries.
+        simplify_tolerance_m: Douglas-Peucker tolerance (in the projected CRS's
+            units, meters for the default EPSG:3857) applied to each route's
+            geometry before buffering. Buffering full-resolution shapes is the
+            slowest step; simplifying first cuts that cost many-fold with no
+            meaningful effect on a ¼-mile buffer. Pass 0.0 to disable.
 
     Raises:
         ValueError: If shapes.txt lacks an EPSG code in the header.
@@ -176,10 +197,11 @@ def _prepare_route_buffers(
 
     selected_routes = [rid for rid in route_shapes.index if not route_filter or rid in route_filter]
     logging.info(
-        "Buffering %d route(s) (buffer=%.1f ft -> %.1f m)...",
+        "Buffering %d route(s) (buffer=%.1f ft -> %.1f m, simplify=%.1f m)...",
         len(selected_routes),
         buffer_dist_ft,
         buff_dist_m,
+        simplify_tolerance_m,
     )
     log_every = max(1, len(selected_routes) // 20)  # ~20 progress lines
 
@@ -208,7 +230,12 @@ def _prepare_route_buffers(
             logging.warning("No geometry for route %s – skipped", route_id)
             continue
 
-        buf = unary_union(list(geoms)).buffer(buff_dist_m)
+        geom = unary_union(list(geoms))
+        # Thin the vertex count before buffering — full-resolution shapes make
+        # buffer() the dominant cost. The tolerance is tiny next to the buffer.
+        if simplify_tolerance_m > 0:
+            geom = geom.simplify(simplify_tolerance_m)
+        buf = geom.buffer(buff_dist_m)
         buffers.append({"route_id": route_id, "geometry": buf})
 
         if processed % log_every == 0 or processed == len(selected_routes):
@@ -370,6 +397,7 @@ def run(
     projected_crs: str | None = None,
     plot_fig_dpi: int | None = None,
     make_plots: bool | None = None,
+    simplify_tolerance_m: float | None = None,
 ) -> None:
     """Run the GTFS feature-coverage analysis."""
     gtfs_dir = Path(GTFS_DIR if gtfs_dir is None else gtfs_dir)
@@ -381,6 +409,9 @@ def run(
     projected_crs = PROJECTED_CRS if projected_crs is None else projected_crs
     plot_fig_dpi = PLOT_FIG_DPI if plot_fig_dpi is None else plot_fig_dpi
     make_plots = MAKE_PLOTS if make_plots is None else make_plots
+    simplify_tolerance_m = (
+        SIMPLIFY_TOLERANCE_M if simplify_tolerance_m is None else simplify_tolerance_m
+    )
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -394,6 +425,7 @@ def run(
         buffer_dist_ft,
         route_filter=route_filter,
         projected_crs=projected_crs,
+        simplify_tolerance_m=simplify_tolerance_m,
     )
 
     if route_buffers.empty:
@@ -468,6 +500,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--dpi", type=int, default=PLOT_FIG_DPI, help="Resolution for PNG exports.")
     parser.add_argument(
+        "--simplify-m",
+        dest="simplify_tolerance_m",
+        type=float,
+        default=SIMPLIFY_TOLERANCE_M,
+        help="Simplify route geometry by this tolerance (projected units) before buffering; "
+        "0 disables.",
+    )
+    parser.add_argument(
         "--plots",
         dest="make_plots",
         action="store_true",
@@ -500,6 +540,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         projected_crs=args.projected_crs,
         plot_fig_dpi=args.dpi,
         make_plots=args.make_plots,
+        simplify_tolerance_m=args.simplify_tolerance_m,
     )
 
 
