@@ -263,7 +263,15 @@ def _load_layers(
             continue
 
         if id_col not in gdf.columns:
-            logging.warning("Column %s missing in %s – skipped", id_col, path)
+            # List the layer's actual attribute columns so the configured
+            # id_col can be corrected without opening the shapefile by hand.
+            available = [c for c in gdf.columns if c != "geometry"]
+            logging.warning(
+                "Column '%s' missing in %s – skipped. Available columns: %s",
+                id_col,
+                path,
+                available,
+            )
             continue
 
         layers[filename] = gdf[[id_col, "geometry"]].to_crs(projected_crs)
