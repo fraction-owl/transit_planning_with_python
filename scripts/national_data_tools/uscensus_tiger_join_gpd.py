@@ -1022,7 +1022,8 @@ def write_geo(gdf: GeoDataFrame, out_path: str) -> None:
 
     Shapefile outputs have field names truncated to 10 chars and the implicit
     pandas index suppressed; other drivers are inferred from the extension.
-    Float columns in shapefiles are written with 1 decimal place.
+    Float columns in shapefiles are written with 1 decimal place when fiona is
+    available (see ``_write_shapefile``).
     """
     path = Path(out_path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1030,11 +1031,33 @@ def write_geo(gdf: GeoDataFrame, out_path: str) -> None:
     logging.info("Writing %d features → %s", len(gdf), path.resolve())
     if out_path.lower().endswith(".shp"):
         gdf = _truncate_field_names(gdf)
-        gdf.to_file(
-            out_path, driver="ESRI Shapefile", schema=_shp_schema(gdf), engine="fiona", index=False
-        )
+        _write_shapefile(gdf, out_path)
     else:
         gdf.to_file(out_path, index=False)
+
+
+def _write_shapefile(gdf: GeoDataFrame, out_path: str) -> None:
+    """Write *gdf* as an ESRI Shapefile, preferring fiona's float-precision schema.
+
+    The fiona engine accepts a per-field ``schema`` (``_shp_schema``) that caps float
+    columns to one decimal place in the DBF. fiona is awkward to install on newer
+    Python versions (it needs a matching GDAL build and often lacks wheels), so when it
+    is not importable we fall back to GeoPandas' default engine (pyogrio). The fallback
+    drops only the cosmetic 1-decimal cap — geometry and attribute values are identical,
+    and pyogrio is what GeoPandas already uses to read the inputs here.
+    """
+    try:
+        import fiona  # noqa: F401  (presence check only)
+    except ImportError:
+        logging.info(
+            "fiona is not installed; writing the Shapefile with GeoPandas' default "
+            "engine (pyogrio), without the cosmetic 1-decimal float cap."
+        )
+        gdf.to_file(Path(out_path), driver="ESRI Shapefile", index=False)
+        return
+    gdf.to_file(
+        out_path, driver="ESRI Shapefile", schema=_shp_schema(gdf), engine="fiona", index=False
+    )
 
 
 def write_csv(df: DataFrame, out_path: str) -> None:

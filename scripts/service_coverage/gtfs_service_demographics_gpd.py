@@ -75,15 +75,16 @@ OUTPUT_DIRECTORY = r"Path\To\Output"
 # intersections) for best results.
 PEDESTRIAN_NETWORK_PATH = r"Path\To\centerlines.shp"
 
-# Calendar / service-pattern filter
-SERVICE_IDS_TO_INCLUDE: Final[list[str]] = ["3"]  # ← NEW
-# e.g. ["1", "2", "3"] for your weekday patterns, [] for “no calendar filter”
+# Calendar / service-pattern filter. Leave empty to auto-select the full Monday–Friday
+# service(s) straight from calendar.txt (recommended — robust to feed-specific service_id
+# values); set explicit ids (e.g. ["2"]) to force a particular service pattern.
+SERVICE_IDS_TO_INCLUDE: Final[list[str]] = []
 
 # Route filters:
 # 1) ROUTES_TO_INCLUDE: If non-empty, only these routes are considered.
 # 2) ROUTES_TO_EXCLUDE: If non-empty, these routes are removed.
 # If both are empty, all routes in routes.txt are used.
-ROUTES_TO_INCLUDE: list[str] = ["101", "202"]  # e.g. [] for no include filter
+ROUTES_TO_INCLUDE: list[str] = []  # empty = all routes; set e.g. ["101", "202"] for a subset
 ROUTES_TO_EXCLUDE: list[str] = []  # e.g. [] for no exclude filter
 
 # Stop filters:
@@ -160,19 +161,19 @@ LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
 
 
 def filter_weekday_service(calendar_df: pd.DataFrame) -> pd.Series:
-    """Return service_ids for routes that run Monday through Friday.
+    """Return service_ids that run every weekday (Monday through Friday).
+
+    calendar.txt is frequently loaded with every column as a string, so the day flags
+    are coerced to numeric before the ``== 1`` comparison; a service must run on all
+    five weekdays to qualify.
 
     :param calendar_df: DataFrame from calendar.txt.
     :return: Series of service_id values available on all weekdays.
     """
-    weekday_filter = (
-        (calendar_df["monday"] == 1)
-        & (calendar_df["tuesday"] == 1)
-        & (calendar_df["wednesday"] == 1)
-        & (calendar_df["thursday"] == 1)
-        & (calendar_df["friday"] == 1)
-    )
-    return calendar_df[weekday_filter]["service_id"]
+    days = ["monday", "tuesday", "wednesday", "thursday", "friday"]
+    flags = calendar_df[days].apply(pd.to_numeric, errors="coerce").fillna(0)
+    weekday_filter = (flags == 1).all(axis=1)
+    return calendar_df.loc[weekday_filter, "service_id"]
 
 
 def get_included_stops(
@@ -668,6 +669,18 @@ def clip_and_calculate_synthetic_fields(
     return clipped_gdf
 
 
+def _present_synthetic_cols(clipped: gpd.GeoDataFrame, synthetic_fields: list[str]) -> list[str]:
+    """Return the ``synthetic_<field>`` columns that clipping actually produced.
+
+    ``clip_and_calculate_synthetic_fields`` only emits a ``synthetic_<field>`` column
+    for a field present in the demographics layer, so a layer that lacks some
+    ``SYNTHETIC_FIELDS`` (e.g. no LEHD jobs table, or tract estimates the census step
+    did not produce) simply yields fewer of them. Selecting only the columns that
+    materialized keeps a missing field from ``KeyError``-ing the whole analysis.
+    """
+    return [f"synthetic_{f}" for f in synthetic_fields if f"synthetic_{f}" in clipped.columns]
+
+
 def export_summary_to_excel(totals_dict: dict, output_path: str) -> None:
     """Write a dictionary of aggregated synthetic fields to a single-row Excel file.
 
@@ -814,7 +827,7 @@ def do_network_analysis(
         service_area_gdf,
         synthetic_fields,
     )
-    synthetic_cols = [f"synthetic_{fld}" for fld in synthetic_fields]
+    synthetic_cols = _present_synthetic_cols(clipped_result, synthetic_fields)
     totals = clipped_result[synthetic_cols].sum().round(0)
 
     logging.info("Network-wide totals:")
@@ -935,7 +948,7 @@ def do_route_by_route_analysis(
             demographics_gdf, service_area_gdf, synthetic_fields
         )
 
-        synthetic_cols = [f"synthetic_{f}" for f in synthetic_fields]
+        synthetic_cols = _present_synthetic_cols(clipped_result, synthetic_fields)
         totals = clipped_result[synthetic_cols].sum().round(0)
         for col, val in totals.items():
             display_col = str(col).replace("synthetic_", "").replace("_", " ").title()
@@ -1049,7 +1062,7 @@ def do_stop_by_stop_analysis(
         clipped_result = clip_and_calculate_synthetic_fields(
             demographics_gdf, service_area_gdf, synthetic_fields
         )
-        synthetic_cols = [f"synthetic_{f}" for f in synthetic_fields]
+        synthetic_cols = _present_synthetic_cols(clipped_result, synthetic_fields)
         totals = clipped_result[synthetic_cols].sum().round(0)
 
         logging.info("\nStop %s totals:", stop_id_str)
@@ -1333,7 +1346,22 @@ def run(
         # --------------------------------------------------------------
         # 2) OPTIONAL CALENDAR FILTER
         # --------------------------------------------------------------
-        if service_ids_to_include:  # e.g. ["1", "2", "3"]
+        if not service_ids_to_include:
+            # Empty -> auto-select the full Monday–Friday service(s) straight from
+            # calendar.txt, so weekday service is chosen for any feed instead of a
+            # hardcoded id (service_id values differ per agency/feed).
+            service_ids_to_include = [
+                str(s) for s in filter_weekday_service(gtfs_raw["calendar"]).tolist()
+            ]
+            if service_ids_to_include:
+                logging.info(
+                    "Auto-selected weekday service_id(s) from calendar.txt: %s",
+                    service_ids_to_include,
+                )
+            else:
+                logging.warning("No Monday–Friday service found in calendar.txt; using all trips.")
+
+        if service_ids_to_include:  # explicit ids or the auto-selected weekday set
             before = len(trips)
             trips = trips[trips["service_id"].isin(service_ids_to_include)]
             logging.info(
