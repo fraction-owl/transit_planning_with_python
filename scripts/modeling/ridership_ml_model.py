@@ -139,13 +139,29 @@ FEATURE_TABLES: Final[list[FeatureTable]] = [
         label="exogenous",
         path=Path(r"Path\To\Your\exogenous_monthly.csv"),
         join_keys=("period",),  # system-wide series; varies by month only
-        keep_cols=("gas_price", "unemployment_rate", "avg_temp_f", "total_precip_in"),
+        keep_cols=(
+            "gas_price",
+            "unemployment_rate",
+            # Daily-derived weather aggregates (from clean_noaa_weather.aggregate_monthly).
+            # These capture event intensity and frequency rather than bare monthly totals.
+            "avg_temp_f",  # mean daily temperature
+            "max_daily_precip_in",  # peak single-day rain (severity, not monthly total)
+            "days_with_precip",  # count of rainy days
+            "total_snow_in",  # total monthly snowfall
+            "max_daily_snow_in",  # peak single-day snowfall
+        ),
     ),
     FeatureTable(
         label="demographic_coverage",
         path=Path(r"Path\To\Your\service_demographics_by_route.csv"),
         join_keys=("route_id",),
-        keep_cols=("pop_served", "low_income_served", "minority_served", "zero_car_hh_served"),
+        keep_cols=(
+            "pop_served",
+            "low_income_served",
+            "minority_served",
+            "zero_car_hh_served",
+            "empl_served",  # Census LODES total employment within service catchment
+        ),
     ),
     FeatureTable(
         label="poi_coverage",
@@ -187,8 +203,15 @@ PREDICTORS: Final[tuple[str, ...]] = (
     "revenue_miles",
     "gas_price",
     "unemployment_rate",
+    # Daily-derived monthly weather aggregates.
+    "avg_temp_f",
+    "max_daily_precip_in",
+    "days_with_precip",
+    "total_snow_in",
+    "max_daily_snow_in",
     "pop_served",
     "low_income_served",
+    "empl_served",  # Census LODES employment within service catchment
     # Generic POI coverage is presence-only: just how many sites a route
     # reaches, with no sense of their size.
     "sites_served",
@@ -201,7 +224,8 @@ PREDICTORS: Final[tuple[str, ...]] = (
 )
 
 # Categorical columns to one-hot encode (first level dropped as the reference).
-CATEGORICAL_PREDICTORS: Final[tuple[str, ...]] = ()
+# "month" is derived automatically from the "period" column after table assembly.
+CATEGORICAL_PREDICTORS: Final[tuple[str, ...]] = ("month",)
 
 # -----------------------------------------------------------------------------
 #  Transforms
@@ -219,8 +243,16 @@ LOG_DEPENDENT: Final[bool] = True
 LOG_PREDICTORS: Final[tuple[str, ...]] = (
     "scheduled_hours",
     "revenue_miles",
+    # Precipitation/snow are right-skewed counts and magnitudes; log1p handles
+    # the many zero-snow months gracefully. avg_temp_f is left linear because
+    # temperature has a natural zero and can be negative.
+    "max_daily_precip_in",
+    "days_with_precip",
+    "total_snow_in",
+    "max_daily_snow_in",
     "pop_served",
     "low_income_served",
+    "empl_served",
     "sites_served",
     "schools_served",
     "enrollment_served",
@@ -1005,6 +1037,18 @@ def main() -> None:
     if DEPENDENT_VAR not in table.columns:
         logging.error("Dependent variable '%s' not found in the assembled table.", DEPENDENT_VAR)
         sys.exit(1)
+
+    if "month" in CATEGORICAL_PREDICTORS:
+        if "period" in table.columns:
+            table["month"] = pd.to_datetime(table["period"], format="%Y-%m").dt.strftime("%b")
+            logging.info(
+                "Derived 'month' column from 'period' (%d unique values).",
+                table["month"].nunique(),
+            )
+        else:
+            logging.warning(
+                "'month' is in CATEGORICAL_PREDICTORS but 'period' is not in the table — skipping."
+            )
 
     # === STEP 2: BUILD FEATURE MATRIX ========================================
     logging.info("=== STEP 2: BUILD FEATURE MATRIX ===")
