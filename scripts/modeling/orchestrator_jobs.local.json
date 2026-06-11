@@ -31,6 +31,14 @@
       "script": "schools_prep_join_gpd.py",
       "cmd": ["{python}", "{script}",
               "--input-dir", "{input}/schools_input",
+              "--output-dir", "{output}",
+              "--school-type", "all"]
+    },
+    {
+      "script": "school_coverage_by_route_gpd.py",
+      "cmd": ["{python}", "{script}",
+              "--gtfs-dir", "{input}/gtfs_input/connector_gtfs_2026_04_29",
+              "--schools-path", "{work}/out/schools_prep_join_gpd",
               "--output-dir", "{output}"]
     },
     {
@@ -58,6 +66,8 @@
   ],
   "outputs": [
     {"file": "headway_span_by_route.csv", "join_keys": ["route_id"],
-     "keep_cols": ["avg_headway_min", "span_hrs"]}
+     "keep_cols": ["avg_headway_min", "span_hrs"]},
+    {"file": "school_coverage_by_route.csv", "join_keys": ["route_id"],
+     "keep_cols": ["schools_served", "enrollment_served"]}
   ]
 }
