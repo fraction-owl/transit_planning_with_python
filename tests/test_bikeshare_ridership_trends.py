@@ -87,6 +87,27 @@ def test_load_trips_from_nested_directories(tmp_path: Path, trips: pd.DataFrame)
     assert len(loaded) == len(trips[trips["month"].isin(months)])
 
 
+def test_load_trips_tolerates_non_utf8_extract(tmp_path: Path, trips: pd.DataFrame) -> None:
+    # Some vendor months carry a stray Windows-1252 byte (e.g. 0x9c) that a
+    # strict UTF-8 read would choke on, aborting the whole run. Write one month
+    # with a cp1252-only station name and confirm it still loads.
+    one_month = trips[trips["month"] == "2024-05"].copy()
+    cols = [c for c in trips.columns if c not in ("month", "source_file")]
+    odd_name = "Cœur Plaza"  # 'œ' encodes to the lone byte 0x9c in cp1252
+    one_month.loc[one_month.index[0], "start_station_name"] = odd_name
+    csv_path = tmp_path / "202405-capitalbikeshare-tripdata.csv"
+    csv_path.write_bytes(one_month[cols].to_csv(index=False).encode("cp1252"))
+
+    # A strict UTF-8 read of these bytes must fail -- proving the fixture is the
+    # problematic case the loader has to survive.
+    with pytest.raises(UnicodeDecodeError):
+        csv_path.read_bytes().decode("utf-8")
+
+    loaded = mod.load_trips(tmp_path)
+    assert len(loaded) == len(one_month)
+    assert odd_name in set(loaded["start_station_name"])
+
+
 # ---------------------------------------------------------------------------
 # build_system_monthly
 # ---------------------------------------------------------------------------

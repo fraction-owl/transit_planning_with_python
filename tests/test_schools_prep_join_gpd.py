@@ -221,6 +221,29 @@ def test_find_elsi_csv_returns_none_when_absent(tmp_path: Path) -> None:
     assert mod._find_elsi_csv(tmp_path, mod.SCHOOL_TYPES["public"]) is None
 
 
+def test_find_elsi_csv_recurses_into_subfolders(tmp_path: Path) -> None:
+    # The prep_features orchestrator unpacks each ELSI export zip into its own
+    # subfolder, so the CSV sits one level below the input dir. Confirm the
+    # finder recurses to it instead of only scanning the top level.
+    nested = tmp_path / "ELSI_csv_export_6391668083015904102675"
+    nested.mkdir()
+    shutil.copy(
+        FIXTURE_DIR / "ELSI_csv_export_public_1920_sample.csv",
+        nested / "ELSI_csv_export_public_1920_sample.csv",
+    )
+    found = mod._find_elsi_csv(tmp_path, mod.SCHOOL_TYPES["public"])
+    assert found is not None and found.parent == nested
+
+
+def test_find_ipeds_file_recurses_into_subfolders(tmp_path: Path) -> None:
+    # Same nesting story for the IPEDS EFFY enrollment file.
+    nested = tmp_path / "EFFY2019"
+    nested.mkdir()
+    shutil.copy(FIXTURE_DIR / "effy2019_sample.csv", nested / "effy2019_sample.csv")
+    found = mod._find_ipeds_file(tmp_path)
+    assert found is not None and found.parent == nested
+
+
 # =============================================================================
 # load_enrollment_wide  (dispatch)
 # =============================================================================

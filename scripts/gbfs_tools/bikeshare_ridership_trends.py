@@ -43,12 +43,12 @@ trends include months with zero activity rather than skipping them.
 from __future__ import annotations
 
 import argparse
+import io
 import logging
 import re
 import sys
 import zipfile
 from pathlib import Path
-from typing import IO
 
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
@@ -104,18 +104,47 @@ logging.getLogger("matplotlib").setLevel(logging.WARNING)
 # ---------------------------------------------------------------------------
 
 
-def _read_one(handle: IO[bytes] | Path, source_name: str) -> pd.DataFrame:
-    """Read a single trip CSV, keeping blanks as empty strings.
+# Trip extracts are normally UTF-8, but some vendor months ship a stray
+# Windows-1252 byte (e.g. 0x9c) that makes a strict UTF-8 read abort the whole
+# run. Decode order: UTF-8 (BOM-aware) first, then cp1252, then latin-1 -- the
+# last accepts every byte, so one oddly encoded file no longer sinks the rest.
+_ENCODINGS = ("utf-8-sig", "cp1252", "latin-1")
+
+
+def _decode_csv(data: bytes, source_name: str) -> str:
+    """Decode trip-CSV bytes, tolerating the occasional non-UTF-8 extract.
+
+    A file that needs a fallback is logged so the odd encoding is surfaced
+    rather than silently reinterpreted.
+    """
+    for encoding in _ENCODINGS:
+        try:
+            text = data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+        if encoding != _ENCODINGS[0]:
+            logger.warning(
+                "Decoded %s as %s after UTF-8 failed; verify that file's encoding.",
+                source_name,
+                encoding,
+            )
+        return text
+    # latin-1 above never raises, so this is unreachable; kept for safety.
+    return data.decode("latin-1", errors="replace")
+
+
+def _read_one(data: bytes, source_name: str) -> pd.DataFrame:
+    """Read a single trip CSV from raw bytes, keeping blanks as empty strings.
 
     Args:
-        handle: An open binary/text file object or path accepted by pandas.
+        data: Raw bytes of one trip extract (a directory file or a zip member).
         source_name: File name recorded in the returned ``source_file`` column.
 
     Returns:
         The trips in one extract, with a ``source_file`` column added.
     """
     frame = pd.read_csv(
-        handle,
+        io.StringIO(_decode_csv(data, source_name)),
         dtype={col: "string" for col in _STRING_COLUMNS},
         keep_default_na=False,
         na_filter=False,
@@ -151,15 +180,14 @@ def load_trips(input_path: Path) -> pd.DataFrame:
                 if name.lower().endswith("-capitalbikeshare-tripdata.csv")
             )
             for member in members:
-                with archive.open(member) as raw:
-                    frames.append(_read_one(raw, Path(member).name))
+                frames.append(_read_one(archive.read(member), Path(member).name))
     else:
         # rglob (not glob) so a directory whose monthly extracts each sit in
         # their own subfolder still resolves -- this is exactly the layout the
         # prep_features.py orchestrator produces when it unzips each
         # ``YYYYMM-capitalbikeshare-tripdata.zip`` into a sibling folder.
         for path in sorted(input_path.rglob(TRIP_FILE_GLOB)):
-            frames.append(_read_one(path, path.name))
+            frames.append(_read_one(path.read_bytes(), path.name))
 
     if not frames:
         raise ValueError(f"No '{TRIP_FILE_GLOB}' files found under {input_path}")

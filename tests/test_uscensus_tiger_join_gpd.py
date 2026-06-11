@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gzip
+import logging
 import shutil
 import zipfile
 from pathlib import Path
@@ -990,3 +991,47 @@ def test_check_placeholders_returns_false_when_paths_overridden(
     monkeypatch.setattr(mod, "INTERMEDIATE_COMBINED_CSV", "")
     monkeypatch.setattr(mod, "INTERMEDIATE_MERGED_SHP", "")
     assert mod._check_placeholders() is False
+
+
+def test_skip_placeholder_output_blanks_placeholder() -> None:
+    assert (
+        mod._skip_placeholder_output(
+            mod._DEFAULT_INTERMEDIATE_COMBINED_CSV,
+            mod._DEFAULT_INTERMEDIATE_COMBINED_CSV,
+            "--intermediate-csv",
+        )
+        == ""
+    )
+
+
+def test_skip_placeholder_output_passes_through_real_path() -> None:
+    assert (
+        mod._skip_placeholder_output(
+            "out/joined.csv", mod._DEFAULT_INTERMEDIATE_COMBINED_CSV, "--intermediate-csv"
+        )
+        == "out/joined.csv"
+    )
+
+
+def test_run_proceeds_when_only_intermediates_are_placeholders(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The orchestrator wires --input-csv-dir/--input-shp-dir/--output but not the
+    # optional intermediates, so they fall back to their placeholder defaults.
+    # That must no longer abort the run with "No processing performed".
+    csv_dir = tmp_path / "census"
+    csv_dir.mkdir()
+    shp_dir = tmp_path / "tiger"
+    shp_dir.mkdir()
+    # The empty input dirs make the real pipeline fail downstream (run() then
+    # sys.exit(1)); that's incidental. What matters is that it reached Stage 1
+    # instead of short-circuiting at the placeholder guard.
+    with caplog.at_level(logging.INFO), pytest.raises(SystemExit):
+        mod.run(
+            input_csv_dir=str(csv_dir),
+            input_shp_dir=str(shp_dir),
+            final_joined_features=str(tmp_path / "out.shp"),
+        )
+    messages = "\n".join(r.getMessage() for r in caplog.records)
+    assert "No processing performed" not in messages
+    assert "Stage 1/3" in messages  # got past the guard and began real work

@@ -56,6 +56,7 @@ import sys
 import tempfile
 import zipfile
 from dataclasses import dataclass, field
+from itertools import islice
 from pathlib import Path
 
 import geopandas as gpd
@@ -467,9 +468,13 @@ def _load_elsi_wide(path: Path, school_type: SchoolType) -> pd.DataFrame:
 
 
 def _find_ipeds_file(input_dir: Path) -> Path | None:
-    """Return the IPEDS EFFY enrollment file (csv preferred over xlsx), or None."""
+    """Return the IPEDS EFFY enrollment file (csv preferred over xlsx), or None.
+
+    Searches recursively so an EFFY zip that the caller (or the prep_features
+    orchestrator) unpacked into its own subfolder still resolves.
+    """
     for pattern in IPEDS_GLOBS:
-        matches = sorted(input_dir.glob(pattern))
+        matches = sorted(input_dir.rglob(pattern))
         if matches:
             return matches[0]
     return None
@@ -524,9 +529,14 @@ def _find_elsi_csv(input_dir: Path, school_type: SchoolType) -> Path | None:
     line in the preamble, so both can sit in the same folder.
     """
     marker = f"This is a {school_type.elsi_kind} based table"
-    for csv_path in sorted(input_dir.glob("*.csv")):
+    # rglob, not glob: a downloaded ELSI export is often a zip the caller (or the
+    # prep_features orchestrator) unpacks into its own subfolder, leaving the CSV
+    # one level below input_dir. The preamble marker still disambiguates which
+    # export is which, so scanning extra CSVs here is harmless.
+    for csv_path in sorted(input_dir.rglob("*.csv")):
         try:
-            head = "".join(csv_path.open(encoding="utf-8-sig").readlines()[:10])
+            with csv_path.open(encoding="utf-8-sig") as handle:
+                head = "".join(islice(handle, 10))
         except OSError:  # pragma: no cover - unreadable file
             continue
         if head.startswith("ELSI Export") and marker in head:
@@ -569,7 +579,7 @@ def load_enrollment_wide(
 
     available: dict[str, Path] = {}
     if "ccd" in st.sources:
-        ccd_zips = sorted(input_dir.glob("ccd_sch_052_*.zip"))
+        ccd_zips = sorted(input_dir.rglob("ccd_sch_052_*.zip"))
         if ccd_zips:
             available["ccd"] = ccd_zips[0]
     if "elsi" in st.sources:
@@ -585,7 +595,7 @@ def load_enrollment_wide(
 
     if chosen is None or chosen not in available:
         if chosen == "ccd" or (chosen is None and "ccd" in st.sources):
-            lea = list(input_dir.glob("ccd_lea_052_*.zip"))
+            lea = list(input_dir.rglob("ccd_lea_052_*.zip"))
             if lea:
                 raise FileNotFoundError(
                     f"No CCD membership file (ccd_sch_052_*.zip) in {input_dir}. Found a "

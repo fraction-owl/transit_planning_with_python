@@ -914,6 +914,34 @@ def _is_blank(p: str | None) -> bool:
     return p is None or not str(p).strip()
 
 
+def _skip_placeholder_output(path: str | None, placeholder: str, flag: str) -> str | None:
+    """Treat an optional output left at its template placeholder as 'skip'.
+
+    The two intermediate artifacts are optional, so leaving their path un-edited
+    must not abort the whole run -- only the required input/output paths do that.
+    This is exactly the case the prep_features orchestrator hits: it wires
+    ``--input-csv-dir``/``--input-shp-dir``/``--output`` but not the
+    intermediates, so they fall back to the placeholder constants.
+
+    Args:
+        path: The configured (or defaulted) intermediate output path.
+        placeholder: The template placeholder value for this output.
+        flag: The CLI flag name, used only in the warning message.
+
+    Returns:
+        ``""`` (skip this artifact) when ``path`` is still the placeholder,
+        otherwise ``path`` unchanged.
+    """
+    if path is not None and str(path) == placeholder:
+        logging.warning(
+            "%s left at its placeholder; skipping that optional artifact. "
+            "Pass a real path to write it, or '' to silence this warning.",
+            flag,
+        )
+        return ""
+    return path
+
+
 def _check_placeholders(
     input_csv_dir: str | Path | None = None,
     input_shp_dir: str | Path | None = None,
@@ -1009,6 +1037,16 @@ def run(
     )
     intermediate_merged_shp = (
         INTERMEDIATE_MERGED_SHP if intermediate_merged_shp is None else intermediate_merged_shp
+    )
+
+    # Optional intermediates left at their placeholder mean "don't write them",
+    # not "abort": coerce to blank so a run wired with only --output (the
+    # orchestrator's pattern) proceeds instead of bailing with "No processing".
+    intermediate_combined_csv = _skip_placeholder_output(
+        intermediate_combined_csv, _DEFAULT_INTERMEDIATE_COMBINED_CSV, "--intermediate-csv"
+    )
+    intermediate_merged_shp = _skip_placeholder_output(
+        intermediate_merged_shp, _DEFAULT_INTERMEDIATE_MERGED_SHP, "--intermediate-shp"
     )
 
     if _check_placeholders(
