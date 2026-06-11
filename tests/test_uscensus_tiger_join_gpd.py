@@ -1097,6 +1097,38 @@ def test_write_geo_shapefile_truncates_long_column_names(tmp_path: Path) -> None
     assert all(len(c) <= 10 for c in non_geom)
 
 
+def test_shp_schema_handles_all_nan_object_column() -> None:
+    # A tract attribute that matched no block in a left join is an all-NaN object
+    # column; astype(str).str.len().max() is NaN (pandas 3.x keeps NaN), which used
+    # to crash int(NaN). It must size to a string field instead of raising.
+    gdf = gpd.GeoDataFrame(
+        {
+            "name_blk": ["block a", "block b"],
+            "name_trt": [None, None],
+            "geometry": [Point(0, 0), Point(1, 1)],
+        },
+        crs="EPSG:4326",
+    )
+    props = mod._shp_schema(gdf)["properties"]
+    assert props["name_trt"].startswith("str:")
+    assert props["name_blk"] == "str:7"
+
+
+def test_write_geo_shapefile_with_all_nan_object_column_roundtrips(tmp_path: Path) -> None:
+    gdf = gpd.GeoDataFrame(
+        {
+            "minority": [10.0, 30.0],
+            "empty_str": pd.Series([None, None], dtype="object"),
+            "geometry": gpd.GeoSeries([Point(0, 0), Point(1, 1)], crs="EPSG:4326"),
+        }
+    )
+    out = tmp_path / "out.shp"
+    mod.write_geo(gdf, str(out))  # must not raise on the all-NaN object column
+    roundtripped = gpd.read_file(out)
+    assert len(roundtripped) == 2
+    assert roundtripped["minority"].tolist() == [10.0, 30.0]
+
+
 # =============================================================================
 # write_csv
 # =============================================================================
