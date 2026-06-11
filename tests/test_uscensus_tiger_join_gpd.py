@@ -332,6 +332,42 @@ def test_load_and_concat_applies_column_rename(tmp_path: Path) -> None:
     assert result["total_pop"].iloc[0] == 42
 
 
+def test_load_and_concat_dedupes_repeated_geo_id_keep_first(tmp_path: Path) -> None:
+    # Two "vintages" of one table repeat a GEO_ID; only the first file's row survives.
+    a = tmp_path / "ACSDT5Y2023.B19001-Data.csv"
+    b = tmp_path / "ACSDT5Y2024.B19001-Data.csv"
+    _write_plain_csv(a, "GEO_ID,val\n1400000US11001000100,10\n")
+    _write_plain_csv(b, "GEO_ID,val\n1400000US11001000100,99\n")
+    result = mod._load_and_concat([str(a), str(b)])
+    assert len(result) == 1
+    assert result["val"].iloc[0] == 10
+
+
+def test_load_and_concat_keeps_distinct_geo_ids(tmp_path: Path) -> None:
+    a = tmp_path / "a-Data.csv"
+    b = tmp_path / "b-Data.csv"
+    _write_plain_csv(a, "GEO_ID,val\nX,1\n")
+    _write_plain_csv(b, "GEO_ID,val\nY,2\n")
+    assert len(mod._load_and_concat([str(a), str(b)])) == 2
+
+
+def test_load_and_concat_dedupe_key_none_disables(tmp_path: Path) -> None:
+    a = tmp_path / "a-Data.csv"
+    _write_plain_csv(a, "GEO_ID,val\nX,1\nX,2\n")
+    assert len(mod._load_and_concat([str(a)], dedupe_key=None)) == 2
+
+
+def test_load_and_concat_dedupes_on_alternate_key(tmp_path: Path) -> None:
+    # LODES files key on w_geocode, not GEO_ID, so several WAC vintages must dedupe there.
+    a = tmp_path / "wac_2021.csv"
+    b = tmp_path / "wac_2022.csv"
+    _write_plain_csv(a, "w_geocode,C000\n110010001001001,50\n")
+    _write_plain_csv(b, "w_geocode,C000\n110010001001001,77\n")
+    result = mod._load_and_concat([str(a), str(b)], dedupe_key="w_geocode")
+    assert len(result) == 1
+    assert result["C000"].iloc[0] == 50
+
+
 # =============================================================================
 # _ensure_fips_column_df  (DataFrame version)
 # =============================================================================
@@ -615,6 +651,142 @@ def test_build_joined_table_with_income_files(tmp_path: Path) -> None:
     )
     assert "low_income" in df.columns
     assert "perc_low_income" in df.columns
+
+
+def test_build_joined_table_duplicate_topic_files_do_not_explode(tmp_path: Path) -> None:
+    """Several files for one topic must not fan rows out into duplicate block keys.
+
+    Regression: when a topic bucket gathered more than one file for the same
+    geography (e.g. two ACS vintages, or race-iteration tables matched by the same
+    signature), the repeated rows multiplied through the GEO_ID and block<->tract
+    merges. That produced duplicate block keys, which aborted the Stage 3 ``1:1``
+    join and left demographics absent from the bundle. Each block must stay unique.
+    """
+    blocks = ["1000000US110010001001001", "1000000US110010001001002"]
+    pop_path = tmp_path / "P1-Data.csv"
+    _write_plain_csv(
+        pop_path,
+        _census_csv(
+            "GEO_ID,NAME,P1_001N",
+            "Geo,Name,!!Total:",
+            f"{blocks[0]},Block 1,100",
+            f"{blocks[1]},Block 2,200",
+        ),
+    )
+    hh_path = tmp_path / "H9-Data.csv"
+    _write_plain_csv(
+        hh_path,
+        _census_csv("GEO_ID,H9_001N", "Geo,!!Total:", f"{blocks[0]},40", f"{blocks[1]},80"),
+    )
+    bands = ",".join(f"B19001_{n:03d}E" for n in range(1, 12))
+    income_row = f"{_TRACT_GEO_ID},Tract,{','.join(['100'] * 11)}"
+    income_csv = _census_csv(
+        f"GEO_ID,NAME,{bands}", "Geo,Name," + ",".join(["lab"] * 11), income_row
+    )
+    # Two vintages of the same income table covering the same tract.
+    inc1 = tmp_path / "ACSDT5Y2023.B19001-Data.csv"
+    inc2 = tmp_path / "ACSDT5Y2024.B19001-Data.csv"
+    _write_plain_csv(inc1, income_csv)
+    _write_plain_csv(inc2, income_csv)
+
+    df = mod.build_joined_table(
+        pop_files=[str(pop_path)],
+        hh_files=[str(hh_path)],
+        jobs_files=[],
+        income_files=[str(inc1), str(inc2)],
+    )
+    normalized = mod.normalize_attribute_keys(df)
+    assert not normalized[mod.RIGHT_KEY].duplicated().any()
+    assert normalized[mod.RIGHT_KEY].nunique() == len(blocks)
+    # The kept income row still attaches to every block in the tract.
+    assert "low_income" in df.columns
+
+
+def test_build_joined_table_disaggregates_tract_count_to_blocks(tmp_path: Path) -> None:
+    """A tract-level count is split across its blocks by population and sums back.
+
+    The two blocks share one tract carrying 40 minority residents. Disaggregation must
+    apportion that by block population (100 vs 300) into 10 and 30 -- not copy 40 onto
+    each block -- so the parts still total the tract figure.
+    """
+    blocks = [("1000000US110010001001001", 100), ("1000000US110010001001002", 300)]
+    pop_path = tmp_path / "P1-Data.csv"
+    _write_plain_csv(
+        pop_path,
+        _census_csv(
+            "GEO_ID,NAME,P1_001N",
+            "Geo,Name,!!Total:",
+            *[f"{g},Block,{p}" for g, p in blocks],
+        ),
+    )
+    hh_path = tmp_path / "H9-Data.csv"
+    _write_plain_csv(
+        hh_path,
+        _census_csv("GEO_ID,H9_001N", "Geo,!!Total:", *[f"{g},{p // 2}" for g, p in blocks]),
+    )
+    eth_cols = "P9_001N,P9_002N,P9_005N,P9_006N,P9_007N,P9_008N,P9_009N,P9_010N,P9_011N"
+    eth_path = tmp_path / "P9-Data.csv"
+    _write_plain_csv(
+        eth_path,
+        _census_csv(
+            f"GEO_ID,NAME,{eth_cols}",
+            "Geo,Name," + ",".join(["lab"] * 9),
+            # total_pop=200, all_hisp=0, white=160, black=40, rest 0 -> minority=40.
+            f"{_TRACT_GEO_ID},Tract,200,0,160,40,0,0,0,0,0",
+        ),
+    )
+    df = mod.build_joined_table(
+        pop_files=[str(pop_path)],
+        hh_files=[str(hh_path)],
+        jobs_files=[],
+        ethnicity_files=[str(eth_path)],
+    ).sort_values("total_pop")
+    assert df["minority"].tolist() == pytest.approx([10.0, 30.0])
+    assert df["minority"].sum() == pytest.approx(40.0)
+
+
+# =============================================================================
+# disaggregate_tract_counts_to_blocks
+# =============================================================================
+
+
+def test_disaggregate_splits_count_by_weight_and_sums_back() -> None:
+    df = pd.DataFrame(
+        {
+            "tract_id_synth": ["T", "T", "T"],
+            "total_pop": [100, 300, 0],
+            "minority": [40, 40, 40],  # tract total copied onto each block
+        }
+    )
+    out = mod.disaggregate_tract_counts_to_blocks(df)
+    assert out["minority"].tolist() == pytest.approx([10.0, 30.0, 0.0])
+    assert out["minority"].sum() == pytest.approx(40.0)
+
+
+def test_disaggregate_renames_source_to_output_column() -> None:
+    df = pd.DataFrame({"tract_id_synth": ["T", "T"], "total_pop": [1, 1], "all_youth": [10, 10]})
+    out = mod.disaggregate_tract_counts_to_blocks(df)
+    assert "youth" in out.columns
+    assert "all_youth" not in out.columns
+    assert out["youth"].tolist() == pytest.approx([5.0, 5.0])
+
+
+def test_disaggregate_zero_weight_tract_yields_zero() -> None:
+    df = pd.DataFrame({"tract_id_synth": ["Z", "Z"], "total_pop": [0, 0], "minority": [10, 10]})
+    out = mod.disaggregate_tract_counts_to_blocks(df)
+    assert out["minority"].tolist() == [0.0, 0.0]
+
+
+def test_disaggregate_skips_field_when_weight_column_missing() -> None:
+    df = pd.DataFrame({"tract_id_synth": ["T"], "minority": [40]})  # no total_pop weight
+    out = mod.disaggregate_tract_counts_to_blocks(df)
+    assert out["minority"].tolist() == [40]
+
+
+def test_disaggregate_noop_without_tract_key() -> None:
+    df = pd.DataFrame({"total_pop": [100], "minority": [40]})
+    out = mod.disaggregate_tract_counts_to_blocks(df)
+    assert out["minority"].tolist() == [40]
 
 
 # =============================================================================

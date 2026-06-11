@@ -134,6 +134,27 @@ TOPIC_SIGNATURES: dict[str, Sequence[str] | str] = {
     "AGE_FILES": ("B01001",),
 }
 
+# ---- Tract -> block disaggregation ------------------------------------------
+#: Income, ethnicity, language, vehicle and age tables arrive at the tract level, so
+#: after the block<->tract join every block in a tract carries that tract's totals
+#: verbatim. For an *additive count* that over-counts — each block claims the whole
+#: tract figure — so each configured count is split across the tract's blocks in
+#: proportion to a block-level weight (population for person counts, households for
+#: household counts): ``tract_total * block_weight / sum(block_weight over the tract)``.
+#: The parts then sum back to the tract total, and a partial-area service-area clip
+#: downstream keeps a proportional slice. Each entry maps the derived tract column to
+#: ``(weight_column, output_column)``; output names stay <=10 chars so the Shapefile
+#: writer does not truncate them. ``perc_*`` ratio columns are intentionally excluded —
+#: percentages are not additive and must never be area-weighted.
+TRACT_COUNT_DISAGG: dict[str, tuple[str, str]] = {
+    "low_income": ("total_hh", "low_income"),  # households under the low-income bands
+    "minority": ("total_pop", "minority"),  # non-white-alone residents
+    "all_nwell": ("total_pop", "lep"),  # limited-English-proficiency residents
+    "all_lo_veh_hh": ("total_hh", "lo_veh_hh"),  # households with 0-1 vehicles
+    "all_youth": ("total_pop", "youth"),  # residents age 15-21
+    "all_elderly": ("total_pop", "elderly"),  # residents age 65+
+}
+
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
 
 # ---- Sentinel defaults — detect un-edited placeholder paths ----------------
@@ -221,6 +242,41 @@ def _clean_name_cols(df: pd.DataFrame) -> None:
         df[col] = df[col].astype(str).str.replace(r"[\r\n\t]+", " ", regex=True).str.strip()
 
 
+def _dedupe_topic_rows(df: pd.DataFrame, key: Hashable, *, source: str) -> pd.DataFrame:
+    """Collapse rows that repeat *key* to the first occurrence, logging any drops.
+
+    A topic bucket can legitimately gather more than one input file for the same
+    geography: multiple ACS vintages of a table, or race/ethnicity iteration
+    tables (e.g. ``B19001A``..``B19001I``, ``B01001A``..``B01001I``) whose codes
+    contain the base topic's token and so match the same signature. Concatenated,
+    those files repeat every ``GEO_ID``, and because the later GEO_ID merges and
+    the one-to-many block<->tract join both fan out on the key, each repeat becomes
+    a *multiplicative* row explosion — enough to violate the Stage 3 ``1:1`` join
+    and abort the whole pipeline.
+
+    Collapsing here, at load time and before any merge, keeps each geography to a
+    single row. Files are read in sorted order, so ``keep="first"`` deterministically
+    prefers the base table over its race iterations (``B19001`` sorts before
+    ``B19001A``) and, for true vintage duplicates, the earliest file.
+    """
+    if key not in df.columns:
+        return df
+    before = len(df)
+    deduped = df.drop_duplicates(subset=[key], keep="first")
+    dropped = before - len(deduped)
+    if dropped:
+        logging.warning(
+            "Dropped %d row(s) repeating '%s' while loading %s (kept the first of each). "
+            "More than one input file covered the same geography — typically multiple ACS "
+            "vintages of a table, or race-iteration tables sharing the topic's token. Keep "
+            "one file per topic per geography to avoid this.",
+            dropped,
+            key,
+            source,
+        )
+    return deduped.reset_index(drop=True)
+
+
 def _load_and_concat(
     files: Sequence[str],
     *,
@@ -229,6 +285,7 @@ def _load_and_concat(
     usecols: Sequence[Hashable] | None = None,
     rename: Mapping[str, str] | None = None,
     compression: Literal["infer", "gzip", "bz2", "zip", "xz", "zstd"] | None = None,
+    dedupe_key: Hashable | None = GEO_ID_COL,
 ) -> pd.DataFrame:
     """Read multiple Census CSV / CSV-GZ / ZIP files and concatenate the results.
 
@@ -238,6 +295,12 @@ def _load_and_concat(
 
     Column renaming occurs *before* column pruning via ``usecols`` (unless
     ``usecols`` is explicitly supplied).
+
+    When ``dedupe_key`` is set (default ``GEO_ID``) and present in the combined
+    frame, rows repeating that key are collapsed to the first occurrence so a
+    topic that gathered several files for the same geography (multiple ACS
+    vintages, or race-iteration tables matched by the same signature) cannot fan
+    out through the downstream merges. Pass ``dedupe_key=None`` to disable.
     """
     frames: list[pd.DataFrame] = []
     for path in files:
@@ -262,7 +325,12 @@ def _load_and_concat(
 
         frames.append(df)
 
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if not frames:
+        return pd.DataFrame()
+    combined = pd.concat(frames, ignore_index=True)
+    if dedupe_key is not None:
+        combined = _dedupe_topic_rows(combined, dedupe_key, source=f"{len(files)} file(s)")
+    return combined
 
 
 def _merge_on_geo_id(left: pd.DataFrame, right: pd.DataFrame) -> pd.DataFrame:
@@ -315,6 +383,9 @@ def _build_block_df(inp: _BlockInputs) -> pd.DataFrame:
             "CE03": "high_wage",
         },
         usecols=["w_geocode", "C000", "CE01", "CE02", "CE03"],
+        # LODES is keyed on the block geocode, not GEO_ID; dedupe on it so several
+        # WAC vintages do not repeat a block and fan out in the merge below.
+        dedupe_key="w_geocode",
     )
     if not jobs.empty:
         jobs[GEO_ID_COL] = "1000000US" + jobs["w_geocode"].astype(str)
@@ -570,6 +641,50 @@ def _apply_fips_filter_df(
     return df[df[dst_col].isin(wanted)].copy()
 
 
+# ----- Tract -> block disaggregation -----------------------------------------
+
+
+def disaggregate_tract_counts_to_blocks(
+    df: pd.DataFrame,
+    *,
+    tract_key: str = "tract_id_synth",
+    field_weights: Mapping[str, tuple[str, str]] = TRACT_COUNT_DISAGG,
+) -> pd.DataFrame:
+    """Split each tract-level count across its blocks in proportion to a block weight.
+
+    After the block<->tract merge, every block in a tract carries that tract's totals
+    verbatim. For an additive count (households below an income threshold, minority
+    residents, ...) that copy-down over-counts: each block claims the whole tract
+    figure. This rewrites each configured count to the block's share —
+    ``tract_total * block_weight / sum(block_weight over the tract)`` — so the parts sum
+    back to the tract total and a partial-area clip downstream keeps a proportional
+    slice. Tracts whose weight sums to zero receive zero (no basis to apportion). The
+    result is written under the configured output column (the source column is dropped
+    when the name changes); ``perc_*`` ratio columns are never touched.
+
+    Args:
+        df: The merged block+tract frame, keyed per block, with ``tract_key`` present.
+        tract_key: Column grouping blocks by their tract (block GEO_ID's tract slice).
+        field_weights: ``{source_count: (weight_column, output_column)}``.
+
+    Returns:
+        ``df`` with each available count column disaggregated and renamed in place.
+    """
+    if tract_key not in df.columns:
+        return df
+    for src, (weight, out) in field_weights.items():
+        if src not in df.columns or weight not in df.columns:
+            continue
+        values = pd.to_numeric(df[src], errors="coerce").fillna(0.0)
+        weights = pd.to_numeric(df[weight], errors="coerce").fillna(0.0)
+        tract_weight = weights.groupby(df[tract_key]).transform("sum")
+        share = np.where(tract_weight > 0, weights / tract_weight, 0.0)
+        df[out] = values * share
+        if out != src:
+            df = df.drop(columns=src)
+    return df
+
+
 # ----- Stage 1 public entry point --------------------------------------------
 
 
@@ -598,6 +713,20 @@ def build_joined_table(
         )
     )
 
+    # Filter each frame to the requested counties BEFORE the block<->tract join. Both
+    # carry a county FIPS inside their GEO_ID, so each filters on its own key; the
+    # temporary column is dropped so it cannot collide under the merge suffixes. This
+    # is output-equivalent to filtering after the merge but keeps the one-to-many join
+    # (and the disaggregation below) off every out-of-area block in a full-state input.
+    if county_fips_filter:
+        block_df = _apply_fips_filter_df(block_df, fips=county_fips_filter).drop(
+            columns="FIPS", errors="ignore"
+        )
+        if not tract_df.empty:
+            tract_df = _apply_fips_filter_df(tract_df, fips=county_fips_filter).drop(
+                columns="FIPS", errors="ignore"
+            )
+
     combined = (
         block_df
         if tract_df.empty
@@ -613,8 +742,12 @@ def build_joined_table(
     if _clean_columns:
         combined = _drop_unfriendly_cols(combined)
 
+    # Re-attach the single 'FIPS' column (the per-frame ones were dropped above). With
+    # both inputs already filtered this is a cheap no-op filter, but it keeps one 'FIPS'
+    # on the output and drops any tract row the outer merge left unmatched to a block.
     combined = _apply_fips_filter_df(combined, fips=county_fips_filter)
     _fill_numeric_only(combined)
+    combined = disaggregate_tract_counts_to_blocks(combined)
     return combined
 
 
