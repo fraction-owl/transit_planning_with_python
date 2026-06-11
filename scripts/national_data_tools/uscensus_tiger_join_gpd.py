@@ -143,8 +143,13 @@ _DEFAULT_INTERMEDIATE_COMBINED_CSV: str = r"Path\To\Your\Output_Folder\joined_bl
 _DEFAULT_INTERMEDIATE_MERGED_SHP: str = r"Path\To\Your\Output_Folder\va_md_dc_blocks_fips_merge.shp"
 _DEFAULT_FINAL_JOINED_FEATURES: str = r"Path\To\Your\Output_Folder\va_md_dc_blocks_plus_data.shp"
 
-#: Sentinel for _check_placeholders args whose valid explicit values include None/"".
-_UNSET: Final = object()
+
+class _Unset:
+    """Sentinel type for _check_placeholders args whose valid values include None/""."""
+
+
+#: Sentinel instance: "argument not supplied, fall back to the module constant".
+_UNSET: Final[_Unset] = _Unset()
 
 # =============================================================================
 # STAGE 1: CSV DISCOVERY & MERGE  (pandas)
@@ -913,8 +918,8 @@ def _check_placeholders(
     input_csv_dir: str | Path | None = None,
     input_shp_dir: str | Path | None = None,
     final_joined_features: str | None = None,
-    intermediate_combined_csv: str | None = _UNSET,
-    intermediate_merged_shp: str | None = _UNSET,
+    intermediate_combined_csv: str | None | _Unset = _UNSET,
+    intermediate_merged_shp: str | None | _Unset = _UNSET,
 ) -> bool:
     """Warn about un-edited placeholder paths. Return True if any are still set.
 
