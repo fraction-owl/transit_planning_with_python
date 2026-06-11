@@ -31,11 +31,12 @@ applied here; if your feed relies heavily on calendar_dates.txt, filter
 
 from __future__ import annotations
 
+import argparse
 import logging
 import re
 import sys
 from pathlib import Path
-from typing import Final, Optional
+from typing import Final, Optional, Sequence
 
 import pandas as pd
 
@@ -198,6 +199,8 @@ def run(
     gtfs_folder: Path | None = None,
     output_path: Path | None = None,
     service_day: str | None = None,
+    filter_in_route_short_names: Sequence[str] | None = None,
+    filter_out_route_short_names: Sequence[str] | None = None,
 ) -> pd.DataFrame:
     """Compute headway and span for one service day and write to CSV.
 
@@ -207,6 +210,16 @@ def run(
     gtfs_folder = GTFS_FOLDER if gtfs_folder is None else Path(gtfs_folder)
     output_path = OUTPUT_PATH if output_path is None else Path(output_path)
     service_day = SERVICE_DAY if service_day is None else service_day
+    filter_in = (
+        FILTER_IN_ROUTE_SHORT_NAMES
+        if filter_in_route_short_names is None
+        else list(filter_in_route_short_names)
+    )
+    filter_out = (
+        FILTER_OUT_ROUTE_SHORT_NAMES
+        if filter_out_route_short_names is None
+        else list(filter_out_route_short_names)
+    )
 
     gtfs = load_gtfs(gtfs_folder)
 
@@ -219,10 +232,10 @@ def run(
     routes = gtfs["routes"][["route_id", "route_short_name"]]
     trips = trips.merge(routes, on="route_id", how="left")
 
-    if FILTER_IN_ROUTE_SHORT_NAMES:
-        trips = trips[trips["route_short_name"].isin(FILTER_IN_ROUTE_SHORT_NAMES)]
-    if FILTER_OUT_ROUTE_SHORT_NAMES:
-        trips = trips[~trips["route_short_name"].isin(FILTER_OUT_ROUTE_SHORT_NAMES)]
+    if filter_in:
+        trips = trips[trips["route_short_name"].isin(filter_in)]
+    if filter_out:
+        trips = trips[~trips["route_short_name"].isin(filter_out)]
 
     if trips.empty:
         logging.error("No trips remain after filtering. Check SERVICE_DAY and route filter lists.")
@@ -250,10 +263,51 @@ def run(
     return result
 
 
-def main() -> None:
-    """CLI / notebook entry point."""
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    """Parse command-line arguments, defaulting to the config block values."""
+    parser = argparse.ArgumentParser(
+        description=(
+            "Compute route-level headway and span of service from a GTFS feed. "
+            "Defaults come from the configuration block at the top of this file."
+        )
+    )
+    parser.add_argument(
+        "--gtfs-folder", type=Path, default=GTFS_FOLDER, help="Path to the GTFS folder."
+    )
+    parser.add_argument("--output", type=Path, default=OUTPUT_PATH, help="Output CSV path.")
+    parser.add_argument(
+        "--service-day",
+        default=SERVICE_DAY,
+        choices=("weekday", "saturday", "sunday"),
+        help="Service day to summarize.",
+    )
+    parser.add_argument(
+        "--filter-in",
+        nargs="*",
+        default=FILTER_IN_ROUTE_SHORT_NAMES,
+        metavar="ROUTE_SHORT_NAME",
+        help="Only keep these route_short_name values (default: all).",
+    )
+    parser.add_argument(
+        "--filter-out",
+        nargs="*",
+        default=FILTER_OUT_ROUTE_SHORT_NAMES,
+        metavar="ROUTE_SHORT_NAME",
+        help="Drop these route_short_name values (default: none).",
+    )
+    parser.add_argument(
+        "--log-level",
+        default=logging.getLevelName(LOG_LEVEL),
+        help="DEBUG / INFO / WARNING / ERROR.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    """Command-line entry point. Defaults fall back to the config block."""
+    args = parse_args(argv)
     logging.basicConfig(
-        level=LOG_LEVEL,
+        level=getattr(logging, str(args.log_level).upper(), LOG_LEVEL),
         format="%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%H:%M:%S",
     )
@@ -261,13 +315,30 @@ def main() -> None:
         Path(r"Path\To\Your\GTFS_Folder"),
         Path(r"Path\To\Your\Output\headway_span_by_route.csv"),
     }
-    if GTFS_FOLDER in sentinels or OUTPUT_PATH in sentinels:
+    if args.gtfs_folder in sentinels or args.output in sentinels:
         logging.warning(
-            "Update GTFS_FOLDER and OUTPUT_PATH in the configuration block before running."
+            "GTFS_FOLDER and/or OUTPUT_PATH are still placeholders. Update the configuration "
+            "block or pass --gtfs-folder/--output before running."
         )
         return
-    run()
+    run(
+        gtfs_folder=args.gtfs_folder,
+        output_path=args.output,
+        service_day=args.service_day,
+        filter_in_route_short_names=args.filter_in,
+        filter_out_route_short_names=args.filter_out,
+    )
+
+
+def _in_ipython() -> bool:
+    """Return True when running inside an IPython/Jupyter kernel."""
+    return "ipykernel" in sys.modules or "IPython" in sys.modules
 
 
 if __name__ == "__main__":
-    main()
+    # In a notebook (pasted cell or %run), use the config block instead of
+    # argparse, which would otherwise try to parse the kernel's own argv.
+    if _in_ipython():
+        run()
+    else:
+        main()

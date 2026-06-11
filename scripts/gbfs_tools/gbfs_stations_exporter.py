@@ -19,10 +19,12 @@ Outputs:
     - `gbfs_stations.geojson`: GeoJSON of static station points
 """
 
+import argparse
 import json
 import logging
+import sys
 from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import Any, Literal, Optional, Sequence
 from urllib.parse import urlparse
 
 import geopandas as gpd
@@ -355,24 +357,70 @@ def gbfs_stations_to_files(
 # ===========================================================================
 
 
-def main() -> None:
-    """Run GBFS station export using the configured default paths."""
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    """Parse command-line arguments, defaulting to the CONFIGURATION block."""
+    parser = argparse.ArgumentParser(
+        description=(
+            "Export GBFS static station information to Shapefile and/or GeoJSON. "
+            "Defaults come from the CONFIGURATION section at the top of this file."
+        )
+    )
+    parser.add_argument(
+        "--source",
+        default=DEFAULT_GBFS_SOURCE,
+        help="GBFS gbfs.json URL, station_information.json URL, or local JSON path.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=DEFAULT_OUTPUT_DIR,
+        help="Directory where outputs are written.",
+    )
+    parser.add_argument(
+        "--format",
+        dest="kind",
+        choices=("shapefile", "geojson", "both"),
+        default="both",
+        help="Output format(s) to write.",
+    )
+    parser.add_argument(
+        "--log-level",
+        default=logging.getLevelName(LOG_LEVEL),
+        help="DEBUG / INFO / WARNING / ERROR.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    """Command-line entry point. Defaults fall back to the CONFIGURATION block."""
+    args = parse_args(argv)
     logging.basicConfig(
-        level=LOG_LEVEL,
+        level=getattr(logging, str(args.log_level).upper(), LOG_LEVEL),
         format="%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-    if DEFAULT_GBFS_SOURCE == r"https://example.com/gbfs/gbfs.json" or DEFAULT_OUTPUT_DIR == Path(
+    if args.source == r"https://example.com/gbfs/gbfs.json" or args.output_dir == Path(
         r"/path/to/your/default_output_folder"
     ):
         logging.warning(
             "DEFAULT_GBFS_SOURCE and/or DEFAULT_OUTPUT_DIR are still set to their default "
-            "placeholder values. Please update them in the CONFIGURATION section before running."
+            "placeholder values. Update them in the CONFIGURATION section or pass "
+            "--source/--output-dir before running."
         )
         return
-    gbfs_stations_to_files()
+    gbfs_stations_to_files(gbfs_source=args.source, output_dir=args.output_dir, kind=args.kind)
     logging.info("Script completed successfully.")
 
 
+def _in_ipython() -> bool:
+    """Return True when running inside an IPython/Jupyter kernel."""
+    return "ipykernel" in sys.modules or "IPython" in sys.modules
+
+
 if __name__ == "__main__":
-    main()
+    # In a notebook (pasted cell or %run), use the CONFIGURATION block instead
+    # of argparse, which would otherwise try to parse the kernel's own argv.
+    if _in_ipython():
+        main([])
+    else:
+        main()

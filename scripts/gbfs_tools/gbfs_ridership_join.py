@@ -19,13 +19,21 @@ geometries. The join key defaults to ``station_id``.
 Typical usage (edit the CONFIG block, then run):
 
     python gbfs_ridership_join.py
+
+Every CONFIG value also has a matching command-line flag that overrides it, e.g.
+
+    python gbfs_ridership_join.py \
+        --ridership-input output/monthly_station_ridership.csv \
+        --geojson-input output/gbfs_stations.geojson --output-dir output
 """
 
 from __future__ import annotations
 
+import argparse
 import logging
+import sys
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 import geopandas as gpd
 import pandas as pd
@@ -175,21 +183,89 @@ def _joined_output_path(input_path: str, output_dir: Path) -> Path:
     return output_dir / f"{source.stem}_ridership{source.suffix}"
 
 
-def main() -> None:
-    """Run the ridership-to-geometry join end to end."""
-    if not GEOJSON_INPUT and not SHAPEFILE_INPUT:
+def run(
+    ridership_input: str | None = None,
+    geojson_input: str | None = None,
+    shapefile_input: str | None = None,
+    output_dir: str | Path | None = None,
+    station_id_field: str | None = None,
+) -> None:
+    """Run the ridership-to-geometry join end to end.
+
+    Unset args fall back to the CONFIG block at the top of this file, so
+    ``m.RIDERSHIP_INPUT = ...; m.run()`` works after a plain import. Pass an
+    empty string for ``geojson_input`` or ``shapefile_input`` to skip that
+    output.
+    """
+    ridership_input = RIDERSHIP_INPUT if ridership_input is None else ridership_input
+    geojson_input = GEOJSON_INPUT if geojson_input is None else geojson_input
+    shapefile_input = SHAPEFILE_INPUT if shapefile_input is None else shapefile_input
+    output_dir = OUTPUT_DIR if output_dir is None else output_dir
+    station_id_field = STATION_ID_FIELD if station_id_field is None else station_id_field
+
+    if not geojson_input and not shapefile_input:
         raise ValueError("Set GEOJSON_INPUT and/or SHAPEFILE_INPUT in the CONFIG block.")
-    ridership = load_station_ridership(RIDERSHIP_INPUT, STATION_ID_FIELD)
-    output_dir = Path(OUTPUT_DIR)
-    for geometry_input in (GEOJSON_INPUT, SHAPEFILE_INPUT):
+    ridership = load_station_ridership(ridership_input, station_id_field)
+    output_dir = Path(output_dir)
+    for geometry_input in (geojson_input, shapefile_input):
         if not geometry_input:
             continue
         stations = gpd.read_file(geometry_input)
-        joined = join_ridership(stations, ridership, STATION_ID_FIELD)
+        joined = join_ridership(stations, ridership, station_id_field)
         output_path = _joined_output_path(geometry_input, output_dir)
         export_layer(joined, output_path)
         logger.info("Joined ridership onto %d stations -> %s", len(joined), output_path)
 
 
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    """Parse command-line arguments, defaulting to the CONFIG block values."""
+    parser = argparse.ArgumentParser(
+        description=(
+            "Join Capital Bikeshare ridership totals onto station geometries. "
+            "Defaults come from the CONFIG block at the top of this file."
+        )
+    )
+    parser.add_argument(
+        "--ridership-input", default=RIDERSHIP_INPUT, help="Per-station ridership CSV."
+    )
+    parser.add_argument(
+        "--geojson-input",
+        default=GEOJSON_INPUT,
+        help="Station GeoJSON to enrich (empty string to skip).",
+    )
+    parser.add_argument(
+        "--shapefile-input",
+        default=SHAPEFILE_INPUT,
+        help="Station Shapefile to enrich (empty string to skip).",
+    )
+    parser.add_argument("--output-dir", default=OUTPUT_DIR, help="Directory for joined outputs.")
+    parser.add_argument(
+        "--station-id-field", default=STATION_ID_FIELD, help="Join column on both sides."
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    """Command-line entry point. Defaults fall back to the CONFIG block."""
+    args = parse_args(argv)
+    run(
+        ridership_input=args.ridership_input,
+        geojson_input=args.geojson_input,
+        shapefile_input=args.shapefile_input,
+        output_dir=args.output_dir,
+        station_id_field=args.station_id_field,
+    )
+
+
+def _in_ipython() -> bool:
+    """Return True when running inside an IPython/Jupyter kernel."""
+    return "ipykernel" in sys.modules or "IPython" in sys.modules
+
+
 if __name__ == "__main__":
-    main()
+    # In a notebook (pasted cell or %run), use the CONFIG block instead of
+    # argparse, which would otherwise try to parse the kernel's own argv.
+    if _in_ipython():
+        run()
+    else:
+        main()
