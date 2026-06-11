@@ -1129,6 +1129,24 @@ def test_write_geo_shapefile_with_all_nan_object_column_roundtrips(tmp_path: Pat
     assert roundtripped["minority"].tolist() == [10.0, 30.0]
 
 
+def test_write_geo_shapefile_falls_back_when_fiona_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sys
+
+    # Simulate an environment without fiona (newer Pythons frequently lack a wheel):
+    # setting the module to None makes ``import fiona`` raise ImportError, so write_geo
+    # must fall back to GeoPandas' default engine instead of crashing.
+    monkeypatch.setitem(sys.modules, "fiona", None)
+    gdf = gpd.GeoDataFrame(
+        {"v": [1.0, 2.0], "geometry": gpd.GeoSeries([Point(0, 0), Point(1, 1)], crs="EPSG:4326")}
+    )
+    out = tmp_path / "x.shp"
+    mod.write_geo(gdf, str(out))
+    assert out.exists()
+    assert len(gpd.read_file(out)) == 2
+
+
 # =============================================================================
 # write_csv
 # =============================================================================
