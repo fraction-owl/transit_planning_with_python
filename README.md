@@ -12,6 +12,8 @@ Turn NTD-format monthly summaries into route-level trend reports, process riders
 
 ### Demand Modeling *(advanced)*
 For analysts comfortable assembling their own modeling tables. A multiple-regression ridership model (`ridership_regression_model.py`) ties NTD ridership to the service supplied (scheduled hours/miles), exogenous context (gas, unemployment, weather), and demographic and points-of-interest coverage. It hand-rolls OLS — coefficients, robust standard errors, VIFs, and the usual diagnostics — entirely on the ArcGIS Pro `numpy`/`scipy` stack, so it needs no machine-learning package. A machine-learning counterpart (`ridership_ml_model.py`) ingests the *same* modeling table but swaps OLS for random-forest and gradient-boosting ensembles, comparing both against the linear baseline on cross-validated, out-of-sample accuracy and adding permutation importance and partial-dependence plots for interpretability. It captures the nonlinearities and interactions OLS can't — at the cost of a `scikit-learn` dependency (not bundled with ArcGIS Pro).
+
+**Predictors wired in by default:** scheduled hours, revenue miles, average headway (min), span of service (hrs), gas price, unemployment rate, average temperature, daily precipitation metrics (peak intensity + days with rain), snowfall (total + peak daily), Census population / low-income share / employment served, points-of-interest coverage (sites, schools, enrollment, bike-share), and month of year.
 *Folder:* `modeling/`
 
 ### OTP & Runtime Diagnostics
@@ -35,7 +37,7 @@ Manual data collection that supplements or backstops modern AVL and APC systems 
 *Folder:* `field_tools/`
 
 ### Plus
-- **GTFS Exports** (`gtfs_exports/`) — GTFS-to-shapefile, segment speeds, time-band summaries, stop patterns, and timepoint schedule exports
+- **GTFS Exports** (`gtfs_exports/`) — GTFS-to-shapefile, segment speeds, time-band summaries, stop patterns, timepoint schedule exports, and route-level headway/span of service (`headway_span_exporter.py`)
 - **GBFS Tools** (`gbfs_tools/`) — export GBFS static stations to shapefile and GeoJSON
 - **Facility Tools** (`facilities_tools/`) — bay usage analysis and stop upgrade flagging
 - **National Data Tools** (`national_data_tools/`) — prep and join national/external reference datasets that feed coverage and demand work: US Census/TIGER and Canadian census geographies, plus exogenous context (EIA gas prices, FRED unemployment, NOAA weather, NCES schools)
