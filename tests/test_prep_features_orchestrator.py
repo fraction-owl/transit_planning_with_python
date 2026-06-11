@@ -202,6 +202,32 @@ def test_failing_script_is_skipped_run_continues(tmp_path: Path) -> None:
     assert [b.filename for b in bundles] == ["features__route_id.csv"]
 
 
+def test_argparse_error_surfaces_reason(tmp_path: Path, caplog) -> None:
+    """A script that rejects the passed flags (exit 2) logs the hint + captured log tail."""
+    layout = _dirs(tmp_path)
+    # Mimics the real scripts: requires a specific flag, so DEFAULT_CMD_TEMPLATE's
+    # --input-dir/--output-dir trigger argparse's exit code 2.
+    _write_script(
+        layout["scripts"],
+        "needs_flags.py",
+        """
+        import argparse
+        p = argparse.ArgumentParser()
+        p.add_argument("--gtfs-folder", required=True)
+        p.parse_args()
+        """,
+    )
+    _write_script(layout["scripts"], "gen_route.py", _ROUTE_SCRIPT)  # so a bundle still results
+
+    with caplog.at_level("WARNING"):
+        _run(layout)
+
+    text = caplog.text
+    assert "exited 2" in text
+    assert "argument error" in text  # the exit-2 hint
+    assert "Last log lines" in text  # the captured per-script log tail
+
+
 def test_forbidden_column_hard_fails_before_write(tmp_path: Path) -> None:
     """§11.5: a script emitting a forbidden column aborts before any bundle is written."""
     layout = _dirs(tmp_path)

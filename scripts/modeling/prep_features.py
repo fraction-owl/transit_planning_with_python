@@ -584,6 +584,16 @@ def run_script(cmd_tokens: list[str], log_path: Path, timeout_sec: int) -> tuple
     return exit_code, time.monotonic() - start, timed_out
 
 
+def _log_tail(log_path: Path, max_lines: int = 12) -> str:
+    """Return the last ``max_lines`` of a captured script log, indented for display."""
+    try:
+        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return "    | (log unavailable)"
+    tail = [ln for ln in lines if ln.strip()][-max_lines:]
+    return "\n".join(f"    | {ln}" for ln in tail) if tail else "    | (empty)"
+
+
 def collect_outputs(out_dir: Path) -> list[Path]:
     """Return the tabular files (``*.csv`` / ``*.xlsx`` / ``*.xls``) under ``out_dir``."""
     files: list[Path] = []
@@ -1007,10 +1017,21 @@ def orchestrate(
         )
 
         if timed_out or exit_code != 0:
+            status = "timed out" if timed_out else f"exited {exit_code}"
+            hint = ""
+            if exit_code == 2:
+                hint = (
+                    " — exit 2 is an argument error: the command flags do not match this script's "
+                    "CLI. Point REGISTRY_PATH (or --registry) at a jobs.json giving this script's "
+                    "real cmd, or it falls back to DEFAULT_CMD_TEMPLATE (--input-dir/--output-dir)."
+                )
             logging.warning(
-                "Script '%s' %s — skipping its outputs (continuing).",
+                "Script '%s' %s — skipping its outputs (continuing).%s\nLast log lines (%s):\n%s",
                 name,
-                "timed out" if timed_out else f"exited {exit_code}",
+                status,
+                hint,
+                log_path,
+                _log_tail(log_path),
             )
             runs.append(run)
             continue
@@ -1049,8 +1070,11 @@ def orchestrate(
     bundles = write_bundles(tables, output_dir)
     if not bundles:
         raise RuntimeError(
-            "No usable bundles were produced. Check that scripts ran, emitted tables, "
-            "and that those tables carry a known join key."
+            "No usable bundles were produced. Every feature script failed or emitted no "
+            f"joinable table. See the per-script logs in {work_dir / 'logs'} for the exact "
+            "errors. If scripts exited with code 2, their command flags do not match — point "
+            "REGISTRY_PATH (or --registry) at a jobs.json describing each script's real cmd "
+            "and input subfolders."
         )
 
     write_manifest(output_dir, bundles)
