@@ -154,6 +154,36 @@ def test_prepare_route_buffers_route_filter_excludes_unspecified_routes() -> Non
     assert list(result["route_id"]) == ["R1"]
 
 
+def test_prepare_route_buffers_simplify_reduces_buffer_vertices() -> None:
+    """A positive tolerance collapses collinear points into a coarser buffer.
+
+    Fewer vertices result, but the buffered area is essentially unchanged.
+    """
+    n = 100
+    step = 0.05 / (n - 1)
+    diag = [i * step for i in range(n)]  # 100 collinear points along y = x
+    tables = _minimal_tables()
+    tables["shapes"] = pd.DataFrame(
+        {
+            "shape_id": ["SH1"] * n,
+            "shape_pt_lat": diag,
+            "shape_pt_lon": diag,
+            "shape_pt_sequence": list(range(1, n + 1)),
+        }
+    )
+    fine = _prepare_route_buffers(
+        tables, use_shape_buffer=True, buffer_dist_ft=1320.0, simplify_tolerance_m=0.0
+    )
+    coarse = _prepare_route_buffers(
+        tables, use_shape_buffer=True, buffer_dist_ft=1320.0, simplify_tolerance_m=50.0
+    )
+    n_fine = len(fine.geometry.iloc[0].exterior.coords)
+    n_coarse = len(coarse.geometry.iloc[0].exterior.coords)
+    assert n_coarse < n_fine
+    # Coverage is preserved: simplifying within 50 m barely changes a ~400 m buffer.
+    assert coarse.geometry.iloc[0].area == pytest.approx(fine.geometry.iloc[0].area, rel=0.02)
+
+
 def test_prepare_route_buffers_missing_shape_columns_raises() -> None:
     """Shapes table missing required columns should raise ValueError."""
     tables = _minimal_tables()
