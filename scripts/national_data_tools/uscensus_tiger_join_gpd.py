@@ -1004,8 +1004,16 @@ def _shp_schema(gdf: GeoDataFrame) -> dict:
         elif pd.api.types.is_bool_dtype(dtype):
             props[col_str] = "int:1"
         else:
-            max_len = int(gdf[col].astype(str).str.len().max()) if not gdf.empty else 1
-            props[col_str] = f"str:{max(max_len, 1)}"
+            # An object column that is entirely NaN (e.g. a tract attribute that
+            # matched no block in a left join) yields a NaN max length -- and in
+            # pandas 3.x ``astype(str)`` keeps NaN rather than writing "nan", so this
+            # is common. Fall back to width 1 instead of ``int(NaN)``, which raises.
+            width = 1
+            if not gdf.empty:
+                str_len = gdf[col].astype(str).str.len().max()
+                if pd.notna(str_len):
+                    width = int(str_len)
+            props[col_str] = f"str:{max(width, 1)}"
     return {"geometry": geom_type, "properties": props}
 
 
