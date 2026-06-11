@@ -332,6 +332,42 @@ def test_load_and_concat_applies_column_rename(tmp_path: Path) -> None:
     assert result["total_pop"].iloc[0] == 42
 
 
+def test_load_and_concat_dedupes_repeated_geo_id_keep_first(tmp_path: Path) -> None:
+    # Two "vintages" of one table repeat a GEO_ID; only the first file's row survives.
+    a = tmp_path / "ACSDT5Y2023.B19001-Data.csv"
+    b = tmp_path / "ACSDT5Y2024.B19001-Data.csv"
+    _write_plain_csv(a, "GEO_ID,val\n1400000US11001000100,10\n")
+    _write_plain_csv(b, "GEO_ID,val\n1400000US11001000100,99\n")
+    result = mod._load_and_concat([str(a), str(b)])
+    assert len(result) == 1
+    assert result["val"].iloc[0] == 10
+
+
+def test_load_and_concat_keeps_distinct_geo_ids(tmp_path: Path) -> None:
+    a = tmp_path / "a-Data.csv"
+    b = tmp_path / "b-Data.csv"
+    _write_plain_csv(a, "GEO_ID,val\nX,1\n")
+    _write_plain_csv(b, "GEO_ID,val\nY,2\n")
+    assert len(mod._load_and_concat([str(a), str(b)])) == 2
+
+
+def test_load_and_concat_dedupe_key_none_disables(tmp_path: Path) -> None:
+    a = tmp_path / "a-Data.csv"
+    _write_plain_csv(a, "GEO_ID,val\nX,1\nX,2\n")
+    assert len(mod._load_and_concat([str(a)], dedupe_key=None)) == 2
+
+
+def test_load_and_concat_dedupes_on_alternate_key(tmp_path: Path) -> None:
+    # LODES files key on w_geocode, not GEO_ID, so several WAC vintages must dedupe there.
+    a = tmp_path / "wac_2021.csv"
+    b = tmp_path / "wac_2022.csv"
+    _write_plain_csv(a, "w_geocode,C000\n110010001001001,50\n")
+    _write_plain_csv(b, "w_geocode,C000\n110010001001001,77\n")
+    result = mod._load_and_concat([str(a), str(b)], dedupe_key="w_geocode")
+    assert len(result) == 1
+    assert result["C000"].iloc[0] == 50
+
+
 # =============================================================================
 # _ensure_fips_column_df  (DataFrame version)
 # =============================================================================
@@ -615,6 +651,55 @@ def test_build_joined_table_with_income_files(tmp_path: Path) -> None:
     )
     assert "low_income" in df.columns
     assert "perc_low_income" in df.columns
+
+
+def test_build_joined_table_duplicate_topic_files_do_not_explode(tmp_path: Path) -> None:
+    """Several files for one topic must not fan rows out into duplicate block keys.
+
+    Regression: when a topic bucket gathered more than one file for the same
+    geography (e.g. two ACS vintages, or race-iteration tables matched by the same
+    signature), the repeated rows multiplied through the GEO_ID and block<->tract
+    merges. That produced duplicate block keys, which aborted the Stage 3 ``1:1``
+    join and left demographics absent from the bundle. Each block must stay unique.
+    """
+    blocks = ["1000000US110010001001001", "1000000US110010001001002"]
+    pop_path = tmp_path / "P1-Data.csv"
+    _write_plain_csv(
+        pop_path,
+        _census_csv(
+            "GEO_ID,NAME,P1_001N",
+            "Geo,Name,!!Total:",
+            f"{blocks[0]},Block 1,100",
+            f"{blocks[1]},Block 2,200",
+        ),
+    )
+    hh_path = tmp_path / "H9-Data.csv"
+    _write_plain_csv(
+        hh_path,
+        _census_csv("GEO_ID,H9_001N", "Geo,!!Total:", f"{blocks[0]},40", f"{blocks[1]},80"),
+    )
+    bands = ",".join(f"B19001_{n:03d}E" for n in range(1, 12))
+    income_row = f"{_TRACT_GEO_ID},Tract,{','.join(['100'] * 11)}"
+    income_csv = _census_csv(
+        f"GEO_ID,NAME,{bands}", "Geo,Name," + ",".join(["lab"] * 11), income_row
+    )
+    # Two vintages of the same income table covering the same tract.
+    inc1 = tmp_path / "ACSDT5Y2023.B19001-Data.csv"
+    inc2 = tmp_path / "ACSDT5Y2024.B19001-Data.csv"
+    _write_plain_csv(inc1, income_csv)
+    _write_plain_csv(inc2, income_csv)
+
+    df = mod.build_joined_table(
+        pop_files=[str(pop_path)],
+        hh_files=[str(hh_path)],
+        jobs_files=[],
+        income_files=[str(inc1), str(inc2)],
+    )
+    normalized = mod.normalize_attribute_keys(df)
+    assert not normalized[mod.RIGHT_KEY].duplicated().any()
+    assert normalized[mod.RIGHT_KEY].nunique() == len(blocks)
+    # The kept income row still attaches to every block in the tract.
+    assert "low_income" in df.columns
 
 
 # =============================================================================

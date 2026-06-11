@@ -221,6 +221,41 @@ def _clean_name_cols(df: pd.DataFrame) -> None:
         df[col] = df[col].astype(str).str.replace(r"[\r\n\t]+", " ", regex=True).str.strip()
 
 
+def _dedupe_topic_rows(df: pd.DataFrame, key: Hashable, *, source: str) -> pd.DataFrame:
+    """Collapse rows that repeat *key* to the first occurrence, logging any drops.
+
+    A topic bucket can legitimately gather more than one input file for the same
+    geography: multiple ACS vintages of a table, or race/ethnicity iteration
+    tables (e.g. ``B19001A``..``B19001I``, ``B01001A``..``B01001I``) whose codes
+    contain the base topic's token and so match the same signature. Concatenated,
+    those files repeat every ``GEO_ID``, and because the later GEO_ID merges and
+    the one-to-many block<->tract join both fan out on the key, each repeat becomes
+    a *multiplicative* row explosion — enough to violate the Stage 3 ``1:1`` join
+    and abort the whole pipeline.
+
+    Collapsing here, at load time and before any merge, keeps each geography to a
+    single row. Files are read in sorted order, so ``keep="first"`` deterministically
+    prefers the base table over its race iterations (``B19001`` sorts before
+    ``B19001A``) and, for true vintage duplicates, the earliest file.
+    """
+    if key not in df.columns:
+        return df
+    before = len(df)
+    deduped = df.drop_duplicates(subset=[key], keep="first")
+    dropped = before - len(deduped)
+    if dropped:
+        logging.warning(
+            "Dropped %d row(s) repeating '%s' while loading %s (kept the first of each). "
+            "More than one input file covered the same geography — typically multiple ACS "
+            "vintages of a table, or race-iteration tables sharing the topic's token. Keep "
+            "one file per topic per geography to avoid this.",
+            dropped,
+            key,
+            source,
+        )
+    return deduped.reset_index(drop=True)
+
+
 def _load_and_concat(
     files: Sequence[str],
     *,
@@ -229,6 +264,7 @@ def _load_and_concat(
     usecols: Sequence[Hashable] | None = None,
     rename: Mapping[str, str] | None = None,
     compression: Literal["infer", "gzip", "bz2", "zip", "xz", "zstd"] | None = None,
+    dedupe_key: Hashable | None = GEO_ID_COL,
 ) -> pd.DataFrame:
     """Read multiple Census CSV / CSV-GZ / ZIP files and concatenate the results.
 
@@ -238,6 +274,12 @@ def _load_and_concat(
 
     Column renaming occurs *before* column pruning via ``usecols`` (unless
     ``usecols`` is explicitly supplied).
+
+    When ``dedupe_key`` is set (default ``GEO_ID``) and present in the combined
+    frame, rows repeating that key are collapsed to the first occurrence so a
+    topic that gathered several files for the same geography (multiple ACS
+    vintages, or race-iteration tables matched by the same signature) cannot fan
+    out through the downstream merges. Pass ``dedupe_key=None`` to disable.
     """
     frames: list[pd.DataFrame] = []
     for path in files:
@@ -262,7 +304,12 @@ def _load_and_concat(
 
         frames.append(df)
 
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if not frames:
+        return pd.DataFrame()
+    combined = pd.concat(frames, ignore_index=True)
+    if dedupe_key is not None:
+        combined = _dedupe_topic_rows(combined, dedupe_key, source=f"{len(files)} file(s)")
+    return combined
 
 
 def _merge_on_geo_id(left: pd.DataFrame, right: pd.DataFrame) -> pd.DataFrame:
@@ -315,6 +362,9 @@ def _build_block_df(inp: _BlockInputs) -> pd.DataFrame:
             "CE03": "high_wage",
         },
         usecols=["w_geocode", "C000", "CE01", "CE02", "CE03"],
+        # LODES is keyed on the block geocode, not GEO_ID; dedupe on it so several
+        # WAC vintages do not repeat a block and fan out in the merge below.
+        dedupe_key="w_geocode",
     )
     if not jobs.empty:
         jobs[GEO_ID_COL] = "1000000US" + jobs["w_geocode"].astype(str)
