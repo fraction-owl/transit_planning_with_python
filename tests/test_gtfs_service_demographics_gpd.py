@@ -16,6 +16,7 @@ matplotlib.use("Agg")  # headless backend; the module imports matplotlib.pyplot
 from scripts.service_coverage.gtfs_service_demographics_gpd import (
     CRS_EPSG_CODE,
     METERS_PER_MILE,
+    _present_synthetic_cols,
     _stops_to_points_gdf,
     apply_fips_filter,
     build_pedestrian_time_network,
@@ -122,6 +123,82 @@ def test_filter_weekday_service_drops_partial_week() -> None:
         ]
     )
     assert filter_weekday_service(cal).empty
+
+
+def test_filter_weekday_service_handles_string_flags() -> None:
+    # Real feeds load calendar.txt with every column as a string. Service "2" runs the
+    # full Mon–Fri week; "1" skips Thursday; "3" is Saturday — only "2" should qualify.
+    cal = _calendar(
+        [
+            {
+                k: v
+                for k, v in zip(
+                    [
+                        "service_id",
+                        "monday",
+                        "tuesday",
+                        "wednesday",
+                        "thursday",
+                        "friday",
+                        "saturday",
+                        "sunday",
+                    ],
+                    ["1", "1", "1", "1", "0", "1", "0", "0"],
+                )
+            },
+            {
+                k: v
+                for k, v in zip(
+                    [
+                        "service_id",
+                        "monday",
+                        "tuesday",
+                        "wednesday",
+                        "thursday",
+                        "friday",
+                        "saturday",
+                        "sunday",
+                    ],
+                    ["2", "1", "1", "1", "1", "1", "0", "0"],
+                )
+            },
+            {
+                k: v
+                for k, v in zip(
+                    [
+                        "service_id",
+                        "monday",
+                        "tuesday",
+                        "wednesday",
+                        "thursday",
+                        "friday",
+                        "saturday",
+                        "sunday",
+                    ],
+                    ["3", "0", "0", "0", "0", "0", "1", "0"],
+                )
+            },
+        ]
+    )
+    assert list(filter_weekday_service(cal)) == ["2"]
+
+
+# ---------------------------------------------------------------------------
+# _present_synthetic_cols
+# ---------------------------------------------------------------------------
+
+
+def test_present_synthetic_cols_filters_to_existing() -> None:
+    clipped = gpd.GeoDataFrame(
+        {"synthetic_total_pop": [1.0], "synthetic_minority": [2.0], "geometry": [Point(0, 0)]}
+    )
+    cols = _present_synthetic_cols(clipped, ["total_pop", "minority", "tot_empl", "youth"])
+    assert cols == ["synthetic_total_pop", "synthetic_minority"]
+
+
+def test_present_synthetic_cols_empty_when_none_present() -> None:
+    clipped = gpd.GeoDataFrame({"geometry": [Point(0, 0)]})
+    assert _present_synthetic_cols(clipped, ["total_pop", "minority"]) == []
 
 
 # ---------------------------------------------------------------------------
