@@ -71,6 +71,22 @@ def test_load_trips_from_directory(tmp_path: Path, trips: pd.DataFrame) -> None:
     assert len(loaded) == len(one_month)
 
 
+def test_load_trips_from_nested_directories(tmp_path: Path, trips: pd.DataFrame) -> None:
+    # The prep_features.py orchestrator unzips each monthly archive into its own
+    # subfolder, so the CSVs land one level below the directory handed to
+    # load_trips. Confirm the directory loader recurses into those subfolders.
+    cols = [c for c in trips.columns if c not in ("month", "source_file")]
+    months = ["2024-05", "2024-06"]
+    for month in months:
+        stem = f"{month.replace('-', '')}-capitalbikeshare-tripdata"
+        sub = tmp_path / stem
+        sub.mkdir()
+        trips[trips["month"] == month][cols].to_csv(sub / f"{stem}.csv", index=False)
+    loaded = mod.load_trips(tmp_path)
+    assert loaded["source_file"].nunique() == len(months)
+    assert len(loaded) == len(trips[trips["month"].isin(months)])
+
+
 # ---------------------------------------------------------------------------
 # build_system_monthly
 # ---------------------------------------------------------------------------

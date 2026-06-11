@@ -350,6 +350,25 @@ def test_load_school_points_private_uses_ppin(staged_dir: Path) -> None:
     assert set(gdf["PPIN"]) == PRIVATE_POINT_IDS
 
 
+def test_load_school_points_handles_nested_geocode_zip(tmp_path: Path) -> None:
+    # Real NCES EDGE downloads unpack into a nested folder named after the
+    # archive, so the .shp sits one level below the extraction root. Repack the
+    # public geocode that way and confirm the (recursive) shp search still finds
+    # it instead of raising FileNotFoundError.
+    import zipfile
+
+    flat = FIXTURE_DIR / "EDGE_GEOCODE_PUBLICSCH_1920_sample.zip"
+    staged = tmp_path / "schools_in"
+    staged.mkdir()
+    nested = staged / "EDGE_GEOCODE_PUBLICSCH_1920_sample.zip"
+    with zipfile.ZipFile(flat) as src, zipfile.ZipFile(nested, "w") as dst:
+        for name in src.namelist():
+            dst.writestr(f"EDGE_GEOCODE_PUBLICSCH_1920_sample/{name}", src.read(name))
+
+    gdf = mod.load_school_points(staged, "public")
+    assert set(gdf["NCESSCH"]) == PUBLIC_POINT_IDS
+
+
 def test_load_school_points_no_matching_states_raises(staged_dir: Path) -> None:
     with pytest.raises(ValueError, match="No school points"):
         mod.load_school_points(staged_dir, "public", state_abbrs={"CA"})
