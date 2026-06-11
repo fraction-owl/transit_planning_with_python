@@ -861,11 +861,14 @@ def do_route_by_route_analysis(
 
     The procedure repeats the selected ``service_area_method`` workflow for
     every ``route_short_name`` in the filtered set, exporting per-route
-    shapefiles and Excel totals.
+    shapefiles plus one combined route-level CSV of totals.
 
-    Exports, for each route_short_name R:
-      - A shapefile named R_service_buffer_data.shp
-      - A summary Excel named R_service_buffer_data.xlsx
+    Exports:
+      - Per route_short_name R: a shapefile R_service_buffer_data.shp.
+      - One combined ``service_demographics_by_route.csv`` keyed on ``route_id``
+        (one row per route_id) — the table the feature bundle / fit_model.py
+        consume. The route identity lives in a real column here, not just the
+        filename, so the orchestrator can join it onto the ridership anchor.
     """
     logging.info("\n=== Route-by-Route Analysis (%s) ===", service_area_method)
 
@@ -885,6 +888,15 @@ def do_route_by_route_analysis(
     route_shapes_gdf = build_route_shapes_gdf(shapes_df, trips, final_routes_df, CRS_EPSG_CODE)
 
     os.makedirs(output_dir, exist_ok=True)
+
+    # Map each route_short_name back to its route_id(s) so the combined summary
+    # below is keyed on route_id (what fit_model.py joins on). A short name that
+    # maps to several route_ids yields one summary row per route_id.
+    short_to_route_ids = (
+        final_routes_df.groupby("route_short_name")["route_id"].apply(list).to_dict()
+    )
+    summary_records: list[dict[str, object]] = []
+
     for route_name in stops_gdf["route_short_name"].unique():
         logging.info("\nProcessing route: %s", route_name)
         route_stops_gdf = stops_gdf[stops_gdf["route_short_name"] == route_name].drop_duplicates(
@@ -929,16 +941,28 @@ def do_route_by_route_analysis(
         clipped_result.to_file(shp_path)
         logging.info("Exported shapefile for route %s: %s", route_name, shp_path)
 
-        xlsx_path = os.path.join(output_dir, f"{route_name}_service_buffer_data.xlsx")
-        final_dict = {col: int(val) for col, val in totals.items()}
-        export_summary_to_excel(final_dict, xlsx_path)
+        # Accumulate this route's totals (stripped of the "synthetic_" prefix)
+        # into one combined, route_id-keyed table written after the loop. The
+        # per-route Excel and blocking plt.show() are intentionally gone: the
+        # combined CSV supersedes the former, and the latter stalls headless
+        # subprocess runs under the orchestrator.
+        route_totals = {str(col).replace("synthetic_", ""): int(val) for col, val in totals.items()}
+        for route_id in short_to_route_ids.get(route_name, [route_name]):
+            summary_records.append(
+                {"route_id": route_id, "route_short_name": route_name, **route_totals}
+            )
 
-        fig, ax = plt.subplots(figsize=(10, 10))
-        service_area_gdf.plot(ax=ax, alpha=0.5, label=f"Route {route_name} Service Area")
-        route_stops_gdf.plot(ax=ax, color="black", markersize=2, label="Stops")
-        plt.title(f"Route {route_name} Service Area ({service_area_method})")
-        plt.legend()
-        plt.show()
+    # Write one combined, route_id-keyed CSV for the bundle. prep_features.py
+    # collects this; fit_model.py joins it onto the ridership anchor by route_id.
+    if summary_records:
+        summary_df = pd.DataFrame(summary_records)
+        csv_path = os.path.join(output_dir, "service_demographics_by_route.csv")
+        summary_df.to_csv(csv_path, index=False)
+        logging.info(
+            "Wrote route-level demographics summary: %s (%d row(s)).", csv_path, len(summary_df)
+        )
+    else:
+        logging.info("No per-route demographics produced; combined CSV not written.")
 
 
 def do_stop_by_stop_analysis(

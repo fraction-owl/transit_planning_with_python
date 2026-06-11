@@ -1,0 +1,63 @@
+{
+  "_comment": [
+    "Registry for prep_features.py wired to the route_ols_run_1 extracted layout.",
+    "{input} is the input-data root (...\\input\\data); topic subfolders are referenced",
+    "directly (gtfs_input/connector_gtfs_2026_04_29, poi_inputs, schools_input,",
+    "census_input/tables, census_input/shps, cabi_input). Run with:",
+    "  python prep_features.py --registry <this file> --input-dir ...\\input\\data --output-dir ...\\prepped_features",
+    "Caveats: (1) install scipy/geopandas/shapely first; (2) gbfs scripts omitted (no GBFS",
+    "source + multi-stage deps); (3) verify each script's real output filenames + keep_cols",
+    "against work\\out\\<script>\\ and adjust the outputs block if they differ."
+  ],
+  "scripts": [
+    {
+      "script": "headway_span_exporter.py",
+      "cmd": ["{python}", "{script}",
+              "--gtfs-folder", "{input}/gtfs_input/connector_gtfs_2026_04_29",
+              "--output", "{output}/headway_span_by_route.csv"],
+      "outputs": [
+        {"file": "headway_span_by_route.csv", "join_keys": ["route_id"],
+         "keep_cols": ["avg_headway_min", "span_hrs"]}
+      ]
+    },
+    {
+      "script": "points_of_interest_coverage_gpd.py",
+      "cmd": ["{python}", "{script}",
+              "--gtfs-dir", "{input}/gtfs_input/connector_gtfs_2026_04_29",
+              "--shp-input-dir", "{input}/poi_inputs",
+              "--output-dir", "{output}"]
+    },
+    {
+      "script": "schools_prep_join_gpd.py",
+      "cmd": ["{python}", "{script}",
+              "--input-dir", "{input}/schools_input",
+              "--output-dir", "{output}"]
+    },
+    {
+      "script": "bikeshare_ridership_trends.py",
+      "cmd": ["{python}", "{script}",
+              "--input", "{input}/cabi_input",
+              "--output-dir", "{output}"]
+    },
+    {
+      "script": "uscensus_tiger_join_gpd.py",
+      "cmd": ["{python}", "{script}",
+              "--input-csv-dir", "{input}/census_input/tables",
+              "--input-shp-dir", "{input}/census_input/shps",
+              "--output", "{output}/census_tiger_join.shp"]
+    },
+    {
+      "script": "gtfs_service_demographics_gpd.py",
+      "cmd": ["{python}", "{script}",
+              "--gtfs-path", "{input}/gtfs_input/connector_gtfs_2026_04_29",
+              "--demographics-shp", "{work}/out/uscensus_tiger_join_gpd/census_tiger_join.shp",
+              "--output-dir", "{output}",
+              "--analysis-mode", "route",
+              "--service-area-method", "stop_buffer"]
+    }
+  ],
+  "outputs": [
+    {"file": "headway_span_by_route.csv", "join_keys": ["route_id"],
+     "keep_cols": ["avg_headway_min", "span_hrs"]}
+  ]
+}
