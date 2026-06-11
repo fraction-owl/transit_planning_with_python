@@ -84,7 +84,7 @@ SERVICE_IDS_TO_INCLUDE: Final[list[str]] = []
 # 1) ROUTES_TO_INCLUDE: If non-empty, only these routes are considered.
 # 2) ROUTES_TO_EXCLUDE: If non-empty, these routes are removed.
 # If both are empty, all routes in routes.txt are used.
-ROUTES_TO_INCLUDE: list[str] = ["101", "202"]  # e.g. [] for no include filter
+ROUTES_TO_INCLUDE: list[str] = []  # empty = all routes; set e.g. ["101", "202"] for a subset
 ROUTES_TO_EXCLUDE: list[str] = []  # e.g. [] for no exclude filter
 
 # Stop filters:
