@@ -1,0 +1,62 @@
+{
+  "_comment": [
+    "Template registry for prep_features.py (the orchestrator). ADJUST paths, flags, and",
+    "output specs to your environment. Scripts not listed here are auto-discovered and run",
+    "with DEFAULT_CMD_TEMPLATE; output files not described here fall back to inference",
+    "(join keys from CANDIDATE_JOIN_KEYS, every numeric/boolean non-key column shipped).",
+    "Command tokens are substituted with {python} {script} {input} {output} {work} {scripts}.",
+    "{input} is the input-data root; reference topic subfolders as {input}/<topic>.",
+    "{output} is this script's own (empty) output subdir, used to attribute collected tables."
+  ],
+  "scripts": [
+    {
+      "script": "headway_span_exporter.py",
+      "cmd": ["{python}", "{script}", "--gtfs-folder", "{input}/gtfs",
+              "--output", "{output}/headway_span_by_route.csv"],
+      "outputs": [
+        {"file": "headway_span_by_route.csv", "join_keys": ["route_id"],
+         "keep_cols": ["avg_headway_min", "span_hrs"]}
+      ]
+    },
+    {
+      "script": "points_of_interest_coverage_gpd.py",
+      "cmd": ["{python}", "{script}", "--gtfs-dir", "{input}/gtfs",
+              "--shp-input-dir", "{input}/shapefiles", "--output-dir", "{output}"]
+    },
+    {
+      "script": "gtfs_service_demographics_gpd.py",
+      "cmd": ["{python}", "{script}", "--gtfs-path", "{input}/gtfs",
+              "--demographics-shp", "{input}/census/demographics.shp", "--output-dir", "{output}"]
+    },
+    {
+      "script": "gbfs_stations_exporter.py",
+      "cmd": ["{python}", "{script}", "--source", "{input}/gbfs/gbfs.json",
+              "--output-dir", "{output}"]
+    },
+    {
+      "script": "gbfs_ridership_join.py",
+      "cmd": ["{python}", "{script}", "--output-dir", "{output}"]
+    },
+    {
+      "script": "uscensus_tiger_join_gpd.py",
+      "cmd": ["{python}", "{script}", "--input-csv-dir", "{input}/census",
+              "--input-shp-dir", "{input}/tiger", "--output", "{output}/census_tiger_join.shp"]
+    }
+  ],
+  "outputs": [
+    {"file": "exogenous_monthly.csv", "join_keys": ["period"],
+     "keep_cols": ["gas_price", "unemployment_rate", "avg_temp_f", "max_daily_precip_in",
+                   "days_with_precip", "total_snow_in", "max_daily_snow_in"]},
+    {"file": "service_demographics_by_route.csv", "join_keys": ["route_id"],
+     "keep_cols": ["pop_served", "low_income_served", "minority_served",
+                   "zero_car_hh_served", "empl_served"]},
+    {"file": "points_of_interest_coverage.csv", "join_keys": ["route_id"],
+     "keep_cols": ["sites_served", "jobs_served"]},
+    {"file": "school_coverage_by_route.csv", "join_keys": ["route_id"],
+     "keep_cols": ["schools_served", "enrollment_served"]},
+    {"file": "cabi_coverage_by_route.csv", "join_keys": ["route_id"],
+     "keep_cols": ["cabi_stations_served", "cabi_weekday_riders_served"]},
+    {"file": "headway_span_by_route.csv", "join_keys": ["route_id"],
+     "keep_cols": ["avg_headway_min", "span_hrs"]}
+  ]
+}

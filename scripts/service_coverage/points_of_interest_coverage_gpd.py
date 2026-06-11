@@ -18,9 +18,11 @@ Assumptions
 
 from __future__ import annotations
 
+import argparse
 import logging
+import sys
 from pathlib import Path
-from typing import Iterable, List, Mapping
+from typing import Iterable, List, Mapping, Sequence
 
 import geopandas as gpd
 import matplotlib.pyplot as plt
@@ -287,25 +289,38 @@ def _count_features(
 # =============================================================================
 
 
-def main() -> None:
+def run(
+    gtfs_dir: str | Path | None = None,
+    shp_input_dir: str | Path | None = None,
+    output_dir: str | Path | None = None,
+    use_shape_buffer: bool | None = None,
+    buffer_dist_ft: float | None = None,
+    route_filter: Sequence[str] | None = None,
+    projected_crs: str | None = None,
+    plot_fig_dpi: int | None = None,
+) -> None:
     """Run the GTFS feature‑coverage analysis."""
-    logging.basicConfig(
-        level=LOG_LEVEL,
-        format="%(asctime)s | %(levelname)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    gtfs_dir = Path(GTFS_DIR if gtfs_dir is None else gtfs_dir)
+    shp_input_dir = Path(SHP_INPUT_DIR if shp_input_dir is None else shp_input_dir)
+    output_dir = Path(OUTPUT_DIR if output_dir is None else output_dir)
+    use_shape_buffer = USE_SHAPE_BUFFER if use_shape_buffer is None else use_shape_buffer
+    buffer_dist_ft = BUFFER_DIST_FT if buffer_dist_ft is None else buffer_dist_ft
+    route_filter = list(ROUTE_FILTER if route_filter is None else route_filter)
+    projected_crs = PROJECTED_CRS if projected_crs is None else projected_crs
+    plot_fig_dpi = PLOT_FIG_DPI if plot_fig_dpi is None else plot_fig_dpi
 
-    logging.info("Loading GTFS from %s", GTFS_DIR)
-    tables = _load_gtfs_tables(GTFS_DIR)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    logging.info("Building route buffers (use_shape_buffer=%s)", USE_SHAPE_BUFFER)
+    logging.info("Loading GTFS from %s", gtfs_dir)
+    tables = _load_gtfs_tables(gtfs_dir)
+
+    logging.info("Building route buffers (use_shape_buffer=%s)", use_shape_buffer)
     route_buffers = _prepare_route_buffers(
         tables,
-        USE_SHAPE_BUFFER,
-        BUFFER_DIST_FT,
-        route_filter=ROUTE_FILTER,
-        projected_crs=PROJECTED_CRS,
+        use_shape_buffer,
+        buffer_dist_ft,
+        route_filter=route_filter,
+        projected_crs=projected_crs,
     )
 
     if route_buffers.empty:
@@ -313,7 +328,7 @@ def main() -> None:
         return
 
     logging.info("Loading designated shapefiles")
-    layers = _load_layers(LAYER_SPECS, SHP_INPUT_DIR, projected_crs=PROJECTED_CRS)
+    layers = _load_layers(LAYER_SPECS, shp_input_dir, projected_crs=projected_crs)
 
     if not layers:
         logging.error("No valid layers loaded – nothing to analyze")
@@ -324,17 +339,102 @@ def main() -> None:
         route_buffers,
         layers,
         LAYER_SPECS,
-        OUTPUT_DIR,
-        plot_fig_dpi=PLOT_FIG_DPI,
+        output_dir,
+        plot_fig_dpi=plot_fig_dpi,
     )
 
     # Save summary CSV
-    summary_path = OUTPUT_DIR / "all_routes_feature_summary.csv"
+    summary_path = output_dir / "all_routes_feature_summary.csv"
     summary_df.to_csv(summary_path)
     logging.info("Summary written to %s", summary_path)
     logging.info("Done.")
     logging.info("Script completed successfully.")
 
 
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    """Parse command-line arguments, defaulting to the CONFIGURATION block."""
+    parser = argparse.ArgumentParser(
+        description=(
+            "Analyze transit route coverage of strategic sites. Defaults come from "
+            "the CONFIGURATION block at the top of this file; the LAYER_SPECS list "
+            "stays in the config block."
+        )
+    )
+    parser.add_argument(
+        "--gtfs-dir", type=Path, default=GTFS_DIR, help="Folder containing GTFS .txt files."
+    )
+    parser.add_argument(
+        "--shp-input-dir",
+        type=Path,
+        default=SHP_INPUT_DIR,
+        help="Folder with .shp layers to test.",
+    )
+    parser.add_argument(
+        "--output-dir", type=Path, default=OUTPUT_DIR, help="Where CSVs and PNGs are written."
+    )
+    parser.add_argument(
+        "--buffer-ft", type=float, default=BUFFER_DIST_FT, help="Buffer distance in feet."
+    )
+    parser.add_argument(
+        "--buffer-stops",
+        dest="use_shape_buffer",
+        action="store_false",
+        default=USE_SHAPE_BUFFER,
+        help="Buffer stops instead of route geometry.",
+    )
+    parser.add_argument(
+        "--routes",
+        nargs="*",
+        default=ROUTE_FILTER,
+        metavar="ROUTE_ID",
+        help="Only analyze these route_id values (default: all).",
+    )
+    parser.add_argument(
+        "--projected-crs", default=PROJECTED_CRS, help="Projected CRS for buffering/joins."
+    )
+    parser.add_argument("--dpi", type=int, default=PLOT_FIG_DPI, help="Resolution for PNG exports.")
+    parser.add_argument(
+        "--log-level",
+        default=logging.getLevelName(LOG_LEVEL),
+        help="DEBUG / INFO / WARNING / ERROR.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    """Command-line entry point. Defaults fall back to the CONFIGURATION block."""
+    args = parse_args(argv)
+    logging.basicConfig(
+        level=getattr(logging, str(args.log_level).upper(), LOG_LEVEL),
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    run(
+        gtfs_dir=args.gtfs_dir,
+        shp_input_dir=args.shp_input_dir,
+        output_dir=args.output_dir,
+        use_shape_buffer=args.use_shape_buffer,
+        buffer_dist_ft=args.buffer_ft,
+        route_filter=args.routes,
+        projected_crs=args.projected_crs,
+        plot_fig_dpi=args.dpi,
+    )
+
+
+def _in_ipython() -> bool:
+    """Return True when running inside an IPython/Jupyter kernel."""
+    return "ipykernel" in sys.modules or "IPython" in sys.modules
+
+
 if __name__ == "__main__":
-    main()
+    # In a notebook (pasted cell or %run), use the CONFIGURATION block instead
+    # of argparse, which would otherwise try to parse the kernel's own argv.
+    if _in_ipython():
+        logging.basicConfig(
+            level=LOG_LEVEL,
+            format="%(asctime)s | %(levelname)s | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+        run()
+    else:
+        main()

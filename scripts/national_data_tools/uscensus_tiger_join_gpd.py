@@ -39,6 +39,7 @@ Helpful links
 
 from __future__ import annotations
 
+import argparse
 import io
 import logging
 import re
@@ -141,6 +142,14 @@ _DEFAULT_INPUT_SHP_DIR: str = r"Path\To\Your\TIGER_Shapefiles"
 _DEFAULT_INTERMEDIATE_COMBINED_CSV: str = r"Path\To\Your\Output_Folder\joined_blocks.csv"
 _DEFAULT_INTERMEDIATE_MERGED_SHP: str = r"Path\To\Your\Output_Folder\va_md_dc_blocks_fips_merge.shp"
 _DEFAULT_FINAL_JOINED_FEATURES: str = r"Path\To\Your\Output_Folder\va_md_dc_blocks_plus_data.shp"
+
+
+class _Unset:
+    """Sentinel type for _check_placeholders args whose valid values include None/""."""
+
+
+#: Sentinel instance: "argument not supplied, fall back to the module constant".
+_UNSET: Final[_Unset] = _Unset()
 
 # =============================================================================
 # STAGE 1: CSV DISCOVERY & MERGE  (pandas)
@@ -905,24 +914,54 @@ def _is_blank(p: str | None) -> bool:
     return p is None or not str(p).strip()
 
 
-def _check_placeholders() -> bool:
-    """Warn about un-edited placeholder paths. Return True if any are still set."""
+def _check_placeholders(
+    input_csv_dir: str | Path | None = None,
+    input_shp_dir: str | Path | None = None,
+    final_joined_features: str | None = None,
+    intermediate_combined_csv: str | None | _Unset = _UNSET,
+    intermediate_merged_shp: str | None | _Unset = _UNSET,
+) -> bool:
+    """Warn about un-edited placeholder paths. Return True if any are still set.
+
+    Unset args fall back to the module-level CONFIGURATION constants at call
+    time, so a plain ``_check_placeholders()`` (and monkeypatching those
+    constants) behaves as before, while ``run()`` can pass resolved CLI values.
+    The two intermediate paths use a sentinel because ``None``/``""`` are valid
+    explicit values (they mean "skip writing that artifact").
+    """
+    input_csv_dir = INPUT_CSV_DIR if input_csv_dir is None else input_csv_dir
+    input_shp_dir = INPUT_SHP_DIR if input_shp_dir is None else input_shp_dir
+    final_joined_features = (
+        FINAL_JOINED_FEATURES if final_joined_features is None else final_joined_features
+    )
+    if intermediate_combined_csv is _UNSET:
+        intermediate_combined_csv = INTERMEDIATE_COMBINED_CSV
+    if intermediate_merged_shp is _UNSET:
+        intermediate_merged_shp = INTERMEDIATE_MERGED_SHP
+
     found = False
-    if str(INPUT_CSV_DIR) == _DEFAULT_INPUT_CSV_DIR:
-        logging.warning("INPUT_CSV_DIR is still the placeholder value — update it before running.")
-        found = True
-    if str(INPUT_SHP_DIR) == _DEFAULT_INPUT_SHP_DIR:
-        logging.warning("INPUT_SHP_DIR is still the placeholder value — update it before running.")
-        found = True
-    if FINAL_JOINED_FEATURES == _DEFAULT_FINAL_JOINED_FEATURES:
+    if str(input_csv_dir) == _DEFAULT_INPUT_CSV_DIR:
         logging.warning(
-            "FINAL_JOINED_FEATURES is still the placeholder value — update it before running."
+            "INPUT_CSV_DIR is still the placeholder value — update it or pass "
+            "--input-csv-dir before running."
+        )
+        found = True
+    if str(input_shp_dir) == _DEFAULT_INPUT_SHP_DIR:
+        logging.warning(
+            "INPUT_SHP_DIR is still the placeholder value — update it or pass "
+            "--input-shp-dir before running."
+        )
+        found = True
+    if final_joined_features == _DEFAULT_FINAL_JOINED_FEATURES:
+        logging.warning(
+            "FINAL_JOINED_FEATURES is still the placeholder value — update it or pass "
+            "--output before running."
         )
         found = True
     # The two intermediate paths are optional — only flag them if non-empty AND still the default
     if (
-        not _is_blank(INTERMEDIATE_COMBINED_CSV)
-        and INTERMEDIATE_COMBINED_CSV == _DEFAULT_INTERMEDIATE_COMBINED_CSV
+        not _is_blank(intermediate_combined_csv)
+        and intermediate_combined_csv == _DEFAULT_INTERMEDIATE_COMBINED_CSV
     ):
         logging.warning(
             "INTERMEDIATE_COMBINED_CSV is still the placeholder value — "
@@ -930,8 +969,8 @@ def _check_placeholders() -> bool:
         )
         found = True
     if (
-        not _is_blank(INTERMEDIATE_MERGED_SHP)
-        and INTERMEDIATE_MERGED_SHP == _DEFAULT_INTERMEDIATE_MERGED_SHP
+        not _is_blank(intermediate_merged_shp)
+        and intermediate_merged_shp == _DEFAULT_INTERMEDIATE_MERGED_SHP
     ):
         logging.warning(
             "INTERMEDIATE_MERGED_SHP is still the placeholder value — "
@@ -941,22 +980,51 @@ def _check_placeholders() -> bool:
     return found
 
 
-def main() -> None:
-    """Run the full three-stage pipeline."""
-    logging.basicConfig(
-        level=LOG_LEVEL,
-        format="%(asctime)s | %(levelname)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
+def run(
+    input_csv_dir: str | Path | None = None,
+    input_shp_dir: str | Path | None = None,
+    final_joined_features: str | None = None,
+    tiger_input_glob: str | None = None,
+    fips_to_filter: Sequence[str] | None = None,
+    intermediate_combined_csv: str | None = None,
+    intermediate_merged_shp: str | None = None,
+) -> None:
+    """Run the full three-stage pipeline.
+
+    Unset args fall back to the CONFIGURATION block at the top of this file, so
+    ``m.INPUT_CSV_DIR = ...; m.run()`` works after a plain import. Pass an empty
+    string for an intermediate path to skip writing that artifact.
+    """
+    input_csv_dir = INPUT_CSV_DIR if input_csv_dir is None else input_csv_dir
+    input_shp_dir = INPUT_SHP_DIR if input_shp_dir is None else input_shp_dir
+    final_joined_features = (
+        FINAL_JOINED_FEATURES if final_joined_features is None else final_joined_features
+    )
+    tiger_input_glob = TIGER_INPUT_GLOB if tiger_input_glob is None else tiger_input_glob
+    fips_to_filter = list(FIPS_TO_FILTER if fips_to_filter is None else fips_to_filter)
+    intermediate_combined_csv = (
+        INTERMEDIATE_COMBINED_CSV
+        if intermediate_combined_csv is None
+        else intermediate_combined_csv
+    )
+    intermediate_merged_shp = (
+        INTERMEDIATE_MERGED_SHP if intermediate_merged_shp is None else intermediate_merged_shp
     )
 
-    if _check_placeholders():
+    if _check_placeholders(
+        input_csv_dir,
+        input_shp_dir,
+        final_joined_features,
+        intermediate_combined_csv,
+        intermediate_merged_shp,
+    ):
         logging.info("No processing performed. Update the configuration paths and re-run.")
         return
 
     try:
         # -------- Stage 1: CSV merge --------
-        logging.info("Stage 1/3: discovering & merging Census CSVs under %s", INPUT_CSV_DIR)
-        discovered = discover_census_files(INPUT_CSV_DIR)
+        logging.info("Stage 1/3: discovering & merging Census CSVs under %s", input_csv_dir)
+        discovered = discover_census_files(input_csv_dir)
         attrs_df = build_joined_table(
             pop_files=discovered["POP_FILES"],
             hh_files=discovered["HH_FILES"],
@@ -966,28 +1034,28 @@ def main() -> None:
             language_files=discovered["LANGUAGE_FILES"],
             vehicle_files=discovered["VEHICLE_FILES"],
             age_files=discovered["AGE_FILES"],
-            county_fips_filter=FIPS_TO_FILTER,
+            county_fips_filter=fips_to_filter,
         )
         logging.info("Stage 1 produced attribute table with shape %s", attrs_df.shape)
 
-        if not _is_blank(INTERMEDIATE_COMBINED_CSV):
-            write_csv(attrs_df, INTERMEDIATE_COMBINED_CSV)
+        if not _is_blank(intermediate_combined_csv):
+            write_csv(attrs_df, intermediate_combined_csv)
 
         # -------- Stage 2: TIGER merge + FIPS filter --------
-        logging.info("Stage 2/3: discovering & merging TIGER shapefiles under %s", INPUT_SHP_DIR)
-        shp_paths = discover_tiger_datasets(INPUT_SHP_DIR, TIGER_INPUT_GLOB, prefer="shp")
+        logging.info("Stage 2/3: discovering & merging TIGER shapefiles under %s", input_shp_dir)
+        shp_paths = discover_tiger_datasets(input_shp_dir, tiger_input_glob, prefer="shp")
         blocks_gdf = merge_shapefiles(shp_paths)
         ensure_fips_column(blocks_gdf)
-        blocks_gdf = filter_by_fips(blocks_gdf, FIPS_TO_FILTER)
+        blocks_gdf = filter_by_fips(blocks_gdf, fips_to_filter)
 
-        if not _is_blank(INTERMEDIATE_MERGED_SHP):
-            write_geo(blocks_gdf, INTERMEDIATE_MERGED_SHP)
+        if not _is_blank(intermediate_merged_shp):
+            write_geo(blocks_gdf, intermediate_merged_shp)
 
         # -------- Stage 3: join attributes onto geometry --------
         logging.info("Stage 3/3: joining attributes onto block geometry")
         attrs_df = normalize_attribute_keys(attrs_df)
         joined = join_blocks_to_attributes(blocks_gdf, attrs_df)
-        write_geo(joined, FINAL_JOINED_FEATURES)
+        write_geo(joined, final_joined_features)
 
         logging.info("Pipeline completed successfully.")
     except Exception:  # noqa: BLE001
@@ -995,5 +1063,90 @@ def main() -> None:
         sys.exit(1)
 
 
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    """Parse command-line arguments, defaulting to the CONFIGURATION block."""
+    parser = argparse.ArgumentParser(
+        description=(
+            "Merge Census CSVs and TIGER shapefiles and join them into a single "
+            "block-level layer. Defaults come from the CONFIGURATION block at the "
+            "top of this file; the CSV topic signatures and join keys stay in the "
+            "config block."
+        )
+    )
+    parser.add_argument(
+        "--input-csv-dir", default=INPUT_CSV_DIR, help="Root folder of Census CSV downloads."
+    )
+    parser.add_argument(
+        "--input-shp-dir", default=INPUT_SHP_DIR, help="Root folder of TIGER/Line shapefiles."
+    )
+    parser.add_argument(
+        "--tiger-glob",
+        default=TIGER_INPUT_GLOB,
+        help="Glob matched against TIGER shapefile basenames.",
+    )
+    parser.add_argument(
+        "--fips",
+        nargs="*",
+        default=FIPS_TO_FILTER,
+        metavar="FIPS",
+        help="5-digit county FIPS codes to keep (default: config; empty = all).",
+    )
+    parser.add_argument(
+        "--output",
+        default=FINAL_JOINED_FEATURES,
+        help="Final joined geometry + attributes output path.",
+    )
+    parser.add_argument(
+        "--intermediate-csv",
+        default=INTERMEDIATE_COMBINED_CSV,
+        help="Stage 1 combined CSV path (empty string to skip).",
+    )
+    parser.add_argument(
+        "--intermediate-shp",
+        default=INTERMEDIATE_MERGED_SHP,
+        help="Stage 2 merged geometry path (empty string to skip).",
+    )
+    parser.add_argument(
+        "--log-level",
+        default=logging.getLevelName(LOG_LEVEL),
+        help="DEBUG / INFO / WARNING / ERROR.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    """Command-line entry point. Defaults fall back to the CONFIGURATION block."""
+    args = parse_args(argv)
+    logging.basicConfig(
+        level=getattr(logging, str(args.log_level).upper(), LOG_LEVEL),
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    run(
+        input_csv_dir=args.input_csv_dir,
+        input_shp_dir=args.input_shp_dir,
+        final_joined_features=args.output,
+        tiger_input_glob=args.tiger_glob,
+        fips_to_filter=args.fips,
+        intermediate_combined_csv=args.intermediate_csv,
+        intermediate_merged_shp=args.intermediate_shp,
+    )
+
+
+def _in_ipython() -> bool:
+    """Return True when running inside an IPython/Jupyter kernel."""
+    return "ipykernel" in sys.modules or "IPython" in sys.modules
+
+
 if __name__ == "__main__":
-    main()
+    # In a notebook (pasted cell or %run), use the CONFIGURATION block instead
+    # of argparse, which would otherwise try to parse the kernel's own argv.
+    if _in_ipython():
+        logging.basicConfig(
+            level=LOG_LEVEL,
+            format="%(asctime)s | %(levelname)s | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+        run()
+    else:
+        main()

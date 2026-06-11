@@ -31,8 +31,10 @@ Outputs:
     - Optional matplotlib plots for visual inspection.
 """
 
+import argparse
 import logging
 import os
+import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Final, Optional, Tuple
@@ -1177,26 +1179,79 @@ def load_gtfs_data(
 # =============================================================================
 
 
-def main() -> None:
-    """Run the catchment-area analysis."""
-    # ------------------------------------------------------------------
-    # Logging (leave it here if you didn't configure logging earlier)
-    # ------------------------------------------------------------------
-    logging.basicConfig(
-        level=LOG_LEVEL,
-        format="%(asctime)s | %(levelname)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
+def run(
+    analysis_mode: str | None = None,
+    service_area_method: str | None = None,
+    gtfs_data_path: str | Path | None = None,
+    demographics_shp_path: str | Path | None = None,
+    output_directory: str | Path | None = None,
+    pedestrian_network_path: str | Path | None = None,
+    service_ids_to_include: Sequence[str] | None = None,
+    routes_to_include: Sequence[str] | None = None,
+    routes_to_exclude: Sequence[str] | None = None,
+    stop_ids_to_include: Sequence[str] | None = None,
+    stop_ids_to_exclude: Sequence[str] | None = None,
+    buffer_distance: float | None = None,
+    large_buffer_distance: float | None = None,
+    stop_ids_large_buffer: Sequence[str] | None = None,
+    isochrone_walk_time_min: float | None = None,
+    walk_speed_mph: float | None = None,
+    fips_filter: Sequence[str] | None = None,
+    crs_epsg_code: int | None = None,
+) -> None:
+    """Run the catchment-area analysis.
+
+    Unset args fall back to the CONFIGURATION block at the top of this file, so
+    ``m.GTFS_DATA_PATH = ...; m.run()`` works after a plain import. The structural
+    settings ``SYNTHETIC_FIELDS``, ``REQUIRED_GTFS_FILES``, and
+    ``ROUTE_GEOMETRY_GTFS_FILE`` are always read from the config block.
+    """
+    analysis_mode = ANALYSIS_MODE if analysis_mode is None else analysis_mode
+    service_area_method = (
+        SERVICE_AREA_METHOD if service_area_method is None else service_area_method
     )
+    gtfs_data_path = GTFS_DATA_PATH if gtfs_data_path is None else gtfs_data_path
+    demographics_shp_path = (
+        DEMOGRAPHICS_SHP_PATH if demographics_shp_path is None else demographics_shp_path
+    )
+    output_directory = OUTPUT_DIRECTORY if output_directory is None else output_directory
+    pedestrian_network_path = (
+        PEDESTRIAN_NETWORK_PATH if pedestrian_network_path is None else pedestrian_network_path
+    )
+    service_ids_to_include = list(
+        SERVICE_IDS_TO_INCLUDE if service_ids_to_include is None else service_ids_to_include
+    )
+    routes_to_include = list(ROUTES_TO_INCLUDE if routes_to_include is None else routes_to_include)
+    routes_to_exclude = list(ROUTES_TO_EXCLUDE if routes_to_exclude is None else routes_to_exclude)
+    stop_ids_to_include = list(
+        STOP_IDS_TO_INCLUDE if stop_ids_to_include is None else stop_ids_to_include
+    )
+    stop_ids_to_exclude = list(
+        STOP_IDS_TO_EXCLUDE if stop_ids_to_exclude is None else stop_ids_to_exclude
+    )
+    buffer_distance = BUFFER_DISTANCE if buffer_distance is None else buffer_distance
+    large_buffer_distance = (
+        LARGE_BUFFER_DISTANCE if large_buffer_distance is None else large_buffer_distance
+    )
+    stop_ids_large_buffer = list(
+        STOP_IDS_LARGE_BUFFER if stop_ids_large_buffer is None else stop_ids_large_buffer
+    )
+    isochrone_walk_time_min = (
+        ISOCHRONE_WALK_TIME_MIN if isochrone_walk_time_min is None else isochrone_walk_time_min
+    )
+    walk_speed_mph = WALK_SPEED_MPH if walk_speed_mph is None else walk_speed_mph
+    fips_filter = list(FIPS_FILTER if fips_filter is None else fips_filter)
+    crs_epsg_code = CRS_EPSG_CODE if crs_epsg_code is None else crs_epsg_code
 
     try:
         # --------------------------------------------------------------
         # 0) VALIDATE SERVICE-AREA METHOD
         # --------------------------------------------------------------
-        service_area_method = SERVICE_AREA_METHOD.lower()
+        service_area_method = service_area_method.lower()
         valid_methods = {"stop_buffer", "route_buffer", "isochrone"}
         if service_area_method not in valid_methods:
             raise ValueError(
-                f"Invalid SERVICE_AREA_METHOD: {SERVICE_AREA_METHOD!r}. "
+                f"Invalid SERVICE_AREA_METHOD: {service_area_method!r}. "
                 f"Choose one of {sorted(valid_methods)}."
             )
 
@@ -1204,7 +1259,7 @@ def main() -> None:
         # 1) LOAD GTFS
         # --------------------------------------------------------------
         gtfs_raw = load_gtfs_data(
-            str(GTFS_DATA_PATH),
+            str(gtfs_data_path),
             files=REQUIRED_GTFS_FILES,
             dtype=str,  # keep everything as strings
         )
@@ -1216,7 +1271,7 @@ def main() -> None:
         # Route geometry from shapes.txt — required for the "route_buffer"
         # method, optional otherwise. Loaded opportunistically.
         shapes_df: Optional[pd.DataFrame] = None
-        shapes_path = os.path.join(str(GTFS_DATA_PATH), ROUTE_GEOMETRY_GTFS_FILE)
+        shapes_path = os.path.join(str(gtfs_data_path), ROUTE_GEOMETRY_GTFS_FILE)
         if os.path.exists(shapes_path):
             shapes_df = pd.read_csv(shapes_path, dtype=str, low_memory=False)
             logging.info("Loaded %s (%d records).", ROUTE_GEOMETRY_GTFS_FILE, len(shapes_df))
@@ -1225,7 +1280,7 @@ def main() -> None:
                 "SERVICE_AREA_METHOD is 'route_buffer' but %s was not found in %s; "
                 "the analysis will fall back to stop buffers.",
                 ROUTE_GEOMETRY_GTFS_FILE,
-                GTFS_DATA_PATH,
+                gtfs_data_path,
             )
 
         # --------------------------------------------------------------
@@ -1234,15 +1289,15 @@ def main() -> None:
         ped_graph: Optional[nx.MultiGraph] = None
         # Walking speed expressed in projected-CRS units per second (metres/s,
         # since CRS_EPSG_CODE is assumed metric).
-        walk_speed_units_per_s = WALK_SPEED_MPH * METERS_PER_MILE / 3_600.0
+        walk_speed_units_per_s = walk_speed_mph * METERS_PER_MILE / 3_600.0
         if service_area_method == "isochrone":
-            ped_path = Path(PEDESTRIAN_NETWORK_PATH)
+            ped_path = Path(pedestrian_network_path)
             if not ped_path.is_file():
                 raise FileNotFoundError(
                     f"Pedestrian network shapefile not found: {ped_path}. "
                     "It is required for the 'isochrone' method."
                 )
-            centerlines = gpd.read_file(ped_path).to_crs(epsg=CRS_EPSG_CODE)
+            centerlines = gpd.read_file(ped_path).to_crs(epsg=crs_epsg_code)
             ped_graph, _ = build_pedestrian_time_network(
                 centerlines, walk_speed=walk_speed_units_per_s
             )
@@ -1250,12 +1305,12 @@ def main() -> None:
         # --------------------------------------------------------------
         # 2) OPTIONAL CALENDAR FILTER
         # --------------------------------------------------------------
-        if SERVICE_IDS_TO_INCLUDE:  # e.g. ["1", "2", "3"]
+        if service_ids_to_include:  # e.g. ["1", "2", "3"]
             before = len(trips)
-            trips = trips[trips["service_id"].isin(SERVICE_IDS_TO_INCLUDE)]
+            trips = trips[trips["service_id"].isin(service_ids_to_include)]
             logging.info(
                 "Applied calendar filter %s — trips: %d → %d",
-                SERVICE_IDS_TO_INCLUDE,
+                service_ids_to_include,
                 before,
                 len(trips),
             )
@@ -1265,25 +1320,25 @@ def main() -> None:
         # --------------------------------------------------------------
         # 3) DEMOGRAPHICS LAYER
         # --------------------------------------------------------------
-        demographics_path = Path(DEMOGRAPHICS_SHP_PATH)
+        demographics_path = Path(demographics_shp_path)
         if not demographics_path.is_file():
             raise FileNotFoundError(f"Demographics shapefile not found: {demographics_path}")
 
         demographics_gdf = gpd.read_file(demographics_path)
-        demographics_gdf = apply_fips_filter(demographics_gdf, FIPS_FILTER)
-        demographics_gdf = demographics_gdf.to_crs(epsg=CRS_EPSG_CODE)
+        demographics_gdf = apply_fips_filter(demographics_gdf, fips_filter)
+        demographics_gdf = demographics_gdf.to_crs(epsg=crs_epsg_code)
 
         # --------------------------------------------------------------
         # 4) ANALYSIS DISPATCH
         # --------------------------------------------------------------
-        mode = ANALYSIS_MODE.lower()
+        mode = analysis_mode.lower()
         analysis_dispatch = {
             "network": do_network_analysis,
             "route": do_route_by_route_analysis,
             "stop": do_stop_by_stop_analysis,
         }
         if mode not in analysis_dispatch:
-            raise ValueError(f"Invalid ANALYSIS_MODE: {ANALYSIS_MODE}")
+            raise ValueError(f"Invalid ANALYSIS_MODE: {analysis_mode}")
 
         analysis_dispatch[mode](
             trips,
@@ -1291,19 +1346,19 @@ def main() -> None:
             routes_df,
             stops_df,
             demographics_gdf,
-            ROUTES_TO_INCLUDE,
-            ROUTES_TO_EXCLUDE,
-            STOP_IDS_TO_INCLUDE,
-            STOP_IDS_TO_EXCLUDE,
-            BUFFER_DISTANCE,
-            LARGE_BUFFER_DISTANCE,
-            STOP_IDS_LARGE_BUFFER,
-            str(OUTPUT_DIRECTORY),
+            routes_to_include,
+            routes_to_exclude,
+            stop_ids_to_include,
+            stop_ids_to_exclude,
+            buffer_distance,
+            large_buffer_distance,
+            stop_ids_large_buffer,
+            str(output_directory),
             SYNTHETIC_FIELDS,
             service_area_method=service_area_method,
             shapes_df=shapes_df,
             ped_graph=ped_graph,
-            walk_time_min=ISOCHRONE_WALK_TIME_MIN,
+            walk_time_min=isochrone_walk_time_min,
             walk_speed_units_per_s=walk_speed_units_per_s,
         )
 
@@ -1313,5 +1368,171 @@ def main() -> None:
         logging.error("Analysis terminated due to an error: %s", exc, exc_info=True)
 
 
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    """Parse command-line arguments, defaulting to the CONFIGURATION block.
+
+    The structural ``SYNTHETIC_FIELDS`` list stays in the config block.
+    """
+    parser = argparse.ArgumentParser(
+        description=(
+            "Estimate demographics within a GTFS-derived service area. Defaults come "
+            "from the CONFIGURATION block at the top of this file; SYNTHETIC_FIELDS "
+            "stays in the config block."
+        )
+    )
+    parser.add_argument(
+        "--analysis-mode",
+        default=ANALYSIS_MODE,
+        choices=("network", "route", "stop"),
+        help="How results are grouped.",
+    )
+    parser.add_argument(
+        "--service-area-method",
+        default=SERVICE_AREA_METHOD,
+        choices=("stop_buffer", "route_buffer", "isochrone"),
+        help="How each catchment polygon is built.",
+    )
+    parser.add_argument("--gtfs-path", default=GTFS_DATA_PATH, help="GTFS data folder.")
+    parser.add_argument(
+        "--demographics-shp", default=DEMOGRAPHICS_SHP_PATH, help="Demographics shapefile."
+    )
+    parser.add_argument("--output-dir", default=OUTPUT_DIRECTORY, help="Output directory.")
+    parser.add_argument(
+        "--pedestrian-network",
+        default=PEDESTRIAN_NETWORK_PATH,
+        help="Pedestrian centerline shapefile (isochrone method only).",
+    )
+    parser.add_argument(
+        "--service-ids",
+        nargs="*",
+        default=SERVICE_IDS_TO_INCLUDE,
+        metavar="SERVICE_ID",
+        help="Calendar service_id values to keep (default: all).",
+    )
+    parser.add_argument(
+        "--routes-include",
+        nargs="*",
+        default=ROUTES_TO_INCLUDE,
+        metavar="ROUTE_ID",
+        help="Only these routes (default: all).",
+    )
+    parser.add_argument(
+        "--routes-exclude",
+        nargs="*",
+        default=ROUTES_TO_EXCLUDE,
+        metavar="ROUTE_ID",
+        help="Drop these routes (default: none).",
+    )
+    parser.add_argument(
+        "--stops-include",
+        nargs="*",
+        default=STOP_IDS_TO_INCLUDE,
+        metavar="STOP_ID",
+        help="Only these stops (default: all).",
+    )
+    parser.add_argument(
+        "--stops-exclude",
+        nargs="*",
+        default=STOP_IDS_TO_EXCLUDE,
+        metavar="STOP_ID",
+        help="Drop these stops (default: none).",
+    )
+    parser.add_argument(
+        "--buffer-distance",
+        type=float,
+        default=BUFFER_DISTANCE,
+        help="Standard buffer distance in miles.",
+    )
+    parser.add_argument(
+        "--large-buffer-distance",
+        type=float,
+        default=LARGE_BUFFER_DISTANCE,
+        help="Larger buffer distance in miles for selected stops.",
+    )
+    parser.add_argument(
+        "--stops-large-buffer",
+        nargs="*",
+        default=STOP_IDS_LARGE_BUFFER,
+        metavar="STOP_ID",
+        help="Stops that use the large buffer (stop_buffer method only).",
+    )
+    parser.add_argument(
+        "--isochrone-walk-time",
+        type=float,
+        default=ISOCHRONE_WALK_TIME_MIN,
+        help="Walk-time budget in minutes (isochrone method).",
+    )
+    parser.add_argument(
+        "--walk-speed-mph",
+        type=float,
+        default=WALK_SPEED_MPH,
+        help="Assumed pedestrian walking speed.",
+    )
+    parser.add_argument(
+        "--fips",
+        nargs="*",
+        default=FIPS_FILTER,
+        metavar="FIPS",
+        help="Demographics FIPS codes to keep (default: all).",
+    )
+    parser.add_argument(
+        "--crs-epsg",
+        type=int,
+        default=CRS_EPSG_CODE,
+        help="Projected (metric) EPSG code for area calculations.",
+    )
+    parser.add_argument(
+        "--log-level",
+        default=logging.getLevelName(LOG_LEVEL),
+        help="DEBUG / INFO / WARNING / ERROR.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    """Command-line entry point. Defaults fall back to the CONFIGURATION block."""
+    args = parse_args(argv)
+    logging.basicConfig(
+        level=getattr(logging, str(args.log_level).upper(), LOG_LEVEL),
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    run(
+        analysis_mode=args.analysis_mode,
+        service_area_method=args.service_area_method,
+        gtfs_data_path=args.gtfs_path,
+        demographics_shp_path=args.demographics_shp,
+        output_directory=args.output_dir,
+        pedestrian_network_path=args.pedestrian_network,
+        service_ids_to_include=args.service_ids,
+        routes_to_include=args.routes_include,
+        routes_to_exclude=args.routes_exclude,
+        stop_ids_to_include=args.stops_include,
+        stop_ids_to_exclude=args.stops_exclude,
+        buffer_distance=args.buffer_distance,
+        large_buffer_distance=args.large_buffer_distance,
+        stop_ids_large_buffer=args.stops_large_buffer,
+        isochrone_walk_time_min=args.isochrone_walk_time,
+        walk_speed_mph=args.walk_speed_mph,
+        fips_filter=args.fips,
+        crs_epsg_code=args.crs_epsg,
+    )
+
+
+def _in_ipython() -> bool:
+    """Return True when running inside an IPython/Jupyter kernel."""
+    return "ipykernel" in sys.modules or "IPython" in sys.modules
+
+
 if __name__ == "__main__":  # pragma: no cover
-    main()
+    # In a notebook (pasted cell or %run), use the CONFIGURATION block instead
+    # of argparse, which would otherwise try to parse the kernel's own argv.
+    if _in_ipython():
+        logging.basicConfig(
+            level=LOG_LEVEL,
+            format="%(asctime)s | %(levelname)s | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+        run()
+    else:
+        main()
