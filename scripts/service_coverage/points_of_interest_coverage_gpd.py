@@ -52,7 +52,11 @@ LAYER_SPECS: list[tuple[str, str]] = [
 ROUTE_FILTER: list[str] = []
 
 # Analysis options
-USE_SHAPE_BUFFER = True  # True → buffer route geometry; False → buffer stops
+# Stop buffers (False) are the default: they measure access at actual boarding
+# points and are both faster and more accurate than full-shape buffers for
+# express/limited routes, which otherwise claim a corridor along miles with no
+# stops. Set True (or pass --buffer-shape) to buffer the whole route shape.
+USE_SHAPE_BUFFER = False
 BUFFER_DIST_FT = 1320.0  # ¼ mile in feet
 # Simplify each route's geometry (Douglas-Peucker, in projected meters) before
 # buffering. Buffering full-resolution shapes (GTFS shapes can carry thousands
@@ -98,6 +102,58 @@ def _load_gtfs_tables(gtfs_dir: Path) -> Mapping[str, pd.DataFrame]:
     return tables
 
 
+def _build_shape_geoms(shapes_df: pd.DataFrame, projected_crs: str) -> gpd.GeoDataFrame:
+    """Build one projected LineString per shape_id, indexed by shape_id.
+
+    Shapes with fewer than 2 points cannot form a line and are skipped with a
+    warning rather than aborting the run. This per-shape, Python-level build over
+    every row of shapes.txt is the slowest preparation step on a large feed, so
+    it logs the row/shape counts before and the geometry count after.
+    """
+    logging.info(
+        "Building shape geometries from %d shape point(s) across %d shape_id(s)...",
+        len(shapes_df),
+        shapes_df["shape_id"].nunique(),
+    )
+    shapes_df = shapes_df.sort_values(["shape_id", "shape_pt_sequence"])
+
+    geom_by_shape: dict[object, LineString] = {}
+    skipped_degenerate = 0
+    for shape_id, grp in shapes_df.groupby("shape_id", sort=False):
+        coords = grp[["shape_pt_lon", "shape_pt_lat"]].to_numpy(dtype=float)
+        if len(coords) < 2:
+            skipped_degenerate += 1
+            continue
+        geom_by_shape[shape_id] = LineString(coords)
+
+    if skipped_degenerate:
+        logging.warning(
+            "Skipped %d shape_id(s) with fewer than 2 points (cannot form a line).",
+            skipped_degenerate,
+        )
+
+    shapes_gdf = gpd.GeoDataFrame(
+        {"geometry": list(geom_by_shape.values())},
+        index=pd.Index(list(geom_by_shape.keys()), name="shape_id"),
+        geometry="geometry",
+        crs="EPSG:4326",
+    )
+    logging.info("Built %d shape geometries; reprojecting to %s...", len(shapes_gdf), projected_crs)
+    return shapes_gdf.to_crs(projected_crs)
+
+
+def _build_stop_geoms(stops_df: pd.DataFrame, projected_crs: str) -> gpd.GeoDataFrame:
+    """Build one projected Point per stop_id, indexed by stop_id."""
+    stops = stops_df[["stop_id", "stop_lat", "stop_lon"]]
+    stops_gdf = gpd.GeoDataFrame(
+        geometry=gpd.points_from_xy(stops["stop_lon"], stops["stop_lat"]),
+        index=pd.Index(stops["stop_id"].to_numpy(), name="stop_id"),
+        crs="EPSG:4326",
+    ).to_crs(projected_crs)
+    logging.info("Built %d stop geometries in %s.", len(stops_gdf), projected_crs)
+    return stops_gdf
+
+
 def _prepare_route_buffers(
     tables: Mapping[str, pd.DataFrame],
     use_shape_buffer: bool,
@@ -129,110 +185,65 @@ def _prepare_route_buffers(
             meaningful effect on a ¼-mile buffer. Pass 0.0 to disable.
 
     Raises:
-        ValueError: If shapes.txt lacks an EPSG code in the header.
+        ValueError: If shapes.txt is missing one of its required columns.
     """
-    # Load shapes as GeoSeries
     shapes_df = tables["shapes"]
     if {"shape_id", "shape_pt_lat", "shape_pt_lon", "shape_pt_sequence"}.difference(
         shapes_df.columns
     ):
         raise ValueError("shapes.txt missing required columns")
 
-    # Convert shape points to LineStrings. This is a per-shape, Python-level
-    # build over every row of shapes.txt, so on a large regional feed it is the
-    # slowest step here — log before/after (and the row/shape counts) so a long
-    # run is visibly progressing rather than appearing frozen.
-    logging.info(
-        "Building shape geometries from %d shape point(s) across %d shape_id(s)...",
-        len(shapes_df),
-        shapes_df["shape_id"].nunique(),
-    )
-    shapes_df = shapes_df.sort_values(["shape_id", "shape_pt_sequence"])
-
-    geom_by_shape: dict[object, LineString] = {}
-    skipped_degenerate = 0
-    for shape_id, grp in shapes_df.groupby("shape_id", sort=False):
-        coords = grp[["shape_pt_lon", "shape_pt_lat"]].to_numpy(dtype=float)
-        # LineString needs >= 2 distinct points; a 1-point (or empty) shape
-        # otherwise raises and would abort the whole run.
-        if len(coords) < 2:
-            skipped_degenerate += 1
-            continue
-        geom_by_shape[shape_id] = LineString(coords)
-
-    if skipped_degenerate:
-        logging.warning(
-            "Skipped %d shape_id(s) with fewer than 2 points (cannot form a line).",
-            skipped_degenerate,
-        )
-
-    shapes_gdf = gpd.GeoDataFrame(
-        {"geometry": list(geom_by_shape.values())},
-        index=pd.Index(list(geom_by_shape.keys()), name="shape_id"),
-        geometry="geometry",
-        crs="EPSG:4326",
-    )
-    logging.info("Built %d shape geometries; reprojecting to %s...", len(shapes_gdf), projected_crs)
-
-    # Trips to route mapping
     trips = tables["trips"][["route_id", "trip_id", "shape_id"]]
-    route_shapes = (
-        trips.drop_duplicates(subset=["route_id", "shape_id"])
-        .groupby("route_id")["shape_id"]
-        .apply(list)
-    )
-
-    # Stops GeoDataFrame
-    stops = tables["stops"][["stop_id", "stop_lat", "stop_lon"]].copy()
-    stops = gpd.GeoDataFrame(
-        stops,
-        geometry=gpd.points_from_xy(stops.stop_lon, stops.stop_lat),
-        crs="EPSG:4326",
-    )
-
-    # Choose projected CRS (meters) to allow buffering
-    shapes_gdf = shapes_gdf.to_crs(projected_crs)
-    stops = stops.to_crs(projected_crs)
     buff_dist_m = buffer_dist_ft * 0.3048  # convert to meters
 
-    selected_routes = [rid for rid in route_shapes.index if not route_filter or rid in route_filter]
+    # Resolve, once, the source geometries each route's buffer is built from and
+    # a route_id -> [geometry ids] map; the loop is then pure lookups. Stop mode
+    # in particular joins stop_times to trips a single time instead of
+    # re-scanning the (often huge) stop_times table once per route.
+    if use_shape_buffer:
+        source_gdf = _build_shape_geoms(shapes_df, projected_crs)
+        route_to_ids = (
+            trips.drop_duplicates(subset=["route_id", "shape_id"])
+            .groupby("route_id")["shape_id"]
+            .apply(list)
+        )
+    else:
+        source_gdf = _build_stop_geoms(tables["stops"], projected_crs)
+        route_to_ids = (
+            tables["stop_times"][["trip_id", "stop_id"]]
+            .merge(trips[["trip_id", "route_id"]], on="trip_id", how="inner")
+            .drop_duplicates(subset=["route_id", "stop_id"])
+            .groupby("route_id")["stop_id"]
+            .apply(list)
+        )
+
+    selected_routes = [rid for rid in route_to_ids.index if not route_filter or rid in route_filter]
     logging.info(
-        "Buffering %d route(s) (buffer=%.1f ft -> %.1f m, simplify=%.1f m)...",
+        "Buffering %d route(s) (buffer=%.1f ft -> %.1f m, simplify=%.1f m, mode=%s)...",
         len(selected_routes),
         buffer_dist_ft,
         buff_dist_m,
         simplify_tolerance_m,
+        "shape" if use_shape_buffer else "stops",
     )
     log_every = max(1, len(selected_routes) // 20)  # ~20 progress lines
 
     buffers: List[dict[str, object]] = []
     for processed, route_id in enumerate(selected_routes, start=1):
-        shp_ids = route_shapes.loc[route_id]
-
-        if use_shape_buffer:
-            # Drop any shape_ids the route references but that produced no
-            # geometry (missing from shapes.txt or skipped as degenerate).
-            present = [s for s in shp_ids if s in shapes_gdf.index]
-            geoms = shapes_gdf.loc[present, "geometry"]
-        else:
-            trip_stops = (
-                tables["stop_times"]
-                .merge(
-                    trips[trips.route_id == route_id][["trip_id"]],
-                    on="trip_id",
-                    how="inner",
-                )["stop_id"]
-                .unique()
-            )
-            geoms = stops[stops.stop_id.isin(trip_stops)].geometry
+        # Keep only ids that actually produced a geometry: a route can reference
+        # a shape absent from shapes.txt (or skipped as degenerate) or a stop
+        # absent from stops.txt.
+        present = source_gdf.index.intersection(route_to_ids.loc[route_id])
+        geoms = source_gdf.loc[present, "geometry"]
 
         if geoms.empty:
-            logging.warning("No geometry for route %s – skipped", route_id)
+            logging.warning("No geometry for route %s - skipped", route_id)
             continue
 
         geom = unary_union(list(geoms))
-        # Thin the vertex count before buffering — full-resolution shapes make
-        # buffer() the dominant cost. The tolerance is tiny next to the buffer.
+        # Thin the vertex count before buffering: full-resolution shapes make
+        # buffer() the dominant cost (a no-op for stop points). The tolerance is
+        # tiny next to the buffer.
         if simplify_tolerance_m > 0:
             geom = geom.simplify(simplify_tolerance_m)
         buf = geom.buffer(buff_dist_m)
@@ -481,13 +492,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--buffer-ft", type=float, default=BUFFER_DIST_FT, help="Buffer distance in feet."
     )
-    parser.add_argument(
+    buffer_mode = parser.add_mutually_exclusive_group()
+    buffer_mode.add_argument(
         "--buffer-stops",
         dest="use_shape_buffer",
         action="store_false",
-        default=USE_SHAPE_BUFFER,
-        help="Buffer stops instead of route geometry.",
+        help="Buffer each route's stops (access at boarding points; default).",
     )
+    buffer_mode.add_argument(
+        "--buffer-shape",
+        dest="use_shape_buffer",
+        action="store_true",
+        help="Buffer the route's full shape geometry (the service corridor).",
+    )
+    parser.set_defaults(use_shape_buffer=USE_SHAPE_BUFFER)
     parser.add_argument(
         "--routes",
         nargs="*",

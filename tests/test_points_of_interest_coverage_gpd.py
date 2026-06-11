@@ -124,6 +124,45 @@ def test_prepare_route_buffers_stop_mode_produces_non_empty_geometry() -> None:
     assert not result.geometry.is_empty.any()
 
 
+def test_prepare_route_buffers_stop_mode_buffers_only_each_routes_own_stops() -> None:
+    """Stop mode must resolve each route to its own stops (single up-front merge)."""
+    tables = _minimal_tables()
+    # Add route R2 with its own trip T2 and a far-away stop S3 at (10, 10).
+    tables["trips"] = pd.concat(
+        [
+            tables["trips"],
+            pd.DataFrame({"route_id": ["R2"], "trip_id": ["T2"], "shape_id": ["SH2"]}),
+        ],
+        ignore_index=True,
+    )
+    tables["stop_times"] = pd.concat(
+        [
+            tables["stop_times"],
+            pd.DataFrame({"trip_id": ["T2"], "stop_id": ["S3"], "stop_sequence": [1]}),
+        ],
+        ignore_index=True,
+    )
+    tables["stops"] = pd.concat(
+        [
+            tables["stops"],
+            pd.DataFrame({"stop_id": ["S3"], "stop_lat": [10.0], "stop_lon": [10.0]}),
+        ],
+        ignore_index=True,
+    )
+
+    result = _prepare_route_buffers(tables, use_shape_buffer=False, buffer_dist_ft=1320.0)
+    by_route = result.set_index("route_id").geometry
+    assert set(by_route.index) == {"R1", "R2"}
+
+    near = gpd.GeoSeries([Point(0.0, 0.0)], crs="EPSG:4326").to_crs("EPSG:3857").iloc[0]
+    far = gpd.GeoSeries([Point(10.0, 10.0)], crs="EPSG:4326").to_crs("EPSG:3857").iloc[0]
+    # R1 covers its stops near the origin but not R2's far stop, and vice versa.
+    assert by_route.loc["R1"].contains(near)
+    assert not by_route.loc["R1"].contains(far)
+    assert by_route.loc["R2"].contains(far)
+    assert not by_route.loc["R2"].contains(near)
+
+
 def test_prepare_route_buffers_route_filter_excludes_unspecified_routes() -> None:
     """When route_filter is set, routes not in the list should be omitted."""
     tables = _minimal_tables()
