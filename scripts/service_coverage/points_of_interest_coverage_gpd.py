@@ -25,7 +25,6 @@ from pathlib import Path
 from typing import Iterable, List, Mapping, Sequence
 
 import geopandas as gpd
-import matplotlib.pyplot as plt
 import pandas as pd
 from shapely.geometry import LineString
 from shapely.ops import unary_union
@@ -55,7 +54,12 @@ ROUTE_FILTER: list[str] = []
 # Analysis options
 USE_SHAPE_BUFFER = True  # True → buffer route geometry; False → buffer stops
 BUFFER_DIST_FT = 1320.0  # ¼ mile in feet
-PLOT_FIG_DPI = 250  # resolution for PNG exports
+# Per-route map PNGs are OFF by default: rendering one matplotlib figure per
+# route is slow and stalls headless/orchestrator runs (the script appeared to
+# "get stuck"). Flip MAKE_PLOTS to True (or pass --plots) for the maps; the CSV
+# summaries are always written either way.
+MAKE_PLOTS = False  # True -> also write a per-route buffer PNG
+PLOT_FIG_DPI = 250  # resolution for PNG exports (only used when MAKE_PLOTS)
 
 # Projected CRS used for buffering and spatial joins.
 # EPSG:3857 (Web Mercator) works globally; swap for a local CRS (e.g. "EPSG:2283"
@@ -230,12 +234,26 @@ def _count_features(
     layer_specs: Iterable[tuple[str, str]],
     output_dir: Path,
     plot_fig_dpi: int = 250,
+    make_plots: bool = False,
 ) -> pd.DataFrame:
-    """For each route, count intersecting features and write per‑route CSV/PNG.
+    """For each route, count intersecting features and write a per-route CSV.
+
+    A per-route map PNG is written too, but only when *make_plots* is True. The
+    plot is opt-in because rendering one figure per route is slow enough to
+    stall headless/orchestrator runs; the CSV summaries are always written.
 
     Returns:
         A summary DataFrame indexed by route_id with feature counts.
     """
+    # Import pyplot lazily with a non-interactive backend so a headless run that
+    # only wants the CSVs never touches a GUI backend (a common hang source).
+    plt = None
+    if make_plots:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
     summary_records: list[dict[str, object]] = []
 
     for _, route_row in route_buffers.iterrows():
@@ -265,20 +283,23 @@ def _count_features(
         ]
         pd.DataFrame(csv_rows).to_csv(output_dir / f"{route_id}_feature_summary.csv", index=False)
 
-        # Plot quick map
-        fig, ax = plt.subplots(figsize=(6, 6), dpi=plot_fig_dpi)
-        gpd.GeoSeries([buf_geom]).plot(ax=ax, facecolor="none", edgecolor="black")
-        for fname in feature_name_lists:
-            layers[fname][layers[fname].intersects(buf_geom)].plot(ax=ax, label=fname.split(".")[0])
-        ax.set_title(f"Route {route_id} buffer & intersecting features")
-        ax.axis("off")
-        ax.legend()
-        fig_path = output_dir / f"{route_id}_buffer_plot.png"
-        fig.savefig(fig_path, bbox_inches="tight")
-        plt.close(fig)
+        # Plot quick map (opt-in; see make_plots above).
+        if make_plots and plt is not None:
+            fig, ax = plt.subplots(figsize=(6, 6), dpi=plot_fig_dpi)
+            gpd.GeoSeries([buf_geom]).plot(ax=ax, facecolor="none", edgecolor="black")
+            for fname in feature_name_lists:
+                layers[fname][layers[fname].intersects(buf_geom)].plot(
+                    ax=ax, label=fname.split(".")[0]
+                )
+            ax.set_title(f"Route {route_id} buffer & intersecting features")
+            ax.axis("off")
+            ax.legend()
+            fig_path = output_dir / f"{route_id}_buffer_plot.png"
+            fig.savefig(fig_path, bbox_inches="tight")
+            plt.close(fig)
 
         summary_records.append(per_route_counts)
-        logging.info("Processed route %s – PNG & CSV written", route_id)
+        logging.info("Processed route %s - CSV written%s", route_id, " & PNG" if make_plots else "")
 
     summary_df = pd.DataFrame(summary_records).set_index("route_id").fillna(0).astype(int)
     return summary_df
@@ -298,8 +319,9 @@ def run(
     route_filter: Sequence[str] | None = None,
     projected_crs: str | None = None,
     plot_fig_dpi: int | None = None,
+    make_plots: bool | None = None,
 ) -> None:
-    """Run the GTFS feature‑coverage analysis."""
+    """Run the GTFS feature-coverage analysis."""
     gtfs_dir = Path(GTFS_DIR if gtfs_dir is None else gtfs_dir)
     shp_input_dir = Path(SHP_INPUT_DIR if shp_input_dir is None else shp_input_dir)
     output_dir = Path(OUTPUT_DIR if output_dir is None else output_dir)
@@ -308,6 +330,7 @@ def run(
     route_filter = list(ROUTE_FILTER if route_filter is None else route_filter)
     projected_crs = PROJECTED_CRS if projected_crs is None else projected_crs
     plot_fig_dpi = PLOT_FIG_DPI if plot_fig_dpi is None else plot_fig_dpi
+    make_plots = MAKE_PLOTS if make_plots is None else make_plots
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -341,6 +364,7 @@ def run(
         LAYER_SPECS,
         output_dir,
         plot_fig_dpi=plot_fig_dpi,
+        make_plots=make_plots,
     )
 
     # Save summary CSV
@@ -394,6 +418,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--dpi", type=int, default=PLOT_FIG_DPI, help="Resolution for PNG exports.")
     parser.add_argument(
+        "--plots",
+        dest="make_plots",
+        action="store_true",
+        default=MAKE_PLOTS,
+        help="Also render a per-route map PNG (slow; off by default).",
+    )
+    parser.add_argument(
         "--log-level",
         default=logging.getLevelName(LOG_LEVEL),
         help="DEBUG / INFO / WARNING / ERROR.",
@@ -418,6 +449,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         route_filter=args.routes,
         projected_crs=args.projected_crs,
         plot_fig_dpi=args.dpi,
+        make_plots=args.make_plots,
     )
 
 

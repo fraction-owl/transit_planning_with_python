@@ -29,6 +29,22 @@
               "--demographics-shp", "{input}/census/demographics.shp", "--output-dir", "{output}"]
     },
     {
+      "script": "schools_prep_join_gpd.py",
+      "cmd": ["{python}", "{script}", "--input-dir", "{input}/schools",
+              "--output-dir", "{output}", "--school-type", "all"]
+    },
+    {
+      "script": "school_coverage_by_route_gpd.py",
+      "cmd": ["{python}", "{script}", "--gtfs-dir", "{input}/gtfs",
+              "--schools-path", "{work}/out/schools_prep_join_gpd",
+              "--output-dir", "{output}"],
+      "outputs": [
+        {"file": "school_coverage_by_route.csv", "join_keys": ["route_id"],
+         "keep_cols": ["schools_served", "enrollment_served", "enrollment_1_8_served",
+                       "enrollment_9_12_served", "enrollment_postsec_served"]}
+      ]
+    },
+    {
       "script": "gbfs_stations_exporter.py",
       "cmd": ["{python}", "{script}", "--source", "{input}/gbfs/gbfs.json",
               "--output-dir", "{output}"]
@@ -53,7 +69,8 @@
     {"file": "points_of_interest_coverage.csv", "join_keys": ["route_id"],
      "keep_cols": ["sites_served", "jobs_served"]},
     {"file": "school_coverage_by_route.csv", "join_keys": ["route_id"],
-     "keep_cols": ["schools_served", "enrollment_served"]},
+     "keep_cols": ["schools_served", "enrollment_served", "enrollment_1_8_served",
+                   "enrollment_9_12_served", "enrollment_postsec_served"]},
     {"file": "cabi_coverage_by_route.csv", "join_keys": ["route_id"],
      "keep_cols": ["cabi_stations_served", "cabi_weekday_riders_served"]},
     {"file": "headway_span_by_route.csv", "join_keys": ["route_id"],

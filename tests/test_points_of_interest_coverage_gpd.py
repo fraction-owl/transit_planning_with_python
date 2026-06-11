@@ -238,10 +238,21 @@ def test_count_features_writes_per_route_csv(tmp_path: Path) -> None:
     assert (tmp_path / "R1_feature_summary.csv").exists()
 
 
-def test_count_features_writes_per_route_png(tmp_path: Path) -> None:
-    """A per-route map PNG should be written for each processed route."""
+def test_count_features_writes_per_route_png_when_enabled(tmp_path: Path) -> None:
+    """With make_plots=True a per-route map PNG is written for each route."""
+    buffers = _prepare_route_buffers(
+        _minimal_tables(), use_shape_buffer=True, buffer_dist_ft=1320.0
+    )
+    _count_features(
+        buffers, _layers_at(0.0, 0.001), [("POI.shp", "NAME")], tmp_path, make_plots=True
+    )
+    assert (tmp_path / "R1_buffer_plot.png").exists()
+
+
+def test_count_features_skips_png_by_default(tmp_path: Path) -> None:
+    """No PNG is rendered by default (the plot is opt-in to avoid headless hangs)."""
     buffers = _prepare_route_buffers(
         _minimal_tables(), use_shape_buffer=True, buffer_dist_ft=1320.0
     )
     _count_features(buffers, _layers_at(0.0, 0.001), [("POI.shp", "NAME")], tmp_path)
-    assert (tmp_path / "R1_buffer_plot.png").exists()
+    assert not (tmp_path / "R1_buffer_plot.png").exists()

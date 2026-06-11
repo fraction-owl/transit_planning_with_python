@@ -88,6 +88,7 @@ transit_planning_with_python/
 │   │   ├── gtfs_service_demographics_gpd.py
 │   │   ├── points_of_interest_coverage_arcpy.py
 │   │   ├── points_of_interest_coverage_gpd.py
+│   │   ├── school_coverage_by_route_gpd.py
 │   │   ├── site_route_proximity_arcpy.py
 │   │   └── site_route_proximity_gpd.py
 │   └── stop_analysis/
