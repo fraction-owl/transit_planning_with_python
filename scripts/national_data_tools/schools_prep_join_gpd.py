@@ -199,12 +199,16 @@ def _prompt_path(label: str, *, must_exist: bool) -> Path:
         return path
 
 
-def _find_one(directory: Path, pattern: str) -> Path:
+def _find_one(directory: Path, pattern: str, *, recursive: bool = False) -> Path:
     """Return the single path in ``directory`` matching ``pattern``.
 
     Args:
-        directory: Folder to search (non-recursive).
+        directory: Folder to search.
         pattern: Glob pattern, e.g. ``"ccd_sch_052_*.zip"``.
+        recursive: When True, search subfolders too. Real NCES distribution
+            zips often unpack their data into a nested folder named after the
+            archive (e.g. ``EDGE_GEOCODE_PUBLICSCH_1920/...shp``), so the file
+            we want is one level down rather than at the extraction root.
 
     Returns:
         The matching path.
@@ -213,9 +217,10 @@ def _find_one(directory: Path, pattern: str) -> Path:
         FileNotFoundError: If zero matches are found.
         ValueError: If more than one match is found.
     """
-    matches = sorted(directory.glob(pattern))
+    matches = sorted(directory.rglob(pattern) if recursive else directory.glob(pattern))
     if not matches:
-        raise FileNotFoundError(f"No file matching {pattern!r} in {directory}")
+        where = f"{directory} (recursively)" if recursive else str(directory)
+        raise FileNotFoundError(f"No file matching {pattern!r} in {where}")
     if len(matches) > 1:
         raise ValueError(f"Multiple files match {pattern!r}: {[m.name for m in matches]}")
     return matches[0]
@@ -277,7 +282,7 @@ def load_school_points(
     with tempfile.TemporaryDirectory() as tmp:
         with zipfile.ZipFile(zip_path) as zf:
             zf.extractall(tmp)
-        shp = _find_one(Path(tmp), "*.shp")
+        shp = _find_one(Path(tmp), "*.shp", recursive=True)
         gdf = gpd.read_file(shp)
 
     if state_col not in gdf.columns:
@@ -314,7 +319,7 @@ def _load_ccd_long(zip_path: Path, id_col: str) -> pd.DataFrame:
     with tempfile.TemporaryDirectory() as tmp:
         with zipfile.ZipFile(zip_path) as zf:
             zf.extractall(tmp)
-        csv = _find_one(Path(tmp), "*.csv")
+        csv = _find_one(Path(tmp), "*.csv", recursive=True)
         mem = pd.read_csv(csv, dtype=str)
 
     mem[id_col] = mem[id_col].astype(str)
