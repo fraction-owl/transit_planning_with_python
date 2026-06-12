@@ -701,7 +701,14 @@ def build_joined_table(
     county_fips_filter: Iterable[str] | None = None,
     _clean_columns: bool = True,
 ) -> pd.DataFrame:
-    """Return a fully joined block + tract DataFrame with optional FIPS filter."""
+    """Return a fully joined block + tract DataFrame with optional FIPS filter.
+
+    Legacy path that assumes *block-level* P1/H9 census tables. ``run()`` now builds the
+    block layer with ``build_tract_attributes`` + ``build_block_jobs`` +
+    ``attach_demographics_to_blocks``, which sources block population/households from the
+    TIGER blocks' POP20/HOUSING20 and so works with tract-level Census downloads. Kept
+    for callers that genuinely have block-level P1/H9 tables.
+    """
     block_df = _build_block_df(_BlockInputs(pop_files, hh_files, jobs_files))
     tract_df = _build_tract_df(
         _TractInputs(
@@ -749,6 +756,79 @@ def build_joined_table(
     _fill_numeric_only(combined)
     combined = disaggregate_tract_counts_to_blocks(combined)
     return combined
+
+
+def build_tract_attributes(
+    *,
+    income_files: list[str] | None = None,
+    ethnicity_files: list[str] | None = None,
+    language_files: list[str] | None = None,
+    vehicle_files: list[str] | None = None,
+    age_files: list[str] | None = None,
+    county_fips_filter: Iterable[str] | None = None,
+    _clean_columns: bool = True,
+) -> pd.DataFrame:
+    """Build a tract-keyed table of additive demographic counts.
+
+    The income / ethnicity / language / vehicle / age tables are tract-level (or
+    coarser), so this collapses them to one row per 11-digit tract (``tract_fips``) with
+    the additive count columns summed. Block-level population and households are NOT
+    sourced here: they come from the TIGER blocks' POP20/HOUSING20 in
+    ``attach_demographics_to_blocks``, so a tract-level Census download is sufficient and
+    no block-level P1/H9 table is required. Percent (``perc_*``) ratio columns are
+    dropped — they are not additive and would be meaningless once summed.
+    """
+    tract_df = _build_tract_df(
+        _TractInputs(
+            income_files or [],
+            ethnicity_files or [],
+            language_files or [],
+            vehicle_files or [],
+            age_files or [],
+        )
+    )
+    if tract_df.empty:
+        return tract_df
+    if _clean_columns:
+        tract_df = _drop_unfriendly_cols(tract_df)
+    tract_df = _apply_fips_filter_df(tract_df, fips=county_fips_filter)
+    tract_df["tract_fips"] = tract_df["tract_id_clean"].astype(str).str[:11]
+    count_cols = [
+        str(c)
+        for c in tract_df.columns
+        if c != "tract_fips"
+        and not str(c).startswith("perc_")
+        and pd.api.types.is_numeric_dtype(tract_df[c])
+    ]
+    return tract_df.groupby("tract_fips", as_index=False)[count_cols].sum()
+
+
+def build_block_jobs(
+    jobs_files: list[str],
+    *,
+    county_fips_filter: Iterable[str] | None = None,
+) -> pd.DataFrame:
+    """Build a block-keyed LEHD WAC jobs table, keyed on the 15-digit ``block_fips``.
+
+    LEHD WAC is natively block-level (``w_geocode``), so it stays at the block level and
+    joins straight onto the TIGER blocks — no disaggregation needed. Several WAC vintages
+    are collapsed to one row per block.
+    """
+    jobs = _load_and_concat(
+        jobs_files,
+        rename={"C000": "tot_empl", "CE01": "low_wage", "CE02": "mid_wage", "CE03": "high_wage"},
+        usecols=["w_geocode", "C000", "CE01", "CE02", "CE03"],
+        dedupe_key="w_geocode",
+    )
+    if jobs.empty:
+        return jobs
+    jobs["block_fips"] = jobs["w_geocode"].astype(str).str.zfill(15)
+    jobs = jobs.drop(columns="w_geocode")
+    if county_fips_filter:
+        wanted = {str(code).zfill(5) for code in county_fips_filter}
+        jobs = jobs[jobs["block_fips"].str[:5].isin(wanted)].copy()
+    _fill_numeric_only(jobs)
+    return jobs
 
 
 # =============================================================================
@@ -932,6 +1012,76 @@ def join_blocks_to_attributes(
     if FORCE_FLOAT:
         _cast_int64_to_float(merged)
 
+    return merged
+
+
+def attach_demographics_to_blocks(
+    blocks: GeoDataFrame,
+    tract_attrs: DataFrame,
+    block_jobs: DataFrame | None = None,
+    *,
+    block_key: str = LEFT_KEY,
+    pop_col: str = "POP20",
+    hh_col: str = "HOUSING20",
+    field_weights: Mapping[str, tuple[str, str]] = TRACT_COUNT_DISAGG,
+) -> GeoDataFrame:
+    """Attach tract demographics to every block and split them down by block weight.
+
+    The TIGER block layer is the spine. Each block is matched to its tract
+    (``GEOID20[:11]``) and receives that tract's additive counts, which are then
+    apportioned to the block in proportion to its share of the tract's TIGER ``POP20``
+    (person counts) or ``HOUSING20`` (household counts) — the block-level population and
+    housing the 2020 Census already records in the block layer. ``total_pop`` /
+    ``total_hh`` are taken straight from POP20/HOUSING20. LEHD jobs, natively block-level,
+    are joined on the block id. This means tract-level Census tables are sufficient; no
+    block-level P1/H9 download is required.
+
+    Args:
+        blocks: TIGER block geometry, carrying ``block_key`` plus ``pop_col``/``hh_col``.
+        tract_attrs: One row per ``tract_fips`` with the additive count columns.
+        block_jobs: Optional block-keyed LEHD jobs (``block_fips`` + job columns).
+        block_key: 15-digit block id column on ``blocks`` (``GEOID20``).
+        pop_col: Block population column (``POP20``) used as ``total_pop`` and person weight.
+        hh_col: Block housing column (``HOUSING20``) used as ``total_hh`` and household weight.
+        field_weights: ``{count: (weight_column, output_column)}`` for the split.
+
+    Returns:
+        ``blocks`` with ``total_pop``/``total_hh``, the disaggregated counts, and jobs.
+    """
+    merged = blocks.copy()
+    merged[block_key] = merged[block_key].astype(str)
+    merged["tract_fips"] = merged[block_key].str[:11]
+
+    logging.info(
+        "Attaching demographics: %d block(s), %d tract row(s), %d job row(s).",
+        len(merged),
+        0 if tract_attrs is None else len(tract_attrs),
+        0 if block_jobs is None else len(block_jobs),
+    )
+
+    if tract_attrs is not None and not tract_attrs.empty:
+        merged = merged.merge(tract_attrs, on="tract_fips", how="left", validate="m:1")
+
+    # Block population & households come straight from TIGER; they double as the weights
+    # that split each tract count back down to its blocks.
+    for out_col, src_col in (("total_pop", pop_col), ("total_hh", hh_col)):
+        if src_col in merged.columns:
+            merged[out_col] = pd.to_numeric(merged[src_col], errors="coerce").fillna(0.0)
+        else:
+            logging.warning("TIGER blocks lack '%s'; '%s' set to 0.", src_col, out_col)
+            merged[out_col] = 0.0
+
+    if block_jobs is not None and not block_jobs.empty:
+        merged = merged.merge(
+            block_jobs, left_on=block_key, right_on="block_fips", how="left", validate="m:1"
+        ).drop(columns="block_fips", errors="ignore")
+
+    _fill_numeric_only(merged)
+    merged = disaggregate_tract_counts_to_blocks(
+        merged, tract_key="tract_fips", field_weights=field_weights
+    )
+    if FORCE_FLOAT:
+        _cast_int64_to_float(merged)
     return merged
 
 
@@ -1227,10 +1377,12 @@ def run(
         # -------- Stage 1: CSV merge --------
         logging.info("Stage 1/3: discovering & merging Census CSVs under %s", input_csv_dir)
         discovered = discover_census_files(input_csv_dir)
-        attrs_df = build_joined_table(
-            pop_files=discovered["POP_FILES"],
-            hh_files=discovered["HH_FILES"],
-            jobs_files=discovered["JOBS_FILES"],
+        if discovered["POP_FILES"] or discovered["HH_FILES"]:
+            logging.info(
+                "Population and households are taken from the TIGER blocks' POP20/HOUSING20; "
+                "any P1/H9 tables found are not required and are ignored."
+            )
+        tract_attrs = build_tract_attributes(
             income_files=discovered["INCOME_FILES"],
             ethnicity_files=discovered["ETHNICITY_FILES"],
             language_files=discovered["LANGUAGE_FILES"],
@@ -1238,10 +1390,15 @@ def run(
             age_files=discovered["AGE_FILES"],
             county_fips_filter=fips_to_filter,
         )
-        logging.info("Stage 1 produced attribute table with shape %s", attrs_df.shape)
+        block_jobs = build_block_jobs(discovered["JOBS_FILES"], county_fips_filter=fips_to_filter)
+        logging.info(
+            "Stage 1 produced %d tract attribute row(s) and %d block-job row(s).",
+            len(tract_attrs),
+            len(block_jobs),
+        )
 
         if not _is_blank(intermediate_combined_csv):
-            write_csv(attrs_df, intermediate_combined_csv)
+            write_csv(tract_attrs, intermediate_combined_csv)
 
         # -------- Stage 2: TIGER merge + FIPS filter --------
         logging.info("Stage 2/3: discovering & merging TIGER shapefiles under %s", input_shp_dir)
@@ -1253,10 +1410,9 @@ def run(
         if not _is_blank(intermediate_merged_shp):
             write_geo(blocks_gdf, intermediate_merged_shp)
 
-        # -------- Stage 3: join attributes onto geometry --------
-        logging.info("Stage 3/3: joining attributes onto block geometry")
-        attrs_df = normalize_attribute_keys(attrs_df)
-        joined = join_blocks_to_attributes(blocks_gdf, attrs_df)
+        # -------- Stage 3: attach demographics onto geometry --------
+        logging.info("Stage 3/3: attaching demographics onto block geometry")
+        joined = attach_demographics_to_blocks(blocks_gdf, tract_attrs, block_jobs)
         write_geo(joined, final_joined_features)
 
         logging.info("Pipeline completed successfully.")
