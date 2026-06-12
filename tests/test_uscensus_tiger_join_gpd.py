@@ -790,6 +790,86 @@ def test_disaggregate_noop_without_tract_key() -> None:
 
 
 # =============================================================================
+# build_tract_attributes / build_block_jobs / attach_demographics_to_blocks
+# =============================================================================
+
+
+def test_build_tract_attributes_keys_by_tract_and_drops_perc(tmp_path: Path) -> None:
+    bands = ",".join(f"B19001_{n:03d}E" for n in range(1, 12))
+    p = tmp_path / "B19001-Data.csv"
+    _write_plain_csv(
+        p,
+        _census_csv(
+            f"GEO_ID,NAME,{bands}",
+            "Geo,Name," + ",".join(["l"] * 11),
+            f"{_TRACT_GEO_ID},Tract," + ",".join(["100"] * 11),
+        ),
+    )
+    out = mod.build_tract_attributes(income_files=[str(p)])
+    assert len(out) == 1  # one row per tract
+    assert out["tract_fips"].iloc[0] == "11001000100"
+    assert out["low_income"].iloc[0] == 1000  # 10 income bands x 100
+    assert not any(str(c).startswith("perc_") for c in out.columns)
+
+
+def test_build_block_jobs_keys_on_block_fips(tmp_path: Path) -> None:
+    wac = tmp_path / "wac_S000_JT00.csv"
+    _write_plain_csv(wac, "w_geocode,C000,CE01,CE02,CE03\n110010001001001,50,10,15,25\n")
+    jobs = mod.build_block_jobs([str(wac)])
+    assert jobs["block_fips"].iloc[0] == "110010001001001"
+    assert jobs["tot_empl"].iloc[0] == 50
+    assert "w_geocode" not in jobs.columns
+
+
+def test_build_block_jobs_applies_fips_filter(tmp_path: Path) -> None:
+    wac = tmp_path / "wac.csv"
+    _write_plain_csv(
+        wac,
+        "w_geocode,C000,CE01,CE02,CE03\n110010001001001,50,10,15,25\n240010001001001,99,9,9,9\n",
+    )
+    jobs = mod.build_block_jobs([str(wac)], county_fips_filter=["11001"])
+    assert jobs["block_fips"].tolist() == ["110010001001001"]
+
+
+def test_attach_demographics_uses_pop20_and_disaggregates() -> None:
+    # Three blocks in one tract; total_pop/total_hh come from POP20/HOUSING20, and the
+    # tract counts split across them by those weights (sum back to the tract total).
+    blocks = gpd.GeoDataFrame(
+        {
+            "GEOID20": ["110010001001001", "110010001001002", "110010001001003"],
+            "POP20": [100, 300, 0],
+            "HOUSING20": [40, 120, 0],
+            "geometry": [Point(0, 0), Point(1, 1), Point(2, 2)],
+        },
+        crs="EPSG:4326",
+    )
+    tract_attrs = pd.DataFrame(
+        {"tract_fips": ["11001000100"], "minority": [40.0], "low_income": [16.0]}
+    )
+    result = mod.attach_demographics_to_blocks(blocks, tract_attrs, None).sort_values("POP20")
+    assert result["total_pop"].tolist() == [0.0, 100.0, 300.0]
+    assert result["total_hh"].tolist() == [0.0, 40.0, 120.0]
+    assert result["minority"].tolist() == pytest.approx([0.0, 10.0, 30.0])  # 40 split by POP20
+    assert result["low_income"].tolist() == pytest.approx([0.0, 4.0, 12.0])  # 16 split by HOUSING20
+
+
+def test_attach_demographics_joins_block_jobs_and_fills_unmatched() -> None:
+    blocks = gpd.GeoDataFrame(
+        {
+            "GEOID20": ["110010001001001", "110010001001002"],
+            "POP20": [100, 100],
+            "HOUSING20": [40, 40],
+            "geometry": [Point(0, 0), Point(1, 1)],
+        },
+        crs="EPSG:4326",
+    )
+    jobs = pd.DataFrame({"block_fips": ["110010001001001"], "tot_empl": [9.0]})
+    result = mod.attach_demographics_to_blocks(blocks, pd.DataFrame(), jobs).set_index("GEOID20")
+    assert result.loc["110010001001001", "tot_empl"] == 9.0
+    assert result.loc["110010001001002", "tot_empl"] == 0.0  # unmatched block -> 0
+
+
+# =============================================================================
 # discover_tiger_datasets  (Stage 2)
 # =============================================================================
 
