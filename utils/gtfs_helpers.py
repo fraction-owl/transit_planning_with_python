@@ -135,3 +135,53 @@ def load_gtfs_data(
             ) from exc
 
     return data
+
+
+def load_express_route_ids(
+    inline_ids: Optional[Sequence[str]] = None,
+    txt_path: Optional[str] = None,
+) -> set[str]:
+    """Resolve the set of express-route ``route_id`` values from two sources.
+
+    Express/commuter routes (long highway corridors with few stops) need to be
+    treated differently from local routes in coverage and ridership work. This
+    helper lets callers name those routes either inline or in an external file,
+    and returns the union so a script can accept both without duplicating the
+    parsing logic.
+
+    Args:
+        inline_ids: ``route_id`` values supplied directly (e.g. an
+            ``EXPRESS_ROUTE_IDS`` config list). ``None`` is treated as empty.
+        txt_path: Path to a text file with one ``route_id`` per line. Blank
+            lines are skipped and ``#`` starts a comment (whole-line or inline).
+            ``None`` skips the file. A path that is set but missing is logged as
+            a warning and skipped — the inline ids are still returned.
+
+    Returns:
+        The unioned set of express ``route_id`` strings (possibly empty). Every
+        id is coerced to a trimmed ``str`` so it matches GTFS ``route_id`` values,
+        which are read as strings.
+    """
+    express: set[str] = set()
+
+    for raw in inline_ids or ():
+        text = str(raw).strip()
+        if text:
+            express.add(text)
+
+    if txt_path:
+        if not os.path.exists(txt_path):
+            logging.warning(
+                "Express-routes file '%s' not found; using inline route ids only.",
+                txt_path,
+            )
+        else:
+            with open(txt_path, encoding="utf-8") as handle:
+                for line in handle:
+                    text = line.split("#", 1)[0].strip()
+                    if text:
+                        express.add(text)
+            logging.info("Loaded express route ids from '%s'.", txt_path)
+
+    logging.info("Resolved %d express route_id(s).", len(express))
+    return express
