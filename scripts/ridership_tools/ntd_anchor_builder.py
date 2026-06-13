@@ -81,8 +81,13 @@ GRAIN: Final[str] = "panel"
 # Inclusive month range to pull, as "Mon-YYYY". Workbooks whose parsed period
 # falls outside this range are ignored even if present on disk. For a cross-
 # sectional pool this window is the pooling window, so choose it deliberately.
-START_MONTH: Final[str] = "Jul-2024"
-END_MONTH: Final[str] = "Apr-2026"
+#
+# Leave either bound BLANK ("") to make it dynamic: an empty START_MONTH starts
+# at the earliest workbook on disk, an empty END_MONTH ends at the latest, and
+# leaving both blank pulls whatever is in DATA_ROOT with no clamping. Set a bound
+# explicitly whenever you need control over the window.
+START_MONTH: Final[str] = ""
+END_MONTH: Final[str] = ""
 
 # -----------------------------------------------------------------------------
 #  Service-day selection
@@ -198,6 +203,15 @@ def to_period_ym(value: str) -> str:
     return parse_month(value).strftime("%Y-%m")
 
 
+def parse_month_bound(value: str) -> datetime | None:
+    """Parse a range bound, treating a blank string as "unbounded" (``None``).
+
+    Lets START_MONTH / END_MONTH be left empty to mean "use whatever is on disk"
+    on that side of the range. A non-blank value is parsed as ``Mon-YYYY``.
+    """
+    return parse_month(value) if value.strip() else None
+
+
 def parse_filename_period(filename: str) -> str | None:
     """Extract a ``Mon-YYYY`` period key from a workbook filename.
 
@@ -298,10 +312,22 @@ def discover_workbooks(data_root: Path) -> dict[str, Path]:
     return found
 
 
-def periods_in_range(workbooks: dict[str, Path], start: datetime, end: datetime) -> list[str]:
-    """Return discovered period keys within ``[start, end]``, chronologically."""
+def periods_in_range(
+    workbooks: dict[str, Path],
+    start: datetime | None,
+    end: datetime | None,
+) -> list[str]:
+    """Return discovered period keys within ``[start, end]``, chronologically.
+
+    A ``None`` bound is treated as open-ended on that side, so passing both as
+    ``None`` returns every discovered period.
+    """
     return sorted(
-        (k for k in workbooks if start <= parse_month(k) <= end),
+        (
+            k
+            for k in workbooks
+            if (start is None or parse_month(k) >= start) and (end is None or parse_month(k) <= end)
+        ),
         key=parse_month,
     )
 
@@ -627,12 +653,27 @@ def main() -> None:
     else:
         logging.info("Discovered %d workbook(s).", len(workbooks))
 
-    start_dt, end_dt = parse_month(START_MONTH), parse_month(END_MONTH)
-    periods = periods_in_range(workbooks, start_dt, end_dt)
-    if not periods:
-        logging.warning("No discovered workbooks fall in %s..%s.", START_MONTH, END_MONTH)
+    try:
+        start_dt = parse_month_bound(START_MONTH)
+        end_dt = parse_month_bound(END_MONTH)
+    except ValueError as exc:
+        logging.error(
+            "START_MONTH / END_MONTH must be blank or 'Mon-YYYY' (e.g. 'Jul-2024'): %s", exc
+        )
+        sys.exit(1)
+    if start_dt is not None and end_dt is not None and start_dt > end_dt:
+        logging.error("START_MONTH (%s) is after END_MONTH (%s).", START_MONTH, END_MONTH)
+        sys.exit(1)
 
-    logging.info("=== STEP 1: READ WORKBOOKS (%s..%s) ===", START_MONTH, END_MONTH)
+    periods = periods_in_range(workbooks, start_dt, end_dt)
+    # Report the window actually applied, naming the dynamic ends explicitly so a
+    # blank bound is never mistaken for a silently dropped month.
+    start_label = START_MONTH if start_dt is not None else "earliest on disk"
+    end_label = END_MONTH if end_dt is not None else "latest on disk"
+    if not periods:
+        logging.warning("No discovered workbooks fall in %s..%s.", start_label, end_label)
+
+    logging.info("=== STEP 1: READ WORKBOOKS (%s..%s) ===", start_label, end_label)
     raw = load_raw(workbooks, periods, selected_periods)
 
     logging.info("=== STEP 2: AGGREGATE TO '%s' GRAIN ('%s') ===", GRAIN, selection)
@@ -652,7 +693,7 @@ def main() -> None:
     summary_lines = [
         f"Grain:            {GRAIN}",
         f"Service day:      {selection} (periods: {', '.join(selected_periods)})",
-        f"Period range:     {START_MONTH}..{END_MONTH}",
+        f"Period range:     {start_label}..{end_label}",
         f"Workbooks found:  {len(workbooks)}",
         f"Periods loaded:   {len(periods)} ({', '.join(periods) or 'none'})",
         f"Output file:      {out_path.name}",
