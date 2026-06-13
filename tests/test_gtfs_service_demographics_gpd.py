@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import math
 import zipfile
 from pathlib import Path
@@ -9,7 +10,7 @@ import matplotlib
 import networkx as nx
 import pandas as pd
 import pytest
-from shapely.geometry import LineString, Point, Polygon
+from shapely.geometry import LineString, Point, Polygon, box
 
 matplotlib.use("Agg")  # headless backend; the module imports matplotlib.pyplot
 
@@ -28,6 +29,7 @@ from scripts.service_coverage.gtfs_service_demographics_gpd import (
     filter_weekday_service,
     get_included_routes,
     get_included_stops,
+    load_express_route_ids,
     load_gtfs_data,
     pick_buffer_distance,
     quantize_node,
@@ -681,3 +683,117 @@ def test_stops_to_points_gdf_no_matching_stops_returns_none(
         [],
     )
     assert result is None
+
+
+# ---------------------------------------------------------------------------
+# load_express_route_ids
+# ---------------------------------------------------------------------------
+
+
+def test_load_express_route_ids_inline_only() -> None:
+    assert load_express_route_ids(["101", "303"], None) == {"101", "303"}
+
+
+def test_load_express_route_ids_none_returns_empty() -> None:
+    assert load_express_route_ids(None, None) == set()
+
+
+def test_load_express_route_ids_trims_dedups_and_coerces() -> None:
+    # Whitespace trimmed, duplicates collapsed, non-str ids coerced to str.
+    assert load_express_route_ids([" 101 ", "101", 303], None) == {"101", "303"}
+
+
+def test_load_express_route_ids_unions_inline_and_file(tmp_path: Path) -> None:
+    f = tmp_path / "express.txt"
+    f.write_text("101\n# whole-line comment\n202  # inline comment\n\n303\n", encoding="utf-8")
+    assert load_express_route_ids(["404"], str(f)) == {"101", "202", "303", "404"}
+
+
+def test_load_express_route_ids_missing_file_warns_and_keeps_inline(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.WARNING):
+        result = load_express_route_ids(["101"], str(tmp_path / "nope.txt"))
+    assert result == {"101"}
+    assert "not found" in caplog.text
+
+
+def test_load_express_route_ids_reads_repo_fixture() -> None:
+    # The shipped example fixture demonstrates the on-disk format.
+    result = load_express_route_ids(None, str(FIXTURES / "express_routes.txt"))
+    assert result == {"101", "303"}
+
+
+# ---------------------------------------------------------------------------
+# run() route mode — service_type labeling (Phase 1)
+# ---------------------------------------------------------------------------
+
+
+def _covering_demographics(stops_gdf: gpd.GeoDataFrame, tmp_path: Path) -> Path:
+    """Write a demographics shapefile whose single square covers every stop."""
+    minx, miny, maxx, maxy = stops_gdf.total_bounds
+    pad = 5_000.0  # metres, comfortably larger than the 0.25-mile stop buffer
+    demo = gpd.GeoDataFrame(
+        {"total_pop": [1_000]},
+        geometry=[box(minx - pad, miny - pad, maxx + pad, maxy + pad)],
+        crs=f"EPSG:{CRS_EPSG_CODE}",
+    )
+    path = tmp_path / "demo.shp"
+    demo.to_file(path)
+    return path
+
+
+def test_run_route_mode_labels_express_routes(
+    tmp_path: Path, dc_gtfs_dir: Path, dc_gtfs: dict[str, pd.DataFrame]
+) -> None:
+    final_routes = get_included_routes(dc_gtfs["routes"], [], [])
+    stops_gdf = _stops_to_points_gdf(
+        dc_gtfs["trips"], dc_gtfs["stop_times"], dc_gtfs["stops"], final_routes, [], []
+    )
+    assert stops_gdf is not None
+    demo_path = _covering_demographics(stops_gdf, tmp_path)
+
+    express_id = str(dc_gtfs["routes"]["route_id"].iloc[0])
+    out_dir = tmp_path / "out"
+    run(
+        analysis_mode="route",
+        service_area_method="stop_buffer",
+        gtfs_data_path=str(dc_gtfs_dir),
+        demographics_shp_path=str(demo_path),
+        output_directory=str(out_dir),
+        express_route_ids=[express_id],
+    )
+
+    summary = pd.read_csv(out_dir / "service_demographics_by_route.csv")
+    assert "service_type" in summary.columns
+    assert set(summary["service_type"]) <= {"express", "local"}
+
+    route_ids = summary["route_id"].astype(str)
+    assert (summary.loc[route_ids == express_id, "service_type"] == "express").all()
+    assert (summary.loc[route_ids != express_id, "service_type"] == "local").all()
+    # Exactly the one named route is flagged express.
+    assert (summary["service_type"] == "express").sum() == 1
+
+
+def test_run_route_mode_all_local_without_express_list(
+    tmp_path: Path, dc_gtfs_dir: Path, dc_gtfs: dict[str, pd.DataFrame]
+) -> None:
+    final_routes = get_included_routes(dc_gtfs["routes"], [], [])
+    stops_gdf = _stops_to_points_gdf(
+        dc_gtfs["trips"], dc_gtfs["stop_times"], dc_gtfs["stops"], final_routes, [], []
+    )
+    assert stops_gdf is not None
+    demo_path = _covering_demographics(stops_gdf, tmp_path)
+
+    out_dir = tmp_path / "out"
+    run(
+        analysis_mode="route",
+        service_area_method="stop_buffer",
+        gtfs_data_path=str(dc_gtfs_dir),
+        demographics_shp_path=str(demo_path),
+        output_directory=str(out_dir),
+        express_route_ids=[],
+    )
+
+    summary = pd.read_csv(out_dir / "service_demographics_by_route.csv")
+    assert (summary["service_type"] == "local").all()

@@ -87,6 +87,19 @@ SERVICE_IDS_TO_INCLUDE: Final[list[str]] = []
 ROUTES_TO_INCLUDE: list[str] = []  # empty = all routes; set e.g. ["101", "202"] for a subset
 ROUTES_TO_EXCLUDE: list[str] = []  # e.g. [] for no exclude filter
 
+# Express routes:
+# Express/commuter routes whose service areas are unreliable under the standard
+# walk-buffer methods (a long highway corridor served by only a few stops). For
+# now this only *labels* them: in "route" mode each output row gets a
+# ``service_type`` column of "express" or "local", so the downstream ridership
+# model can fit them separately. Catchment geometry is unchanged in this pass.
+# The express set is the union of two sources, matched against GTFS ``route_id``:
+#   1) EXPRESS_ROUTE_IDS: route_id values listed inline (e.g. ["101", "303"]).
+#   2) EXPRESS_ROUTES_FILE: path to a text file with one route_id per line
+#      ("#" starts a comment). Set to None to use the inline list only.
+EXPRESS_ROUTE_IDS: list[str] = []
+EXPRESS_ROUTES_FILE: str | None = None
+
 # Stop filters:
 # 1) STOP_IDS_TO_INCLUDE: If non-empty, only these stops are considered (after route filter).
 # 2) STOP_IDS_TO_EXCLUDE: If non-empty, these stops are removed (after route filter).
@@ -757,6 +770,7 @@ def do_network_analysis(
     ped_graph: Optional[nx.MultiGraph] = None,
     walk_time_min: float = 0.0,
     walk_speed_units_per_s: float = 0.0,
+    express_route_ids: Optional[set[str]] = None,
 ) -> None:
     """Run a single network-wide service-area/clip analysis.
 
@@ -785,6 +799,9 @@ def do_network_analysis(
         ped_graph: Pedestrian network (for the ``isochrone`` method).
         walk_time_min: Walk-time budget in minutes (isochrone method).
         walk_speed_units_per_s: Walking speed in CRS units/s (isochrone method).
+        express_route_ids: Express ``route_id`` values. Accepted for a uniform
+            dispatch signature but unused here — the ``service_type`` label is a
+            per-route output, emitted only by ``do_route_by_route_analysis``.
 
     Returns:
         - A single shapefile (all_routes_service_buffer_data.shp)
@@ -873,6 +890,7 @@ def do_route_by_route_analysis(
     ped_graph: Optional[nx.MultiGraph] = None,
     walk_time_min: float = 0.0,
     walk_speed_units_per_s: float = 0.0,
+    express_route_ids: Optional[set[str]] = None,
 ) -> None:
     """Perform a service-area/clip analysis for each individual route.
 
@@ -885,7 +903,10 @@ def do_route_by_route_analysis(
       - One combined ``service_demographics_by_route.csv`` keyed on ``route_id``
         (one row per route_id) — the table the feature bundle / fit_model.py
         consume. The route identity lives in a real column here, not just the
-        filename, so the orchestrator can join it onto the ridership anchor.
+        filename, so the orchestrator can join it onto the ridership anchor. A
+        ``service_type`` column labels each route ``"express"`` (its route_id is
+        in ``express_route_ids``) or ``"local"`` so the model can fit the two
+        differently; catchment geometry is identical for both in this pass.
     """
     logging.info("\n=== Route-by-Route Analysis (%s) ===", service_area_method)
 
@@ -912,6 +933,9 @@ def do_route_by_route_analysis(
     short_to_route_ids = (
         final_routes_df.groupby("route_short_name")["route_id"].apply(list).to_dict()
     )
+    # Express routes are labeled (not yet buffered differently) via a service_type
+    # column on each output row; an empty set leaves every route labeled "local".
+    express_set = express_route_ids or set()
     summary_records: list[dict[str, object]] = []
 
     for route_name in stops_gdf["route_short_name"].unique():
@@ -966,7 +990,12 @@ def do_route_by_route_analysis(
         route_totals = {str(col).replace("synthetic_", ""): int(val) for col, val in totals.items()}
         for route_id in short_to_route_ids.get(route_name, [route_name]):
             summary_records.append(
-                {"route_id": route_id, "route_short_name": route_name, **route_totals}
+                {
+                    "route_id": route_id,
+                    "route_short_name": route_name,
+                    "service_type": "express" if str(route_id) in express_set else "local",
+                    **route_totals,
+                }
             )
 
     # Write one combined, route_id-keyed CSV for the bundle. prep_features.py
@@ -1003,6 +1032,7 @@ def do_stop_by_stop_analysis(
     ped_graph: Optional[nx.MultiGraph] = None,
     walk_time_min: float = 0.0,
     walk_speed_units_per_s: float = 0.0,
+    express_route_ids: Optional[set[str]] = None,
 ) -> None:
     """Compute a service area and demographic catchment for each stop.
 
@@ -1215,6 +1245,60 @@ def load_gtfs_data(
     return data
 
 
+def load_express_route_ids(
+    inline_ids: Optional[Sequence[str]] = None,
+    txt_path: Optional[str] = None,
+) -> set[str]:
+    """Resolve the set of express-route ``route_id`` values from two sources.
+
+    Copied verbatim from utils/gtfs_helpers.py so this script stays
+    self-contained (same convention as the helpers above). Keep both copies in
+    sync when updating either.
+
+    Express/commuter routes (long highway corridors with few stops) need to be
+    treated differently from local routes in coverage and ridership work. This
+    helper lets callers name those routes either inline or in an external file,
+    and returns the union so a script can accept both without duplicating the
+    parsing logic.
+
+    Args:
+        inline_ids: ``route_id`` values supplied directly (e.g. an
+            ``EXPRESS_ROUTE_IDS`` config list). ``None`` is treated as empty.
+        txt_path: Path to a text file with one ``route_id`` per line. Blank
+            lines are skipped and ``#`` starts a comment (whole-line or inline).
+            ``None`` skips the file. A path that is set but missing is logged as
+            a warning and skipped — the inline ids are still returned.
+
+    Returns:
+        The unioned set of express ``route_id`` strings (possibly empty). Every
+        id is coerced to a trimmed ``str`` so it matches GTFS ``route_id`` values,
+        which are read as strings.
+    """
+    express: set[str] = set()
+
+    for raw in inline_ids or ():
+        text = str(raw).strip()
+        if text:
+            express.add(text)
+
+    if txt_path:
+        if not os.path.exists(txt_path):
+            logging.warning(
+                "Express-routes file '%s' not found; using inline route ids only.",
+                txt_path,
+            )
+        else:
+            with open(txt_path, encoding="utf-8") as handle:
+                for line in handle:
+                    text = line.split("#", 1)[0].strip()
+                    if text:
+                        express.add(text)
+            logging.info("Loaded express route ids from '%s'.", txt_path)
+
+    logging.info("Resolved %d express route_id(s).", len(express))
+    return express
+
+
 # =============================================================================
 # MAIN
 # =============================================================================
@@ -1239,6 +1323,8 @@ def run(
     walk_speed_mph: float | None = None,
     fips_filter: Sequence[str] | None = None,
     crs_epsg_code: int | None = None,
+    express_route_ids: Sequence[str] | None = None,
+    express_routes_file: str | Path | None = None,
 ) -> None:
     """Run the catchment-area analysis.
 
@@ -1283,6 +1369,15 @@ def run(
     walk_speed_mph = WALK_SPEED_MPH if walk_speed_mph is None else walk_speed_mph
     fips_filter = list(FIPS_FILTER if fips_filter is None else fips_filter)
     crs_epsg_code = CRS_EPSG_CODE if crs_epsg_code is None else crs_epsg_code
+    express_route_ids = list(EXPRESS_ROUTE_IDS if express_route_ids is None else express_route_ids)
+    express_routes_file = (
+        EXPRESS_ROUTES_FILE if express_routes_file is None else express_routes_file
+    )
+    # Union the inline list and the optional .txt into the set used for labeling.
+    express_route_id_set = load_express_route_ids(
+        express_route_ids,
+        str(express_routes_file) if express_routes_file else None,
+    )
 
     try:
         # --------------------------------------------------------------
@@ -1416,6 +1511,7 @@ def run(
             ped_graph=ped_graph,
             walk_time_min=isochrone_walk_time_min,
             walk_speed_units_per_s=walk_speed_units_per_s,
+            express_route_ids=express_route_id_set,
         )
 
         logging.info("\nAnalysis completed successfully.")
@@ -1542,6 +1638,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Projected (metric) EPSG code for area calculations.",
     )
     parser.add_argument(
+        "--express-routes",
+        nargs="*",
+        default=EXPRESS_ROUTE_IDS,
+        metavar="ROUTE_ID",
+        help="route_id values to label 'express' in route mode (default: none).",
+    )
+    parser.add_argument(
+        "--express-routes-file",
+        default=EXPRESS_ROUTES_FILE,
+        help="Path to a text file of express route_ids, one per line ('#' comments).",
+    )
+    parser.add_argument(
         "--log-level",
         default=logging.getLevelName(LOG_LEVEL),
         help="DEBUG / INFO / WARNING / ERROR.",
@@ -1577,6 +1685,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             walk_speed_mph=args.walk_speed_mph,
             fips_filter=args.fips,
             crs_epsg_code=args.crs_epsg,
+            express_route_ids=args.express_routes,
+            express_routes_file=args.express_routes_file,
         )
     except Exception:
         # run() already logged the traceback; exit non-zero so the orchestrator
