@@ -29,6 +29,9 @@ Typical inputs:
 Outputs:
     - Shapefiles (.shp) and Excel summaries (.xlsx) for each analysis unit.
     - Optional matplotlib plots for visual inspection.
+    - Optional ``express_origin_candidates.csv`` advisory when express routes are
+      set: stops ranked by nearby jobs, flagging the job-poor ones as likely
+      express origins for review (it never changes any buffer).
 """
 
 import argparse
@@ -133,6 +136,20 @@ EXPRESS_ORIGIN_BUFFER_DISTANCE = 2.0  # Drive-access buffer for express origin s
 # only candidates, and a later advisory can suggest which of them are origins.
 EXPRESS_ORIGIN_STOP_IDS: list[str] = []
 EXPRESS_ORIGIN_STOPS_FILE: str | None = None
+
+# Express origin advisory:
+# When EXPRESS_ROUTE_IDS / file is set and the demographics layer carries a jobs
+# field, score each express-route stop by the jobs within a walk buffer and flag
+# the job-poor ones as *likely* origins (park-and-rides sit far from employment;
+# downtown destinations do not). Results are written to
+# express_origin_candidates.csv with a warning. Advisory only — it never changes
+# any buffer; review the flagged stop_ids and copy the real origins into
+# EXPRESS_ORIGIN_STOP_IDS yourself.
+EXPRESS_ORIGIN_ADVISORY: bool = True
+EXPRESS_ORIGIN_JOBS_FIELD: str = "tot_empl"  # demographics column holding job counts
+# A stop is flagged when its nearby jobs fall below this fraction of the
+# job-richest stop on the same route (a relative, per-route cutoff).
+EXPRESS_ORIGIN_JOBS_SHARE_THRESHOLD: float = 0.2
 
 # Isochrone settings (only used when SERVICE_AREA_METHOD == "isochrone")
 ISOCHRONE_WALK_TIME_MIN = 10.0  # Walk-time budget in minutes
@@ -764,6 +781,152 @@ def _stops_to_points_gdf(
     )
 
 
+def flag_express_origin_candidates(stop_jobs: pd.DataFrame, threshold: float) -> pd.DataFrame:
+    """Flag job-poor express-route stops as likely origins (pure ranking step).
+
+    On an express route, every stop is essentially either a suburban
+    park-and-ride *origin* (few jobs nearby) or an employment-anchor
+    *destination* (many jobs nearby), so jobs-near-the-stop separates the two.
+    A stop is flagged when its nearby-jobs count falls below ``threshold`` times
+    the job-richest stop on the *same* route — a relative, per-route rule that is
+    scale-free across big and small job markets. Routes whose stops all show zero
+    nearby jobs are inconclusive and flag nothing.
+
+    Args:
+        stop_jobs: One row per (route, stop) with at least ``route_short_name``,
+            ``stop_id``, and ``nearby_jobs`` columns.
+        threshold: Fraction of a route's maximum stop-jobs below which a stop is
+            flagged (e.g. ``0.2`` flags stops under 20% of the route's richest).
+
+    Returns:
+        A copy of *stop_jobs* with added ``jobs_share`` (the stop's share of its
+        route's total nearby jobs) and ``likely_origin`` (bool) columns, sorted
+        by route then ascending nearby jobs.
+    """
+    out = stop_jobs.copy()
+    out["nearby_jobs"] = pd.to_numeric(out["nearby_jobs"], errors="coerce").fillna(0.0)
+
+    grouped = out.groupby("route_short_name")["nearby_jobs"]
+    route_max = grouped.transform("max")
+    route_sum = grouped.transform("sum")
+
+    out["jobs_share"] = (out["nearby_jobs"] / route_sum).where(route_sum > 0, 0.0)
+    out["likely_origin"] = (route_max > 0) & (out["nearby_jobs"] < threshold * route_max)
+
+    return out.sort_values(["route_short_name", "nearby_jobs"]).reset_index(drop=True)
+
+
+def suggest_express_origin_stops(
+    trips: pd.DataFrame,
+    stop_times: pd.DataFrame,
+    routes_df: pd.DataFrame,
+    stops_df: pd.DataFrame,
+    demographics_gdf: gpd.GeoDataFrame,
+    *,
+    express_route_ids: set[str],
+    buffer_distance_mi: float,
+    jobs_field: str,
+    threshold: float,
+    output_dir: str,
+) -> Optional[pd.DataFrame]:
+    """Suggest which express-route stops are likely origins, from nearby jobs.
+
+    Advisory only: this never changes any buffer. For every stop on an express
+    route (``route_id`` in *express_route_ids*) it counts the jobs within a walk
+    buffer, ranks them per route via :func:`flag_express_origin_candidates`, and
+    writes ``express_origin_candidates.csv`` plus a warning naming the flagged
+    stops — so the flagged ``stop_id`` values can be reviewed and copied into
+    ``EXPRESS_ORIGIN_STOP_IDS``.
+
+    No-ops (returning ``None``) when there are no express routes, the demographics
+    layer lacks *jobs_field*, or no express stops resolve.
+
+    Args:
+        trips: Calendar-filtered GTFS ``trips`` table.
+        stop_times: GTFS ``stop_times`` table.
+        routes_df: GTFS ``routes`` table (needs ``route_id``/``route_short_name``).
+        stops_df: GTFS ``stops`` table.
+        demographics_gdf: Projected demographics layer carrying *jobs_field*.
+        express_route_ids: ``route_id`` values treated as express.
+        buffer_distance_mi: Walk-buffer radius used to count nearby jobs.
+        jobs_field: Demographics column holding the job count (e.g. ``tot_empl``).
+        threshold: Per-route flag cutoff passed through to the ranking step.
+        output_dir: Directory the candidates CSV is written to.
+
+    Returns:
+        The ranked candidates DataFrame, or ``None`` when the advisory cannot run.
+    """
+    if not express_route_ids:
+        return None
+    if jobs_field not in demographics_gdf.columns:
+        logging.info(
+            "Express-origin advisory skipped: demographics layer has no jobs field '%s'.",
+            jobs_field,
+        )
+        return None
+
+    express_routes_df = routes_df[routes_df["route_id"].astype(str).isin(express_route_ids)]
+    if express_routes_df.empty:
+        logging.info("Express-origin advisory: no express route_id matched routes.txt; skipping.")
+        return None
+
+    stops_gdf = _stops_to_points_gdf(trips, stop_times, stops_df, express_routes_df, [], [])
+    if stops_gdf is None or stops_gdf.empty:
+        logging.info("Express-origin advisory: no stops on the express routes; skipping.")
+        return None
+
+    # Jobs near a stop depend only on the stop, so compute once per stop_id and
+    # attribute back to each (route, stop) pair for per-route normalization.
+    keep_cols = ["stop_id", "route_short_name"]
+    if "stop_name" in stops_gdf.columns:
+        keep_cols.append("stop_name")
+    pairs = stops_gdf[keep_cols].drop_duplicates().reset_index(drop=True)
+
+    jobs_col = f"synthetic_{jobs_field}"
+    jobs_by_stop: dict[str, float] = {}
+    for stop_id, geom in (
+        stops_gdf.drop_duplicates(subset="stop_id").set_index("stop_id").geometry.items()
+    ):
+        key = str(stop_id)
+        single = gpd.GeoDataFrame({"stop_id": [key]}, geometry=[geom], crs=stops_gdf.crs)
+        area = build_service_area_polygon(
+            single,
+            method="stop_buffer",
+            buffer_distance_mi=buffer_distance_mi,
+            large_buffer_distance_mi=buffer_distance_mi,
+            stop_ids_large_buffer=[],
+        )
+        if area is None or area.empty:
+            jobs_by_stop[key] = 0.0
+            continue
+        clipped = clip_and_calculate_synthetic_fields(demographics_gdf, area, [jobs_field])
+        jobs_by_stop[key] = float(clipped[jobs_col].sum()) if jobs_col in clipped.columns else 0.0
+
+    pairs["nearby_jobs"] = pairs["stop_id"].astype(str).map(jobs_by_stop).fillna(0.0)
+    ranked = flag_express_origin_candidates(pairs, threshold)
+
+    os.makedirs(output_dir, exist_ok=True)
+    csv_path = os.path.join(output_dir, "express_origin_candidates.csv")
+    ranked.to_csv(csv_path, index=False)
+
+    flagged = ranked[ranked["likely_origin"]]
+    if flagged.empty:
+        logging.info(
+            "Express-origin advisory: no likely origins flagged (wrote %s for review).", csv_path
+        )
+    else:
+        logging.warning(
+            "Express-origin advisory: %d stop(s) MAY be express origins (low nearby jobs). "
+            "Review %s, then add confirmed stop_ids to EXPRESS_ORIGIN_STOP_IDS. Flagged: %s",
+            len(flagged),
+            csv_path,
+            ", ".join(
+                f"{r.stop_id} (route {r.route_short_name})" for r in flagged.itertuples(index=False)
+            ),
+        )
+    return ranked
+
+
 def do_network_analysis(
     trips: pd.DataFrame,
     stop_times: pd.DataFrame,
@@ -1353,6 +1516,9 @@ def run(
     crs_epsg_code: int | None = None,
     express_route_ids: Sequence[str] | None = None,
     express_routes_file: str | Path | None = None,
+    express_origin_advisory: bool | None = None,
+    express_origin_jobs_field: str | None = None,
+    express_origin_jobs_threshold: float | None = None,
 ) -> None:
     """Run the catchment-area analysis.
 
@@ -1418,6 +1584,19 @@ def run(
         express_origin_stop_ids,
         str(express_origin_stops_file) if express_origin_stops_file else None,
         kind="express origin stop",
+    )
+    express_origin_advisory = (
+        EXPRESS_ORIGIN_ADVISORY if express_origin_advisory is None else express_origin_advisory
+    )
+    express_origin_jobs_field = (
+        EXPRESS_ORIGIN_JOBS_FIELD
+        if express_origin_jobs_field is None
+        else express_origin_jobs_field
+    )
+    express_origin_jobs_threshold = (
+        EXPRESS_ORIGIN_JOBS_SHARE_THRESHOLD
+        if express_origin_jobs_threshold is None
+        else express_origin_jobs_threshold
     )
 
     try:
@@ -1519,6 +1698,28 @@ def run(
         demographics_gdf = gpd.read_file(demographics_path)
         demographics_gdf = apply_fips_filter(demographics_gdf, fips_filter)
         demographics_gdf = demographics_gdf.to_crs(epsg=crs_epsg_code)
+
+        # --------------------------------------------------------------
+        # 3b) EXPRESS-ORIGIN ADVISORY (optional, non-fatal)
+        # --------------------------------------------------------------
+        # Suggest which express-route stops look like origins, for review. It
+        # must never break the real analysis, so failures are logged and ignored.
+        if express_origin_advisory and express_route_id_set:
+            try:
+                suggest_express_origin_stops(
+                    trips,
+                    stop_times,
+                    routes_df,
+                    stops_df,
+                    demographics_gdf,
+                    express_route_ids=express_route_id_set,
+                    buffer_distance_mi=buffer_distance,
+                    jobs_field=express_origin_jobs_field,
+                    threshold=express_origin_jobs_threshold,
+                    output_dir=str(output_directory),
+                )
+            except Exception:  # noqa: BLE001 — advisory must not abort the analysis
+                logging.warning("Express-origin advisory failed; continuing.", exc_info=True)
 
         # --------------------------------------------------------------
         # 4) ANALYSIS DISPATCH
@@ -1660,6 +1861,23 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Path to a text file of express origin stop_ids, one per line ('#' comments).",
     )
     parser.add_argument(
+        "--express-origin-advisory",
+        action=argparse.BooleanOptionalAction,
+        default=EXPRESS_ORIGIN_ADVISORY,
+        help="Suggest likely express origin stops from nearby jobs (when express routes are set).",
+    )
+    parser.add_argument(
+        "--express-origin-jobs-field",
+        default=EXPRESS_ORIGIN_JOBS_FIELD,
+        help="Demographics column holding job counts for the express-origin advisory.",
+    )
+    parser.add_argument(
+        "--express-origin-jobs-threshold",
+        type=float,
+        default=EXPRESS_ORIGIN_JOBS_SHARE_THRESHOLD,
+        help="Flag a stop when its nearby jobs fall below this fraction of its route's max.",
+    )
+    parser.add_argument(
         "--isochrone-walk-time",
         type=float,
         default=ISOCHRONE_WALK_TIME_MIN,
@@ -1735,6 +1953,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             crs_epsg_code=args.crs_epsg,
             express_route_ids=args.express_routes,
             express_routes_file=args.express_routes_file,
+            express_origin_advisory=args.express_origin_advisory,
+            express_origin_jobs_field=args.express_origin_jobs_field,
+            express_origin_jobs_threshold=args.express_origin_jobs_threshold,
         )
     except Exception:
         # run() already logged the traceback; exit non-zero so the orchestrator
