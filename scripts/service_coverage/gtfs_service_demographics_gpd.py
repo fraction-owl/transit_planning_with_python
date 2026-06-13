@@ -8,8 +8,8 @@ independent choices:
   surface), ``"route"`` (one surface per route), or ``"stop"`` (one surface per
   stop).
 * **Service-area method** — how each catchment polygon is built:
-    - ``"stop_buffer"``: a fixed-radius buffer around each transit stop
-      (the original behaviour, with optional per-stop large buffers).
+    - ``"stop_buffer"``: a fixed-radius buffer around each transit stop, with an
+      optional wider drive-access buffer for express origin (park-and-ride) stops.
     - ``"route_buffer"``: a fixed-radius buffer around the route-line geometry
       taken from GTFS ``shapes.txt``.
     - ``"isochrone"``: a walk-time isochrone (walkshed) around each stop,
@@ -56,8 +56,9 @@ from shapely.ops import unary_union
 ANALYSIS_MODE = "network"  # Options: "network", "route", "stop"
 
 # Select how the service-area polygon is built around the transit it serves:
-#   "stop_buffer"  → fixed-radius buffer around each stop (uses BUFFER_DISTANCE
-#                    and the optional large-buffer settings below).
+#   "stop_buffer"  → fixed-radius buffer around each stop (uses BUFFER_DISTANCE,
+#                    plus the wider express-origin buffer for the stops listed
+#                    in the express-origin settings below).
 #   "route_buffer" → fixed-radius buffer around the route-line geometry from
 #                    shapes.txt (uses BUFFER_DISTANCE). Falls back to
 #                    "stop_buffer" when route geometry is unavailable.
@@ -112,12 +113,26 @@ STOP_IDS_TO_EXCLUDE: list[
 ] = []  # e.g. [] for no include filter or [1010, 1011] for exclude filter
 
 # Buffer distances in miles (used by the "stop_buffer" and "route_buffer" methods)
-BUFFER_DISTANCE = 0.25  # Standard buffer distance
-LARGE_BUFFER_DISTANCE = 2.0  # Larger buffer distance for specified stops
+BUFFER_DISTANCE = 0.25  # Standard walk-access buffer (≈ a quarter-mile walkshed)
+EXPRESS_ORIGIN_BUFFER_DISTANCE = 2.0  # Drive-access buffer for express origin stops
 
-# If a stop_id is in this list, use LARGE_BUFFER_DISTANCE instead.
-# (Applies to the "stop_buffer" method only.)
-STOP_IDS_LARGE_BUFFER: list[str] = []
+# Express origin stops:
+# stop_ids that are *origin* stops on express/commuter routes — park-and-rides
+# and similar boarding points people reach by car, not on foot. Each of these
+# gets EXPRESS_ORIGIN_BUFFER_DISTANCE (a wide drive-access catchment) instead of
+# the standard walk buffer, so an express route's residential market is captured
+# rather than just the near-empty quarter-mile around a highway lot. Every other
+# stop — including express *destination* stops downtown — keeps BUFFER_DISTANCE,
+# so only the origins need to be listed here. (Applies to the "stop_buffer"
+# method, which is the right method for express routes anyway.) The set is the
+# union of two sources, matched against GTFS ``stop_id``:
+#   1) EXPRESS_ORIGIN_STOP_IDS: stop_id values listed inline.
+#   2) EXPRESS_ORIGIN_STOPS_FILE: path to a text file with one stop_id per line
+#      ("#" starts a comment). Set to None to use the inline list only.
+# Tip: run with EXPRESS_ROUTE_IDS set first; the express routes' stops are the
+# only candidates, and a later advisory can suggest which of them are origins.
+EXPRESS_ORIGIN_STOP_IDS: list[str] = []
+EXPRESS_ORIGIN_STOPS_FILE: str | None = None
 
 # Isochrone settings (only used when SERVICE_AREA_METHOD == "isochrone")
 ISOCHRONE_WALK_TIME_MIN = 10.0  # Walk-time budget in minutes
@@ -1245,58 +1260,70 @@ def load_gtfs_data(
     return data
 
 
-def load_express_route_ids(
+def load_id_set(
     inline_ids: Optional[Sequence[str]] = None,
     txt_path: Optional[str] = None,
+    *,
+    kind: str = "id",
 ) -> set[str]:
-    """Resolve the set of express-route ``route_id`` values from two sources.
+    """Union an inline list and an optional text file of ids into one set.
 
     Copied verbatim from utils/gtfs_helpers.py so this script stays
     self-contained (same convention as the helpers above). Keep both copies in
     sync when updating either.
 
-    Express/commuter routes (long highway corridors with few stops) need to be
-    treated differently from local routes in coverage and ridership work. This
-    helper lets callers name those routes either inline or in an external file,
-    and returns the union so a script can accept both without duplicating the
-    parsing logic.
+    Used to resolve override lists (express routes, express origin stops, …) that
+    a caller may supply inline, in an external file, or both — without repeating
+    the parsing for each one.
 
     Args:
-        inline_ids: ``route_id`` values supplied directly (e.g. an
-            ``EXPRESS_ROUTE_IDS`` config list). ``None`` is treated as empty.
-        txt_path: Path to a text file with one ``route_id`` per line. Blank
-            lines are skipped and ``#`` starts a comment (whole-line or inline).
-            ``None`` skips the file. A path that is set but missing is logged as
-            a warning and skipped — the inline ids are still returned.
+        inline_ids: Id values supplied directly (e.g. a config list). ``None`` is
+            treated as empty.
+        txt_path: Path to a text file with one id per line. Blank lines are
+            skipped and ``#`` starts a comment (whole-line or inline). ``None``
+            skips the file. A path that is set but missing is logged as a warning
+            and skipped — the inline ids are still returned.
+        kind: Human-readable noun used only in log messages (e.g.
+            ``"express route"``, ``"express origin stop"``).
 
     Returns:
-        The unioned set of express ``route_id`` strings (possibly empty). Every
-        id is coerced to a trimmed ``str`` so it matches GTFS ``route_id`` values,
-        which are read as strings.
+        The unioned set of id strings (possibly empty). Every id is coerced to a
+        trimmed ``str`` so it matches GTFS values, which are read as strings.
     """
-    express: set[str] = set()
+    ids: set[str] = set()
 
     for raw in inline_ids or ():
         text = str(raw).strip()
         if text:
-            express.add(text)
+            ids.add(text)
 
     if txt_path:
         if not os.path.exists(txt_path):
             logging.warning(
-                "Express-routes file '%s' not found; using inline route ids only.",
-                txt_path,
+                "%s file '%s' not found; using inline ids only.", kind.capitalize(), txt_path
             )
         else:
             with open(txt_path, encoding="utf-8") as handle:
                 for line in handle:
                     text = line.split("#", 1)[0].strip()
                     if text:
-                        express.add(text)
-            logging.info("Loaded express route ids from '%s'.", txt_path)
+                        ids.add(text)
+            logging.info("Loaded %s ids from '%s'.", kind, txt_path)
 
-    logging.info("Resolved %d express route_id(s).", len(express))
-    return express
+    logging.info("Resolved %d %s id(s).", len(ids), kind)
+    return ids
+
+
+def load_express_route_ids(
+    inline_ids: Optional[Sequence[str]] = None,
+    txt_path: Optional[str] = None,
+) -> set[str]:
+    """Resolve the set of express-route ``route_id`` values (see ``load_id_set``).
+
+    Thin wrapper kept for readable call sites and backwards compatibility. Copied
+    verbatim from utils/gtfs_helpers.py — keep both copies in sync.
+    """
+    return load_id_set(inline_ids, txt_path, kind="express route")
 
 
 # =============================================================================
@@ -1317,8 +1344,9 @@ def run(
     stop_ids_to_include: Sequence[str] | None = None,
     stop_ids_to_exclude: Sequence[str] | None = None,
     buffer_distance: float | None = None,
-    large_buffer_distance: float | None = None,
-    stop_ids_large_buffer: Sequence[str] | None = None,
+    express_origin_buffer_distance: float | None = None,
+    express_origin_stop_ids: Sequence[str] | None = None,
+    express_origin_stops_file: str | Path | None = None,
     isochrone_walk_time_min: float | None = None,
     walk_speed_mph: float | None = None,
     fips_filter: Sequence[str] | None = None,
@@ -1357,11 +1385,18 @@ def run(
         STOP_IDS_TO_EXCLUDE if stop_ids_to_exclude is None else stop_ids_to_exclude
     )
     buffer_distance = BUFFER_DISTANCE if buffer_distance is None else buffer_distance
-    large_buffer_distance = (
-        LARGE_BUFFER_DISTANCE if large_buffer_distance is None else large_buffer_distance
+    express_origin_buffer_distance = (
+        EXPRESS_ORIGIN_BUFFER_DISTANCE
+        if express_origin_buffer_distance is None
+        else express_origin_buffer_distance
     )
-    stop_ids_large_buffer = list(
-        STOP_IDS_LARGE_BUFFER if stop_ids_large_buffer is None else stop_ids_large_buffer
+    express_origin_stop_ids = list(
+        EXPRESS_ORIGIN_STOP_IDS if express_origin_stop_ids is None else express_origin_stop_ids
+    )
+    express_origin_stops_file = (
+        EXPRESS_ORIGIN_STOPS_FILE
+        if express_origin_stops_file is None
+        else express_origin_stops_file
     )
     isochrone_walk_time_min = (
         ISOCHRONE_WALK_TIME_MIN if isochrone_walk_time_min is None else isochrone_walk_time_min
@@ -1373,10 +1408,16 @@ def run(
     express_routes_file = (
         EXPRESS_ROUTES_FILE if express_routes_file is None else express_routes_file
     )
-    # Union the inline list and the optional .txt into the set used for labeling.
+    # Union each inline list with its optional .txt: route ids drive the
+    # service_type label, origin stop ids drive the wide drive-access buffer.
     express_route_id_set = load_express_route_ids(
         express_route_ids,
         str(express_routes_file) if express_routes_file else None,
+    )
+    express_origin_stop_id_set = load_id_set(
+        express_origin_stop_ids,
+        str(express_origin_stops_file) if express_origin_stops_file else None,
+        kind="express origin stop",
     )
 
     try:
@@ -1502,8 +1543,8 @@ def run(
             stop_ids_to_include,
             stop_ids_to_exclude,
             buffer_distance,
-            large_buffer_distance,
-            stop_ids_large_buffer,
+            express_origin_buffer_distance,
+            sorted(express_origin_stop_id_set),
             str(output_directory),
             SYNTHETIC_FIELDS,
             service_area_method=service_area_method,
@@ -1600,17 +1641,23 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Standard buffer distance in miles.",
     )
     parser.add_argument(
-        "--large-buffer-distance",
+        "--express-origin-buffer-distance",
         type=float,
-        default=LARGE_BUFFER_DISTANCE,
-        help="Larger buffer distance in miles for selected stops.",
+        default=EXPRESS_ORIGIN_BUFFER_DISTANCE,
+        help="Drive-access buffer distance in miles for express origin stops.",
     )
     parser.add_argument(
-        "--stops-large-buffer",
+        "--express-origin-stops",
         nargs="*",
-        default=STOP_IDS_LARGE_BUFFER,
+        default=EXPRESS_ORIGIN_STOP_IDS,
         metavar="STOP_ID",
-        help="Stops that use the large buffer (stop_buffer method only).",
+        help="Express origin (park-and-ride) stop_ids that use the drive-access "
+        "buffer (stop_buffer method only).",
+    )
+    parser.add_argument(
+        "--express-origin-stops-file",
+        default=EXPRESS_ORIGIN_STOPS_FILE,
+        help="Path to a text file of express origin stop_ids, one per line ('#' comments).",
     )
     parser.add_argument(
         "--isochrone-walk-time",
@@ -1679,8 +1726,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             stop_ids_to_include=args.stops_include,
             stop_ids_to_exclude=args.stops_exclude,
             buffer_distance=args.buffer_distance,
-            large_buffer_distance=args.large_buffer_distance,
-            stop_ids_large_buffer=args.stops_large_buffer,
+            express_origin_buffer_distance=args.express_origin_buffer_distance,
+            express_origin_stop_ids=args.express_origin_stops,
+            express_origin_stops_file=args.express_origin_stops_file,
             isochrone_walk_time_min=args.isochrone_walk_time,
             walk_speed_mph=args.walk_speed_mph,
             fips_filter=args.fips,
