@@ -27,6 +27,7 @@ from scripts.service_coverage.gtfs_service_demographics_gpd import (
     clip_and_calculate_synthetic_fields,
     export_summary_to_excel,
     filter_weekday_service,
+    flag_express_origin_candidates,
     get_included_routes,
     get_included_stops,
     load_express_route_ids,
@@ -35,6 +36,7 @@ from scripts.service_coverage.gtfs_service_demographics_gpd import (
     pick_buffer_distance,
     quantize_node,
     run,
+    suggest_express_origin_stops,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -905,3 +907,138 @@ def test_run_route_mode_express_origin_widens_catchment(
     # The walk buffer never reaches the far block; the drive buffer does, so the
     # express-origin run captures strictly more population on that route.
     assert drive_pop > walk_pop
+
+
+# ---------------------------------------------------------------------------
+# flag_express_origin_candidates (Phase 3 advisory ranking)
+# ---------------------------------------------------------------------------
+
+
+def test_flag_express_origin_candidates_flags_low_jobs() -> None:
+    df = pd.DataFrame(
+        {
+            "route_short_name": ["X", "X", "X", "X"],
+            "stop_id": ["A", "B", "C", "D"],
+            "nearby_jobs": [100.0, 50.0, 10.0, 0.0],
+        }
+    )
+    out = flag_express_origin_candidates(df, threshold=0.2)
+    flags = dict(zip(out["stop_id"], out["likely_origin"]))
+    # max is 100; threshold 0.2 -> cutoff 20. C (10) and D (0) are flagged.
+    assert flags == {"A": False, "B": False, "C": True, "D": True}
+    # jobs_share is the within-route share (sum = 160).
+    share = dict(zip(out["stop_id"], out["jobs_share"]))
+    assert share["A"] == pytest.approx(100.0 / 160.0)
+
+
+def test_flag_express_origin_candidates_independent_per_route() -> None:
+    df = pd.DataFrame(
+        {
+            "route_short_name": ["X", "X", "Y", "Y"],
+            "stop_id": ["A", "B", "C", "D"],
+            # Route Y's 10 would be flagged against X's max but not its own.
+            "nearby_jobs": [100.0, 10.0, 12.0, 10.0],
+        }
+    )
+    out = flag_express_origin_candidates(df, threshold=0.2)
+    flags = dict(zip(out["stop_id"], out["likely_origin"]))
+    assert bool(flags["B"])  # 10 < 0.2 * 100
+    assert not bool(flags["D"])  # 10 is not < 0.2 * 12 within route Y
+
+
+def test_flag_express_origin_candidates_all_zero_flags_nothing() -> None:
+    df = pd.DataFrame(
+        {"route_short_name": ["X", "X"], "stop_id": ["A", "B"], "nearby_jobs": [0.0, 0.0]}
+    )
+    out = flag_express_origin_candidates(df, threshold=0.2)
+    assert not out["likely_origin"].any()
+
+
+# ---------------------------------------------------------------------------
+# suggest_express_origin_stops (Phase 3 advisory end-to-end)
+# ---------------------------------------------------------------------------
+
+
+def test_suggest_express_origin_stops_writes_candidates(
+    tmp_path: Path, dc_gtfs_dir: Path, dc_gtfs: dict[str, pd.DataFrame]
+) -> None:
+    final_routes = get_included_routes(dc_gtfs["routes"], [], [])
+    all_stops = _stops_to_points_gdf(
+        dc_gtfs["trips"], dc_gtfs["stop_times"], dc_gtfs["stops"], final_routes, [], []
+    )
+    assert all_stops is not None
+
+    # Target the route with the most distinct stops, and place a jobs cluster on
+    # one of its stops so that stop reads as a destination and the rest as
+    # job-poor likely origins.
+    counts = (
+        all_stops.drop_duplicates(["route_short_name", "stop_id"])
+        .groupby("route_short_name")
+        .size()
+    )
+    target_short = str(counts.idxmax())
+    routes = dc_gtfs["routes"]
+    route_id = str(
+        routes.loc[routes["route_short_name"].astype(str) == target_short, "route_id"].iloc[0]
+    )
+
+    route_stops = all_stops[all_stops["route_short_name"].astype(str) == target_short]
+    anchor = route_stops.drop_duplicates("stop_id").iloc[0]
+    anchor_stop_id = str(anchor["stop_id"])
+    ax, ay = anchor.geometry.x, anchor.geometry.y
+    jobs_block = box(ax - 200, ay - 200, ax + 200, ay + 200)
+    demo = gpd.GeoDataFrame(
+        {"tot_empl": [1_000]}, geometry=[jobs_block], crs=f"EPSG:{CRS_EPSG_CODE}"
+    )
+
+    ranked = suggest_express_origin_stops(
+        dc_gtfs["trips"],
+        dc_gtfs["stop_times"],
+        routes,
+        dc_gtfs["stops"],
+        demo,
+        express_route_ids={route_id},
+        buffer_distance_mi=0.25,
+        jobs_field="tot_empl",
+        threshold=0.2,
+        output_dir=str(tmp_path),
+    )
+
+    assert ranked is not None
+    assert (tmp_path / "express_origin_candidates.csv").is_file()
+    assert {
+        "route_short_name",
+        "stop_id",
+        "nearby_jobs",
+        "jobs_share",
+        "likely_origin",
+    } <= set(ranked.columns)
+
+    anchor_row = ranked[ranked["stop_id"].astype(str) == anchor_stop_id].iloc[0]
+    assert anchor_row["nearby_jobs"] > 0  # the destination stop sees the jobs
+    assert not bool(anchor_row["likely_origin"])  # and is therefore not an origin
+    assert bool(ranked["likely_origin"].any())  # job-poor stops are flagged
+
+
+def test_suggest_express_origin_stops_no_jobs_field_is_noop(
+    tmp_path: Path, dc_gtfs: dict[str, pd.DataFrame]
+) -> None:
+    # Demographics layer without the jobs field -> advisory cannot run.
+    demo = gpd.GeoDataFrame(
+        {"total_pop": [100]}, geometry=[box(0, 0, 1, 1)], crs=f"EPSG:{CRS_EPSG_CODE}"
+    )
+    route_id = str(dc_gtfs["routes"]["route_id"].iloc[0])
+    result = suggest_express_origin_stops(
+        dc_gtfs["trips"],
+        dc_gtfs["stop_times"],
+        dc_gtfs["routes"],
+        dc_gtfs["stops"],
+        demo,
+        express_route_ids={route_id},
+        buffer_distance_mi=0.25,
+        jobs_field="tot_empl",
+        threshold=0.2,
+        output_dir=str(tmp_path),
+    )
+    assert result is None
+    assert not (tmp_path / "express_origin_candidates.csv").exists()
