@@ -31,6 +31,7 @@ from scripts.service_coverage.gtfs_service_demographics_gpd import (
     get_included_stops,
     load_express_route_ids,
     load_gtfs_data,
+    load_id_set,
     pick_buffer_distance,
     quantize_node,
     run,
@@ -797,3 +798,110 @@ def test_run_route_mode_all_local_without_express_list(
 
     summary = pd.read_csv(out_dir / "service_demographics_by_route.csv")
     assert (summary["service_type"] == "local").all()
+
+
+# ---------------------------------------------------------------------------
+# load_id_set (generic override loader)
+# ---------------------------------------------------------------------------
+
+
+def test_load_id_set_inline_only() -> None:
+    assert load_id_set(["S1", "S2"], None) == {"S1", "S2"}
+
+
+def test_load_id_set_none_returns_empty() -> None:
+    assert load_id_set(None, None) == set()
+
+
+def test_load_id_set_trims_dedups_and_coerces() -> None:
+    assert load_id_set([" S1 ", "S1", 7], None) == {"S1", "7"}
+
+
+def test_load_id_set_unions_inline_and_file(tmp_path: Path) -> None:
+    f = tmp_path / "ids.txt"
+    f.write_text("1001\n# comment\n2005  # inline\n\n3009\n", encoding="utf-8")
+    assert load_id_set(["4000"], str(f), kind="express origin stop") == {
+        "1001",
+        "2005",
+        "3009",
+        "4000",
+    }
+
+
+def test_load_id_set_missing_file_warns_and_keeps_inline(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.WARNING):
+        result = load_id_set(["S1"], str(tmp_path / "nope.txt"), kind="express origin stop")
+    assert result == {"S1"}
+    assert "not found" in caplog.text
+
+
+def test_load_id_set_reads_origin_stops_fixture() -> None:
+    result = load_id_set(None, str(FIXTURES / "express_origin_stops.txt"))
+    assert result == {"1001", "2005"}
+
+
+def test_load_express_route_ids_delegates_to_load_id_set() -> None:
+    # The Phase 1 wrapper is now a thin alias over the generic loader.
+    assert load_express_route_ids(["101", "303"], None) == {"101", "303"}
+
+
+# ---------------------------------------------------------------------------
+# run() route mode — express origin drive-access buffer (Phase 2)
+# ---------------------------------------------------------------------------
+
+
+def test_run_route_mode_express_origin_widens_catchment(
+    tmp_path: Path, dc_gtfs_dir: Path, dc_gtfs: dict[str, pd.DataFrame]
+) -> None:
+    # A demographics layer with two parts (World Mercator metres):
+    #   - a background square covering every stop (so each route always has a
+    #     non-empty clip), and
+    #   - a small "far block" placed 1 km east of the easternmost stop — beyond
+    #     every stop's 0.25-mi (~402 m) walk buffer, but inside a 2.0-mi
+    #     (~3219 m) drive buffer. Only that stop's route can reach it, and only
+    #     when the stop is treated as an express origin.
+    final_routes = get_included_routes(dc_gtfs["routes"], [], [])
+    stops_gdf = _stops_to_points_gdf(
+        dc_gtfs["trips"], dc_gtfs["stop_times"], dc_gtfs["stops"], final_routes, [], []
+    )
+    assert stops_gdf is not None
+
+    minx, miny, maxx, maxy = stops_gdf.total_bounds
+    origin_idx = stops_gdf.geometry.x.idxmax()
+    origin_stop_id = str(stops_gdf.loc[origin_idx, "stop_id"])
+    origin_route = str(stops_gdf.loc[origin_idx, "route_short_name"])
+    oy = stops_gdf.loc[origin_idx].geometry.y
+
+    background = box(minx - 450, miny - 450, maxx + 450, maxy + 450)
+    far_cx = maxx + 1_000.0  # ≥ 1 km from every stop (all stops have x ≤ maxx)
+    far_block = box(far_cx - 100, oy - 100, far_cx + 100, oy + 100)
+    demo = gpd.GeoDataFrame(
+        {"total_pop": [5_000, 1_000]},
+        geometry=[background, far_block],
+        crs=f"EPSG:{CRS_EPSG_CODE}",
+    )
+    demo_path = tmp_path / "demo.shp"
+    demo.to_file(demo_path)
+
+    def _route_pop(out_dir: Path, express_origins: list[str]) -> float:
+        run(
+            analysis_mode="route",
+            service_area_method="stop_buffer",
+            gtfs_data_path=str(dc_gtfs_dir),
+            demographics_shp_path=str(demo_path),
+            output_directory=str(out_dir),
+            express_origin_buffer_distance=2.0,
+            express_origin_stop_ids=express_origins,
+        )
+        summary = pd.read_csv(out_dir / "service_demographics_by_route.csv")
+        match = summary["route_short_name"].astype(str) == origin_route
+        return summary.loc[match, "total_pop"].sum()
+
+    walk_pop = _route_pop(tmp_path / "walk", [])
+    drive_pop = _route_pop(tmp_path / "drive", [origin_stop_id])
+
+    # The walk buffer never reaches the far block; the drive buffer does, so the
+    # express-origin run captures strictly more population on that route.
+    assert drive_pop > walk_pop
