@@ -74,6 +74,25 @@ def test_to_period_ym_formats_year_month() -> None:
 
 
 # ---------------------------------------------------------------------------
+# parse_month_bound
+# ---------------------------------------------------------------------------
+
+
+def test_parse_month_bound_parses_non_blank() -> None:
+    assert mod.parse_month_bound("Jul-2024") == datetime(2024, 7, 1)
+
+
+@pytest.mark.parametrize("value", ["", "   "])
+def test_parse_month_bound_blank_is_none(value: str) -> None:
+    assert mod.parse_month_bound(value) is None
+
+
+def test_parse_month_bound_invalid_raises() -> None:
+    with pytest.raises(ValueError):
+        mod.parse_month_bound("2024-07")
+
+
+# ---------------------------------------------------------------------------
 # parse_filename_period
 # ---------------------------------------------------------------------------
 
@@ -229,6 +248,25 @@ def test_periods_in_range_inclusive_and_sorted() -> None:
 def test_periods_in_range_empty_when_none_match() -> None:
     workbooks = {"Jan-2020": Path("Jan-2020.xlsx")}
     assert mod.periods_in_range(workbooks, datetime(2024, 7, 1), datetime(2024, 8, 1)) == []
+
+
+def _range_workbooks() -> dict[str, Path]:
+    return {k: Path(f"{k}.xlsx") for k in ["Jun-2024", "Jul-2024", "Aug-2024", "May-2026"]}
+
+
+def test_periods_in_range_both_none_returns_all_sorted() -> None:
+    result = mod.periods_in_range(_range_workbooks(), None, None)
+    assert result == ["Jun-2024", "Jul-2024", "Aug-2024", "May-2026"]
+
+
+def test_periods_in_range_open_start_clamps_only_end() -> None:
+    result = mod.periods_in_range(_range_workbooks(), None, datetime(2024, 7, 1))
+    assert result == ["Jun-2024", "Jul-2024"]
+
+
+def test_periods_in_range_open_end_clamps_only_start() -> None:
+    result = mod.periods_in_range(_range_workbooks(), datetime(2024, 8, 1), None)
+    assert result == ["Aug-2024", "May-2026"]
 
 
 # ---------------------------------------------------------------------------
