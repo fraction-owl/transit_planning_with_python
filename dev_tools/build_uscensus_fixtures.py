@@ -36,13 +36,6 @@ Workflow
    LEHD files (WAC or RAC) are filtered by 15-char block ID in ``w_geocode``
    or ``h_geocode``.
 
-5. Synthesizes any subject-table fixture that is consumed by the pipeline but not
-   supplied as a real download. Currently that is ACS S0801 (Commuting
-   Characteristics): when no real S0801 bundle is found under ``INPUT_DIR``, a
-   structurally faithful S0801 fixture is generated from the manifest tracts. A
-   real S0801 download always takes precedence (it is filtered in step 4 and the
-   synthesis is skipped). Disable via ``SYNTHESIZE_MISSING_S0801``.
-
 Modes
 -----
 
@@ -126,42 +119,6 @@ RANDOM_SEED: Final[int] = 42
 GEO_ID_COL: Final[str] = "GEO_ID"
 LEHD_GEO_COLS: Final[tuple[str, ...]] = ("w_geocode", "h_geocode")
 WAC_JOBS_COL: Final[str] = "C000"  # LEHD WAC: total jobs by workplace block
-
-# ---- Synthetic ACS subject-table fixtures -----------------------------------
-
-#: ACS subject table S0801 (Commuting Characteristics by Sex) is consumed by the
-#: census pipeline but is awkward to obtain as a real data.census.gov download
-#: covering exactly the sampled counties. When no real S0801 bundle is found in
-#: ``INPUT_DIR``, synthesize a structurally faithful fixture from the manifest
-#: tracts: the real 344-column S0801 layout, with deterministic, internally
-#: consistent values for the journey-to-work fields the pipeline reads. A real
-#: S0801 download placed in ``INPUT_DIR`` always wins (it is filtered in Phase 4
-#: and this step is skipped). Set to False to disable synthesis entirely.
-SYNTHESIZE_MISSING_S0801: Final[bool] = True
-
-#: Table id used for the synthesized bundle's file names (mirrors the real
-#: data.census.gov naming, e.g. ``ACSST5Y2024.S0801-Data.csv``).
-S0801_TABLE_ID: Final[str] = "ACSST5Y2024.S0801"
-
-#: Fixed timestamp in the synthesized zip name. Stable so re-runs overwrite the
-#: same file rather than accumulating dated copies.
-S0801_STAMP: Final[str] = "2026-06-14T000000"
-
-#: S0801 estimate columns the census pipeline reads (see uscensus_table_build /
-#: uscensus_tiger_join_gpd), mapped to the label shown in the discarded label row.
-S0801_KEY_COLUMNS: Final[dict[str, str]] = {
-    "S0801_C01_001E": "Estimate!!Total!!Workers 16 years and over",
-    "S0801_C01_003E": "Estimate!!Total!!Workers 16 years and over!!"
-    "MEANS OF TRANSPORTATION TO WORK!!Car, truck, or van!!Drove alone",
-    "S0801_C01_004E": "Estimate!!Total!!Workers 16 years and over!!"
-    "MEANS OF TRANSPORTATION TO WORK!!Car, truck, or van!!Carpooled",
-    "S0801_C01_009E": "Estimate!!Total!!Workers 16 years and over!!"
-    "MEANS OF TRANSPORTATION TO WORK!!Public transportation",
-    "S0801_C01_013E": "Estimate!!Total!!Workers 16 years and over!!"
-    "MEANS OF TRANSPORTATION TO WORK!!Worked from home",
-    "S0801_C01_046E": "Estimate!!Total!!Workers 16 years and over who did not work from home!!"
-    "TRAVEL TIME TO WORK!!Mean travel time to work (minutes)",
-}
 
 #: Census summary-level prefix -> (geo_keys lookup name, ID length after prefix).
 GEO_PREFIXES: Final[dict[str, tuple[str, int]]] = {
@@ -595,127 +552,6 @@ def filter_lehd_file(
 
 
 # =============================================================================
-# SYNTHETIC ACS S0801 (Commuting Characteristics)
-# =============================================================================
-
-
-def _s0801_columns() -> list[str]:
-    """Return the full real S0801 column layout: GEO_ID, NAME, then 3x57 E/M pairs.
-
-    data.census.gov S0801 has three column groups (C01 Total, C02 Male, C03 Female),
-    each with 57 line items, each carrying an Estimate (``E``) and Margin (``M``). That
-    is ``2 + 3 * 57 * 2 = 344`` columns, generated here rather than hardcoded.
-    """
-    cols = [GEO_ID_COL, "NAME"]
-    for group in (1, 2, 3):
-        for line in range(1, 58):
-            for kind in ("E", "M"):
-                cols.append(f"S0801_C{group:02d}_{line:03d}{kind}")
-    return cols
-
-
-def _s0801_label_row(columns: list[str]) -> list[str]:
-    """Build the human-readable label row (index 1) the real download carries.
-
-    Only the consumed key columns get meaningful labels; the rest are generic, since
-    every downstream reader discards this row via ``skiprows=[1]``.
-    """
-    labels = []
-    for col in columns:
-        if col == GEO_ID_COL:
-            labels.append("Geography")
-        elif col == "NAME":
-            labels.append("Geographic Area Name")
-        elif col in S0801_KEY_COLUMNS:
-            labels.append(S0801_KEY_COLUMNS[col])
-        else:
-            labels.append("Margin of Error" if col.endswith("M") else "Estimate")
-    return labels
-
-
-def _synthetic_s0801_values(index: int) -> dict[str, str]:
-    """Deterministic, internally consistent journey-to-work values for one tract.
-
-    Varies by tract *index* so the fixture shows a spread of mode shares and commute
-    times rather than identical rows. Percentages stay within plausible bounds and the
-    motorized + transit + WFH shares never exceed 100%.
-    """
-    return {
-        "S0801_C01_001E": str(400 + (index * 37) % 2200),  # workers 16+
-        "S0801_C01_003E": str(round(72 - (index % 18), 1)),  # % drove alone
-        "S0801_C01_004E": str(round(7 + (index % 6), 1)),  # % carpooled
-        "S0801_C01_009E": str(round((index * 2.5) % 34, 1)),  # % public transit
-        "S0801_C01_013E": str(round(3 + (index * 1.3) % 15, 1)),  # % worked from home
-        "S0801_C01_046E": str(round(18 + (index % 25), 1)),  # mean travel time (min)
-    }
-
-
-def _synthetic_s0801_dataframe(tracts: set[str]) -> pd.DataFrame:
-    """Build the S0801 ``-Data.csv`` frame (label row at index 0) for *tracts*.
-
-    *tracts* are 11-char tract GEOIDs from the manifest; each becomes a
-    ``1400000US``-prefixed S0801 row. Non-consumed columns are filled with ``0`` —
-    the pipeline keeps only GEO_ID, NAME, and the renamed key columns.
-    """
-    columns = _s0801_columns()
-    rows: list[list[str]] = [_s0801_label_row(columns)]
-
-    for index, tract in enumerate(sorted(tracts)):
-        values = _synthetic_s0801_values(index)
-        state_fp, county_fp, tract6 = tract[:2], tract[2:5], tract[5:11]
-        name = f"Census Tract {tract6}; county {county_fp}; state {state_fp}"
-        row = {col: "0" for col in columns}
-        row[GEO_ID_COL] = f"1400000US{tract}"
-        row["NAME"] = name
-        row.update(values)
-        rows.append([row[col] for col in columns])
-
-    return pd.DataFrame(rows, columns=columns)
-
-
-def build_synthetic_s0801(tracts: set[str], output_dir: Path) -> Path | None:
-    """Write a synthesized S0801 fixture zip to *output_dir*. Returns its path.
-
-    The zip mirrors a real data.census.gov bundle: an ``ACSST5Y2024.S0801-Data.csv``
-    (UTF-8 BOM, label row at index 1) plus a minimal column-metadata sidecar.
-    """
-    if not tracts:
-        print("  [s0801] no tracts in manifest; nothing to synthesize")
-        return None
-
-    df = _synthetic_s0801_dataframe(tracts)
-
-    out_zip = output_dir / f"{S0801_TABLE_ID}_{S0801_STAMP}.zip"
-    with tempfile.TemporaryDirectory() as tmpdir:
-        data_path = Path(tmpdir) / f"{S0801_TABLE_ID}-Data.csv"
-        df.to_csv(data_path, index=False, encoding="utf-8-sig")
-
-        meta_lines = ["Column Name,Label"]
-        for col, label in zip(df.columns, df.iloc[0]):
-            meta_lines.append(f"{col},{label}")
-        meta_path = Path(tmpdir) / f"{S0801_TABLE_ID}-Column-Metadata.csv"
-        meta_path.write_text("\n".join(meta_lines) + "\n", encoding="utf-8-sig")
-
-        with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as zout:
-            zout.write(data_path, data_path.name)
-            zout.write(meta_path, meta_path.name)
-
-    print(f"  [s0801] synthesized {len(df) - 1:,} tracts -> {out_zip}")
-    return out_zip
-
-
-def _real_s0801_present(folder_bundles: list[Path], zip_bundles: list[Path]) -> bool:
-    """Return True if a real S0801 download is among the discovered input bundles."""
-    if any(S0801_TABLE_ID.split(".")[-1] in p.name for p in zip_bundles):
-        return True
-    return any(
-        S0801_TABLE_ID.split(".")[-1] in f.name
-        for bdir in folder_bundles
-        for f in bdir.glob("*-Data.csv")
-    )
-
-
-# =============================================================================
 # ENTRYPOINT
 # =============================================================================
 
@@ -811,19 +647,7 @@ def main() -> int:
         if filter_lehd_file(path, geo_keys["block"], INPUT_DIR, OUTPUT_DIR, geo_col):
             written_lehd += 1
 
-    # ---- Phase 5: synthesize subject tables not supplied as real downloads --
-    synthesized = 0
-    if SYNTHESIZE_MISSING_S0801:
-        print("\nSynthetic subject tables:")
-        if _real_s0801_present(folder_bundles, zip_bundles):
-            print("  [s0801] real S0801 download found in inputs; using filtered real data")
-        elif build_synthetic_s0801(geo_keys["tract"], OUTPUT_DIR) is not None:
-            synthesized += 1
-
-    print(
-        f"\nSummary: {written_bundles} census bundle(s), {written_lehd} LEHD file(s), "
-        f"{synthesized} synthesized table(s)"
-    )
+    print(f"\nSummary: {written_bundles} census bundle(s), {written_lehd} LEHD file(s)")
     return 0
 
 
