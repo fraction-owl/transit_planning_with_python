@@ -515,6 +515,28 @@ def test_derive_vehicle_computes_low_vehicle_metrics() -> None:
     assert result["perc_lo_veh_mod"].iloc[0] == pytest.approx(round(0.6 - 0.15, 3))
 
 
+def test_derive_commute_reconstructs_counts_and_drops_mean() -> None:
+    df = pd.DataFrame(
+        {
+            "GEO_ID": [_TRACT_GEO_ID],
+            "commute_workers": [1000],
+            "perc_drove_alone": [80.0],
+            "perc_carpool": [10.0],
+            "perc_transit": [5.0],
+            "perc_wfh": [4.0],
+            "mean_travel_time": [22.5],
+        }
+    )
+    result = mod._derive_commute(df)
+    assert result["commute_transit"].iloc[0] == pytest.approx(50.0)
+    assert result["commute_drove"].iloc[0] == pytest.approx(800.0)
+    assert result["commute_person_min"].iloc[0] == pytest.approx(22_500.0)
+    # Non-additive mean is dropped from this block-bound path (recoverable as
+    # commute_person_min / commute_workers); the percentages ride along.
+    assert "mean_travel_time" not in result.columns
+    assert "perc_transit" in result.columns
+
+
 def test_derive_age_computes_youth_and_elderly() -> None:
     df = pd.DataFrame(
         {
@@ -769,6 +791,22 @@ def test_disaggregate_renames_source_to_output_column() -> None:
     assert "youth" in out.columns
     assert "all_youth" not in out.columns
     assert out["youth"].tolist() == pytest.approx([5.0, 5.0])
+
+
+def test_disaggregate_commute_count_splits_by_population() -> None:
+    df = pd.DataFrame(
+        {
+            "tract_id_synth": ["T", "T", "T"],
+            "total_pop": [100, 300, 0],
+            "commute_transit": [40, 40, 40],  # tract total copied onto each block
+        }
+    )
+    out = mod.disaggregate_tract_counts_to_blocks(df)
+    # weighted by population share, renamed to the <=10-char shapefile column
+    assert "cmt_trnst" in out.columns
+    assert "commute_transit" not in out.columns
+    assert out["cmt_trnst"].tolist() == pytest.approx([10.0, 30.0, 0.0])
+    assert out["cmt_trnst"].sum() == pytest.approx(40.0)
 
 
 def test_disaggregate_zero_weight_tract_yields_zero() -> None:

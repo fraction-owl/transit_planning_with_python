@@ -3,7 +3,8 @@
 This module discovers, reads, and merges demographic and employment datasets
 from the U.S. Census and LODES, based on GEO_ID alignment. Output includes
 population, household counts, job totals, income brackets, ethnicity, language
-proficiency, vehicle availability, and age group statistics.
+proficiency, vehicle availability, age group, and commuting (journey-to-work)
+statistics.
 
 Supports input as CSV, GZ, or ZIP files (containing '-Data.csv'), and can filter
 by county FIPS codes. Output may be saved as a flat CSV.
@@ -66,6 +67,7 @@ TOPIC_SIGNATURES: dict[str, Sequence[str] | str] = {
     "LANGUAGE_FILES": ("C16001",),
     "VEHICLE_FILES": ("B08201",),
     "AGE_FILES": ("B01001",),
+    "COMMUTE_FILES": ("S0801",),
 }
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
@@ -374,6 +376,34 @@ def _derive_age(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _derive_commute(df: pd.DataFrame) -> pd.DataFrame:
+    """Derive commuting measures from ACS S0801 (Commuting Characteristics).
+
+    Unlike the count-based detailed tables, S0801's means-of-transportation rows
+    arrive as *percentages* of workers 16+ (and travel time as a mean in minutes).
+    We keep those percentages for readability, and also materialize the matching
+    additive worker *counts* (``workers * pct / 100``) plus person-minutes. Only
+    those counts are legal to area-weight in the tract->block disaggregation and the
+    service-area clip downstream — percentages and means are never additive. A
+    catchment mean travel time is recoverable later as
+    ``sum(commute_person_min) / sum(commute_workers)``.
+    """
+    perc_cols = ["perc_drove_alone", "perc_carpool", "perc_transit", "perc_wfh"]
+    for col in ["commute_workers", "mean_travel_time", *perc_cols]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    workers = df["commute_workers"].fillna(0)
+    df["commute_transit"] = workers * df["perc_transit"] / 100.0
+    df["commute_drove"] = workers * df["perc_drove_alone"] / 100.0
+    df["commute_carpool"] = workers * df["perc_carpool"] / 100.0
+    df["commute_wfh"] = workers * df["perc_wfh"] / 100.0
+    # Person-minutes is the additive form of mean travel time. Workers in tracts
+    # where Census suppresses the mean (NaN) contribute no person-minutes.
+    df["commute_person_min"] = workers * df["mean_travel_time"]
+    return df
+
+
 @dataclass(slots=True)
 class _TractInputs:
     income_files: list[str]
@@ -381,6 +411,7 @@ class _TractInputs:
     language_files: list[str]
     vehicle_files: list[str]
     age_files: list[str]
+    commute_files: list[str]
 
 
 def _build_tract_df(inp: _TractInputs) -> pd.DataFrame:
@@ -498,6 +529,21 @@ def _build_tract_df(inp: _TractInputs) -> pd.DataFrame:
         )
         dfs.append(_derive_age(age))
 
+    if inp.commute_files:
+        commute = _load_and_concat(
+            inp.commute_files,
+            skiprows=[1],
+            rename={
+                "S0801_C01_001E": "commute_workers",
+                "S0801_C01_003E": "perc_drove_alone",
+                "S0801_C01_004E": "perc_carpool",
+                "S0801_C01_009E": "perc_transit",
+                "S0801_C01_013E": "perc_wfh",
+                "S0801_C01_046E": "mean_travel_time",
+            },
+        )
+        dfs.append(_derive_commute(commute))
+
     if not dfs:
         return pd.DataFrame()
 
@@ -557,6 +603,7 @@ def build_joined_table(
     language_files: list[str] | None = None,
     vehicle_files: list[str] | None = None,
     age_files: list[str] | None = None,
+    commute_files: list[str] | None = None,
     county_fips_filter: Iterable[str] | None = None,
     _clean_columns: bool = True,
 ) -> pd.DataFrame:
@@ -569,6 +616,7 @@ def build_joined_table(
             language_files or [],
             vehicle_files or [],
             age_files or [],
+            commute_files or [],
         )
     )
 
@@ -633,6 +681,7 @@ def main() -> None:
             language_files=discovered["LANGUAGE_FILES"],
             vehicle_files=discovered["VEHICLE_FILES"],
             age_files=discovered["AGE_FILES"],
+            commute_files=discovered["COMMUTE_FILES"],
             county_fips_filter=COUNTY_FIPS_FILTER,
         )
         logging.info("Created DataFrame with shape %s", df_joined.shape)

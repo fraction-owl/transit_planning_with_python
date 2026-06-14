@@ -17,6 +17,7 @@ matplotlib.use("Agg")  # headless backend; the module imports matplotlib.pyplot
 from scripts.service_coverage.gtfs_service_demographics_gpd import (
     CRS_EPSG_CODE,
     METERS_PER_MILE,
+    SYNTHETIC_FIELDS,
     _present_synthetic_cols,
     _stops_to_points_gdf,
     apply_fips_filter,
@@ -546,6 +547,34 @@ def test_clip_and_calculate_synthetic_fields_half_overlap() -> None:
     assert row["synthetic_total_pop"] == pytest.approx(50.0, rel=1e-6)
     assert "area_ac_og" in result.columns
     assert "area_ac_cl" in result.columns
+
+
+def _commute_demographics() -> gpd.GeoDataFrame:
+    # The 1000x1000 m square with disaggregated commute worker counts.
+    square = Polygon([(0, 0), (1000, 0), (1000, 1000), (0, 1000)])
+    return gpd.GeoDataFrame(
+        {"cmt_wrkrs": [800], "cmt_trnst": [200]},
+        geometry=[square],
+        crs="EPSG:3395",
+    )
+
+
+def test_commute_count_fields_are_synthetic_fields() -> None:
+    # The disaggregated S0801 worker counts must be apportioned like every other count.
+    for field in ("cmt_wrkrs", "cmt_trnst", "cmt_drove", "cmt_carpl", "cmt_wfh", "cmt_pmin"):
+        assert field in SYNTHETIC_FIELDS
+
+
+def test_clip_and_calculate_commute_counts_area_weight_and_recover_share() -> None:
+    result = clip_and_calculate_synthetic_fields(
+        _commute_demographics(), _half_buffer(), ["cmt_wrkrs", "cmt_trnst"]
+    )
+    row = result.iloc[0]
+    # Half the square -> half the workers and transit commuters.
+    assert row["synthetic_cmt_wrkrs"] == pytest.approx(400.0, rel=1e-6)
+    assert row["synthetic_cmt_trnst"] == pytest.approx(100.0, rel=1e-6)
+    # Catchment transit share is recoverable from the apportioned counts.
+    assert row["synthetic_cmt_trnst"] / row["synthetic_cmt_wrkrs"] == pytest.approx(0.25, rel=1e-6)
 
 
 def test_clip_and_calculate_synthetic_fields_missing_field_skipped() -> None:

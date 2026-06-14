@@ -132,6 +132,7 @@ TOPIC_SIGNATURES: dict[str, Sequence[str] | str] = {
     "LANGUAGE_FILES": ("C16001",),
     "VEHICLE_FILES": ("B08201",),
     "AGE_FILES": ("B01001",),
+    "COMMUTE_FILES": ("S0801",),
 }
 
 # ---- Tract -> block disaggregation ------------------------------------------
@@ -153,6 +154,15 @@ TRACT_COUNT_DISAGG: dict[str, tuple[str, str]] = {
     "all_lo_veh_hh": ("total_hh", "lo_veh_hh"),  # households with 0-1 vehicles
     "all_youth": ("total_pop", "youth"),  # residents age 15-21
     "all_elderly": ("total_pop", "elderly"),  # residents age 65+
+    # Commuting (ACS S0801) worker counts, reconstructed from percentages in
+    # _derive_commute. Weighted by population (blocks carry no worker count); the
+    # percentages/mean themselves are intentionally absent here — never area-weighted.
+    "commute_workers": ("total_pop", "cmt_wrkrs"),  # workers 16+
+    "commute_transit": ("total_pop", "cmt_trnst"),  # commute by public transit
+    "commute_drove": ("total_pop", "cmt_drove"),  # drove alone
+    "commute_carpool": ("total_pop", "cmt_carpl"),  # carpooled
+    "commute_wfh": ("total_pop", "cmt_wfh"),  # worked from home
+    "commute_person_min": ("total_pop", "cmt_pmin"),  # worker-minutes (mean = /workers)
 }
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
@@ -471,6 +481,34 @@ def _derive_age(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _derive_commute(df: pd.DataFrame) -> pd.DataFrame:
+    """Derive commuting measures from ACS S0801 (Commuting Characteristics).
+
+    S0801's means-of-transportation rows are *percentages* of workers 16+ (and
+    travel time is a mean in minutes), so they can ride along verbatim per tract
+    but must never be area-weighted. The additive worker *counts* derived here
+    (``workers * pct / 100``) plus person-minutes are what TRACT_COUNT_DISAGG
+    splits down to blocks; a catchment mean travel time is then recoverable as
+    ``sum(commute_person_min) / sum(commute_workers)``.
+    """
+    perc_cols = ["perc_drove_alone", "perc_carpool", "perc_transit", "perc_wfh"]
+    for col in ["commute_workers", "mean_travel_time", *perc_cols]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    workers = df["commute_workers"].fillna(0)
+    df["commute_transit"] = workers * df["perc_transit"] / 100.0
+    df["commute_drove"] = workers * df["perc_drove_alone"] / 100.0
+    df["commute_carpool"] = workers * df["perc_carpool"] / 100.0
+    df["commute_wfh"] = workers * df["perc_wfh"] / 100.0
+    df["commute_person_min"] = workers * df["mean_travel_time"]
+    # ``mean_travel_time`` is a non-additive mean: drop it from this block-bound path
+    # (build_tract_attributes sums count columns) — it is recoverable downstream as
+    # commute_person_min / commute_workers. The flat uscensus_table_build keeps it.
+    df = df.drop(columns="mean_travel_time")
+    return df
+
+
 @dataclass(slots=True)
 class _TractInputs:
     income_files: list[str]
@@ -478,6 +516,7 @@ class _TractInputs:
     language_files: list[str]
     vehicle_files: list[str]
     age_files: list[str]
+    commute_files: list[str]
 
 
 def _build_tract_df(inp: _TractInputs) -> pd.DataFrame:
@@ -595,6 +634,21 @@ def _build_tract_df(inp: _TractInputs) -> pd.DataFrame:
         )
         dfs.append(_derive_age(age))
 
+    if inp.commute_files:
+        commute = _load_and_concat(
+            inp.commute_files,
+            skiprows=[1],
+            rename={
+                "S0801_C01_001E": "commute_workers",
+                "S0801_C01_003E": "perc_drove_alone",
+                "S0801_C01_004E": "perc_carpool",
+                "S0801_C01_009E": "perc_transit",
+                "S0801_C01_013E": "perc_wfh",
+                "S0801_C01_046E": "mean_travel_time",
+            },
+        )
+        dfs.append(_derive_commute(commute))
+
     if not dfs:
         return pd.DataFrame()
 
@@ -698,6 +752,7 @@ def build_joined_table(
     language_files: list[str] | None = None,
     vehicle_files: list[str] | None = None,
     age_files: list[str] | None = None,
+    commute_files: list[str] | None = None,
     county_fips_filter: Iterable[str] | None = None,
     _clean_columns: bool = True,
 ) -> pd.DataFrame:
@@ -717,6 +772,7 @@ def build_joined_table(
             language_files or [],
             vehicle_files or [],
             age_files or [],
+            commute_files or [],
         )
     )
 
@@ -765,14 +821,15 @@ def build_tract_attributes(
     language_files: list[str] | None = None,
     vehicle_files: list[str] | None = None,
     age_files: list[str] | None = None,
+    commute_files: list[str] | None = None,
     county_fips_filter: Iterable[str] | None = None,
     _clean_columns: bool = True,
 ) -> pd.DataFrame:
     """Build a tract-keyed table of additive demographic counts.
 
-    The income / ethnicity / language / vehicle / age tables are tract-level (or
-    coarser), so this collapses them to one row per 11-digit tract (``tract_fips``) with
-    the additive count columns summed. Block-level population and households are NOT
+    The income / ethnicity / language / vehicle / age / commute tables are tract-level
+    (or coarser), so this collapses them to one row per 11-digit tract (``tract_fips``)
+    with the additive count columns summed. Block-level population and households are NOT
     sourced here: they come from the TIGER blocks' POP20/HOUSING20 in
     ``attach_demographics_to_blocks``, so a tract-level Census download is sufficient and
     no block-level P1/H9 table is required. Percent (``perc_*``) ratio columns are
@@ -785,6 +842,7 @@ def build_tract_attributes(
             language_files or [],
             vehicle_files or [],
             age_files or [],
+            commute_files or [],
         )
     )
     if tract_df.empty:
@@ -1388,6 +1446,7 @@ def run(
             language_files=discovered["LANGUAGE_FILES"],
             vehicle_files=discovered["VEHICLE_FILES"],
             age_files=discovered["AGE_FILES"],
+            commute_files=discovered["COMMUTE_FILES"],
             county_fips_filter=fips_to_filter,
         )
         block_jobs = build_block_jobs(discovered["JOBS_FILES"], county_fips_filter=fips_to_filter)

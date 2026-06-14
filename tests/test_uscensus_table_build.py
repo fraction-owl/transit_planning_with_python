@@ -14,6 +14,7 @@ from scripts.national_data_tools.uscensus_table_build import (
     _apply_fips_filter,
     _clean_name_cols,
     _derive_age,
+    _derive_commute,
     _derive_ethnicity,
     _derive_income,
     _derive_language,
@@ -464,6 +465,50 @@ def test_derive_age_without_total_pop_skips_percentages() -> None:
     assert result["all_youth"].iloc[0] == 20
 
 
+def test_derive_commute_reconstructs_counts_from_percentages() -> None:
+    df = pd.DataFrame(
+        {
+            GEO_ID_COL: [_TRACT_GEO_ID],
+            "commute_workers": [1000],
+            "perc_drove_alone": [80.0],
+            "perc_carpool": [10.0],
+            "perc_transit": [5.0],
+            "perc_wfh": [4.0],
+            "mean_travel_time": [22.5],
+        }
+    )
+    result = _derive_commute(df)
+    # workers * pct / 100
+    assert result["commute_drove"].iloc[0] == pytest.approx(800.0)
+    assert result["commute_carpool"].iloc[0] == pytest.approx(100.0)
+    assert result["commute_transit"].iloc[0] == pytest.approx(50.0)
+    assert result["commute_wfh"].iloc[0] == pytest.approx(40.0)
+    # person-minutes = workers * mean; the additive form of a mean
+    assert result["commute_person_min"].iloc[0] == pytest.approx(22_500.0)
+    # the readable percentages survive for the flat table
+    assert result["perc_transit"].iloc[0] == pytest.approx(5.0)
+
+
+def test_derive_commute_coerces_jam_values_to_nan() -> None:
+    """Census suppression tokens (e.g. ``(X)``) coerce to NaN, not a crash."""
+    df = pd.DataFrame(
+        {
+            GEO_ID_COL: [_TRACT_GEO_ID],
+            "commute_workers": ["0"],
+            "perc_drove_alone": ["(X)"],
+            "perc_carpool": ["(X)"],
+            "perc_transit": ["(X)"],
+            "perc_wfh": ["(X)"],
+            "mean_travel_time": ["(X)"],
+        }
+    )
+    result = _derive_commute(df)
+    # Suppressed percentages coerce to NaN, so the derived count is NaN (unknown,
+    # not zero); build_joined_table's _fill_numeric_only zero-fills it downstream.
+    assert pd.isna(result["commute_transit"].iloc[0])
+    assert pd.isna(result["mean_travel_time"].iloc[0])
+
+
 # ---------------------------------------------------------------------------
 # _load_and_concat
 # ---------------------------------------------------------------------------
@@ -628,6 +673,41 @@ def test_build_joined_table_with_tract_income(tmp_path: Path) -> None:
     assert "perc_low_income" in df.columns
 
 
+def test_build_joined_table_with_tract_commute(tmp_path: Path) -> None:
+    """Adding S0801 files yields readable percentages and additive worker counts."""
+    pop_path = tmp_path / "P1-Data.csv"
+    hh_path = tmp_path / "H9-Data.csv"
+    commute_path = tmp_path / "ACSST5Y2024.S0801-Data.csv"
+
+    _write_plain_csv(pop_path, _make_block_pop_csv())
+    _write_plain_csv(hh_path, _make_block_hh_csv())
+
+    cols = (
+        "S0801_C01_001E,S0801_C01_003E,S0801_C01_004E,S0801_C01_009E,S0801_C01_013E,S0801_C01_046E"
+    )
+    _write_plain_csv(
+        commute_path,
+        _census_csv(
+            f"GEO_ID,NAME,{cols}",
+            "Geography,Geographic Area Name," + ",".join(["label"] * 6),
+            # workers=1000, drove=80%, carpool=10%, transit=5%, wfh=4%, mean=22.5 min
+            f"{_TRACT_GEO_ID},Test Tract,1000,80.0,10.0,5.0,4.0,22.5",
+        ),
+    )
+
+    df = build_joined_table(
+        pop_files=[str(pop_path)],
+        hh_files=[str(hh_path)],
+        jobs_files=[],
+        commute_files=[str(commute_path)],
+    )
+    assert "perc_transit" in df.columns
+    assert "commute_transit" in df.columns
+    assert "commute_person_min" in df.columns
+    assert df["commute_transit"].iloc[0] == pytest.approx(50.0)
+    assert df["commute_person_min"].iloc[0] == pytest.approx(22_500.0)
+
+
 # ---------------------------------------------------------------------------
 # discover_census_files  (integration using existing test fixtures)
 # ---------------------------------------------------------------------------
@@ -636,6 +716,8 @@ def test_build_joined_table_with_tract_income(tmp_path: Path) -> None:
 def test_discover_census_files_with_real_fixtures() -> None:
     """The real fixture directory contains files for all expected topics."""
     result = discover_census_files(FIXTURE_DIR)
-    # At minimum the P1 (population) and B19001 (income) fixtures must be found.
+    # At minimum the P1 (population), B19001 (income), and S0801 (commute) fixtures
+    # must be found.
     assert len(result["POP_FILES"]) >= 1
     assert len(result["INCOME_FILES"]) >= 1
+    assert len(result["COMMUTE_FILES"]) >= 1
