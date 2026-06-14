@@ -177,6 +177,15 @@ SYNTHETIC_FIELDS = [
     "lo_veh_hh",  # households with 0-1 vehicles
     "youth",  # residents age 15-21
     "elderly",  # residents age 65+
+    # Commuting (ACS S0801) worker counts, disaggregated to blocks by
+    # uscensus_tiger_join_gpd. All additive, so they area-weight cleanly. A catchment
+    # transit share is cmt_trnst / cmt_wrkrs; mean travel time is cmt_pmin / cmt_wrkrs.
+    "cmt_wrkrs",  # workers 16+
+    "cmt_trnst",  # commute by public transit
+    "cmt_drove",  # drove alone
+    "cmt_carpl",  # carpooled
+    "cmt_wfh",  # worked from home
+    "cmt_pmin",  # worker-minutes (mean travel time = cmt_pmin / cmt_wrkrs)
 ]
 
 # EPSG code for projected coordinate system used in area calculations
