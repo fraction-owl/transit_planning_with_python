@@ -6,7 +6,11 @@
     "(join keys from CANDIDATE_JOIN_KEYS, every numeric/boolean non-key column shipped).",
     "Command tokens are substituted with {python} {script} {input} {output} {work} {scripts}.",
     "{input} is the input-data root; reference topic subfolders as {input}/<topic>.",
-    "{output} is this script's own (empty) output subdir, used to attribute collected tables."
+    "{output} is this script's own (empty) output subdir, used to attribute collected tables.",
+    "NOTE: service_demographics_by_route.csv is intentionally NOT described below. Its column",
+    "set varies with which Census tables were supplied (commute/income/vehicles/etc.), and a",
+    "described table whose keep_cols are not all present is skipped wholesale; inference ships",
+    "whatever numeric columns it produced, including the commute counts/shares from ACS S0801."
   ],
   "scripts": [
     {
@@ -63,9 +67,6 @@
     {"file": "exogenous_monthly.csv", "join_keys": ["period"],
      "keep_cols": ["gas_price", "unemployment_rate", "avg_temp_f", "max_daily_precip_in",
                    "days_with_precip", "total_snow_in", "max_daily_snow_in"]},
-    {"file": "service_demographics_by_route.csv", "join_keys": ["route_id"],
-     "keep_cols": ["pop_served", "low_income_served", "minority_served",
-                   "zero_car_hh_served", "empl_served"]},
     {"file": "points_of_interest_coverage.csv", "join_keys": ["route_id"],
      "keep_cols": ["sites_served", "jobs_served"]},
     {"file": "school_coverage_by_route.csv", "join_keys": ["route_id"],
