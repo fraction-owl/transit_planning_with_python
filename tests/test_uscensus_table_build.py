@@ -144,6 +144,49 @@ def test_discover_census_files_recurses_into_subdirs(tmp_path: Path) -> None:
     assert len(result["POP"]) == 1
 
 
+def test_discover_census_files_drops_in_place_zip_extraction(tmp_path: Path) -> None:
+    """A ZIP plus its in-place unzip must resolve to a single source (no double read)."""
+    content = "GEO_ID,val\n1400000US11001000100,5\n"
+    zip_path = tmp_path / "ACSST5Y2024.S0801_20260613T122436.zip"
+    _write_zip_csv(zip_path, "ACSST5Y2024.S0801-Data.csv", content)
+    # Mimic prep_features.extract_zips: unzip into a <stem>/ sibling folder.
+    extracted = tmp_path / zip_path.stem / "ACSST5Y2024.S0801-Data.csv"
+    extracted.parent.mkdir(parents=True)
+    extracted.write_text(content, encoding="utf-8")
+
+    result = discover_census_files(tmp_path, {"COMMUTE": ("S0801",)})
+    assert len(result["COMMUTE"]) == 1
+    assert result["COMMUTE"][0].endswith(".zip")
+
+
+def test_discover_census_files_keeps_distinct_csv_with_same_basename(tmp_path: Path) -> None:
+    """A different-sized table sharing a base name (e.g. another geography) is kept."""
+    zip_path = tmp_path / "geoA" / "ACSST5Y2024.S0801_a.zip"
+    zip_path.parent.mkdir(parents=True)
+    _write_zip_csv(zip_path, "ACSST5Y2024.S0801-Data.csv", "GEO_ID,val\n1400000US11001,5\n")
+    loose = tmp_path / "geoB" / "ACSST5Y2024.S0801-Data.csv"
+    loose.parent.mkdir(parents=True)
+    loose.write_text("GEO_ID,val\n1400000US24031,999999\n", encoding="utf-8")
+
+    result = discover_census_files(tmp_path, {"COMMUTE": ("S0801",)})
+    assert len(result["COMMUTE"]) == 2
+
+
+def test_discover_census_files_dedupes_real_s0801_fixture(tmp_path: Path) -> None:
+    """The shipped S0801 fixture plus its in-place unzip resolve to one source."""
+    src = FIXTURE_DIR / "ACSST5Y2024.S0801_20260613T122436.zip"
+    census = tmp_path / "census"
+    census.mkdir()
+    zip_copy = census / src.name
+    zip_copy.write_bytes(src.read_bytes())
+    with zipfile.ZipFile(zip_copy) as zf:
+        zf.extractall(census / src.stem)  # in-place extraction, as the orchestrator does
+
+    result = discover_census_files(census, {"COMMUTE": ("S0801",)})
+    assert len(result["COMMUTE"]) == 1
+    assert result["COMMUTE"][0].endswith(".zip")
+
+
 # ---------------------------------------------------------------------------
 # _read_csv_any
 # ---------------------------------------------------------------------------
