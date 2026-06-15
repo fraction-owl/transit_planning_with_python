@@ -141,11 +141,70 @@ def _token_match(name: str, tokens: Sequence[str] | str) -> bool:
     return all(tok.lower() in low for tok in tokens)
 
 
+def _zip_data_member_sizes(zip_path: str | Path) -> dict[str, int]:
+    """Map each '*-Data.csv' member's base name to its uncompressed size in bytes.
+
+    Reads only the ZIP central directory (no extraction). Returns an empty map
+    when the archive cannot be read, so a corrupt ZIP never suppresses a loose CSV.
+    """
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            return {
+                Path(info.filename).name.lower(): info.file_size
+                for info in zf.infolist()
+                if info.filename.lower().endswith("-data.csv")
+            }
+    except (zipfile.BadZipFile, OSError):
+        return {}
+
+
+def _dedupe_extracted_zip_members(paths: Sequence[str]) -> list[str]:
+    """Drop loose '*-Data.csv' files that duplicate a '-Data.csv' member of a ZIP.
+
+    ``_read_csv_any`` reads a Census ZIP's '-Data.csv' member directly, so when
+    the same archive has also been unzipped in place — which the feature-prep
+    orchestrator does by default, and a human may do manually — the scanned root
+    holds both the ``*.zip`` and the extracted ``*-Data.csv``. Bucketing both
+    would concatenate the identical table twice (duplicate GEO_ID rows). A loose
+    CSV is treated as redundant only when its base name AND byte size match a
+    member of a ZIP in the same bucket, so the ZIP is kept and the extracted copy
+    dropped; genuinely distinct downloads (e.g. other geographies, which differ
+    in size) are never removed.
+    """
+    member_sizes: dict[str, set[int]] = {}
+    for p in paths:
+        if p.lower().endswith(".zip"):
+            for name, size in _zip_data_member_sizes(p).items():
+                member_sizes.setdefault(name, set()).add(size)
+    if not member_sizes:
+        return list(paths)
+
+    kept: list[str] = []
+    for p in paths:
+        base = Path(p).name.lower()
+        if base.endswith("-data.csv") and base in member_sizes:
+            try:
+                if Path(p).stat().st_size in member_sizes[base]:
+                    logging.info(
+                        "Skipping '%s'; byte-identical to a ZIP member already in this bucket.",
+                        p,
+                    )
+                    continue
+            except OSError:
+                pass
+        kept.append(p)
+    return kept
+
+
 def discover_census_files(
     root_dir: str | Path,
     signatures: Mapping[str, Sequence[str] | str] = TOPIC_SIGNATURES,
 ) -> dict[str, list[str]]:
-    """Recursively locate Census “data” CSV/ZIP and bucket them by topic."""
+    """Recursively locate Census “data” CSV/ZIP and bucket them by topic.
+
+    A loose ``*-Data.csv`` that merely duplicates a ZIP member already in the
+    same bucket (e.g. an in-place unzip) is dropped, so the table is read once.
+    """
     buckets: dict[str, list[str]] = {k: [] for k in signatures}
     root = Path(root_dir).expanduser().resolve()
 
@@ -160,8 +219,8 @@ def discover_census_files(
                 buckets[var].append(str(path))
                 break
 
-    for lst in buckets.values():
-        lst.sort()
+    for var, lst in buckets.items():
+        buckets[var] = sorted(_dedupe_extracted_zip_members(lst))
     return buckets
 
 
