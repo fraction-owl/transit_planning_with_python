@@ -22,53 +22,63 @@ def _two_stop_times(spec: list[tuple[str, str, str]]) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# _service_day_coverage  (30-minute bins, divided by 48)
+# _service_day_coverage  (one-hour bins, divided by 24)
 # ---------------------------------------------------------------------------
 
 
 def test_coverage_one_bin_per_departure() -> None:
-    # A single departure occupies exactly one 30-min bin (06:00 -> bin 12).
+    # A single departure occupies exactly one one-hour bin (06:00 -> hour 6).
     trips = pd.DataFrame({"route_id": ["A"], "start_sec": [21600.0]})
     cov = _service_day_coverage(trips).set_index("route_id")["pct_day_with_service"]
-    assert cov["A"] == pytest.approx(100.0 * 1 / 48)
+    assert cov["A"] == pytest.approx(100.0 * 1 / 24)
 
 
 def test_coverage_counts_only_the_start_bin_not_the_run() -> None:
-    # A single long trip (06:00-08:00) credits ONLY its departure bin (12), never the
+    # A single long trip (06:00-08:00) credits ONLY its departure bin (hour 6), never the
     # bins it runs through: a rider at a stop sees one bus, not service all morning.
     # end_sec is supplied to prove it is ignored.
     trips = pd.DataFrame({"route_id": ["A"], "start_sec": [21600.0], "end_sec": [28800.0]})
     cov = _service_day_coverage(trips).set_index("route_id")["pct_day_with_service"]
-    assert cov["A"] == pytest.approx(100.0 * 1 / 48)
+    assert cov["A"] == pytest.approx(100.0 * 1 / 24)
+
+
+def test_hourly_service_fills_each_operating_hour() -> None:
+    # Hourly departures 06:00, 07:00, 08:00, 09:00 cover four whole hours -> 4/24.
+    # One-hour bins credit a 60-minute-frequency route for every hour it runs (not half);
+    # the 30- vs 60-minute distinction belongs to median_headway_min, not this span metric.
+    trips = pd.DataFrame({"route_id": ["A"] * 4, "start_sec": [21600.0, 25200.0, 28800.0, 32400.0]})
+    cov = _service_day_coverage(trips).set_index("route_id")["pct_day_with_service"]
+    assert cov["A"] == pytest.approx(100.0 * 4 / 24)
 
 
 def test_coverage_counts_distinct_departure_bins() -> None:
-    # Departures at 06:00 (bin 12), 06:45 (bin 13), 09:00 (bin 18) -> three bins.
-    trips = pd.DataFrame({"route_id": ["A"] * 3, "start_sec": [21600.0, 24300.0, 32400.0]})
+    # Departures at 06:00 (hour 6), 08:00 (hour 8), 09:00 (hour 9) -> three bins; the
+    # empty hour 7 is a real gap and is not counted.
+    trips = pd.DataFrame({"route_id": ["A"] * 3, "start_sec": [21600.0, 28800.0, 32400.0]})
     cov = _service_day_coverage(trips).set_index("route_id")["pct_day_with_service"]
-    assert cov["A"] == pytest.approx(100.0 * 3 / 48)
+    assert cov["A"] == pytest.approx(100.0 * 3 / 24)
 
 
 def test_coverage_departures_in_same_bin_dedupe() -> None:
-    # 06:00 and 06:20 both fall in bin 12 -> one served bin.
-    trips = pd.DataFrame({"route_id": ["A", "A"], "start_sec": [21600.0, 22800.0]})
+    # 06:00 and 06:30 both fall in the same one-hour bin (hour 6) -> one served bin.
+    trips = pd.DataFrame({"route_id": ["A", "A"], "start_sec": [21600.0, 23400.0]})
     cov = _service_day_coverage(trips).set_index("route_id")["pct_day_with_service"]
-    assert cov["A"] == pytest.approx(100.0 * 1 / 48)
+    assert cov["A"] == pytest.approx(100.0 * 1 / 24)
 
 
 def test_coverage_keeps_extended_clock_no_wrap() -> None:
-    # 01:00 -> bin 2 and 25:00 -> bin 50 stay distinct; wrapping 25:00 to 01:00 would
+    # 01:00 -> hour 1 and 25:00 -> hour 25 stay distinct; wrapping 25:00 to 01:00 would
     # wrongly collapse them into a single bin.
     trips = pd.DataFrame({"route_id": ["A", "A"], "start_sec": [3600.0, 90000.0]})
     cov = _service_day_coverage(trips).set_index("route_id")["pct_day_with_service"]
-    assert cov["A"] == pytest.approx(100.0 * 2 / 48)
+    assert cov["A"] == pytest.approx(100.0 * 2 / 24)
 
 
 def test_coverage_drops_missing_start() -> None:
     # Rows without a start time are ignored; the route is summarized from the rest.
     trips = pd.DataFrame({"route_id": ["A", "A"], "start_sec": [21600.0, float("nan")]})
     cov = _service_day_coverage(trips).set_index("route_id")["pct_day_with_service"]
-    assert cov["A"] == pytest.approx(100.0 * 1 / 48)
+    assert cov["A"] == pytest.approx(100.0 * 1 / 24)
 
 
 # ---------------------------------------------------------------------------
@@ -101,8 +111,8 @@ def test_modal_shape_length_distinct_from_longest() -> None:
     assert supply.loc["A", "route_length_modal_mi"] == pytest.approx(5.0)
     # Daily revenue miles still sum every trip's own shape: 10 + 3*5 = 25.
     assert supply.loc["A", "revenue_miles"] == pytest.approx(25.0)
-    # Four 30-min trips at 06/07/08/09 -> four distinct bins.
-    assert supply.loc["A", "pct_day_with_service"] == pytest.approx(100.0 * 4 / 48)
+    # Four trips departing at 06/07/08/09 -> four distinct one-hour bins.
+    assert supply.loc["A", "pct_day_with_service"] == pytest.approx(100.0 * 4 / 24)
 
 
 def test_modal_tie_breaks_toward_longer_shape() -> None:
@@ -131,7 +141,7 @@ def test_no_shapes_yields_nan_lengths() -> None:
     assert pd.isna(supply.loc["A", "route_length_mi"])
     assert pd.isna(supply.loc["A", "route_length_modal_mi"])
     # Coverage does not depend on shapes, so it is still populated.
-    assert supply.loc["A", "pct_day_with_service"] == pytest.approx(100.0 * 1 / 48)
+    assert supply.loc["A", "pct_day_with_service"] == pytest.approx(100.0 * 1 / 24)
 
 
 # ---------------------------------------------------------------------------
