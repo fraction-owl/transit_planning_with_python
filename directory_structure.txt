@@ -55,6 +55,12 @@ transit_planning_with_python/
 │   │   ├── time_band_exporter.py
 │   │   └── timepoint_schedule_exporter.py
 │   ├── modeling/
+│   │   ├── fit_model.py
+│   │   ├── fit_ridership_model.py
+│   │   ├── gtfs_route_features.py
+│   │   ├── orchestrator_jobs.json
+│   │   ├── orchestrator_jobs.local.json
+│   │   ├── prep_features.py
 │   │   ├── ridership_ml_model.py
 │   │   └── ridership_regression_model.py
 │   ├── national_data_tools/
