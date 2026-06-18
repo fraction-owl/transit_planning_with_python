@@ -115,28 +115,9 @@ LOG_PREDICTORS: Final[tuple[str, ...]] = (
 LOG_DEPENDENT: Final[bool] = True
 
 # --- Service-type flag -------------------------------------------------------
-# Routes flagged is_express = 1; everything else 0.
-EXPRESS_ROUTES: Final[tuple[str, ...]] = (
-    "159",
-    "393",
-    "394",
-    "395",
-    "396",
-    "494",
-    "495",
-    "598",
-    "599",
-    "660",
-    "663",
-    "670",
-    "671",
-    "697",
-    "698",
-    "699",
-    "722",
-    "798",
-    "835",
-)
+# Routes flagged is_express = 1; everything else 0. Replace these placeholders
+# with your agency's express route numbers.
+EXPRESS_ROUTES: Final[tuple[str, ...]] = ("101", "202", "303")  # <<< EDIT ME
 
 # --- Diagnostic overlays (attached to RoutePerformance, NOT regressors) ------
 # Service levers + equity context to explain why a route under/over-performs.

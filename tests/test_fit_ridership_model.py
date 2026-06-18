@@ -93,7 +93,7 @@ def test_derive_features_flags_express_and_equity_pct() -> None:
     """Express routes get a 1/0 flag and equity %s divide count by denominator."""
     table = pd.DataFrame(
         {
-            "route_id": ["159", "100"],  # 159 is in EXPRESS_ROUTES, 100 is not
+            "route_id": ["101", "100"],  # 101 is in EXPRESS_ROUTES, 100 is not
             "low_income": [250.0, 100.0],
             "total_pop": [1000.0, 500.0],
         }
