@@ -18,7 +18,7 @@ Features produced (one row per route, keyed on ``route_id`` = GTFS route_short_n
         revenue_hours         sum of trip in-service runtimes (hours)
         span_hours            first departure to last arrival (hours)
         median_headway_min    median gap between consecutive trip starts (route-level, all-day)
-        pct_day_with_service  percent of the day's 48 half-hour bins a trip is operating
+        pct_day_with_service  percent of the day's 48 half-hour bins with a trip departure
         revenue_miles         daily total revenue miles (sum of trip shape lengths)
         route_length_mi       representative one-way length (longest shape the route uses)
         route_length_modal_mi one-way length of the modal shape variant (shape most trips run)
@@ -41,11 +41,14 @@ Caveats worth knowing before you read the coefficients:
       directions and counts layover gaps below 4 h. Peak/by-direction headway is a later
       refinement, not this number.
     - pct_day_with_service is the more robust service-availability measure: the share of
-      the day's 48 half-hour bins in which at least one trip is operating (its start->end
-      interval overlaps the bin), x100. Unlike median_headway_min it is direction-agnostic
-      and counts every midday/overnight gap rather than ignoring it. Late trips keep the
-      GTFS extended clock (25:xx, 26:xx are not wrapped to the next day), matching
-      span_hours / runtimes; the denominator is a nominal 24 h (48 bins).
+      the day's 48 half-hour bins in which at least one trip *departs*, x100. Counting
+      departures (not whole operating intervals) mirrors what a rider waiting at a stop
+      experiences -- how often a boardable vehicle shows up, not that some bus is mid-route
+      elsewhere -- so a long through-running trip credits only its start bin. Unlike
+      median_headway_min it is direction-agnostic and counts every midday/overnight gap
+      rather than ignoring it. Late trips keep the GTFS extended clock (25:xx, 26:xx are
+      not wrapped to the next day), matching span_hours / runtimes; the denominator is a
+      nominal 24 h (48 bins).
     - revenue_miles is a daily total (a supply *quantity*); route_length_mi is the
       one-way extent used for stops_per_mile. They are deliberately different units.
     - route_length_mi is the route's longest shape (its full extent); route_length_modal_mi
@@ -405,20 +408,23 @@ def _median_headway_min(start_secs: pd.Series) -> float:
 
 
 def _service_day_coverage(trip_times: pd.DataFrame, bins_per_day: int = 48) -> pd.DataFrame:
-    """Per route: percent of the day (0-100) in which a trip is operating.
+    """Per route: percent of the day (0-100) with a trip departure.
 
     The day is split into ``bins_per_day`` equal bins (48 -> 30-minute bins). A bin
-    counts as served if any of the route's trips is in motion during it (the trip's
-    [start, end] interval overlaps the bin); served bins are unioned across the route's
-    trips and divided by ``bins_per_day``. Late-night trips keep the GTFS extended clock
-    (e.g. 25:30 falls in bin 51, not wrapped back to 01:30), matching how span_hours and
+    counts as served if at least one of the route's trips *departs* within it; served
+    bins are unioned across the route's trips and divided by ``bins_per_day``. Counting
+    departures -- rather than whole operating intervals -- mirrors the service a rider
+    waiting at a stop actually experiences: what matters is how often a boardable vehicle
+    shows up, not that some bus is mid-route elsewhere. A long trip therefore credits only
+    the bin it starts in. Late-night trips keep the GTFS extended clock (e.g. a 25:30
+    departure falls in bin 51, not wrapped back to 01:30), matching how span_hours and
     runtimes treat after-midnight times here.
 
     A more robust alternative to median_headway_min: direction-agnostic, and it explicitly
     penalizes midday / overnight gaps instead of ignoring gaps above a threshold.
 
-    Returns ``[route_id, pct_day_with_service]``; routes with no usable trip times are
-    omitted so callers can left-merge and leave them NaN.
+    Returns ``[route_id, pct_day_with_service]``; routes with no usable trip start times
+    are omitted so callers can left-merge and leave them NaN.
     """
     cols = ["route_id", "pct_day_with_service"]
     df = trip_times.dropna(subset=["start_sec"])
@@ -426,17 +432,11 @@ def _service_day_coverage(trip_times: pd.DataFrame, bins_per_day: int = 48) -> p
         return pd.DataFrame(columns=cols)
 
     bin_sec = 86_400.0 / bins_per_day
-    start = df["start_sec"].to_numpy(dtype=float)
-    end = df["end_sec"].to_numpy(dtype=float)
-    end = np.where(np.isfinite(end), end, start)  # missing end -> credit the departure bin only
-    end = np.clip(end, start, start + 86_400.0)  # guard clock anomalies / absurd >24 h spans
-    first_bin = np.floor(start / bin_sec).astype(np.int64)
-    # Subtract 1 s so a trip arriving exactly on a bin boundary does not credit the next bin.
-    last_bin = np.maximum(np.floor((end - 1.0) / bin_sec).astype(np.int64), first_bin)
+    bin_idx = np.floor(df["start_sec"].to_numpy(dtype=float) / bin_sec).astype(np.int64)
 
     served: dict[str, set[int]] = {}
-    for route_id, lo, hi in zip(df["route_id"].to_numpy(), first_bin, last_bin):
-        served.setdefault(route_id, set()).update(range(int(lo), int(hi) + 1))
+    for route_id, b in zip(df["route_id"].to_numpy(), bin_idx):
+        served.setdefault(route_id, set()).add(int(b))
 
     rows = [(rid, 100.0 * len(bins) / bins_per_day) for rid, bins in served.items()]
     return pd.DataFrame(rows, columns=cols)
@@ -490,7 +490,7 @@ def compute_route_supply_metrics(
 
     out = trips_per_day.merge(agg, on="route_id", how="left")
 
-    coverage = _service_day_coverage(trips_t[["route_id", "start_sec", "end_sec"]])
+    coverage = _service_day_coverage(trips_t[["route_id", "start_sec"]])
     out = out.merge(coverage, on="route_id", how="left")
 
     if not shape_len.empty:
