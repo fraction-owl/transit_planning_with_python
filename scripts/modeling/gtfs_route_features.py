@@ -639,6 +639,11 @@ def collapse_to_route_number(metrics: pd.DataFrame, route_col: str) -> pd.DataFr
     agg["competition_intensity"] = (
         agg["competitor_trips_at_shared_stops"] / agg["trips_per_day"].replace(0, np.nan)
     ).fillna(0.0)
+    # Recompute from the aggregates like the other rate-like metrics; otherwise the
+    # output schema would silently lose stops_per_mile only on collision. n_stops is
+    # the summed (deliberately approximate) count, so a stop shared by two sub-routes
+    # double-counts here — accepted because collisions are already logged as approximate.
+    agg["stops_per_mile"] = agg["n_stops"] / agg["route_length_mi"].replace(0, np.nan)
 
     agg = agg.drop(
         columns=["min_start_sec", "max_end_sec", "_hw_num", "_hw_w", "_share_num", "_share_w"]
