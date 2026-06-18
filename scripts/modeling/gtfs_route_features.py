@@ -14,13 +14,15 @@ Where this sits in the pipeline:
 Features produced (one row per route, keyed on ``route_id`` = GTFS route_short_name):
 
     Supply (the actionable levers + scale):
-        trips_per_day        trips on the analysis weekday
-        revenue_hours        sum of trip in-service runtimes (hours)
-        span_hours           first departure to last arrival (hours)
-        median_headway_min   median gap between consecutive trip starts (route-level, all-day)
-        revenue_miles        daily total revenue miles (sum of trip shape lengths)
-        route_length_mi      representative one-way length (longest shape the route uses)
-        avg_speed_mph        revenue_miles / revenue_hours
+        trips_per_day         trips on the analysis weekday
+        revenue_hours         sum of trip in-service runtimes (hours)
+        span_hours            first departure to last arrival (hours)
+        median_headway_min    median gap between consecutive trip starts (route-level, all-day)
+        pct_day_with_service  percent of the day's 48 half-hour bins a trip is operating
+        revenue_miles         daily total revenue miles (sum of trip shape lengths)
+        route_length_mi       representative one-way length (longest shape the route uses)
+        route_length_modal_mi one-way length of the modal shape variant (shape most trips run)
+        avg_speed_mph         revenue_miles / revenue_hours
 
     Network structure / redundancy:
         n_stops                          distinct stops served by the route
@@ -38,8 +40,18 @@ Caveats worth knowing before you read the coefficients:
     - median_headway_min is a coarse all-day, all-direction route-level median; it mixes
       directions and counts layover gaps below 4 h. Peak/by-direction headway is a later
       refinement, not this number.
+    - pct_day_with_service is the more robust service-availability measure: the share of
+      the day's 48 half-hour bins in which at least one trip is operating (its start->end
+      interval overlaps the bin), x100. Unlike median_headway_min it is direction-agnostic
+      and counts every midday/overnight gap rather than ignoring it. Late trips keep the
+      GTFS extended clock (25:xx, 26:xx are not wrapped to the next day), matching
+      span_hours / runtimes; the denominator is a nominal 24 h (48 bins).
     - revenue_miles is a daily total (a supply *quantity*); route_length_mi is the
       one-way extent used for stops_per_mile. They are deliberately different units.
+    - route_length_mi is the route's longest shape (its full extent); route_length_modal_mi
+      is the length of the shape variant the most trips run (the *typical* one-way trip).
+      They diverge when a route has short-turns or occasional extensions. stops_per_mile
+      still pairs with route_length_mi (the all-shapes distinct-stop count needs the extent).
 
 Inputs:
     A GTFS feed folder containing routes/trips/calendar/stop_times/shapes (.txt).
@@ -392,6 +404,44 @@ def _median_headway_min(start_secs: pd.Series) -> float:
     return float(np.median(diffs) / 60.0) if diffs.size else float("nan")
 
 
+def _service_day_coverage(trip_times: pd.DataFrame, bins_per_day: int = 48) -> pd.DataFrame:
+    """Per route: percent of the day (0-100) in which a trip is operating.
+
+    The day is split into ``bins_per_day`` equal bins (48 -> 30-minute bins). A bin
+    counts as served if any of the route's trips is in motion during it (the trip's
+    [start, end] interval overlaps the bin); served bins are unioned across the route's
+    trips and divided by ``bins_per_day``. Late-night trips keep the GTFS extended clock
+    (e.g. 25:30 falls in bin 51, not wrapped back to 01:30), matching how span_hours and
+    runtimes treat after-midnight times here.
+
+    A more robust alternative to median_headway_min: direction-agnostic, and it explicitly
+    penalizes midday / overnight gaps instead of ignoring gaps above a threshold.
+
+    Returns ``[route_id, pct_day_with_service]``; routes with no usable trip times are
+    omitted so callers can left-merge and leave them NaN.
+    """
+    cols = ["route_id", "pct_day_with_service"]
+    df = trip_times.dropna(subset=["start_sec"])
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+
+    bin_sec = 86_400.0 / bins_per_day
+    start = df["start_sec"].to_numpy(dtype=float)
+    end = df["end_sec"].to_numpy(dtype=float)
+    end = np.where(np.isfinite(end), end, start)  # missing end -> credit the departure bin only
+    end = np.clip(end, start, start + 86_400.0)  # guard clock anomalies / absurd >24 h spans
+    first_bin = np.floor(start / bin_sec).astype(np.int64)
+    # Subtract 1 s so a trip arriving exactly on a bin boundary does not credit the next bin.
+    last_bin = np.maximum(np.floor((end - 1.0) / bin_sec).astype(np.int64), first_bin)
+
+    served: dict[str, set[int]] = {}
+    for route_id, lo, hi in zip(df["route_id"].to_numpy(), first_bin, last_bin):
+        served.setdefault(route_id, set()).update(range(int(lo), int(hi) + 1))
+
+    rows = [(rid, 100.0 * len(bins) / bins_per_day) for rid, bins in served.items()]
+    return pd.DataFrame(rows, columns=cols)
+
+
 def compute_route_supply_metrics(
     trips: pd.DataFrame, stop_times: pd.DataFrame, shape_len: pd.DataFrame
 ) -> pd.DataFrame:
@@ -440,6 +490,9 @@ def compute_route_supply_metrics(
 
     out = trips_per_day.merge(agg, on="route_id", how="left")
 
+    coverage = _service_day_coverage(trips_t[["route_id", "start_sec", "end_sec"]])
+    out = out.merge(coverage, on="route_id", how="left")
+
     if not shape_len.empty:
         sl = shape_len.copy()
         sl["shape_id"] = sl["shape_id"].astype(str)
@@ -458,16 +511,37 @@ def compute_route_supply_metrics(
             .rename("route_length_m")
             .reset_index()
         )
-        out = out.merge(rev_miles, on="route_id", how="left").merge(
-            route_len, on="route_id", how="left"
+        # Modal shape variant = the shape the most trips run (the *typical* one-way trip).
+        # Ties break toward the longer shape so the fuller variant wins a 50/50 split; we
+        # take the first row per route after sorting (not groupby.first(), which would skip
+        # a NaN length and return a *different* shape's length).
+        shape_counts = (
+            trips_s.groupby(["route_id", "shape_id"], dropna=False)
+            .agg(n_trips=("trip_id", "count"), shape_len_m=("shape_len_m", "first"))
+            .reset_index()
+            .sort_values(
+                ["route_id", "n_trips", "shape_len_m"],
+                ascending=[True, False, False],
+                na_position="last",
+            )
+        )
+        modal_len = shape_counts.drop_duplicates(subset="route_id", keep="first")[
+            ["route_id", "shape_len_m"]
+        ].rename(columns={"shape_len_m": "route_length_modal_m"})
+        out = (
+            out.merge(rev_miles, on="route_id", how="left")
+            .merge(route_len, on="route_id", how="left")
+            .merge(modal_len, on="route_id", how="left")
         )
         out["revenue_miles"] = out["revenue_miles_m"] / 1609.344
         out["route_length_mi"] = out["route_length_m"] / 1609.344
-        out = out.drop(columns=["revenue_miles_m", "route_length_m"])
+        out["route_length_modal_mi"] = out["route_length_modal_m"] / 1609.344
+        out = out.drop(columns=["revenue_miles_m", "route_length_m", "route_length_modal_m"])
         out["avg_speed_mph"] = out["revenue_miles"] / out["revenue_hours"].replace(0, np.nan)
     else:
         out["revenue_miles"] = np.nan
         out["route_length_mi"] = np.nan
+        out["route_length_modal_mi"] = np.nan
         out["avg_speed_mph"] = np.nan
 
     return out
@@ -614,6 +688,14 @@ def collapse_to_route_number(metrics: pd.DataFrame, route_col: str) -> pd.DataFr
     stops = pd.to_numeric(df["n_stops"], errors="coerce").fillna(0.0)
     df["_share_num"] = df["shared_stop_share"].fillna(0.0) * stops
     df["_share_w"] = stops
+    # pct_day_with_service and route_length_modal_mi are rate-/typical-like, so they
+    # collapse to a trips-weighted mean (approximate, like headway) rather than a sum/max.
+    cov_mask = df["pct_day_with_service"].notna()
+    df["_cov_num"] = np.where(cov_mask, df["pct_day_with_service"] * df["trips_per_day"], 0.0)
+    df["_cov_w"] = np.where(cov_mask, df["trips_per_day"], 0.0)
+    rlm_mask = df["route_length_modal_mi"].notna()
+    df["_rlm_num"] = np.where(rlm_mask, df["route_length_modal_mi"] * df["trips_per_day"], 0.0)
+    df["_rlm_w"] = np.where(rlm_mask, df["trips_per_day"], 0.0)
 
     g = df.groupby(route_col, dropna=False)
     agg = g.agg(
@@ -630,11 +712,17 @@ def collapse_to_route_number(metrics: pd.DataFrame, route_col: str) -> pd.DataFr
         _hw_w=("_hw_w", "sum"),
         _share_num=("_share_num", "sum"),
         _share_w=("_share_w", "sum"),
+        _cov_num=("_cov_num", "sum"),
+        _cov_w=("_cov_w", "sum"),
+        _rlm_num=("_rlm_num", "sum"),
+        _rlm_w=("_rlm_w", "sum"),
     )
 
     agg["span_hours"] = (agg["max_end_sec"] - agg["min_start_sec"]) / 3600.0
     agg["avg_speed_mph"] = agg["revenue_miles"] / agg["revenue_hours"].replace(0, np.nan)
     agg["median_headway_min"] = agg["_hw_num"] / agg["_hw_w"].replace(0, np.nan)
+    agg["pct_day_with_service"] = agg["_cov_num"] / agg["_cov_w"].replace(0, np.nan)
+    agg["route_length_modal_mi"] = agg["_rlm_num"] / agg["_rlm_w"].replace(0, np.nan)
     agg["shared_stop_share"] = agg["_share_num"] / agg["_share_w"].replace(0, np.nan)
     agg["competition_intensity"] = (
         agg["competitor_trips_at_shared_stops"] / agg["trips_per_day"].replace(0, np.nan)
@@ -646,7 +734,18 @@ def collapse_to_route_number(metrics: pd.DataFrame, route_col: str) -> pd.DataFr
     agg["stops_per_mile"] = agg["n_stops"] / agg["route_length_mi"].replace(0, np.nan)
 
     agg = agg.drop(
-        columns=["min_start_sec", "max_end_sec", "_hw_num", "_hw_w", "_share_num", "_share_w"]
+        columns=[
+            "min_start_sec",
+            "max_end_sec",
+            "_hw_num",
+            "_hw_w",
+            "_share_num",
+            "_share_w",
+            "_cov_num",
+            "_cov_w",
+            "_rlm_num",
+            "_rlm_w",
+        ]
     )
     return agg.reset_index().rename(columns={route_col: "route_id"})
 
@@ -784,8 +883,10 @@ def run() -> Optional[pd.DataFrame]:
         "revenue_hours",
         "span_hours",
         "median_headway_min",
+        "pct_day_with_service",
         "revenue_miles",
         "route_length_mi",
+        "route_length_modal_mi",
         "avg_speed_mph",
         "n_stops",
         "stops_per_mile",
