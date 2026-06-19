@@ -15,12 +15,14 @@ transit_planning_with_python/
 ├── dev_tools/
 │   ├── audit_helper_functions.py
 │   ├── build_cacensus_fixtures.py
+│   ├── build_schools_fixtures.py
 │   ├── build_uscensus_fixtures.py
 │   ├── check_style.py
 │   ├── export_repo_file_tree.py
 │   ├── export_requirements.py
 │   ├── generate_mock_bikeshare_trips.py
 │   ├── generate_mock_gtfs.py
+│   ├── generate_mock_points_of_interest.py
 │   ├── generate_mock_roads.py
 │   ├── generate_mock_tides.py
 │   ├── lint_commit.py
@@ -115,6 +117,17 @@ transit_planning_with_python/
 │   │   │   ├── stop_times.txt
 │   │   │   ├── stops.txt
 │   │   │   └── trips.txt
+│   │   ├── points_of_interest/
+│   │   │   ├── Bus_Stations.zip
+│   │   │   ├── Colleges_and_Universities.zip
+│   │   │   ├── Commuter_Rail_Stations.zip
+│   │   │   ├── Hospitals.zip
+│   │   │   ├── Libraries.zip
+│   │   │   ├── Metrorail_Stations.zip
+│   │   │   ├── Park_and_Rides.zip
+│   │   │   ├── Private_Shuttle_Stops.zip
+│   │   │   ├── School_Facilities.zip
+│   │   │   └── Urgent_Care_Facilities.zip
 │   │   ├── 4331222_sample.csv
 │   │   ├── 98-401-X2021006_eng_CSV.zip
 │   │   ├── ACSDT5Y2024.B01001_2026-05-23T135534.zip
@@ -126,10 +139,19 @@ transit_planning_with_python/
 │   │   ├── DECENNIALDHC2020.H1_2026-05-23T134937.zip
 │   │   ├── DECENNIALDHC2020.P9_2026-05-23T135214.zip
 │   │   ├── DECENNIALPL2020.P1_2026-05-23T133835.zip
+│   │   ├── EDGE_GEOCODE_POSTSEC_1920_sample.zip
+│   │   ├── EDGE_GEOCODE_PRIVATESCH_1920_sample.zip
+│   │   ├── EDGE_GEOCODE_PUBLICSCH_1920_sample.zip
+│   │   ├── ELSI_csv_export_private_1920_sample.csv
+│   │   ├── ELSI_csv_export_public_1920_sample.csv
 │   │   ├── PET_PRI_GND_DCUS_NUS_W_Data_1__sample.csv
 │   │   ├── UNRATE_sample.csv
 │   │   ├── capitalbikeshare_fixtures_24mo.zip
+│   │   ├── ccd_sch_052_1920_sample.zip
 │   │   ├── dc_wac_S000_JT00_2023.csv.gz
+│   │   ├── effy2019_sample.csv
+│   │   ├── express_origin_stops.txt
+│   │   ├── express_routes.txt
 │   │   ├── lda_000b21a_e_sample.zip
 │   │   ├── md_wac_S000_JT00_2023.csv.gz
 │   │   ├── mock_gtfs_dc.zip
@@ -156,8 +178,10 @@ transit_planning_with_python/
 │   ├── test_clean_fred_unrate.py
 │   ├── test_clean_noaa_weather.py
 │   ├── test_data_request_by_stop_processor.py
+│   ├── test_fit_ridership_model.py
 │   ├── test_flag_stop_upgrades.py
 │   ├── test_gbfs_ridership_join.py
+│   ├── test_gtfs_route_features.py
 │   ├── test_gtfs_route_summary.py
 │   ├── test_gtfs_service_demographics_gpd.py
 │   ├── test_gtfs_stop_compare.py
@@ -166,14 +190,19 @@ transit_planning_with_python/
 │   ├── test_load_factor_monitor.py
 │   ├── test_load_gtfs_data.py
 │   ├── test_network_helpers.py
+│   ├── test_ntd_anchor_builder.py
 │   ├── test_ntd_monthly_summary.py
 │   ├── test_ntd_monthly_trends_export.py
 │   ├── test_otp_by_timepoint.py
 │   ├── test_otp_monthly_tides.py
+│   ├── test_points_of_interest_coverage_gpd.py
+│   ├── test_prep_features_orchestrator.py
 │   ├── test_printable_block_schedules.py
 │   ├── test_ridership_ml_model.py
 │   ├── test_ridership_regression_model.py
 │   ├── test_route_direction_classifier.py
+│   ├── test_school_coverage_by_route_gpd.py
+│   ├── test_schools_prep_join_gpd.py
 │   ├── test_segment_runtime_tides.py
 │   ├── test_segment_speed_exporter.py
 │   ├── test_stop_impacts_target_routes.py
