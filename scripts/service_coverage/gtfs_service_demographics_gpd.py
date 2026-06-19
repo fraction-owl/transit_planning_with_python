@@ -15,6 +15,17 @@ independent choices:
     - ``"isochrone"``: a walk-time isochrone (walkshed) around each stop,
       traced over a pedestrian centerline network.
 
+In ``"route"`` mode each route is labeled by ``service_type``
+(``"express"``/``"local"``) and ``express_direction``
+(``"unidirectional"``/``"bidirectional"``/``""``). Express routes get *access-mode
+accounting* under the ``"stop_buffer"`` method: population is drive-scaled at the
+park-and-ride origin stops (wide buffer) and walk-scaled elsewhere, while
+employment is always walk-scaled (riders walk from the alighting stop to the
+job). Unidirectional (commuter) routes additionally drop the two cross-terms —
+origin employment and destination population — which can be zeroed
+independently; bidirectional routes keep both ends. See the express settings in
+the CONFIGURATION block.
+
 Intended for use in Jupyter notebooks with appropriate EPSG settings. The
 projected CRS (``CRS_EPSG_CODE``) is assumed to use **metres** as its linear
 unit, matching the miles-to-metres conversions used throughout.
@@ -93,14 +104,41 @@ ROUTES_TO_EXCLUDE: list[str] = []  # e.g. [] for no exclude filter
 
 # Express routes:
 # Express/commuter routes whose service areas are unreliable under the standard
-# walk-buffer methods (a long highway corridor served by only a few stops). For
-# now this only *labels* them: in "route" mode each output row gets a
-# ``service_type`` column of "express" or "local", so the downstream ridership
-# model can fit them separately. Catchment geometry is unchanged in this pass.
-# The express set is the union of two sources, matched against GTFS ``route_id``:
-#   1) EXPRESS_ROUTE_IDS: route_id values listed inline (e.g. ["101", "303"]).
-#   2) EXPRESS_ROUTES_FILE: path to a text file with one route_id per line
-#      ("#" starts a comment). Set to None to use the inline list only.
+# walk-buffer methods (a long highway corridor served by only a few stops). In
+# "route" mode each output row gets a ``service_type`` column of "express" or
+# "local" (so the downstream model can fit them separately) plus an
+# ``express_direction`` column of "unidirectional", "bidirectional", or "".
+#
+# Express routes split into two service patterns. Each is matched against GTFS
+# ``route_id`` and is the union of an inline list and an optional text file (one
+# route_id per line, "#" starts a comment; set the file to None for inline only):
+#
+#   * UNIDIRECTIONAL (commuter) express — a directional home->work flow (AM
+#     inbound, PM outbound). Its ridership market is population at the origin
+#     (residential / park-and-ride end) plus employment at the destination
+#     (job / CBD end), so in "route" mode with the "stop_buffer" method these get
+#     *directional accounting*: population is summed from the origin catchment and
+#     employment from the destination catchment, and the two cross-terms can be
+#     zeroed (see the directional-accounting knobs below). Origin stops must be
+#     listed in the express-origin settings so the two ends can be told apart;
+#     a route with no origin stop falls back to symmetric accounting (warned).
+EXPRESS_UNIDIRECTIONAL_ROUTE_IDS: list[str] = []
+EXPRESS_UNIDIRECTIONAL_ROUTES_FILE: str | None = None
+#
+#   * BIDIRECTIONAL express — connects two mixed job/residential centers and
+#     carries load both ways, so both ends contribute. It keeps both ends'
+#     population and employment (the cross-term knobs are unidirectional-only),
+#     but still uses access-mode buffering: population is drive-scaled at the
+#     park-and-ride origins (wide buffer) and employment is walk-scaled at every
+#     stop. (Counting jobs over a wide drive buffer would imply driving miles
+#     from the bus to the desk — riders walk that last leg, so jobs stay walk.)
+EXPRESS_BIDIRECTIONAL_ROUTE_IDS: list[str] = []
+EXPRESS_BIDIRECTIONAL_ROUTES_FILE: str | None = None
+#
+# EXPRESS_ROUTE_IDS / EXPRESS_ROUTES_FILE is the original, direction-agnostic
+# list. Routes listed here (and not in either list above) are still labeled
+# "express" and get the wide origin buffer, but keep symmetric accounting — i.e.
+# they behave like bidirectional express. Kept for backward compatibility.
 EXPRESS_ROUTE_IDS: list[str] = []
 EXPRESS_ROUTES_FILE: str | None = None
 
@@ -121,19 +159,20 @@ EXPRESS_ORIGIN_BUFFER_DISTANCE = 2.0  # Drive-access buffer for express origin s
 
 # Express origin stops:
 # stop_ids that are *origin* stops on express/commuter routes — park-and-rides
-# and similar boarding points people reach by car, not on foot. Each of these
-# gets EXPRESS_ORIGIN_BUFFER_DISTANCE (a wide drive-access catchment) instead of
-# the standard walk buffer, so an express route's residential market is captured
-# rather than just the near-empty quarter-mile around a highway lot. Every other
-# stop — including express *destination* stops downtown — keeps BUFFER_DISTANCE,
-# so only the origins need to be listed here. (Applies to the "stop_buffer"
-# method, which is the right method for express routes anyway.) The set is the
-# union of two sources, matched against GTFS ``stop_id``:
+# and similar boarding points people reach by car, not on foot. For an express
+# route they mark the drive-access end: population near them is captured with the
+# wide EXPRESS_ORIGIN_BUFFER_DISTANCE drive-shed (instead of the near-empty
+# quarter-mile around a highway lot), while every other stop uses the walk
+# BUFFER_DISTANCE for population. Employment is always counted on the walk buffer
+# (riders walk from the bus to the job), at every stop including the origins.
+# Listing a route's origins is also what lets the unidirectional split tell its
+# two ends apart. (Applies to the "stop_buffer" method.) The set is the union of
+# two sources, matched against GTFS ``stop_id``:
 #   1) EXPRESS_ORIGIN_STOP_IDS: stop_id values listed inline.
 #   2) EXPRESS_ORIGIN_STOPS_FILE: path to a text file with one stop_id per line
 #      ("#" starts a comment). Set to None to use the inline list only.
-# Tip: run with EXPRESS_ROUTE_IDS set first; the express routes' stops are the
-# only candidates, and a later advisory can suggest which of them are origins.
+# Tip: set the express route lists first; those routes' stops are the only
+# candidates, and the advisory can suggest which of them are origins.
 EXPRESS_ORIGIN_STOP_IDS: list[str] = []
 EXPRESS_ORIGIN_STOPS_FILE: str | None = None
 
@@ -150,6 +189,32 @@ EXPRESS_ORIGIN_JOBS_FIELD: str = "tot_empl"  # demographics column holding job c
 # A stop is flagged when its nearby jobs fall below this fraction of the
 # job-richest stop on the same route (a relative, per-route cutoff).
 EXPRESS_ORIGIN_JOBS_SHARE_THRESHOLD: float = 0.2
+
+# Directional accounting (UNIDIRECTIONAL express routes only):
+# A commuter express is a one-way flow — riders board near home (the origin /
+# park-and-ride end) and alight near work (the destination / CBD end) — so its
+# market is population@origin + employment@destination. Those two "keystone"
+# terms are always kept. The two *cross-terms* are mostly irrelevant (only the
+# rare reverse / night-shift rider uses them) and can be zeroed independently:
+#   * EXPRESS_ZERO_ORIGIN_EMPLOYMENT — drop the employment counted in the origin
+#     stops' walk buffer (employment is always walk-scaled, never drive-scaled).
+#     Park-and-rides sit far from jobs by construction, so this term is usually
+#     negligible; leave True.
+#   * EXPRESS_ZERO_DESTINATION_POPULATION — drop population counted in the
+#     destination (CBD) catchment. Set False where the destination has real
+#     housing inside the walk buffer (e.g. mixed-use cores like Tysons or
+#     Bethesda) and you want those residents kept; True suits job-only downtowns
+#     (e.g. a CBD or office park with little housing within a quarter mile).
+# Applies only in "route" mode with the "stop_buffer" method; other methods fall
+# back to symmetric accounting with a warning.
+EXPRESS_ZERO_ORIGIN_EMPLOYMENT: bool = True
+EXPRESS_ZERO_DESTINATION_POPULATION: bool = True
+
+# Which SYNTHETIC_FIELDS (below) are employment (job) counts. Employment is
+# walk-scaled at every stop; every other synthetic field is treated as
+# residence-based (population / households / residents), drive-scaled at the
+# origin stops and walk-scaled elsewhere.
+EXPRESS_EMPLOYMENT_FIELDS: list[str] = ["tot_empl", "low_wage", "mid_wage", "high_wage"]
 
 # Isochrone settings (only used when SERVICE_AREA_METHOD == "isochrone")
 ISOCHRONE_WALK_TIME_MIN = 10.0  # Walk-time budget in minutes
@@ -1056,6 +1121,147 @@ def do_network_analysis(
     plt.show()
 
 
+def express_route_totals(
+    route_stops_gdf: gpd.GeoDataFrame,
+    demographics_gdf: gpd.GeoDataFrame,
+    synthetic_fields: list[str],
+    *,
+    origin_stop_ids: set[str],
+    walk_buffer_mi: float,
+    origin_buffer_mi: float,
+    employment_fields: Sequence[str],
+    zero_origin_employment: bool,
+    zero_destination_population: bool,
+) -> Tuple[Optional[dict[str, int]], Optional[gpd.GeoDataFrame]]:
+    """Access-mode demographic totals for one express route.
+
+    Buffer width follows how each demographic reaches the bus, not a stop's
+    label:
+
+    * **Population** is drive-accessed at origin (park-and-ride) stops — those in
+      *origin_stop_ids* get the wide ``origin_buffer_mi`` drive-shed — and
+      walk-accessed (``walk_buffer_mi``) at every other stop.
+    * **Employment** is always walk-accessed: riders walk from the alighting stop
+      to the job, so every stop uses ``walk_buffer_mi`` for jobs. A wide buffer
+      would imply driving miles from the bus to the desk and overcount jobs.
+
+    The two directional cross-terms are then dropped per the flags:
+
+    * ``zero_destination_population`` — count population only from the origin
+      (drive) end, not the non-origin (destination / walk) stops.
+    * ``zero_origin_employment`` — count employment only from the non-origin
+      (destination / walk) stops, not the origin stops' walk buffer.
+
+    A unidirectional express sets both flags True (population@origin +
+    employment@destination); a bidirectional express sets both False (both ends
+    contribute population *and* employment, employment still walk-scaled).
+
+    Args:
+        route_stops_gdf: This route's stop points (projected CRS), deduped by stop.
+        demographics_gdf: Projected demographics layer carrying *synthetic_fields*.
+        synthetic_fields: Demographic count fields to total.
+        origin_stop_ids: stop_ids treated as drive-access origins (park-and-rides).
+        walk_buffer_mi: Walk-access buffer radius in miles.
+        origin_buffer_mi: Drive-access buffer radius in miles for origin stops.
+        employment_fields: Subset of *synthetic_fields* that are job counts; every
+            other field is treated as residence-based (population).
+        zero_origin_employment: Drop the origin stops' (walk-buffer) employment.
+        zero_destination_population: Drop the non-origin stops' population.
+
+    Returns:
+        ``(route_totals, combined_clip)`` where *route_totals* maps each present
+        bare field name to its integer total and *combined_clip* is the clipped
+        catchment for the per-route shapefile; or ``(None, None)`` when a required
+        catchment is empty (e.g. a unidirectional route with no origin stop or no
+        non-origin stop), so the caller can fall back to symmetric accounting.
+    """
+    sid = route_stops_gdf["stop_id"].astype(str)
+    origin_ids = {str(s) for s in origin_stop_ids}
+    origin_stops = route_stops_gdf[sid.isin(origin_ids)]
+    other_stops = route_stops_gdf[~sid.isin(origin_ids)]
+
+    def _buffer(stops: gpd.GeoDataFrame, radius_mi: float) -> Optional[gpd.GeoDataFrame]:
+        if stops.empty:
+            return None
+        return build_service_area_polygon(
+            stops,
+            method="stop_buffer",
+            buffer_distance_mi=radius_mi,
+            large_buffer_distance_mi=radius_mi,
+            stop_ids_large_buffer=[],
+        )
+
+    # Population: drive-shed at the origin stops, walk buffer elsewhere. Dropping
+    # destination population leaves only the origin drive-shed; the not-dropped
+    # case is dissolved into one polygon so the wide and walk parts do not
+    # double-count where they overlap.
+    if zero_destination_population:
+        population_area = _buffer(origin_stops, origin_buffer_mi)
+    else:
+        population_area = build_service_area_polygon(
+            route_stops_gdf,
+            method="stop_buffer",
+            buffer_distance_mi=walk_buffer_mi,
+            large_buffer_distance_mi=origin_buffer_mi,
+            stop_ids_large_buffer=sorted(origin_ids),
+        )
+
+    # Employment: walk buffer only — the non-origin stops, plus the origin stops'
+    # walk buffer unless origin employment is dropped.
+    if zero_origin_employment:
+        employment_area = _buffer(other_stops, walk_buffer_mi)
+    else:
+        employment_area = _buffer(route_stops_gdf, walk_buffer_mi)
+
+    if (
+        population_area is None
+        or population_area.empty
+        or employment_area is None
+        or employment_area.empty
+    ):
+        return None, None
+
+    pop_clip = clip_and_calculate_synthetic_fields(
+        demographics_gdf, population_area, synthetic_fields
+    )
+    empl_clip = clip_and_calculate_synthetic_fields(
+        demographics_gdf, employment_area, synthetic_fields
+    )
+
+    # Only emit fields that materialized, matching the symmetric path (a field
+    # missing from the layer is omitted, not zeroed).
+    present = {
+        col.replace("synthetic_", "")
+        for col in (
+            *_present_synthetic_cols(pop_clip, synthetic_fields),
+            *_present_synthetic_cols(empl_clip, synthetic_fields),
+        )
+    }
+    employment = set(employment_fields)
+
+    def _total(clipped: gpd.GeoDataFrame, field: str) -> float:
+        col = f"synthetic_{field}"
+        return float(clipped[col].sum()) if col in clipped.columns else 0.0
+
+    # Iterate synthetic_fields to preserve the symmetric path's column order;
+    # employment fields come from the walk catchment, the rest from population.
+    route_totals: dict[str, int] = {}
+    for field in synthetic_fields:
+        if field not in present:
+            continue
+        source = empl_clip if field in employment else pop_clip
+        route_totals[field] = int(round(_total(source, field)))
+
+    # One dissolved catchment (population area ∪ employment area) for the
+    # per-route shapefile, so overlapping blocks are not written twice.
+    combined_geom = unary_union(list(population_area.geometry) + list(employment_area.geometry))
+    combined_area = gpd.GeoDataFrame(geometry=[combined_geom], crs=population_area.crs)
+    combined_clip = clip_and_calculate_synthetic_fields(
+        demographics_gdf, combined_area, synthetic_fields
+    )
+    return route_totals, combined_clip
+
+
 def do_route_by_route_analysis(
     trips: pd.DataFrame,
     stop_times: pd.DataFrame,
@@ -1078,6 +1284,10 @@ def do_route_by_route_analysis(
     walk_time_min: float = 0.0,
     walk_speed_units_per_s: float = 0.0,
     express_route_ids: Optional[set[str]] = None,
+    unidirectional_route_ids: Optional[set[str]] = None,
+    employment_fields: Optional[Sequence[str]] = None,
+    zero_origin_employment: bool = True,
+    zero_destination_population: bool = True,
 ) -> None:
     """Perform a service-area/clip analysis for each individual route.
 
@@ -1093,7 +1303,19 @@ def do_route_by_route_analysis(
         filename, so the orchestrator can join it onto the ridership anchor. A
         ``service_type`` column labels each route ``"express"`` (its route_id is
         in ``express_route_ids``) or ``"local"`` so the model can fit the two
-        differently; catchment geometry is identical for both in this pass.
+        differently, and an ``express_direction`` column records
+        ``"unidirectional"``, ``"bidirectional"``, or ``""``.
+
+    Express routes (route_id in *express_route_ids*) get access-mode accounting
+    via :func:`express_route_totals`: population is drive-scaled at the
+    park-and-ride origin stops (wide buffer) and walk-scaled elsewhere, while
+    employment is always walk-scaled. Unidirectional routes (in
+    *unidirectional_route_ids*) additionally drop the two cross-terms per
+    *zero_origin_employment* / *zero_destination_population*; bidirectional routes
+    keep both ends. This needs the ``"stop_buffer"`` method (and, for
+    unidirectional, at least one origin and one non-origin stop); otherwise the
+    route falls back to symmetric accounting (warned). Local routes keep the
+    symmetric single-catchment totals.
     """
     logging.info("\n=== Route-by-Route Analysis (%s) ===", service_area_method)
 
@@ -1120,10 +1342,14 @@ def do_route_by_route_analysis(
     short_to_route_ids = (
         final_routes_df.groupby("route_short_name")["route_id"].apply(list).to_dict()
     )
-    # Express routes are labeled (not yet buffered differently) via a service_type
-    # column on each output row; an empty set leaves every route labeled "local".
-    express_set = express_route_ids or set()
+    # Express routes are labeled via a service_type column on each output row (an
+    # empty set leaves every route "local"); unidirectional express routes also
+    # get directional (origin-pop + destination-jobs) accounting.
+    express_set = {str(r) for r in (express_route_ids or set())}
+    uni_set = {str(r) for r in (unidirectional_route_ids or set())}
+    empl_fields = list(employment_fields) if employment_fields is not None else []
     summary_records: list[dict[str, object]] = []
+    express_fallback_warned = False
 
     for route_name in stops_gdf["route_short_name"].unique():
         logging.info("\nProcessing route: %s", route_name)
@@ -1140,47 +1366,112 @@ def do_route_by_route_analysis(
             else route_shapes_gdf
         )
 
-        service_area_gdf = build_service_area_polygon(
-            route_stops_gdf,
-            method=service_area_method,
-            buffer_distance_mi=buffer_distance_mi,
-            large_buffer_distance_mi=large_buffer_distance_mi,
-            stop_ids_large_buffer=stop_ids_large_buffer,
-            route_shapes_gdf=route_only_shapes,
-            ped_graph=ped_graph,
-            walk_time_min=walk_time_min,
-            walk_speed_units_per_s=walk_speed_units_per_s,
-        )
-        if service_area_gdf is None or service_area_gdf.empty:
-            logging.info("Could not build a service area for route '%s' - skipping.", route_name)
-            continue
-
-        clipped_result = clip_and_calculate_synthetic_fields(
-            demographics_gdf, service_area_gdf, synthetic_fields
+        route_id_list = short_to_route_ids.get(route_name, [route_name])
+        route_is_express = any(str(rid) in express_set for rid in route_id_list)
+        route_is_unidirectional = bool(uni_set) and any(
+            str(rid) in uni_set for rid in route_id_list
         )
 
-        synthetic_cols = _present_synthetic_cols(clipped_result, synthetic_fields)
-        totals = clipped_result[synthetic_cols].sum().round(0)
-        for col, val in totals.items():
-            display_col = str(col).replace("synthetic_", "").replace("_", " ").title()
-            logging.info("  Total Synthetic %s for route %s: %d", display_col, route_name, int(val))
+        # Express routes get access-mode accounting (population drive-scaled at
+        # park-and-ride origins, employment always walk-scaled). Unidirectional
+        # routes additionally drop the two cross-terms via the zero_* knobs;
+        # bidirectional routes keep both ends. Local routes use the symmetric
+        # single-catchment totals in the else branch.
+        route_totals: Optional[dict[str, int]] = None
+        clipped_result: Optional[gpd.GeoDataFrame] = None
+        if route_is_express:
+            if service_area_method == "stop_buffer":
+                # The cross-term knobs are unidirectional-only; bidirectional
+                # routes keep both ends' population and employment.
+                zero_origin_empl = zero_origin_employment if route_is_unidirectional else False
+                zero_dest_pop = zero_destination_population if route_is_unidirectional else False
+                route_totals, clipped_result = express_route_totals(
+                    route_stops_gdf,
+                    demographics_gdf,
+                    synthetic_fields,
+                    origin_stop_ids=set(stop_ids_large_buffer),
+                    walk_buffer_mi=buffer_distance_mi,
+                    origin_buffer_mi=large_buffer_distance_mi,
+                    employment_fields=empl_fields,
+                    zero_origin_employment=zero_origin_empl,
+                    zero_destination_population=zero_dest_pop,
+                )
+                if route_totals is None and route_is_unidirectional:
+                    logging.warning(
+                        "Route '%s' is flagged unidirectional express but its stops do not "
+                        "split into an origin and a destination end (need at least one "
+                        "express-origin stop and one other stop on the route); using "
+                        "symmetric accounting. List the route's park-and-ride stop_ids in "
+                        "the express-origin settings.",
+                        route_name,
+                    )
+            elif not express_fallback_warned:
+                logging.warning(
+                    "Express access-mode accounting needs the 'stop_buffer' method; "
+                    "'%s' is in use, so express routes use symmetric accounting.",
+                    service_area_method,
+                )
+                express_fallback_warned = True
+
+        if route_totals is not None and clipped_result is not None:
+            for field, val in route_totals.items():
+                display = field.replace("_", " ").title()
+                logging.info("  Express %s for route %s: %d", display, route_name, int(val))
+        else:
+            service_area_gdf = build_service_area_polygon(
+                route_stops_gdf,
+                method=service_area_method,
+                buffer_distance_mi=buffer_distance_mi,
+                large_buffer_distance_mi=large_buffer_distance_mi,
+                stop_ids_large_buffer=stop_ids_large_buffer,
+                route_shapes_gdf=route_only_shapes,
+                ped_graph=ped_graph,
+                walk_time_min=walk_time_min,
+                walk_speed_units_per_s=walk_speed_units_per_s,
+            )
+            if service_area_gdf is None or service_area_gdf.empty:
+                logging.info(
+                    "Could not build a service area for route '%s' - skipping.", route_name
+                )
+                continue
+
+            clipped_result = clip_and_calculate_synthetic_fields(
+                demographics_gdf, service_area_gdf, synthetic_fields
+            )
+
+            synthetic_cols = _present_synthetic_cols(clipped_result, synthetic_fields)
+            totals = clipped_result[synthetic_cols].sum().round(0)
+            for col, val in totals.items():
+                display_col = str(col).replace("synthetic_", "").replace("_", " ").title()
+                logging.info(
+                    "  Total Synthetic %s for route %s: %d", display_col, route_name, int(val)
+                )
+            route_totals = {
+                str(col).replace("synthetic_", ""): int(val) for col, val in totals.items()
+            }
 
         shp_path = os.path.join(output_dir, f"{route_name}_service_buffer_data.shp")
         clipped_result.to_file(shp_path)
         logging.info("Exported shapefile for route %s: %s", route_name, shp_path)
 
-        # Accumulate this route's totals (stripped of the "synthetic_" prefix)
-        # into one combined, route_id-keyed table written after the loop. The
-        # per-route Excel and blocking plt.show() are intentionally gone: the
-        # combined CSV supersedes the former, and the latter stalls headless
-        # subprocess runs under the orchestrator.
-        route_totals = {str(col).replace("synthetic_", ""): int(val) for col, val in totals.items()}
-        for route_id in short_to_route_ids.get(route_name, [route_name]):
+        # Accumulate this route's totals into one combined, route_id-keyed table
+        # written after the loop. The per-route Excel and blocking plt.show() are
+        # intentionally gone: the combined CSV supersedes the former, and the
+        # latter stalls headless subprocess runs under the orchestrator.
+        for route_id in route_id_list:
+            rid = str(route_id)
+            if rid in uni_set:
+                direction = "unidirectional"
+            elif rid in express_set:
+                direction = "bidirectional"
+            else:
+                direction = ""
             summary_records.append(
                 {
                     "route_id": route_id,
                     "route_short_name": route_name,
-                    "service_type": "express" if str(route_id) in express_set else "local",
+                    "service_type": "express" if rid in express_set else "local",
+                    "express_direction": direction,
                     **route_totals,
                 }
             )
@@ -1528,6 +1819,13 @@ def run(
     express_origin_advisory: bool | None = None,
     express_origin_jobs_field: str | None = None,
     express_origin_jobs_threshold: float | None = None,
+    express_unidirectional_route_ids: Sequence[str] | None = None,
+    express_unidirectional_routes_file: str | Path | None = None,
+    express_bidirectional_route_ids: Sequence[str] | None = None,
+    express_bidirectional_routes_file: str | Path | None = None,
+    express_zero_origin_employment: bool | None = None,
+    express_zero_destination_population: bool | None = None,
+    express_employment_fields: Sequence[str] | None = None,
 ) -> None:
     """Run the catchment-area analysis.
 
@@ -1583,11 +1881,55 @@ def run(
     express_routes_file = (
         EXPRESS_ROUTES_FILE if express_routes_file is None else express_routes_file
     )
-    # Union each inline list with its optional .txt: route ids drive the
-    # service_type label, origin stop ids drive the wide drive-access buffer.
-    express_route_id_set = load_express_route_ids(
-        express_route_ids,
-        str(express_routes_file) if express_routes_file else None,
+    express_unidirectional_route_ids = list(
+        EXPRESS_UNIDIRECTIONAL_ROUTE_IDS
+        if express_unidirectional_route_ids is None
+        else express_unidirectional_route_ids
+    )
+    express_unidirectional_routes_file = (
+        EXPRESS_UNIDIRECTIONAL_ROUTES_FILE
+        if express_unidirectional_routes_file is None
+        else express_unidirectional_routes_file
+    )
+    express_bidirectional_route_ids = list(
+        EXPRESS_BIDIRECTIONAL_ROUTE_IDS
+        if express_bidirectional_route_ids is None
+        else express_bidirectional_route_ids
+    )
+    express_bidirectional_routes_file = (
+        EXPRESS_BIDIRECTIONAL_ROUTES_FILE
+        if express_bidirectional_routes_file is None
+        else express_bidirectional_routes_file
+    )
+    # Union each inline list with its optional .txt. Unidirectional and
+    # bidirectional express routes both count as "express" (the service_type
+    # label + wide origin buffer + advisory); the legacy direction-agnostic list
+    # is folded in as bidirectional (symmetric). Only the unidirectional set
+    # drives directional accounting. Origin stop ids drive the drive-access buffer.
+    unidirectional_route_id_set = load_id_set(
+        express_unidirectional_route_ids,
+        str(express_unidirectional_routes_file) if express_unidirectional_routes_file else None,
+        kind="unidirectional express route",
+    )
+    bidirectional_route_id_set = load_id_set(
+        express_bidirectional_route_ids,
+        str(express_bidirectional_routes_file) if express_bidirectional_routes_file else None,
+        kind="bidirectional express route",
+    )
+    conflicting_express = unidirectional_route_id_set & bidirectional_route_id_set
+    if conflicting_express:
+        logging.warning(
+            "Route id(s) %s are in both the unidirectional and bidirectional express "
+            "lists; treating them as unidirectional.",
+            sorted(conflicting_express),
+        )
+    express_route_id_set = (
+        load_express_route_ids(
+            express_route_ids,
+            str(express_routes_file) if express_routes_file else None,
+        )
+        | unidirectional_route_id_set
+        | bidirectional_route_id_set
     )
     express_origin_stop_id_set = load_id_set(
         express_origin_stop_ids,
@@ -1606,6 +1948,21 @@ def run(
         EXPRESS_ORIGIN_JOBS_SHARE_THRESHOLD
         if express_origin_jobs_threshold is None
         else express_origin_jobs_threshold
+    )
+    express_zero_origin_employment = (
+        EXPRESS_ZERO_ORIGIN_EMPLOYMENT
+        if express_zero_origin_employment is None
+        else express_zero_origin_employment
+    )
+    express_zero_destination_population = (
+        EXPRESS_ZERO_DESTINATION_POPULATION
+        if express_zero_destination_population is None
+        else express_zero_destination_population
+    )
+    express_employment_fields = list(
+        EXPRESS_EMPLOYMENT_FIELDS
+        if express_employment_fields is None
+        else express_employment_fields
     )
 
     try:
@@ -1734,15 +2091,11 @@ def run(
         # 4) ANALYSIS DISPATCH
         # --------------------------------------------------------------
         mode = analysis_mode.lower()
-        analysis_dispatch = {
-            "network": do_network_analysis,
-            "route": do_route_by_route_analysis,
-            "stop": do_stop_by_stop_analysis,
-        }
-        if mode not in analysis_dispatch:
-            raise ValueError(f"Invalid ANALYSIS_MODE: {analysis_mode}")
-
-        analysis_dispatch[mode](
+        # Shared positional arguments for all three analysis modes. Kwargs are
+        # passed literally (not via a dict) so the static type checker keeps each
+        # parameter's type. Directional accounting is a route-mode concept, so
+        # only that analyzer additionally receives those settings.
+        common_args = (
             trips,
             stop_times,
             routes_df,
@@ -1757,13 +2110,34 @@ def run(
             sorted(express_origin_stop_id_set),
             str(output_directory),
             SYNTHETIC_FIELDS,
-            service_area_method=service_area_method,
-            shapes_df=shapes_df,
-            ped_graph=ped_graph,
-            walk_time_min=isochrone_walk_time_min,
-            walk_speed_units_per_s=walk_speed_units_per_s,
-            express_route_ids=express_route_id_set,
         )
+        if mode == "route":
+            do_route_by_route_analysis(
+                *common_args,
+                service_area_method=service_area_method,
+                shapes_df=shapes_df,
+                ped_graph=ped_graph,
+                walk_time_min=isochrone_walk_time_min,
+                walk_speed_units_per_s=walk_speed_units_per_s,
+                express_route_ids=express_route_id_set,
+                unidirectional_route_ids=unidirectional_route_id_set,
+                employment_fields=express_employment_fields,
+                zero_origin_employment=express_zero_origin_employment,
+                zero_destination_population=express_zero_destination_population,
+            )
+        elif mode in ("network", "stop"):
+            analyzer = do_network_analysis if mode == "network" else do_stop_by_stop_analysis
+            analyzer(
+                *common_args,
+                service_area_method=service_area_method,
+                shapes_df=shapes_df,
+                ped_graph=ped_graph,
+                walk_time_min=isochrone_walk_time_min,
+                walk_speed_units_per_s=walk_speed_units_per_s,
+                express_route_ids=express_route_id_set,
+            )
+        else:
+            raise ValueError(f"Invalid ANALYSIS_MODE: {analysis_mode}")
 
         logging.info("\nAnalysis completed successfully.")
 
@@ -1921,7 +2295,56 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--express-routes-file",
         default=EXPRESS_ROUTES_FILE,
-        help="Path to a text file of express route_ids, one per line ('#' comments).",
+        help="Path to a text file of express route_ids, one per line ('#' comments). "
+        "Direction-agnostic; treated as bidirectional (symmetric) accounting.",
+    )
+    parser.add_argument(
+        "--express-unidirectional-routes",
+        nargs="*",
+        default=EXPRESS_UNIDIRECTIONAL_ROUTE_IDS,
+        metavar="ROUTE_ID",
+        help="route_id values for unidirectional (commuter) express routes, which get "
+        "directional accounting in route mode (default: none).",
+    )
+    parser.add_argument(
+        "--express-unidirectional-routes-file",
+        default=EXPRESS_UNIDIRECTIONAL_ROUTES_FILE,
+        help="Path to a text file of unidirectional express route_ids, one per line.",
+    )
+    parser.add_argument(
+        "--express-bidirectional-routes",
+        nargs="*",
+        default=EXPRESS_BIDIRECTIONAL_ROUTE_IDS,
+        metavar="ROUTE_ID",
+        help="route_id values for bidirectional express routes (symmetric accounting; "
+        "default: none).",
+    )
+    parser.add_argument(
+        "--express-bidirectional-routes-file",
+        default=EXPRESS_BIDIRECTIONAL_ROUTES_FILE,
+        help="Path to a text file of bidirectional express route_ids, one per line.",
+    )
+    parser.add_argument(
+        "--express-zero-origin-employment",
+        action=argparse.BooleanOptionalAction,
+        default=EXPRESS_ZERO_ORIGIN_EMPLOYMENT,
+        help="Zero employment counted at the origin (park-and-ride) end of "
+        "unidirectional express routes.",
+    )
+    parser.add_argument(
+        "--express-zero-destination-population",
+        action=argparse.BooleanOptionalAction,
+        default=EXPRESS_ZERO_DESTINATION_POPULATION,
+        help="Zero population counted at the destination (CBD) end of unidirectional "
+        "express routes.",
+    )
+    parser.add_argument(
+        "--express-employment-fields",
+        nargs="*",
+        default=EXPRESS_EMPLOYMENT_FIELDS,
+        metavar="FIELD",
+        help="SYNTHETIC_FIELDS that are employment counts, attributed to the destination "
+        "end of unidirectional express routes.",
     )
     parser.add_argument(
         "--log-level",
@@ -1965,6 +2388,13 @@ def main(argv: Sequence[str] | None = None) -> None:
             express_origin_advisory=args.express_origin_advisory,
             express_origin_jobs_field=args.express_origin_jobs_field,
             express_origin_jobs_threshold=args.express_origin_jobs_threshold,
+            express_unidirectional_route_ids=args.express_unidirectional_routes,
+            express_unidirectional_routes_file=args.express_unidirectional_routes_file,
+            express_bidirectional_route_ids=args.express_bidirectional_routes,
+            express_bidirectional_routes_file=args.express_bidirectional_routes_file,
+            express_zero_origin_employment=args.express_zero_origin_employment,
+            express_zero_destination_population=args.express_zero_destination_population,
+            express_employment_fields=args.express_employment_fields,
         )
     except Exception:
         # run() already logged the traceback; exit non-zero so the orchestrator

@@ -27,6 +27,7 @@ from scripts.service_coverage.gtfs_service_demographics_gpd import (
     build_walk_isochrone,
     clip_and_calculate_synthetic_fields,
     export_summary_to_excel,
+    express_route_totals,
     filter_weekday_service,
     flag_express_origin_candidates,
     get_included_routes,
@@ -1071,3 +1072,328 @@ def test_suggest_express_origin_stops_no_jobs_field_is_noop(
     )
     assert result is None
     assert not (tmp_path / "express_origin_candidates.csv").exists()
+
+
+# ---------------------------------------------------------------------------
+# express_route_totals — access-mode accounting math (Phase 4)
+# ---------------------------------------------------------------------------
+
+# Projected metres (EPSG:CRS_EPSG_CODE). Origin and destination sit 50 km apart,
+# far beyond either buffer, so the two end catchments never overlap.
+_ORIGIN_XY = (0.0, 0.0)
+_DEST_XY = (50_000.0, 0.0)
+_EXP_FIELDS = ["total_pop", "tot_empl"]
+_EXP_EMPL = ["tot_empl"]
+
+
+def _express_stops() -> gpd.GeoDataFrame:
+    """One origin stop and one destination stop on the same route."""
+    return gpd.GeoDataFrame(
+        {"stop_id": ["O", "D"], "route_short_name": ["X", "X"]},
+        geometry=[Point(*_ORIGIN_XY), Point(*_DEST_XY)],
+        crs=f"EPSG:{CRS_EPSG_CODE}",
+    )
+
+
+def _express_demographics() -> gpd.GeoDataFrame:
+    """Population at the origin, employment at the destination, small cross-terms.
+
+    Each 200 m block sits fully inside its end's buffer, so it area-weights to
+    its full count: a home block and a few park-and-ride jobs at the origin, a
+    job block and a little housing at the destination.
+    """
+    ox, oy = _ORIGIN_XY
+    dx, dy = _DEST_XY
+    home = box(ox - 100, oy - 100, ox + 100, oy + 100)
+    job = box(dx - 100, dy - 100, dx + 100, dy + 100)
+    return gpd.GeoDataFrame(
+        {
+            "total_pop": [1_000, 20],  # origin home block, destination housing
+            "tot_empl": [5, 2_000],  # origin park-and-ride jobs, destination jobs
+        },
+        geometry=[home, job],
+        crs=f"EPSG:{CRS_EPSG_CODE}",
+    )
+
+
+def _express_kwargs(**overrides: object) -> dict[str, object]:
+    base: dict[str, object] = dict(
+        origin_stop_ids={"O"},
+        walk_buffer_mi=0.25,
+        origin_buffer_mi=2.0,
+        employment_fields=_EXP_EMPL,
+        zero_origin_employment=True,
+        zero_destination_population=True,
+    )
+    base.update(overrides)
+    return base
+
+
+def test_express_route_totals_keeps_keystones_zeroes_crossterms() -> None:
+    totals, combined = express_route_totals(
+        _express_stops(), _express_demographics(), _EXP_FIELDS, **_express_kwargs()
+    )
+    assert totals is not None and combined is not None
+    # Unidirectional defaults: population from the origin drive-shed, employment
+    # from the destination walk buffer; the 5 origin jobs and 20 destination
+    # residents (the cross-terms) are dropped.
+    assert totals["total_pop"] == 1_000
+    assert totals["tot_empl"] == 2_000
+
+
+def test_express_route_totals_keeps_crossterms_when_flags_false() -> None:
+    # Both flags False is the bidirectional case: both ends contribute.
+    totals, _ = express_route_totals(
+        _express_stops(),
+        _express_demographics(),
+        _EXP_FIELDS,
+        **_express_kwargs(zero_origin_employment=False, zero_destination_population=False),
+    )
+    assert totals is not None
+    assert totals["total_pop"] == 1_020  # origin 1000 + destination 20
+    assert totals["tot_empl"] == 2_005  # destination 2000 + origin 5 (walk-scaled)
+
+
+def test_express_route_totals_zero_flags_are_independent() -> None:
+    # Zero origin employment only -> destination population is retained.
+    totals, _ = express_route_totals(
+        _express_stops(),
+        _express_demographics(),
+        _EXP_FIELDS,
+        **_express_kwargs(zero_origin_employment=True, zero_destination_population=False),
+    )
+    assert totals is not None
+    assert totals["total_pop"] == 1_020  # origin 1000 + destination 20
+    assert totals["tot_empl"] == 2_000  # destination only
+
+
+def test_express_route_totals_employment_is_walk_scaled_at_origin() -> None:
+    # Origin jobs beyond the walk buffer but within the wide drive buffer must NOT
+    # be counted: employment is walk-scaled even at a park-and-ride origin, while
+    # population there is drive-scaled (captured by the wide buffer).
+    ox, oy = _ORIGIN_XY
+    dx, dy = _DEST_XY
+    home = box(ox - 100, oy - 100, ox + 100, oy + 100)  # at the origin stop
+    # 1 km east of the origin: inside the 2.0-mi drive buffer, beyond the 0.25-mi
+    # walk buffer (~402 m).
+    origin_far = box(ox + 900, oy - 100, ox + 1_100, oy + 100)
+    job = box(dx - 100, dy - 100, dx + 100, dy + 100)  # at the destination stop
+    demo = gpd.GeoDataFrame(
+        {
+            "total_pop": [1_000, 300, 0],  # home, far origin housing, destination
+            "tot_empl": [0, 500, 2_000],  # -, far origin jobs, destination jobs
+        },
+        geometry=[home, origin_far, job],
+        crs=f"EPSG:{CRS_EPSG_CODE}",
+    )
+    totals, _ = express_route_totals(
+        _express_stops(),
+        demo,
+        _EXP_FIELDS,
+        **_express_kwargs(zero_origin_employment=False, zero_destination_population=False),
+    )
+    assert totals is not None
+    # Population drive-scaled at the origin: home 1000 + far origin 300 = 1300.
+    assert totals["total_pop"] == 1_300
+    # Employment walk-scaled: the 500 far-origin jobs are beyond the walk buffer
+    # and excluded; only the destination's 2000 (walk) count.
+    assert totals["tot_empl"] == 2_000
+
+
+def test_express_route_totals_no_origin_returns_none() -> None:
+    # Unidirectional defaults with no origin stop -> empty drive-shed -> None.
+    totals, combined = express_route_totals(
+        _express_stops(),
+        _express_demographics(),
+        _EXP_FIELDS,
+        **_express_kwargs(origin_stop_ids=set()),
+    )
+    assert totals is None and combined is None
+
+
+def test_express_route_totals_all_origin_returns_none() -> None:
+    # Unidirectional defaults with every stop an origin -> empty walk destination
+    # end -> None.
+    totals, combined = express_route_totals(
+        _express_stops(),
+        _express_demographics(),
+        _EXP_FIELDS,
+        **_express_kwargs(origin_stop_ids={"O", "D"}),
+    )
+    assert totals is None and combined is None
+
+
+# ---------------------------------------------------------------------------
+# run() route mode — access-mode accounting wiring (Phase 4)
+# ---------------------------------------------------------------------------
+
+
+def test_run_route_mode_express_direction_labels(
+    tmp_path: Path, dc_gtfs_dir: Path, dc_gtfs: dict[str, pd.DataFrame]
+) -> None:
+    final_routes = get_included_routes(dc_gtfs["routes"], [], [])
+    stops_gdf = _stops_to_points_gdf(
+        dc_gtfs["trips"], dc_gtfs["stop_times"], dc_gtfs["stops"], final_routes, [], []
+    )
+    assert stops_gdf is not None
+    demo_path = _covering_demographics(stops_gdf, tmp_path)
+
+    # Pick two distinct route_short_names that have stops (so they appear in the
+    # summary), and flag one unidirectional and one bidirectional by route_id.
+    shorts = stops_gdf["route_short_name"].astype(str).unique().tolist()
+    assert len(shorts) >= 2
+    uni_short, bi_short = shorts[0], shorts[1]
+
+    def _ids_for(short: str) -> list[str]:
+        return (
+            final_routes.loc[final_routes["route_short_name"].astype(str) == short, "route_id"]
+            .astype(str)
+            .tolist()
+        )
+
+    out_dir = tmp_path / "out"
+    run(
+        analysis_mode="route",
+        service_area_method="stop_buffer",
+        gtfs_data_path=str(dc_gtfs_dir),
+        demographics_shp_path=str(demo_path),
+        output_directory=str(out_dir),
+        express_unidirectional_route_ids=_ids_for(uni_short),
+        express_bidirectional_route_ids=_ids_for(bi_short),
+    )
+
+    summary = pd.read_csv(out_dir / "service_demographics_by_route.csv")
+    assert "express_direction" in summary.columns
+    summary["route_short_name"] = summary["route_short_name"].astype(str)
+    summary["express_direction"] = summary["express_direction"].fillna("")
+
+    uni_rows = summary["route_short_name"] == uni_short
+    bi_rows = summary["route_short_name"] == bi_short
+    assert (summary.loc[uni_rows, "express_direction"] == "unidirectional").all()
+    assert (summary.loc[bi_rows, "express_direction"] == "bidirectional").all()
+    assert (summary.loc[uni_rows, "service_type"] == "express").all()
+    assert (summary.loc[bi_rows, "service_type"] == "express").all()
+
+    others = summary[~(uni_rows | bi_rows)]
+    assert (others["service_type"] == "local").all()
+    assert (others["express_direction"] == "").all()
+
+
+def test_run_route_mode_bidirectional_employment_walk_scaled(
+    tmp_path: Path, dc_gtfs_dir: Path, dc_gtfs: dict[str, pd.DataFrame]
+) -> None:
+    final_routes = get_included_routes(dc_gtfs["routes"], [], [])
+    stops_gdf = _stops_to_points_gdf(
+        dc_gtfs["trips"], dc_gtfs["stop_times"], dc_gtfs["stops"], final_routes, [], []
+    )
+    assert stops_gdf is not None
+
+    minx, miny, maxx, maxy = stops_gdf.total_bounds
+    origin_idx = stops_gdf.geometry.x.idxmax()
+    origin_stop_id = str(stops_gdf.loc[origin_idx, "stop_id"])
+    origin_route = str(stops_gdf.loc[origin_idx, "route_short_name"])
+    oy = stops_gdf.loc[origin_idx].geometry.y
+    origin_route_ids = (
+        final_routes.loc[final_routes["route_short_name"].astype(str) == origin_route, "route_id"]
+        .astype(str)
+        .tolist()
+    )
+
+    background = box(minx - 450, miny - 450, maxx + 450, maxy + 450)
+    # A block 1 km east of the origin stop: inside the 2.0-mi drive buffer but
+    # beyond every 0.25-mi walk buffer, carrying both population and employment.
+    far_cx = maxx + 1_000.0
+    far_block = box(far_cx - 100, oy - 100, far_cx + 100, oy + 100)
+
+    def _row(name: str, demo: gpd.GeoDataFrame) -> pd.Series:
+        demo_path = tmp_path / f"{name}_demo.shp"
+        demo.to_file(demo_path)
+        out_dir = tmp_path / name
+        run(
+            analysis_mode="route",
+            service_area_method="stop_buffer",
+            gtfs_data_path=str(dc_gtfs_dir),
+            demographics_shp_path=str(demo_path),
+            output_directory=str(out_dir),
+            express_origin_buffer_distance=2.0,
+            express_origin_stop_ids=[origin_stop_id],
+            express_bidirectional_route_ids=origin_route_ids,
+        )
+        summary = pd.read_csv(out_dir / "service_demographics_by_route.csv")
+        match = summary["route_short_name"].astype(str) == origin_route
+        return summary.loc[match].iloc[0]
+
+    only_bg = gpd.GeoDataFrame(
+        {"total_pop": [5_000], "tot_empl": [4_000]},
+        geometry=[background],
+        crs=f"EPSG:{CRS_EPSG_CODE}",
+    )
+    with_far = gpd.GeoDataFrame(
+        {"total_pop": [5_000, 1_000], "tot_empl": [4_000, 1_000]},
+        geometry=[background, far_block],
+        crs=f"EPSG:{CRS_EPSG_CODE}",
+    )
+    base = _row("base", only_bg)
+    plus = _row("plus", with_far)
+
+    assert base["express_direction"] == "bidirectional"
+    # Population is drive-scaled at the origin, so the far block (inside the 2-mi
+    # drive buffer) lifts the population total.
+    assert plus["total_pop"] > base["total_pop"]
+    # Employment is walk-scaled everywhere, so the far block (beyond every walk
+    # buffer) is not counted — employment is identical with and without it.
+    assert plus["tot_empl"] == base["tot_empl"]
+
+
+def test_run_route_mode_origin_employment_knob_changes_total(
+    tmp_path: Path, dc_gtfs_dir: Path, dc_gtfs: dict[str, pd.DataFrame]
+) -> None:
+    final_routes = get_included_routes(dc_gtfs["routes"], [], [])
+    stops_gdf = _stops_to_points_gdf(
+        dc_gtfs["trips"], dc_gtfs["stop_times"], dc_gtfs["stops"], final_routes, [], []
+    )
+    assert stops_gdf is not None
+
+    minx, miny, maxx, maxy = stops_gdf.total_bounds
+    origin_idx = stops_gdf.geometry.x.idxmax()
+    origin_stop_id = str(stops_gdf.loc[origin_idx, "stop_id"])
+    origin_route = str(stops_gdf.loc[origin_idx, "route_short_name"])
+    origin_route_ids = (
+        final_routes.loc[final_routes["route_short_name"].astype(str) == origin_route, "route_id"]
+        .astype(str)
+        .tolist()
+    )
+
+    # Uniform employment everywhere; the origin is the easternmost stop, so its
+    # walk buffer covers area no other stop's does.
+    background = box(minx - 450, miny - 450, maxx + 450, maxy + 450)
+    demo = gpd.GeoDataFrame(
+        {"total_pop": [5_000], "tot_empl": [4_000]},
+        geometry=[background],
+        crs=f"EPSG:{CRS_EPSG_CODE}",
+    )
+    demo_path = tmp_path / "demo.shp"
+    demo.to_file(demo_path)
+
+    def _empl(out_dir: Path, zero_origin_empl: bool) -> float:
+        run(
+            analysis_mode="route",
+            service_area_method="stop_buffer",
+            gtfs_data_path=str(dc_gtfs_dir),
+            demographics_shp_path=str(demo_path),
+            output_directory=str(out_dir),
+            express_origin_buffer_distance=2.0,
+            express_origin_stop_ids=[origin_stop_id],
+            express_unidirectional_route_ids=origin_route_ids,
+            express_zero_origin_employment=zero_origin_empl,
+        )
+        summary = pd.read_csv(out_dir / "service_demographics_by_route.csv")
+        match = summary["route_short_name"].astype(str) == origin_route
+        return float(summary.loc[match, "tot_empl"].iloc[0])
+
+    # Employment is walk-scaled everywhere. Keeping origin employment adds the
+    # origin stops' own walk-buffer jobs; dropping it counts only the non-origin
+    # (destination) stops, so keeping it is strictly larger.
+    keep = _empl(tmp_path / "keep", zero_origin_empl=False)
+    drop = _empl(tmp_path / "drop", zero_origin_empl=True)
+    assert keep > drop
