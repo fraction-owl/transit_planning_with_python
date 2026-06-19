@@ -14,10 +14,12 @@ from shapely.geometry import Point
 matplotlib.use("Agg")
 
 from scripts.service_coverage.points_of_interest_coverage_gpd import (
+    LAYER_SPECS,
     _count_features,
     _load_gtfs_tables,
     _load_layers,
     _prepare_route_buffers,
+    run,
 )
 
 # ---------------------------------------------------------------------------
@@ -390,3 +392,99 @@ def test_count_features_skips_png_by_default(tmp_path: Path) -> None:
     )
     _count_features(buffers, _layers_at(0.0, 0.001), [("POI.shp", "NAME")], tmp_path)
     assert not (tmp_path / "R1_buffer_plot.png").exists()
+
+
+# ---------------------------------------------------------------------------
+# Integration tests against the committed POI fixtures
+#
+# tests/fixtures/points_of_interest/*.zip are produced by
+# dev_tools/generate_mock_points_of_interest.py and mirror LAYER_SPECS exactly
+# (one zipped point shapefile per layer). These tests exercise the real loader
+# (including zip discovery), LAYER_SPECS, and the coverage pipeline end to end,
+# locking in the generator-output <-> consumer contract.
+# ---------------------------------------------------------------------------
+
+POI_FIXTURE_DIR = Path("tests/fixtures/points_of_interest")
+
+# Shared DC bounding box used by the mock generators (WGS84).
+_DC_BBOX = (-77.120, 38.790, -76.910, 39.000)
+
+
+def test_fixtures_present_for_every_layer_spec() -> None:
+    """Every LAYER_SPECS layer ships a matching fixture zip in the fixtures dir."""
+    available = {p.name for p in POI_FIXTURE_DIR.glob("*.zip")}
+    expected = {f"{Path(fn).stem}.zip" for fn, _ in LAYER_SPECS}
+    assert expected <= available
+
+
+def test_fixture_layers_all_load_with_expected_schema() -> None:
+    """All LAYER_SPECS layers load from the zipped fixtures with their id column."""
+    layers = _load_layers(LAYER_SPECS, POI_FIXTURE_DIR)
+    assert set(layers) == {fn for fn, _ in LAYER_SPECS}
+    for filename, id_col in LAYER_SPECS:
+        gdf = layers[filename]
+        assert id_col in gdf.columns
+        assert len(gdf) > 0
+        assert (gdf.geometry.geom_type == "Point").all()
+        assert gdf.crs.to_epsg() == 3857
+
+
+def test_fixture_points_lie_within_the_dc_bbox() -> None:
+    """Fixture points fall inside the shared DC bbox (sanity-checks the region)."""
+    min_lon, min_lat, max_lon, max_lat = _DC_BBOX
+    layers = _load_layers(LAYER_SPECS, POI_FIXTURE_DIR, projected_crs="EPSG:4326")
+    for filename, _ in LAYER_SPECS:
+        pts = layers[filename].geometry
+        assert pts.x.between(min_lon, max_lon).all(), filename
+        assert pts.y.between(min_lat, max_lat).all(), filename
+
+
+def test_coverage_counts_a_fixture_poi_for_a_colocated_stop(tmp_path: Path) -> None:
+    """A route with a stop on a fixture point counts that point within its buffer."""
+    layers = _load_layers([("Metrorail_Stations.shp", "NAME")], POI_FIXTURE_DIR)
+    seed = (
+        gpd.GeoSeries([layers["Metrorail_Stations.shp"].geometry.iloc[0]], crs="EPSG:3857")
+        .to_crs("EPSG:4326")
+        .iloc[0]
+    )
+    tables = {
+        "routes": pd.DataFrame({"route_id": ["RX"]}),
+        "trips": pd.DataFrame({"route_id": ["RX"], "trip_id": ["TX"], "shape_id": ["SX"]}),
+        "stop_times": pd.DataFrame({"trip_id": ["TX"], "stop_id": ["SX1"], "stop_sequence": [1]}),
+        "stops": pd.DataFrame({"stop_id": ["SX1"], "stop_lat": [seed.y], "stop_lon": [seed.x]}),
+        "shapes": pd.DataFrame(
+            {
+                "shape_id": ["SX", "SX"],
+                "shape_pt_lat": [seed.y, seed.y],
+                "shape_pt_lon": [seed.x, seed.x],
+                "shape_pt_sequence": [1, 2],
+            }
+        ),
+    }
+    buffers = _prepare_route_buffers(tables, use_shape_buffer=False, buffer_dist_ft=1320.0)
+    summary = _count_features(buffers, layers, [("Metrorail_Stations.shp", "NAME")], tmp_path)
+    assert summary.loc["RX", "Metrorail_Stations.shp"] >= 1
+
+
+def test_run_end_to_end_against_fixtures(tmp_path: Path) -> None:
+    """run() loads the zipped fixtures and writes a summary spanning every layer."""
+    layers = _load_layers(LAYER_SPECS, POI_FIXTURE_DIR, projected_crs="EPSG:4326")
+    seed = layers["Metrorail_Stations.shp"].geometry.iloc[0]
+
+    gtfs = tmp_path / "gtfs"
+    gtfs.mkdir()
+    (gtfs / "routes.txt").write_text("route_id\nRA\n")
+    (gtfs / "trips.txt").write_text("route_id,trip_id,shape_id\nRA,TA,SA\n")
+    (gtfs / "stop_times.txt").write_text("trip_id,stop_id,stop_sequence\nTA,SA1,1\n")
+    (gtfs / "stops.txt").write_text(f"stop_id,stop_lat,stop_lon\nSA1,{seed.y},{seed.x}\n")
+    (gtfs / "shapes.txt").write_text(
+        "shape_id,shape_pt_lat,shape_pt_lon,shape_pt_sequence\n"
+        f"SA,{seed.y},{seed.x},1\nSA,{seed.y},{seed.x},2\n"
+    )
+
+    out = tmp_path / "out"
+    run(gtfs_dir=gtfs, shp_input_dir=POI_FIXTURE_DIR, output_dir=out)
+
+    summary = pd.read_csv(out / "all_routes_feature_summary.csv", index_col="route_id")
+    assert set(summary.columns) == {fn for fn, _ in LAYER_SPECS}
+    assert summary.loc["RA", "Metrorail_Stations.shp"] >= 1
