@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import tempfile
+import zipfile
 from pathlib import Path
 
 import geopandas as gpd
@@ -76,6 +78,31 @@ def _layers_at(lon: float, lat: float) -> dict[str, gpd.GeoDataFrame]:
         crs="EPSG:4326",
     ).to_crs("EPSG:3857")
     return {"POI.shp": gdf}
+
+
+def _write_point_shp_zip(
+    directory: Path,
+    zip_name: str,
+    shp_name: str,
+    lon: float,
+    lat: float,
+    id_col: str = "NAME",
+) -> Path:
+    """Write a one-feature point shapefile zipped into *directory*/*zip_name*.
+
+    The shapefile components are stored at the archive's top level (matching what
+    dev_tools/generate_mock_points_of_interest.py emits) and the path is returned.
+    """
+    gdf = gpd.GeoDataFrame({id_col: ["Feature"]}, geometry=[Point(lon, lat)], crs="EPSG:4326")
+    zip_path = directory / zip_name
+    stem = Path(shp_name).stem
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        gdf.to_file(tmp_dir / f"{stem}.shp")
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for comp in sorted(tmp_dir.glob(f"{stem}.*")):
+                zf.write(comp, comp.name)
+    return zip_path
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +305,36 @@ def test_load_layers_respects_projected_crs_parameter(tmp_path: Path) -> None:
     _write_point_shp(tmp_path, "Station.shp", lon=0.001, lat=0.001)
     layers = _load_layers([("Station.shp", "NAME")], tmp_path, projected_crs="EPSG:32618")
     assert layers["Station.shp"].crs.to_epsg() == 32618
+
+
+def test_load_layers_reads_zipped_shapefile(tmp_path: Path) -> None:
+    """A shapefile packaged inside a .zip should be discovered, loaded, reprojected."""
+    _write_point_shp_zip(tmp_path, "Libraries.zip", "Libraries.shp", lon=0.001, lat=0.001)
+    layers = _load_layers([("Libraries.shp", "NAME")], tmp_path)
+    assert "Libraries.shp" in layers
+    assert layers["Libraries.shp"].crs.to_epsg() == 3857
+    assert len(layers["Libraries.shp"]) == 1
+
+
+def test_load_layers_finds_zipped_shapefile_in_subdirectory(tmp_path: Path) -> None:
+    """Recursive search should discover zipped shapefiles nested in subdirectories."""
+    sub = tmp_path / "downloads"
+    sub.mkdir()
+    _write_point_shp_zip(sub, "Libraries.zip", "Libraries.shp", lon=0.001, lat=0.001)
+    layers = _load_layers([("Libraries.shp", "NAME")], tmp_path)
+    assert "Libraries.shp" in layers
+
+
+def test_load_layers_zipped_wrong_id_column_excluded(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A zipped shapefile lacking the expected id column should be excluded with a warning."""
+    _write_point_shp_zip(tmp_path, "Libraries.zip", "Libraries.shp", lon=0.001, lat=0.001)
+    with caplog.at_level(logging.WARNING):
+        layers = _load_layers([("Libraries.shp", "WRONG_COL")], tmp_path)
+    assert "Libraries.shp" not in layers
+    # The warning should still surface the layer's actual attribute columns.
+    assert "NAME" in caplog.text
 
 
 # ---------------------------------------------------------------------------
