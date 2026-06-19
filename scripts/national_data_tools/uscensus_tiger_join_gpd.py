@@ -152,6 +152,7 @@ TRACT_COUNT_DISAGG: dict[str, tuple[str, str]] = {
     "minority": ("total_pop", "minority"),  # non-white-alone residents
     "all_nwell": ("total_pop", "lep"),  # limited-English-proficiency residents
     "all_lo_veh_hh": ("total_hh", "lo_veh_hh"),  # households with 0-1 vehicles
+    "all_lo_veh_hh_mod": ("total_hh", "lo_veh_mod"),  # low-vehicle, excl. 1-person/1-vehicle
     "all_youth": ("total_pop", "youth"),  # residents age 15-21
     "all_elderly": ("total_pop", "elderly"),  # residents age 65+
     # Commuting (ACS S0801) worker counts, reconstructed from percentages in
@@ -504,12 +505,32 @@ def _derive_language(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _derive_vehicle(df: pd.DataFrame) -> pd.DataFrame:
+    # Low-vehicle households from Census table B08201 (Household Size by
+    # Vehicles Available). Two definitions are emitted side by side so each
+    # consumer can choose the one it wants; neither is suppressed.
+    #
+    # Standard ("all_lo_veh_hh" / "perc_lo_veh"): every household with 0 or 1
+    # vehicle. This is the common transit-equity convention (e.g. FTA Title VI
+    # analyses) -- transparent and comparable across agencies -- but it flags a
+    # 1-person/1-vehicle household as low-vehicle even though it is fully mobile.
+    #
+    # Modified ("all_lo_veh_hh_mod" / "perc_lo_veh_mod"): the standard count
+    # minus 1-person households that already own a vehicle. The implied model is
+    # "a household needs 1 vehicle when it has 1 person and 2 vehicles
+    # otherwise" -- i.e. assume at most ~2 drivers (2 adults) per household and
+    # treat any additional members as non-drivers (children). This keeps a 3- or
+    # 4-person household with 2 vehicles from being counted as constrained.
+    # Caveat: it undercounts deficiency in multi-adult households
+    # (multigenerational, adult children, shared housing), which skew toward
+    # transit-dependent populations. Measuring vehicles against *workers*
+    # (ACS B08203 / B08141) would capture the commute constraint directly.
     df["all_lo_veh_hh"] = df[["veh_0_all_hh", "veh_1_all_hh"]].sum(axis=1)
-    df["perc_lo_veh"] = df["all_lo_veh_hh"] / df["all_hhs"]
-    df["perc_0_veh"] = df["veh_0_all_hh"] / df["all_hhs"]
-    df["perc_1_veh"] = df["veh_1_all_hh"] / df["all_hhs"]
-    df["perc_veh_1_hh_1"] = df["veh_1_hh_1"] / df["all_hhs"]
-    df["perc_lo_veh_mod"] = (df["perc_lo_veh"] - df["perc_veh_1_hh_1"]).round(3)
+    df["all_lo_veh_hh_mod"] = df["all_lo_veh_hh"] - df["veh_1_hh_1"]
+    df["perc_lo_veh"] = (df["all_lo_veh_hh"] / df["all_hhs"]).fillna(0).round(3)
+    df["perc_0_veh"] = (df["veh_0_all_hh"] / df["all_hhs"]).fillna(0).round(3)
+    df["perc_1_veh"] = (df["veh_1_all_hh"] / df["all_hhs"]).fillna(0).round(3)
+    df["perc_veh_1_hh_1"] = (df["veh_1_hh_1"] / df["all_hhs"]).fillna(0).round(3)
+    df["perc_lo_veh_mod"] = (df["all_lo_veh_hh_mod"] / df["all_hhs"]).fillna(0).round(3)
     return df
 
 

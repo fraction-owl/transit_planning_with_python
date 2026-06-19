@@ -458,11 +458,32 @@ def test_derive_vehicle_computes_low_vehicle_metrics() -> None:
     )
     result = _derive_vehicle(df)
     assert result["all_lo_veh_hh"].iloc[0] == 60
+    # modified count excludes the 15 one-person/one-vehicle households
+    assert result["all_lo_veh_hh_mod"].iloc[0] == 45
     assert result["perc_lo_veh"].iloc[0] == pytest.approx(0.6)
     assert result["perc_0_veh"].iloc[0] == pytest.approx(0.2)
     assert result["perc_1_veh"].iloc[0] == pytest.approx(0.4)
-    # perc_lo_veh_mod = perc_lo_veh - perc_veh_1_hh_1
-    assert result["perc_lo_veh_mod"].iloc[0] == pytest.approx(round(0.6 - 0.15, 3))
+    # perc_lo_veh_mod = all_lo_veh_hh_mod / all_hhs
+    assert result["perc_lo_veh_mod"].iloc[0] == pytest.approx(0.45)
+
+
+def test_derive_vehicle_handles_zero_households() -> None:
+    # Unpopulated geographies (e.g. parks, water) have no households; the
+    # percentage shares must resolve to 0 rather than inf/NaN.
+    df = pd.DataFrame(
+        {
+            GEO_ID_COL: [_TRACT_GEO_ID],
+            "all_hhs": [0],
+            "veh_0_all_hh": [0],
+            "veh_1_all_hh": [0],
+            "veh_1_hh_1": [0],
+        }
+    )
+    result = _derive_vehicle(df)
+    assert result["all_lo_veh_hh"].iloc[0] == 0
+    assert result["all_lo_veh_hh_mod"].iloc[0] == 0
+    for col in ("perc_lo_veh", "perc_0_veh", "perc_1_veh", "perc_veh_1_hh_1", "perc_lo_veh_mod"):
+        assert result[col].iloc[0] == 0
 
 
 def test_derive_age_computes_youth_and_elderly() -> None:
