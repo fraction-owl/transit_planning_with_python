@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+import zipfile
 from pathlib import Path
 from typing import Iterable, List, Mapping, Sequence
 
@@ -38,13 +39,24 @@ GTFS_DIR = Path(r"data/gtfs")  # folder containing GTFS .txt files
 SHP_INPUT_DIR = Path(r"data/shapefiles")  # folder with .shp layers to test
 OUTPUT_DIR = Path(r"output")  # where CSVs and PNGs are written
 
-# List of `(filename, id_column)` describing each layer to test
-# (filenames are relative to SHP_INPUT_DIR)
+# List of `(filename, id_column)` describing each layer to test. Filenames are
+# matched (case-insensitively) anywhere under SHP_INPUT_DIR, as a loose ``.shp``
+# on disk OR as a ``.shp`` packaged inside a ``.zip`` (see ``_load_layers``).
+# These defaults line up with the mock layers emitted by
+# ``dev_tools/generate_mock_points_of_interest.py``: id columns reuse the source
+# data's own field names where one exists (DESCRIPTIO / SCHOOL_NAM / NAME) and
+# fall back to NAME for layers without an established schema.
 LAYER_SPECS: list[tuple[str, str]] = [
-    ("Hospitals_and_Urgent_Care_Facilities.shp", "DESCRIPTIO"),
+    ("Hospitals.shp", "DESCRIPTIO"),
+    ("Urgent_Care_Facilities.shp", "DESCRIPTIO"),
     ("School_Facilities.shp", "SCHOOL_NAM"),
+    ("Colleges_and_Universities.shp", "NAME"),
     ("Libraries.shp", "DESCRIPTIO"),
     ("Metrorail_Stations.shp", "NAME"),
+    ("Commuter_Rail_Stations.shp", "NAME"),
+    ("Park_and_Rides.shp", "NAME"),
+    ("Bus_Stations.shp", "NAME"),
+    ("Private_Shuttle_Stops.shp", "NAME"),
 ]
 
 # Optional filter: only analyze these route_id values.
@@ -257,6 +269,47 @@ def _prepare_route_buffers(
     return buffer_gdf
 
 
+def _find_layer_sources(filename: str, shp_dir: Path) -> list[str]:
+    """Return geopandas-readable paths for *filename* found under *shp_dir*.
+
+    The search is recursive and case-insensitive, and it covers a layer shipped
+    either as a loose ``.shp`` on disk or as a ``.shp`` packaged inside a ``.zip``
+    archive (the form ``generate_mock_points_of_interest.py`` and most government
+    open-data portals deliver). Zip members are returned as geopandas
+    ``zip://archive.zip!member`` URIs, which the GeoPandas reader opens directly
+    via GDAL's virtual filesystem.
+
+    Args:
+        filename: The target shapefile name, e.g. ``"Libraries.shp"``.
+        shp_dir: Root directory to search.
+
+    Returns:
+        A sorted list of geopandas-readable path strings. Loose filesystem paths
+        sort ahead of ``zip://`` URIs, so an already-extracted shapefile is
+        preferred over a zipped copy when both are present.
+    """
+    sources: list[str] = []
+
+    # Loose shapefiles on disk.
+    for shp_path in shp_dir.rglob("*.shp"):
+        if shp_path.name.lower() == filename.lower():
+            sources.append(str(shp_path))
+
+    # Shapefiles packaged inside zip archives.
+    for zip_path in shp_dir.rglob("*.zip"):
+        try:
+            with zipfile.ZipFile(zip_path) as zf:
+                members = zf.namelist()
+        except (OSError, zipfile.BadZipFile):  # pragma: no cover
+            logging.warning("Could not open zip archive %s", zip_path)
+            continue
+        for member in members:
+            if member.lower().endswith(".shp") and Path(member).name.lower() == filename.lower():
+                sources.append(f"zip://{zip_path}!{member}")
+
+    return sorted(sources)
+
+
 def _load_layers(
     layer_specs: Iterable[tuple[str, str]],
     shp_dir: Path,
@@ -264,9 +317,10 @@ def _load_layers(
 ) -> dict[str, gpd.GeoDataFrame]:
     """Recursively load each designated shapefile (case‑insensitive search).
 
-    The search now walks *all* subfolders under *shp_dir* using ``Path.rglob``.
-    If multiple copies of the same filename are discovered, the first match in
-    lexicographic order is used and a warning is logged.
+    The search walks *all* subfolders under *shp_dir* and matches each layer as a
+    loose ``.shp`` on disk or as a ``.shp`` inside a ``.zip`` archive (see
+    ``_find_layer_sources``). If multiple copies of the same filename are
+    discovered, the first in lexicographic order is used and a warning is logged.
 
     Args:
         layer_specs: Tuples of (filename, id_column).
@@ -274,28 +328,25 @@ def _load_layers(
         projected_crs: CRS string used to reproject each loaded layer.
 
     Returns:
-    -------
-    dict[str, gpd.GeoDataFrame]
         Mapping of the *original* filename to its loaded GeoDataFrame.
     """
     layers: dict[str, gpd.GeoDataFrame] = {}
 
     for filename, id_col in layer_specs:
-        # Case‑insensitive recursive search for the .shp
-        matches = sorted(p for p in shp_dir.rglob("*.shp") if p.name.lower() == filename.lower())
+        sources = _find_layer_sources(filename, shp_dir)
 
-        if not matches:
+        if not sources:
             logging.warning("Layer %s NOT FOUND anywhere under %s", filename, shp_dir)
             continue
-        if len(matches) > 1:
-            logging.warning("Multiple copies of %s found; using %s", filename, matches[0])
+        if len(sources) > 1:
+            logging.warning("Multiple copies of %s found; using %s", filename, sources[0])
 
-        path = matches[0]
+        source = sources[0]
 
         try:
-            gdf = gpd.read_file(path)
+            gdf = gpd.read_file(source)
         except Exception as exc:  # pragma: no cover
-            logging.warning("Failed to read %s – %s", path, exc)
+            logging.warning("Failed to read %s – %s", source, exc)
             continue
 
         if id_col not in gdf.columns:
@@ -305,13 +356,13 @@ def _load_layers(
             logging.warning(
                 "Column '%s' missing in %s – skipped. Available columns: %s",
                 id_col,
-                path,
+                source,
                 available,
             )
             continue
 
         layers[filename] = gdf[[id_col, "geometry"]].to_crs(projected_crs)
-        logging.info("Loaded %s (%d features)", path.relative_to(shp_dir), len(gdf))
+        logging.info("Loaded %s (%d features)", source, len(gdf))
 
     return layers
 
