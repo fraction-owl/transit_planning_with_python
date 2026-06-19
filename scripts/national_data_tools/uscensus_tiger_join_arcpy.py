@@ -447,10 +447,10 @@ def _derive_language(df: pd.DataFrame) -> pd.DataFrame:
 
 def _derive_vehicle(df: pd.DataFrame) -> pd.DataFrame:
     df["all_lo_veh_hh"] = df[["veh_0_all_hh", "veh_1_all_hh"]].sum(axis=1)
-    df["perc_lo_veh"] = df["all_lo_veh_hh"] / df["all_hhs"]
-    df["perc_0_veh"] = df["veh_0_all_hh"] / df["all_hhs"]
-    df["perc_1_veh"] = df["veh_1_all_hh"] / df["all_hhs"]
-    df["perc_veh_1_hh_1"] = df["veh_1_hh_1"] / df["all_hhs"]
+    df["perc_lo_veh"] = (df["all_lo_veh_hh"] / df["all_hhs"]).fillna(0).round(3)
+    df["perc_0_veh"] = (df["veh_0_all_hh"] / df["all_hhs"]).fillna(0).round(3)
+    df["perc_1_veh"] = (df["veh_1_all_hh"] / df["all_hhs"]).fillna(0).round(3)
+    df["perc_veh_1_hh_1"] = (df["veh_1_hh_1"] / df["all_hhs"]).fillna(0).round(3)
     df["perc_lo_veh_mod"] = (df["perc_lo_veh"] - df["perc_veh_1_hh_1"]).round(3)
     return df
 
