@@ -220,7 +220,7 @@ def test_flag_outages_zero_ridership_nonzero_days(fixture_df: pd.DataFrame) -> N
         patch.object(mod, "SERVICE_PERIODS", ["Weekday", "Saturday", "Sunday"]),
     ):
         monthly_long, observed_keys = mod.aggregate_monthly_long(raw, [dt_dec])
-        flags = mod.flag_outages(monthly_long, [dt_dec], observed_keys)
+        flags = mod.flag_outages(monthly_long, [dt_dec], observed_keys, {dt_dec})
 
     zero_flags = flags[flags["flag"] == "zero_ridership_nonzero_days"]
     assert any(
@@ -243,7 +243,7 @@ def test_flag_outages_zero_days(fixture_df: pd.DataFrame) -> None:
         patch.object(mod, "SERVICE_PERIODS", ["Weekday", "Saturday", "Sunday"]),
     ):
         monthly_long, observed_keys = mod.aggregate_monthly_long(raw, [dt_feb])
-        flags = mod.flag_outages(monthly_long, [dt_feb], observed_keys)
+        flags = mod.flag_outages(monthly_long, [dt_feb], observed_keys, {dt_feb})
 
     zero_day_flags = flags[flags["flag"] == "zero_days"]
     assert any(
@@ -270,7 +270,7 @@ def test_flag_outages_missing_service_period() -> None:
         patch.object(mod, "SERVICE_PERIODS", ["Weekday", "Saturday", "Sunday"]),
     ):
         monthly_long, observed_keys = mod.aggregate_monthly_long(raw, [dt])
-        flags = mod.flag_outages(monthly_long, [dt], observed_keys)
+        flags = mod.flag_outages(monthly_long, [dt], observed_keys, {dt})
 
     missing = flags[flags["flag"] == "missing_service_period"]
     missing_sps = set(zip(missing["route"], missing["service_period"]))
@@ -296,7 +296,7 @@ def test_flag_outages_clean_data_no_flags() -> None:
         patch.object(mod, "SERVICE_PERIODS", ["Weekday", "Saturday", "Sunday"]),
     ):
         monthly_long, observed_keys = mod.aggregate_monthly_long(raw, [dt])
-        flags = mod.flag_outages(monthly_long, [dt], observed_keys)
+        flags = mod.flag_outages(monthly_long, [dt], observed_keys, {dt})
 
     assert flags.empty
 
@@ -384,13 +384,13 @@ def test_to_wide_values_match_long(fixture_df: pd.DataFrame) -> None:
 
 
 def test_main_integration(fixture_df: pd.DataFrame, tmp_path: Path) -> None:
-    test_periods = {
-        "Dec-2025": mod.PeriodSpec("dummy.xlsx", "Sheet1"),
-        "Jan-2026": mod.PeriodSpec("dummy.xlsx", "Sheet1"),
-        "Feb-2026": mod.PeriodSpec("dummy.xlsx", "Sheet1"),
+    test_workbooks = {
+        "Dec-2025": tmp_path / "dec.xlsx",
+        "Jan-2026": tmp_path / "jan.xlsx",
+        "Feb-2026": tmp_path / "feb.xlsx",
     }
 
-    def mock_read_month_workbook(period: str, spec: mod.PeriodSpec) -> pd.DataFrame:
+    def mock_read_month_workbook(period: str, path: Path) -> pd.DataFrame:
         dt = datetime.strptime(period, "%b-%Y")
         fixture_month_str = dt.strftime("%B %Y")
         period_df = fixture_df[fixture_df["MTH_YR"] == fixture_month_str].copy()
@@ -407,7 +407,7 @@ def test_main_integration(fixture_df: pd.DataFrame, tmp_path: Path) -> None:
         return period_df
 
     with (
-        patch.object(mod, "PERIODS", test_periods),
+        patch.object(mod, "discover_workbooks", return_value=test_workbooks),
         patch.object(mod, "START_MONTH", "Dec-2025"),
         patch.object(mod, "END_MONTH", "Feb-2026"),
         patch.object(mod, "ROUTES", ["101", "202"]),
