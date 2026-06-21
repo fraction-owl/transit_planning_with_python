@@ -3,7 +3,7 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from scripts.modeling.gtfs_route_features import (
+from scripts.gtfs_exports.gtfs_route_features import (
     _service_day_coverage,
     collapse_to_route_number,
     compute_route_supply_metrics,
