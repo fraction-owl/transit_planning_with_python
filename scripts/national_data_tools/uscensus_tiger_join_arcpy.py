@@ -424,7 +424,7 @@ def _derive_income(df: pd.DataFrame) -> pd.DataFrame:
         "50k_60k",
     ]
     df["low_income"] = df[bands].sum(axis=1)
-    df["perc_low_income"] = df["low_income"] / df["total_hh"]
+    df["perc_low_income"] = (df["low_income"] / df["total_hh"]).fillna(0)
     df = df.drop(columns="total_hh")
     return df
 
@@ -432,7 +432,7 @@ def _derive_income(df: pd.DataFrame) -> pd.DataFrame:
 def _derive_ethnicity(df: pd.DataFrame) -> pd.DataFrame:
     minority = ["black", "native", "asian", "pac_isl", "other", "multi"]
     df["minority"] = df[minority].sum(axis=1)
-    df["perc_minority"] = df["minority"] / df["total_pop"]
+    df["perc_minority"] = (df["minority"] / df["total_pop"]).fillna(0)
     df = df.drop(columns="total_pop")
     return df
 
@@ -494,8 +494,8 @@ def _derive_age(df: pd.DataFrame) -> pd.DataFrame:
     df["all_youth"] = df[[c for c in youth if c in df]].sum(axis=1)
     df["all_elderly"] = df[[c for c in elderly if c in df]].sum(axis=1)
     if "total_pop" in df.columns:
-        df["perc_youth"] = (df["all_youth"] / df["total_pop"]).round(3)
-        df["perc_elderly"] = (df["all_elderly"] / df["total_pop"]).round(3)
+        df["perc_youth"] = (df["all_youth"] / df["total_pop"]).fillna(0).round(3)
+        df["perc_elderly"] = (df["all_elderly"] / df["total_pop"]).fillna(0).round(3)
         df = df.drop(columns="total_pop")
     return df
 
