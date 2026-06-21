@@ -95,12 +95,12 @@ CONFIG_END_MARKER: Final[str] = "# === END CONFIG ==="
 # prep_features drops the feed/data into. Phase-2 inputs (WMATA feed, Metro
 # shapefile, service-type file) live here as siblings of the GTFS feed.
 INPUT_DIR: Final[Path] = Path(
-    r"Path\To\Your\analysis_requests\remix_regression_feb_2026\input"
+    r"Path\To\Your\Input_Folder"
 )  # <<< EDIT ME
 
 # GTFS feed folder. Resolved under INPUT_DIR by default; repoint to an absolute
 # path (e.g. the shared G:\ data drive) if the feed isn't copied per request.
-GTFS_DIR: Final[Path] = INPUT_DIR / "connector_gtfs_2025_11_10"  # <<< EDIT ME
+GTFS_DIR: Final[Path] = INPUT_DIR / "your_gtfs_name"  # <<< EDIT ME
 
 # Weekday to characterize (monday..friday). The script picks the date with the
 # most active weekday service_ids so a holiday-skewed date isn't used.
