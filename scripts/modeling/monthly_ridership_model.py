@@ -853,7 +853,7 @@ def export_results(
     Returns:
         The path to the written workbook.
     """
-    workbook = output_dir / "ridership_regression_results.xlsx"
+    workbook = output_dir / "monthly_ridership_results.xlsx"
 
     coef = build_coefficient_frame(result)
     summary = build_summary_frame(result, dependent, log_dependent)
@@ -1013,7 +1013,7 @@ def write_run_log(output_dir: Path, provenance: list[tuple[str, str]]) -> bool:
     Returns:
         ``True`` if the log was written successfully, ``False`` otherwise.
     """
-    log_path = output_dir / "ridership_regression_model_runlog.txt"
+    log_path = output_dir / "monthly_ridership_model_runlog.txt"
 
     try:
         config_text: str = extract_config_block(Path(__file__))

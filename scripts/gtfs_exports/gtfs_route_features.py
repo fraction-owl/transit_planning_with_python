@@ -3,13 +3,13 @@
 This is a feature-generation script for the cross-sectional route boardings model
 (engine 1). It reads a GTFS feed directly — no arcpy, no geospatial deps beyond a
 haversine — and emits one row per route, keyed so the result joins straight onto the
-NTD boardings anchor consumed by ``fit_ridership_model.py`` (PART B).
+NTD boardings anchor consumed by ``route_performance_model.py`` (PART B).
 
 Where this sits in the pipeline:
 
     PART A (this script + others)   ->  route-keyed CSV of non-NTD features
     prep_features.py (orchestrator) ->  bundles the CSV(s) + writes manifest.json
-    fit_ridership_model.py (PART B) ->  joins the bundle onto the NTD anchor, fits OLS
+    route_performance_model.py (PART B) ->  joins the bundle onto the NTD anchor, fits OLS
 
 Features produced (one row per route, keyed on ``route_id`` = GTFS route_short_name):
 
@@ -94,9 +94,7 @@ CONFIG_END_MARKER: Final[str] = "# === END CONFIG ==="
 # request's input folder; under the orchestrator, this is the directory
 # prep_features drops the feed/data into. Phase-2 inputs (WMATA feed, Metro
 # shapefile, service-type file) live here as siblings of the GTFS feed.
-INPUT_DIR: Final[Path] = Path(
-    r"Path\To\Your\Input_Folder"
-)  # <<< EDIT ME
+INPUT_DIR: Final[Path] = Path(r"Path\To\Your\Input_Folder")  # <<< EDIT ME
 
 # GTFS feed folder. Resolved under INPUT_DIR by default; repoint to an absolute
 # path (e.g. the shared G:\ data drive) if the feed isn't copied per request.
@@ -134,7 +132,7 @@ LOG_LEVEL: int = logging.INFO
 def _canonical_key(series: pd.Series) -> pd.Series:
     """Normalize a join-key column so this output matches the NTD anchor reliably.
 
-    Kept BYTE-IDENTICAL to the copy in fit_ridership_model.py / prep_features.py:
+    Kept BYTE-IDENTICAL to the copy in route_performance_model.py / prep_features.py:
     collapse to a trimmed string and strip a single trailing ``.0`` so an integer
     that survived a float round-trip still matches its string form.
     """

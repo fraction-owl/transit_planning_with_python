@@ -2,7 +2,7 @@
 
 Mirrors the validation checklist in the orchestrator brief (§11): synthetic
 feature scripts + (optionally zipped) inputs are run end to end, and the emitted
-bundles + manifest are round-tripped into the unmodified Part B (fit_model.py).
+bundles + manifest are round-tripped into the unmodified Part B (monthly_ridership_model.py).
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from scripts.modeling import fit_model as fm
+from scripts.modeling import monthly_ridership_model as mrm
 from scripts.modeling import prep_features as pf
 
 
@@ -162,7 +162,7 @@ def test_round_trip_panel_anchor_joins_both(tmp_path: Path) -> None:
         }
     ).to_csv(anchor, index=False)
 
-    merged, provenance = fm.assemble_model_table(
+    merged, provenance = mrm.assemble_model_table(
         anchor, 0, layout["output"], layout["output"] / "manifest.json", True
     )
     # Both bundles joined: route feature and period feature both present.
@@ -183,7 +183,7 @@ def test_round_trip_cross_sectional_anchor_skips_period(tmp_path: Path) -> None:
         anchor, index=False
     )
 
-    merged, provenance = fm.assemble_model_table(
+    merged, provenance = mrm.assemble_model_table(
         anchor, 0, layout["output"], layout["output"] / "manifest.json", True
     )
     assert "avg_headway_min" in merged.columns  # route bundle joined

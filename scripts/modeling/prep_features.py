@@ -10,7 +10,7 @@ data on one machine while feature prep happens elsewhere:
         join-key signature and writes one CSV bundle per signature plus a
         manifest (row counts + per-bundle SHA-256 + provenance).
 
-    PART B (``fit_model.py``, runs only where the NTD anchor lives)
+    PART B (``monthly_ridership_model.py``, runs only where the NTD anchor lives)
         Loads the NTD anchor, verifies and joins each prepped bundle onto it,
         then fits the regression and exports results.
 
@@ -50,7 +50,7 @@ Design notes:
     - CSV only. Bundles cross to a stock ``arcgispro-py3`` env that has no
       ``pyarrow``, so Parquet is deliberately avoided.
     - This script must never read, require, or reference the NTD anchor; that is
-      ``fit_model.py``'s job on the secured box.
+      ``monthly_ridership_model.py``'s job on the secured box.
 
 Inputs:
     - Feature-generation scripts (``*.py``) plus their input data, and an
@@ -223,8 +223,8 @@ DEFAULT_CMD_TEMPLATE: tuple[str, ...] = (
 # the secured-box model are always excluded; the latter must never run here.
 EXCLUDE_SCRIPT_NAMES: tuple[str, ...] = (
     "prep_features.py",
-    "fit_model.py",
-    "ridership_regression_model.py",
+    "monthly_ridership_model.py",
+    "route_performance_model.py",
     "ridership_ml_model.py",
     "__init__.py",
 )
@@ -272,7 +272,7 @@ REQUIRE_RUN_LOG: bool = True
 # === END CONFIG ===
 
 # =============================================================================
-# SHARED HELPERS (copied into fit_model.py — keep both copies in sync)
+# SHARED HELPERS (copied into monthly_ridership_model.py — keep both copies in sync)
 # =============================================================================
 
 
@@ -309,7 +309,7 @@ def _canonical_key(series: pd.Series) -> pd.Series:
     ``"101.0"`` from a float round-trip) on the other. This collapses every
     key to a trimmed string and strips a single trailing ``.0`` so an integer
     that survived a float cast still matches its string form. The same helper
-    is copied into fit_model.py and MUST stay byte-identical between the two.
+    is copied into monthly_ridership_model.py and MUST stay byte-identical between the two.
     """
     out = series.astype("string").str.strip()
     out = out.str.replace(r"\.0$", "", regex=True)
@@ -828,7 +828,7 @@ def write_manifest(output_dir: Path, bundles: list[BundleResult]) -> Path:
 
 
 # =============================================================================
-# RUN-LOG HELPERS (copied into fit_model.py — keep both copies in sync)
+# RUN-LOG HELPERS (copied into monthly_ridership_model.py — keep both copies in sync)
 # =============================================================================
 
 
@@ -1110,7 +1110,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Drop-folder feature-prep orchestrator (Part A). Runs feature scripts, "
-            "collects their tables, and writes bundles + manifest for fit_model.py. "
+            "collects their tables, and writes bundles + manifest for monthly_ridership_model.py. "
             "Defaults come from the CONFIGURATION block at the top of this file."
         )
     )

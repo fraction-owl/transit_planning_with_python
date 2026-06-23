@@ -1298,7 +1298,7 @@ def do_route_by_route_analysis(
     Exports:
       - Per route_short_name R: a shapefile R_service_buffer_data.shp.
       - One combined ``service_demographics_by_route.csv`` keyed on ``route_id``
-        (one row per route_id) — the table the feature bundle / fit_model.py
+        (one row per route_id) — the table the feature bundle / monthly_ridership_model.py
         consume. The route identity lives in a real column here, not just the
         filename, so the orchestrator can join it onto the ridership anchor. A
         ``service_type`` column labels each route ``"express"`` (its route_id is
@@ -1337,7 +1337,7 @@ def do_route_by_route_analysis(
     os.makedirs(output_dir, exist_ok=True)
 
     # Map each route_short_name back to its route_id(s) so the combined summary
-    # below is keyed on route_id (what fit_model.py joins on). A short name that
+    # below is keyed on route_id (what monthly_ridership_model.py joins on). A short name that
     # maps to several route_ids yields one summary row per route_id.
     short_to_route_ids = (
         final_routes_df.groupby("route_short_name")["route_id"].apply(list).to_dict()
@@ -1477,7 +1477,7 @@ def do_route_by_route_analysis(
             )
 
     # Write one combined, route_id-keyed CSV for the bundle. prep_features.py
-    # collects this; fit_model.py joins it onto the ridership anchor by route_id.
+    # collects this; monthly_ridership_model.py joins it onto the ridership anchor by route_id.
     if summary_records:
         summary_df = pd.DataFrame(summary_records)
         csv_path = os.path.join(output_dir, "service_demographics_by_route.csv")

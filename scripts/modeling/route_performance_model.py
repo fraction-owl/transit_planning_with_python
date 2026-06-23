@@ -24,7 +24,7 @@ Inputs (all keyed on route_id = public route number):
     GTFS_FEATURES_PATH   output of gtfs_route_features.py (supply + competition).
 
 Outputs:
-    ridership_route_model_results.xlsx
+    route_performance_results.xlsx
         ModelSummary | Coefficients | RoutePerformance | Correlations
     diagnostic plots + a run-log sidecar.
 
@@ -584,7 +584,7 @@ def build_route_performance(result: OLSResult, model_frame: pd.DataFrame) -> pd.
 
 def export_results(result: OLSResult, model_frame: pd.DataFrame) -> Path:
     """Write the five-sheet results workbook and return its path."""
-    workbook = OUTPUT_DIR / "ridership_route_model_results.xlsx"
+    workbook = OUTPUT_DIR / "route_performance_results.xlsx"
     summary = build_summary_frame(result)
     coef = build_coefficient_frame(result)
     performance = build_route_performance(result, model_frame)
@@ -678,7 +678,7 @@ def _extract_config_block() -> str:
 
 def write_run_log(result: OLSResult) -> None:
     """Write the run-log sidecar (timestamp, fit headline, verbatim config block)."""
-    log_path = OUTPUT_DIR / "ridership_route_model_runlog.txt"
+    log_path = OUTPUT_DIR / "route_performance_model_runlog.txt"
     lines = [
         "=" * 72,
         "CROSS-SECTIONAL ROUTE RIDERSHIP MODEL RUN LOG (ENGINE 1, secured box)",
