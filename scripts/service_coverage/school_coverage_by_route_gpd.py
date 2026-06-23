@@ -4,7 +4,7 @@ This is an intermediate ("prep") script in the same spirit as
 ``points_of_interest_coverage_gpd.py`` and the route-level output of
 ``gtfs_service_demographics_gpd.py``: it turns a point layer of schools into a
 single, route-keyed feature table that the modeling pipeline
-(``scripts/modeling/prep_features.py`` → ``fit_model.py``) can join onto the
+(``scripts/modeling/prep_features.py`` → ``monthly_ridership_model.py``) can join onto the
 ridership anchor by ``route_id``.
 
 It buffers each route's stops (a simple fixed-radius catchment is intentional

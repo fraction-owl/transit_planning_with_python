@@ -1,9 +1,10 @@
 """Fit machine-learning ridership models from the same agency planning data.
 
-This is the machine-learning counterpart to ``ridership_regression_model.py``.
-It ingests the *exact same* modeling table — the dependent NTD ridership
-variable plus the service-supplied, exogenous, demographic, and
-points-of-interest predictors — but replaces the single hand-rolled OLS fit
+This is the machine-learning counterpart to the hand-rolled OLS ridership
+models in this folder. It ingests the *exact same* modeling table — the
+dependent NTD ridership variable plus the service-supplied, exogenous,
+demographic, and points-of-interest predictors — but replaces the single
+hand-rolled OLS fit
 with tree-ensemble learners that capture the nonlinearities and feature
 interactions a linear model cannot.
 
@@ -79,9 +80,8 @@ except ImportError as exc:  # pragma: no cover - exercised only without sklearn
         "ridership_ml_model.py requires scikit-learn, which is not installed.\n"
         "Install it into your environment with:\n"
         "    pip install scikit-learn\n"
-        "(This advanced ML script intentionally depends on it; the linear "
-        "ridership_regression_model.py runs without it if you cannot install "
-        "scikit-learn.)"
+        "(This advanced ML script intentionally depends on it; the linear OLS "
+        "ridership models run without it if you cannot install scikit-learn.)"
     ) from exc
 
 # Sentinel markers used by extract_config_block / write_run_log to identify
@@ -588,7 +588,7 @@ def build_models(
     """Construct the estimators to compare, keyed by display name.
 
     The OLS baseline is wrapped in a standardizing pipeline so it matches the
-    linear ``ridership_regression_model.py`` fit (scaling does not change its
+    linear OLS fit (scaling does not change its
     R^2 but keeps coefficients comparable); the ensembles are seeded for
     reproducibility.
 

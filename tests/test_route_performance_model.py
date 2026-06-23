@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from scripts.modeling import fit_ridership_model as frm
+from scripts.modeling import route_performance_model as rpm
 
 
 @pytest.fixture
@@ -22,7 +22,7 @@ def design() -> tuple[np.ndarray, np.ndarray, list[str]]:
 def test_fit_ols_recovers_coefficients(design) -> None:
     """OLS should recover the known coefficients and report a high R^2."""
     y, x_matrix, names = design
-    result = frm.fit_ols(y, x_matrix, names, se_type="classical")
+    result = rpm.fit_ols(y, x_matrix, names, se_type="classical")
 
     assert result.n_obs == 80
     assert result.n_params == 3
@@ -37,21 +37,21 @@ def test_fit_ols_requires_enough_observations() -> None:
     x_matrix = np.ones((2, 3))
     y = np.array([1.0, 2.0])
     with pytest.raises(ValueError):
-        frm.fit_ols(y, x_matrix, ["intercept", "a", "b"], se_type="classical")
+        rpm.fit_ols(y, x_matrix, ["intercept", "a", "b"], se_type="classical")
 
 
 def test_fit_ols_rejects_unknown_se_type(design) -> None:
     """An unrecognised SE type must raise rather than silently fall through."""
     y, x_matrix, names = design
     with pytest.raises(ValueError):
-        frm.fit_ols(y, x_matrix, names, se_type="bootstrap")
+        rpm.fit_ols(y, x_matrix, names, se_type="bootstrap")
 
 
 def test_hc1_matches_classical_under_homoskedasticity(design) -> None:
     """HC1 and classical SEs should be close when errors are homoskedastic."""
     y, x_matrix, names = design
-    classical = frm.fit_ols(y, x_matrix, names, se_type="classical")
-    robust = frm.fit_ols(y, x_matrix, names, se_type="HC1")
+    classical = rpm.fit_ols(y, x_matrix, names, se_type="classical")
+    robust = rpm.fit_ols(y, x_matrix, names, se_type="HC1")
 
     np.testing.assert_allclose(classical.params, robust.params)
     np.testing.assert_allclose(classical.std_errors, robust.std_errors, rtol=0.5)
@@ -60,7 +60,7 @@ def test_hc1_matches_classical_under_homoskedasticity(design) -> None:
 def test_loo_residuals_match_bruteforce_refits(design) -> None:
     """The hat-matrix LOO residuals must equal explicit leave-one-out refits."""
     y, x_matrix, names = design
-    result = frm.fit_ols(y, x_matrix, names, se_type="classical")
+    result = rpm.fit_ols(y, x_matrix, names, se_type="classical")
 
     n = len(y)
     brute = np.empty(n)
@@ -78,14 +78,14 @@ def test_vif_flags_collinearity() -> None:
     x1 = rng.normal(size=50)
     x2 = x1 + rng.normal(scale=1e-6, size=50)  # nearly identical to x1
     x_matrix = np.column_stack([np.ones(50), x1, x2])
-    vif = frm._vif(x_matrix, ["intercept", "x1", "x2"])
+    vif = rpm._vif(x_matrix, ["intercept", "x1", "x2"])
     assert vif["x1"] > 100
     assert vif["x2"] > 100
 
 
 def test_canonical_key_normalizes_join_values() -> None:
     """Keys are trimmed, de-floated, and NaN-filled to a stable string form."""
-    out = frm._canonical_key(pd.Series([" 159 ", "159.0", 42, None]))
+    out = rpm._canonical_key(pd.Series([" 159 ", "159.0", 42, None]))
     assert out.tolist() == ["159", "159", "42", ""]
 
 
@@ -98,7 +98,7 @@ def test_derive_features_flags_express_and_equity_pct() -> None:
             "total_pop": [1000.0, 500.0],
         }
     )
-    out = frm.derive_features(table)
+    out = rpm.derive_features(table)
 
     assert out["is_express"].tolist() == [1.0, 0.0]
     np.testing.assert_allclose(out["pct_low_income"], [0.25, 0.20])
@@ -106,9 +106,9 @@ def test_derive_features_flags_express_and_equity_pct() -> None:
 
 def test_end_to_end_export(tmp_path, monkeypatch) -> None:
     """A full design-matrix build, fit, and export writes the expected sheets."""
-    monkeypatch.setattr(frm, "PREDICTORS", ("revenue_hours", "total_pop"))
-    monkeypatch.setattr(frm, "LOG_PREDICTORS", ("revenue_hours", "total_pop"))
-    monkeypatch.setattr(frm, "OUTPUT_DIR", tmp_path)
+    monkeypatch.setattr(rpm, "PREDICTORS", ("revenue_hours", "total_pop"))
+    monkeypatch.setattr(rpm, "LOG_PREDICTORS", ("revenue_hours", "total_pop"))
+    monkeypatch.setattr(rpm, "OUTPUT_DIR", tmp_path)
 
     rng = np.random.default_rng(7)
     n = 60
@@ -124,11 +124,11 @@ def test_end_to_end_export(tmp_path, monkeypatch) -> None:
         }
     )
 
-    y, x_matrix, names, frame, _ = frm.build_design_matrix(table)
+    y, x_matrix, names, frame, _ = rpm.build_design_matrix(table)
     assert names == ["intercept", "log_revenue_hours", "log_total_pop"]
 
-    result = frm.fit_ols(y, x_matrix, names, se_type="HC1")
-    workbook = frm.export_results(result, frame)
+    result = rpm.fit_ols(y, x_matrix, names, se_type="HC1")
+    workbook = rpm.export_results(result, frame)
 
     assert workbook.exists()
     sheets = pd.read_excel(workbook, sheet_name=None)
@@ -145,8 +145,8 @@ def test_end_to_end_export(tmp_path, monkeypatch) -> None:
 
 def test_log_dependent_rejects_nonpositive(monkeypatch) -> None:
     """A non-positive dependent under the log transform must raise."""
-    monkeypatch.setattr(frm, "PREDICTORS", ("revenue_hours",))
-    monkeypatch.setattr(frm, "LOG_PREDICTORS", ("revenue_hours",))
+    monkeypatch.setattr(rpm, "PREDICTORS", ("revenue_hours",))
+    monkeypatch.setattr(rpm, "LOG_PREDICTORS", ("revenue_hours",))
     table = pd.DataFrame(
         {
             "route_id": ["1", "2", "3"],
@@ -155,4 +155,4 @@ def test_log_dependent_rejects_nonpositive(monkeypatch) -> None:
         }
     )
     with pytest.raises(ValueError):
-        frm.build_design_matrix(table)
+        rpm.build_design_matrix(table)
