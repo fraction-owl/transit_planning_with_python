@@ -365,39 +365,34 @@ def process_typos(
     stops_gdf: gpd.GeoDataFrame,
     roadways_gdf: gpd.GeoDataFrame,
     modifiers: Set[str],
-    road_names_clean: Set[str],
+    join_gdf: gpd.GeoDataFrame,
     threshold: int,
-    join_gdf: Optional[gpd.GeoDataFrame] = None,
 ) -> pd.DataFrame:
     """Process each stop and perform fuzzy matching to identify potential typos.
 
-    When ``join_gdf`` is supplied, fuzzy comparison is restricted to the roads
-    that intersect each stop's buffer (per-stop local set). When it is
-    ``None``, the comparison falls back to the global ``road_names_clean`` set
-    -- the prior behavior.
+    Fuzzy comparison is restricted to the roads that intersect each stop's
+    buffer (the per-stop local set), as determined by ``join_gdf``. A stop is
+    therefore never compared against a similarly-named road elsewhere in the
+    region.
 
     Args:
         stops_gdf (gpd.GeoDataFrame): The GeoDataFrame of stops.
         roadways_gdf (gpd.GeoDataFrame): The GeoDataFrame of roadways.
         modifiers (set): A set of known street name modifiers.
-        road_names_clean (set): Global set of normalized roadway names; used
-            as the comparison set only when ``join_gdf`` is None.
+        join_gdf (gpd.GeoDataFrame): Output of
+            :func:`spatial_join_stops_roadways`. Each stop is compared only
+            against roads inside its own buffer.
         threshold (int): The similarity score threshold for fuzzy matching.
-        join_gdf (gpd.GeoDataFrame | None): Output of
-            :func:`spatial_join_stops_roadways`. When provided, each stop is
-            compared only against roads inside its own buffer.
 
     Returns:
         pd.DataFrame: A deduplicated DataFrame of potential typos, sorted by
         similarity score. Empty DataFrame if no candidates are found.
     """
-    # Build per-stop nearby-road sets from the spatial join, if provided.
-    nearby_clean_by_stop: Dict[str, Set[str]] = {}
-    if join_gdf is not None:
-        local = join_gdf.dropna(subset=["FULLNAME_clean"])
-        nearby_clean_by_stop = (
-            local.groupby("stop_id")["FULLNAME_clean"].apply(lambda s: set(s.unique())).to_dict()
-        )
+    # Build per-stop nearby-road sets from the spatial join.
+    local = join_gdf.dropna(subset=["FULLNAME_clean"])
+    nearby_clean_by_stop: Dict[str, Set[str]] = (
+        local.groupby("stop_id")["FULLNAME_clean"].apply(lambda s: set(s.unique())).to_dict()
+    )
 
     potential_typos: List[Dict[str, Any]] = []
     for _, stop in stops_gdf.iterrows():
@@ -405,15 +400,11 @@ def process_typos(
         s_name = stop["stop_name"]
         s_streets = extract_street_names(s_name, modifiers)
 
-        if join_gdf is not None:
-            local_road_names = nearby_clean_by_stop.get(s_id, set())
-            if not local_road_names:
-                # No roads within this stop's buffer -- nothing to compare against.
-                continue
-            local_roads_gdf = roadways_gdf[roadways_gdf["FULLNAME_clean"].isin(local_road_names)]
-        else:
-            local_road_names = road_names_clean
-            local_roads_gdf = roadways_gdf
+        local_road_names = nearby_clean_by_stop.get(s_id, set())
+        if not local_road_names:
+            # No roads within this stop's buffer -- nothing to compare against.
+            continue
+        local_roads_gdf = roadways_gdf[roadways_gdf["FULLNAME_clean"].isin(local_road_names)]
 
         typos = compare_stop_to_roads(
             s_id, s_name, s_streets, local_road_names, local_roads_gdf, threshold
@@ -602,14 +593,12 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 10. Fuzzy-match street names to find potential typos
     # ------------------------------------------------------------------
-    road_names_clean = set(roadways_gdf["FULLNAME_clean"].dropna().unique())
     typos_df = process_typos(
         stops_gdf,
         roadways_gdf,
         modifiers,
-        road_names_clean,
+        join_gdf,
         SIMILARITY_THRESHOLD,
-        join_gdf=join_gdf,
     )
 
     # 11. Save or report results

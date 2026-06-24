@@ -314,8 +314,11 @@ def test_process_typos_returns_dataframe() -> None:
     roads["FULLNAME_clean"] = roads["FULLNAME"].apply(
         lambda x: target.normalize_street_name(x, set())
     )
-    road_names = set(roads["FULLNAME_clean"].unique())
-    result = target.process_typos(stops_gdf, roads, set(), road_names, 80)
+    # Both roads fall inside this stop's buffer.
+    join_gdf = pd.DataFrame(
+        {"stop_id": ["S1", "S1"], "FULLNAME_clean": list(roads["FULLNAME_clean"])}
+    )
+    result = target.process_typos(stops_gdf, roads, set(), join_gdf, 80)
     assert isinstance(result, pd.DataFrame)
 
 
@@ -330,8 +333,50 @@ def test_process_typos_empty_when_no_nearby_roads() -> None:
     # Pass an empty join DataFrame so that each stop gets no local roads
     # process_typos only calls dropna/groupby on join_gdf, no geometry ops needed
     empty_join = pd.DataFrame(columns=["stop_id", "FULLNAME_clean"])
-    result = target.process_typos(stops_gdf, roads, set(), set(), 80, join_gdf=empty_join)
+    result = target.process_typos(stops_gdf, roads, set(), empty_join, 80)
     assert result.empty
+
+
+def test_process_typos_respects_buffer_scoping() -> None:
+    """A stop is only matched against roads inside its own buffer.
+
+    Regression guard: the fuzzy match must run against the per-stop spatial-join
+    set, not the global roster of road names. Previously a stop could be flagged
+    as a typo of a similarly-named road on the far side of the region because
+    the buffer was used only for logging, not for the matching itself.
+    """
+    # Two roads ~10 km apart. Both normalize to something fuzzy-similar to the
+    # stop's street token, so name similarity alone cannot distinguish them --
+    # only the spatial buffer can.
+    roads = gpd.GeoDataFrame(
+        {
+            "FULLNAME": ["Washington Blvd", "Washingten Blvd"],
+            "RW_TYPE_US": ["Blvd", "Blvd"],
+        },
+        geometry=[
+            LineString([(0, 0), (100, 0)]),  # near the stop
+            LineString([(10_000, 0), (10_100, 0)]),  # far away
+        ],
+        crs=TARGET_CRS,
+    )
+    roads["FULLNAME_clean"] = roads["FULLNAME"].apply(
+        lambda x: target.normalize_street_name(x, {"blvd"})
+    )
+
+    # Stop sits on the near road; its street token is a typo of both road names.
+    stops = gpd.GeoDataFrame(
+        {"stop_id": ["S1"], "stop_name": ["Washingtn Blvd @ Oak"]},
+        geometry=[Point(50, 0)],
+        crs=TARGET_CRS,
+    )
+
+    buffered = target.create_buffered_stops(stops, buffer_distance=100.0)
+    join_gdf = target.spatial_join_stops_roadways(buffered, roads)
+    result = target.process_typos(stops, roads, {"blvd"}, join_gdf, threshold=80)
+
+    matched = set(result["similar_road_name_original"])
+    assert "Washington Blvd" in matched  # near road IS a candidate
+    assert "Washingten Blvd" not in matched  # far road is OUT of the buffer
 
 
 # ---------------------------------------------------------------------------
@@ -389,6 +434,7 @@ def test_integration_dc_load_and_process(tmp_path: Path) -> None:
         lambda x: target.normalize_street_name(x, modifiers)
     )
 
-    road_names_clean = set(roads_gdf["FULLNAME_clean"].dropna().unique())
-    result = target.process_typos(stops_gdf, roads_gdf, modifiers, road_names_clean, threshold=80)
+    buffered = target.create_buffered_stops(stops_gdf, buffer_distance=50.0)
+    join_gdf = target.spatial_join_stops_roadways(buffered, roads_gdf)
+    result = target.process_typos(stops_gdf, roads_gdf, modifiers, join_gdf, threshold=80)
     assert isinstance(result, pd.DataFrame)
