@@ -10,9 +10,26 @@
     "NOTE: service_demographics_by_route.csv is intentionally NOT described below. Its column",
     "set varies with which Census tables were supplied (commute/income/vehicles/etc.), and a",
     "described table whose keep_cols are not all present is skipped wholesale; inference ships",
-    "whatever numeric columns it produced, including the commute counts/shares from ACS S0801."
+    "whatever numeric columns it produced, including the commute counts/shares from ACS S0801.",
+    "NOTE: gtfs_route_features.csv keep_cols deliberately EXCLUDE revenue_hours/revenue_miles.",
+    "Those are NTD-sourced supply quantities that live on the anchor (the NTD figures are more",
+    "accurate than the schedule-derived GTFS copy), and prep_features governance forbids them",
+    "from any feature bundle; without an explicit keep_cols, inference would ship them and the",
+    "run would fail closed."
   ],
   "scripts": [
+    {
+      "script": "gtfs_route_features.py",
+      "cmd": ["{python}", "{script}", "--gtfs-dir", "{input}/gtfs",
+              "--output-dir", "{output}"],
+      "outputs": [
+        {"file": "gtfs_route_features.csv", "join_keys": ["route_id"],
+         "keep_cols": ["trips_per_day", "span_hours", "median_headway_min", "pct_day_with_service",
+                       "route_length_mi", "route_length_modal_mi", "avg_speed_mph", "n_stops",
+                       "stops_per_mile", "shared_stop_share", "n_competitor_routes",
+                       "competitor_trips_at_shared_stops", "competition_intensity"]}
+      ]
+    },
     {
       "script": "headway_span_exporter.py",
       "cmd": ["{python}", "{script}", "--gtfs-folder", "{input}/gtfs",
@@ -64,6 +81,11 @@
     }
   ],
   "outputs": [
+    {"file": "gtfs_route_features.csv", "join_keys": ["route_id"],
+     "keep_cols": ["trips_per_day", "span_hours", "median_headway_min", "pct_day_with_service",
+                   "route_length_mi", "route_length_modal_mi", "avg_speed_mph", "n_stops",
+                   "stops_per_mile", "shared_stop_share", "n_competitor_routes",
+                   "competitor_trips_at_shared_stops", "competition_intensity"]},
     {"file": "exogenous_monthly.csv", "join_keys": ["period"],
      "keep_cols": ["gas_price", "unemployment_rate", "avg_temp_f", "max_daily_precip_in",
                    "days_with_precip", "total_snow_in", "max_daily_snow_in"]},
