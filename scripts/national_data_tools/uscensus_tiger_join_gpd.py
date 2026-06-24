@@ -1369,7 +1369,7 @@ def _skip_placeholder_output(path: str | None, placeholder: str, flag: str) -> s
 
     The two intermediate artifacts are optional, so leaving their path un-edited
     must not abort the whole run -- only the required input/output paths do that.
-    This is exactly the case the prep_features orchestrator hits: it wires
+    This is exactly the case the prep_features_public orchestrator hits: it wires
     ``--input-csv-dir``/``--input-shp-dir``/``--output`` but not the
     intermediates, so they fall back to the placeholder constants.
 

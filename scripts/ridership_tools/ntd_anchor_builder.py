@@ -36,13 +36,14 @@ Measure conventions (kept consistent with ntd_monthly_summary.py):
 
 from __future__ import annotations
 
+import argparse
 import calendar
 import logging
 import re
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, Sequence
 
 import pandas as pd
 
@@ -600,7 +601,43 @@ def write_run_log(output_dir: Path, summary_lines: list[str]) -> bool:
 # =============================================================================
 
 
-def main() -> None:
+def build_arg_parser() -> argparse.ArgumentParser:
+    """Create the command-line argument parser.
+
+    Every option defaults to the matching CONFIGURATION constant, so the script
+    behaves identically when run with no flags (notebook / ArcGIS Pro) and can be
+    fully driven by an orchestrator (e.g. ``prep_features_private.py``) when
+    flags are supplied.
+    """
+    p = argparse.ArgumentParser(
+        description="Build the NTD regression anchor from monthly ridership workbooks."
+    )
+    p.add_argument("--data-root", default=str(DATA_ROOT), help="Folder of monthly NTD workbooks.")
+    p.add_argument("--output-dir", default=str(OUTPUT_DIR), help="Where the anchor CSV is written.")
+    p.add_argument("--output-filename", default=OUTPUT_FILENAME, help="Anchor CSV filename.")
+    p.add_argument(
+        "--grain",
+        default=GRAIN,
+        choices=["cross_section", "panel"],
+        help="One row per route ('cross_section') or per route x month ('panel').",
+    )
+    p.add_argument(
+        "--service-day",
+        default=SERVICE_DAY_SELECTION,
+        help="weekday / saturday / sunday / combined.",
+    )
+    p.add_argument(
+        "--start-month",
+        default=START_MONTH,
+        help="Inclusive start as 'Mon-YYYY' (blank = earliest).",
+    )
+    p.add_argument(
+        "--end-month", default=END_MONTH, help="Inclusive end as 'Mon-YYYY' (blank = latest)."
+    )
+    return p
+
+
+def main(argv: Sequence[str] | None = None) -> None:
     """Read the monthly workbooks, build the anchor, and export it."""
     logging.basicConfig(
         level=LOG_LEVEL,
@@ -608,27 +645,37 @@ def main() -> None:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    if GRAIN not in {"cross_section", "panel"}:
-        logging.error("GRAIN must be 'cross_section' or 'panel', got '%s'.", GRAIN)
+    parser = build_arg_parser()
+    args, _unknown = parser.parse_known_args(argv)
+
+    data_root = Path(args.data_root)
+    output_dir = Path(args.output_dir)
+    output_filename = args.output_filename
+    grain = args.grain
+    start_month = args.start_month
+    end_month = args.end_month
+
+    if grain not in {"cross_section", "panel"}:
+        logging.error("--grain must be 'cross_section' or 'panel', got '%s'.", grain)
         sys.exit(1)
 
-    selection = SERVICE_DAY_SELECTION.strip().lower()
+    selection = args.service_day.strip().lower()
     if selection not in _SERVICE_DAY_SETS:
         logging.error(
-            "SERVICE_DAY_SELECTION must be one of %s, got '%s'.",
+            "--service-day must be one of %s, got '%s'.",
             sorted(_SERVICE_DAY_SETS),
-            SERVICE_DAY_SELECTION,
+            args.service_day,
         )
         sys.exit(1)
     selected_periods = _SERVICE_DAY_SETS[selection]
 
     if (
-        str(DATA_ROOT) == r"Path\To\Your\NTD_Folder"
-        or str(OUTPUT_DIR) == r"Path\To\Your\Output\Folder"
+        str(data_root) == r"Path\To\Your\NTD_Folder"
+        or str(output_dir) == r"Path\To\Your\Output\Folder"
     ):
         logging.warning(
             "File paths are still set to their defaults. Update DATA_ROOT and OUTPUT_DIR "
-            "in the CONFIGURATION section before running."
+            "in the CONFIGURATION section, or pass --data-root/--output-dir, before running."
         )
         return
 
@@ -644,54 +691,54 @@ def main() -> None:
         "Service-day selection: '%s' (periods summed: %s).", selection, ", ".join(selected_periods)
     )
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    logging.info("=== STEP 0: DISCOVER WORKBOOKS UNDER %s ===", DATA_ROOT)
-    workbooks = discover_workbooks(DATA_ROOT)
+    logging.info("=== STEP 0: DISCOVER WORKBOOKS UNDER %s ===", data_root)
+    workbooks = discover_workbooks(data_root)
     if not workbooks:
-        logging.warning("No workbooks matched '%s' under %s.", WORKBOOK_GLOB, DATA_ROOT)
+        logging.warning("No workbooks matched '%s' under %s.", WORKBOOK_GLOB, data_root)
     else:
         logging.info("Discovered %d workbook(s).", len(workbooks))
 
     try:
-        start_dt = parse_month_bound(START_MONTH)
-        end_dt = parse_month_bound(END_MONTH)
+        start_dt = parse_month_bound(start_month)
+        end_dt = parse_month_bound(end_month)
     except ValueError as exc:
         logging.error(
-            "START_MONTH / END_MONTH must be blank or 'Mon-YYYY' (e.g. 'Jul-2024'): %s", exc
+            "--start-month / --end-month must be blank or 'Mon-YYYY' (e.g. 'Jul-2024'): %s", exc
         )
         sys.exit(1)
     if start_dt is not None and end_dt is not None and start_dt > end_dt:
-        logging.error("START_MONTH (%s) is after END_MONTH (%s).", START_MONTH, END_MONTH)
+        logging.error("--start-month (%s) is after --end-month (%s).", start_month, end_month)
         sys.exit(1)
 
     periods = periods_in_range(workbooks, start_dt, end_dt)
     # Report the window actually applied, naming the dynamic ends explicitly so a
     # blank bound is never mistaken for a silently dropped month.
-    start_label = START_MONTH if start_dt is not None else "earliest on disk"
-    end_label = END_MONTH if end_dt is not None else "latest on disk"
+    start_label = start_month if start_dt is not None else "earliest on disk"
+    end_label = end_month if end_dt is not None else "latest on disk"
     if not periods:
         logging.warning("No discovered workbooks fall in %s..%s.", start_label, end_label)
 
     logging.info("=== STEP 1: READ WORKBOOKS (%s..%s) ===", start_label, end_label)
     raw = load_raw(workbooks, periods, selected_periods)
 
-    logging.info("=== STEP 2: AGGREGATE TO '%s' GRAIN ('%s') ===", GRAIN, selection)
-    anchor = build_anchor(raw, GRAIN)
+    logging.info("=== STEP 2: AGGREGATE TO '%s' GRAIN ('%s') ===", grain, selection)
+    anchor = build_anchor(raw, grain)
     anchor = clean_anchor(anchor)
 
     # Stamp the service-day selection onto every row so the regression can assert
     # which service day it is analyzing.
-    insert_at = 2 if GRAIN == "panel" else 1
+    insert_at = 2 if grain == "panel" else 1
     anchor.insert(insert_at, SERVICE_DAY_OUT, selection)
 
-    out_path = OUTPUT_DIR / OUTPUT_FILENAME
+    out_path = output_dir / output_filename
     anchor.to_csv(out_path, index=False)
     logging.info("Anchor written: %s (%d rows, %d cols).", out_path, *anchor.shape)
 
     n_routes = anchor[ROUTE_ID_OUT].nunique() if not anchor.empty else 0
     summary_lines = [
-        f"Grain:            {GRAIN}",
+        f"Grain:            {grain}",
         f"Service day:      {selection} (periods: {', '.join(selected_periods)})",
         f"Period range:     {start_label}..{end_label}",
         f"Workbooks found:  {len(workbooks)}",
@@ -700,10 +747,10 @@ def main() -> None:
         f"Rows written:     {len(anchor)}",
         f"Unique route_ids: {n_routes}",
     ]
-    if GRAIN == "panel" and not anchor.empty:
+    if grain == "panel" and not anchor.empty:
         summary_lines.append(f"Unique periods:   {anchor[PERIOD_OUT].nunique()}")
 
-    if not write_run_log(OUTPUT_DIR, summary_lines) and REQUIRE_RUN_LOG:
+    if not write_run_log(output_dir, summary_lines) and REQUIRE_RUN_LOG:
         logging.error(
             "Run log could not be written. Set REQUIRE_RUN_LOG = False to suppress this "
             "error when a sidecar file is genuinely impossible."

@@ -17,14 +17,14 @@ so an underperformer can be read as thin-service vs car-oriented-market vs canni
 This is the secured-box fit (PART B): the NTD anchor (the dependent variable plus the
 service-supplied predictors revenue_hours / revenue_miles) is read here and never
 leaves; the non-NTD feature tables (GTFS competition + demographics) are prepped on the
-unsecured box by prep_features.py (PART A) and transferred in as one governance-checked
+unsecured box by prep_features_public.py (PART A) and transferred in as one governance-checked
 CSV bundle per join-key signature, each verified against a manifest before joining.
 
 Inputs:
     ANCHOR_PATH    NTD anchor: route_id + ntd_boardings (the proprietary DV) plus the
                    service-supplied predictors revenue_hours / revenue_miles.
-    BUNDLE_DIR     Feature bundle CSVs produced by prep_features.py (Part A).
-    MANIFEST_PATH  prep_features manifest (each bundle's join keys + SHA-256). A bundle
+    BUNDLE_DIR     Feature bundle CSVs produced by prep_features_public.py (Part A).
+    MANIFEST_PATH  prep_features_public manifest (each bundle's join keys + SHA-256). A bundle
                    is joined only if every one of its join keys is present in the anchor,
                    so a cross-sectional (route_id) anchor auto-skips a period bundle.
 
@@ -76,13 +76,13 @@ ANCHOR_AGG: Final[str] = "mean"  # <<< EDIT ME
 # revenue_hours/_miles averages use the same months, keeping PPH consistent).
 ANCHOR_EXCLUDE_ZERO_MONTHS: Final[bool] = True
 
-# Feature bundles produced by prep_features.py (PART A) and transferred in.
+# Feature bundles produced by prep_features_public.py (PART A) and transferred in.
 # BUNDLE_DIR holds the bundle CSVs; MANIFEST_PATH is the JSON sidecar listing each
 # bundle's join keys, row/column counts, and SHA-256. A bundle is joined onto the
 # anchor only if every one of its join keys is present in the anchor, so a
 # cross-sectional (route_id) anchor silently skips a period-keyed bundle. Supply
 # columns (revenue_hours / revenue_miles) are NTD-side and live on the anchor;
-# prep_features governance forbids them from ever entering a feature bundle.
+# prep_features_public governance forbids them from ever entering a feature bundle.
 BUNDLE_DIR: Final[Path] = Path(r"Path\To\Your\prepped_features")  # <<< EDIT ME
 MANIFEST_PATH: Final[Path] = Path(r"Path\To\Your\prepped_features\manifest.json")  # <<< EDIT ME
 # When True, every bundle's on-disk SHA-256 must match the manifest before it is
@@ -220,7 +220,7 @@ def load_table(path: Path, sheet: str | int = 0) -> pd.DataFrame:
 
 
 class BundleSpec(NamedTuple):
-    """A prepped feature bundle described by the prep_features (Part A) manifest.
+    """A prepped feature bundle described by the prep_features_public (Part A) manifest.
 
     Attributes:
         filename: Bundle CSV filename (resolved against ``BUNDLE_DIR``).
@@ -245,7 +245,7 @@ def _sha256_file(path: Path) -> str:
 
 
 def load_manifest(manifest_path: Path) -> list[BundleSpec]:
-    """Parse the prep_features manifest into an ordered list of bundle specs.
+    """Parse the prep_features_public manifest into an ordered list of bundle specs.
 
     Raises:
         FileNotFoundError: If ``manifest_path`` does not exist.

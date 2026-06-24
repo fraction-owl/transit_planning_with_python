@@ -1,61 +1,63 @@
-"""Drop-folder feature-prep orchestrator (PART A of a two-stage split).
+"""Secured-box feature-prep orchestrator (the PRIVATE half of the split).
 
-This is the unsecured-box half of a split pipeline that keeps proprietary NTD
-data on one machine while feature prep happens elsewhere:
+This is the secured-box counterpart to ``prep_features_public.py``. The two are
+symmetric at the *interface* -- each runs a set of feature scripts, collects
+their tabular outputs, groups them by join-key signature, and writes one CSV
+bundle per signature plus a manifest -- but they have opposite trust postures:
 
-    PART A (this script, runs anywhere, NO NTD)
-        Runs the non-NTD feature-generation scripts as subprocesses, collects
-        the tabular outputs they write, describes each output's join keys and
-        shippable columns (registry-or-inference), then groups everything by
-        join-key signature and writes one CSV bundle per signature plus a
-        manifest (row counts + per-bundle SHA-256 + provenance).
+    prep_features_public.py (runs anywhere, NO NTD)
+        A guarded *exporter*. Its whole reason to exist is a fail-closed
+        boundary: it must never let an NTD-derived quantity cross to the
+        unsecured box, so it runs a forbidden-column denylist before writing.
 
-    PART B (``monthly_ridership_model.py``, runs only where the NTD anchor lives)
-        Loads the NTD anchor, verifies and joins each prepped bundle onto it,
-        then fits the regression and exports results.
+    prep_features_private.py (this script, runs only on the secured box)
+        An internal *assembler*. The proprietary data (NTD ridership, plus the
+        TIDES-derived OTP and runtime operational measures) all live here, so
+        there is no boundary to police. The dependent variable (NTD boardings)
+        and the service-supply predictors are *expected* in these bundles, not
+        forbidden. Nothing produced here is meant to leave the secured box.
 
-Pipeline (front half is new; the "combine" back half is unchanged):
+Pipeline (identical shape to the public half):
 
     scan -> extract -> run -> collect -> describe -> combine
 
-    scan      Discover feature scripts (``SCRIPTS_DIR`` and an optional inbox)
-              and an optional ``jobs.json`` registry.
+    scan      Discover the private feature scripts under ``SCRIPTS_DIR``
+              (searched recursively, since the private set spans
+              ``ridership_tools`` and ``operations_tools``) using the
+              ``jobs.private.json`` registry as an ordered allowlist.
     extract   Optionally unzip ``*.zip`` archives found under the input root
-              (zip-slip guarded), so a human can drop either loose files or
-              zips.
-    run       Invoke each script as a subprocess using a per-script command
-              template (from the registry, else ``DEFAULT_CMD_TEMPLATE``),
-              each into its own output subdir, capturing logs, applying a
-              per-script timeout, and recording the exit code.
+              (zip-slip guarded), so NTD workbooks / TIDES exports can be dropped
+              either loose or zipped.
+    run       Invoke each script as a subprocess using its registry command
+              template, each into its own output subdir, capturing logs and
+              applying a per-script timeout. Downstream scripts read an upstream
+              script's output via ``{work}/out/<script_stem>/`` (e.g.
+              ``otp_by_route`` consumes ``otp_monthly_tides``'s panel).
     collect   Gather the ``*.csv`` / ``*.xlsx`` tables each successful script
               produced.
     describe  Resolve each table's join keys + kept columns from the registry
-              when present, else by inference, building a ``list[FeatureTable]``
-              dynamically instead of hardcoding it.
-    combine   Run the existing back half: ``validate_config`` (fail-closed
-              governance), then ``write_bundles`` -> ``write_manifest`` ->
-              ``write_run_log``.
+              when present, else by inference, building a ``list[FeatureTable]``.
+    combine   Validate (hygiene only -- no denylist), then ``write_bundles`` ->
+              ``write_manifest`` -> ``write_run_log``.
 
 Design notes:
-    - One bundle per join-key signature. Tables that share a join key (e.g. all
-      the ``route_id`` coverage tables) are outer-merged into a single bundle; a
-      differently keyed table (e.g. ``period``-keyed exogenous series) goes to
-      its own bundle. Part B then joins each bundle only if the anchor carries
-      its keys, which is what makes ``period`` optional downstream.
-    - Run-what-you-can, fail-closed only on leakage. A script that exits
-      non-zero or times out is logged and skipped; the run continues. The only
-      hard failures are (a) a shipped column matching ``FORBIDDEN_COLUMN_PATTERNS``
-      (caught by ``validate_config`` *before* any bundle is written) and (b) zero
-      usable bundles.
-    - CSV only. Bundles cross to a stock ``arcgispro-py3`` env that has no
-      ``pyarrow``, so Parquet is deliberately avoided.
-    - This script must never read, require, or reference the NTD anchor; that is
-      ``monthly_ridership_model.py``'s job on the secured box.
+    - One bundle per join-key signature, exactly like the public half. The
+      route-level rollups (NTD cross-section anchor + OTP + runtime) merge into a
+      single ``route_id`` bundle -- the "one route-level table" the OLS and ML
+      models consume -- while any route x month panel collected (e.g. the runtime
+      monthly panel) becomes its own bundle for the future monthly-change model.
+    - Governance is inverted relative to the public half: there is NO forbidden
+      column denylist and NO anchor guard. The only checks are hygiene (every
+      shipped table must enumerate its keep_cols; a join key may not also be a
+      shipped value; two tables in one key group may not ship the same column),
+      plus an advisory check that the configured dependent variable is present.
+    - CSV only, for parity with the public bundles and the stock
+      ``arcgispro-py3`` env (no ``pyarrow``).
 
 Inputs:
-    - Feature-generation scripts (``*.py``) plus their input data, and an
-      optional ``jobs.json`` registry describing each script's command and the
-      join keys / kept columns of its outputs.
+    - The private feature scripts (NTD anchor builder; OTP and runtime rollups)
+      plus their input data, and a ``jobs.private.json`` registry describing each
+      script's command and its outputs' join keys / kept columns.
 
 Outputs:
     - One CSV bundle per join-key signature in ``OUTPUT_DIR``.
@@ -85,17 +87,19 @@ from typing import Final, NamedTuple, Sequence
 
 import pandas as pd
 
-# Sentinel markers used by extract_config_block / write_run_log to identify
-# the configuration block within this file's source. Each string must appear
-# exactly once in this file as a stand-alone comment line (other than these
-# constant definitions themselves). Edit with care.
+# Sentinel markers used by extract_config_block / write_run_log to identify the
+# configuration block within this file's source. Each string must appear exactly
+# once in this file as a stand-alone comment line (other than these constant
+# definitions themselves). Edit with care.
 CONFIG_BEGIN_MARKER: str = "# === BEGIN CONFIG ==="
 CONFIG_END_MARKER: str = "# === END CONFIG ==="
 
 # Path to this file, used to extract the config block for the run log. ``__file__``
 # is undefined when the code is pasted into a notebook cell, so a configured
 # fallback keeps the run log working there too.
-SELF_PATH: Final[Path] = Path(__file__) if "__file__" in globals() else Path("prep_features.py")
+SELF_PATH: Final[Path] = (
+    Path(__file__) if "__file__" in globals() else Path("prep_features_private.py")
+)
 
 
 # =============================================================================
@@ -104,21 +108,18 @@ SELF_PATH: Final[Path] = Path(__file__) if "__file__" in globals() else Path("pr
 
 
 class FeatureTable(NamedTuple):
-    """A non-NTD predictor source to be bundled for transfer to the secured box.
+    """A private predictor / anchor source to be bundled for the models.
 
-    Built dynamically by the orchestrator (one per collected output table)
-    rather than hardcoded. The combine half consumes ``path`` / ``join_keys`` /
-    ``keep_cols`` / ``sheet``; the ``source_*`` fields carry provenance through
-    to the manifest and run log.
+    Built dynamically by the orchestrator (one per collected output table). The
+    combine half consumes ``path`` / ``join_keys`` / ``keep_cols`` / ``sheet``;
+    the ``source_*`` fields carry provenance through to the manifest and run log.
 
     Attributes:
-        label: Human-readable name used in logs (e.g. ``"headway/headway.csv"``).
+        label: Human-readable name used in logs (e.g. ``"otp_by_route/otp_by_route.csv"``).
         path: Path to the CSV or XLSX file.
         join_keys: Columns the table is keyed on; tables sharing a key signature
             are merged into one bundle.
-        keep_cols: Predictor columns to ship. REQUIRED and non-empty — the
-            boundary is enumerated explicitly, so there is no "keep everything"
-            shortcut on this side.
+        keep_cols: Predictor / dependent columns to ship. REQUIRED and non-empty.
         sheet: Worksheet name for XLSX inputs (ignored for CSV).
         source_script: Filename of the script that produced this table, if known.
         source_exit_code: Exit code of that script's subprocess run.
@@ -168,15 +169,16 @@ class ScriptRun(NamedTuple):
 #  Locations
 # -----------------------------------------------------------------------------
 
-# Folder scanned for feature-generation scripts (``*.py``).
+# Folder scanned (recursively) for the private feature scripts. The private set
+# spans ridership_tools + operations_tools, so this points at the scripts root.
 SCRIPTS_DIR: Path = Path(r"Path\To\Your\scripts")
 
-# Input-data root. Topic subfolders (e.g. ``gtfs``, ``shapefiles``, ``census``)
-# are referenced by each script's command template via the ``{input}`` placeholder.
+# Input-data root. Topic subfolders (e.g. ``ntd``, ``tides``) are referenced by
+# each script's command template via the ``{input}`` placeholder.
 INPUT_DIR: Path = Path(r"Path\To\Your\input")
 
-# Where the bundle CSVs and manifest.json are written for transfer to Part B.
-OUTPUT_DIR: Path = Path(r"Path\To\Your\prepped_features")
+# Where the bundle CSVs and manifest.json are written for the models to ingest.
+OUTPUT_DIR: Path = Path(r"Path\To\Your\private_features")
 
 # Scratch space for per-script output subdirs, staged data, and captured logs.
 WORK_DIR: Path = Path(r"Path\To\Your\work")
@@ -186,9 +188,11 @@ WORK_DIR: Path = Path(r"Path\To\Your\work")
 # only SCRIPTS_DIR + INPUT_DIR.
 INBOX_DIR: Path | None = None
 
-# Optional registry (jobs.json) mapping each script to its command template and
-# each output file to its join keys / kept columns. Leave None to auto-discover
-# scripts and infer keys/columns.
+# Registry (jobs.private.json) mapping each script to its command template and
+# each output file to its join keys / kept columns. Unlike the public half this
+# is effectively required: the private scripts have heterogeneous CLIs and the
+# dependent / supply columns must be enumerated deliberately. Leave None to fall
+# back to auto-discovery + inference.
 REGISTRY_PATH: Path | None = None
 
 # -----------------------------------------------------------------------------
@@ -196,20 +200,19 @@ REGISTRY_PATH: Path | None = None
 # -----------------------------------------------------------------------------
 
 # When True, every ``*.zip`` found under INPUT_DIR (and INBOX_DIR) is extracted
-# before scripts run, so humans can drop loose files OR zips ("both" model).
+# before scripts run, so NTD workbooks / TIDES exports can be dropped loose OR
+# zipped ("both" model).
 EXTRACT_ZIPS: bool = True
 
 # Per-script wall-clock timeout in seconds (overridable per script in the registry).
 PER_SCRIPT_TIMEOUT_SEC: int = 1800
 
 # Candidate join keys, in priority order, used by inference when a collected
-# output is not described in the registry.
-CANDIDATE_JOIN_KEYS: tuple[str, ...] = ("route_id", "period")
+# output is not described in the registry. Covers the route, panel, and stop
+# grains the model family spans.
+CANDIDATE_JOIN_KEYS: tuple[str, ...] = ("route_id", "period", "month", "stop_id")
 
 # Command template used for any script lacking an explicit registry ``cmd``.
-# Tokens are substituted with {python}, {script}, {input}, {output}, {work},
-# {scripts}. Provided as a token list so paths with spaces/backslashes are not
-# re-parsed by a shell.
 DEFAULT_CMD_TEMPLATE: tuple[str, ...] = (
     "{python}",
     "{script}",
@@ -219,9 +222,11 @@ DEFAULT_CMD_TEMPLATE: tuple[str, ...] = (
     "{output}",
 )
 
-# Scripts never run when auto-discovering (no registry). The orchestrator and
-# the secured-box model are always excluded; the latter must never run here.
+# Scripts never run when auto-discovering (no registry). Both orchestrators and
+# the secured-box models are always excluded.
 EXCLUDE_SCRIPT_NAMES: tuple[str, ...] = (
+    "prep_features_private.py",
+    "prep_features_public.py",
     "prep_features.py",
     "monthly_ridership_model.py",
     "route_performance_model.py",
@@ -231,33 +236,14 @@ EXCLUDE_SCRIPT_NAMES: tuple[str, ...] = (
 EXCLUDE_SCRIPT_GLOBS: tuple[str, ...] = ("test_*", "conftest*", "_*")
 
 # -----------------------------------------------------------------------------
-#  Governance guards (fail closed)
+#  Governance (hygiene only -- no denylist on this side)
 # -----------------------------------------------------------------------------
 
-# Optional path to the NTD anchor. If set, the run aborts should any described
-# feature table resolve to it — a defense against accidentally bundling the
-# proprietary anchor on the unsecured box. Leave None if the anchor path is not
-# known here (the forbidden-pattern denylist below is the always-on check).
-ANCHOR_PATH_GUARD: Path | None = None
-
-# Case-insensitive regex patterns matched against every shipped (non-key)
-# column name. Any match aborts the run BEFORE any bundle is written. These
-# target NTD-sourced quantities (boardings, unlinked passenger trips, revenue
-# hours/miles) that must never cross the boundary in a feature bundle — they
-# belong only in the anchor.
-FORBIDDEN_COLUMN_PATTERNS: tuple[str, ...] = (
-    r"boarding",
-    r"ridership",
-    r"\bntd\b",
-    r"\bupt\b",
-    r"unlinked",
-    r"passenger_trip",
-    r"revenue_mile",
-    r"revenue_hour",
-    r"scheduled_hour",
-    r"\bvrm\b",
-    r"\bvrh\b",
-)
+# The dependent variable expected to appear in (at least) one shipped table on
+# the secured box. This is NOT fail-closed: a private run with no DV (a
+# features-only refresh) is allowed, but the absence is logged so a misconfigured
+# run is easy to spot. Set "" to disable the advisory check entirely.
+EXPECTED_DV_COLUMN: str = "ntd_boardings"
 
 # -----------------------------------------------------------------------------
 #  Output behaviour
@@ -272,7 +258,7 @@ REQUIRE_RUN_LOG: bool = True
 # === END CONFIG ===
 
 # =============================================================================
-# SHARED HELPERS (copied into monthly_ridership_model.py — keep both copies in sync)
+# SHARED HELPERS (self-contained copy; mirrors prep_features_public.py)
 # =============================================================================
 
 
@@ -302,14 +288,10 @@ def load_table(path: Path, sheet: str | int = 0) -> pd.DataFrame:
 
 
 def _canonical_key(series: pd.Series) -> pd.Series:
-    """Normalize a join-key column so the anchor and a bundle match reliably.
+    """Normalize a join-key column so two independently produced tables match.
 
-    The anchor and bundle are produced on different machines from different
-    files, so a key can arrive as ``101`` on one side and ``"101"`` (or
-    ``"101.0"`` from a float round-trip) on the other. This collapses every
-    key to a trimmed string and strips a single trailing ``.0`` so an integer
-    that survived a float cast still matches its string form. The same helper
-    is copied into monthly_ridership_model.py and MUST stay byte-identical between the two.
+    Collapses every key to a trimmed string and strips a single trailing ``.0``
+    so an integer that survived a float cast still matches its string form.
     """
     out = series.astype("string").str.strip()
     out = out.str.replace(r"\.0$", "", regex=True)
@@ -326,65 +308,56 @@ def _sha256_file(path: Path) -> str:
 
 
 # =============================================================================
-# VALIDATION
+# VALIDATION (hygiene only)
 # =============================================================================
 
 
 def validate_config(
     tables: list[FeatureTable],
     *,
-    forbidden_patterns: Sequence[str] = FORBIDDEN_COLUMN_PATTERNS,
-    anchor_guard: Path | None = ANCHOR_PATH_GUARD,
+    expected_dv: str = EXPECTED_DV_COLUMN,
 ) -> None:
-    """Run the fail-closed governance checks before any bundle is written.
+    """Run hygiene checks before any bundle is written.
 
-    This is the single fail-closed point (brief §6). It is intentionally run on
-    the inferred keep_cols too, so a script that emits an NTD-like column aborts
-    the run rather than having that column silently dropped.
+    Unlike the public half this performs NO leakage denylist and NO anchor
+    guard: the proprietary data legitimately lives here. The checks are purely
+    structural, plus an advisory (non-fatal) check that the dependent variable is
+    present somewhere so a misconfigured private run is easy to notice.
 
     Args:
         tables: The dynamically built feature tables to ship.
-        forbidden_patterns: Case-insensitive regexes; any match in a shipped
-            column name aborts the run.
-        anchor_guard: If set, any table resolving to this path aborts the run.
+        expected_dv: Dependent-variable column expected somewhere; "" disables
+            the advisory check.
 
     Raises:
-        ValueError: If a table declares no keep_cols, a shipped column matches a
-            forbidden pattern, or a table resolves to the guarded anchor path.
+        ValueError: If a table declares no keep_cols or lists a join key in its
+            keep_cols.
     """
-    forbidden = [re.compile(p, re.IGNORECASE) for p in forbidden_patterns]
-    guard = anchor_guard.resolve() if anchor_guard is not None else None
-
     problems: list[str] = []
     for ft in tables:
         if not ft.keep_cols:
             problems.append(
                 f"'{ft.label}' declares no keep_cols (the boundary must be enumerated)."
             )
-
-        if guard is not None:
-            try:
-                if ft.path.resolve() == guard:
-                    problems.append(f"'{ft.label}' resolves to the guarded NTD anchor path.")
-            except OSError:
-                pass  # resolve() can fail on non-existent paths; the loader reports those later.
-
         overlap = set(ft.keep_cols) & set(ft.join_keys)
         if overlap:
             problems.append(f"'{ft.label}' lists join key(s) {sorted(overlap)} in keep_cols.")
 
-        for col in ft.keep_cols:
-            for pat in forbidden:
-                if pat.search(col):
-                    problems.append(
-                        f"'{ft.label}' ships column '{col}', which matches forbidden "
-                        f"pattern /{pat.pattern}/ (looks NTD-derived)."
-                    )
-
     if problems:
-        raise ValueError(
-            "Configuration failed governance checks (fail closed):\n  - " + "\n  - ".join(problems)
-        )
+        raise ValueError("Configuration failed hygiene checks:\n  - " + "\n  - ".join(problems))
+
+    if expected_dv:
+        carriers = [ft.label for ft in tables if expected_dv in ft.keep_cols]
+        if not carriers:
+            logging.warning(
+                "Dependent variable '%s' is not shipped by any table. This is allowed "
+                "(features-only refresh), but a model run will need the DV from elsewhere.",
+                expected_dv,
+            )
+        else:
+            logging.info(
+                "Dependent variable '%s' present in: %s.", expected_dv, ", ".join(carriers)
+            )
 
 
 # =============================================================================
@@ -393,7 +366,7 @@ def validate_config(
 
 
 def load_registry(path: Path | None) -> tuple["OrderedDict[str, dict]", dict[str, dict]]:
-    """Parse the optional jobs.json registry.
+    """Parse the optional jobs.private.json registry.
 
     Returns:
         ``(scripts, outputs)`` where ``scripts`` maps a script filename to
@@ -464,11 +437,6 @@ def _safe_extract_zip(zip_path: Path, dest_dir: Path) -> None:
 def extract_zips(input_dir: Path, inbox_dir: Path | None) -> list[Path]:
     """Extract archives so loose files and zips both end up under the input root.
 
-    Every ``*.zip`` under ``input_dir`` is extracted into a sibling folder named
-    after the archive stem; any ``*.zip`` in ``inbox_dir`` is extracted into
-    ``input_dir/<stem>``. Targets that already exist and are non-empty are left
-    alone, so the step is safe to re-run and a human may pre-extract.
-
     Returns:
         The list of destination directories that were written.
     """
@@ -501,9 +469,10 @@ def discover_scripts(
 ) -> list[tuple[str, Path, list[str] | str | None]]:
     """Resolve the ordered set of scripts to run.
 
-    When the registry lists scripts it is an allowlist: only those are run, in
-    registry order, each with its registry ``cmd``. Otherwise every ``*.py`` in
-    ``scripts_dir`` (and ``inbox_dir``) is run except excluded names/globs.
+    ``scripts_dir`` is searched RECURSIVELY (unlike the public half), because the
+    private feature scripts live in different topic folders (``ridership_tools``,
+    ``operations_tools``). When the registry lists scripts it is an allowlist:
+    only those are run, in registry order, each with its registry ``cmd``.
 
     Returns:
         A list of ``(name, path, cmd)`` where ``cmd`` is the registry command
@@ -514,7 +483,7 @@ def discover_scripts(
     for directory in search_dirs:
         if not directory.exists():
             continue
-        for py in sorted(directory.glob("*.py")):
+        for py in sorted(directory.rglob("*.py")):
             found.setdefault(py.name, py)
 
     if registry_scripts:
@@ -620,14 +589,20 @@ def describe_output(
     Resolution is registry-first: a per-script output spec wins, then a global
     output spec, then inference. Inference picks join keys from
     ``candidate_join_keys`` and ships every other numeric/boolean column.
-    Forbidden columns are NOT filtered here — ``validate_config`` is the single
-    fail-closed gate, so leakage aborts the run rather than being hidden.
 
     Returns:
         A FeatureTable, or None when the table cannot be joined / has nothing to
         contribute (skipped with a warning).
     """
     spec = script_outputs.get(file.name) or global_outputs.get(file.name)
+    # Convention: a registry spec with empty keep_cols deliberately drops an
+    # intermediate from bundling (e.g. otp_monthly_tides' panel, which
+    # otp_by_route consumes but which must not become a bundle of its own).
+    if spec is not None and not spec["keep_cols"]:
+        logging.info(
+            "Output '%s' is registry-marked ignore (empty keep_cols) — skipping.", file.name
+        )
+        return None
     sheet = spec["sheet"] if spec else 0
     try:
         df = load_table(file, sheet)
@@ -804,7 +779,7 @@ def write_bundles(tables: list[FeatureTable], output_dir: Path) -> list[BundleRe
 
 
 def write_manifest(output_dir: Path, bundles: list[BundleResult]) -> Path:
-    """Write manifest.json describing every bundle for Part B to verify."""
+    """Write manifest.json describing every bundle for the models to verify."""
     manifest = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "source_script": str(SELF_PATH.resolve() if SELF_PATH.exists() else SELF_PATH),
@@ -828,7 +803,7 @@ def write_manifest(output_dir: Path, bundles: list[BundleResult]) -> Path:
 
 
 # =============================================================================
-# RUN-LOG HELPERS (copied into monthly_ridership_model.py — keep both copies in sync)
+# RUN-LOG HELPERS (self-contained copy; mirrors prep_features_public.py)
 # =============================================================================
 
 
@@ -867,7 +842,7 @@ def write_run_log(
     source_path: Path = SELF_PATH,
 ) -> bool:
     """Write a run log of the configuration block plus the script + bundle summary."""
-    log_path = output_dir / "prep_features_runlog.txt"
+    log_path = output_dir / "prep_features_private_runlog.txt"
 
     try:
         config_text: str = extract_config_block(source_path)
@@ -895,7 +870,7 @@ def write_run_log(
 
     lines: list[str] = [
         "=" * 72,
-        "FEATURE PREP RUN LOG (PART A — unsecured box, orchestrator)",
+        "FEATURE PREP RUN LOG (PRIVATE — secured box, orchestrator)",
         "=" * 72,
         f"Run timestamp:    {datetime.now().isoformat(timespec='seconds')}",
         f"Output directory: {output_dir}",
@@ -944,8 +919,7 @@ def orchestrate(
     per_script_timeout_sec: int = PER_SCRIPT_TIMEOUT_SEC,
     extract_zips_flag: bool = EXTRACT_ZIPS,
     default_cmd_template: Sequence[str] = DEFAULT_CMD_TEMPLATE,
-    forbidden_patterns: Sequence[str] = FORBIDDEN_COLUMN_PATTERNS,
-    anchor_guard: Path | None = ANCHOR_PATH_GUARD,
+    expected_dv: str = EXPECTED_DV_COLUMN,
     exclude_names: Sequence[str] = EXCLUDE_SCRIPT_NAMES,
     exclude_globs: Sequence[str] = EXCLUDE_SCRIPT_GLOBS,
     require_run_log: bool = REQUIRE_RUN_LOG,
@@ -957,8 +931,8 @@ def orchestrate(
         The written bundles.
 
     Raises:
-        ValueError: On a governance failure (leakage / guarded anchor / bad
-            keep_cols) — raised BEFORE any bundle is written.
+        ValueError: On a hygiene failure (bad keep_cols) — raised BEFORE any
+            bundle is written.
         RuntimeError: If no usable bundles result.
     """
     registry_scripts, global_outputs = load_registry(registry_path)
@@ -1022,8 +996,7 @@ def orchestrate(
             if exit_code == 2:
                 hint = (
                     " — exit 2 is an argument error: the command flags do not match this script's "
-                    "CLI. Point REGISTRY_PATH (or --registry) at a jobs.json giving this script's "
-                    "real cmd, or it falls back to DEFAULT_CMD_TEMPLATE (--input-dir/--output-dir)."
+                    "CLI. Fix this script's cmd in the jobs.private.json registry."
                 )
             logging.warning(
                 "Script '%s' %s — skipping its outputs (continuing).%s\nLast log lines (%s):\n%s",
@@ -1062,9 +1035,9 @@ def orchestrate(
                 )
 
     # --- COMBINE ---------------------------------------------------------
-    # Fail-closed governance runs BEFORE any bundle is written (brief §6).
-    validate_config(tables, forbidden_patterns=forbidden_patterns, anchor_guard=anchor_guard)
-    logging.info("Governance checks passed: %d feature table(s) cleared.", len(tables))
+    # Hygiene checks run BEFORE any bundle is written (no denylist on this side).
+    validate_config(tables, expected_dv=expected_dv)
+    logging.info("Hygiene checks passed: %d feature table(s) cleared.", len(tables))
 
     output_dir.mkdir(parents=True, exist_ok=True)
     bundles = write_bundles(tables, output_dir)
@@ -1072,9 +1045,8 @@ def orchestrate(
         raise RuntimeError(
             "No usable bundles were produced. Every feature script failed or emitted no "
             f"joinable table. See the per-script logs in {work_dir / 'logs'} for the exact "
-            "errors. If scripts exited with code 2, their command flags do not match — point "
-            "REGISTRY_PATH (or --registry) at a jobs.json describing each script's real cmd "
-            "and input subfolders."
+            "errors. If scripts exited with code 2, their command flags do not match — fix "
+            "their cmd entries in the jobs.private.json registry."
         )
 
     write_manifest(output_dir, bundles)
@@ -1085,7 +1057,7 @@ def orchestrate(
         )
 
     logging.info(
-        "All processing complete. %d bundle(s) ready for transfer to the secured box.",
+        "All processing complete. %d bundle(s) ready for the models.",
         len(bundles),
     )
     return bundles
@@ -1109,9 +1081,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """
     parser = argparse.ArgumentParser(
         description=(
-            "Drop-folder feature-prep orchestrator (Part A). Runs feature scripts, "
-            "collects their tables, and writes bundles + manifest for monthly_ridership_model.py. "
-            "Defaults come from the CONFIGURATION block at the top of this file."
+            "Secured-box feature-prep orchestrator (PRIVATE). Runs the NTD / OTP / runtime "
+            "feature scripts, collects their tables, and writes bundles + manifest for the "
+            "ridership models. Defaults come from the CONFIGURATION block at the top of this file."
         )
     )
     parser.add_argument("--scripts-dir", default=str(SCRIPTS_DIR), help="Folder of *.py scripts.")
@@ -1128,7 +1100,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--registry",
         default=str(REGISTRY_PATH) if REGISTRY_PATH is not None else None,
-        help="Optional jobs.json registry path.",
+        help="Optional jobs.private.json registry path.",
     )
     parser.add_argument(
         "--timeout", type=int, default=PER_SCRIPT_TIMEOUT_SEC, help="Per-script timeout (seconds)."
@@ -1177,8 +1149,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             extract_zips_flag=args.extract_zips,
             source_path=_source_path(),
         )
-    except ValueError as exc:  # governance failure (fail closed)
-        logging.error("Governance check failed (fail closed): %s", exc)
+    except ValueError as exc:  # hygiene failure
+        logging.error("Hygiene check failed: %s", exc)
         sys.exit(1)
     except RuntimeError as exc:
         logging.error("%s", exc)

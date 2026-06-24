@@ -184,7 +184,7 @@ def load_trips(input_path: Path) -> pd.DataFrame:
     else:
         # rglob (not glob) so a directory whose monthly extracts each sit in
         # their own subfolder still resolves -- this is exactly the layout the
-        # prep_features.py orchestrator produces when it unzips each
+        # prep_features_public.py orchestrator produces when it unzips each
         # ``YYYYMM-capitalbikeshare-tripdata.zip`` into a sibling folder.
         for path in sorted(input_path.rglob(TRIP_FILE_GLOB)):
             frames.append(_read_one(path.read_bytes(), path.name))

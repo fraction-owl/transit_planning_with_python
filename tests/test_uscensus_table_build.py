@@ -149,7 +149,7 @@ def test_discover_census_files_drops_in_place_zip_extraction(tmp_path: Path) -> 
     content = "GEO_ID,val\n1400000US11001000100,5\n"
     zip_path = tmp_path / "ACSST5Y2024.S0801_20260613T122436.zip"
     _write_zip_csv(zip_path, "ACSST5Y2024.S0801-Data.csv", content)
-    # Mimic prep_features.extract_zips: unzip into a <stem>/ sibling folder.
+    # Mimic prep_features_public.extract_zips: unzip into a <stem>/ sibling folder.
     extracted = tmp_path / zip_path.stem / "ACSST5Y2024.S0801-Data.csv"
     extracted.parent.mkdir(parents=True)
     extracted.write_text(content, encoding="utf-8")

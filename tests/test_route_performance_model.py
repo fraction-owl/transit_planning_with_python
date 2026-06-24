@@ -147,7 +147,7 @@ def test_end_to_end_export(tmp_path, monkeypatch) -> None:
 
 
 def _write_bundle_manifest(bundle_dir, entries) -> None:
-    """Write a prep_features-style manifest, hashing each bundle from disk.
+    """Write a prep_features_public-style manifest, hashing each bundle from disk.
 
     ``entries`` is a list of ``(filename, join_keys)``; SHA-256 is computed with
     the same helper the model uses so VERIFY_BUNDLE_HASHES passes.

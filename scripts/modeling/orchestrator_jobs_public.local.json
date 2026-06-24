@@ -1,10 +1,10 @@
 {
   "_comment": [
-    "Registry for prep_features.py wired to the route_ols_run_1 extracted layout.",
+    "Registry for prep_features_public.py wired to the route_ols_run_1 extracted layout.",
     "{input} is the input-data root (...\\input\\data); topic subfolders are referenced",
     "directly (gtfs_input/connector_gtfs_2026_04_29, poi_inputs, schools_input,",
     "census_input/tables, census_input/shps, cabi_input). Run with:",
-    "  python prep_features.py --registry <this file> --input-dir ...\\input\\data --output-dir ...\\prepped_features",
+    "  python prep_features_public.py --registry <this file> --input-dir ...\\input\\data --output-dir ...\\prepped_features",
     "Caveats: (1) install scipy/geopandas/shapely first; (2) gbfs scripts omitted (no GBFS",
     "source + multi-stage deps); (3) verify each script's real output filenames + keep_cols",
     "against work\\out\\<script>\\ and adjust the outputs block if they differ."

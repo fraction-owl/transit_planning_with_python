@@ -1476,7 +1476,7 @@ def do_route_by_route_analysis(
                 }
             )
 
-    # Write one combined, route_id-keyed CSV for the bundle. prep_features.py
+    # Write one combined, route_id-keyed CSV for the bundle. prep_features_public.py
     # collects this; monthly_ridership_model.py joins it onto the ridership anchor by route_id.
     if summary_records:
         summary_df = pd.DataFrame(summary_records)
@@ -2143,7 +2143,7 @@ def run(
 
     except Exception:
         # Re-raise after logging: a swallowed error here exits 0 and looks
-        # identical to "legitimately produced nothing" to the prep_features
+        # identical to "legitimately produced nothing" to the prep_features_public
         # orchestrator, which is what hid a missing-demographics-input chain.
         logging.error("Analysis terminated due to an error", exc_info=True)
         raise

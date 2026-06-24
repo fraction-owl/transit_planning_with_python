@@ -1,4 +1,4 @@
-"""Smoke tests for the drop-folder feature-prep orchestrator (prep_features.py).
+"""Smoke tests for the drop-folder feature-prep orchestrator (prep_features_public.py).
 
 Mirrors the validation checklist in the orchestrator brief (§11): synthetic
 feature scripts + (optionally zipped) inputs are run end to end, and the emitted
@@ -16,7 +16,7 @@ import pandas as pd
 import pytest
 
 from scripts.modeling import monthly_ridership_model as mrm
-from scripts.modeling import prep_features as pf
+from scripts.modeling import prep_features_public as pf
 
 
 def _write_script(scripts_dir: Path, name: str, body: str) -> Path:
