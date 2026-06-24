@@ -14,14 +14,19 @@ controlled, so the residual is a productivity-adjusted over/under read rather th
 deliberately NOT regressors: they ride alongside the residual as diagnostic overlays
 so an underperformer can be read as thin-service vs car-oriented-market vs cannibalized.
 
-This is the secured-box fit: the NTD anchor (the dependent variable) is read here and
-never leaves; the non-NTD feature tables (GTFS supply/competition + demographics) are
-prepped elsewhere and joined in.
+This is the secured-box fit (PART B): the NTD anchor (the dependent variable plus the
+service-supplied predictors revenue_hours / revenue_miles) is read here and never
+leaves; the non-NTD feature tables (GTFS competition + demographics) are prepped on the
+unsecured box by prep_features.py (PART A) and transferred in as one governance-checked
+CSV bundle per join-key signature, each verified against a manifest before joining.
 
-Inputs (all keyed on route_id = public route number):
-    ANCHOR_PATH          NTD anchor: route_id + ntd_boardings (the proprietary DV).
-    DEMOGRAPHICS_PATH    route_id + population / employment / enrollment / equity counts.
-    GTFS_FEATURES_PATH   output of gtfs_route_features.py (supply + competition).
+Inputs:
+    ANCHOR_PATH    NTD anchor: route_id + ntd_boardings (the proprietary DV) plus the
+                   service-supplied predictors revenue_hours / revenue_miles.
+    BUNDLE_DIR     Feature bundle CSVs produced by prep_features.py (Part A).
+    MANIFEST_PATH  prep_features manifest (each bundle's join keys + SHA-256). A bundle
+                   is joined only if every one of its join keys is present in the anchor,
+                   so a cross-sectional (route_id) anchor auto-skips a period bundle.
 
 Outputs:
     route_performance_results.xlsx
@@ -35,6 +40,8 @@ scikit-learn, or pyarrow. Runs in a notebook via %run or as a script.
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
+import json
 import logging
 from pathlib import Path
 from typing import Final, NamedTuple, Optional
@@ -53,7 +60,10 @@ CONFIG_END_MARKER: Final[str] = "# === END CONFIG ==="
 # =============================================================================
 # === BEGIN CONFIG ===
 
-# --- Inputs (left-joined on route_id) ---------------------------------------
+# --- Inputs ------------------------------------------------------------------
+# NTD anchor: the proprietary dependent variable (ntd_boardings) plus the
+# service-supplied predictors (revenue_hours / revenue_miles). Read only here on
+# the secured box; nothing NTD-derived ever crosses to the feature-prep side.
 ANCHOR_PATH: Final[Path] = Path(r"Path\To\Your\ntd_route_boardings.csv")  # <<< EDIT ME
 ANCHOR_SHEET: Final[str | int] = 0
 # A long/panel anchor (route x period) is collapsed to one row per route, since
@@ -65,18 +75,19 @@ ANCHOR_AGG: Final[str] = "mean"  # <<< EDIT ME
 # before the collapse so the average reflects operating months only (and the
 # revenue_hours/_miles averages use the same months, keeping PPH consistent).
 ANCHOR_EXCLUDE_ZERO_MONTHS: Final[bool] = True
-DEMOGRAPHICS_PATH: Final[Path] = Path(r"Path\To\Your\input\route_demographics.csv")  # <<< EDIT ME
-DEMOGRAPHICS_SHEET: Final[str | int] = 0
-GTFS_FEATURES_PATH: Final[Path] = Path(
-    r"Path\To\Your\prepped_features\gtfs_route_features.csv"
-)  # <<< EDIT ME
 
-# revenue_hours / revenue_miles are reported by BOTH the NTD anchor and the GTFS
-# extractor. "ntd" keeps boardings and revenue_hours on the same reporting basis
-# (so the residual is the official boardings-per-revenue-hour); "gtfs" uses the
-# schedule-derived snapshot. The unused source's copies are dropped before the join.
-SUPPLY_SOURCE: Final[str] = "ntd"  # "ntd" (anchor) or "gtfs" (extractor)
-SHARED_SUPPLY_COLS: Final[tuple[str, ...]] = ("revenue_hours", "revenue_miles")
+# Feature bundles produced by prep_features.py (PART A) and transferred in.
+# BUNDLE_DIR holds the bundle CSVs; MANIFEST_PATH is the JSON sidecar listing each
+# bundle's join keys, row/column counts, and SHA-256. A bundle is joined onto the
+# anchor only if every one of its join keys is present in the anchor, so a
+# cross-sectional (route_id) anchor silently skips a period-keyed bundle. Supply
+# columns (revenue_hours / revenue_miles) are NTD-side and live on the anchor;
+# prep_features governance forbids them from ever entering a feature bundle.
+BUNDLE_DIR: Final[Path] = Path(r"Path\To\Your\prepped_features")  # <<< EDIT ME
+MANIFEST_PATH: Final[Path] = Path(r"Path\To\Your\prepped_features\manifest.json")  # <<< EDIT ME
+# When True, every bundle's on-disk SHA-256 must match the manifest before it is
+# joined; a mismatch aborts the run (catches truncated/edited transfers).
+VERIFY_BUNDLE_HASHES: Final[bool] = True
 
 OUTPUT_DIR: Final[Path] = Path(r"Path\To\Your\output")  # <<< EDIT ME
 
@@ -92,7 +103,7 @@ COLUMN_ALIASES: Final[dict[str, str]] = {
 
 # --- Core regressors (predict potential) ------------------------------------
 PREDICTORS: Final[tuple[str, ...]] = (
-    "revenue_hours",  # supply quantity / productivity offset  [GTFS]
+    "revenue_hours",  # supply quantity / productivity offset  [anchor/NTD]
     "total_pop",  # population scale                       [demographics]
     "tot_empl",  # employment                            [demographics]
     "enrollment_9_12_served",  # high-school enrollment reached        [demographics]
@@ -208,95 +219,195 @@ def load_table(path: Path, sheet: str | int = 0) -> pd.DataFrame:
     raise ValueError(f"Unsupported file type '{suffix}' for {path}.")
 
 
-def assemble_model_table() -> pd.DataFrame:
-    """Left-join demographics and GTFS features onto the NTD anchor on route_id."""
-    anchor = load_table(ANCHOR_PATH, ANCHOR_SHEET)
-    demo = load_table(DEMOGRAPHICS_PATH, DEMOGRAPHICS_SHEET)
-    gtfs = load_table(GTFS_FEATURES_PATH)
-    logging.info(
-        "Loaded anchor (%d), demographics (%d), gtfs features (%d).",
-        len(anchor),
-        len(demo),
-        len(gtfs),
+class BundleSpec(NamedTuple):
+    """A prepped feature bundle described by the prep_features (Part A) manifest.
+
+    Attributes:
+        filename: Bundle CSV filename (resolved against ``BUNDLE_DIR``).
+        join_keys: Columns the bundle is keyed on (joined onto the anchor).
+        sha256: Expected SHA-256 of the bundle file (verified before joining).
+        n_rows: Row count recorded by Part A (logged for cross-check).
+    """
+
+    filename: str
+    join_keys: tuple[str, ...]
+    sha256: str
+    n_rows: int
+
+
+def _sha256_file(path: Path) -> str:
+    """Return the hex SHA-256 of a file, read in chunks."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def load_manifest(manifest_path: Path) -> list[BundleSpec]:
+    """Parse the prep_features manifest into an ordered list of bundle specs.
+
+    Raises:
+        FileNotFoundError: If ``manifest_path`` does not exist.
+        ValueError: If the manifest is malformed or lists no bundles.
+    """
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Bundle manifest not found: {manifest_path}")
+
+    data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    raw_bundles = data.get("bundles", [])
+    if not raw_bundles:
+        raise ValueError(f"Manifest '{manifest_path}' lists no bundles.")
+
+    specs: list[BundleSpec] = []
+    for entry in raw_bundles:
+        try:
+            specs.append(
+                BundleSpec(
+                    filename=str(entry["filename"]),
+                    join_keys=tuple(entry["join_keys"]),
+                    sha256=str(entry["sha256"]),
+                    n_rows=int(entry["n_rows"]),
+                )
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"Malformed bundle entry in '{manifest_path}': {entry}") from exc
+    return specs
+
+
+def _collapse_panel_anchor(anchor: pd.DataFrame) -> pd.DataFrame:
+    """Collapse a long/panel anchor (route x period) to one row per route.
+
+    Engine 1 is cross-sectional. Every numeric anchor column is aggregated with
+    ANCHOR_AGG, so a panel ntd_boardings becomes (by default) a typical-period
+    figure and the NTD service columns (revenue_hours/_miles) survive the collapse
+    on the same basis. A non-duplicated (already cross-sectional) anchor is
+    returned unchanged.
+    """
+    if not anchor[ROUTE_KEY].duplicated().any():
+        return anchor
+
+    rows_per = len(anchor) / anchor[ROUTE_KEY].nunique()
+    if DEPENDENT_VAR in anchor.columns:
+        anchor[DEPENDENT_VAR] = pd.to_numeric(anchor[DEPENDENT_VAR], errors="coerce")
+
+    if ANCHOR_EXCLUDE_ZERO_MONTHS and DEPENDENT_VAR in anchor.columns:
+        routes_before = anchor[ROUTE_KEY].nunique()
+        zero_rows = int((anchor[DEPENDENT_VAR] == 0).sum())
+        anchor = anchor[anchor[DEPENDENT_VAR] != 0]
+        dropped_routes = routes_before - anchor[ROUTE_KEY].nunique()
+        logging.info(
+            "Excluded %d zero-boarding month(s) as non-operating%s.",
+            zero_rows,
+            f"; {dropped_routes} route(s) had no operating months and were dropped"
+            if dropped_routes
+            else "",
+        )
+
+    num_cols = list(anchor.select_dtypes(include="number").columns)
+    logging.warning(
+        "Anchor is long-format (~%.1f rows/route); collapsing %d numeric column(s) "
+        "to one row per route with ANCHOR_AGG='%s'.",
+        rows_per,
+        len(num_cols),
+        ANCHOR_AGG,
     )
+    anchor = anchor.groupby(ROUTE_KEY, as_index=False)[num_cols].agg(ANCHOR_AGG)
+    logging.info("Anchor collapsed to %d routes.", len(anchor))
+    return anchor
 
-    anchor = anchor.rename(columns=COLUMN_ALIASES)
-    demo = demo.rename(columns=COLUMN_ALIASES)
-    gtfs = gtfs.rename(columns=COLUMN_ALIASES)
 
-    for frame in (anchor, demo, gtfs):
-        if ROUTE_KEY not in frame.columns:
-            raise KeyError(f"Input is missing the join key '{ROUTE_KEY}'.")
-        frame[ROUTE_KEY] = _canonical_key(frame[ROUTE_KEY])
+def assemble_model_table() -> tuple[pd.DataFrame, list[tuple[str, str]]]:
+    """Load the NTD anchor and left-join every prepped feature bundle onto it.
 
-    for label, frame in (("anchor", anchor), ("demographics", demo), ("gtfs", gtfs)):
-        logging.info("%s columns: %s", label, list(frame.columns))
+    The anchor holds the dependent variable plus the service-supplied predictors
+    (revenue_hours / revenue_miles); a long/panel anchor is first collapsed to one
+    row per route. Each bundle named in the manifest is then verified (SHA-256) and
+    joined only if every one of its join keys is present in the anchor, so a
+    route_id-only anchor silently skips a period bundle. Bundles are deduplicated
+    on their keys so they can never fan out the anchor.
 
-    # Engine 1 is cross-sectional: collapse a long/panel anchor to one row per route.
-    # Every numeric anchor column is aggregated with ANCHOR_AGG, so a panel
-    # ntd_boardings becomes (by default) a typical-period figure and any NTD service
-    # columns survive the collapse.
-    if anchor[ROUTE_KEY].duplicated().any():
-        rows_per = len(anchor) / anchor[ROUTE_KEY].nunique()
-        if DEPENDENT_VAR in anchor.columns:
-            anchor[DEPENDENT_VAR] = pd.to_numeric(anchor[DEPENDENT_VAR], errors="coerce")
+    Returns:
+        ``(merged, provenance)`` where ``merged`` is the assembled route table and
+        ``provenance`` is the ``(filename, sha256)`` of every bundle actually
+        joined, recorded in the run log.
 
-        if ANCHOR_EXCLUDE_ZERO_MONTHS and DEPENDENT_VAR in anchor.columns:
-            routes_before = anchor[ROUTE_KEY].nunique()
-            zero_rows = int((anchor[DEPENDENT_VAR] == 0).sum())
-            anchor = anchor[anchor[DEPENDENT_VAR] != 0]
-            dropped_routes = routes_before - anchor[ROUTE_KEY].nunique()
-            logging.info(
-                "Excluded %d zero-boarding month(s) as non-operating%s.",
-                zero_rows,
-                f"; {dropped_routes} route(s) had no operating months and were dropped"
-                if dropped_routes
-                else "",
+    Raises:
+        KeyError: If the anchor or a joined bundle lacks the join key(s).
+        FileNotFoundError: If a manifest-listed bundle is missing.
+        ValueError: If VERIFY_BUNDLE_HASHES is True and a bundle's hash mismatches.
+    """
+    anchor = load_table(ANCHOR_PATH, ANCHOR_SHEET).rename(columns=COLUMN_ALIASES)
+    if ROUTE_KEY not in anchor.columns:
+        raise KeyError(f"Anchor is missing the join key '{ROUTE_KEY}'.")
+    anchor[ROUTE_KEY] = _canonical_key(anchor[ROUTE_KEY])
+    logging.info("Anchor '%s' loaded: %d rows, %d cols.", ANCHOR_PATH.name, *anchor.shape)
+
+    merged = _collapse_panel_anchor(anchor)
+
+    specs = load_manifest(MANIFEST_PATH)
+    provenance: list[tuple[str, str]] = []
+    for spec in specs:
+        bundle_path = BUNDLE_DIR / spec.filename
+        if not bundle_path.exists():
+            raise FileNotFoundError(
+                f"Manifest lists '{spec.filename}' but it is not in {BUNDLE_DIR}."
             )
 
-        num_cols = list(anchor.select_dtypes(include="number").columns)
+        actual_hash = _sha256_file(bundle_path)
+        if VERIFY_BUNDLE_HASHES and actual_hash != spec.sha256:
+            raise ValueError(
+                f"SHA-256 mismatch for bundle '{spec.filename}' (expected {spec.sha256[:12]}…, "
+                f"got {actual_hash[:12]}…). Re-transfer the bundle or set "
+                "VERIFY_BUNDLE_HASHES = False to override."
+            )
+
+        keys = list(spec.join_keys)
+        missing_anchor = [k for k in keys if k not in merged.columns]
+        if missing_anchor:
+            logging.warning(
+                "Skipping bundle '%s': anchor lacks its join key(s) %s "
+                "(expected for a cross-sectional anchor and a 'period' bundle).",
+                spec.filename,
+                missing_anchor,
+            )
+            continue
+
+        df = load_table(bundle_path).rename(columns=COLUMN_ALIASES)
+        missing_bundle = [k for k in keys if k not in df.columns]
+        if missing_bundle:
+            raise KeyError(
+                f"Bundle '{spec.filename}' is missing its own join key(s): {missing_bundle}."
+            )
+
+        # Canonicalize join keys on both sides so a string/int/float mismatch across
+        # the machine boundary cannot silently produce zero matches.
+        for key in keys:
+            df[key] = _canonical_key(df[key])
+
+        value_cols = [c for c in df.columns if c not in keys]
+        subset = df[keys + value_cols].drop_duplicates(subset=keys)
+
+        before = len(merged)
+        merged = merged.merge(subset, on=keys, how="left")
+        matched = int(merged[value_cols[0]].notna().sum()) if value_cols else before
+        logging.info(
+            "Joined bundle '%s' on %s: %d/%d routes matched (%d feature col(s)).",
+            spec.filename,
+            keys,
+            matched,
+            before,
+            len(value_cols),
+        )
+        provenance.append((spec.filename, actual_hash))
+
+    if not provenance:
         logging.warning(
-            "Anchor is long-format (~%.1f rows/route); collapsing %d numeric column(s) "
-            "to one row per route with ANCHOR_AGG='%s'.",
-            rows_per,
-            len(num_cols),
-            ANCHOR_AGG,
+            "No bundles were joined onto the anchor. Check that the manifest join keys "
+            "match the anchor grain."
         )
-        anchor = anchor.groupby(ROUTE_KEY, as_index=False)[num_cols].agg(ANCHOR_AGG)
-        logging.info("Anchor collapsed to %d routes.", len(anchor))
-
-    # Feature tables are deduped (keep first) so they can't fan out the anchor.
-    for label, frame in (("demographics", demo), ("gtfs features", gtfs)):
-        dups = int(frame[ROUTE_KEY].duplicated().sum())
-        if dups:
-            logging.warning("%s has %d duplicate route_id(s); keeping first of each.", label, dups)
-    demo = demo.drop_duplicates(subset=ROUTE_KEY)
-    gtfs = gtfs.drop_duplicates(subset=ROUTE_KEY)
-
-    # Resolve columns reported by more than one source so the join can't produce
-    # _x/_y suffixes. revenue_hours/_miles come from NTD or GTFS per SUPPLY_SOURCE;
-    # other GTFS metrics win over any stale demographics copy; NTD wins shared supply.
-    if SUPPLY_SOURCE == "ntd":
-        gtfs = gtfs.drop(
-            columns=[c for c in SHARED_SUPPLY_COLS if c in gtfs.columns], errors="ignore"
-        )
-    elif SUPPLY_SOURCE == "gtfs":
-        anchor = anchor.drop(
-            columns=[c for c in SHARED_SUPPLY_COLS if c in anchor.columns], errors="ignore"
-        )
-    else:
-        raise ValueError(f"SUPPLY_SOURCE must be 'ntd' or 'gtfs', got '{SUPPLY_SOURCE}'.")
-    logging.info("Supply columns (revenue_hours/_miles) sourced from %s.", SUPPLY_SOURCE.upper())
-
-    demo = demo.drop(
-        columns=[
-            c for c in demo.columns if c != ROUTE_KEY and (c in gtfs.columns or c in anchor.columns)
-        ],
-        errors="ignore",
-    )
-    merged = anchor.merge(demo, on=ROUTE_KEY, how="left").merge(gtfs, on=ROUTE_KEY, how="left")
     logging.info("Assembled table: %d routes x %d columns.", *merged.shape)
-    return merged
+    return merged, provenance
 
 
 def derive_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -676,20 +787,28 @@ def _extract_config_block() -> str:
     return "\n".join(lines[begin + 1 : end])
 
 
-def write_run_log(result: OLSResult) -> None:
-    """Write the run-log sidecar (timestamp, fit headline, verbatim config block)."""
+def write_run_log(result: OLSResult, provenance: list[tuple[str, str]]) -> None:
+    """Write the run-log sidecar (timestamp, fit headline, bundle provenance, config)."""
     log_path = OUTPUT_DIR / "route_performance_model_runlog.txt"
+    bundle_lines = (
+        [f"  {name}  sha256={sha}" for name, sha in provenance] if provenance else ["  (none)"]
+    )
     lines = [
         "=" * 72,
         "CROSS-SECTIONAL ROUTE RIDERSHIP MODEL RUN LOG (ENGINE 1, secured box)",
         "=" * 72,
         f"Run timestamp:    {dt.datetime.now().isoformat(timespec='seconds')}",
         f"Anchor:           {ANCHOR_PATH}",
-        f"Demographics:     {DEMOGRAPHICS_PATH}",
-        f"GTFS features:    {GTFS_FEATURES_PATH}",
+        f"Bundle dir:       {BUNDLE_DIR}",
+        f"Manifest:         {MANIFEST_PATH}",
         f"Routes modeled:   {result.n_obs}",
         f"R2 / adjR2 / LOO: {result.r_squared:.4f} / {result.adj_r_squared:.4f} / "
         f"{result.loo_r_squared:.4f}",
+        "",
+        "-" * 72,
+        "FEATURE BUNDLES JOINED (verified provenance)",
+        "-" * 72,
+        *bundle_lines,
         "",
         "-" * 72,
         "CONFIGURATION (verbatim from source)",
@@ -734,15 +853,14 @@ def run() -> Optional[OLSResult]:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
     if any(
-        "Path\\To\\Your" in str(p)
-        for p in (ANCHOR_PATH, DEMOGRAPHICS_PATH, GTFS_FEATURES_PATH, OUTPUT_DIR)
+        "Path\\To\\Your" in str(p) for p in (ANCHOR_PATH, BUNDLE_DIR, MANIFEST_PATH, OUTPUT_DIR)
     ):
         logging.warning("Set the input/output paths (marked '# <<< EDIT ME') before running.")
         return None
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    table = assemble_model_table()
+    table, provenance = assemble_model_table()
     table = derive_features(table)
     if DEPENDENT_VAR not in table.columns:
         raise KeyError(f"Dependent variable '{DEPENDENT_VAR}' not in the assembled table.")
@@ -754,7 +872,7 @@ def run() -> Optional[OLSResult]:
     export_results(result, model_frame)
     if MAKE_PLOTS:
         make_diagnostic_plots(result)
-    write_run_log(result)
+    write_run_log(result, provenance)
 
     logging.info("Done.")
     return result
