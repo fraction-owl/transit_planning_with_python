@@ -470,7 +470,7 @@ def _load_elsi_wide(path: Path, school_type: SchoolType) -> pd.DataFrame:
 def _find_ipeds_file(input_dir: Path) -> Path | None:
     """Return the IPEDS EFFY enrollment file (csv preferred over xlsx), or None.
 
-    Searches recursively so an EFFY zip that the caller (or the prep_features
+    Searches recursively so an EFFY zip that the caller (or the prep_features_public
     orchestrator) unpacked into its own subfolder still resolves.
     """
     for pattern in IPEDS_GLOBS:
@@ -530,7 +530,7 @@ def _find_elsi_csv(input_dir: Path, school_type: SchoolType) -> Path | None:
     """
     marker = f"This is a {school_type.elsi_kind} based table"
     # rglob, not glob: a downloaded ELSI export is often a zip the caller (or the
-    # prep_features orchestrator) unpacks into its own subfolder, leaving the CSV
+    # prep_features_public orchestrator) unpacks into its own subfolder, leaving the CSV
     # one level below input_dir. The preamble marker still disambiguates which
     # export is which, so scanning extra CSVs here is harmless.
     for csv_path in sorted(input_dir.rglob("*.csv")):

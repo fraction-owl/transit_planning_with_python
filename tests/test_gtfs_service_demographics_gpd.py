@@ -666,7 +666,7 @@ def test_load_gtfs_data_missing_file_raises(dc_gtfs_dir: Path) -> None:
 def test_run_raises_on_missing_demographics(tmp_path: Path, dc_gtfs_dir: Path) -> None:
     # run() used to catch every error and return, so a missing demographics
     # input exited 0 and looked identical to "produced nothing" under the
-    # prep_features orchestrator. It must now surface the failure instead.
+    # prep_features_public orchestrator. It must now surface the failure instead.
     with pytest.raises(FileNotFoundError, match="Demographics shapefile not found"):
         run(
             analysis_mode="route",

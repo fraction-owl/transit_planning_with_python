@@ -58,13 +58,14 @@ transit_planning_with_python/
 │   │   ├── time_band_exporter.py
 │   │   └── timepoint_schedule_exporter.py
 │   ├── modeling/
-│   │   ├── fit_model.py
-│   │   ├── fit_ridership_model.py
-│   │   ├── orchestrator_jobs.json
-│   │   ├── orchestrator_jobs.local.json
-│   │   ├── prep_features.py
+│   │   ├── monthly_ridership_model.py
+│   │   ├── orchestrator_jobs_private.json
+│   │   ├── orchestrator_jobs_public.json
+│   │   ├── orchestrator_jobs_public.local.json
+│   │   ├── prep_features_private.py
+│   │   ├── prep_features_public.py
 │   │   ├── ridership_ml_model.py
-│   │   └── ridership_regression_model.py
+│   │   └── route_performance_model.py
 │   ├── national_data_tools/
 │   │   ├── cacensus_da_join_gpd.py
 │   │   ├── clean_eia_gas_prices.py
@@ -77,8 +78,10 @@ transit_planning_with_python/
 │   ├── operations_tools/
 │   │   ├── convert_to_tides_stop_visits.py
 │   │   ├── convert_to_tides_trips_performed.py
+│   │   ├── otp_by_route.py
 │   │   ├── otp_by_timepoint.py
 │   │   ├── otp_monthly_tides.py
+│   │   ├── route_runtime_tides.py
 │   │   ├── segment_runtime_tides.py
 │   │   ├── trip_runtime_diagnostics.py
 │   │   └── trip_runtime_tides.py
@@ -178,7 +181,6 @@ transit_planning_with_python/
 │   ├── test_clean_fred_unrate.py
 │   ├── test_clean_noaa_weather.py
 │   ├── test_data_request_by_stop_processor.py
-│   ├── test_fit_ridership_model.py
 │   ├── test_flag_stop_upgrades.py
 │   ├── test_gbfs_ridership_join.py
 │   ├── test_gtfs_route_features.py
@@ -193,14 +195,17 @@ transit_planning_with_python/
 │   ├── test_ntd_anchor_builder.py
 │   ├── test_ntd_monthly_summary.py
 │   ├── test_ntd_monthly_trends_export.py
+│   ├── test_otp_by_route.py
 │   ├── test_otp_by_timepoint.py
 │   ├── test_otp_monthly_tides.py
 │   ├── test_points_of_interest_coverage_gpd.py
-│   ├── test_prep_features_orchestrator.py
+│   ├── test_prep_features_private_orchestrator.py
+│   ├── test_prep_features_public_orchestrator.py
 │   ├── test_printable_block_schedules.py
 │   ├── test_ridership_ml_model.py
-│   ├── test_ridership_regression_model.py
 │   ├── test_route_direction_classifier.py
+│   ├── test_route_performance_model.py
+│   ├── test_route_runtime_tides.py
 │   ├── test_school_coverage_by_route_gpd.py
 │   ├── test_schools_prep_join_gpd.py
 │   ├── test_segment_runtime_tides.py

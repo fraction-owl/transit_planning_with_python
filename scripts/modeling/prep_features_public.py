@@ -1,16 +1,18 @@
-"""Drop-folder feature-prep orchestrator (PART A of a two-stage split).
+"""Drop-folder feature-prep orchestrator (the PUBLIC half of the split).
 
 This is the unsecured-box half of a split pipeline that keeps proprietary NTD
-data on one machine while feature prep happens elsewhere:
+data on one machine while feature prep happens elsewhere. Its secured-box
+counterpart is ``prep_features_private.py``, which assembles the NTD / OTP /
+runtime features that may never cross to this side:
 
-    PART A (this script, runs anywhere, NO NTD)
+    PUBLIC (this script, runs anywhere, NO NTD)
         Runs the non-NTD feature-generation scripts as subprocesses, collects
         the tabular outputs they write, describes each output's join keys and
         shippable columns (registry-or-inference), then groups everything by
         join-key signature and writes one CSV bundle per signature plus a
         manifest (row counts + per-bundle SHA-256 + provenance).
 
-    PART B (``monthly_ridership_model.py``, runs only where the NTD anchor lives)
+    MODEL (``monthly_ridership_model.py``, runs only where the NTD anchor lives)
         Loads the NTD anchor, verifies and joins each prepped bundle onto it,
         then fits the regression and exports results.
 
@@ -40,7 +42,7 @@ Design notes:
     - One bundle per join-key signature. Tables that share a join key (e.g. all
       the ``route_id`` coverage tables) are outer-merged into a single bundle; a
       differently keyed table (e.g. ``period``-keyed exogenous series) goes to
-      its own bundle. Part B then joins each bundle only if the anchor carries
+      its own bundle. The model then joins each bundle only if the anchor carries
       its keys, which is what makes ``period`` optional downstream.
     - Run-what-you-can, fail-closed only on leakage. A script that exits
       non-zero or times out is logged and skipped; the run continues. The only
@@ -95,7 +97,9 @@ CONFIG_END_MARKER: str = "# === END CONFIG ==="
 # Path to this file, used to extract the config block for the run log. ``__file__``
 # is undefined when the code is pasted into a notebook cell, so a configured
 # fallback keeps the run log working there too.
-SELF_PATH: Final[Path] = Path(__file__) if "__file__" in globals() else Path("prep_features.py")
+SELF_PATH: Final[Path] = (
+    Path(__file__) if "__file__" in globals() else Path("prep_features_public.py")
+)
 
 
 # =============================================================================
@@ -219,10 +223,12 @@ DEFAULT_CMD_TEMPLATE: tuple[str, ...] = (
     "{output}",
 )
 
-# Scripts never run when auto-discovering (no registry). The orchestrator and
-# the secured-box model are always excluded; the latter must never run here.
+# Scripts never run when auto-discovering (no registry). Both orchestrators and
+# the secured-box models are always excluded; the secured-box code must never run
+# here (the private orchestrator and models would touch NTD).
 EXCLUDE_SCRIPT_NAMES: tuple[str, ...] = (
-    "prep_features.py",
+    "prep_features_public.py",
+    "prep_features_private.py",
     "monthly_ridership_model.py",
     "route_performance_model.py",
     "ridership_ml_model.py",
@@ -867,7 +873,7 @@ def write_run_log(
     source_path: Path = SELF_PATH,
 ) -> bool:
     """Write a run log of the configuration block plus the script + bundle summary."""
-    log_path = output_dir / "prep_features_runlog.txt"
+    log_path = output_dir / "prep_features_public_runlog.txt"
 
     try:
         config_text: str = extract_config_block(source_path)
@@ -895,7 +901,7 @@ def write_run_log(
 
     lines: list[str] = [
         "=" * 72,
-        "FEATURE PREP RUN LOG (PART A — unsecured box, orchestrator)",
+        "FEATURE PREP RUN LOG (PUBLIC — unsecured box, orchestrator)",
         "=" * 72,
         f"Run timestamp:    {datetime.now().isoformat(timespec='seconds')}",
         f"Output directory: {output_dir}",

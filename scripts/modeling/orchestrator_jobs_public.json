@@ -1,6 +1,6 @@
 {
   "_comment": [
-    "Template registry for prep_features.py (the orchestrator). ADJUST paths, flags, and",
+    "Template registry for prep_features_public.py (the orchestrator). ADJUST paths, flags, and",
     "output specs to your environment. Scripts not listed here are auto-discovered and run",
     "with DEFAULT_CMD_TEMPLATE; output files not described here fall back to inference",
     "(join keys from CANDIDATE_JOIN_KEYS, every numeric/boolean non-key column shipped).",
@@ -13,7 +13,7 @@
     "whatever numeric columns it produced, including the commute counts/shares from ACS S0801.",
     "NOTE: gtfs_route_features.csv keep_cols deliberately EXCLUDE revenue_hours/revenue_miles.",
     "Those are NTD-sourced supply quantities that live on the anchor (the NTD figures are more",
-    "accurate than the schedule-derived GTFS copy), and prep_features governance forbids them",
+    "accurate than the schedule-derived GTFS copy), and prep_features_public governance forbids them",
     "from any feature bundle; without an explicit keep_cols, inference would ship them and the",
     "run would fail closed."
   ],

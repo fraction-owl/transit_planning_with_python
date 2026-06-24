@@ -72,7 +72,7 @@ def test_load_trips_from_directory(tmp_path: Path, trips: pd.DataFrame) -> None:
 
 
 def test_load_trips_from_nested_directories(tmp_path: Path, trips: pd.DataFrame) -> None:
-    # The prep_features.py orchestrator unzips each monthly archive into its own
+    # The prep_features_public.py orchestrator unzips each monthly archive into its own
     # subfolder, so the CSVs land one level below the directory handed to
     # load_trips. Confirm the directory loader recurses into those subfolders.
     cols = [c for c in trips.columns if c not in ("month", "source_file")]

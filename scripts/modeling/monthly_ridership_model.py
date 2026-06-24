@@ -3,7 +3,7 @@
 This is the secured-box half of a split pipeline that keeps proprietary NTD
 data on one machine while feature prep happens elsewhere:
 
-    PART A (``prep_features.py``, runs anywhere, no NTD)
+    PART A (``prep_features_public.py``, runs anywhere, no NTD)
         Loads, validates, dedups, and bundles the *non-NTD* feature tables,
         grouping them by join-key signature and writing one CSV bundle per
         signature plus a manifest (row counts + per-bundle SHA-256).
@@ -31,7 +31,7 @@ and no ``pyarrow`` (bundles are CSV so a stock ``arcgispro-py3`` env suffices).
 
 Inputs:
     - One anchor table (CSV or XLSX) holding the dependent variable (NTD).
-    - A bundle directory + manifest produced by ``prep_features.py``.
+    - A bundle directory + manifest produced by ``prep_features_public.py``.
 
 Outputs:
     - An Excel workbook with model summary, coefficient, correlation, and
@@ -85,7 +85,7 @@ ANCHOR_SHEET: Final[str | int] = 0  # worksheet name/index if ANCHOR_PATH is XLS
 
 OUTPUT_DIR: Final[Path] = Path(r"Path\To\Your\Output\Folder")
 
-# Feature bundles produced by prep_features.py (PART A) and transferred in.
+# Feature bundles produced by prep_features_public.py (PART A) and transferred in.
 # BUNDLE_DIR holds the bundle CSVs; MANIFEST_PATH is the JSON sidecar that lists
 # each bundle's join keys, row/column counts, and SHA-256. Every bundle is
 # joined onto the anchor only if all of its join keys are present in the anchor,
@@ -313,7 +313,7 @@ def _canonical_key(series: pd.Series) -> pd.Series:
     ``"101.0"`` from a float round-trip) on the other. This collapses every
     key to a trimmed string and strips a single trailing ``.0`` so an integer
     that survived a float cast still matches its string form. The same helper
-    is copied into prep_features.py and MUST stay byte-identical between the two.
+    is copied into prep_features_public.py and MUST stay byte-identical between the two.
     """
     out = series.astype("string").str.strip()
     out = out.str.replace(r"\.0$", "", regex=True)
