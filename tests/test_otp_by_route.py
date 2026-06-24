@@ -63,6 +63,17 @@ def test_select_window_trailing_and_end_month() -> None:
     assert target.select_window(months, "", 0) == months
 
 
+def test_select_window_supports_24_month_cadence() -> None:
+    """A 24-month (2-year) window is a supported trailing-window length."""
+    months = [f"2024-{m:02d}" for m in range(1, 13)] + [
+        f"2025-{m:02d}" for m in range(1, 13)
+    ] + [f"2026-{m:02d}" for m in range(1, 7)]  # 30 months total
+    window = target.select_window(months, "", 24)
+    assert len(window) == 24
+    assert window[0] == "2024-07"
+    assert window[-1] == "2026-06"
+
+
 def _toy_panel() -> pd.DataFrame:
     """Route A: a light 80%-month (10 eval) and a perfect month (30 eval)."""
     return pd.DataFrame(

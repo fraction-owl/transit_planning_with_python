@@ -15,7 +15,8 @@ CSV that carries ``level`` / ``route_id`` / ``month`` / ``on_time`` /
 ``evaluated`` columns.
 
 The reduction takes the route-level rows over a configurable trailing window
-(e.g. last 12 or 36 months) and collapses them two possible ways:
+(e.g. last 12, 24, or 36 months -- 1, 2, or 3 years) and collapses them two
+possible ways:
 
     * naive       - sum on-time and evaluated counts across the window, then
                     divide (a month with more evaluated visits weighs more).
@@ -66,7 +67,9 @@ OUTPUT_DIR: str = r"Path\To\Your\Output_Folder"
 LEVEL: str = "route"
 
 # Trailing window length, in months, for the rollup. The most recent
-# WINDOW_MONTHS months present (up to END_MONTH, if set) are used. 0 = all months.
+# WINDOW_MONTHS months present (up to END_MONTH, if set) are used. Any positive
+# integer works; common cadences are 12, 24, or 36 (1, 2, or 3 years).
+# 0 = all months.
 WINDOW_MONTHS: int = 12
 
 # Rollup aggregation across the window:
@@ -430,7 +433,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--window-months",
         type=int,
         default=WINDOW_MONTHS,
-        help="Trailing window length in months for the rollup (0 = all months).",
+        help="Trailing window length in months, e.g. 12, 24, 36 (0 = all months).",
     )
     p.add_argument(
         "--normalize",

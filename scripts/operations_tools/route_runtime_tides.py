@@ -17,8 +17,9 @@ panel exists elsewhere to consume:
                            trip, and aggregated to a ``route_id`` x ``month``
                            panel (mean / median / std / observation count).
     panel  -> rollup       The panel is reduced to one row per route over a
-                           configurable trailing window (e.g. last 12 or 36
-                           months) using one of two aggregations:
+                           configurable trailing window (e.g. last 12, 24, or
+                           36 months -- 1, 2, or 3 years) using one of two
+                           aggregations:
                              * naive       - pool every observation in the window
                                              (months weighted by how much data
                                              they carry).
@@ -76,7 +77,8 @@ TRIM_FRAC: float = 0.01
 
 # Trailing window length, in months, used to build the route-level rollup. The
 # most recent WINDOW_MONTHS months present (up to END_MONTH, if set) are pooled.
-# Set 0 to use every month available (no windowing).
+# Any positive integer works; common cadences are 12, 24, or 36 (1, 2, or 3
+# years). Set 0 to use every month available (no windowing).
 WINDOW_MONTHS: int = 12
 
 # Rollup aggregation across the window:
@@ -598,7 +600,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--window-months",
         type=int,
         default=WINDOW_MONTHS,
-        help="Trailing window length in months for the rollup (0 = all months).",
+        help="Trailing window length in months, e.g. 12, 24, 36 (0 = all months).",
     )
     p.add_argument(
         "--normalize",
