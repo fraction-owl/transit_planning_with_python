@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -141,6 +144,122 @@ def test_end_to_end_export(tmp_path, monkeypatch) -> None:
     }
     # Recover the data-generating elasticities; the signal is strong and clean.
     assert result.r_squared > 0.8
+
+
+def _write_bundle_manifest(bundle_dir, entries) -> None:
+    """Write a prep_features-style manifest, hashing each bundle from disk.
+
+    ``entries`` is a list of ``(filename, join_keys)``; SHA-256 is computed with
+    the same helper the model uses so VERIFY_BUNDLE_HASHES passes.
+    """
+    bundles = []
+    for filename, join_keys in entries:
+        path = bundle_dir / filename
+        n_rows = max(sum(1 for _ in path.open(encoding="utf-8")) - 1, 0)
+        bundles.append(
+            {
+                "filename": filename,
+                "join_keys": list(join_keys),
+                "n_rows": n_rows,
+                "n_cols": 0,
+                "sha256": rpm._sha256_file(path),
+            }
+        )
+    (bundle_dir / "manifest.json").write_text(json.dumps({"bundles": bundles}), encoding="utf-8")
+
+
+def _make_anchor_and_bundles(tmp_path) -> tuple[Path, Path, Path]:
+    """Write a route-level anchor, a route_id bundle, and a period bundle to disk."""
+    anchor_path = tmp_path / "anchor.csv"
+    pd.DataFrame(
+        {
+            "route_id": ["101", "102", "103"],
+            "ntd_boardings": [1000.0, 2000.0, 3000.0],
+            # Supply lives on the NTD anchor (more accurate than the GTFS copy).
+            "revenue_hours": [50.0, 80.0, 120.0],
+            "revenue_miles": [500.0, 800.0, 1200.0],
+        }
+    ).to_csv(anchor_path, index=False)
+
+    bundle_dir = tmp_path / "bundles"
+    bundle_dir.mkdir()
+    pd.DataFrame(
+        {
+            "route_id": ["101", "102", "103"],
+            "total_pop": [10000, 20000, 30000],
+            "shared_stop_share": [0.2, 0.3, 0.4],
+            "competition_intensity": [0.5, 0.6, 0.7],
+            # A shapefile-derived name the model aliases back to a clean column.
+            "Metrorail_Stations.shp": [1, 0, 2],
+        }
+    ).to_csv(bundle_dir / "features__route_id.csv", index=False)
+    pd.DataFrame({"period": ["2024-01", "2024-02"], "gas_price": [3.1, 3.2]}).to_csv(
+        bundle_dir / "features__period.csv", index=False
+    )
+
+    _write_bundle_manifest(
+        bundle_dir,
+        [("features__route_id.csv", ["route_id"]), ("features__period.csv", ["period"])],
+    )
+    return anchor_path, bundle_dir, bundle_dir / "manifest.json"
+
+
+def test_assemble_model_table_joins_route_bundle_and_skips_period(tmp_path, monkeypatch) -> None:
+    """The route_id bundle joins; the period bundle is skipped (anchor has no period)."""
+    anchor_path, bundle_dir, manifest_path = _make_anchor_and_bundles(tmp_path)
+    monkeypatch.setattr(rpm, "ANCHOR_PATH", anchor_path)
+    monkeypatch.setattr(rpm, "BUNDLE_DIR", bundle_dir)
+    monkeypatch.setattr(rpm, "MANIFEST_PATH", manifest_path)
+
+    merged, provenance = rpm.assemble_model_table()
+
+    assert len(merged) == 3
+    # Feature columns from the route_id bundle are joined on.
+    assert {"total_pop", "shared_stop_share", "competition_intensity"} <= set(merged.columns)
+    # Supply columns stay on the anchor (sourced from NTD, never from a bundle).
+    assert {"revenue_hours", "revenue_miles"} <= set(merged.columns)
+    # The COLUMN_ALIASES rename is applied to bundle columns too.
+    assert "Metrorail_Stations" in merged.columns and "Metrorail_Stations.shp" not in merged.columns
+    # The period bundle was skipped, so none of its columns leak in.
+    assert "gas_price" not in merged.columns
+    # Only the joined bundle is recorded in provenance.
+    assert [name for name, _ in provenance] == ["features__route_id.csv"]
+
+
+def test_assemble_model_table_rejects_hash_mismatch(tmp_path, monkeypatch) -> None:
+    """A bundle edited after the manifest was written aborts the run when verifying."""
+    anchor_path, bundle_dir, manifest_path = _make_anchor_and_bundles(tmp_path)
+    # Corrupt the route bundle so its on-disk hash no longer matches the manifest.
+    (bundle_dir / "features__route_id.csv").write_text(
+        "route_id,total_pop\n101,999999\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(rpm, "ANCHOR_PATH", anchor_path)
+    monkeypatch.setattr(rpm, "BUNDLE_DIR", bundle_dir)
+    monkeypatch.setattr(rpm, "MANIFEST_PATH", manifest_path)
+    monkeypatch.setattr(rpm, "VERIFY_BUNDLE_HASHES", True)
+
+    with pytest.raises(ValueError, match="SHA-256 mismatch"):
+        rpm.assemble_model_table()
+
+
+def test_collapse_panel_anchor_rolls_up_to_one_row_per_route(monkeypatch) -> None:
+    """A route x period anchor collapses to one row per route via ANCHOR_AGG."""
+    monkeypatch.setattr(rpm, "ANCHOR_AGG", "mean")
+    monkeypatch.setattr(rpm, "ANCHOR_EXCLUDE_ZERO_MONTHS", True)
+    panel = pd.DataFrame(
+        {
+            "route_id": rpm._canonical_key(pd.Series(["101", "101", "102", "102"])),
+            "ntd_boardings": [100.0, 0.0, 200.0, 400.0],  # the zero month is dropped
+            "revenue_hours": [10.0, 99.0, 20.0, 40.0],
+        }
+    )
+    out = rpm._collapse_panel_anchor(panel)
+
+    assert sorted(out["route_id"]) == ["101", "102"]
+    # Route 101's zero-boarding month is excluded, so its mean is 100, not 50.
+    r101 = out.loc[out["route_id"] == "101"].iloc[0]
+    assert r101["ntd_boardings"] == 100.0
+    assert r101["revenue_hours"] == 10.0
 
 
 def test_log_dependent_rejects_nonpositive(monkeypatch) -> None:

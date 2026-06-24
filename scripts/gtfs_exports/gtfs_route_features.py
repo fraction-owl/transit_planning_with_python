@@ -70,9 +70,11 @@ Outputs:
 
 from __future__ import annotations
 
+import argparse
 import datetime as dt
 import hashlib
 import logging
+import sys
 from pathlib import Path
 from typing import Final, Optional, Sequence
 
@@ -782,7 +784,12 @@ def _extract_config_block() -> str:
 
 
 def write_run_log(
-    output_dir: Path, feed_files: dict[str, str], analysis_date: dt.date, n_routes: int
+    output_dir: Path,
+    feed_files: dict[str, str],
+    analysis_date: dt.date,
+    n_routes: int,
+    gtfs_dir: Path = GTFS_DIR,
+    analysis_weekday: str = ANALYSIS_WEEKDAY,
 ) -> None:
     """Write a run-log sidecar capturing config, feed provenance, and selected date."""
     log_path = output_dir / "gtfs_route_features_runlog.txt"
@@ -792,8 +799,8 @@ def write_run_log(
         "GTFS ROUTE FEATURE EXTRACTION RUN LOG (PART A)",
         "=" * 72,
         f"Run timestamp:   {dt.datetime.now().isoformat(timespec='seconds')}",
-        f"GTFS feed:       {GTFS_DIR}",
-        f"Analysis date:   {analysis_date.isoformat()} ({ANALYSIS_WEEKDAY})",
+        f"GTFS feed:       {gtfs_dir}",
+        f"Analysis date:   {analysis_date.isoformat()} ({analysis_weekday})",
         f"Routes emitted:  {n_routes}",
         "",
         "-" * 72,
@@ -816,28 +823,41 @@ def write_run_log(
 # =============================================================================
 
 
-def run() -> Optional[pd.DataFrame]:
-    """Build the route-level GTFS feature table and write it to OUTPUT_DIR."""
+def run(
+    gtfs_dir: Path | None = None,
+    output_dir: Path | None = None,
+    analysis_weekday: str | None = None,
+) -> Optional[pd.DataFrame]:
+    """Build the route-level GTFS feature table and write it to ``output_dir``.
+
+    Unset args fall back to the config block at the top of this file, so both
+    ``m.GTFS_DIR = ...; m.run()`` after a plain import and the orchestrator's
+    ``--gtfs-dir/--output-dir`` invocation work from the same body.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    if "Path\\To\\Your" in str(INPUT_DIR) or "Path\\To\\Your" in str(OUTPUT_DIR):
-        logging.warning("Set INPUT_DIR and OUTPUT_DIR (marked '# <<< EDIT ME') before running.")
+    gtfs_dir = GTFS_DIR if gtfs_dir is None else Path(gtfs_dir)
+    output_dir = OUTPUT_DIR if output_dir is None else Path(output_dir)
+    analysis_weekday = ANALYSIS_WEEKDAY if analysis_weekday is None else analysis_weekday
+
+    if "Path\\To\\Your" in str(gtfs_dir) or "Path\\To\\Your" in str(output_dir):
+        logging.warning("Set GTFS_DIR and OUTPUT_DIR (marked '# <<< EDIT ME') before running.")
         return None
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    routes = _read_gtfs_csv(_gtfs_path(GTFS_DIR, "routes.txt"))
-    trips = _read_gtfs_csv(_gtfs_path(GTFS_DIR, "trips.txt"))
-    calendar = _read_gtfs_csv(_gtfs_path(GTFS_DIR, "calendar.txt"))
-    cd_path = GTFS_DIR / "calendar_dates.txt"
+    routes = _read_gtfs_csv(_gtfs_path(gtfs_dir, "routes.txt"))
+    trips = _read_gtfs_csv(_gtfs_path(gtfs_dir, "trips.txt"))
+    calendar = _read_gtfs_csv(_gtfs_path(gtfs_dir, "calendar.txt"))
+    cd_path = gtfs_dir / "calendar_dates.txt"
     calendar_dates = _read_gtfs_csv(cd_path) if cd_path.exists() else None
 
     analysis_date, active_sids = choose_analysis_date_and_services(
-        calendar, calendar_dates, ANALYSIS_WEEKDAY
+        calendar, calendar_dates, analysis_weekday
     )
     logging.info("Analysis date %s | %d active service_ids.", analysis_date, len(active_sids))
 
@@ -855,10 +875,10 @@ def run() -> Optional[pd.DataFrame]:
     shape_ids = set(trips["shape_id"]) - {""}
 
     stop_times = load_stop_times_filtered(
-        _gtfs_path(GTFS_DIR, "stop_times.txt"), trip_ids, STOP_TIMES_CHUNKSIZE
+        _gtfs_path(gtfs_dir, "stop_times.txt"), trip_ids, STOP_TIMES_CHUNKSIZE
     )
     logging.info("stop_times rows in scope: %d", len(stop_times))
-    shape_len = compute_shape_lengths(_gtfs_path(GTFS_DIR, "shapes.txt"), shape_ids)
+    shape_len = compute_shape_lengths(_gtfs_path(gtfs_dir, "shapes.txt"), shape_ids)
     logging.info("Shapes measured: %d", len(shape_len))
 
     supply = compute_route_supply_metrics(trips, stop_times, shape_len)
@@ -906,21 +926,89 @@ def run() -> Optional[pd.DataFrame]:
         if col != ROUTE_KEY_OUT:
             features[col] = pd.to_numeric(features[col], errors="coerce").round(4)
 
-    out_csv = OUTPUT_DIR / OUTPUT_CSV_NAME
+    out_csv = output_dir / OUTPUT_CSV_NAME
     features.to_csv(out_csv, index=False)
     logging.info("Wrote %d routes x %d features to '%s'.", *features.shape, out_csv)
 
     if WRITE_RUN_LOG:
         feed_files = {
-            name: _sha256_file(GTFS_DIR / name)
+            name: _sha256_file(gtfs_dir / name)
             for name in ("routes.txt", "trips.txt", "calendar.txt", "stop_times.txt", "shapes.txt")
-            if (GTFS_DIR / name).exists()
+            if (gtfs_dir / name).exists()
         }
-        write_run_log(OUTPUT_DIR, feed_files, analysis_date, len(features))
+        write_run_log(
+            output_dir, feed_files, analysis_date, len(features), gtfs_dir, analysis_weekday
+        )
 
     logging.info("Done.")
     return features
 
 
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    """Parse command-line arguments, defaulting to the configuration block.
+
+    ``parse_known_args`` is used so a notebook kernel's injected argv (or the
+    orchestrator's extra ``--input-dir`` token) does not raise ``SystemExit: 2``.
+    """
+    parser = argparse.ArgumentParser(
+        description=(
+            "Compute route-level GTFS supply & competition features (Part A feature "
+            "generator). Defaults come from the CONFIGURATION block at the top of this file."
+        )
+    )
+    parser.add_argument(
+        "--gtfs-dir", type=Path, default=GTFS_DIR, help="Path to the GTFS feed folder."
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=OUTPUT_DIR,
+        help="Directory the feature CSV and run log are written to.",
+    )
+    parser.add_argument(
+        "--analysis-weekday",
+        default=ANALYSIS_WEEKDAY,
+        help="Weekday to characterize (monday..friday).",
+    )
+    parser.add_argument(
+        "--log-level",
+        default=logging.getLevelName(LOG_LEVEL),
+        help="DEBUG / INFO / WARNING / ERROR.",
+    )
+    args, _unknown = parser.parse_known_args(argv)
+    return args
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    """Command-line entry point. Defaults fall back to the configuration block."""
+    args = parse_args(argv)
+    logging.basicConfig(
+        level=getattr(logging, str(args.log_level).upper(), LOG_LEVEL),
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    if "Path\\To\\Your" in str(args.gtfs_dir) or "Path\\To\\Your" in str(args.output_dir):
+        logging.warning(
+            "GTFS_DIR and/or OUTPUT_DIR are still placeholders. Update the CONFIGURATION "
+            "block or pass --gtfs-dir/--output-dir before running."
+        )
+        return
+    run(
+        gtfs_dir=args.gtfs_dir,
+        output_dir=args.output_dir,
+        analysis_weekday=args.analysis_weekday,
+    )
+
+
+def _in_ipython() -> bool:
+    """Return True when running inside an IPython/Jupyter kernel."""
+    return "ipykernel" in sys.modules or "IPython" in sys.modules
+
+
 if __name__ == "__main__":
-    run()
+    # In a notebook (pasted cell or %run), use the config block instead of
+    # argparse, which would otherwise try to parse the kernel's own argv.
+    if _in_ipython():
+        run()
+    else:
+        main()

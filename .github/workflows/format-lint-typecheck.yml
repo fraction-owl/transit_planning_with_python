@@ -43,4 +43,8 @@ jobs:
         run: ruff check .
 
       - name: Type check with Ty
-        run: ty check scripts --exclude "**/*arcpy*"
+        # ty is pre-1.0 and currently surfaces pandas/geopandas-stubs typing noise as
+        # warning-level diagnostics; a newer ty started exiting non-zero on warnings.
+        # --exit-zero-on-warning keeps those warnings advisory (still printed in the log)
+        # while error-level diagnostics continue to fail the build.
+        run: ty check scripts --exclude "**/*arcpy*" --exit-zero-on-warning
