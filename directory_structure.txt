@@ -88,9 +88,11 @@ transit_planning_with_python/
 │   ├── ridership_tools/
 │   │   ├── data_request_by_stop_processor.py
 │   │   ├── load_factor_monitor.py
+│   │   ├── max_load_from_tides.py
 │   │   ├── ntd_anchor_builder.py
 │   │   ├── ntd_monthly_summary.py
 │   │   ├── ntd_monthly_trends_export.py
+│   │   ├── ridership_from_tides.py
 │   │   ├── stops_ridership_joiner_arcpy.py
 │   │   └── stops_ridership_joiner_gpd.py
 │   ├── service_coverage/
@@ -191,6 +193,7 @@ transit_planning_with_python/
 │   ├── test_gtfs_to_shapefile_gpd.py
 │   ├── test_load_factor_monitor.py
 │   ├── test_load_gtfs_data.py
+│   ├── test_max_load_from_tides.py
 │   ├── test_network_helpers.py
 │   ├── test_ntd_anchor_builder.py
 │   ├── test_ntd_monthly_summary.py
@@ -202,6 +205,7 @@ transit_planning_with_python/
 │   ├── test_prep_features_private_orchestrator.py
 │   ├── test_prep_features_public_orchestrator.py
 │   ├── test_printable_block_schedules.py
+│   ├── test_ridership_from_tides.py
 │   ├── test_ridership_ml_model.py
 │   ├── test_route_direction_classifier.py
 │   ├── test_route_performance_model.py

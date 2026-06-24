@@ -7,7 +7,7 @@ Welcome to **Transit Planning With Python**, a toolkit of off‑the‑shelf Pyth
 A toolkit for transit planners and analysts. Most spatial tools ship in both `arcpy` and GeoPandas flavors, so the repo is usable whether or not your agency licenses ArcGIS Pro.
 
 ### Ridership & NTD Trend Analysis *(arcpy + GeoPandas)*
-Turn NTD-format monthly summaries into route-level trend reports, process ridership by stop, and join ridership figures to stop geometries. Load factor monitoring is also included, built on ridecheck outputs — the data shape varies between agencies, but the underlying structure is robust and adaptable.
+Turn NTD-format monthly summaries into route-level trend reports, process ridership by stop, and join ridership figures to stop geometries. Load factor monitoring is also included, built on ridecheck outputs — the data shape varies between agencies, but the underlying structure is robust and adaptable. For agencies without vendor ridecheck software, two TIDES-derived tools build the inputs the rest of this folder expects directly from raw stop-event data: `ridership_from_tides.py` sums boardings/alightings, and `max_load_from_tides.py` derives each trip's peak load — both at a configurable time-period × month grain, mirroring the TIDES OTP calculator.
 *Folder:* `ridership_tools/`
 
 ### Demand Modeling *(advanced)*
