@@ -301,8 +301,14 @@ def aggregate_route_month(df: pd.DataFrame) -> pd.DataFrame:
         Panel with columns ``route_id``, ``month``, ``n_obs``,
         ``runtime_mean_min``, ``runtime_median_min``, ``runtime_std_min``.
     """
-    cols = ["route_id", "month", "n_obs", "runtime_mean_min", "runtime_median_min",
-            "runtime_std_min"]
+    cols = [
+        "route_id",
+        "month",
+        "n_obs",
+        "runtime_mean_min",
+        "runtime_median_min",
+        "runtime_std_min",
+    ]
     if df.empty:
         return pd.DataFrame(columns=cols)
 
@@ -317,9 +323,7 @@ def aggregate_route_month(df: pd.DataFrame) -> pd.DataFrame:
         .reset_index()
         .sort_values(["route_id", "month"], ignore_index=True)
     )
-    return panel.round(
-        {"runtime_mean_min": 2, "runtime_median_min": 2, "runtime_std_min": 2}
-    )
+    return panel.round({"runtime_mean_min": 2, "runtime_median_min": 2, "runtime_std_min": 2})
 
 
 def select_window(months: Sequence[str], end_month: str, window_months: int) -> List[str]:
@@ -363,8 +367,15 @@ def reduce_to_route(
         Rollup with columns ``route_id``, ``runtime_mean_min``, ``n_obs``,
         ``n_months``, ``window_start``, ``window_end``, ``normalized``.
     """
-    cols = ["route_id", "runtime_mean_min", "n_obs", "n_months", "window_start",
-            "window_end", "normalized"]
+    cols = [
+        "route_id",
+        "runtime_mean_min",
+        "n_obs",
+        "n_months",
+        "window_start",
+        "window_end",
+        "normalized",
+    ]
     win = sorted(set(window))
     sub = panel.loc[panel["month"].isin(win)].copy()
     if min_obs_per_month > 0:

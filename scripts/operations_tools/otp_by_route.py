@@ -216,8 +216,16 @@ def reduce_to_route(
         ``evaluated``, ``n_months``, ``window_start``, ``window_end``,
         ``normalized``.
     """
-    cols = ["route_id", "pct_on_time", "on_time", "evaluated", "n_months", "window_start",
-            "window_end", "normalized"]
+    cols = [
+        "route_id",
+        "pct_on_time",
+        "on_time",
+        "evaluated",
+        "n_months",
+        "window_start",
+        "window_end",
+        "normalized",
+    ]
     win = sorted(set(window))
     sub = panel.loc[panel["month"].isin(win)].copy()
     if min_eval_per_month > 0:
@@ -392,9 +400,7 @@ def run(cfg: Config) -> pd.DataFrame:
     logging.info("Wrote: %s", rollup_path)
 
     agg_label = (
-        "normalized (equal month weight)"
-        if cfg.normalize_by_month
-        else "naive (pooled counts)"
+        "normalized (equal month weight)" if cfg.normalize_by_month else "naive (pooled counts)"
     )
     summary_lines = [
         f"Level:              {cfg.level}",

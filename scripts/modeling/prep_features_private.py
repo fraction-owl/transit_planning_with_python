@@ -344,9 +344,7 @@ def validate_config(
             problems.append(f"'{ft.label}' lists join key(s) {sorted(overlap)} in keep_cols.")
 
     if problems:
-        raise ValueError(
-            "Configuration failed hygiene checks:\n  - " + "\n  - ".join(problems)
-        )
+        raise ValueError("Configuration failed hygiene checks:\n  - " + "\n  - ".join(problems))
 
     if expected_dv:
         carriers = [ft.label for ft in tables if expected_dv in ft.keep_cols]
@@ -601,8 +599,9 @@ def describe_output(
     # intermediate from bundling (e.g. otp_monthly_tides' panel, which
     # otp_by_route consumes but which must not become a bundle of its own).
     if spec is not None and not spec["keep_cols"]:
-        logging.info("Output '%s' is registry-marked ignore (empty keep_cols) — skipping.",
-                     file.name)
+        logging.info(
+            "Output '%s' is registry-marked ignore (empty keep_cols) — skipping.", file.name
+        )
         return None
     sheet = spec["sheet"] if spec else 0
     try:

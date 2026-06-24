@@ -237,6 +237,11 @@ def test_end_to_end_real_scripts_via_registry(tmp_path: Path) -> None:
 
     route_bundle = pd.read_csv(tmp_path / "private_features" / "features__route_id.csv")
     # The route-level table carries the DV plus the OTP and runtime features.
-    for col in ("ntd_boardings", "revenue_hours", "revenue_miles", "pct_on_time",
-                "runtime_mean_min"):
+    for col in (
+        "ntd_boardings",
+        "revenue_hours",
+        "revenue_miles",
+        "pct_on_time",
+        "runtime_mean_min",
+    ):
         assert col in route_bundle.columns, f"missing {col} in {list(route_bundle.columns)}"

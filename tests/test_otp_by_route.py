@@ -65,9 +65,11 @@ def test_select_window_trailing_and_end_month() -> None:
 
 def test_select_window_supports_24_month_cadence() -> None:
     """A 24-month (2-year) window is a supported trailing-window length."""
-    months = [f"2024-{m:02d}" for m in range(1, 13)] + [
-        f"2025-{m:02d}" for m in range(1, 13)
-    ] + [f"2026-{m:02d}" for m in range(1, 7)]  # 30 months total
+    months = (
+        [f"2024-{m:02d}" for m in range(1, 13)]
+        + [f"2025-{m:02d}" for m in range(1, 13)]
+        + [f"2026-{m:02d}" for m in range(1, 7)]
+    )  # 30 months total
     window = target.select_window(months, "", 24)
     assert len(window) == 24
     assert window[0] == "2024-07"
@@ -88,9 +90,7 @@ def _toy_panel() -> pd.DataFrame:
 
 def test_reduce_normalized_weights_months_equally() -> None:
     """Normalized rollup averages monthly %: (80 + 100) / 2 = 90."""
-    rollup = target.reduce_to_route(
-        _toy_panel(), ["2025-01", "2025-02"], normalize_by_month=True
-    )
+    rollup = target.reduce_to_route(_toy_panel(), ["2025-01", "2025-02"], normalize_by_month=True)
     row = rollup.iloc[0]
     assert row["pct_on_time"] == pytest.approx(90.0)
     assert row["n_months"] == 2
@@ -99,9 +99,7 @@ def test_reduce_normalized_weights_months_equally() -> None:
 
 def test_reduce_naive_pools_counts() -> None:
     """Naive rollup pools counts: 38 / 40 * 100 = 95."""
-    rollup = target.reduce_to_route(
-        _toy_panel(), ["2025-01", "2025-02"], normalize_by_month=False
-    )
+    rollup = target.reduce_to_route(_toy_panel(), ["2025-01", "2025-02"], normalize_by_month=False)
     assert rollup.iloc[0]["pct_on_time"] == pytest.approx(95.0)
 
 

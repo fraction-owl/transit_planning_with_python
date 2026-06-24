@@ -614,9 +614,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--data-root", default=str(DATA_ROOT), help="Folder of monthly NTD workbooks.")
     p.add_argument("--output-dir", default=str(OUTPUT_DIR), help="Where the anchor CSV is written.")
-    p.add_argument(
-        "--output-filename", default=OUTPUT_FILENAME, help="Anchor CSV filename."
-    )
+    p.add_argument("--output-filename", default=OUTPUT_FILENAME, help="Anchor CSV filename.")
     p.add_argument(
         "--grain",
         default=GRAIN,

@@ -79,9 +79,7 @@ def _toy_panel() -> pd.DataFrame:
 
 def test_reduce_normalized_weights_months_equally() -> None:
     """Normalized rollup averages the monthly means: (10 + 20) / 2 = 15."""
-    rollup = target.reduce_to_route(
-        _toy_panel(), ["2025-01", "2025-02"], normalize_by_month=True
-    )
+    rollup = target.reduce_to_route(_toy_panel(), ["2025-01", "2025-02"], normalize_by_month=True)
     row = rollup.iloc[0]
     assert row["runtime_mean_min"] == pytest.approx(15.0)
     assert row["n_months"] == 2
@@ -91,9 +89,7 @@ def test_reduce_normalized_weights_months_equally() -> None:
 
 def test_reduce_naive_weights_by_observations() -> None:
     """Naive rollup pools observations: (10*1 + 20*3) / 4 = 17.5."""
-    rollup = target.reduce_to_route(
-        _toy_panel(), ["2025-01", "2025-02"], normalize_by_month=False
-    )
+    rollup = target.reduce_to_route(_toy_panel(), ["2025-01", "2025-02"], normalize_by_month=False)
     assert rollup.iloc[0]["runtime_mean_min"] == pytest.approx(17.5)
 
 
