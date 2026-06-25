@@ -14,6 +14,8 @@ import ridership_from_tides as target  # noqa: E402
 STOP_VISITS = Path("tests/fixtures/stop_visits.csv")
 TRIPS_PERFORMED = Path("tests/fixtures/trips_performed.csv")
 
+FINE_KEYS = ["month", "time_period"]
+
 
 @pytest.fixture()
 def prepared() -> pd.DataFrame:
@@ -25,7 +27,7 @@ def prepared() -> pd.DataFrame:
         joined.pipe(target.filter_for_ridership)
         .pipe(target.add_ridership_columns)
         .pipe(target.assign_time_period, target.TIME_PERIODS)
-        .pipe(target.add_month, True)
+        .pipe(target.add_month)
     )
 
 
@@ -88,23 +90,48 @@ def test_assign_time_period_empty_is_all_day() -> None:
     assert out["time_period"].tolist() == ["ALL DAY"]
 
 
-def test_add_month_toggle() -> None:
-    """SPLIT_BY_MONTH controls whether month is YYYY-MM or the constant ALL."""
+def test_add_month_is_year_month() -> None:
+    """Month is derived as YYYY-MM from the service date."""
     df = pd.DataFrame({"service_date": pd.to_datetime(["2025-02-15"])})
-    assert target.add_month(df, True)["month"].iloc[0] == "2025-02"
-    assert target.add_month(df, False)["month"].iloc[0] == "ALL"
+    assert target.add_month(df)["month"].iloc[0] == "2025-02"
+
+
+def test_resolve_grains_drops_period_when_no_windows() -> None:
+    """Period-bearing grains are skipped when there are no time windows."""
+    all_grains = ("month_and_period", "month", "period", "total")
+    assert target.resolve_grains(all_grains, target.TIME_PERIODS) == list(all_grains)
+    assert target.resolve_grains(all_grains, {}) == ["month", "total"]
+    # Unknown grains are ignored.
+    assert target.resolve_grains(("month", "bogus"), {}) == ["month"]
 
 
 def test_aggregate_reconciles_with_raw_totals(prepared: pd.DataFrame) -> None:
     """Aggregated boardings equal the raw boardings sum (no double counting)."""
-    agg = target.aggregate_ridership(prepared, ["route_id"])
+    agg = target.aggregate_ridership(prepared, ["route_id"], FINE_KEYS)
     assert agg["boardings"].sum() == pytest.approx(prepared["boardings"].sum())
     assert (agg["net_boardings"] == agg["boardings"] - agg["alightings"]).all()
 
 
+def test_total_grain_is_single_row_per_group(prepared: pd.DataFrame) -> None:
+    """The total grain collapses to one row per group with no temporal columns."""
+    agg = target.aggregate_ridership(prepared, ["route_id"], [])
+    assert "month" not in agg.columns
+    assert "time_period" not in agg.columns
+    assert agg["route_id"].is_unique
+
+
+def test_coarser_grains_match_finest_totals(prepared: pd.DataFrame) -> None:
+    """Each coarser grain sums to the same boardings as the finest grain."""
+    fine = target.aggregate_ridership(prepared, ["route_id"], FINE_KEYS)
+    by_month = target.aggregate_ridership(prepared, ["route_id"], ["month"])
+    total = target.aggregate_ridership(prepared, ["route_id"], [])
+    assert by_month["boardings"].sum() == pytest.approx(fine["boardings"].sum())
+    assert total["boardings"].sum() == pytest.approx(fine["boardings"].sum())
+
+
 def test_build_all_levels_and_long_table(prepared: pd.DataFrame) -> None:
     """All standard levels are produced and concatenate into a long table."""
-    levels = target.build_all_levels(prepared)
+    levels = target.build_all_levels(prepared, FINE_KEYS)
     assert set(levels) == {
         "route_stop",
         "stop",
@@ -113,34 +140,34 @@ def test_build_all_levels_and_long_table(prepared: pd.DataFrame) -> None:
         "service_type",
         "overall",
     }
-    long_table = target.make_long_table(levels)
+    long_table = target.make_long_table(levels, FINE_KEYS)
     assert {"level", "group", "month", "time_period", "boardings"} <= set(long_table.columns)
     overall = long_table.loc[long_table["level"] == "overall"]
     assert set(overall["group"].unique()) == {"ALL"}
-    # The overall boardings (summed across cells) match the raw total.
     assert overall["boardings"].sum() == pytest.approx(prepared["boardings"].sum())
 
 
 def test_by_route_and_stop_export_shape(prepared: pd.DataFrame) -> None:
     """The vendor-style export carries BOARD_ALL/ALIGHT_ALL keyed by stop."""
-    levels = target.build_all_levels(prepared)
+    levels = target.build_all_levels(prepared, FINE_KEYS)
     brs = target.build_by_route_and_stop(levels)
     for col in ("TIME_PERIOD", "ROUTE_ID", "STOP_ID", "BOARD_ALL", "ALIGHT_ALL"):
         assert col in brs.columns
     assert brs["BOARD_ALL"].sum() == pytest.approx(prepared["boardings"].sum())
 
 
-def test_run_writes_outputs(tmp_path: Path) -> None:
-    """The end-to-end run writes the processed table, stop export, and run log."""
+def test_run_writes_all_grain_files(tmp_path: Path) -> None:
+    """The end-to-end run writes one file per grain, the stop export, run log."""
     cfg = target.Config(
         stop_visits_path=STOP_VISITS,
         trips_performed_path=TRIPS_PERFORMED,
         output_dir=tmp_path,
         time_periods=target.TIME_PERIODS,
-        split_by_month=True,
+        export_grains=target.EXPORT_GRAINS,
     )
-    long_table = target.run(cfg)
-    assert not long_table.empty
-    assert (tmp_path / target.PROCESSED_FILENAME).exists()
+    grain_tables = target.run(cfg)
+    assert set(grain_tables) == {"month_and_period", "month", "period", "total"}
+    for grain in grain_tables:
+        assert (tmp_path / target.GRAIN_FILENAME[grain]).exists()
     assert (tmp_path / target.BY_ROUTE_AND_STOP_FILENAME).exists()
     assert (tmp_path / "ridership_from_tides_runlog.txt").exists()

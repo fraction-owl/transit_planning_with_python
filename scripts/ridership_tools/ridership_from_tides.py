@@ -24,28 +24,32 @@ alightings for several aggregation levels:
 
 Temporal grain
 --------------
-Two independent switches in the CONFIGURATION block control the temporal grain,
-so a single run can produce time-period totals, monthly totals, monthly x
-time-period totals, or a grand total:
+The CONFIGURATION block produces every temporal grain at once by default, so an
+analyst who is not yet sure which cut they need gets all of them. Each grain is
+written to its own file -- grains are never mixed as rows in one table, which
+would invite double-counting when a column is naively summed:
 
   * ``TIME_PERIODS`` - named clock windows (e.g. AM PEAK / MIDDAY / PM PEAK).
     Each event is assigned to the window containing its departure time. Leave
-    the mapping empty to disable the split (every event falls in ``ALL DAY``).
-  * ``SPLIT_BY_MONTH`` - when True, split every series by calendar ``month``
-    (``YYYY-MM``); when False the ``month`` column is the constant ``ALL``.
+    the mapping empty to disable time-of-day splitting entirely.
+  * ``EXPORT_GRAINS`` - which grains to write: ``month_and_period`` (finest),
+    ``month`` (a monthly trend), ``period`` (a time-of-day profile), and
+    ``total`` (one number per group). Period grains are skipped automatically
+    when ``TIME_PERIODS`` is empty.
 
 Outputs
 -------
-  1) ``ridership_processed.csv`` - tidy long table with one row per
-     (level, group, month, time_period) carrying boardings, alightings,
-     net boardings, observed stop visits, observed trips, and average
-     boardings per observed trip.
-  2) ``ridership_by_route_and_stop.csv`` - the ``route_stop`` level reshaped
-     into a vendor-style export (``TIME_PERIOD`` / ``ROUTE_ID`` / ``STOP_ID`` /
-     ``BOARD_ALL`` / ``ALIGHT_ALL``) so it can stand in as the input that
-     ``stops_ridership_joiner`` expects.
-  3) PNG bar charts of boardings per group within each level (by month when
-     ``SPLIT_BY_MONTH`` is set, otherwise by time period).
+  1) One tidy long table per exported grain -- ``ridership_by_month_and_period``
+     / ``ridership_by_month`` / ``ridership_by_period`` / ``ridership_total``
+     ``.csv`` -- each with one row per (level, group, *temporal keys*) carrying
+     boardings, alightings, net boardings, observed stop visits, observed
+     trips, and average boardings per observed trip.
+  2) ``ridership_by_route_and_stop.csv`` - the ``route_stop`` level (at the
+     finest exported grain) reshaped into a vendor-style export (``TIME_PERIOD``
+     / ``ROUTE_ID`` / ``STOP_ID`` / ``BOARD_ALL`` / ``ALIGHT_ALL``) so it can
+     stand in as the input that ``stops_ridership_joiner`` expects.
+  3) PNG bar charts of boardings per group within each level, drawn from the
+     monthly grain when present, otherwise the time-period grain.
   4) A run-log sidecar capturing the verbatim CONFIGURATION block.
 
 A note on APC data
@@ -107,9 +111,17 @@ TIME_PERIODS: Mapping[str, Tuple[str, str]] = {
     "NIGHT": ("22:00", "06:00"),
 }
 
-# When True, every series is additionally split by calendar month (YYYY-MM).
-# When False the "month" column is the constant "ALL".
-SPLIT_BY_MONTH: bool = True
+# Temporal grains to export. Each grain is written to its own CSV so that
+# grains are never mixed as rows in a single file (which would invite
+# double-counting when an analyst naively sums a column). Available grains:
+#   "month_and_period" - finest: one row per (group, month, time period)
+#   "month"            - pooled across time periods (a monthly trend)
+#   "period"           - pooled across months (a time-of-day profile)
+#   "total"            - pooled across both (a single number per group)
+# The two period-bearing grains are skipped automatically when TIME_PERIODS is
+# empty, since they would duplicate "month" and "total". The default exports
+# everything, which is handy when you are not yet sure which cut you need.
+EXPORT_GRAINS: Sequence[str] = ("month_and_period", "month", "period", "total")
 
 # Optional route filters (matched against route_id as a string). Empty = keep all.
 ROUTES_TO_INCLUDE: Sequence[str] = ()
@@ -118,7 +130,6 @@ ROUTES_TO_EXCLUDE: Sequence[str] = ()
 LOG_LEVEL: int = logging.INFO
 
 # Filenames.
-PROCESSED_FILENAME: str = "ridership_processed.csv"
 BY_ROUTE_AND_STOP_FILENAME: str = "ridership_by_route_and_stop.csv"
 
 # When True, a failed run-log write aborts the script so an output is never left
@@ -140,7 +151,7 @@ class Config:
     trips_performed_path: Path
     output_dir: Path
     time_periods: Mapping[str, Tuple[str, str]] = field(default_factory=dict)
-    split_by_month: bool = SPLIT_BY_MONTH
+    export_grains: Sequence[str] = EXPORT_GRAINS
     routes_to_include: Sequence[str] = ()
     routes_to_exclude: Sequence[str] = ()
 
@@ -153,6 +164,22 @@ LEVELS: Dict[str, List[str]] = {
     "route": ["route_id"],
     "service_type": ["route_type_agency"],
     "overall": [],
+}
+
+# Temporal grain -> the temporal grouping columns it adds to each level.
+GRAIN_TEMPORAL_KEYS: Dict[str, List[str]] = {
+    "month_and_period": ["month", "time_period"],
+    "month": ["month"],
+    "period": ["time_period"],
+    "total": [],
+}
+
+# Temporal grain -> output filename.
+GRAIN_FILENAME: Dict[str, str] = {
+    "month_and_period": "ridership_by_month_and_period.csv",
+    "month": "ridership_by_month.csv",
+    "period": "ridership_by_period.csv",
+    "total": "ridership_total.csv",
 }
 
 # Per-door APC count columns summed into total boardings / alightings.
@@ -334,34 +361,60 @@ def assign_time_period(
     return df
 
 
-def add_month(df: pd.DataFrame, split_by_month: bool) -> pd.DataFrame:
-    """Add a ``month`` column (``YYYY-MM``), or the constant ``"ALL"``.
+def add_month(df: pd.DataFrame) -> pd.DataFrame:
+    """Add a ``month`` column in ``YYYY-MM`` form derived from ``service_date``.
 
     Args:
         df: Stop visits with a parsed ``service_date`` column.
-        split_by_month: When True, derive ``YYYY-MM`` from ``service_date``;
-            when False, set the column to ``"ALL"``.
 
     Returns:
         Copy of ``df`` with a string ``month`` column.
     """
     df = df.copy()
-    if split_by_month:
-        df["month"] = df["service_date"].dt.strftime("%Y-%m")
-    else:
-        df["month"] = "ALL"
+    df["month"] = df["service_date"].dt.strftime("%Y-%m")
     return df
+
+
+def resolve_grains(
+    export_grains: Sequence[str],
+    time_periods: Mapping[str, Tuple[str, str]],
+) -> List[str]:
+    """Return the grains to actually export, filtered and de-duplicated.
+
+    Unknown grain names are dropped with a warning. When ``time_periods`` is
+    empty the period-bearing grains (``month_and_period`` and ``period``) are
+    skipped, since they would duplicate ``month`` and ``total`` respectively.
+
+    Args:
+        export_grains: Requested grain names (see ``EXPORT_GRAINS``).
+        time_periods: The configured time-period windows.
+
+    Returns:
+        An ordered list of valid grain names with duplicates removed.
+    """
+    has_periods = bool(time_periods)
+    resolved: List[str] = []
+    for grain in export_grains:
+        if grain not in GRAIN_TEMPORAL_KEYS:
+            logging.warning("Ignoring unknown grain %r.", grain)
+            continue
+        if not has_periods and "time_period" in GRAIN_TEMPORAL_KEYS[grain]:
+            continue
+        if grain not in resolved:
+            resolved.append(grain)
+    return resolved
 
 
 # =============================================================================
 # AGGREGATION
 # =============================================================================
 
-# Temporal keys appended to every level's grouping.
-_TEMPORAL_KEYS: List[str] = ["month", "time_period"]
 
-
-def aggregate_ridership(df: pd.DataFrame, group_cols: Sequence[str]) -> pd.DataFrame:
+def aggregate_ridership(
+    df: pd.DataFrame,
+    group_cols: Sequence[str],
+    temporal_keys: Sequence[str],
+) -> pd.DataFrame:
     """Aggregate ridership to boardings/alightings counts per group.
 
     Args:
@@ -369,16 +422,23 @@ def aggregate_ridership(df: pd.DataFrame, group_cols: Sequence[str]) -> pd.DataF
             ``time_period`` columns.
         group_cols: Grouping columns in addition to the temporal keys (may be
             empty for a system-wide aggregation).
+        temporal_keys: Temporal grouping columns for the chosen grain (e.g.
+            ``["month", "time_period"]``, ``["month"]``, or ``[]``).
 
     Returns:
-        Tidy DataFrame with one row per (``*group_cols``, ``month``,
-        ``time_period``) and columns ``boardings``, ``alightings``,
-        ``net_boardings``, ``stop_visits``, ``trips``, and
-        ``avg_boardings_per_trip``.
+        Tidy DataFrame with one row per (``*group_cols``, ``*temporal_keys``)
+        and columns ``boardings``, ``alightings``, ``net_boardings``,
+        ``stop_visits``, ``trips``, and ``avg_boardings_per_trip``.
     """
-    keys = list(group_cols) + _TEMPORAL_KEYS
-    grouped = df.groupby(keys, dropna=False)
-    out = grouped.agg(
+    keys = list(group_cols) + list(temporal_keys)
+    work = df
+    group_on: List[str] = keys
+    if not keys:
+        # System-wide single-row aggregation: group on a constant helper column.
+        work = df.assign(_all=0)
+        group_on = ["_all"]
+
+    out = work.groupby(group_on, dropna=False).agg(
         boardings=("boardings", "sum"),
         alightings=("alightings", "sum"),
         stop_visits=("boardings", "size"),
@@ -398,15 +458,20 @@ def aggregate_ridership(df: pd.DataFrame, group_cols: Sequence[str]) -> pd.DataF
             "avg_boardings_per_trip",
         ]
     ]
-    return out.reset_index().sort_values(keys).reset_index(drop=True)
+    out = out.reset_index()
+    if not keys:
+        out = out.drop(columns="_all")
+        return out
+    return out.sort_values(keys).reset_index(drop=True)
 
 
-def build_all_levels(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
-    """Compute ridership for every aggregation level.
+def build_all_levels(df: pd.DataFrame, temporal_keys: Sequence[str]) -> Dict[str, pd.DataFrame]:
+    """Compute ridership for every aggregation level at one temporal grain.
 
     Args:
         df: Stop visits ready for aggregation (boardings/alightings + temporal
             keys present).
+        temporal_keys: Temporal grouping columns for the chosen grain.
 
     Returns:
         Mapping of level name -> aggregated DataFrame. Each frame gains a
@@ -415,13 +480,16 @@ def build_all_levels(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
     results: Dict[str, pd.DataFrame] = {}
     for level, group_cols in LEVELS.items():
         present = [c for c in group_cols if c in df.columns]
-        agg = aggregate_ridership(df, present)
+        agg = aggregate_ridership(df, present, temporal_keys)
         agg.insert(0, "level", level)
         results[level] = agg
     return results
 
 
-def make_long_table(levels: Mapping[str, pd.DataFrame]) -> pd.DataFrame:
+def make_long_table(
+    levels: Mapping[str, pd.DataFrame],
+    temporal_keys: Sequence[str],
+) -> pd.DataFrame:
     """Concatenate per-level frames into a single tidy long table.
 
     A ``group`` column is synthesized as a human-readable identifier for each
@@ -430,10 +498,11 @@ def make_long_table(levels: Mapping[str, pd.DataFrame]) -> pd.DataFrame:
 
     Args:
         levels: Mapping of level name -> aggregated DataFrame.
+        temporal_keys: Temporal columns present in the frames, placed up front.
 
     Returns:
         A single long DataFrame with a leading ``level`` / ``group`` /
-        ``month`` / ``time_period`` column order.
+        ``*temporal_keys`` column order.
     """
     rows: List[pd.DataFrame] = []
     for level, agg in levels.items():
@@ -460,7 +529,7 @@ def make_long_table(levels: Mapping[str, pd.DataFrame]) -> pd.DataFrame:
         rows.append(frame)
 
     combined = pd.concat(rows, ignore_index=True)
-    front = ["level", "group", "month", "time_period", "boardings", "alightings", "net_boardings"]
+    front = ["level", "group", *temporal_keys, "boardings", "alightings", "net_boardings"]
     ordered = front + [c for c in combined.columns if c not in front]
     return combined[ordered]
 
@@ -527,17 +596,27 @@ def _slug(value: object) -> str:
 
 
 def export_tables(
-    long_table: pd.DataFrame,
+    grain_tables: Mapping[str, pd.DataFrame],
     by_route_and_stop: pd.DataFrame,
     out_dir: Path,
 ) -> List[Path]:
-    """Write the long processed table and the vendor-style stop export."""
+    """Write one CSV per temporal grain plus the vendor-style stop export.
+
+    Args:
+        grain_tables: Mapping of grain name -> its tidy long table.
+        by_route_and_stop: The vendor-style stop export (may be empty).
+        out_dir: Destination directory.
+
+    Returns:
+        Paths of the files written.
+    """
     ensure_dir(out_dir)
     written: List[Path] = []
 
-    long_path = out_dir / PROCESSED_FILENAME
-    long_table.to_csv(long_path, index=False)
-    written.append(long_path)
+    for grain, table in grain_tables.items():
+        grain_path = out_dir / GRAIN_FILENAME[grain]
+        table.to_csv(grain_path, index=False)
+        written.append(grain_path)
 
     if not by_route_and_stop.empty:
         brs_path = out_dir / BY_ROUTE_AND_STOP_FILENAME
@@ -547,17 +626,17 @@ def export_tables(
     return written
 
 
-def plot_levels(long_table: pd.DataFrame, out_dir: Path, split_by_month: bool) -> List[Path]:
+def plot_levels(long_table: pd.DataFrame, out_dir: Path, x_field: str) -> List[Path]:
     """Render boardings bar charts, one PNG per group within each level.
 
-    When ``split_by_month`` is set the x-axis is calendar month; otherwise it
-    is the time period. The high-cardinality ``route_stop`` and ``stop`` levels
-    are skipped to keep the chart count manageable.
+    The high-cardinality ``route_stop`` and ``stop`` levels are skipped to keep
+    the chart count manageable.
 
     Args:
-        long_table: The tidy long ridership table.
+        long_table: The tidy long ridership table for the chart grain.
         out_dir: Output directory; charts are written under ``out_dir/plots``.
-        split_by_month: Whether the run was split by month.
+        x_field: Column to place on the x-axis (``"month"`` or
+            ``"time_period"``).
 
     Returns:
         Paths of the PNG files written.
@@ -566,7 +645,6 @@ def plot_levels(long_table: pd.DataFrame, out_dir: Path, split_by_month: bool) -
     ensure_dir(plots_dir)
     written: List[Path] = []
 
-    x_field = "month" if split_by_month else "time_period"
     chart_levels = ["route_direction", "route", "service_type", "overall"]
     for level in chart_levels:
         sub = long_table.loc[long_table["level"] == level]
@@ -689,14 +767,32 @@ def write_run_log(output_dir: Path, summary_lines: List[str]) -> bool:
 # =============================================================================
 
 
-def run(cfg: Config) -> pd.DataFrame:
+def _pick_chart_grain(grains: Sequence[str]) -> str | None:
+    """Choose which exported grain to chart (prefer a single-axis trend/profile).
+
+    Charts read best with one categorical axis, so a monthly trend is preferred,
+    then a time-of-day profile, then the system total.
+
+    Args:
+        grains: The grains being exported.
+
+    Returns:
+        A grain name to chart, or ``None`` if none is suitable.
+    """
+    for preferred in ("month", "period", "total"):
+        if preferred in grains:
+            return preferred
+    return None
+
+
+def run(cfg: Config) -> Dict[str, pd.DataFrame]:
     """Execute the full ridership pipeline and write all artifacts.
 
     Args:
         cfg: Resolved configuration.
 
     Returns:
-        The tidy long ridership table (also written to disk).
+        Mapping of grain name -> the tidy long ridership table written for it.
     """
     stop_visits = load_stop_visits(cfg.stop_visits_path)
     trips = load_trips_performed(cfg.trips_performed_path)
@@ -713,18 +809,33 @@ def run(cfg: Config) -> pd.DataFrame:
         joined.pipe(filter_for_ridership)
         .pipe(add_ridership_columns)
         .pipe(assign_time_period, cfg.time_periods)
-        .pipe(add_month, cfg.split_by_month)
+        .pipe(add_month)
     )
 
-    levels = build_all_levels(prepared)
-    long_table = make_long_table(levels)
-    by_route_and_stop = build_by_route_and_stop(levels)
+    grains = resolve_grains(cfg.export_grains, cfg.time_periods)
+    if not grains:
+        raise RuntimeError("No valid grains to export; check EXPORT_GRAINS.")
 
-    paths = export_tables(long_table, by_route_and_stop, cfg.output_dir)
+    grain_tables: Dict[str, pd.DataFrame] = {}
+    for grain in grains:
+        temporal_keys = GRAIN_TEMPORAL_KEYS[grain]
+        levels = build_all_levels(prepared, temporal_keys)
+        grain_tables[grain] = make_long_table(levels, temporal_keys)
+
+    # The vendor-style stop export is built at the finest grain available.
+    finest = "month_and_period" if "month_and_period" in grains else grains[0]
+    finest_levels = build_all_levels(prepared, GRAIN_TEMPORAL_KEYS[finest])
+    by_route_and_stop = build_by_route_and_stop(finest_levels)
+
+    paths = export_tables(grain_tables, by_route_and_stop, cfg.output_dir)
     for p in paths:
         logging.info("Wrote table: %s", p)
-    plot_paths = plot_levels(long_table, cfg.output_dir, cfg.split_by_month)
-    logging.info("Wrote %d ridership charts to %s", len(plot_paths), cfg.output_dir / "plots")
+
+    chart_grain = _pick_chart_grain(grains)
+    if chart_grain is not None and GRAIN_TEMPORAL_KEYS[chart_grain]:
+        x_field = GRAIN_TEMPORAL_KEYS[chart_grain][0]
+        plot_paths = plot_levels(grain_tables[chart_grain], cfg.output_dir, x_field)
+        logging.info("Wrote %d ridership charts to %s", len(plot_paths), cfg.output_dir / "plots")
 
     summary_lines = [
         f"Total boardings:    {int(prepared['boardings'].sum())}",
@@ -733,7 +844,7 @@ def run(cfg: Config) -> pd.DataFrame:
         f"Trips observed:     {prepared['trip_id_performed'].nunique()}",
         f"Months in panel:    {prepared['month'].nunique()}",
         f"Time periods:       {', '.join(sorted(prepared['time_period'].unique()))}",
-        f"Processed rows:     {len(long_table)}",
+        f"Grains exported:    {', '.join(grains)}",
     ]
     if not write_run_log(cfg.output_dir, summary_lines) and REQUIRE_RUN_LOG:
         raise RuntimeError(
@@ -741,7 +852,7 @@ def run(cfg: Config) -> pd.DataFrame:
             "error when a sidecar file is genuinely impossible."
         )
 
-    return long_table
+    return grain_tables
 
 
 # =============================================================================
@@ -757,11 +868,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--trips-performed", default=TRIPS_PERFORMED_PATH, help="Path to trips_performed CSV."
     )
     p.add_argument("--output-dir", default=OUTPUT_DIR, help="Directory for outputs.")
-    p.add_argument(
-        "--no-month-split",
-        action="store_true",
-        help="Pool all months together instead of splitting by calendar month.",
-    )
     return p
 
 
@@ -787,7 +893,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         trips_performed_path=Path(args.trips_performed).expanduser(),
         output_dir=Path(args.output_dir).expanduser(),
         time_periods=TIME_PERIODS,
-        split_by_month=not args.no_month_split and SPLIT_BY_MONTH,
+        export_grains=EXPORT_GRAINS,
         routes_to_include=ROUTES_TO_INCLUDE,
         routes_to_exclude=ROUTES_TO_EXCLUDE,
     )

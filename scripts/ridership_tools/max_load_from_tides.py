@@ -23,16 +23,20 @@ several aggregation levels:
 
 Temporal grain
 --------------
-Two independent switches in the CONFIGURATION block control the temporal grain,
-so a single run can produce time-period maxima, monthly maxima, monthly x
-time-period maxima, or a grand total. A trip is assigned to a single time
-period by its **start time** (the conventional "this is an AM-peak trip" rule):
+The CONFIGURATION block produces every temporal grain at once by default, so an
+analyst who is not yet sure which cut they need gets all of them. Each grain is
+written to its own file. This matters more than for simple ridership counts:
+max-load statistics (mean / median / p85 / peak) do not compose across grains,
+so every grain is recomputed from the per-trip table rather than rolled up from
+a finer one. A trip is assigned to a single time period by its **start time**
+(the conventional "this is an AM-peak trip" rule):
 
   * ``TIME_PERIODS`` - named clock windows (e.g. AM PEAK / MIDDAY / PM PEAK).
-    Leave the mapping empty to disable the split (every trip falls in
-    ``ALL DAY``).
-  * ``SPLIT_BY_MONTH`` - when True, split every series by calendar ``month``
-    (``YYYY-MM``); when False the ``month`` column is the constant ``ALL``.
+    Leave the mapping empty to disable time-of-day splitting entirely.
+  * ``EXPORT_GRAINS`` - which grains to write: ``month_and_period`` (finest),
+    ``month`` (a monthly trend), ``period`` (a time-of-day profile), and
+    ``total`` (one number per group). Period grains are skipped automatically
+    when ``TIME_PERIODS`` is empty.
 
 Load factor
 -----------
@@ -48,12 +52,13 @@ Outputs
      month, and time period. Its column shape echoes the vendor
      ``statistics_by_route_and_trip`` export that ``load_factor_monitor``
      consumes, so it can serve as that tool's input.
-  2) ``max_load_processed.csv`` - tidy long table with one row per
-     (level, group, month, time_period) carrying the trip count and the mean /
-     median / 85th-percentile / peak maximum load, mean load factor, and the
-     share of trips over capacity.
-  3) PNG bar charts of mean and peak maximum load per group within each level
-     (by month when ``SPLIT_BY_MONTH`` is set, otherwise by time period).
+  2) One tidy long table per exported grain -- ``max_load_by_month_and_period``
+     / ``max_load_by_month`` / ``max_load_by_period`` / ``max_load_total``
+     ``.csv`` -- each with one row per (level, group, *temporal keys*) carrying
+     the trip count and the mean / median / 85th-percentile / peak maximum load,
+     mean load factor, and the share of trips over capacity.
+  3) PNG bar charts of mean and peak maximum load per group within each level,
+     drawn from the monthly grain when present, otherwise the time-period grain.
   4) A run-log sidecar capturing the verbatim CONFIGURATION block.
 
 A note on APC data
@@ -119,9 +124,20 @@ TIME_PERIODS: Mapping[str, Tuple[str, str]] = {
     "NIGHT": ("22:00", "06:00"),
 }
 
-# When True, every series is additionally split by calendar month (YYYY-MM).
-# When False the "month" column is the constant "ALL".
-SPLIT_BY_MONTH: bool = True
+# Temporal grains to export. Each grain is written to its own CSV so that
+# grains are never mixed as rows in a single file. This matters more here than
+# for simple counts: max-load statistics (mean / median / p85 / peak) do not
+# compose across grains -- a monthly mean cannot be recovered from the
+# month-by-period means -- so every grain is recomputed from the per-trip table.
+# Available grains:
+#   "month_and_period" - finest: one row per (group, month, time period)
+#   "month"            - pooled across time periods (a monthly trend)
+#   "period"           - pooled across months (a time-of-day profile)
+#   "total"            - pooled across both (a single number per group)
+# The two period-bearing grains are skipped automatically when TIME_PERIODS is
+# empty. The default exports everything, which is handy when you are not yet
+# sure which cut you need.
+EXPORT_GRAINS: Sequence[str] = ("month_and_period", "month", "period", "total")
 
 # Optional route filters (matched against route_id as a string). Empty = keep all.
 ROUTES_TO_INCLUDE: Sequence[str] = ()
@@ -131,7 +147,6 @@ LOG_LEVEL: int = logging.INFO
 
 # Filenames.
 BY_TRIP_FILENAME: str = "max_load_by_trip.csv"
-PROCESSED_FILENAME: str = "max_load_processed.csv"
 
 # When True, a failed run-log write aborts the script so an output is never left
 # without a matching configuration record.
@@ -153,7 +168,7 @@ class Config:
     output_dir: Path
     vehicle_capacity: int = VEHICLE_CAPACITY
     time_periods: Mapping[str, Tuple[str, str]] = field(default_factory=dict)
-    split_by_month: bool = SPLIT_BY_MONTH
+    export_grains: Sequence[str] = EXPORT_GRAINS
     routes_to_include: Sequence[str] = ()
     routes_to_exclude: Sequence[str] = ()
 
@@ -164,6 +179,22 @@ LEVELS: Dict[str, List[str]] = {
     "route": ["route_id"],
     "service_type": ["route_type_agency"],
     "overall": [],
+}
+
+# Temporal grain -> the temporal grouping columns it adds to each level.
+GRAIN_TEMPORAL_KEYS: Dict[str, List[str]] = {
+    "month_and_period": ["month", "time_period"],
+    "month": ["month"],
+    "period": ["time_period"],
+    "total": [],
+}
+
+# Temporal grain -> output filename.
+GRAIN_FILENAME: Dict[str, str] = {
+    "month_and_period": "max_load_by_month_and_period.csv",
+    "month": "max_load_by_month.csv",
+    "period": "max_load_by_period.csv",
+    "total": "max_load_total.csv",
 }
 
 # =============================================================================
@@ -348,23 +379,48 @@ def assign_time_period(
     return df
 
 
-def add_month(df: pd.DataFrame, split_by_month: bool) -> pd.DataFrame:
-    """Add a ``month`` column (``YYYY-MM``), or the constant ``"ALL"``.
+def add_month(df: pd.DataFrame) -> pd.DataFrame:
+    """Add a ``month`` column in ``YYYY-MM`` form derived from ``service_date``.
 
     Args:
         df: Per-trip rows with a parsed ``service_date`` column.
-        split_by_month: When True, derive ``YYYY-MM`` from ``service_date``;
-            when False, set the column to ``"ALL"``.
 
     Returns:
         Copy of ``df`` with a string ``month`` column.
     """
     df = df.copy()
-    if split_by_month:
-        df["month"] = pd.to_datetime(df["service_date"], errors="coerce").dt.strftime("%Y-%m")
-    else:
-        df["month"] = "ALL"
+    df["month"] = pd.to_datetime(df["service_date"], errors="coerce").dt.strftime("%Y-%m")
     return df
+
+
+def resolve_grains(
+    export_grains: Sequence[str],
+    time_periods: Mapping[str, Tuple[str, str]],
+) -> List[str]:
+    """Return the grains to actually export, filtered and de-duplicated.
+
+    Unknown grain names are dropped with a warning. When ``time_periods`` is
+    empty the period-bearing grains (``month_and_period`` and ``period``) are
+    skipped, since they would duplicate ``month`` and ``total`` respectively.
+
+    Args:
+        export_grains: Requested grain names (see ``EXPORT_GRAINS``).
+        time_periods: The configured time-period windows.
+
+    Returns:
+        An ordered list of valid grain names with duplicates removed.
+    """
+    has_periods = bool(time_periods)
+    resolved: List[str] = []
+    for grain in export_grains:
+        if grain not in GRAIN_TEMPORAL_KEYS:
+            logging.warning("Ignoring unknown grain %r.", grain)
+            continue
+        if not has_periods and "time_period" in GRAIN_TEMPORAL_KEYS[grain]:
+            continue
+        if grain not in resolved:
+            resolved.append(grain)
+    return resolved
 
 
 def add_load_factor(df: pd.DataFrame, vehicle_capacity: int) -> pd.DataFrame:
@@ -389,9 +445,6 @@ def add_load_factor(df: pd.DataFrame, vehicle_capacity: int) -> pd.DataFrame:
 # AGGREGATION
 # =============================================================================
 
-# Temporal keys appended to every level's grouping.
-_TEMPORAL_KEYS: List[str] = ["month", "time_period"]
-
 
 def _p85(series: pd.Series) -> float:
     """Return the 85th percentile of *series* (NaN for an empty series)."""
@@ -404,29 +457,40 @@ def _p85(series: pd.Series) -> float:
 def aggregate_max_load(
     df: pd.DataFrame,
     group_cols: Sequence[str],
+    temporal_keys: Sequence[str],
     vehicle_capacity: int,
 ) -> pd.DataFrame:
     """Aggregate per-trip maxima to summary statistics per group.
+
+    Because max-load statistics do not compose across grains, this always reads
+    the per-trip rows directly; coarser grains simply group on fewer columns.
 
     Args:
         df: Per-trip max-load rows with ``max_load``, ``load_factor``,
             ``month``, and ``time_period`` columns.
         group_cols: Grouping columns in addition to the temporal keys (may be
             empty for a system-wide aggregation).
+        temporal_keys: Temporal grouping columns for the chosen grain (e.g.
+            ``["month", "time_period"]``, ``["month"]``, or ``[]``).
         vehicle_capacity: Capacity used to flag over-capacity trips.
 
     Returns:
-        Tidy DataFrame with one row per (``*group_cols``, ``month``,
-        ``time_period``) and columns ``trips``, ``mean_max_load``,
-        ``median_max_load``, ``p85_max_load``, ``peak_max_load``,
-        ``mean_load_factor``, and ``pct_trips_over_capacity``.
+        Tidy DataFrame with one row per (``*group_cols``, ``*temporal_keys``)
+        and columns ``trips``, ``mean_max_load``, ``median_max_load``,
+        ``p85_max_load``, ``peak_max_load``, ``mean_load_factor``, and
+        ``pct_trips_over_capacity``.
     """
-    keys = list(group_cols) + _TEMPORAL_KEYS
+    keys = list(group_cols) + list(temporal_keys)
     work = df.copy()
     work["_over"] = (work["max_load"] > vehicle_capacity).astype(float)
 
-    grouped = work.groupby(keys, dropna=False)
-    out = grouped.agg(
+    group_on: List[str] = keys
+    if not keys:
+        # System-wide single-row aggregation: group on a constant helper column.
+        work["_all"] = 0
+        group_on = ["_all"]
+
+    out = work.groupby(group_on, dropna=False).agg(
         trips=("max_load", "size"),
         mean_max_load=("max_load", "mean"),
         median_max_load=("max_load", "median"),
@@ -439,14 +503,22 @@ def aggregate_max_load(
     out["p85_max_load"] = out["p85_max_load"].round(2)
     out["mean_load_factor"] = out["mean_load_factor"].round(4)
     out["pct_trips_over_capacity"] = (out["pct_trips_over_capacity"] * 100.0).round(1)
-    return out.reset_index().sort_values(keys).reset_index(drop=True)
+    out = out.reset_index()
+    if not keys:
+        return out.drop(columns="_all")
+    return out.sort_values(keys).reset_index(drop=True)
 
 
-def build_all_levels(df: pd.DataFrame, vehicle_capacity: int) -> Dict[str, pd.DataFrame]:
-    """Compute max-load summaries for every aggregation level.
+def build_all_levels(
+    df: pd.DataFrame,
+    temporal_keys: Sequence[str],
+    vehicle_capacity: int,
+) -> Dict[str, pd.DataFrame]:
+    """Compute max-load summaries for every aggregation level at one grain.
 
     Args:
         df: Per-trip max-load rows ready for aggregation.
+        temporal_keys: Temporal grouping columns for the chosen grain.
         vehicle_capacity: Capacity used to flag over-capacity trips.
 
     Returns:
@@ -456,13 +528,16 @@ def build_all_levels(df: pd.DataFrame, vehicle_capacity: int) -> Dict[str, pd.Da
     results: Dict[str, pd.DataFrame] = {}
     for level, group_cols in LEVELS.items():
         present = [c for c in group_cols if c in df.columns]
-        agg = aggregate_max_load(df, present, vehicle_capacity)
+        agg = aggregate_max_load(df, present, temporal_keys, vehicle_capacity)
         agg.insert(0, "level", level)
         results[level] = agg
     return results
 
 
-def make_long_table(levels: Mapping[str, pd.DataFrame]) -> pd.DataFrame:
+def make_long_table(
+    levels: Mapping[str, pd.DataFrame],
+    temporal_keys: Sequence[str],
+) -> pd.DataFrame:
     """Concatenate per-level frames into a single tidy long table.
 
     A ``group`` column is synthesized as a human-readable identifier for each
@@ -470,10 +545,11 @@ def make_long_table(levels: Mapping[str, pd.DataFrame]) -> pd.DataFrame:
 
     Args:
         levels: Mapping of level name -> aggregated DataFrame.
+        temporal_keys: Temporal columns present in the frames, placed up front.
 
     Returns:
         A single long DataFrame with a leading ``level`` / ``group`` /
-        ``month`` / ``time_period`` column order.
+        ``*temporal_keys`` column order.
     """
     rows: List[pd.DataFrame] = []
     for level, agg in levels.items():
@@ -490,7 +566,7 @@ def make_long_table(levels: Mapping[str, pd.DataFrame]) -> pd.DataFrame:
         rows.append(frame)
 
     combined = pd.concat(rows, ignore_index=True)
-    front = ["level", "group", "month", "time_period", "trips", "mean_max_load", "peak_max_load"]
+    front = ["level", "group", *temporal_keys, "trips", "mean_max_load", "peak_max_load"]
     ordered = front + [c for c in combined.columns if c not in front]
     return combined[ordered]
 
@@ -548,10 +624,19 @@ def _slug(value: object) -> str:
 
 def export_tables(
     by_trip: pd.DataFrame,
-    long_table: pd.DataFrame,
+    grain_tables: Mapping[str, pd.DataFrame],
     out_dir: Path,
 ) -> List[Path]:
-    """Write the per-trip max-load table and the long processed table."""
+    """Write the per-trip max-load table and one CSV per temporal grain.
+
+    Args:
+        by_trip: The per-trip max-load table.
+        grain_tables: Mapping of grain name -> its tidy long table.
+        out_dir: Destination directory.
+
+    Returns:
+        Paths of the files written.
+    """
     ensure_dir(out_dir)
     written: List[Path] = []
 
@@ -559,23 +644,22 @@ def export_tables(
     by_trip.to_csv(by_trip_path, index=False)
     written.append(by_trip_path)
 
-    long_path = out_dir / PROCESSED_FILENAME
-    long_table.to_csv(long_path, index=False)
-    written.append(long_path)
+    for grain, table in grain_tables.items():
+        grain_path = out_dir / GRAIN_FILENAME[grain]
+        table.to_csv(grain_path, index=False)
+        written.append(grain_path)
 
     return written
 
 
-def plot_levels(long_table: pd.DataFrame, out_dir: Path, split_by_month: bool) -> List[Path]:
+def plot_levels(long_table: pd.DataFrame, out_dir: Path, x_field: str) -> List[Path]:
     """Render mean/peak max-load bar charts per group within each level.
 
-    When ``split_by_month`` is set the x-axis is calendar month; otherwise it
-    is the time period.
-
     Args:
-        long_table: The tidy long max-load table.
+        long_table: The tidy long max-load table for the chart grain.
         out_dir: Output directory; charts are written under ``out_dir/plots``.
-        split_by_month: Whether the run was split by month.
+        x_field: Column to place on the x-axis (``"month"`` or
+            ``"time_period"``).
 
     Returns:
         Paths of the PNG files written.
@@ -584,7 +668,6 @@ def plot_levels(long_table: pd.DataFrame, out_dir: Path, split_by_month: bool) -
     ensure_dir(plots_dir)
     written: List[Path] = []
 
-    x_field = "month" if split_by_month else "time_period"
     for level in long_table["level"].unique():
         sub = long_table.loc[long_table["level"] == level]
         categories = sorted(sub[x_field].dropna().unique())
@@ -709,6 +792,21 @@ def write_run_log(output_dir: Path, summary_lines: List[str]) -> bool:
 # =============================================================================
 
 
+def _pick_chart_grain(grains: Sequence[str]) -> str | None:
+    """Choose which exported grain to chart (prefer a single-axis trend/profile).
+
+    Args:
+        grains: The grains being exported.
+
+    Returns:
+        A grain name to chart, or ``None`` if none is suitable.
+    """
+    for preferred in ("month", "period", "total"):
+        if preferred in grains:
+            return preferred
+    return None
+
+
 def run(cfg: Config) -> Dict[str, pd.DataFrame]:
     """Execute the full max-load pipeline and write all artifacts.
 
@@ -716,8 +814,8 @@ def run(cfg: Config) -> Dict[str, pd.DataFrame]:
         cfg: Resolved configuration.
 
     Returns:
-        Mapping with keys ``by_trip`` (per-trip maxima) and ``processed``
-        (the tidy long summary).
+        Mapping with key ``by_trip`` (per-trip maxima) plus one key per
+        exported grain (the tidy long summary written for it).
     """
     stop_visits = load_stop_visits(cfg.stop_visits_path)
     trips = load_trips_performed(cfg.trips_performed_path)
@@ -734,19 +832,31 @@ def run(cfg: Config) -> Dict[str, pd.DataFrame]:
 
     prepared = (
         joined.pipe(assign_time_period, cfg.time_periods)
-        .pipe(add_month, cfg.split_by_month)
+        .pipe(add_month)
         .pipe(add_load_factor, cfg.vehicle_capacity)
     )
 
     by_trip = build_by_trip_export(prepared)
-    levels = build_all_levels(prepared, cfg.vehicle_capacity)
-    long_table = make_long_table(levels)
 
-    paths = export_tables(by_trip, long_table, cfg.output_dir)
+    grains = resolve_grains(cfg.export_grains, cfg.time_periods)
+    if not grains:
+        raise RuntimeError("No valid grains to export; check EXPORT_GRAINS.")
+
+    grain_tables: Dict[str, pd.DataFrame] = {}
+    for grain in grains:
+        temporal_keys = GRAIN_TEMPORAL_KEYS[grain]
+        levels = build_all_levels(prepared, temporal_keys, cfg.vehicle_capacity)
+        grain_tables[grain] = make_long_table(levels, temporal_keys)
+
+    paths = export_tables(by_trip, grain_tables, cfg.output_dir)
     for p in paths:
         logging.info("Wrote table: %s", p)
-    plot_paths = plot_levels(long_table, cfg.output_dir, cfg.split_by_month)
-    logging.info("Wrote %d max-load charts to %s", len(plot_paths), cfg.output_dir / "plots")
+
+    chart_grain = _pick_chart_grain(grains)
+    if chart_grain is not None and GRAIN_TEMPORAL_KEYS[chart_grain]:
+        x_field = GRAIN_TEMPORAL_KEYS[chart_grain][0]
+        plot_paths = plot_levels(grain_tables[chart_grain], cfg.output_dir, x_field)
+        logging.info("Wrote %d max-load charts to %s", len(plot_paths), cfg.output_dir / "plots")
 
     peak = int(prepared["max_load"].max()) if not prepared.empty else 0
     mean_load = round(float(prepared["max_load"].mean()), 2) if not prepared.empty else 0
@@ -757,7 +867,7 @@ def run(cfg: Config) -> Dict[str, pd.DataFrame]:
         f"Vehicle capacity:    {cfg.vehicle_capacity}",
         f"Months in panel:     {prepared['month'].nunique()}",
         f"Time periods:        {', '.join(sorted(prepared['time_period'].unique()))}",
-        f"Processed rows:      {len(long_table)}",
+        f"Grains exported:     {', '.join(grains)}",
     ]
     if not write_run_log(cfg.output_dir, summary_lines) and REQUIRE_RUN_LOG:
         raise RuntimeError(
@@ -765,7 +875,7 @@ def run(cfg: Config) -> Dict[str, pd.DataFrame]:
             "error when a sidecar file is genuinely impossible."
         )
 
-    return {"by_trip": by_trip, "processed": long_table}
+    return {"by_trip": by_trip, **grain_tables}
 
 
 # =============================================================================
@@ -786,11 +896,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=VEHICLE_CAPACITY,
         help="Capacity used for the load factor.",
-    )
-    p.add_argument(
-        "--no-month-split",
-        action="store_true",
-        help="Pool all months together instead of splitting by calendar month.",
     )
     return p
 
@@ -818,7 +923,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         output_dir=Path(args.output_dir).expanduser(),
         vehicle_capacity=args.vehicle_capacity,
         time_periods=TIME_PERIODS,
-        split_by_month=not args.no_month_split and SPLIT_BY_MONTH,
+        export_grains=EXPORT_GRAINS,
         routes_to_include=ROUTES_TO_INCLUDE,
         routes_to_exclude=ROUTES_TO_EXCLUDE,
     )
