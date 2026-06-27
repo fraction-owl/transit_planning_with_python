@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from scripts.stop_analysis.gtfs_stop_compare import (
+from scripts.stop_analysis.gtfs_stop_diff import (
     build_modified_description,
     coerce_float,
     compare_stops,

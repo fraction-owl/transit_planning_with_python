@@ -107,7 +107,7 @@ transit_planning_with_python/
 │   │   └── site_route_proximity_gpd.py
 │   └── stop_analysis/
 │       ├── audit_turn_clearance.py
-│       ├── gtfs_stop_compare.py
+│       ├── gtfs_stop_diff.py
 │       ├── route_direction_classifier.py
 │       ├── stop_impacts_target_routes.py
 │       ├── stop_removal_impact_gpd.py
@@ -188,7 +188,7 @@ transit_planning_with_python/
 │   ├── test_gtfs_route_features.py
 │   ├── test_gtfs_route_summary.py
 │   ├── test_gtfs_service_demographics_gpd.py
-│   ├── test_gtfs_stop_compare.py
+│   ├── test_gtfs_stop_diff.py
 │   ├── test_gtfs_stop_proximity_qc.py
 │   ├── test_gtfs_to_shapefile_gpd.py
 │   ├── test_load_factor_monitor.py
