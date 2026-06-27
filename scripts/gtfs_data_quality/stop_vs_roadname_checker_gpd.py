@@ -4,20 +4,27 @@ This script buffers GTFS stops, spatially joins them with nearby roadway
 centerlines, and uses fuzzy string comparison to flag discrepancies between
 stop names and adjacent road names.
 
+To reduce false positives, suspected fixed-width-truncated stop names are
+flagged in a separate report and excluded from matching (keeping a planner in
+the loop), common abbreviations are expanded before comparison, and substring
+containment matches (abbreviations/partials) are suppressed.
+
 Inputs:
     - GTFS 'stops.txt' file
     - Roadway centerline shapefile
-    - Configuration parameters (paths, CRS, buffer distance, similarity threshold)
+    - Configuration parameters (paths, CRS, buffer distance, similarity threshold,
+      stop-identifier field, truncation detection, false-positive filters)
     - Optional user input for mapping non-standard roadway field names
 
 Outputs:
     - CSV listing potential stop name typos and similarity scores
+    - CSV listing suspected-truncated stop names for manual review
 """
 
 import logging
 import os
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Any, Dict, List, Optional, Set
 
 import geopandas as gpd
@@ -39,12 +46,63 @@ OUTPUT_DIR = r"path\to\output\directory"  # Replace with your desired output dir
 OUTPUT_CSV_NAME = "potential_typos.csv"
 OUTPUT_CSV_PATH = os.path.join(OUTPUT_DIR, OUTPUT_CSV_NAME)
 
+# Stop identifier field used to label rows in the output. "stop_id" is required
+# by the GTFS spec and always present; "stop_code" is the optional public-facing
+# code. If STOP_ID_FIELD is set to a column that is absent from stops.txt, the
+# script falls back to "stop_id" with a warning.
+STOP_ID_FIELD = "stop_id"  # "stop_id" or "stop_code"
+
 # Coordinate Reference Systems
 STOPS_CRS = "EPSG:4326"  # WGS84 Latitude/Longitude. Typically standard for GTFS stops.
 TARGET_CRS = "EPSG:2248"  # Projected CRS for spatial analysis (adjust as needed).
 
 # Processing parameters
 SIMILARITY_THRESHOLD = 80  # 0-100, higher number yields fewer results
+
+# -----------------------------------------------------------------------------
+# Length-truncation detection
+# -----------------------------------------------------------------------------
+# Legacy AVL / scheduling systems frequently truncate ``stop_name`` to a fixed
+# character width. Truncated names ("Martin Luther King Jr Av" -> "Martin Luther
+# King Jr") produce noisy, low-confidence fuzzy matches, so they are flagged in a
+# separate report and excluded from typo matching rather than silently dropped.
+# This keeps a planner in the loop: the truncated stops are surfaced for manual
+# review instead of polluting the typo output.
+DETECT_TRUNCATION = True
+# Manual override. When set to an int, any stop whose name length is >= this value
+# is treated as suspected-truncated. Leave as None to auto-detect the truncation
+# width from the stop-name length distribution.
+TRUNCATION_LENGTH: Optional[int] = None
+# Auto-detection guardrails: the longest observed name length is treated as a
+# truncation artifact only if at least TRUNCATION_MIN_COUNT stops *and* at least
+# TRUNCATION_MIN_FRACTION of all stops share that exact length (i.e. a spike at
+# the maximum width, which is the signature of fixed-width truncation).
+TRUNCATION_MIN_COUNT = 5
+TRUNCATION_MIN_FRACTION = 0.02
+OUTPUT_TRUNCATED_CSV_NAME = "suspected_truncated_stops.csv"
+
+# -----------------------------------------------------------------------------
+# False-positive filters
+# -----------------------------------------------------------------------------
+# When True, a stop/road pair is not flagged as a typo if one normalized name
+# fully contains the other (e.g. "washington" vs "washington heights"). These are
+# abbreviations or partial names, not misspellings.
+FILTER_SUBSTRING_CONTAINMENT = True
+# When True, common abbreviations are expanded before comparison so that, e.g.,
+# "Ft Hunt" matches "Fort Hunt" instead of being flagged as a typo. Street-type
+# modifiers (St, Ave, Rd, ...) are already removed during normalization, so this
+# map deliberately targets name-body abbreviations rather than street types.
+EXPAND_ABBREVIATIONS = True
+ABBREVIATIONS: Dict[str, str] = {
+    "ft": "fort",
+    "mt": "mount",
+    "mtn": "mountain",
+    "jct": "junction",
+    "spgs": "springs",
+    "hts": "heights",
+    "pt": "point",
+    "ctr": "center",
+}
 
 # Buffer distance configuration
 BUFFER_DISTANCE_VALUE = 50
@@ -126,6 +184,29 @@ def convert_buffer_distance(value: float, from_unit: str, to_unit: str) -> float
 # -----------------------------------------------------------------------------
 # DATA LOADING FUNCTIONS
 # -----------------------------------------------------------------------------
+
+
+def resolve_stop_id_field(stops_df: pd.DataFrame, preferred: str = STOP_ID_FIELD) -> str:
+    """Return the stop-identifier column to use, falling back to ``stop_id``.
+
+    ``stop_id`` is mandatory in GTFS, whereas ``stop_code`` is optional. If the
+    preferred field is absent, the caller is warned and ``stop_id`` is used.
+
+    Args:
+        stops_df (pandas.DataFrame): Parsed ``stops.txt``.
+        preferred (str, optional): Configured identifier field. Defaults to
+            STOP_ID_FIELD.
+
+    Returns:
+        str: ``preferred`` if present, otherwise ``"stop_id"``.
+    """
+    if preferred in stops_df.columns:
+        return preferred
+    logging.warning(
+        "STOP_ID_FIELD '%s' is not present in stops.txt; falling back to 'stop_id'.",
+        preferred,
+    )
+    return "stop_id"
 
 
 def load_stops(stops_df: pd.DataFrame, crs: str = STOPS_CRS) -> gpd.GeoDataFrame:
@@ -242,12 +323,19 @@ def extract_modifiers(
     return modifiers
 
 
-def normalize_street_name(name: str, modifiers_set: Set[str]) -> str:
+def normalize_street_name(
+    name: str,
+    modifiers_set: Set[str],
+    abbreviations: Optional[Mapping[str, str]] = None,
+) -> str:
     """Normalize a street name by removing known modifiers, punctuation, and extra spaces.
 
     Args:
         name (str): The street name to normalize.
         modifiers_set (set): A set of known modifiers to remove from the name.
+        abbreviations (Mapping[str, str], optional): Token-level abbreviation map
+            applied after cleaning so that, e.g., ``"ft" -> "fort"``. When ``None``
+            (the default) no expansion is performed.
 
     Returns:
         str: The normalized street name.
@@ -258,7 +346,72 @@ def normalize_street_name(name: str, modifiers_set: Set[str]) -> str:
         pattern = r"\b(" + "|".join(re.escape(m) for m in modifiers_set) + r")\b"
         name = re.sub(pattern, "", name, flags=re.IGNORECASE)
     name = re.sub(r"[^\w\s]", "", name)
-    return re.sub(r"\s+", " ", name).strip().lower()
+    name = re.sub(r"\s+", " ", name).strip().lower()
+    if abbreviations:
+        name = " ".join(abbreviations.get(token, token) for token in name.split())
+    return name
+
+
+def detect_truncation_length(
+    stop_names: Iterable[Any],
+    min_count: int = TRUNCATION_MIN_COUNT,
+    min_fraction: float = TRUNCATION_MIN_FRACTION,
+) -> Optional[int]:
+    """Infer a fixed-width truncation length from a collection of stop names.
+
+    Fixed-width truncation leaves a tell-tale spike of names at the maximum
+    observed length. The longest length is reported as the truncation width only
+    if enough stops cluster there (both an absolute count and a fraction of all
+    stops), which avoids mistaking a single long name for truncation.
+
+    Args:
+        stop_names (Iterable): Stop-name values (non-strings are ignored).
+        min_count (int, optional): Minimum number of stops at the maximum length.
+            Defaults to TRUNCATION_MIN_COUNT.
+        min_fraction (float, optional): Minimum share of all stops at the maximum
+            length. Defaults to TRUNCATION_MIN_FRACTION.
+
+    Returns:
+        int or None: The suspected truncation width, or None if no spike is found.
+    """
+    lengths = [len(name) for name in stop_names if isinstance(name, str) and name]
+    if not lengths:
+        return None
+    max_len = max(lengths)
+    count_at_max = sum(1 for length in lengths if length == max_len)
+    if count_at_max >= min_count and (count_at_max / len(lengths)) >= min_fraction:
+        return max_len
+    return None
+
+
+def flag_truncated_stops(
+    stops_gdf: gpd.GeoDataFrame,
+    truncation_length: Optional[int],
+    stop_id_field: str = "stop_id",
+) -> pd.DataFrame:
+    """Return stops whose names are at/above the suspected truncation width.
+
+    Args:
+        stops_gdf (gpd.GeoDataFrame): The GeoDataFrame of stops.
+        truncation_length (int or None): Suspected truncation width. When None, no
+            stop is flagged and an empty (but correctly-columned) frame is returned.
+        stop_id_field (str, optional): Identifier column to include. Defaults to
+            ``"stop_id"``.
+
+    Returns:
+        pd.DataFrame: Columns ``[stop_id_field, "stop_name", "stop_name_length",
+        "suspected_truncation_length"]`` for each flagged stop.
+    """
+    columns = [stop_id_field, "stop_name", "stop_name_length", "suspected_truncation_length"]
+    if truncation_length is None:
+        return pd.DataFrame(columns=columns)
+
+    name_lengths = stops_gdf["stop_name"].apply(lambda s: len(s) if isinstance(s, str) else 0)
+    mask = name_lengths >= truncation_length
+    flagged = stops_gdf.loc[mask, [stop_id_field, "stop_name"]].copy()
+    flagged["stop_name_length"] = name_lengths[mask].to_numpy()
+    flagged["suspected_truncation_length"] = truncation_length
+    return flagged.reset_index(drop=True)
 
 
 def create_buffered_stops(stops_gdf: gpd.GeoDataFrame, buffer_distance: float) -> gpd.GeoDataFrame:
@@ -276,31 +429,41 @@ def create_buffered_stops(stops_gdf: gpd.GeoDataFrame, buffer_distance: float) -
 
 
 def spatial_join_stops_roadways(
-    stops_buffered_gdf: gpd.GeoDataFrame, roadways_gdf: gpd.GeoDataFrame
+    stops_buffered_gdf: gpd.GeoDataFrame,
+    roadways_gdf: gpd.GeoDataFrame,
+    stop_id_field: str = "stop_id",
 ) -> gpd.GeoDataFrame:
     """Spatially join the buffered stops with the roadways.
 
     Args:
         stops_buffered_gdf (gpd.GeoDataFrame): The GeoDataFrame of buffered stops.
         roadways_gdf (gpd.GeoDataFrame): The GeoDataFrame of roadways.
+        stop_id_field (str, optional): Stop-identifier column to carry through the
+            join. Defaults to ``"stop_id"``.
 
     Returns:
         gpd.GeoDataFrame: A GeoDataFrame resulting from the spatial join.
     """
     return gpd.sjoin(
-        stops_buffered_gdf[["stop_id", "stop_name", "buffered_geometry"]],
+        stops_buffered_gdf[[stop_id_field, "stop_name", "buffered_geometry"]],
         roadways_gdf[["FULLNAME", "FULLNAME_clean", "geometry"]],
         how="left",
         predicate="intersects",
     )
 
 
-def extract_street_names(stop_name: str, modifiers: Set[str]) -> List[str]:
+def extract_street_names(
+    stop_name: str,
+    modifiers: Set[str],
+    abbreviations: Optional[Mapping[str, str]] = None,
+) -> List[str]:
     """Extract potential street names from a stop name using common separators.
 
     Args:
         stop_name (str): The name of the stop.
         modifiers (set): A set of known modifiers to assist in normalization.
+        abbreviations (Mapping[str, str], optional): Abbreviation map forwarded to
+            :func:`normalize_street_name`.
 
     Returns:
         list: A list of normalized street names extracted from the stop name.
@@ -310,7 +473,35 @@ def extract_street_names(stop_name: str, modifiers: Set[str]) -> List[str]:
     separators = [" @ ", " and ", " & ", "/", " intersection of "]
     pattern = "|".join(map(re.escape, separators))
     streets = re.split(pattern, stop_name, flags=re.IGNORECASE)
-    return [normalize_street_name(street, modifiers) for street in streets if street]
+    return [normalize_street_name(street, modifiers, abbreviations) for street in streets if street]
+
+
+def is_substring_match(street: str, road_name: str) -> bool:
+    """Return True if one normalized name fully contains the other (token-aware).
+
+    Used to suppress false positives where a stop fragment is an abbreviation or
+    partial form of a road name (e.g. ``"washington"`` vs ``"washington heights"``)
+    rather than a misspelling. Whole-token containment is required so that, e.g.,
+    ``"oak"`` does not match ``"oakland"``.
+
+    Args:
+        street (str): Normalized street fragment from the stop name.
+        road_name (str): Normalized road name.
+
+    Returns:
+        bool: True if either name's tokens are a contiguous subsequence of the other.
+    """
+    if not street or not road_name:
+        return False
+    street_tokens = street.split()
+    road_tokens = road_name.split()
+    shorter, longer = (
+        (street_tokens, road_tokens)
+        if len(street_tokens) <= len(road_tokens)
+        else (road_tokens, street_tokens)
+    )
+    span = len(shorter)
+    return any(longer[i : i + span] == shorter for i in range(len(longer) - span + 1))
 
 
 def compare_stop_to_roads(
@@ -320,6 +511,8 @@ def compare_stop_to_roads(
     road_names: Set[str],
     roads_gdf: gpd.GeoDataFrame,
     threshold: int,
+    stop_id_field: str = "stop_id",
+    filter_substring: bool = False,
 ) -> List[Dict[str, Any]]:
     """Compare each portion of the stop name to known road names via fuzzy matching.
 
@@ -333,6 +526,11 @@ def compare_stop_to_roads(
             original road names.
         threshold (int): The similarity score threshold (0-100) for considering a
             match.
+        stop_id_field (str, optional): Key used for the identifier column in each
+            output row. Defaults to ``"stop_id"``.
+        filter_substring (bool, optional): When True, skip pairs where one
+            normalized name fully contains the other (likely abbreviation, not a
+            typo). Defaults to False.
 
     Returns:
         list[dict]: A list of dictionaries, each representing a potential typo.
@@ -344,13 +542,15 @@ def compare_stop_to_roads(
         match_tuples = process.extract(street, road_names, scorer=fuzz.token_set_ratio, limit=3)
         for match_clean, score, _ in match_tuples:
             if threshold <= score < 100:
+                if filter_substring and is_substring_match(street, match_clean):
+                    continue
                 original_matches = roads_gdf.loc[
                     roads_gdf["FULLNAME_clean"] == match_clean, "FULLNAME"
                 ].unique()
                 for original_match in original_matches:
                     potential_typos_list.append(
                         {
-                            "stop_id": stop_id,
+                            stop_id_field: stop_id,
                             "stop_name": stop_name,
                             "street_in_stop_name": street,
                             "similar_road_name_clean": match_clean,
@@ -367,6 +567,10 @@ def process_typos(
     modifiers: Set[str],
     join_gdf: gpd.GeoDataFrame,
     threshold: int,
+    stop_id_field: str = "stop_id",
+    skip_ids: Optional[Set[str]] = None,
+    abbreviations: Optional[Mapping[str, str]] = None,
+    filter_substring: bool = False,
 ) -> pd.DataFrame:
     """Process each stop and perform fuzzy matching to identify potential typos.
 
@@ -383,22 +587,35 @@ def process_typos(
             :func:`spatial_join_stops_roadways`. Each stop is compared only
             against roads inside its own buffer.
         threshold (int): The similarity score threshold for fuzzy matching.
+        stop_id_field (str, optional): Stop-identifier column. Defaults to
+            ``"stop_id"``.
+        skip_ids (set, optional): Stop identifiers to exclude from matching (e.g.
+            suspected-truncated stops reported separately). Defaults to None.
+        abbreviations (Mapping[str, str], optional): Abbreviation map applied when
+            normalizing stop-name fragments. Defaults to None.
+        filter_substring (bool, optional): Forwarded to
+            :func:`compare_stop_to_roads` to drop substring-containment matches.
+            Defaults to False.
 
     Returns:
         pd.DataFrame: A deduplicated DataFrame of potential typos, sorted by
         similarity score. Empty DataFrame if no candidates are found.
     """
+    skip_ids = skip_ids or set()
+
     # Build per-stop nearby-road sets from the spatial join.
     local = join_gdf.dropna(subset=["FULLNAME_clean"])
     nearby_clean_by_stop: Dict[str, Set[str]] = (
-        local.groupby("stop_id")["FULLNAME_clean"].apply(lambda s: set(s.unique())).to_dict()
+        local.groupby(stop_id_field)["FULLNAME_clean"].apply(lambda s: set(s.unique())).to_dict()
     )
 
     potential_typos: List[Dict[str, Any]] = []
     for _, stop in stops_gdf.iterrows():
-        s_id = stop["stop_id"]
+        s_id = stop[stop_id_field]
+        if s_id in skip_ids:
+            continue
         s_name = stop["stop_name"]
-        s_streets = extract_street_names(s_name, modifiers)
+        s_streets = extract_street_names(s_name, modifiers, abbreviations)
 
         local_road_names = nearby_clean_by_stop.get(s_id, set())
         if not local_road_names:
@@ -407,7 +624,14 @@ def process_typos(
         local_roads_gdf = roadways_gdf[roadways_gdf["FULLNAME_clean"].isin(local_road_names)]
 
         typos = compare_stop_to_roads(
-            s_id, s_name, s_streets, local_road_names, local_roads_gdf, threshold
+            s_id,
+            s_name,
+            s_streets,
+            local_road_names,
+            local_roads_gdf,
+            threshold,
+            stop_id_field=stop_id_field,
+            filter_substring=filter_substring,
         )
         potential_typos.extend(typos)
 
@@ -415,7 +639,7 @@ def process_typos(
     if not potential_typos:
         return pd.DataFrame(
             columns=[
-                "stop_id",
+                stop_id_field,
                 "stop_name",
                 "street_in_stop_name",
                 "similar_road_name_clean",
@@ -549,7 +773,12 @@ def main() -> None:
     # ------------------------------------------------------------------
     gtfs_data = load_gtfs_data(GTFS_FOLDER, files=["stops.txt"])
     stops_df = gtfs_data["stops"]  # key name = file name w/o ".txt"
+    stop_id_field = resolve_stop_id_field(stops_df, STOP_ID_FIELD)
+    logging.info("Using '%s' as the stop identifier field.", stop_id_field)
     stops_gdf = load_stops(stops_df)  # validate and convert to GDF
+
+    # Abbreviation map applied during normalization (None disables expansion).
+    abbreviations = ABBREVIATIONS if EXPAND_ABBREVIATIONS else None
 
     # 4. Load roadway shapefile
     roadways_gdf = load_roadways(ROADWAYS_PATH)
@@ -570,7 +799,7 @@ def main() -> None:
     modifiers = extract_modifiers(roadways_gdf, column_mapping)
     logging.info("Extracted modifiers (%d): %s", len(modifiers), modifiers)
     roadways_gdf["FULLNAME_clean"] = roadways_gdf["FULLNAME"].apply(
-        lambda x: normalize_street_name(x, modifiers)
+        lambda x: normalize_street_name(x, modifiers, abbreviations)
     )
 
     # ------------------------------------------------------------------
@@ -585,13 +814,40 @@ def main() -> None:
         else BUFFER_DISTANCE_VALUE
     )
 
-    # 9. Buffer stops, spatial-join with roadways
+    # ------------------------------------------------------------------
+    # 9. Flag suspected-truncated stop names (planner-in-the-loop)
+    #    These are reported separately and excluded from fuzzy matching so
+    #    they don't generate noisy, low-confidence "typos".
+    # ------------------------------------------------------------------
+    skip_ids: Set[str] = set()
+    if DETECT_TRUNCATION:
+        truncation_length = (
+            TRUNCATION_LENGTH
+            if TRUNCATION_LENGTH is not None
+            else detect_truncation_length(stops_gdf["stop_name"])
+        )
+        if truncation_length is not None:
+            logging.info("Suspected truncation width: %d characters.", truncation_length)
+            truncated_df = flag_truncated_stops(stops_gdf, truncation_length, stop_id_field)
+            if not truncated_df.empty:
+                skip_ids = set(truncated_df[stop_id_field])
+                trunc_path = os.path.join(OUTPUT_DIR, OUTPUT_TRUNCATED_CSV_NAME)
+                truncated_df.to_csv(trunc_path, index=False)
+                logging.info(
+                    "Flagged %d suspected-truncated stop(s) -> %s (excluded from matching).",
+                    len(truncated_df),
+                    trunc_path,
+                )
+        else:
+            logging.info("No fixed-width truncation pattern detected.")
+
+    # 10. Buffer stops, spatial-join with roadways
     stops_buffered = create_buffered_stops(stops_gdf, buffer_distance)
-    join_gdf = spatial_join_stops_roadways(stops_buffered, roadways_gdf)
+    join_gdf = spatial_join_stops_roadways(stops_buffered, roadways_gdf, stop_id_field)
     logging.info("Spatial join produced %d candidate matches", join_gdf.shape[0])
 
     # ------------------------------------------------------------------
-    # 10. Fuzzy-match street names to find potential typos
+    # 11. Fuzzy-match street names to find potential typos
     # ------------------------------------------------------------------
     typos_df = process_typos(
         stops_gdf,
@@ -599,9 +855,13 @@ def main() -> None:
         modifiers,
         join_gdf,
         SIMILARITY_THRESHOLD,
+        stop_id_field=stop_id_field,
+        skip_ids=skip_ids,
+        abbreviations=abbreviations,
+        filter_substring=FILTER_SUBSTRING_CONTAINMENT,
     )
 
-    # 11. Save or report results
+    # 12. Save or report results
     if typos_df.empty:
         logging.info("No potential typos found.")
     else:

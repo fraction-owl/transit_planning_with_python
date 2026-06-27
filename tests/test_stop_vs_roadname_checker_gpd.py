@@ -380,6 +380,157 @@ def test_process_typos_respects_buffer_scoping() -> None:
 
 
 # ---------------------------------------------------------------------------
+# resolve_stop_id_field
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_stop_id_field_returns_preferred_when_present() -> None:
+    df = _make_stops_df([{"stop_id": "S1", "stop_code": "100", "stop_name": "Main"}])
+    assert target.resolve_stop_id_field(df, "stop_code") == "stop_code"
+
+
+def test_resolve_stop_id_field_falls_back_to_stop_id() -> None:
+    df = _make_stops_df([{"stop_id": "S1", "stop_name": "Main"}])
+    assert target.resolve_stop_id_field(df, "stop_code") == "stop_id"
+
+
+# ---------------------------------------------------------------------------
+# normalize_street_name — abbreviation expansion
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_street_name_expands_abbreviations() -> None:
+    result = target.normalize_street_name("Ft Hunt", set(), {"ft": "fort"})
+    assert result == "fort hunt"
+
+
+def test_normalize_street_name_abbreviations_default_noop() -> None:
+    # Without an abbreviation map, tokens are left untouched.
+    assert target.normalize_street_name("Ft Hunt", set()) == "ft hunt"
+
+
+# ---------------------------------------------------------------------------
+# detect_truncation_length
+# ---------------------------------------------------------------------------
+
+
+def test_detect_truncation_length_finds_spike() -> None:
+    # Ten names all exactly 24 chars long -> a clear fixed-width spike.
+    names = ["X" * 24 for _ in range(10)] + ["Short", "Also short"]
+    assert target.detect_truncation_length(names, min_count=5, min_fraction=0.1) == 24
+
+
+def test_detect_truncation_length_none_when_no_spike() -> None:
+    # A single long name is not enough to count as truncation.
+    names = ["A" * 30] + ["short name {}".format(i) for i in range(50)]
+    assert target.detect_truncation_length(names, min_count=5, min_fraction=0.1) is None
+
+
+def test_detect_truncation_length_handles_empty() -> None:
+    assert target.detect_truncation_length([]) is None
+
+
+# ---------------------------------------------------------------------------
+# flag_truncated_stops
+# ---------------------------------------------------------------------------
+
+
+def test_flag_truncated_stops_flags_long_names() -> None:
+    df = _make_stops_df(
+        [
+            {"stop_id": "S1", "stop_name": "X" * 24, "stop_lat": "38.9", "stop_lon": "-77.0"},
+            {"stop_id": "S2", "stop_name": "Short", "stop_lat": "38.9", "stop_lon": "-77.0"},
+        ]
+    )
+    gdf = target.load_stops(df)
+    flagged = target.flag_truncated_stops(gdf, truncation_length=24, stop_id_field="stop_id")
+    assert list(flagged["stop_id"]) == ["S1"]
+    assert flagged["suspected_truncation_length"].iloc[0] == 24
+
+
+def test_flag_truncated_stops_empty_when_length_none() -> None:
+    df = _make_stops_df(
+        [{"stop_id": "S1", "stop_name": "Main", "stop_lat": "38.9", "stop_lon": "-77.0"}]
+    )
+    gdf = target.load_stops(df)
+    flagged = target.flag_truncated_stops(gdf, truncation_length=None)
+    assert flagged.empty
+    assert "suspected_truncation_length" in flagged.columns
+
+
+# ---------------------------------------------------------------------------
+# is_substring_match
+# ---------------------------------------------------------------------------
+
+
+def test_is_substring_match_detects_containment() -> None:
+    assert target.is_substring_match("washington", "washington heights") is True
+
+
+def test_is_substring_match_rejects_partial_token() -> None:
+    # "oak" must not be treated as contained in "oakland" (token-aware).
+    assert target.is_substring_match("oak", "oakland") is False
+
+
+def test_is_substring_match_handles_empty() -> None:
+    assert target.is_substring_match("", "main") is False
+
+
+# ---------------------------------------------------------------------------
+# compare_stop_to_roads — substring filter & custom id field
+# ---------------------------------------------------------------------------
+
+
+def test_compare_stop_to_roads_substring_filter_suppresses() -> None:
+    roads = _make_roads_gdf(["Washington Heights"])
+    roads["FULLNAME_clean"] = "washington heights"
+    filtered = target.compare_stop_to_roads(
+        "S1",
+        "Washington @ Oak",
+        ["washington"],
+        {"washington heights"},
+        roads,
+        threshold=70,
+        filter_substring=True,
+    )
+    assert filtered == []
+
+
+def test_compare_stop_to_roads_uses_custom_id_field() -> None:
+    roads = _make_roads_gdf(["Washington Boulevard"])
+    roads["FULLNAME_clean"] = "washington boulevard"
+    results = target.compare_stop_to_roads(
+        "100",
+        "Washingtn Blvd",
+        ["washingtn blvd"],
+        {"washington boulevard"},
+        roads,
+        threshold=60,
+        stop_id_field="stop_code",
+    )
+    assert all("stop_code" in row for row in results)
+
+
+# ---------------------------------------------------------------------------
+# process_typos — skip_ids
+# ---------------------------------------------------------------------------
+
+
+def test_process_typos_skips_flagged_ids() -> None:
+    stops_df = _make_stops_df(
+        [{"stop_id": "S1", "stop_name": "Washingtn @ Oak", "stop_lat": "38.9", "stop_lon": "-77.0"}]
+    )
+    stops_gdf = target.load_stops(stops_df).to_crs(TARGET_CRS)
+    roads = _make_roads_gdf(["Washington Street"])
+    roads["FULLNAME_clean"] = roads["FULLNAME"].apply(
+        lambda x: target.normalize_street_name(x, set())
+    )
+    join_gdf = pd.DataFrame({"stop_id": ["S1"], "FULLNAME_clean": ["washington street"]})
+    result = target.process_typos(stops_gdf, roads, set(), join_gdf, 60, skip_ids={"S1"})
+    assert result.empty
+
+
+# ---------------------------------------------------------------------------
 # load_gtfs_data
 # ---------------------------------------------------------------------------
 
