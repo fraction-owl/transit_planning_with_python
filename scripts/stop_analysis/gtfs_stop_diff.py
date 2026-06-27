@@ -11,7 +11,7 @@ Outputs (CSV):
 Also outputs:
 - stops_comparison.xlsx (sheets: before, after, modified, deleted, new, summary,
   optional nearest_id_matches)
-- gtfs_stop_compare.log
+- gtfs_stop_diff.log
 
 No arcpy / geopandas. pandas + numpy + scipy only.
 """
@@ -84,7 +84,7 @@ def setup_logging(output_dir: Path) -> None:
         format="%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
         handlers=[
-            logging.FileHandler(output_dir / "gtfs_stop_compare.log", encoding="utf-8"),
+            logging.FileHandler(output_dir / "gtfs_stop_diff.log", encoding="utf-8"),
             logging.StreamHandler(),
         ],
         force=True,
