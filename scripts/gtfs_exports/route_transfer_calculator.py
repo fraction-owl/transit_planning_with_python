@@ -64,7 +64,7 @@ OUTPUT_DIR: Path = Path(r"Path\To\Output_Folder")
 
 # Routes we want transfers FOR. Each token is matched against route_short_name OR
 # route_id, across every feed. Leave empty to treat every route as a target.
-TARGET_ROUTE_TOKENS: set[str] = { } #{"10", "20"}
+TARGET_ROUTE_TOKENS: set[str] = set()  # e.g. {"10", "20"}; empty = every route is a target
 
 # Optionally restrict which feeds' routes can be targets (by label). None = any
 # feed. Connectors are always drawn from all feeds regardless of this setting.
