@@ -35,7 +35,7 @@ Manual data collection that supplements or backstops modern AVL and APC systems 
 *Folder:* `field_tools/`
 
 ### Plus
-- **GTFS Exports** (`gtfs_exports/`) — GTFS-to-shapefile, segment speeds, time-band summaries, stop patterns, timepoint schedule exports, and per-route supply/competition features (`gtfs_route_features.py`) for demand modeling
+- **GTFS Exports** (`gtfs_exports/`) — GTFS-to-shapefile, segment speeds, time-band summaries, stop patterns, timepoint schedule exports, per-route supply/competition features (`gtfs_route_features.py`) for demand modeling, and a route-to-route transfer calculator (`route_transfer_calculator.py`) that pools one or more feeds and, for each target route, lists and counts the routes it can transfer to within a configurable walking distance and (optionally) a scheduled wait window
 - **GBFS Tools** (`gbfs_tools/`) — export GBFS static stations to shapefile and GeoJSON
 - **Facility Tools** (`facilities_tools/`) — bay usage analysis and stop upgrade flagging
 - **National Data Tools** (`national_data_tools/`) — prep and join national/external reference datasets that feed coverage and demand work: US Census/TIGER and Canadian census geographies, plus exogenous context (EIA gas prices, FRED unemployment, NOAA weather, NCES schools)
