@@ -26,9 +26,9 @@ Stages
 
 Configuration
 -------------
-At minimum, set ``INPUT_CSV_DIR``, ``INPUT_SHP_DIR``, and
-``FINAL_JOINED_FEATURES``.  Set ``INTERMEDIATE_COMBINED_CSV`` or
-``INTERMEDIATE_DA_SHP`` to an empty string to skip writing those intermediate
+At minimum, set ``INPUT_CSV_DIR``, ``INPUT_SHP_DIR``, and ``OUTPUT_DIR``.
+Set ``INTERMEDIATE_COMBINED_CSV_NAME`` to an empty string or None, or leave
+``INTERMEDIATE_DA_SHP`` as None, to skip writing those intermediate
 artifacts.
 
 Notes:
@@ -95,14 +95,23 @@ CDUIDS_TO_FILTER: List[str] = [
 ]
 
 # ---- Outputs ----------------------------------------------------------------
-#: Intermediate combined CSV from Stage 1. Set to "" or None to skip.
-INTERMEDIATE_COMBINED_CSV: str | None = r"Path\To\Your\Output\da_attributes.csv"
+#: Folder both outputs below are written into.
+OUTPUT_DIR: str | Path = r"Path\To\Your\Output"  # <<< EDIT ME
+
+#: Intermediate combined CSV filename from Stage 1. Set to "" or None to skip.
+INTERMEDIATE_COMBINED_CSV_NAME: str | None = "da_attributes.csv"
+INTERMEDIATE_COMBINED_CSV: str | None = (
+    None
+    if not INTERMEDIATE_COMBINED_CSV_NAME
+    else str(Path(OUTPUT_DIR) / INTERMEDIATE_COMBINED_CSV_NAME)
+)
 
 #: Intermediate DA geometry from Stage 2. Set to "" or None to skip.
 INTERMEDIATE_DA_SHP: str | None = None
 
-#: Final joined geometry + attributes (Stage 3 output).
-FINAL_JOINED_FEATURES: str = r"Path\To\Your\Output\da_joined.gpkg"
+#: Final joined geometry + attributes filename (Stage 3 output).
+FINAL_JOINED_FEATURES_NAME: str = "da_joined.gpkg"
+FINAL_JOINED_FEATURES: str = str(Path(OUTPUT_DIR) / FINAL_JOINED_FEATURES_NAME)
 
 # ---- Join settings ----------------------------------------------------------
 JOIN_KEY: Final[str] = "DAUID"
@@ -173,8 +182,9 @@ LOG_LEVEL: int = logging.INFO
 # ---- Sentinel defaults — detect un-edited placeholder paths ----------------
 _DEFAULT_INPUT_CSV_DIR: str = r"Path\To\Your\CensusProfile_CSV_Dir"
 _DEFAULT_INPUT_SHP_DIR: str = r"Path\To\Your\DA_Boundary_Dir"
-_DEFAULT_FINAL_JOINED_FEATURES: str = r"Path\To\Your\Output\da_joined.gpkg"
-_DEFAULT_INTERMEDIATE_COMBINED_CSV: str = r"Path\To\Your\Output\da_attributes.csv"
+_DEFAULT_OUTPUT_DIR: str = r"Path\To\Your\Output"
+_DEFAULT_FINAL_JOINED_FEATURES: str = str(Path(_DEFAULT_OUTPUT_DIR) / "da_joined.gpkg")
+_DEFAULT_INTERMEDIATE_COMBINED_CSV: str = str(Path(_DEFAULT_OUTPUT_DIR) / "da_attributes.csv")
 
 # =============================================================================
 # STAGE 1: CSV DISCOVERY & PIVOT  (pandas)
