@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -73,3 +74,49 @@ def test_validate_default_file_list_flags_standard_gtfs_files(
     # A few standard files we know are absent should be flagged.
     for expected in ("trips.txt", "routes.txt", "stop_times.txt"):
         assert any(f"Missing GTFS file: {expected}" in m for m in messages)
+
+
+# ---------------------------------------------------------------------------
+# zip archive support
+# ---------------------------------------------------------------------------
+
+
+def test_validate_zip_wrapper_folder_no_false_positives(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A zip nesting files in one wrapper folder is not flagged as missing."""
+    zip_path = tmp_path / "gtfs.zip"
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("dc/stops.txt", "stop_id\n001\n")
+        zf.writestr("dc/trips.txt", "trip_id\nA\n")
+
+    with caplog.at_level(logging.WARNING):
+        validate_gtfs_files_exist(str(zip_path), files=("stops.txt", "trips.txt"))
+
+    assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+
+def test_validate_zip_missing_file_warns(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """A file absent from the zip triggers the same warning as a missing folder file."""
+    zip_path = tmp_path / "gtfs.zip"
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("stops.txt", "stop_id\n001\n")
+
+    with caplog.at_level(logging.WARNING):
+        validate_gtfs_files_exist(str(zip_path), files=("stops.txt", "trips.txt"))
+
+    messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("Missing GTFS file: trips.txt" in m for m in messages)
+    assert not any("Missing GTFS file: stops.txt" in m for m in messages)
+
+
+def test_validate_bad_zip_warns(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """A .zip path that isn't a valid archive warns instead of raising."""
+    bad_zip = tmp_path / "not_really_a.zip"
+    bad_zip.write_text("this is not a zip file", encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING):
+        validate_gtfs_files_exist(str(bad_zip), files=("stops.txt",))
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("not a valid zip archive" in m for m in warnings)
