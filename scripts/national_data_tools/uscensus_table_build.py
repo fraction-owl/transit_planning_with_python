@@ -378,8 +378,11 @@ def _derive_income(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _derive_ethnicity(df: pd.DataFrame) -> pd.DataFrame:
-    minority = ["black", "native", "asian", "pac_isl", "other", "multi"]
-    df["minority"] = df[minority].sum(axis=1)
+    # Minority population, Title VI/EJ convention: total minus Not-Hispanic White
+    # alone. This necessarily includes Hispanic/Latino residents of any race (a
+    # separate P9 branch from the race-alone rows, so no double-count) — summing
+    # only the non-white race-alone categories would silently drop them.
+    df["minority"] = df["total_pop"] - df["white"]
     df["perc_minority"] = (df["minority"] / df["total_pop"]).fillna(0)
     df = df.drop(columns="total_pop")
     return df
