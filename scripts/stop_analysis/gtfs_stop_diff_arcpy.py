@@ -1,26 +1,39 @@
-"""GTFS stop comparison (before vs after) with notebook-friendly execution.
+"""GTFS stop comparison (before vs after) with notebook-friendly execution (ArcPy version).
 
-Optionally annotates every stop with the routes that serve it (via
-stop_times -> trips -> routes). Route context is informational only and
-never affects the modified/unchanged classification; disable it with
-ENABLE_ROUTE_CONTEXT = False / --no-route-context.
+Companion to gtfs_stop_diff.py (which has zero geospatial dependencies) for
+planners who want to scope the comparison to a district polygon and see which
+routes serve it. Adds two things on top of the base script's stop-level diff:
+
+- District filter: restrict the comparison to stops falling within the
+  polygon(s) of a district shapefile. A stop is kept if its BEFORE or AFTER
+  position is inside the district, so stops relocated across the boundary
+  still show up as relocations rather than false deletes/adds.
+- Route diff: report routes added/removed relative to the district. A route
+  "serves the district" in a feed if at least one of its stops falls within
+  a configurable buffer of the district boundary.
+
+Route context (annotating each stop with the routes that serve it) is also
+available, unmodified from the base script; it is informational only and
+never affects the modified/unchanged classification.
 
 Outputs (CSV):
-- stops_before.csv     : all stops from before feed (+ routes/route_count if enabled)
-- stops_after.csv      : all stops from after feed (+ routes/route_count if enabled)
+- stops_before.csv     : all stops from before feed (district-filtered if enabled)
+- stops_after.csv      : all stops from after feed (district-filtered if enabled)
 - stops_modified.csv   : overlap stop_id where relocated > threshold and/or attributes changed
 - stops_deleted.csv    : stop_id present only in before feed
 - stops_new.csv        : stop_id present only in after feed
+- routes_diff.csv      : routes added/removed/retained near the district (if enabled)
 - summary.json
 
 Also outputs:
 - stops_comparison.xlsx (sheets: before, after, modified, deleted, new, summary,
-  optional nearest_id_matches)
-- gtfs_stop_diff.log
+  optional nearest_id_matches, optional routes_diff)
+- gtfs_stop_diff_arcpy.log
 
-No arcpy / geopandas. pandas + numpy + scipy only. For a district-polygon
-filter and a routes-serving-the-district diff (both require arcpy), see the
-companion script gtfs_stop_diff_arcpy.py.
+Requires arcpy (run with the ArcGIS Pro Python environment) whenever the
+district filter and/or route diff are enabled. Disable both
+(ENABLE_DISTRICT_FILTER = False and ENABLE_ROUTE_DIFF = False) to run this
+script with plain pandas, same as the base gtfs_stop_diff.py.
 """
 
 from __future__ import annotations
@@ -35,6 +48,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Optional
 
+import arcpy
 import numpy as np
 import pandas as pd
 from scipy.spatial import cKDTree
@@ -57,6 +71,21 @@ NEAREST_MATCHES_MAX_FEET = 500.0  # only report nearest matches within this dist
 # stop_times -> trips -> routes). This is informational only; route changes
 # do NOT affect the modified/unchanged classification.
 ENABLE_ROUTE_CONTEXT = True
+
+# District filter: restrict the comparison to stops falling within the
+# polygon(s) in this shapefile. A stop is kept if its BEFORE or AFTER
+# position is inside the district, so stops relocated across the boundary
+# still show up as relocations rather than false deletes/adds.
+# Set ENABLE_DISTRICT_FILTER = False to compare all stops (no arcpy needed).
+ENABLE_DISTRICT_FILTER = True
+DISTRICT_SHAPEFILE: Path | None = Path(r"Path\To\District.shp")
+
+# Route diff: report routes added/removed relative to the district. A route
+# "serves the district" in a feed if at least one of its stops falls within
+# ROUTE_DIFF_BUFFER_MILES of the district boundary. Requires the district
+# filter to be enabled plus routes/trips/stop_times in both feeds.
+ENABLE_ROUTE_DIFF = True
+ROUTE_DIFF_BUFFER_MILES = 0.25
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
 
@@ -96,7 +125,7 @@ def setup_logging(output_dir: Path) -> None:
         format="%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
         handlers=[
-            logging.FileHandler(output_dir / "gtfs_stop_diff.log", encoding="utf-8"),
+            logging.FileHandler(output_dir / "gtfs_stop_diff_arcpy.log", encoding="utf-8"),
             logging.StreamHandler(),
         ],
         force=True,
@@ -249,6 +278,163 @@ def load_stops(gtfs_path: Path, label: str) -> pd.DataFrame:
 
 
 # =============================================================================
+# District filter
+# =============================================================================
+
+
+def _buffer_geometry_miles(geometry: Any, miles: float) -> Any:
+    """Buffer an arcpy geometry by a distance in miles, handling units/CRS.
+
+    If the geometry's spatial reference is projected, the buffer is applied in
+    its native linear units. If it is geographic (degrees), the geometry is
+    first projected to a UTM zone derived from its extent so the buffer
+    distance is meaningful.
+    """
+    meters = miles * 1609.344
+    sr = geometry.spatialReference
+
+    if sr is not None and getattr(sr, "type", "") == "Projected":
+        distance_native_units = meters / float(sr.metersPerUnit)
+        return geometry.buffer(distance_native_units)
+
+    # Geographic (or unknown) CRS: buffer in a UTM projection instead.
+    extent = geometry.extent
+    center_lon = (extent.XMin + extent.XMax) / 2.0
+    center_lat = (extent.YMin + extent.YMax) / 2.0
+    zone = min(max(int((center_lon + 180.0) // 6) + 1, 1), 60)
+    wkid = (32600 if center_lat >= 0 else 32700) + zone  # WGS84 UTM N/S
+    utm = arcpy.SpatialReference(wkid)
+    logging.info("Buffering in UTM zone %s (WKID %s) since source CRS is geographic.", zone, wkid)
+    return geometry.projectAs(utm).buffer(meters)
+
+
+def load_district_geometry(shp_path: Path, buffer_miles: float = 0.0) -> Any:
+    """Load a district shapefile and return a single dissolved arcpy polygon in WGS84.
+
+    All features in the shapefile are unioned into one geometry, so a
+    multi-feature district file works the same as a single polygon. The
+    shapefile can be in any CRS (e.g. State Plane) as long as it has a defined
+    spatial reference. If ``buffer_miles`` > 0, the dissolved polygon is
+    buffered outward by that distance (in the source's projected CRS, or a
+    derived UTM zone for geographic sources) before reprojection to WGS84.
+    """
+    if not shp_path.exists():
+        raise OSError(f"District shapefile not found: {shp_path}")
+
+    desc = arcpy.Describe(str(shp_path))
+    source_sr = desc.spatialReference
+    logging.info(
+        "District shapefile: %s (source CRS: %s)",
+        shp_path.name,
+        source_sr.name if source_sr else "unknown",
+    )
+    if source_sr is None or source_sr.name in ("", "Unknown"):
+        logging.warning(
+            "District shapefile has no defined spatial reference (.prj missing?). "
+            "arcpy cannot reproject it, so the filter may match nothing unless the "
+            "coordinates already happen to be WGS84 lat/lon. Check the shapefile's CRS."
+        )
+
+    # Read in the native CRS so buffering can happen in real linear units.
+    geometries = [
+        row[0]
+        for row in arcpy.da.SearchCursor(str(shp_path), ["SHAPE@"])
+        if row[0] is not None
+    ]
+    if not geometries:
+        raise ValueError(f"District shapefile has no features: {shp_path}")
+
+    logging.info("District shapefile: %s feature(s) dissolved into one polygon.", len(geometries))
+
+    district = geometries[0]
+    for geom in geometries[1:]:
+        district = district.union(geom)
+
+    if buffer_miles > 0:
+        district = _buffer_geometry_miles(district, buffer_miles)
+        logging.info("Applied %.2f mile buffer to district polygon.", buffer_miles)
+
+    wgs84 = arcpy.SpatialReference(4326)
+    return district.projectAs(wgs84)
+
+
+def flag_stops_in_district(stops_df: pd.DataFrame, district_geometry: Any, label: str) -> pd.Series:
+    """Boolean Series (aligned to stops_df.index): stop point is inside the district.
+
+    Stops with missing/invalid coordinates are flagged False (they cannot be
+    located) and a warning is logged. Uses a bounding-box prefilter so the
+    per-point arcpy geometry test only runs on plausible candidates.
+    """
+    wgs84 = arcpy.SpatialReference(4326)
+    inside = pd.Series(False, index=stops_df.index)
+
+    valid = stops_df["stop_lat"].notna() & stops_df["stop_lon"].notna()
+    invalid_count = int((~valid).sum())
+    if invalid_count > 0:
+        logging.warning(
+            "%s: %s stops have missing coordinates and are excluded by the district filter.",
+            label,
+            invalid_count,
+        )
+
+    # Cheap bounding-box prefilter before the (slower) per-point geometry test.
+    extent = district_geometry.extent
+    candidates = (
+        valid
+        & stops_df["stop_lon"].between(extent.XMin, extent.XMax)
+        & stops_df["stop_lat"].between(extent.YMin, extent.YMax)
+    )
+
+    for idx in stops_df.index[candidates]:
+        point = arcpy.PointGeometry(
+            arcpy.Point(
+                float(stops_df.loc[idx, "stop_lon"]),
+                float(stops_df.loc[idx, "stop_lat"]),
+            ),
+            wgs84,
+        )
+        # not disjoint == "inside or on the boundary" for points.
+        inside.loc[idx] = not district_geometry.disjoint(point)
+
+    logging.info(
+        "%s: %s of %s stops fall within the district (%s tested after bbox prefilter).",
+        label,
+        int(inside.sum()),
+        len(stops_df),
+        int(candidates.sum()),
+    )
+    return inside
+
+
+def apply_district_filter(
+    before_df: pd.DataFrame, after_df: pd.DataFrame, district_geometry: Any
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Restrict both feeds to district stops.
+
+    A stop_id is retained if its position in EITHER feed falls inside the
+    district. This keeps cross-boundary relocations classified as 'relocated'
+    instead of producing a misleading deleted/new pair.
+    """
+    in_before = flag_stops_in_district(before_df, district_geometry, label="before")
+    in_after = flag_stops_in_district(after_df, district_geometry, label="after")
+
+    keep_ids = set(before_df.loc[in_before, "stop_id"]) | set(after_df.loc[in_after, "stop_id"])
+
+    before_out = before_df.loc[before_df["stop_id"].isin(keep_ids)].copy()
+    after_out = after_df.loc[after_df["stop_id"].isin(keep_ids)].copy()
+
+    logging.info(
+        "District filter: before %s -> %s stops; after %s -> %s stops (%s unique stop_ids kept).",
+        len(before_df),
+        len(before_out),
+        len(after_df),
+        len(after_out),
+        len(keep_ids),
+    )
+    return before_out, after_out
+
+
+# =============================================================================
 # Route context
 # =============================================================================
 
@@ -283,7 +469,7 @@ def load_stop_route_pairs(gtfs_path: Path, label: str) -> pd.DataFrame | None:
     except (OSError, ValueError, RuntimeError) as exc:
         logging.warning(
             "%s: could not load routes.txt/trips.txt for route data (%s). "
-            "Route context will be skipped.",
+            "Route context / route diff will be skipped.",
             label,
             exc,
         )
@@ -380,6 +566,123 @@ def attach_route_context(
             label,
             unserved,
         )
+    return out
+
+
+# =============================================================================
+# Route diff (district-level)
+# =============================================================================
+
+
+def build_route_diff(
+    before_stops: pd.DataFrame,
+    after_stops: pd.DataFrame,
+    before_pairs: pd.DataFrame | None,
+    after_pairs: pd.DataFrame | None,
+    buffered_geometry: Any,
+    buffer_miles: float,
+) -> pd.DataFrame | None:
+    """Diff the set of routes serving the (buffered) district between feeds.
+
+    A route "serves the district" in a feed if at least one of its stops in
+    that feed falls within the buffered district polygon. Routes are matched
+    across feeds by display label (short name, falling back to long name /
+    route_id) so that route_id rekeying between feeds doesn't produce false
+    added/removed pairs.
+
+    Expects the FULL (unfiltered) stops tables, since the buffer extends
+    beyond the strict district boundary used by the stop filter.
+    """
+    if before_pairs is None or after_pairs is None:
+        logging.warning("Route diff skipped: route/trip data unavailable in one or both feeds.")
+        return None
+
+    in_before = flag_stops_in_district(
+        before_stops, buffered_geometry, label=f"before ({buffer_miles:g} mi buffer)"
+    )
+    in_after = flag_stops_in_district(
+        after_stops, buffered_geometry, label=f"after ({buffer_miles:g} mi buffer)"
+    )
+
+    before_buffer_stop_ids = set(before_stops.loc[in_before, "stop_id"])
+    after_buffer_stop_ids = set(after_stops.loc[in_after, "stop_id"])
+
+    def routes_serving(pairs: pd.DataFrame, stop_ids: set[str]) -> pd.DataFrame:
+        sub = pairs.loc[pairs["stop_id"].isin(stop_ids)]
+        return sub.groupby("route_label").agg(
+            route_ids=("route_id", lambda s: "; ".join(sorted(set(s)))),
+            buffer_stop_count=("stop_id", "nunique"),
+        )
+
+    before_tbl = routes_serving(before_pairs, before_buffer_stop_ids)
+    after_tbl = routes_serving(after_pairs, after_buffer_stop_ids)
+
+    # Systemwide presence (anywhere in the feed) helps distinguish a route
+    # that was discontinued entirely from one that still runs but no longer
+    # enters the district.
+    systemwide_before = set(before_pairs["route_label"])
+    systemwide_after = set(after_pairs["route_label"])
+
+    all_labels = sorted(
+        set(before_tbl.index) | set(after_tbl.index), key=_route_sort_key
+    )
+
+    rows: list[dict[str, Any]] = []
+    for route_label in all_labels:
+        serves_before = route_label in before_tbl.index
+        serves_after = route_label in after_tbl.index
+        if serves_before and serves_after:
+            status = "retained"
+        elif serves_after:
+            status = "added"
+        else:
+            status = "removed"
+
+        rows.append(
+            {
+                "route": route_label,
+                "status": status,
+                "route_ids_before": (
+                    before_tbl.loc[route_label, "route_ids"] if serves_before else ""
+                ),
+                "route_ids_after": (
+                    after_tbl.loc[route_label, "route_ids"] if serves_after else ""
+                ),
+                "buffer_stop_count_before": (
+                    int(before_tbl.loc[route_label, "buffer_stop_count"]) if serves_before else 0
+                ),
+                "buffer_stop_count_after": (
+                    int(after_tbl.loc[route_label, "buffer_stop_count"]) if serves_after else 0
+                ),
+                "systemwide_before": route_label in systemwide_before,
+                "systemwide_after": route_label in systemwide_after,
+            }
+        )
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        logging.info("Route diff: no routes serve the buffered district in either feed.")
+        return out
+
+    status_order = {"added": 0, "removed": 1, "retained": 2}
+    out["_status_order"] = out["status"].map(status_order)
+    out["_route_order"] = out["route"].map(lambda x: _route_sort_key(str(x)))
+    out = (
+        out.sort_values(["_status_order", "_route_order"])
+        .drop(columns=["_status_order", "_route_order"])
+        .reset_index(drop=True)
+    )
+
+    added = int((out["status"] == "added").sum())
+    removed = int((out["status"] == "removed").sum())
+    retained = int((out["status"] == "retained").sum())
+    logging.info(
+        "Route diff (%.2f mi buffer): %s added, %s removed, %s retained.",
+        buffer_miles,
+        added,
+        removed,
+        retained,
+    )
     return out
 
 
@@ -711,6 +1014,7 @@ def write_outputs(
     new_df: pd.DataFrame,
     summary: Summary,
     nearest_matches: pd.DataFrame | None,
+    route_diff: pd.DataFrame | None = None,
 ) -> None:
     """Write CSVs + Excel workbook + summary json."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -744,6 +1048,9 @@ def write_outputs(
         if nearest_matches is not None and not nearest_matches.empty:
             nearest_matches.to_excel(writer, sheet_name="nearest_id_matches", index=False)
 
+        if route_diff is not None and not route_diff.empty:
+            route_diff.to_excel(writer, sheet_name="routes_diff", index=False)
+
     logging.info("Wrote: %s", before_csv)
     logging.info("Wrote: %s", after_csv)
     logging.info("Wrote: %s", modified_csv)
@@ -757,6 +1064,11 @@ def write_outputs(
         nearest_matches.to_csv(nm_csv, index=False, encoding="utf-8")
         logging.info("Wrote: %s", nm_csv)
 
+    if route_diff is not None:
+        rd_csv = output_dir / "routes_diff.csv"
+        route_diff.to_csv(rd_csv, index=False, encoding="utf-8")
+        logging.info("Wrote: %s", rd_csv)
+
 
 # =============================================================================
 # Notebook-friendly entry point
@@ -769,22 +1081,60 @@ def run_compare(
     out_dir: Path = OUTPUT_DIR,
     threshold_feet: float = RELOCATE_THRESHOLD_FEET,
     include_route_context: bool = ENABLE_ROUTE_CONTEXT,
+    district_shp: Path | None = DISTRICT_SHAPEFILE if ENABLE_DISTRICT_FILTER else None,
+    include_route_diff: bool = ENABLE_ROUTE_DIFF,
+    route_diff_buffer_miles: float = ROUTE_DIFF_BUFFER_MILES,
 ) -> Summary:
     """Run the comparison (notebook-friendly) and write outputs."""
     setup_logging(out_dir)
+
+    route_diff_enabled = include_route_diff and district_shp is not None
+    if include_route_diff and district_shp is None:
+        logging.warning("Route diff requires the district filter; skipping route diff.")
 
     logging.info("Before GTFS: %s", before_dir)
     logging.info("After GTFS:  %s", after_dir)
     logging.info("Output dir:  %s", out_dir)
     logging.info("Relocation threshold: %.1f ft", threshold_feet)
     logging.info("Route context: %s", "enabled" if include_route_context else "disabled")
+    logging.info(
+        "District filter: %s", district_shp if district_shp is not None else "disabled"
+    )
+    logging.info(
+        "Route diff: %s",
+        f"enabled ({route_diff_buffer_miles:g} mi buffer)" if route_diff_enabled else "disabled",
+    )
 
     before_df = load_stops(before_dir, label="before")
     after_df = load_stops(after_dir, label="after")
 
-    if include_route_context:
+    # Stop/route pairs are needed by both route context and the route diff.
+    before_pairs = after_pairs = None
+    if include_route_context or route_diff_enabled:
         before_pairs = load_stop_route_pairs(before_dir, label="before")
         after_pairs = load_stop_route_pairs(after_dir, label="after")
+
+    route_diff_df = None
+    if district_shp is not None:
+        # Route diff first: it needs the FULL stop tables (the buffer extends
+        # past the strict boundary used by the stop filter below).
+        if route_diff_enabled:
+            buffered_geometry = load_district_geometry(
+                district_shp, buffer_miles=route_diff_buffer_miles
+            )
+            route_diff_df = build_route_diff(
+                before_stops=before_df,
+                after_stops=after_df,
+                before_pairs=before_pairs,
+                after_pairs=after_pairs,
+                buffered_geometry=buffered_geometry,
+                buffer_miles=route_diff_buffer_miles,
+            )
+
+        district_geometry = load_district_geometry(district_shp)
+        before_df, after_df = apply_district_filter(before_df, after_df, district_geometry)
+
+    if include_route_context:
         before_df = attach_route_context(
             before_df, build_stop_routes_table(before_pairs), label="before"
         )
@@ -807,6 +1157,7 @@ def run_compare(
         new_df=new_df,
         summary=summary,
         nearest_matches=nearest_matches,
+        route_diff=route_diff_df,
     )
 
     logging.info(
@@ -843,6 +1194,28 @@ def parse_args(argv: Sequence[str] | None = None) -> tuple[argparse.Namespace, l
         action="store_true",
         help="Skip attaching routes-serving-stop context columns to outputs",
     )
+    parser.add_argument(
+        "--district-shp",
+        type=Path,
+        default=DISTRICT_SHAPEFILE,
+        help="District polygon shapefile; only stops inside it are compared",
+    )
+    parser.add_argument(
+        "--no-district-filter",
+        action="store_true",
+        help="Compare all stops (ignore the district shapefile)",
+    )
+    parser.add_argument(
+        "--route-diff-buffer-miles",
+        type=float,
+        default=ROUTE_DIFF_BUFFER_MILES,
+        help="Buffer around the district for the route added/removed diff",
+    )
+    parser.add_argument(
+        "--no-route-diff",
+        action="store_true",
+        help="Skip the route added/removed diff for the district",
+    )
     args, unknown = parser.parse_known_args(list(argv) if argv is not None else None)
     return args, unknown
 
@@ -864,6 +1237,12 @@ def main(argv: Sequence[str] | None = None) -> None:
             "placeholder values. Please update them in the CONFIGURATION section before running."
         )
         return
+    if ENABLE_DISTRICT_FILTER and DISTRICT_SHAPEFILE == Path(r"Path\To\District.shp"):
+        logging.warning(
+            "ENABLE_DISTRICT_FILTER is True but DISTRICT_SHAPEFILE is still the placeholder "
+            "value. Set it to a real shapefile path, or set ENABLE_DISTRICT_FILTER = False."
+        )
+        return
     args, _unknown = parse_args(argv)
     run_compare(
         before_dir=args.before,
@@ -871,6 +1250,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         out_dir=args.out,
         threshold_feet=args.threshold_feet,
         include_route_context=not args.no_route_context,
+        district_shp=None if args.no_district_filter else args.district_shp,
+        include_route_diff=not args.no_route_diff,
+        route_diff_buffer_miles=args.route_diff_buffer_miles,
     )
     logging.info("Script completed successfully.")
 

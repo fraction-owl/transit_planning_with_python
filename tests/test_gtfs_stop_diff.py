@@ -5,7 +5,11 @@ import pandas as pd
 import pytest
 
 from scripts.stop_analysis.gtfs_stop_diff import (
+    _route_display_label,
+    _route_sort_key,
+    attach_route_context,
     build_modified_description,
+    build_stop_routes_table,
     coerce_float,
     compare_stops,
     haversine_meters,
@@ -250,3 +254,85 @@ def test_compare_stops_summary_counts_are_consistent() -> None:
     assert summary.new_count == len(new)
     assert summary.before_stop_count == 3
     assert summary.after_stop_count == 3
+
+
+# ---------------------------------------------------------------------------
+# _route_display_label / _route_sort_key
+# ---------------------------------------------------------------------------
+
+
+def test_route_display_label_prefers_short_name() -> None:
+    row = pd.Series({"route_short_name": "10", "route_long_name": "Main St", "route_id": "R1"})
+    assert _route_display_label(row) == "10"
+
+
+def test_route_display_label_falls_back_to_long_name() -> None:
+    row = pd.Series({"route_short_name": "", "route_long_name": "Main St", "route_id": "R1"})
+    assert _route_display_label(row) == "Main St"
+
+
+def test_route_display_label_falls_back_to_route_id() -> None:
+    row = pd.Series({"route_short_name": "", "route_long_name": "", "route_id": "R1"})
+    assert _route_display_label(row) == "R1"
+
+
+def test_route_sort_key_orders_numeric_routes_numerically() -> None:
+    labels = ["10", "2", "1"]
+    assert sorted(labels, key=_route_sort_key) == ["1", "2", "10"]
+
+
+def test_route_sort_key_orders_alpha_after_numeric() -> None:
+    labels = ["B", "10", "A"]
+    assert sorted(labels, key=_route_sort_key) == ["10", "A", "B"]
+
+
+# ---------------------------------------------------------------------------
+# build_stop_routes_table
+# ---------------------------------------------------------------------------
+
+
+def test_build_stop_routes_table_collapses_pairs() -> None:
+    pairs = pd.DataFrame(
+        {
+            "stop_id": ["S1", "S1", "S2"],
+            "route_id": ["R1", "R2", "R1"],
+            "route_label": ["1", "2", "1"],
+        }
+    )
+    result = build_stop_routes_table(pairs)
+    assert result is not None
+    s1 = result.loc[result["stop_id"] == "S1"].iloc[0]
+    assert s1["routes"] == "1; 2"
+    assert s1["route_count"] == 2
+
+
+def test_build_stop_routes_table_none_input_returns_none() -> None:
+    assert build_stop_routes_table(None) is None
+
+
+# ---------------------------------------------------------------------------
+# attach_route_context
+# ---------------------------------------------------------------------------
+
+
+def test_attach_route_context_adds_routes_and_count() -> None:
+    stops = pd.DataFrame({"stop_id": ["S1", "S2"]})
+    stop_routes = pd.DataFrame({"stop_id": ["S1"], "routes": ["1; 2"], "route_count": [2]})
+    result = attach_route_context(stops, stop_routes, label="test")
+    assert result.loc[result.stop_id == "S1", "routes"].iloc[0] == "1; 2"
+    assert result.loc[result.stop_id == "S1", "route_count"].iloc[0] == 2
+
+
+def test_attach_route_context_blank_for_unserved_stop() -> None:
+    stops = pd.DataFrame({"stop_id": ["S1", "S2"]})
+    stop_routes = pd.DataFrame({"stop_id": ["S1"], "routes": ["1"], "route_count": [1]})
+    result = attach_route_context(stops, stop_routes, label="test")
+    assert result.loc[result.stop_id == "S2", "routes"].iloc[0] == ""
+    assert result.loc[result.stop_id == "S2", "route_count"].iloc[0] == 0
+
+
+def test_attach_route_context_noop_when_none() -> None:
+    stops = pd.DataFrame({"stop_id": ["S1", "S2"]})
+    result = attach_route_context(stops, None, label="test")
+    assert "routes" not in result.columns
+    assert len(result) == 2
