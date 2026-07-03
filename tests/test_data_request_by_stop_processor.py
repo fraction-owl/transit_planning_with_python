@@ -500,6 +500,92 @@ def test_filter_data_routes_exclude_before_stop_ids() -> None:
 
 
 # =============================================================================
+# load_stop_ids_from_file / resolve_stop_ids
+# =============================================================================
+
+STOP_IDS_FIXTURE_PATH = Path("tests/fixtures/stop_ids.txt")
+
+
+def test_load_stop_ids_from_file_parses_fixture() -> None:
+    """The bundled stop_ids.txt fixture parses to the expected unique IDs in order."""
+    result = target.load_stop_ids_from_file(STOP_IDS_FIXTURE_PATH)
+    assert result == [1001, 3003, 4004, 5006, 7008]
+
+
+def test_load_stop_ids_from_file_missing_file_exits() -> None:
+    """A nonexistent STOP_IDS_FILE path raises SystemExit."""
+    with pytest.raises(SystemExit):
+        target.load_stop_ids_from_file(Path("tests/fixtures/does_not_exist.txt"))
+
+
+def test_load_stop_ids_from_file_skips_bad_tokens(tmp_path: Path) -> None:
+    """Non-integer tokens are skipped (with a warning) rather than aborting."""
+    stop_ids_file = tmp_path / "stop_ids.txt"
+    stop_ids_file.write_text("1001\nSTOP_ID\n2002 abc\n", encoding="utf-8")
+
+    with patch("logging.warning") as mock_warn:
+        result = target.load_stop_ids_from_file(stop_ids_file)
+
+    assert result == [1001, 2002]
+    mock_warn.assert_called_once()
+    assert "STOP_ID" in mock_warn.call_args[0][-1]
+    assert "abc" in mock_warn.call_args[0][-1]
+
+
+def test_load_stop_ids_from_file_no_valid_ids_exits(tmp_path: Path) -> None:
+    """A file with no parseable integers raises SystemExit."""
+    stop_ids_file = tmp_path / "stop_ids.txt"
+    stop_ids_file.write_text("# just a comment\nnot_a_number\n", encoding="utf-8")
+    with pytest.raises(SystemExit):
+        target.load_stop_ids_from_file(stop_ids_file)
+
+
+def test_resolve_stop_ids_file_takes_precedence() -> None:
+    """STOP_IDS_FILE wins over the inline STOP_IDS list when both are set."""
+    with patch("logging.warning") as mock_warn:
+        result = target.resolve_stop_ids([9999], STOP_IDS_FIXTURE_PATH)
+    assert result == [1001, 3003, 4004, 5006, 7008]
+    mock_warn.assert_called_once()
+    assert "Both STOP_IDS and STOP_IDS_FILE" in mock_warn.call_args[0][0]
+
+
+def test_resolve_stop_ids_no_file_uses_inline() -> None:
+    """With no STOP_IDS_FILE, the inline STOP_IDS list passes through unchanged."""
+    result = target.resolve_stop_ids([1001, 2002], None)
+    assert result == [1001, 2002]
+
+
+def test_main_filters_using_stop_ids_file() -> None:
+    """main() filters by STOP_IDS_FILE contents when STOP_IDS_FILE is set."""
+    fixture_df = pd.read_csv(FIXTURE_PATH)
+
+    with (
+        patch("data_request_by_stop_processor.read_excel_file") as mock_read,
+        patch("data_request_by_stop_processor.write_to_excel") as mock_write,
+        patch("data_request_by_stop_processor.write_run_log", return_value=True),
+        patch("data_request_by_stop_processor.INPUT_FILE_PATH", Path("dummy_input.xlsx")),
+        patch("data_request_by_stop_processor.OUTPUT_DIR", Path("dummy_output")),
+        patch("data_request_by_stop_processor.ROUTES", []),
+        patch("data_request_by_stop_processor.ROUTES_EXCLUDE", []),
+        patch("data_request_by_stop_processor.STOP_IDS", []),
+        patch("data_request_by_stop_processor.STOP_IDS_FILE", STOP_IDS_FIXTURE_PATH),
+        patch("data_request_by_stop_processor.TIME_PERIODS", ["AM PEAK", "PM PEAK"]),
+        patch("data_request_by_stop_processor.AGGREGATE_ROUTES_TOGETHER", True),
+        patch("data_request_by_stop_processor.APPLY_ROUNDING", True),
+        patch("data_request_by_stop_processor.AGGREGATE_BIN_RANGES", False),
+        patch("data_request_by_stop_processor.EXPORT_ROUTE_LEVEL_ANALYSIS", False),
+    ):
+        mock_read.return_value = fixture_df.copy()
+        target.main()
+
+        args, _ = mock_write.call_args
+        filtered_data = args[1]
+
+    # Fixture lists stop IDs 1001, 3003, 4004, 5006, 7008 — no others should remain.
+    assert set(filtered_data["STOP_ID"].unique()) == {1001, 3003, 4004, 5006, 7008}
+
+
+# =============================================================================
 # verify_required_columns
 # =============================================================================
 

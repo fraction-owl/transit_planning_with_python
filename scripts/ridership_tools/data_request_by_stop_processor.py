@@ -3,7 +3,9 @@
 Reads an input Excel file (RIDERSHIP_BY_ROUTE_AND_STOP_(ALL_TIME_PERIODS).XLSX),
 optionally filters by route or stop ID, aggregates boardings and alightings by
 stop and time period, and saves the results to a new Excel file. Aggregated data
-can optionally be rounded or categorized into bins.
+can optionally be rounded or categorized into bins. Stop-ID filtering accepts
+either an inline ``STOP_IDS`` list or an external plain-text file of IDs via
+``STOP_IDS_FILE``, whichever is more convenient.
 
 When a GTFS feed is supplied (GTFS_PATH), aggregation sheets are enriched with
 LATITUDE/LONGITUDE columns and an additional ``Stops Clean`` sheet is produced
@@ -76,6 +78,14 @@ AGGREGATE_ROUTES_TOGETHER: bool = True
 
 # Optional STOP_IDS filter list
 STOP_IDS: List[int] = []  # keep these (empty → keep all)
+
+# Optional STOP_IDS text file. When set (not None), stop IDs are read from this
+# file instead of the inline STOP_IDS list above — some users find a plain text
+# list easier than editing Python. The file lists integer stop IDs separated by
+# newlines, commas, or spaces; blank lines and lines starting with "#" are
+# ignored, and non-integer tokens (e.g. a stray header) are skipped with a
+# warning. If both STOP_IDS_FILE and STOP_IDS are set, STOP_IDS_FILE wins.
+STOP_IDS_FILE: Path | None = None  # e.g. Path(r"C:\Data\stop_ids.txt")
 
 # Optional TIME_PERIOD aggregation list
 TIME_PERIODS: List[str] = [
@@ -684,6 +694,90 @@ def verify_required_columns(data_frame: pd.DataFrame, required_columns: Sequence
         sys.exit(1)
 
 
+def load_stop_ids_from_file(stop_ids_file: Path) -> List[int]:
+    """Read a plain-text list of integer stop IDs from *stop_ids_file*.
+
+    The file may separate IDs by newlines, commas, or whitespace. Blank lines
+    and lines beginning with ``#`` are ignored. Non-integer tokens are skipped
+    with a warning rather than aborting the run, so a stray header row or note
+    won't stop processing. Duplicate IDs are collapsed while preserving the
+    order of first appearance.
+
+    Args:
+        stop_ids_file: Path to the text file of stop IDs.
+
+    Returns:
+        A list of unique integer stop IDs in first-seen order.
+
+    Raises:
+        SystemExit: If the file cannot be read, or contains no valid integer
+            stop IDs at all.
+    """
+    try:
+        raw_text: str = stop_ids_file.read_text(encoding="utf-8")
+    except OSError as exc:
+        logging.error("Error reading STOP_IDS_FILE '%s': %s", stop_ids_file, exc)
+        sys.exit(1)
+
+    stop_ids: List[int] = []
+    bad_tokens: List[str] = []
+    seen: set[int] = set()
+    for raw_line in raw_text.splitlines():
+        line: str = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        # Treat commas as whitespace so "1, 2 3" and one-per-line both work.
+        for token in line.replace(",", " ").split():
+            try:
+                value: int = int(token)
+            except ValueError:
+                bad_tokens.append(token)
+                continue
+            if value not in seen:
+                seen.add(value)
+                stop_ids.append(value)
+
+    if bad_tokens:
+        logging.warning(
+            "Ignored %d non-integer token(s) in STOP_IDS_FILE '%s': %s",
+            len(bad_tokens),
+            stop_ids_file,
+            bad_tokens,
+        )
+
+    if not stop_ids:
+        logging.error("STOP_IDS_FILE '%s' contained no valid integer stop IDs.", stop_ids_file)
+        sys.exit(1)
+
+    logging.info("Loaded %d stop ID(s) from STOP_IDS_FILE '%s'.", len(stop_ids), stop_ids_file)
+    return stop_ids
+
+
+def resolve_stop_ids(stop_ids: Sequence[int], stop_ids_file: Path | None) -> List[int]:
+    """Determine the effective STOP_IDS filter from the two config options.
+
+    Precedence: when ``stop_ids_file`` is provided it wins and the inline
+    ``stop_ids`` list is ignored (with a warning if both are set). When no
+    file is given, the inline list is used as-is.
+
+    Args:
+        stop_ids: The inline ``STOP_IDS`` list from CONFIGURATION.
+        stop_ids_file: The ``STOP_IDS_FILE`` path from CONFIGURATION, or None.
+
+    Returns:
+        The list of stop IDs to filter on. An empty list means "keep all".
+    """
+    if stop_ids_file is not None:
+        loaded: List[int] = load_stop_ids_from_file(stop_ids_file)
+        if stop_ids:
+            logging.warning(
+                "Both STOP_IDS and STOP_IDS_FILE are set; using STOP_IDS_FILE "
+                "and ignoring the inline STOP_IDS list."
+            )
+        return loaded
+    return list(stop_ids)
+
+
 def filter_data(
     data_frame: pd.DataFrame,
     routes: Sequence[str] | None = None,
@@ -1108,6 +1202,10 @@ def main() -> None:  # noqa: D401 – imperative mood is OK for main entry point
         )
         sys.exit(1)
 
+    # Resolve the effective STOP_IDS filter: STOP_IDS_FILE (if set) takes
+    # precedence over the inline STOP_IDS list.
+    effective_stop_ids: List[int] = resolve_stop_ids(STOP_IDS, STOP_IDS_FILE)
+
     input_file: Path = INPUT_FILE_PATH
 
     # Build output file path
@@ -1130,13 +1228,13 @@ def main() -> None:  # noqa: D401 – imperative mood is OK for main entry point
         routes=ROUTES,
         routes_exclude=ROUTES_EXCLUDE,
     )
-    filtered_data: pd.DataFrame = filter_data(route_filtered_data, stop_ids=STOP_IDS)
+    filtered_data: pd.DataFrame = filter_data(route_filtered_data, stop_ids=effective_stop_ids)
 
     # Build & log selection-vs-system summary (filtered rows vs. full input)
     selection_summary: pd.DataFrame = build_selection_summary(ridership_df, filtered_data)
 
     # Log missing optional STOP_IDS
-    log_missing_stop_ids(STOP_IDS, filtered_data["STOP_ID"])
+    log_missing_stop_ids(effective_stop_ids, filtered_data["STOP_ID"])
 
     # Standardise TIME_PERIOD values
     filtered_data["TIME_PERIOD"] = filtered_data["TIME_PERIOD"].astype(str).str.strip().str.upper()
@@ -1171,14 +1269,14 @@ def main() -> None:  # noqa: D401 – imperative mood is OK for main entry point
     if EXPORT_ROUTE_LEVEL_ANALYSIS:
         route_scope: pd.DataFrame = route_filtered_data.copy()
         route_scope["ROUTE_NAME"] = route_scope["ROUTE_NAME"].astype(str).str.strip()
-        if STOP_IDS:
+        if effective_stop_ids:
             relevant_routes: set[str] = set(
                 filtered_data["ROUTE_NAME"].astype(str).str.strip().unique()
             )
             route_scope = route_scope[route_scope["ROUTE_NAME"].isin(relevant_routes)]
         route_analysis = build_route_level_analysis(
             route_scope,
-            stop_ids_filter=STOP_IDS,
+            stop_ids_filter=effective_stop_ids,
             gtfs_stops=gtfs_stops,
             gtfs_join_key=GTFS_JOIN_KEY,
         )
