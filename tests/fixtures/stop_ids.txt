@@ -1,0 +1,8 @@
+# Sample STOP_IDS_FILE fixture for data_request_by_stop_processor tests.
+# Blank lines and comment lines like this one are ignored.
+
+1001
+3003, 4004
+
+# Commas and whitespace can be mixed on one line.
+5006 7008
