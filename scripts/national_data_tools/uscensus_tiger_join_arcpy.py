@@ -69,13 +69,15 @@ FIPS_TO_FILTER: list[str] = [
 ]
 
 # ---- Outputs ----
-INTERMEDIATE_MERGED_SHP: str = (
-    "File/Path/To/Your/output_intermediate/merged_blocks.shp"  # or ...gdb/merged_blocks
-)
-INTERMEDIATE_COMBINED_CSV: str = r"File\Path\To\Your\output_intermediate\combined_blocks.csv"
-FINAL_JOINED_FEATURES: str = (
-    "File/Path/To/Your/output_final/blocks_with_attrs.shp"  # or ...gdb/blocks_with_attrs
-)
+INTERMEDIATE_OUTPUT_DIR: str = r"File\Path\To\Your\output_intermediate"  # <<< EDIT ME
+INTERMEDIATE_MERGED_SHP_NAME: str = "merged_blocks.shp"  # or "merged_blocks" in a .gdb
+INTERMEDIATE_MERGED_SHP: str = str(Path(INTERMEDIATE_OUTPUT_DIR) / INTERMEDIATE_MERGED_SHP_NAME)
+INTERMEDIATE_COMBINED_CSV_NAME: str = "combined_blocks.csv"
+INTERMEDIATE_COMBINED_CSV: str = str(Path(INTERMEDIATE_OUTPUT_DIR) / INTERMEDIATE_COMBINED_CSV_NAME)
+
+FINAL_OUTPUT_DIR: str = r"File\Path\To\Your\output_final"  # <<< EDIT ME
+FINAL_JOINED_FEATURES_NAME: str = "blocks_with_attrs.shp"  # or "blocks_with_attrs" in a .gdb
+FINAL_JOINED_FEATURES: str = str(Path(FINAL_OUTPUT_DIR) / FINAL_JOINED_FEATURES_NAME)
 
 # ---- CSV topic signatures ----
 TOPIC_SIGNATURES: dict[str, Sequence[str] | str] = {
@@ -105,11 +107,15 @@ LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
 # Sentinel values — detect un-edited placeholder paths
 _DEFAULT_INPUT_CSV_DIR: str = r"Folder\Path\To\Your\input_csvs"
 _DEFAULT_INPUT_SHP_DIR: str = r"Folder\Path\To\Your\input_shps"
-_DEFAULT_INTERMEDIATE_MERGED_SHP: str = "File/Path/To/Your/output_intermediate/merged_blocks.shp"
-_DEFAULT_INTERMEDIATE_COMBINED_CSV: str = (
-    r"File\Path\To\Your\output_intermediate\combined_blocks.csv"
+_DEFAULT_INTERMEDIATE_OUTPUT_DIR: str = r"File\Path\To\Your\output_intermediate"
+_DEFAULT_INTERMEDIATE_MERGED_SHP: str = str(
+    Path(_DEFAULT_INTERMEDIATE_OUTPUT_DIR) / "merged_blocks.shp"
 )
-_DEFAULT_FINAL_JOINED_FEATURES: str = "File/Path/To/Your/output_final/blocks_with_attrs.shp"
+_DEFAULT_INTERMEDIATE_COMBINED_CSV: str = str(
+    Path(_DEFAULT_INTERMEDIATE_OUTPUT_DIR) / "combined_blocks.csv"
+)
+_DEFAULT_FINAL_OUTPUT_DIR: str = r"File\Path\To\Your\output_final"
+_DEFAULT_FINAL_JOINED_FEATURES: str = str(Path(_DEFAULT_FINAL_OUTPUT_DIR) / "blocks_with_attrs.shp")
 
 
 def _gp(msg: str, level: str = "info") -> None:

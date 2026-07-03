@@ -18,10 +18,10 @@ Stages
 
 Configuration
 -------------
-At minimum, set INPUT_CSV_DIR, INPUT_SHP_DIR, and FINAL_JOINED_FEATURES.
-Set INTERMEDIATE_COMBINED_CSV or INTERMEDIATE_MERGED_SHP to an empty string
-to skip writing those intermediate artifacts; the pipeline will still run
-in memory.
+At minimum, set INPUT_CSV_DIR, INPUT_SHP_DIR, and OUTPUT_DIR.
+Set INTERMEDIATE_COMBINED_CSV_NAME or INTERMEDIATE_MERGED_SHP_NAME to an
+empty string or None to skip writing those intermediate artifacts; the
+pipeline will still run in memory.
 
 Notes:
 -----
@@ -103,15 +103,29 @@ FIPS_TO_FILTER: List[str] = [
 ]
 
 # ---- Outputs ----------------------------------------------------------------
-#: Intermediate combined CSV from Stage 1. Set to "" or None to skip writing.
-INTERMEDIATE_COMBINED_CSV: str | None = r"Path\To\Your\Output_Folder\joined_blocks.csv"
+#: Folder all three outputs below are written into.
+OUTPUT_DIR: str | Path = r"Path\To\Your\Output_Folder"  # <<< EDIT ME
 
-#: Intermediate merged geometry from Stage 2 (Shapefile *.shp or GeoPackage
-#: *.gpkg). Set to "" or None to skip writing.
-INTERMEDIATE_MERGED_SHP: str | None = r"Path\To\Your\Output_Folder\va_md_dc_blocks_fips_merge.shp"
+#: Intermediate combined CSV filename from Stage 1. Set to "" or None to skip writing.
+INTERMEDIATE_COMBINED_CSV_NAME: str | None = "joined_blocks.csv"
+INTERMEDIATE_COMBINED_CSV: str | None = (
+    None
+    if not INTERMEDIATE_COMBINED_CSV_NAME
+    else str(Path(OUTPUT_DIR) / INTERMEDIATE_COMBINED_CSV_NAME)
+)
 
-#: Final joined geometry + attributes (Stage 3 output).
-FINAL_JOINED_FEATURES: str = r"Path\To\Your\Output_Folder\va_md_dc_blocks_plus_data.shp"
+#: Intermediate merged geometry filename from Stage 2 (Shapefile *.shp or
+#: GeoPackage *.gpkg). Set to "" or None to skip writing.
+INTERMEDIATE_MERGED_SHP_NAME: str | None = "va_md_dc_blocks_fips_merge.shp"
+INTERMEDIATE_MERGED_SHP: str | None = (
+    None
+    if not INTERMEDIATE_MERGED_SHP_NAME
+    else str(Path(OUTPUT_DIR) / INTERMEDIATE_MERGED_SHP_NAME)
+)
+
+#: Final joined geometry + attributes filename (Stage 3 output).
+FINAL_JOINED_FEATURES_NAME: str = "va_md_dc_blocks_plus_data.shp"
+FINAL_JOINED_FEATURES: str = str(Path(OUTPUT_DIR) / FINAL_JOINED_FEATURES_NAME)
 
 # ---- Join settings ----------------------------------------------------------
 LEFT_KEY: Final[str] = "GEOID20"  # 15-digit block ID in geometry
@@ -171,9 +185,14 @@ LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
 # ---- Sentinel defaults — detect un-edited placeholder paths ----------------
 _DEFAULT_INPUT_CSV_DIR: str = r"Path\To\Your\Census_Table_Data_Files"
 _DEFAULT_INPUT_SHP_DIR: str = r"Path\To\Your\TIGER_Shapefiles"
-_DEFAULT_INTERMEDIATE_COMBINED_CSV: str = r"Path\To\Your\Output_Folder\joined_blocks.csv"
-_DEFAULT_INTERMEDIATE_MERGED_SHP: str = r"Path\To\Your\Output_Folder\va_md_dc_blocks_fips_merge.shp"
-_DEFAULT_FINAL_JOINED_FEATURES: str = r"Path\To\Your\Output_Folder\va_md_dc_blocks_plus_data.shp"
+_DEFAULT_OUTPUT_DIR: str = r"Path\To\Your\Output_Folder"
+_DEFAULT_INTERMEDIATE_COMBINED_CSV: str = str(Path(_DEFAULT_OUTPUT_DIR) / "joined_blocks.csv")
+_DEFAULT_INTERMEDIATE_MERGED_SHP: str = str(
+    Path(_DEFAULT_OUTPUT_DIR) / "va_md_dc_blocks_fips_merge.shp"
+)
+_DEFAULT_FINAL_JOINED_FEATURES: str = str(
+    Path(_DEFAULT_OUTPUT_DIR) / "va_md_dc_blocks_plus_data.shp"
+)
 
 
 class _Unset:
