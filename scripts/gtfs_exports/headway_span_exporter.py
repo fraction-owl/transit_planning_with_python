@@ -45,7 +45,8 @@ import pandas as pd
 # =============================================================================
 
 GTFS_FOLDER: Path = Path(r"Path\To\Your\GTFS_Folder")  # ←–– change me
-OUTPUT_PATH: Path = Path(r"Path\To\Your\Output\headway_span_by_route.csv")  # ←–– change me
+OUTPUT_DIR: Path = Path(r"Path\To\Your\Output_Folder")  # ←–– change me
+OUTPUT_FILENAME: str = "headway_span_by_route.csv"
 
 # "weekday" (Mon–Fri), "saturday", or "sunday".
 SERVICE_DAY: str = "weekday"
@@ -208,7 +209,7 @@ def run(
     ``m.GTFS_FOLDER = ...; m.run()`` works after a plain import.
     """
     gtfs_folder = GTFS_FOLDER if gtfs_folder is None else Path(gtfs_folder)
-    output_path = OUTPUT_PATH if output_path is None else Path(output_path)
+    output_path = (OUTPUT_DIR / OUTPUT_FILENAME) if output_path is None else Path(output_path)
     service_day = SERVICE_DAY if service_day is None else service_day
     filter_in = (
         FILTER_IN_ROUTE_SHORT_NAMES
@@ -274,7 +275,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--gtfs-folder", type=Path, default=GTFS_FOLDER, help="Path to the GTFS folder."
     )
-    parser.add_argument("--output", type=Path, default=OUTPUT_PATH, help="Output CSV path.")
+    parser.add_argument(
+        "--output", type=Path, default=OUTPUT_DIR / OUTPUT_FILENAME, help="Output CSV path."
+    )
     parser.add_argument(
         "--service-day",
         default=SERVICE_DAY,
@@ -313,11 +316,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     sentinels = {
         Path(r"Path\To\Your\GTFS_Folder"),
-        Path(r"Path\To\Your\Output\headway_span_by_route.csv"),
+        Path(r"Path\To\Your\Output_Folder") / "headway_span_by_route.csv",
     }
     if args.gtfs_folder in sentinels or args.output in sentinels:
         logging.warning(
-            "GTFS_FOLDER and/or OUTPUT_PATH are still placeholders. Update the configuration "
+            "GTFS_FOLDER and/or OUTPUT_DIR are still placeholders. Update the configuration "
             "block or pass --gtfs-folder/--output before running."
         )
         return

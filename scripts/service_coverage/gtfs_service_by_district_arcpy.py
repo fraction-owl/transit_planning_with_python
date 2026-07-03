@@ -43,7 +43,9 @@ DISTRICT_FIELD = "DISTRICT"
 WORK_DIR = os.path.abspath(r"temp\gtfs_district_matrix_work")
 WORK_GDB_NAME = "work.gdb"
 
-OUTPUT_EXCEL = r"Path\To\Your\Excel_File.xlsx"
+OUTPUT_DIR = r"Path\To\Your\Output_Folder"
+OUTPUT_EXCEL_NAME = "Excel_File.xlsx"
+OUTPUT_EXCEL = os.path.join(OUTPUT_DIR, OUTPUT_EXCEL_NAME)
 LOG_DIR = r"Path\To\Your\Logs"
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
@@ -432,10 +434,10 @@ def main() -> None:
     if (
         GTFS_DIR == r"Path\To\Your\GTFS_data"
         or DISTRICTS_FC == r"Path\To\Your\Districts.shp"
-        or OUTPUT_EXCEL == r"Path\To\Your\Excel_File.xlsx"
+        or OUTPUT_DIR == r"Path\To\Your\Output_Folder"
     ):
         logging.warning(
-            "GTFS_DIR, DISTRICTS_FC, and/or OUTPUT_EXCEL are still set to placeholder values. "
+            "GTFS_DIR, DISTRICTS_FC, and/or OUTPUT_DIR are still set to placeholder values. "
             "Please update them in the CONFIGURATION section before running."
         )
         return
