@@ -29,7 +29,10 @@ the CONFIGURATION block of this script verbatim (the text between the
 timestamp and source-script path. This provides a permanent, drift-proof record
 of the settings used to produce each output. Treat the run log as a required
 deliverable — set ``REQUIRE_RUN_LOG = False`` only when writing to a location
-where a sidecar file is genuinely impossible.
+where a sidecar file is genuinely impossible. When ``STOP_IDS_FILE`` is used,
+the CONFIG block only records its path — the file's contents can change after
+the fact — so the run log additionally pins the file's SHA-256 hash and the
+full resolved STOP_IDS list actually used for that run.
 
 The script is designed for analysts and data scientists who need a quick and
 repeatable tool for ad-hoc stop ridership data requests, and it is suitable
@@ -38,6 +41,7 @@ for use in environments like ArcGIS Pro or Jupyter Notebooks.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import sys
 import zipfile
@@ -1115,7 +1119,20 @@ def _resolve_script_source() -> Tuple[str, str]:
     )
 
 
-def write_run_log(output_file: Path) -> bool:
+def _hash_file_sha256(path: Path) -> str | None:
+    """Return the SHA-256 hex digest of *path*'s contents, or None if unreadable."""
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def write_run_log(
+    output_file: Path,
+    *,
+    stop_ids_file: Path | None = None,
+    effective_stop_ids: Sequence[int] | None = None,
+) -> bool:
     """Write a sidecar .txt log of the configuration block for recordkeeping.
 
     The log is saved next to ``output_file`` with the same stem and a
@@ -1123,6 +1140,12 @@ def write_run_log(output_file: Path) -> bool:
     script verbatim — text between :data:`CONFIG_BEGIN_MARKER` and
     :data:`CONFIG_END_MARKER` — so the log can never drift from the actual
     values used. Comments and whitespace inside the block are preserved.
+
+    When ``stop_ids_file`` is given, an additional section pins the file's
+    SHA-256 hash and the full resolved ``STOP_IDS`` list. The CONFIG block
+    only records the file's *path*; the file's contents can be edited later,
+    so without this section an old run log couldn't prove which stop IDs a
+    past run actually used.
 
     Source resolution: Jupyter/IPython kernels are detected first via
     ``get_ipython()``; the most-recent cell in ``In[]`` that contains both
@@ -1134,6 +1157,10 @@ def write_run_log(output_file: Path) -> bool:
 
     Args:
         output_file: Path to the Excel workbook this run produced.
+        stop_ids_file: The ``STOP_IDS_FILE`` config value, if set.
+        effective_stop_ids: The resolved STOP_IDS list actually used for this
+            run (from :func:`resolve_stop_ids`). Only recorded in the log
+            when ``stop_ids_file`` is also given.
 
     Returns:
         ``True`` if the log was written successfully, ``False`` otherwise.
@@ -1159,8 +1186,25 @@ def write_run_log(output_file: Path) -> bool:
         "CONFIGURATION (verbatim from source)",
         "-" * 72,
         config_text,
-        "=" * 72,
     ]
+
+    if stop_ids_file is not None:
+        file_hash: str | None = _hash_file_sha256(stop_ids_file)
+        resolved_ids: List[int] = list(effective_stop_ids) if effective_stop_ids else []
+        ids_repr: str = ", ".join(str(i) for i in resolved_ids) if resolved_ids else "(none)"
+        lines += [
+            "",
+            "-" * 72,
+            "STOP_IDS_FILE SNAPSHOT (the CONFIG block above only records the path;",
+            "this section pins what was actually read, so later edits to the file",
+            "don't retroactively change what this log proves)",
+            "-" * 72,
+            f"STOP_IDS_FILE:        {stop_ids_file}",
+            f"STOP_IDS_FILE SHA256: {file_hash or '<unreadable at log time>'}",
+            f"Resolved STOP_IDS (n={len(resolved_ids)}): {ids_repr}",
+        ]
+
+    lines.append("=" * 72)
 
     try:
         log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -1293,7 +1337,14 @@ def main() -> None:  # noqa: D401 – imperative mood is OK for main entry point
     )
 
     # Sidecar run log — required by default so outputs are always traceable.
-    if not write_run_log(output_file) and REQUIRE_RUN_LOG:
+    if (
+        not write_run_log(
+            output_file,
+            stop_ids_file=STOP_IDS_FILE,
+            effective_stop_ids=effective_stop_ids,
+        )
+        and REQUIRE_RUN_LOG
+    ):
         logging.error(
             "Run log could not be written. Set REQUIRE_RUN_LOG = False to "
             "suppress this error when a sidecar file is genuinely impossible."

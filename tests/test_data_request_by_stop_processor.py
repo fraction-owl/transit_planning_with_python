@@ -1,3 +1,4 @@
+import hashlib
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -79,6 +80,63 @@ def test_write_run_log_returns_false_on_io_error(tmp_path: Path) -> None:
         result = target.write_run_log(output_file)
 
     assert result is False
+
+
+def test_write_run_log_omits_snapshot_when_no_stop_ids_file(tmp_path: Path) -> None:
+    """No STOP_IDS_FILE SNAPSHOT section when stop_ids_file is not given."""
+    output_file = tmp_path / "output.xlsx"
+    fake_source = "# === BEGIN CONFIG ===\nKEY = 1\n# === END CONFIG ===\n"
+    with patch(
+        "data_request_by_stop_processor._resolve_script_source",
+        return_value=(fake_source, "<test>"),
+    ):
+        target.write_run_log(output_file)
+
+    content = (tmp_path / "output_runlog.txt").read_text(encoding="utf-8")
+    assert "STOP_IDS_FILE SNAPSHOT" not in content
+
+
+def test_write_run_log_includes_stop_ids_file_snapshot(tmp_path: Path) -> None:
+    """The snapshot section pins the file's hash and the resolved ID list."""
+    output_file = tmp_path / "output.xlsx"
+    stop_ids_file = tmp_path / "stop_ids.txt"
+    stop_ids_file.write_text("1001\n3003\n", encoding="utf-8")
+    expected_hash = hashlib.sha256(stop_ids_file.read_bytes()).hexdigest()
+
+    fake_source = "# === BEGIN CONFIG ===\nKEY = 1\n# === END CONFIG ===\n"
+    with patch(
+        "data_request_by_stop_processor._resolve_script_source",
+        return_value=(fake_source, "<test>"),
+    ):
+        result = target.write_run_log(
+            output_file, stop_ids_file=stop_ids_file, effective_stop_ids=[1001, 3003]
+        )
+
+    assert result is True
+    content = (tmp_path / "output_runlog.txt").read_text(encoding="utf-8")
+    assert "STOP_IDS_FILE SNAPSHOT" in content
+    assert str(stop_ids_file) in content
+    assert expected_hash in content
+    assert "Resolved STOP_IDS (n=2): 1001, 3003" in content
+
+
+def test_write_run_log_snapshot_handles_unreadable_file(tmp_path: Path) -> None:
+    """An unreadable stop_ids_file logs a placeholder instead of raising."""
+    output_file = tmp_path / "output.xlsx"
+    missing_file = tmp_path / "does_not_exist.txt"
+
+    fake_source = "# === BEGIN CONFIG ===\nKEY = 1\n# === END CONFIG ===\n"
+    with patch(
+        "data_request_by_stop_processor._resolve_script_source",
+        return_value=(fake_source, "<test>"),
+    ):
+        result = target.write_run_log(
+            output_file, stop_ids_file=missing_file, effective_stop_ids=[1001]
+        )
+
+    assert result is True
+    content = (tmp_path / "output_runlog.txt").read_text(encoding="utf-8")
+    assert "<unreadable at log time>" in content
 
 
 def test_full_processing_integration() -> None:
@@ -583,6 +641,35 @@ def test_main_filters_using_stop_ids_file() -> None:
 
     # Fixture lists stop IDs 1001, 3003, 4004, 5006, 7008 — no others should remain.
     assert set(filtered_data["STOP_ID"].unique()) == {1001, 3003, 4004, 5006, 7008}
+
+
+def test_main_passes_stop_ids_file_snapshot_info_to_run_log() -> None:
+    """main() forwards STOP_IDS_FILE and the resolved IDs to write_run_log."""
+    fixture_df = pd.read_csv(FIXTURE_PATH)
+
+    with (
+        patch("data_request_by_stop_processor.read_excel_file") as mock_read,
+        patch("data_request_by_stop_processor.write_to_excel"),
+        patch("data_request_by_stop_processor.write_run_log", return_value=True) as mock_log,
+        patch("data_request_by_stop_processor.INPUT_FILE_PATH", Path("dummy_input.xlsx")),
+        patch("data_request_by_stop_processor.OUTPUT_DIR", Path("dummy_output")),
+        patch("data_request_by_stop_processor.ROUTES", []),
+        patch("data_request_by_stop_processor.ROUTES_EXCLUDE", []),
+        patch("data_request_by_stop_processor.STOP_IDS", []),
+        patch("data_request_by_stop_processor.STOP_IDS_FILE", STOP_IDS_FIXTURE_PATH),
+        patch("data_request_by_stop_processor.TIME_PERIODS", ["AM PEAK", "PM PEAK"]),
+        patch("data_request_by_stop_processor.AGGREGATE_ROUTES_TOGETHER", True),
+        patch("data_request_by_stop_processor.APPLY_ROUNDING", True),
+        patch("data_request_by_stop_processor.AGGREGATE_BIN_RANGES", False),
+        patch("data_request_by_stop_processor.EXPORT_ROUTE_LEVEL_ANALYSIS", False),
+    ):
+        mock_read.return_value = fixture_df.copy()
+        target.main()
+
+        _, kwargs = mock_log.call_args
+
+    assert kwargs["stop_ids_file"] == STOP_IDS_FIXTURE_PATH
+    assert kwargs["effective_stop_ids"] == [1001, 3003, 4004, 5006, 7008]
 
 
 # =============================================================================
