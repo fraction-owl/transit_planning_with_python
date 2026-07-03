@@ -45,7 +45,9 @@ import pandas as pd
 # =============================================================================
 
 INPUT_CSV: Path = Path(r"Path\To\Event Runtime Analysis.csv")
-OUTPUT_CSV: Path = Path(r"Path\To\trips_performed.csv")
+OUTPUT_DIR: Path = Path(r"Path\To\Your\Output_Folder")
+OUTPUT_FILENAME: str = "trips_performed.csv"
+OUTPUT_CSV: Path = OUTPUT_DIR / OUTPUT_FILENAME
 
 # If set (e.g., "Revenue"), keeps only Trip Type == this value.
 # If None/blank, keeps everything and logs nothing about filtering.
@@ -473,11 +475,11 @@ def main() -> None:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    if INPUT_CSV == Path(r"Path\To\Event Runtime Analysis.csv") or OUTPUT_CSV == Path(
-        r"Path\To\trips_performed.csv"
+    if INPUT_CSV == Path(r"Path\To\Event Runtime Analysis.csv") or OUTPUT_DIR == Path(
+        r"Path\To\Your\Output_Folder"
     ):
         logging.warning(
-            "INPUT_CSV and/or OUTPUT_CSV are still set to placeholder values. "
+            "INPUT_CSV and/or OUTPUT_DIR are still set to placeholder values. "
             "Please update them in the CONFIGURATION section before running."
         )
         return

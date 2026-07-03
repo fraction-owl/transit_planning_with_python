@@ -36,8 +36,12 @@ import pandas as pd
 #: Sub-directories are searched automatically.
 ROOT_DATA_DIR: str | Path = r"Path\To\Your\Census_Table_Data_Files"  # <<< EDIT ME
 
-#: Optional output CSV (set to None to skip writing)
-CSV_OUTPUT_PATH: str | None = r"Path\To\Your\Output_Folder\joined_blocks.csv"
+#: Optional output folder for the joined CSV (set OUTPUT_DIR to None to skip writing).
+OUTPUT_DIR: str | Path | None = r"Path\To\Your\Output_Folder"  # <<< EDIT ME
+OUTPUT_CSV_NAME: str = "joined_blocks.csv"
+CSV_OUTPUT_PATH: str | None = (
+    None if OUTPUT_DIR is None else str(Path(OUTPUT_DIR) / OUTPUT_CSV_NAME)
+)
 
 #: Optional county FIPS filter (5-digit codes, e.g. ["11001", "51059"])
 COUNTY_FIPS_FILTER: list[str] = [
@@ -74,7 +78,7 @@ LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
 
 # Sentinel values — detect un-edited placeholder paths
 _DEFAULT_ROOT_DATA_DIR: str = r"Path\To\Your\Census_Table_Data_Files"
-_DEFAULT_CSV_OUTPUT_PATH: str = r"Path\To\Your\Output_Folder\joined_blocks.csv"
+_DEFAULT_OUTPUT_DIR: str = r"Path\To\Your\Output_Folder"
 
 # =============================================================================
 # FUNCTIONS
@@ -736,10 +740,8 @@ def main() -> None:
     if str(ROOT_DATA_DIR) == _DEFAULT_ROOT_DATA_DIR:
         logging.warning("ROOT_DATA_DIR is still the placeholder value — update it before running.")
         defaults_found = True
-    if CSV_OUTPUT_PATH == _DEFAULT_CSV_OUTPUT_PATH:
-        logging.warning(
-            "CSV_OUTPUT_PATH is still the placeholder value — update it before running."
-        )
+    if OUTPUT_DIR is not None and str(OUTPUT_DIR) == _DEFAULT_OUTPUT_DIR:
+        logging.warning("OUTPUT_DIR is still the placeholder value — update it before running.")
         defaults_found = True
     if defaults_found:
         logging.info("No processing performed. Update the configuration paths and re-run.")

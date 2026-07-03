@@ -33,6 +33,7 @@ Participation is welcome from anyone, whether you’re new to Python, an experie
 - Prefer the `logging` module over `print()` for all success messages, diagnostics, or warnings.
 - Implement **graceful, actionable error handling** — no cryptic tracebacks.
 - Use placeholder filenames that are clean, minimal, and safe to run (e.g., r"Path\\To\\Output_Folder", "input_data.csv").
+- **Output paths are a directory constant plus separate filename constant(s).** Define `OUTPUT_DIR` (a folder) in the CONFIGURATION block, then join it with a separate `*_FILENAME`/`*_NAME` constant (e.g., `OUTPUT_DIR / OUTPUT_FILENAME`) to build each output path. This confines the only hand-edited, backslash-prone value to the directory, and lets users redirect every output by changing one line. If a script writes a dynamically-named or per-loop set of outputs (one file per route, service_id, etc.), define `OUTPUT_DIR` only — see `stop_pattern_exporter.py`. For a fixed set of named outputs, see `route_transfer_calculator.py` (`OUTPUT_DIR` + `SUMMARY_FILENAME`/`DETAIL_FILENAME`).
 - **Run logs are required.** Any script that produces an output file must write a matching `_runlog.txt` sidecar (same directory, same stem). A `REQUIRE_RUN_LOG: bool = True` config variable controls enforcement: when `True` (the default), a failed log write aborts the script so analysts are never left with an untraced output. Set it to `False` only when writing to a genuinely read-only location.
 - Default to:
   - **Washington, DC CRS** unless otherwise noted (chosen because DC is the U.S. capital).

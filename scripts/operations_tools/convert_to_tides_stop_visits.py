@@ -53,7 +53,9 @@ import pandas as pd
 # =============================================================================
 
 INPUT_CSV: Path = Path(r"Path\To\Stop Visit Events.csv")
-OUTPUT_CSV: Path = Path(r"Path\To\stop_visits.csv")
+OUTPUT_DIR: Path = Path(r"Path\To\Your\Output_Folder")
+OUTPUT_FILENAME: str = "stop_visits.csv"
+OUTPUT_CSV: Path = OUTPUT_DIR / OUTPUT_FILENAME
 
 # Trip ID strategy:
 # - "token": trip_id_performed = second token in Trip field (default)
@@ -541,11 +543,11 @@ def main() -> None:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    if INPUT_CSV == Path(r"Path\To\Stop Visit Events.csv") or OUTPUT_CSV == Path(
-        r"Path\To\stop_visits.csv"
+    if INPUT_CSV == Path(r"Path\To\Stop Visit Events.csv") or OUTPUT_DIR == Path(
+        r"Path\To\Your\Output_Folder"
     ):
         logging.warning(
-            "INPUT_CSV and/or OUTPUT_CSV are still set to placeholder values. "
+            "INPUT_CSV and/or OUTPUT_DIR are still set to placeholder values. "
             "Please update them in the CONFIGURATION section before running."
         )
         return
