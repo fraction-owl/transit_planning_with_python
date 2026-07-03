@@ -490,15 +490,19 @@ def test_derive_ethnicity_computes_minority_sum_and_percentage() -> None:
         {
             "GEO_ID": [_TRACT_GEO_ID],
             "total_pop": [200],
-            "black": [40],
-            "native": [10],
-            "asian": [20],
-            "pac_isl": [5],
-            "other": [5],
-            "multi": [10],
+            "white": [110],
+            "all_hisp": [30],
+            "black": [30],
+            "native": [5],
+            "asian": [15],
+            "pac_isl": [2],
+            "other": [3],
+            "multi": [5],
         }
     )
     result = mod._derive_ethnicity(df)
+    # minority = total_pop - white = 90 = all_hisp(30) + the non-white NH race
+    # categories (60): Hispanic/Latino residents must be included, not dropped.
     assert result["minority"].iloc[0] == 90
     assert result["perc_minority"].iloc[0] == pytest.approx(0.45)
     assert "total_pop" not in result.columns
