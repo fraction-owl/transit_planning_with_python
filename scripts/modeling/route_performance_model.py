@@ -22,7 +22,11 @@ CSV bundle per join-key signature, each verified against a manifest before joini
 
 Inputs:
     ANCHOR_PATH    NTD anchor: route_id + ntd_boardings (the proprietary DV) plus the
-                   service-supplied predictors revenue_hours / revenue_miles.
+                   service-supplied predictors revenue_hours / revenue_miles. Built by
+                   ntd_anchor_builder.py on a single service-day basis (weekday /
+                   saturday / sunday / combined); its service_day stamp is verified
+                   against EXPECTED_SERVICE_DAY so the DV and the supply predictors
+                   are guaranteed to sit on the same day-type basis.
     BUNDLE_DIR     Feature bundle CSVs produced by prep_features_public.py (Part A).
     MANIFEST_PATH  prep_features_public manifest (each bundle's join keys + SHA-256). A bundle
                    is joined only if every one of its join keys is present in the anchor,
@@ -78,6 +82,18 @@ ANCHOR_AGG: Final[str] = "mean"  # <<< EDIT ME
 # revenue averages because mean() skips NaN only in the boardings column).
 ANCHOR_EXCLUDE_ZERO_MONTHS: Final[bool] = True
 
+# --- Service-day contract ------------------------------------------------------
+# ntd_anchor_builder.py stamps every anchor row with the service day it represents
+# ("weekday" / "saturday" / "sunday" / "combined") and keeps the DV and the supply
+# predictors on that same basis (boardings, revenue_hours, and revenue_miles are
+# all summed over the same service-day rows — the pairing this model's
+# productivity control depends on). When EXPECTED_SERVICE_DAY is set, the run
+# aborts if the anchor's stamp disagrees (e.g. a combined anchor fed to a
+# weekday-only analysis); set it to "" to accept any anchor. An anchor without
+# the stamp column only warns, so pre-existing anchors still run.
+SERVICE_DAY_COLUMN: Final[str] = "service_day"
+EXPECTED_SERVICE_DAY: Final[str] = "weekday"  # <<< EDIT ME ("" = accept any)
+
 # Feature bundles produced by prep_features_public.py (PART A) and transferred in.
 # BUNDLE_DIR holds the bundle CSVs; MANIFEST_PATH is the JSON sidecar listing each
 # bundle's join keys, row/column counts, and SHA-256. A bundle is joined onto the
@@ -126,6 +142,12 @@ LOG_PREDICTORS: Final[tuple[str, ...]] = (
     "enrollment_postsec_served",
 )
 LOG_DEPENDENT: Final[bool] = True
+# What to do when the dependent variable is <= 0 under LOG_DEPENDENT. True drops
+# those routes with a logged count — right for Saturday/Sunday runs, where a zero
+# usually means "this route runs no weekend service", a non-operator rather than
+# an underperformer. False keeps the hard abort — right when a zero in a weekday
+# anchor is a data error worth stopping on.
+DROP_NONPOSITIVE_DEPENDENT: Final[bool] = True
 
 # --- Service-type flag -------------------------------------------------------
 # Routes flagged is_express = 1; everything else 0. Replace these placeholders
@@ -282,6 +304,46 @@ def load_manifest(manifest_path: Path) -> list[BundleSpec]:
     return specs
 
 
+def _verify_service_day(anchor: pd.DataFrame) -> Optional[str]:
+    """Verify the anchor's service-day stamp against EXPECTED_SERVICE_DAY.
+
+    Returns the anchor's (single) service day, or ``None`` when the anchor has no
+    stamp column (pre-stamp anchors warn but run). The stamp is written by
+    ntd_anchor_builder.py; the residual read is only meaningful when every row —
+    DV and supply predictors alike — sits on one day-type basis.
+
+    Raises:
+        ValueError: If the anchor mixes service days, or its stamp disagrees with
+            a non-empty EXPECTED_SERVICE_DAY.
+    """
+    if SERVICE_DAY_COLUMN not in anchor.columns:
+        if EXPECTED_SERVICE_DAY:
+            logging.warning(
+                "Anchor has no '%s' column, so it cannot be verified as a '%s' anchor. "
+                "Rebuild it with ntd_anchor_builder.py to get the stamp.",
+                SERVICE_DAY_COLUMN,
+                EXPECTED_SERVICE_DAY,
+            )
+        return None
+
+    days = sorted(set(anchor[SERVICE_DAY_COLUMN].astype(str).str.strip().str.lower()))
+    if len(days) != 1:
+        raise ValueError(
+            f"Anchor mixes service days {days}; this model analyzes one day type per "
+            "run. Rebuild single-day anchors with ntd_anchor_builder.py."
+        )
+    day = days[0]
+    expected = EXPECTED_SERVICE_DAY.strip().lower()
+    if expected and day != expected:
+        raise ValueError(
+            f"Anchor is stamped {SERVICE_DAY_COLUMN}='{day}' but EXPECTED_SERVICE_DAY "
+            f"is '{EXPECTED_SERVICE_DAY}'. Point ANCHOR_PATH at the {EXPECTED_SERVICE_DAY} "
+            "anchor, or change EXPECTED_SERVICE_DAY to match."
+        )
+    logging.info("Anchor service day verified: '%s'.", day)
+    return day
+
+
 def _collapse_panel_anchor(anchor: pd.DataFrame) -> pd.DataFrame:
     """Collapse a long/panel anchor (route x period) to one row per route.
 
@@ -330,7 +392,7 @@ def _collapse_panel_anchor(anchor: pd.DataFrame) -> pd.DataFrame:
     return anchor
 
 
-def assemble_model_table() -> tuple[pd.DataFrame, list[tuple[str, str]]]:
+def assemble_model_table() -> tuple[pd.DataFrame, list[tuple[str, str]], Optional[str]]:
     """Load the NTD anchor and left-join every prepped feature bundle onto it.
 
     The anchor holds the dependent variable plus the service-supplied predictors
@@ -341,9 +403,10 @@ def assemble_model_table() -> tuple[pd.DataFrame, list[tuple[str, str]]]:
     on their keys so they can never fan out the anchor.
 
     Returns:
-        ``(merged, provenance)`` where ``merged`` is the assembled route table and
-        ``provenance`` is the ``(filename, sha256)`` of every bundle actually
-        joined, recorded in the run log.
+        ``(merged, provenance, service_day)`` where ``merged`` is the assembled
+        route table, ``provenance`` is the ``(filename, sha256)`` of every bundle
+        actually joined (recorded in the run log), and ``service_day`` is the
+        anchor's verified day-type stamp (``None`` for an unstamped anchor).
 
     Raises:
         KeyError: If the anchor or a joined bundle lacks the join key(s).
@@ -356,6 +419,11 @@ def assemble_model_table() -> tuple[pd.DataFrame, list[tuple[str, str]]]:
         raise KeyError(f"Anchor is missing the join key '{ROUTE_KEY}'.")
     anchor[ROUTE_KEY] = _canonical_key(anchor[ROUTE_KEY])
     logging.info("Anchor '%s' loaded: %d rows, %d cols.", ANCHOR_PATH.name, *anchor.shape)
+
+    service_day = _verify_service_day(anchor)
+    # Once verified, the stamp column has done its job; drop it so the assembled
+    # table stays purely numeric alongside the join key.
+    anchor = anchor.drop(columns=[SERVICE_DAY_COLUMN], errors="ignore")
 
     merged = _collapse_panel_anchor(anchor)
 
@@ -443,7 +511,7 @@ def assemble_model_table() -> tuple[pd.DataFrame, list[tuple[str, str]]]:
             "match the anchor grain."
         )
     logging.info("Assembled table: %d routes x %d columns.", *merged.shape)
-    return merged, provenance
+    return merged, provenance, service_day
 
 
 def derive_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -519,12 +587,33 @@ def build_design_matrix(
     if frame.empty:
         raise ValueError("No complete rows remain after dropping missing values.")
 
+    if LOG_DEPENDENT:
+        nonpos = frame[DEPENDENT_VAR] <= 0
+        n_nonpos = int(nonpos.sum())
+        if n_nonpos and DROP_NONPOSITIVE_DEPENDENT:
+            # On a Saturday/Sunday anchor these are routes that run no service on
+            # that day type — non-operators, not underperformers — so they cannot
+            # (and should not) be in the fit.
+            dropped_ids = frame.loc[nonpos, ROUTE_KEY].astype(str).tolist()
+            shown = ", ".join(dropped_ids[:10]) + (", …" if n_nonpos > 10 else "")
+            logging.warning(
+                "Dropping %d route(s) with non-positive '%s' before the log transform "
+                "(no service on this day type, or a data gap): %s",
+                n_nonpos,
+                DEPENDENT_VAR,
+                shown,
+            )
+            frame = frame[~nonpos].reset_index(drop=True)
+            if frame.empty:
+                raise ValueError("No routes remain after dropping non-positive dependents.")
+        elif n_nonpos:
+            raise ValueError(
+                f"LOG_DEPENDENT is True but '{DEPENDENT_VAR}' has {n_nonpos} non-positive "
+                "value(s). Set DROP_NONPOSITIVE_DEPENDENT = True to drop them instead."
+            )
+
     y = frame[DEPENDENT_VAR].to_numpy(dtype=float)
     if LOG_DEPENDENT:
-        if np.any(y <= 0):
-            raise ValueError(
-                f"LOG_DEPENDENT is True but '{DEPENDENT_VAR}' has non-positive values."
-            )
         y = np.log(y)
 
     columns: dict[str, np.ndarray] = {}
@@ -668,10 +757,11 @@ def fit_ols(y: np.ndarray, x_matrix: np.ndarray, term_names: list[str], se_type:
 # =============================================================================
 
 
-def build_summary_frame(result: OLSResult) -> pd.DataFrame:
+def build_summary_frame(result: OLSResult, service_day: Optional[str]) -> pd.DataFrame:
     """Assemble the model-fit summary metrics into a tidy frame."""
     metrics = [
         ("dependent_variable", f"log({DEPENDENT_VAR})" if LOG_DEPENDENT else DEPENDENT_VAR),
+        ("service_day", service_day or "(not stamped)"),
         ("observations", result.n_obs),
         ("parameters", result.n_params),
         ("r_squared", round(result.r_squared, 4)),
@@ -766,10 +856,12 @@ def build_route_performance(result: OLSResult, model_frame: pd.DataFrame) -> pd.
     return out.sort_values("studentized_residual").reset_index(drop=True)
 
 
-def export_results(result: OLSResult, model_frame: pd.DataFrame) -> Path:
+def export_results(
+    result: OLSResult, model_frame: pd.DataFrame, service_day: Optional[str] = None
+) -> Path:
     """Write the five-sheet results workbook and return its path."""
     workbook = OUTPUT_DIR / "route_performance_results.xlsx"
-    summary = build_summary_frame(result)
+    summary = build_summary_frame(result, service_day)
     coef = build_coefficient_frame(result)
     performance = build_route_performance(result, model_frame)
     numeric = model_frame.select_dtypes(include="number")
@@ -860,7 +952,9 @@ def _extract_config_block() -> str:
     return "\n".join(lines[begin + 1 : end])
 
 
-def write_run_log(result: OLSResult, provenance: list[tuple[str, str]]) -> None:
+def write_run_log(
+    result: OLSResult, provenance: list[tuple[str, str]], service_day: Optional[str] = None
+) -> None:
     """Write the run-log sidecar (timestamp, fit headline, bundle provenance, config)."""
     log_path = OUTPUT_DIR / "route_performance_model_runlog.txt"
     bundle_lines = (
@@ -877,6 +971,7 @@ def write_run_log(result: OLSResult, provenance: list[tuple[str, str]]) -> None:
         f"Run timestamp:    {dt.datetime.now().isoformat(timespec='seconds')}",
         f"Anchor:           {ANCHOR_PATH}",
         f"Anchor SHA-256:   {anchor_sha}",
+        f"Service day:      {service_day or '(not stamped)'}",
         f"Bundle dir:       {BUNDLE_DIR}",
         f"Manifest:         {MANIFEST_PATH}",
         f"Routes modeled:   {result.n_obs}",
@@ -938,7 +1033,7 @@ def run() -> Optional[OLSResult]:
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    table, provenance = assemble_model_table()
+    table, provenance, service_day = assemble_model_table()
     table = derive_features(table)
     if DEPENDENT_VAR not in table.columns:
         raise KeyError(f"Dependent variable '{DEPENDENT_VAR}' not in the assembled table.")
@@ -947,10 +1042,10 @@ def run() -> Optional[OLSResult]:
     result = fit_ols(y, x_matrix, term_names, SE_TYPE)
     log_report(result)
 
-    export_results(result, model_frame)
+    export_results(result, model_frame, service_day)
     if MAKE_PLOTS:
         make_diagnostic_plots(result)
-    write_run_log(result, provenance)
+    write_run_log(result, provenance, service_day)
 
     logging.info("Done.")
     return result

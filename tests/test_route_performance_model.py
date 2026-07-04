@@ -245,8 +245,10 @@ def test_assemble_model_table_joins_route_bundle_and_skips_period(tmp_path, monk
     monkeypatch.setattr(rpm, "BUNDLE_DIR", bundle_dir)
     monkeypatch.setattr(rpm, "MANIFEST_PATH", manifest_path)
 
-    merged, provenance = rpm.assemble_model_table()
+    merged, provenance, service_day = rpm.assemble_model_table()
 
+    # The fixture anchor carries no service_day stamp: run proceeds, day unknown.
+    assert service_day is None
     assert len(merged) == 3
     # Feature columns from the route_id bundle are joined on.
     assert {"total_pop", "shared_stop_share", "competition_intensity"} <= set(merged.columns)
@@ -341,9 +343,10 @@ def test_collapse_panel_anchor_drops_nan_months_with_zeros(monkeypatch) -> None:
 
 
 def test_log_dependent_rejects_nonpositive(monkeypatch) -> None:
-    """A non-positive dependent under the log transform must raise."""
+    """A non-positive dependent under the log transform must raise when not dropping."""
     monkeypatch.setattr(rpm, "PREDICTORS", ("revenue_hours",))
     monkeypatch.setattr(rpm, "LOG_PREDICTORS", ("revenue_hours",))
+    monkeypatch.setattr(rpm, "DROP_NONPOSITIVE_DEPENDENT", False)
     table = pd.DataFrame(
         {
             "route_id": ["1", "2", "3"],
@@ -353,3 +356,62 @@ def test_log_dependent_rejects_nonpositive(monkeypatch) -> None:
     )
     with pytest.raises(ValueError):
         rpm.build_design_matrix(table)
+
+
+def test_log_dependent_drops_nonpositive_when_enabled(monkeypatch) -> None:
+    """Non-operating routes (zero boardings on this day type) are dropped, not fatal."""
+    monkeypatch.setattr(rpm, "PREDICTORS", ("revenue_hours",))
+    monkeypatch.setattr(rpm, "LOG_PREDICTORS", ("revenue_hours",))
+    monkeypatch.setattr(rpm, "DROP_NONPOSITIVE_DEPENDENT", True)
+    table = pd.DataFrame(
+        {
+            "route_id": ["1", "2", "3"],
+            "ntd_boardings": [100.0, 0.0, 300.0],  # e.g. route 2 runs no Saturday service
+            "revenue_hours": [10.0, 20.0, 30.0],
+        }
+    )
+    y, x_matrix, _, frame = rpm.build_design_matrix(table)
+
+    assert list(frame["route_id"]) == ["1", "3"]
+    assert len(y) == 2 and x_matrix.shape[0] == 2
+    np.testing.assert_allclose(y, np.log([100.0, 300.0]))
+
+
+def _stamped_anchor(service_days: list[str]) -> pd.DataFrame:
+    """A minimal anchor frame carrying a service_day stamp column."""
+    n = len(service_days)
+    return pd.DataFrame(
+        {
+            "route_id": [str(100 + i) for i in range(n)],
+            "service_day": service_days,
+            "ntd_boardings": [1000.0] * n,
+            "revenue_hours": [50.0] * n,
+        }
+    )
+
+
+def test_verify_service_day_accepts_matching_stamp(monkeypatch) -> None:
+    """A uniformly stamped anchor matching EXPECTED_SERVICE_DAY verifies cleanly."""
+    monkeypatch.setattr(rpm, "EXPECTED_SERVICE_DAY", "saturday")
+    assert rpm._verify_service_day(_stamped_anchor(["saturday", "Saturday "])) == "saturday"
+
+
+def test_verify_service_day_rejects_mismatched_stamp(monkeypatch) -> None:
+    """A combined anchor fed to a weekday-only run must abort."""
+    monkeypatch.setattr(rpm, "EXPECTED_SERVICE_DAY", "weekday")
+    with pytest.raises(ValueError, match="combined"):
+        rpm._verify_service_day(_stamped_anchor(["combined", "combined"]))
+
+
+def test_verify_service_day_rejects_mixed_stamps(monkeypatch) -> None:
+    """An anchor mixing day types can never be modeled in one run."""
+    monkeypatch.setattr(rpm, "EXPECTED_SERVICE_DAY", "")
+    with pytest.raises(ValueError, match="mixes"):
+        rpm._verify_service_day(_stamped_anchor(["weekday", "saturday"]))
+
+
+def test_verify_service_day_unstamped_anchor_warns_and_passes(monkeypatch) -> None:
+    """A pre-stamp anchor (no service_day column) runs with a warning."""
+    monkeypatch.setattr(rpm, "EXPECTED_SERVICE_DAY", "weekday")
+    anchor = _stamped_anchor(["weekday"]).drop(columns=["service_day"])
+    assert rpm._verify_service_day(anchor) is None
