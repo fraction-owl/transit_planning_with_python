@@ -50,6 +50,7 @@ transit_planning_with_python/
 │   │   ├── block_status_timeline_exporter.py
 │   │   ├── bus_block_exporter.py
 │   │   ├── gtfs_route_features.py
+│   │   ├── gtfs_route_timeline.py
 │   │   ├── gtfs_to_shapefile_arcpy.py
 │   │   ├── gtfs_to_shapefile_gpd.py
 │   │   ├── headway_span_exporter.py
@@ -190,6 +191,7 @@ transit_planning_with_python/
 │   ├── test_gtfs_route_diff.py
 │   ├── test_gtfs_route_features.py
 │   ├── test_gtfs_route_summary.py
+│   ├── test_gtfs_route_timeline.py
 │   ├── test_gtfs_service_demographics_gpd.py
 │   ├── test_gtfs_stop_diff.py
 │   ├── test_gtfs_stop_proximity_qc.py
