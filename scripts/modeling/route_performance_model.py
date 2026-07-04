@@ -30,7 +30,7 @@ Inputs:
 
 Outputs:
     route_performance_results.xlsx
-        ModelSummary | Coefficients | RoutePerformance | Correlations
+        ModelSummary | Coefficients | RoutePerformance | Correlations | CollinearityMatrix
     diagnostic plots + a run-log sidecar.
 
 ArcGIS Pro Python stack only (numpy / scipy / pandas / matplotlib); no statsmodels,
@@ -71,9 +71,11 @@ ANCHOR_SHEET: Final[str | int] = 0
 # periods, "median" = robust typical. Applied to every numeric anchor column.
 ANCHOR_AGG: Final[str] = "mean"  # <<< EDIT ME
 # A zero in a monthly anchor almost always means the route did not operate / report
-# that month, not that it ran empty. When True, zero-boarding months are dropped
-# before the collapse so the average reflects operating months only (and the
-# revenue_hours/_miles averages use the same months, keeping PPH consistent).
+# that month, not that it ran empty. When True, zero- AND missing-boarding months
+# are dropped before the collapse so the average reflects operating months only
+# (and the revenue_hours/_miles averages use the same months, keeping PPH
+# consistent — a NaN-boardings month would otherwise still count toward the
+# revenue averages because mean() skips NaN only in the boardings column).
 ANCHOR_EXCLUDE_ZERO_MONTHS: Final[bool] = True
 
 # Feature bundles produced by prep_features_public.py (PART A) and transferred in.
@@ -150,9 +152,13 @@ EQUITY_PCT_SPEC: Final[tuple[tuple[str, str, str], ...]] = (
 )
 
 # --- Estimator options -------------------------------------------------------
-SE_TYPE: Final[str] = "HC1"  # "classical" or "HC1"
+# "classical", "HC1", or "HC3". HC3 has better small-sample coverage
+# (MacKinnon-White) and is worth preferring when routes number in the dozens.
+SE_TYPE: Final[str] = "HC1"
 VIF_THRESHOLD: Final[float] = 10.0
-# Std-residual magnitude beyond which a route is flagged strongly over/under.
+# Studentized-residual magnitude beyond which a route is flagged strongly
+# over/under. Studentized (leverage-adjusted) rather than raw residuals, so a
+# high-leverage route that drags the fit toward itself is still flagged.
 PERF_FLAG_SD: Final[float] = 1.0
 # Add an is_express 0/1 column to the RoutePerformance sheet (express routes
 # dominate both residual tails, so it's handy for filtering/sorting them out).
@@ -182,6 +188,7 @@ class OLSResult(NamedTuple):
     fitted: np.ndarray
     residuals: np.ndarray
     loo_residuals: np.ndarray
+    leverage: np.ndarray
     n_obs: int
     n_params: int
     r_squared: float
@@ -293,12 +300,18 @@ def _collapse_panel_anchor(anchor: pd.DataFrame) -> pd.DataFrame:
 
     if ANCHOR_EXCLUDE_ZERO_MONTHS and DEPENDENT_VAR in anchor.columns:
         routes_before = anchor[ROUTE_KEY].nunique()
-        zero_rows = int((anchor[DEPENDENT_VAR] == 0).sum())
-        anchor = anchor[anchor[DEPENDENT_VAR] != 0]
+        boardings = anchor[DEPENDENT_VAR]
+        # Drop NaN-boardings months along with zeros: mean() would skip them for
+        # boardings but still count them toward the revenue_hours/_miles averages,
+        # breaking the "same months on both sides" consistency promised above.
+        zero_rows = int((boardings == 0).sum())
+        nan_rows = int(boardings.isna().sum())
+        anchor = anchor[boardings.notna() & (boardings != 0)]
         dropped_routes = routes_before - anchor[ROUTE_KEY].nunique()
         logging.info(
-            "Excluded %d zero-boarding month(s) as non-operating%s.",
+            "Excluded %d zero- and %d missing-boarding month(s) as non-operating%s.",
             zero_rows,
+            nan_rows,
             f"; {dropped_routes} route(s) had no operating months and were dropped"
             if dropped_routes
             else "",
@@ -335,7 +348,8 @@ def assemble_model_table() -> tuple[pd.DataFrame, list[tuple[str, str]]]:
     Raises:
         KeyError: If the anchor or a joined bundle lacks the join key(s).
         FileNotFoundError: If a manifest-listed bundle is missing.
-        ValueError: If VERIFY_BUNDLE_HASHES is True and a bundle's hash mismatches.
+        ValueError: If VERIFY_BUNDLE_HASHES is True and a bundle's hash mismatches,
+            or a bundle's value columns collide with columns already on the table.
     """
     anchor = load_table(ANCHOR_PATH, ANCHOR_SHEET).rename(columns=COLUMN_ALIASES)
     if ROUTE_KEY not in anchor.columns:
@@ -386,6 +400,28 @@ def assemble_model_table() -> tuple[pd.DataFrame, list[tuple[str, str]]]:
             df[key] = _canonical_key(df[key])
 
         value_cols = [c for c in df.columns if c not in keys]
+
+        # A value column already present on the anchor (or an earlier bundle) would
+        # make pandas rename BOTH sides with _x/_y suffixes, silently breaking every
+        # downstream lookup of the original name — fail loudly instead.
+        collisions = sorted(set(value_cols) & set(merged.columns))
+        if collisions:
+            raise ValueError(
+                f"Bundle '{spec.filename}' carries column(s) {collisions} that already "
+                "exist on the anchor or an earlier bundle. Drop or rename them on one "
+                "side before joining."
+            )
+
+        n_dup = int(df.duplicated(subset=keys).sum())
+        if n_dup:
+            logging.warning(
+                "Bundle '%s' has %d duplicate row(s) on %s; keeping the first occurrence "
+                "of each key. Differing values in the dropped rows point to an upstream "
+                "prep problem worth checking.",
+                spec.filename,
+                n_dup,
+                keys,
+            )
         subset = df[keys + value_cols].drop_duplicates(subset=keys)
 
         before = len(merged)
@@ -441,12 +477,12 @@ def derive_features(df: pd.DataFrame) -> pd.DataFrame:
 
 def build_design_matrix(
     df: pd.DataFrame,
-) -> tuple[np.ndarray, np.ndarray, list[str], pd.DataFrame, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, list[str], pd.DataFrame]:
     """Construct the response vector and design matrix; drop incomplete rows.
 
-    Returns (y, X, term_names, model_frame, keep_mask). ``model_frame`` is the
-    cleaned, kept-row frame (untransformed) so per-route outputs and overlays can
-    be aligned back to it.
+    Returns (y, X, term_names, model_frame). ``model_frame`` is the cleaned,
+    kept-row frame (untransformed) so per-route outputs and overlays can be
+    aligned back to it.
     """
     missing = [c for c in PREDICTORS if c not in df.columns]
     if missing:
@@ -468,10 +504,18 @@ def build_design_matrix(
         frame[col] = pd.to_numeric(frame[col], errors="coerce")
 
     before = len(frame)
+    missing_by_col = frame[used].isna().sum()
+    missing_by_col = missing_by_col[missing_by_col > 0]
     frame = frame.dropna(subset=used).reset_index(drop=True)
     dropped = before - len(frame)
     if dropped:
-        logging.warning("Dropped %d route(s) with missing model columns.", dropped)
+        # Name the offending columns: one sparse predictor (e.g. postsec enrollment)
+        # can quietly cost a big chunk of the sample.
+        logging.warning(
+            "Dropped %d route(s) with missing model columns. Missing counts by column: %s.",
+            dropped,
+            {col: int(n) for col, n in missing_by_col.items()},
+        )
     if frame.empty:
         raise ValueError("No complete rows remain after dropping missing values.")
 
@@ -498,8 +542,7 @@ def build_design_matrix(
     design = pd.DataFrame(columns, index=frame.index)
     term_names = ["intercept", *design.columns.tolist()]
     x_matrix = np.column_stack([np.ones(len(design)), design.to_numpy(dtype=float)])
-    keep_mask = np.ones(len(frame), dtype=bool)
-    return y, x_matrix, term_names, frame, keep_mask
+    return y, x_matrix, term_names, frame
 
 
 # =============================================================================
@@ -530,12 +573,12 @@ def _durbin_watson(residuals: np.ndarray) -> float:
 
 
 def fit_ols(y: np.ndarray, x_matrix: np.ndarray, term_names: list[str], se_type: str) -> OLSResult:
-    """Fit OLS with HC1/classical SEs plus VIF, Durbin-Watson, and exact LOO-R²."""
+    """Fit OLS with HC1/HC3/classical SEs plus VIF, Durbin-Watson, and exact LOO-R²."""
     n_obs, n_params = x_matrix.shape
     if n_obs <= n_params:
         raise ValueError(f"Need more routes ({n_obs}) than parameters ({n_params}).")
-    if se_type not in {"classical", "HC1"}:
-        raise ValueError(f"SE_TYPE must be 'classical' or 'HC1', got '{se_type}'.")
+    if se_type not in {"classical", "HC1", "HC3"}:
+        raise ValueError(f"SE_TYPE must be 'classical', 'HC1', or 'HC3', got '{se_type}'.")
 
     beta, _, _, _ = np.linalg.lstsq(x_matrix, y, rcond=None)
     fitted = x_matrix @ beta
@@ -549,12 +592,20 @@ def fit_ols(y: np.ndarray, x_matrix: np.ndarray, term_names: list[str], se_type:
 
     sigma2 = ss_res / dof
     xtx_inv = np.linalg.inv(x_matrix.T @ x_matrix)
+    # Hat-matrix diagonal, shared by HC3, the exact LOO residuals, and the
+    # studentized per-route flags downstream.
+    leverage = np.sum((x_matrix @ xtx_inv) * x_matrix, axis=1)
 
     if se_type == "classical":
         cov = sigma2 * xtx_inv
-    else:  # HC1 sandwich
+    elif se_type == "HC1":
         meat = x_matrix.T @ (x_matrix * (residuals**2)[:, None])
         cov = (n_obs / dof) * (xtx_inv @ meat @ xtx_inv)
+    else:  # HC3: weight by e²/(1-h)² for better small-sample coverage.
+        with np.errstate(divide="ignore", invalid="ignore"):
+            weights = (residuals / (1.0 - leverage)) ** 2
+        meat = x_matrix.T @ (x_matrix * weights[:, None])
+        cov = xtx_inv @ meat @ xtx_inv
     std_errors = np.sqrt(np.diag(cov))
 
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -578,7 +629,6 @@ def fit_ols(y: np.ndarray, x_matrix: np.ndarray, term_names: list[str], se_type:
         f_stat = f_pvalue = float("nan")
 
     # Exact leave-one-out residuals via the hat matrix: e_loo = e / (1 - h_ii).
-    leverage = np.sum((x_matrix @ xtx_inv) * x_matrix, axis=1)
     with np.errstate(divide="ignore", invalid="ignore"):
         loo_residuals = residuals / (1.0 - leverage)
     press = float(np.nansum(loo_residuals**2))
@@ -598,6 +648,7 @@ def fit_ols(y: np.ndarray, x_matrix: np.ndarray, term_names: list[str], se_type:
         fitted=fitted,
         residuals=residuals,
         loo_residuals=loo_residuals,
+        leverage=leverage,
         n_obs=n_obs,
         n_params=n_params,
         r_squared=r_squared,
@@ -655,22 +706,44 @@ def build_route_performance(result: OLSResult, model_frame: pd.DataFrame) -> pd.
     """Per-route potential (fitted), over/under (residual), and diagnostic overlays."""
     out = pd.DataFrame({ROUTE_KEY: model_frame[ROUTE_KEY].to_numpy()})
     out[DEPENDENT_VAR] = model_frame[DEPENDENT_VAR].to_numpy()
-    # Back-transform the fitted value to a boardings-scale "potential" (median, no
-    # smearing correction — fine for ranking; note it under log retransform).
-    out["fitted_potential"] = np.exp(result.fitted) if LOG_DEPENDENT else result.fitted
-    out["residual_log"] = result.residuals
+    if LOG_DEPENDENT:
+        # Duan smearing: exp(fitted) alone estimates the conditional *median* and
+        # systematically undershoots the boardings the sheet sits next to; the
+        # mean(exp(residual)) factor rescales to a mean without changing the ranking.
+        smear = float(np.mean(np.exp(result.residuals)))
+        out["fitted_potential"] = np.exp(result.fitted) * smear
+        logging.info("Duan smearing factor applied to fitted_potential: %.4f", smear)
+    else:
+        out["fitted_potential"] = result.fitted
+
+    resid_suffix = "_log" if LOG_DEPENDENT else ""
+    out[f"residual{resid_suffix}"] = result.residuals
     resid_sd = result.residuals.std(ddof=0)
     out["std_residual"] = result.residuals / resid_sd if resid_sd > 0 else result.residuals
-    out["loo_residual_log"] = result.loo_residuals
+    out[f"loo_residual{resid_suffix}"] = result.loo_residuals
+
+    # Leverage-adjusted (studentized) residuals drive the over/under flag: a
+    # high-leverage route drags the fit toward itself, so its raw residual
+    # understates how far off expectation it really is.
+    with np.errstate(divide="ignore", invalid="ignore"):
+        studentized = result.residuals / (result.sigma * np.sqrt(1.0 - result.leverage))
+        cooks_d = (studentized**2 / result.n_params) * (result.leverage / (1.0 - result.leverage))
+    out["studentized_residual"] = studentized
+    out["leverage"] = result.leverage
+    out["cooks_d"] = cooks_d
 
     def _flag(z: float) -> str:
+        if not np.isfinite(z):
+            # Leverage ≈ 1: the model fits this route exactly (e.g. it is the only
+            # member of a dummy level), so its residual carries no information.
+            return "undetermined"
         if z >= PERF_FLAG_SD:
             return "over"
         if z <= -PERF_FLAG_SD:
             return "under"
         return "expected"
 
-    out["performance"] = [_flag(z) for z in out["std_residual"]]
+    out["performance"] = [_flag(z) for z in out["studentized_residual"]]
 
     if SHOW_EXPRESS_COLUMN and "is_express" in model_frame.columns:
         out["is_express"] = (
@@ -690,7 +763,7 @@ def build_route_performance(result: OLSResult, model_frame: pd.DataFrame) -> pd.
     for col in overlay_cols:
         out[col] = pd.to_numeric(model_frame[col], errors="coerce").to_numpy()
 
-    return out.sort_values("std_residual").reset_index(drop=True)
+    return out.sort_values("studentized_residual").reset_index(drop=True)
 
 
 def export_results(result: OLSResult, model_frame: pd.DataFrame) -> Path:
@@ -793,12 +866,17 @@ def write_run_log(result: OLSResult, provenance: list[tuple[str, str]]) -> None:
     bundle_lines = (
         [f"  {name}  sha256={sha}" for name, sha in provenance] if provenance else ["  (none)"]
     )
+    # Hash the anchor too, so the run log is a complete provenance record — the
+    # bundles are already hashed via the manifest, but the anchor is the input
+    # that matters most.
+    anchor_sha = _sha256_file(ANCHOR_PATH) if ANCHOR_PATH.exists() else "(file not found)"
     lines = [
         "=" * 72,
         "CROSS-SECTIONAL ROUTE RIDERSHIP MODEL RUN LOG (ENGINE 1, secured box)",
         "=" * 72,
         f"Run timestamp:    {dt.datetime.now().isoformat(timespec='seconds')}",
         f"Anchor:           {ANCHOR_PATH}",
+        f"Anchor SHA-256:   {anchor_sha}",
         f"Bundle dir:       {BUNDLE_DIR}",
         f"Manifest:         {MANIFEST_PATH}",
         f"Routes modeled:   {result.n_obs}",
@@ -865,7 +943,7 @@ def run() -> Optional[OLSResult]:
     if DEPENDENT_VAR not in table.columns:
         raise KeyError(f"Dependent variable '{DEPENDENT_VAR}' not in the assembled table.")
 
-    y, x_matrix, term_names, model_frame, _ = build_design_matrix(table)
+    y, x_matrix, term_names, model_frame = build_design_matrix(table)
     result = fit_ols(y, x_matrix, term_names, SE_TYPE)
     log_report(result)
 
