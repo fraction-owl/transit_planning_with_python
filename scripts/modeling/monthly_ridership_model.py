@@ -98,6 +98,12 @@ MANIFEST_PATH: Final[Path] = Path(r"Path\To\Your\prepped_features\manifest.json"
 # exact prep that produced the bundles and catches truncated/edited transfers.
 VERIFY_BUNDLE_HASHES: Final[bool] = True
 
+# Minimum share of anchor rows each joined bundle must match (0..1). A join
+# below this floor almost always means a key-normalization or grain problem
+# upstream, so the run aborts rather than silently modeling a subset of the
+# system. Lower it (or set 0.0) only for a bundle that is legitimately sparse.
+MIN_BUNDLE_MATCH_RATE: Final[float] = 0.9
+
 # Join key(s) used for predictor *exclusion* (keys are never modeled) and to
 # derive a month dummy. The actual joins are driven by each bundle's own keys
 # from the manifest, not by this constant. Use ("route_id",) for a purely
@@ -311,11 +317,13 @@ def _canonical_key(series: pd.Series) -> pd.Series:
     The anchor and bundle are produced on different machines from different
     files, so a key can arrive as ``101`` on one side and ``"101"`` (or
     ``"101.0"`` from a float round-trip) on the other. This collapses every
-    key to a trimmed string and strips a single trailing ``.0`` so an integer
-    that survived a float cast still matches its string form. The same helper
+    key to a trimmed, upper-cased, space-free string and strips a single trailing
+    ``.0`` — the same folding as ntd_anchor_builder's normalise_route, so an
+    anchor keyed ``RT5`` matches a bundle keyed ``"Rt 5"``. The same helper
     is copied into prep_features_public.py and MUST stay byte-identical between the two.
     """
-    out = series.astype("string").str.strip()
+    out = series.astype("string").str.strip().str.upper()
+    out = out.str.replace(" ", "", regex=False)
     out = out.str.replace(r"\.0$", "", regex=True)
     return out.fillna("")
 
@@ -449,8 +457,11 @@ def assemble_model_table(
         subset = df[keys + value_cols].drop_duplicates(subset=keys)
 
         before = len(merged)
-        merged = merged.merge(subset, on=keys, how="left")
-        matched = int(merged[value_cols[0]].notna().sum()) if value_cols else before
+        # The merge indicator counts matches exactly, unlike inferring them from a
+        # value column that may itself contain legitimate NaNs.
+        merged = merged.merge(subset, on=keys, how="left", indicator="_bundle_matched")
+        matched = int((merged["_bundle_matched"] == "both").sum())
+        merged = merged.drop(columns="_bundle_matched")
         logging.info(
             "Joined bundle '%s' on %s: %d/%d anchor rows matched (%d feature col(s)).",
             spec.filename,
@@ -459,6 +470,15 @@ def assemble_model_table(
             before,
             len(value_cols),
         )
+        match_rate = matched / before if before else 1.0
+        if match_rate < MIN_BUNDLE_MATCH_RATE:
+            raise ValueError(
+                f"Bundle '{spec.filename}' matched only {matched}/{before} anchor rows "
+                f"({match_rate:.0%}), below MIN_BUNDLE_MATCH_RATE ({MIN_BUNDLE_MATCH_RATE:.0%}). "
+                "This usually means a join-key normalization or grain mismatch between the "
+                "anchor and the bundle; lower the floor only if the bundle is legitimately "
+                "sparse."
+            )
         provenance.append((spec.filename, actual_hash))
 
     if not provenance:

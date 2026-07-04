@@ -106,6 +106,11 @@ MANIFEST_PATH: Final[Path] = Path(r"Path\To\Your\prepped_features\manifest.json"
 # When True, every bundle's on-disk SHA-256 must match the manifest before it is
 # joined; a mismatch aborts the run (catches truncated/edited transfers).
 VERIFY_BUNDLE_HASHES: Final[bool] = True
+# Minimum share of anchor routes each joined bundle must match (0..1). A join
+# below this floor almost always means a key-normalization or grain problem
+# upstream, so the run aborts rather than silently modeling a subset of the
+# system. Lower it (or set 0.0) only for a bundle that is legitimately sparse.
+MIN_BUNDLE_MATCH_RATE: Final[float] = 0.9
 
 OUTPUT_DIR: Final[Path] = Path(r"Path\To\Your\output")  # <<< EDIT ME
 
@@ -230,8 +235,14 @@ class OLSResult(NamedTuple):
 
 
 def _canonical_key(series: pd.Series) -> pd.Series:
-    """Normalize a join-key column (byte-identical to the other pipeline scripts)."""
-    out = series.astype("string").str.strip()
+    """Normalize a join-key column (byte-identical to the other pipeline scripts).
+
+    Trims, upper-cases, removes internal spaces, and strips a single trailing
+    ``.0`` — the same folding as ntd_anchor_builder's normalise_route, so an
+    anchor keyed ``RT5`` matches a GTFS-derived bundle keyed ``"Rt 5"``.
+    """
+    out = series.astype("string").str.strip().str.upper()
+    out = out.str.replace(" ", "", regex=False)
     out = out.str.replace(r"\.0$", "", regex=True)
     return out.fillna("")
 
@@ -493,8 +504,11 @@ def assemble_model_table() -> tuple[pd.DataFrame, list[tuple[str, str]], Optiona
         subset = df[keys + value_cols].drop_duplicates(subset=keys)
 
         before = len(merged)
-        merged = merged.merge(subset, on=keys, how="left")
-        matched = int(merged[value_cols[0]].notna().sum()) if value_cols else before
+        # The merge indicator counts matches exactly, unlike inferring them from a
+        # value column that may itself contain legitimate NaNs.
+        merged = merged.merge(subset, on=keys, how="left", indicator="_bundle_matched")
+        matched = int((merged["_bundle_matched"] == "both").sum())
+        merged = merged.drop(columns="_bundle_matched")
         logging.info(
             "Joined bundle '%s' on %s: %d/%d routes matched (%d feature col(s)).",
             spec.filename,
@@ -503,6 +517,15 @@ def assemble_model_table() -> tuple[pd.DataFrame, list[tuple[str, str]], Optiona
             before,
             len(value_cols),
         )
+        match_rate = matched / before if before else 1.0
+        if match_rate < MIN_BUNDLE_MATCH_RATE:
+            raise ValueError(
+                f"Bundle '{spec.filename}' matched only {matched}/{before} anchor routes "
+                f"({match_rate:.0%}), below MIN_BUNDLE_MATCH_RATE ({MIN_BUNDLE_MATCH_RATE:.0%}). "
+                "This usually means a join-key normalization or grain mismatch between the "
+                "anchor and the bundle; lower the floor only if the bundle is legitimately "
+                "sparse."
+            )
         provenance.append((spec.filename, actual_hash))
 
     if not provenance:

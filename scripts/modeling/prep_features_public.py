@@ -313,11 +313,13 @@ def _canonical_key(series: pd.Series) -> pd.Series:
     The anchor and bundle are produced on different machines from different
     files, so a key can arrive as ``101`` on one side and ``"101"`` (or
     ``"101.0"`` from a float round-trip) on the other. This collapses every
-    key to a trimmed string and strips a single trailing ``.0`` so an integer
-    that survived a float cast still matches its string form. The same helper
+    key to a trimmed, upper-cased, space-free string and strips a single trailing
+    ``.0`` — the same folding as ntd_anchor_builder's normalise_route, so an
+    anchor keyed ``RT5`` matches a bundle keyed ``"Rt 5"``. The same helper
     is copied into monthly_ridership_model.py and MUST stay byte-identical between the two.
     """
-    out = series.astype("string").str.strip()
+    out = series.astype("string").str.strip().str.upper()
+    out = out.str.replace(" ", "", regex=False)
     out = out.str.replace(r"\.0$", "", regex=True)
     return out.fillna("")
 

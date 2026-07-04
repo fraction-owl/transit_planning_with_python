@@ -106,9 +106,9 @@ def test_vif_flags_collinearity() -> None:
 
 
 def test_canonical_key_normalizes_join_values() -> None:
-    """Keys are trimmed, de-floated, and NaN-filled to a stable string form."""
-    out = rpm._canonical_key(pd.Series([" 159 ", "159.0", 42, None]))
-    assert out.tolist() == ["159", "159", "42", ""]
+    """Keys are trimmed, case/space-folded, de-floated, and NaN-filled."""
+    out = rpm._canonical_key(pd.Series([" 159 ", "159.0", 42, None, "rt 5", "Rt 5"]))
+    assert out.tolist() == ["159", "159", "42", "", "RT5", "RT5"]
 
 
 def test_derive_features_flags_express_and_equity_pct() -> None:
@@ -284,6 +284,56 @@ def test_assemble_model_table_rejects_column_collision(tmp_path, monkeypatch) ->
 
     with pytest.raises(ValueError, match="total_pop"):
         rpm.assemble_model_table()
+
+
+def test_assemble_model_table_enforces_match_rate_floor(tmp_path, monkeypatch) -> None:
+    """A bundle matching too few anchor routes aborts instead of modeling a subset."""
+    anchor_path, bundle_dir, manifest_path = _make_anchor_and_bundles(tmp_path)
+    # Break one of the three route keys so the bundle matches only 2/3 (67%),
+    # under the 90% default floor.
+    bundle_file = bundle_dir / "features__route_id.csv"
+    df = pd.read_csv(bundle_file)
+    df["route_id"] = df["route_id"].astype(str)
+    df.loc[df["route_id"] == "103", "route_id"] = "999"
+    df.to_csv(bundle_file, index=False)
+    _write_bundle_manifest(
+        bundle_dir,
+        [("features__route_id.csv", ["route_id"]), ("features__period.csv", ["period"])],
+    )
+    monkeypatch.setattr(rpm, "ANCHOR_PATH", anchor_path)
+    monkeypatch.setattr(rpm, "BUNDLE_DIR", bundle_dir)
+    monkeypatch.setattr(rpm, "MANIFEST_PATH", manifest_path)
+
+    with pytest.raises(ValueError, match="MIN_BUNDLE_MATCH_RATE"):
+        rpm.assemble_model_table()
+
+    # Disabling the floor lets a legitimately sparse bundle through.
+    monkeypatch.setattr(rpm, "MIN_BUNDLE_MATCH_RATE", 0.0)
+    merged, provenance, _ = rpm.assemble_model_table()
+    assert len(merged) == 3
+    assert [name for name, _ in provenance] == ["features__route_id.csv"]
+
+
+def test_assemble_model_table_joins_case_and_space_variant_keys(tmp_path, monkeypatch) -> None:
+    """An anchor keyed 'RT 5' joins a bundle keyed 'rt5' after canonicalization."""
+    anchor_path, bundle_dir, manifest_path = _make_anchor_and_bundles(tmp_path)
+    anchor = pd.read_csv(anchor_path)
+    anchor["route_id"] = ["RT 5", "Rt-6", "route7"]
+    anchor.to_csv(anchor_path, index=False)
+    bundle_file = bundle_dir / "features__route_id.csv"
+    bundle = pd.read_csv(bundle_file)
+    bundle["route_id"] = ["rt5", "RT-6", "Route7"]
+    bundle.to_csv(bundle_file, index=False)
+    _write_bundle_manifest(
+        bundle_dir,
+        [("features__route_id.csv", ["route_id"]), ("features__period.csv", ["period"])],
+    )
+    monkeypatch.setattr(rpm, "ANCHOR_PATH", anchor_path)
+    monkeypatch.setattr(rpm, "BUNDLE_DIR", bundle_dir)
+    monkeypatch.setattr(rpm, "MANIFEST_PATH", manifest_path)
+
+    merged, _, _ = rpm.assemble_model_table()
+    assert merged["total_pop"].notna().all(), "case/space variants failed to join"
 
 
 def test_assemble_model_table_rejects_hash_mismatch(tmp_path, monkeypatch) -> None:

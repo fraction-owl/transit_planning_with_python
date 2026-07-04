@@ -135,10 +135,12 @@ def _canonical_key(series: pd.Series) -> pd.Series:
     """Normalize a join-key column so this output matches the NTD anchor reliably.
 
     Kept BYTE-IDENTICAL to the copy in route_performance_model.py / prep_features_public.py:
-    collapse to a trimmed string and strip a single trailing ``.0`` so an integer
-    that survived a float round-trip still matches its string form.
+    collapse to a trimmed, upper-cased, space-free string and strip a single
+    trailing ``.0`` — the same folding as ntd_anchor_builder's normalise_route,
+    so an anchor keyed ``RT5`` matches this output keyed ``"Rt 5"``.
     """
-    out = series.astype("string").str.strip()
+    out = series.astype("string").str.strip().str.upper()
+    out = out.str.replace(" ", "", regex=False)
     out = out.str.replace(r"\.0$", "", regex=True)
     return out.fillna("")
 

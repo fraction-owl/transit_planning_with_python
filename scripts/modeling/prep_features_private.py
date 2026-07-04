@@ -290,10 +290,12 @@ def load_table(path: Path, sheet: str | int = 0) -> pd.DataFrame:
 def _canonical_key(series: pd.Series) -> pd.Series:
     """Normalize a join-key column so two independently produced tables match.
 
-    Collapses every key to a trimmed string and strips a single trailing ``.0``
-    so an integer that survived a float cast still matches its string form.
+    Collapses every key to a trimmed, upper-cased, space-free string and strips a
+    single trailing ``.0`` — the same folding as ntd_anchor_builder's
+    normalise_route, so alphanumeric route names join reliably.
     """
-    out = series.astype("string").str.strip()
+    out = series.astype("string").str.strip().str.upper()
+    out = out.str.replace(" ", "", regex=False)
     out = out.str.replace(r"\.0$", "", regex=True)
     return out.fillna("")
 
