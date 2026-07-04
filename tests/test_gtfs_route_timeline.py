@@ -1,4 +1,4 @@
-"""Tests for scripts.stop_analysis.gtfs_route_timeline."""
+"""Tests for scripts.gtfs_exports.gtfs_route_timeline."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import pytest
 
 matplotlib.use("Agg")  # headless: no display needed for savefig
 
-from scripts.stop_analysis.gtfs_route_timeline import (
+from scripts.gtfs_exports.gtfs_route_timeline import (
     FeedPeriod,
     FeedSummary,
     Lineage,
