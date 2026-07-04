@@ -12,17 +12,20 @@ predictors, keyed to whatever grain the model expects:
 
 The workbooks carry separate Weekday / Saturday / Sunday rows. SERVICE_DAY_SELECTION
 picks which of those each anchor row represents: a single service day in
-isolation ("weekday" / "saturday" / "sunday"), or all three summed into a
-full-week monthly total ("combined"). The choice is stamped onto every row as the
-SERVICE_DAY_OUT column so the regression can confirm the service day it analyzes.
+isolation ("weekday" / "saturday" / "sunday"), all three summed into a
+full-week monthly total ("combined"), or "each" to build all three single-day
+anchors in one pass (one CSV per day, the day suffixed onto OUTPUT_FILENAME).
+The choice is stamped onto every row as the SERVICE_DAY_OUT column so the
+regression can confirm the service day it analyzes.
 
 Workbooks are discovered by scanning DATA_ROOT: each file is assumed to hold a
 single worksheet, and its month/year are parsed from the filename (full or
 3-letter month, 4-digit year, in any order or separator). No hand-maintained
 catalogue is required.
 
-Output is a single CSV written to OUTPUT_DIR / OUTPUT_FILENAME, plus a run-log
-sidecar. Point the regression's ANCHOR_PATH at that CSV.
+Output is a CSV written to OUTPUT_DIR / OUTPUT_FILENAME (or one day-suffixed CSV
+per service day under "each"), plus a run-log sidecar. Point the regression's
+ANCHOR_PATH at the CSV for the service day being modeled.
 
 Measure conventions (kept consistent with ntd_monthly_summary.py):
     - boardings   = sum of MTH_BOARD across the selected service periods
@@ -100,6 +103,10 @@ END_MONTH: Final[str] = ""
 #   - "weekday" / "saturday" / "sunday" -> isolate that single service day.
 #   - "combined"                        -> sum all three into a full-week monthly
 #                                          total (the historical behaviour).
+#   - "each"                            -> build all three single-day anchors in
+#                                          one pass, writing one CSV per day with
+#                                          the day suffixed onto OUTPUT_FILENAME
+#                                          (ntd_anchor_weekday.csv, ...).
 # Whatever is chosen, the measures (boardings, hours, revenue miles) are summed
 # over exactly the selected service period(s), so a single-day anchor carries that
 # day's totals and a combined anchor carries the full-week totals.
@@ -168,6 +175,9 @@ _SERVICE_DAY_SETS: Final[dict[str, list[str]]] = {
     "sunday": ["Sunday"],
     "combined": ["Weekday", "Saturday", "Sunday"],
 }
+
+# The single-day selections built by SERVICE_DAY_SELECTION = "each", in output order.
+_EACH_SELECTIONS: Final[list[str]] = ["weekday", "saturday", "sunday"]
 
 # Internal (pre-rename) measure column names.
 _BOARD: Final[str] = "_board"
@@ -278,6 +288,12 @@ def normalise_service_period(value: Any) -> str:
         "sunday": "Sunday",
     }
     return mapping.get(str(value).strip().lower(), str(value).strip())
+
+
+def day_type_filename(base: str, service_day: str) -> str:
+    """Suffix an anchor filename with its service day (ntd_anchor.csv -> ntd_anchor_weekday.csv)."""
+    p = Path(base)
+    return f"{p.stem}_{service_day}{p.suffix}"
 
 
 def discover_workbooks(data_root: Path) -> dict[str, Path]:
@@ -624,7 +640,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--service-day",
         default=SERVICE_DAY_SELECTION,
-        help="weekday / saturday / sunday / combined.",
+        help="weekday / saturday / sunday / combined, or 'each' to write all three "
+        "single-day anchors in one pass.",
     )
     p.add_argument(
         "--start-month",
@@ -660,14 +677,19 @@ def main(argv: Sequence[str] | None = None) -> None:
         sys.exit(1)
 
     selection = args.service_day.strip().lower()
-    if selection not in _SERVICE_DAY_SETS:
+    if selection not in _SERVICE_DAY_SETS and selection != "each":
         logging.error(
             "--service-day must be one of %s, got '%s'.",
-            sorted(_SERVICE_DAY_SETS),
+            sorted([*_SERVICE_DAY_SETS, "each"]),
             args.service_day,
         )
         sys.exit(1)
-    selected_periods = _SERVICE_DAY_SETS[selection]
+    # "each" reads every service-period row once, then builds the three single-day
+    # anchors from the same tidy frame (one workbook pass, three CSVs).
+    selections = _EACH_SELECTIONS if selection == "each" else [selection]
+    selected_periods = (
+        _SERVICE_DAY_SETS["combined"] if selection == "each" else _SERVICE_DAY_SETS[selection]
+    )
 
     if (
         str(data_root) == r"Path\To\Your\NTD_Folder"
@@ -723,32 +745,38 @@ def main(argv: Sequence[str] | None = None) -> None:
     logging.info("=== STEP 1: READ WORKBOOKS (%s..%s) ===", start_label, end_label)
     raw = load_raw(workbooks, periods, selected_periods)
 
-    logging.info("=== STEP 2: AGGREGATE TO '%s' GRAIN ('%s') ===", grain, selection)
-    anchor = build_anchor(raw, grain)
-    anchor = clean_anchor(anchor)
-
-    # Stamp the service-day selection onto every row so the regression can assert
-    # which service day it is analyzing.
-    insert_at = 2 if grain == "panel" else 1
-    anchor.insert(insert_at, SERVICE_DAY_OUT, selection)
-
-    out_path = output_dir / output_filename
-    anchor.to_csv(out_path, index=False)
-    logging.info("Anchor written: %s (%d rows, %d cols).", out_path, *anchor.shape)
-
-    n_routes = anchor[ROUTE_ID_OUT].nunique() if not anchor.empty else 0
     summary_lines = [
         f"Grain:            {grain}",
-        f"Service day:      {selection} (periods: {', '.join(selected_periods)})",
+        f"Service day:      {selection} (periods read: {', '.join(selected_periods)})",
         f"Period range:     {start_label}..{end_label}",
         f"Workbooks found:  {len(workbooks)}",
         f"Periods loaded:   {len(periods)} ({', '.join(periods) or 'none'})",
-        f"Output file:      {out_path.name}",
-        f"Rows written:     {len(anchor)}",
-        f"Unique route_ids: {n_routes}",
     ]
-    if grain == "panel" and not anchor.empty:
-        summary_lines.append(f"Unique periods:   {anchor[PERIOD_OUT].nunique()}")
+
+    for sel in selections:
+        sub = (
+            raw[raw["_service_period"].isin(_SERVICE_DAY_SETS[sel])] if selection == "each" else raw
+        )
+        logging.info("=== STEP 2: AGGREGATE TO '%s' GRAIN ('%s') ===", grain, sel)
+        anchor = build_anchor(sub, grain)
+        anchor = clean_anchor(anchor)
+
+        # Stamp the service-day selection onto every row so the regression can assert
+        # which service day it is analyzing.
+        insert_at = 2 if grain == "panel" else 1
+        anchor.insert(insert_at, SERVICE_DAY_OUT, sel)
+
+        filename = (
+            day_type_filename(output_filename, sel) if selection == "each" else output_filename
+        )
+        out_path = output_dir / filename
+        anchor.to_csv(out_path, index=False)
+        logging.info("Anchor written: %s (%d rows, %d cols).", out_path, *anchor.shape)
+
+        n_routes = anchor[ROUTE_ID_OUT].nunique() if not anchor.empty else 0
+        summary_lines.append(f"[{sel}] {filename}: {len(anchor)} row(s), {n_routes} route(s)")
+        if grain == "panel" and not anchor.empty:
+            summary_lines.append(f"[{sel}]   unique periods: {anchor[PERIOD_OUT].nunique()}")
 
     if not write_run_log(output_dir, summary_lines) and REQUIRE_RUN_LOG:
         logging.error(

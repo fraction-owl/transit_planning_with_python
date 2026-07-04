@@ -424,6 +424,85 @@ def test_clean_anchor_warns_on_nan_supply(caplog: pytest.LogCaptureFixture) -> N
 
 
 # ---------------------------------------------------------------------------
+# day_type_filename / "each" service-day mode
+# ---------------------------------------------------------------------------
+
+
+def test_day_type_filename_suffixes_stem() -> None:
+    assert mod.day_type_filename("ntd_anchor.csv", "weekday") == "ntd_anchor_weekday.csv"
+    assert mod.day_type_filename("anchor.v2.csv", "sunday") == "anchor.v2_sunday.csv"
+
+
+def test_main_each_writes_one_anchor_per_service_day(tmp_path: Path) -> None:
+    """'each' builds all three single-day anchors from one workbook pass."""
+    data_root = tmp_path / "data"
+    out_dir = tmp_path / "out"
+    data_root.mkdir()
+    _write_workbook(data_root / "JULY 2024 NTD.xlsx", _one_month_rows())
+
+    mod.main(
+        [
+            "--data-root",
+            str(data_root),
+            "--output-dir",
+            str(out_dir),
+            "--grain",
+            "cross_section",
+            "--service-day",
+            "each",
+        ]
+    )
+
+    frames: dict[str, pd.DataFrame] = {}
+    for day in ("weekday", "saturday", "sunday"):
+        path = out_dir / f"ntd_anchor_{day}.csv"
+        assert path.exists(), f"missing {path.name}"
+        df = pd.read_csv(path)
+        assert set(df[mod.SERVICE_DAY_OUT]) == {day}
+        frames[day] = df.assign(**{mod.ROUTE_ID_OUT: df[mod.ROUTE_ID_OUT].astype(str)})
+
+    # Each anchor carries only that day's measures: route 101's weekday boardings/
+    # hours stay separate from its Saturday figures, keeping DV and supply on the
+    # same day-type basis.
+    wk_101 = frames["weekday"].set_index(mod.ROUTE_ID_OUT).loc["101"]
+    sat_101 = frames["saturday"].set_index(mod.ROUTE_ID_OUT).loc["101"]
+    assert wk_101[mod.BOARDINGS_OUT] == pytest.approx(6278.0)
+    assert wk_101[mod.HOURS_OUT] == pytest.approx(803.0)
+    assert sat_101[mod.BOARDINGS_OUT] == pytest.approx(575.0)
+    assert sat_101[mod.HOURS_OUT] == pytest.approx(109.5)
+
+    assert (out_dir / "ntd_anchor_builder_runlog.txt").exists()
+
+
+def test_main_single_day_keeps_plain_filename(tmp_path: Path) -> None:
+    """A single-day run still writes OUTPUT_FILENAME unchanged, stamped with the day."""
+    data_root = tmp_path / "data"
+    out_dir = tmp_path / "out"
+    data_root.mkdir()
+    _write_workbook(data_root / "JULY 2024 NTD.xlsx", _one_month_rows())
+
+    mod.main(
+        [
+            "--data-root",
+            str(data_root),
+            "--output-dir",
+            str(out_dir),
+            "--grain",
+            "cross_section",
+            "--service-day",
+            "saturday",
+        ]
+    )
+
+    path = out_dir / "ntd_anchor.csv"
+    assert path.exists()
+    df = pd.read_csv(path)
+    assert set(df[mod.SERVICE_DAY_OUT]) == {"saturday"}
+    row_101 = df[df[mod.ROUTE_ID_OUT].astype(str) == "101"].iloc[0]
+    assert row_101[mod.BOARDINGS_OUT] == pytest.approx(575.0)
+
+
+# ---------------------------------------------------------------------------
 # extract_config_block / write_run_log
 # ---------------------------------------------------------------------------
 
