@@ -430,16 +430,41 @@ def assemble_model_table(
         cols = list(ft.join_keys) + [
             c for c in (ft.keep_cols or _non_key_columns(df, ft.join_keys)) if c in df.columns
         ]
+
+        # A value column already present on the anchor (or an earlier table) would
+        # make pandas rename BOTH sides with _x/_y suffixes, silently breaking every
+        # downstream lookup of the original name — fail loudly instead.
+        value_cols = [c for c in cols if c not in ft.join_keys]
+        collisions = sorted(set(value_cols) & set(merged.columns))
+        if collisions:
+            raise ValueError(
+                f"Feature table '{ft.label}' carries column(s) {collisions} that already "
+                "exist on the anchor or an earlier table. Drop or rename them on one "
+                "side before joining."
+            )
+
+        n_dup = int(df.duplicated(subset=list(ft.join_keys)).sum())
+        if n_dup:
+            logging.warning(
+                "Feature table '%s' has %d duplicate row(s) on %s; keeping the first "
+                "occurrence of each key.",
+                ft.label,
+                n_dup,
+                ft.join_keys,
+            )
         subset = df[cols].drop_duplicates(subset=list(ft.join_keys))
 
         before = len(merged)
-        merged = merged.merge(subset, on=list(ft.join_keys), how="left")
-        matched = merged[cols[-1]].notna().sum() if len(cols) > len(ft.join_keys) else before
+        # The merge indicator counts matches exactly, unlike inferring them from a
+        # value column that may itself contain legitimate NaNs.
+        merged = merged.merge(subset, on=list(ft.join_keys), how="left", indicator="_table_matched")
+        matched = int((merged["_table_matched"] == "both").sum())
+        merged = merged.drop(columns="_table_matched")
         logging.info(
             "Merged '%s' on %s: %d/%d rows matched.",
             ft.label,
             ft.join_keys,
-            int(matched),
+            matched,
             before,
         )
 
@@ -535,10 +560,19 @@ def build_feature_frame(
         frame[col] = pd.to_numeric(frame[col], errors="coerce")
 
     before = len(frame)
+    missing_by_col = frame[used_cols].isna().sum()
+    missing_by_col = missing_by_col[missing_by_col > 0]
     frame = frame.dropna(subset=used_cols).reset_index(drop=True)
     dropped = before - len(frame)
     if dropped:
-        logging.warning("Dropped %d row(s) with missing values across model columns.", dropped)
+        # Name the offending columns: one sparse predictor can quietly cost a
+        # big chunk of the sample.
+        logging.warning(
+            "Dropped %d row(s) with missing values across model columns. Missing "
+            "counts by column: %s.",
+            dropped,
+            {col: int(n) for col, n in missing_by_col.items()},
+        )
     if frame.empty:
         raise ValueError("No complete rows remain after dropping missing values.")
 

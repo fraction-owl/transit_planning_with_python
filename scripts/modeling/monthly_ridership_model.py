@@ -190,8 +190,9 @@ LOG_PREDICTORS: Final[tuple[str, ...]] = (
 # (beta) coefficients are always reported regardless of this setting.
 STANDARDIZE_PREDICTORS: Final[bool] = False
 
-# Standard-error estimator: "classical" (homoskedastic) or "HC1"
-# (heteroskedasticity-robust, recommended for cross-sectional agency data).
+# Standard-error estimator: "classical" (homoskedastic), "HC1"
+# (heteroskedasticity-robust, recommended for cross-sectional agency data), or
+# "HC3" (MacKinnon-White; better coverage when observations number in the dozens).
 SE_TYPE: Final[str] = "HC1"
 
 # Predictors whose VIF exceeds this threshold are reported (and optionally
@@ -233,10 +234,13 @@ class OLSResult(NamedTuple):
         vif: Variance inflation factors keyed by predictor (excludes intercept).
         fitted: Fitted values aligned with the modeling rows.
         residuals: Raw residuals (``y - fitted``).
+        leverage: Hat-matrix diagonal per observation (influence).
+        loo_residuals: Exact leave-one-out residuals (``e / (1 - h)``).
         n_obs: Number of observations used.
         n_params: Number of estimated parameters (including the intercept).
         r_squared: Coefficient of determination.
         adj_r_squared: Adjusted R^2.
+        loo_r_squared: Leave-one-out (PRESS) R^2 — out-of-sample fit.
         f_stat: Overall F-statistic.
         f_pvalue: p-value of the F-statistic.
         aic: Akaike information criterion.
@@ -257,10 +261,13 @@ class OLSResult(NamedTuple):
     vif: dict[str, float]
     fitted: np.ndarray
     residuals: np.ndarray
+    leverage: np.ndarray
+    loo_residuals: np.ndarray
     n_obs: int
     n_params: int
     r_squared: float
     adj_r_squared: float
+    loo_r_squared: float
     f_stat: float
     f_pvalue: float
     aic: float
@@ -454,6 +461,28 @@ def assemble_model_table(
             df[key] = _canonical_key(df[key])
 
         value_cols = [c for c in df.columns if c not in keys]
+
+        # A value column already present on the anchor (or an earlier bundle) would
+        # make pandas rename BOTH sides with _x/_y suffixes, silently breaking every
+        # downstream lookup of the original name — fail loudly instead.
+        collisions = sorted(set(value_cols) & set(merged.columns))
+        if collisions:
+            raise ValueError(
+                f"Bundle '{spec.filename}' carries column(s) {collisions} that already "
+                "exist on the anchor or an earlier bundle. Drop or rename them on one "
+                "side before joining."
+            )
+
+        n_dup = int(df.duplicated(subset=keys).sum())
+        if n_dup:
+            logging.warning(
+                "Bundle '%s' has %d duplicate row(s) on %s; keeping the first occurrence "
+                "of each key. Differing values in the dropped rows point to an upstream "
+                "prep problem worth checking.",
+                spec.filename,
+                n_dup,
+                keys,
+            )
         subset = df[keys + value_cols].drop_duplicates(subset=keys)
 
         before = len(merged)
@@ -574,11 +603,20 @@ def build_design_matrix(
         frame[col] = pd.to_numeric(frame[col], errors="coerce")
 
     before = len(frame)
+    missing_by_col = frame[used_cols].isna().sum()
+    missing_by_col = missing_by_col[missing_by_col > 0]
     frame = frame.dropna(subset=used_cols)
     keep_mask = df.index.isin(frame.index)
     dropped = before - len(frame)
     if dropped:
-        logging.warning("Dropped %d row(s) with missing values across model columns.", dropped)
+        # Name the offending columns: one sparse predictor can quietly cost a
+        # big chunk of the sample.
+        logging.warning(
+            "Dropped %d row(s) with missing values across model columns. Missing "
+            "counts by column: %s.",
+            dropped,
+            {col: int(n) for col, n in missing_by_col.items()},
+        )
     if frame.empty:
         raise ValueError("No complete rows remain after dropping missing values.")
 
@@ -673,8 +711,9 @@ def fit_ols(
         y: Response vector, length ``n``.
         x_matrix: Design matrix of shape ``(n, k)`` with an intercept column.
         term_names: Column labels aligned with ``x_matrix``.
-        se_type: ``"classical"`` for homoskedastic SEs or ``"HC1"`` for
-            heteroskedasticity-robust SEs.
+        se_type: ``"classical"`` for homoskedastic SEs, ``"HC1"`` or ``"HC3"``
+            for heteroskedasticity-robust SEs (HC3 has better small-sample
+            coverage).
 
     Returns:
         A populated :class:`OLSResult`.
@@ -689,8 +728,8 @@ def fit_ols(
             f"Need more observations ({n_obs}) than parameters ({n_params}); "
             "reduce predictors or add data."
         )
-    if se_type not in {"classical", "HC1"}:
-        raise ValueError(f"SE_TYPE must be 'classical' or 'HC1', got '{se_type}'.")
+    if se_type not in {"classical", "HC1", "HC3"}:
+        raise ValueError(f"SE_TYPE must be 'classical', 'HC1', or 'HC3', got '{se_type}'.")
 
     beta, _, _, _ = np.linalg.lstsq(x_matrix, y, rcond=None)
     fitted = x_matrix @ beta
@@ -704,12 +743,20 @@ def fit_ols(
 
     sigma2 = ss_res / dof
     xtx_inv = np.linalg.inv(x_matrix.T @ x_matrix)
+    # Hat-matrix diagonal, shared by HC3, the exact LOO residuals, and the
+    # studentized per-observation diagnostics downstream.
+    leverage = np.sum((x_matrix @ xtx_inv) * x_matrix, axis=1)
 
     if se_type == "classical":
         cov = sigma2 * xtx_inv
-    else:  # HC1 sandwich estimator
+    elif se_type == "HC1":
         meat = x_matrix.T @ (x_matrix * (residuals**2)[:, None])
         cov = (n_obs / dof) * (xtx_inv @ meat @ xtx_inv)
+    else:  # HC3: weight by e²/(1-h)² for better small-sample coverage.
+        with np.errstate(divide="ignore", invalid="ignore"):
+            weights = (residuals / (1.0 - leverage)) ** 2
+        meat = x_matrix.T @ (x_matrix * weights[:, None])
+        cov = xtx_inv @ meat @ xtx_inv
 
     std_errors = np.sqrt(np.diag(cov))
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -741,6 +788,13 @@ def fit_ols(
     aic = 2 * n_params - 2 * log_like
     bic = n_params * np.log(n_obs) - 2 * log_like
 
+    # Exact leave-one-out residuals via the hat matrix: e_loo = e / (1 - h_ii),
+    # and the PRESS-based out-of-sample R².
+    with np.errstate(divide="ignore", invalid="ignore"):
+        loo_residuals = residuals / (1.0 - leverage)
+    press = float(np.nansum(loo_residuals**2))
+    loo_r_squared = 1.0 - press / ss_tot if ss_tot > 0 else float("nan")
+
     # Condition number of the scaled design matrix (multicollinearity signal).
     col_norms = np.linalg.norm(x_matrix, axis=0)
     scaled = x_matrix / np.where(col_norms > 0, col_norms, 1.0)
@@ -757,10 +811,13 @@ def fit_ols(
         vif=_variance_inflation_factors(x_matrix, term_names),
         fitted=fitted,
         residuals=residuals,
+        leverage=leverage,
+        loo_residuals=loo_residuals,
         n_obs=n_obs,
         n_params=n_params,
         r_squared=r_squared,
         adj_r_squared=adj_r_squared,
+        loo_r_squared=loo_r_squared,
         f_stat=f_stat,
         f_pvalue=f_pvalue,
         aic=aic,
@@ -841,6 +898,7 @@ def build_summary_frame(result: OLSResult, dependent: str, log_dependent: bool) 
         ("parameters", result.n_params),
         ("r_squared", round(result.r_squared, 4)),
         ("adj_r_squared", round(result.adj_r_squared, 4)),
+        ("loo_r_squared", round(result.loo_r_squared, 4)),
         ("f_statistic", round(result.f_stat, 4)),
         ("f_pvalue", result.f_pvalue),
         ("residual_std_error", round(result.sigma, 4)),
@@ -885,6 +943,15 @@ def export_results(
     observations["residual"] = result.residuals
     resid_sd = result.residuals.std(ddof=0)
     observations["std_residual"] = result.residuals / resid_sd if resid_sd > 0 else result.residuals
+    # Leverage-adjusted diagnostics: a high-leverage observation drags the fit
+    # toward itself, so its raw residual understates how anomalous it is.
+    with np.errstate(divide="ignore", invalid="ignore"):
+        studentized = result.residuals / (result.sigma * np.sqrt(1.0 - result.leverage))
+        cooks_d = (studentized**2 / result.n_params) * (result.leverage / (1.0 - result.leverage))
+    observations["studentized_residual"] = studentized
+    observations["loo_residual"] = result.loo_residuals
+    observations["leverage"] = result.leverage
+    observations["cooks_d"] = cooks_d
 
     with pd.ExcelWriter(workbook) as writer:
         summary.to_excel(writer, sheet_name="ModelSummary", index=False)
@@ -969,7 +1036,12 @@ def log_model_report(result: OLSResult) -> None:
         result.n_params,
         result.se_type,
     )
-    logging.info("R^2 = %.4f | Adj R^2 = %.4f", result.r_squared, result.adj_r_squared)
+    logging.info(
+        "R^2 = %.4f | Adj R^2 = %.4f | LOO R^2 = %.4f",
+        result.r_squared,
+        result.adj_r_squared,
+        result.loo_r_squared,
+    )
     logging.info(
         "F = %.3f (p = %.3g) | AIC = %.1f | BIC = %.1f",
         result.f_stat,
@@ -1021,7 +1093,9 @@ def extract_config_block(source_file: Path) -> str:
     return "\n".join(lines[begin_idx + 1 : end_idx])
 
 
-def write_run_log(output_dir: Path, provenance: list[tuple[str, str]]) -> bool:
+def write_run_log(
+    output_dir: Path, provenance: list[tuple[str, str]], anchor_path: Path | None = None
+) -> bool:
     """Write a run log of the configuration block into *output_dir*.
 
     Args:
@@ -1029,6 +1103,9 @@ def write_run_log(output_dir: Path, provenance: list[tuple[str, str]]) -> bool:
         provenance: ``(filename, sha256)`` pairs for every bundle joined into
             the model, recorded so the secured-box output traces back to the
             exact Part A prep that fed it.
+        anchor_path: The NTD anchor actually modeled; its SHA-256 is recorded so
+            the run log is a complete provenance record (bundles are already
+            hashed via the manifest).
 
     Returns:
         ``True`` if the log was written successfully, ``False`` otherwise.
@@ -1046,12 +1123,20 @@ def write_run_log(output_dir: Path, provenance: list[tuple[str, str]]) -> bool:
     else:
         provenance_lines = ["  (none — no bundles were joined)"]
 
+    anchor_sha = (
+        _sha256_file(anchor_path)
+        if anchor_path is not None and anchor_path.exists()
+        else "(not recorded)"
+    )
+
     lines: list[str] = [
         "=" * 72,
         "RIDERSHIP REGRESSION MODEL RUN LOG (PART B — secured box)",
         "=" * 72,
         f"Run timestamp:    {datetime.now().isoformat(timespec='seconds')}",
         f"Output directory: {output_dir}",
+        f"Anchor:           {anchor_path if anchor_path is not None else '(not recorded)'}",
+        f"Anchor SHA-256:   {anchor_sha}",
         f"Source script:    {Path(__file__).resolve()}",
         "",
         "-" * 72,
@@ -1157,7 +1242,7 @@ def main() -> None:
     if MAKE_PLOTS:
         make_diagnostic_plots(result, OUTPUT_DIR)
 
-    if not write_run_log(OUTPUT_DIR, provenance) and REQUIRE_RUN_LOG:
+    if not write_run_log(OUTPUT_DIR, provenance, ANCHOR_PATH) and REQUIRE_RUN_LOG:
         logging.error(
             "Run log could not be written. Set REQUIRE_RUN_LOG = False to "
             "suppress this error when a sidecar file is genuinely impossible."

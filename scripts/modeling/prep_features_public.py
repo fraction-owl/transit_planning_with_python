@@ -808,6 +808,22 @@ def write_bundles(tables: list[FeatureTable], output_dir: Path) -> list[BundleRe
             frame.shape[1],
             digest[:12],
         )
+
+    # A value column shipped by two differently keyed bundles will collide at
+    # model-join time if both bundles join the same anchor. The model aborts on
+    # that; warn here too, where the producing tables can still be named.
+    col_owners: dict[str, list[str]] = {}
+    for res in results:
+        for col in res.columns:
+            if col not in res.join_keys:
+                col_owners.setdefault(col, []).append(res.filename)
+    cross_bundle = {col: owners for col, owners in col_owners.items() if len(owners) > 1}
+    if cross_bundle:
+        logging.warning(
+            "Column name(s) shipped by multiple bundles (the model will refuse to "
+            "join the second if both bundles match the same anchor): %s",
+            cross_bundle,
+        )
     return results
 
 
