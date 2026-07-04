@@ -75,6 +75,25 @@ def test_loo_residuals_match_bruteforce_refits(design) -> None:
     np.testing.assert_allclose(result.loo_residuals, brute, rtol=1e-7, atol=1e-9)
 
 
+def test_hc3_close_to_hc1_under_homoskedasticity(design) -> None:
+    """HC3 must be accepted, leave the fit unchanged, and stay near HC1's SEs."""
+    y, x_matrix, names = design
+    hc1 = rpm.fit_ols(y, x_matrix, names, se_type="HC1")
+    hc3 = rpm.fit_ols(y, x_matrix, names, se_type="HC3")
+
+    np.testing.assert_allclose(hc1.params, hc3.params)
+    assert np.all(np.isfinite(hc3.std_errors))
+    np.testing.assert_allclose(hc3.std_errors, hc1.std_errors, rtol=0.5)
+
+
+def test_leverage_matches_hat_matrix_diagonal(design) -> None:
+    """The stored leverage must equal the hat-matrix diagonal."""
+    y, x_matrix, names = design
+    result = rpm.fit_ols(y, x_matrix, names, se_type="classical")
+    hat = x_matrix @ np.linalg.inv(x_matrix.T @ x_matrix) @ x_matrix.T
+    np.testing.assert_allclose(result.leverage, np.diag(hat), atol=1e-10)
+
+
 def test_vif_flags_collinearity() -> None:
     """A duplicated predictor should yield a very large VIF."""
     rng = np.random.default_rng(0)
@@ -127,7 +146,7 @@ def test_end_to_end_export(tmp_path, monkeypatch) -> None:
         }
     )
 
-    y, x_matrix, names, frame, _ = rpm.build_design_matrix(table)
+    y, x_matrix, names, frame = rpm.build_design_matrix(table)
     assert names == ["intercept", "log_revenue_hours", "log_total_pop"]
 
     result = rpm.fit_ols(y, x_matrix, names, se_type="HC1")
@@ -144,6 +163,21 @@ def test_end_to_end_export(tmp_path, monkeypatch) -> None:
     }
     # Recover the data-generating elasticities; the signal is strong and clean.
     assert result.r_squared > 0.8
+
+    # The over/under flag is driven by the leverage-adjusted studentized residual,
+    # and the influence diagnostics ride along in the sheet.
+    perf = sheets["RoutePerformance"]
+    assert {"studentized_residual", "leverage", "cooks_d"} <= set(perf.columns)
+    finite = perf["studentized_residual"].notna()
+    over = perf.loc[finite, "studentized_residual"] >= rpm.PERF_FLAG_SD
+    under = perf.loc[finite, "studentized_residual"] <= -rpm.PERF_FLAG_SD
+    assert (over == (perf.loc[finite, "performance"] == "over")).all()
+    assert (under == (perf.loc[finite, "performance"] == "under")).all()
+
+    # Duan smearing puts fitted_potential on the mean (not median) boardings
+    # scale, so its mean tracks the actual mean closely on clean data.
+    ratio = perf["fitted_potential"].mean() / perf["ntd_boardings"].mean()
+    assert 0.9 < ratio < 1.1
 
 
 def _write_bundle_manifest(bundle_dir, entries) -> None:
@@ -226,6 +260,30 @@ def test_assemble_model_table_joins_route_bundle_and_skips_period(tmp_path, monk
     assert [name for name, _ in provenance] == ["features__route_id.csv"]
 
 
+def test_assemble_model_table_rejects_column_collision(tmp_path, monkeypatch) -> None:
+    """A bundle re-shipping a column that already exists on the table must fail loudly."""
+    anchor_path, bundle_dir, manifest_path = _make_anchor_and_bundles(tmp_path)
+    # A second route_id bundle that re-ships total_pop (already joined by the first);
+    # a silent merge would _x/_y-rename both copies and break downstream lookups.
+    pd.DataFrame({"route_id": ["101", "102", "103"], "total_pop": [1, 2, 3]}).to_csv(
+        bundle_dir / "clash__route_id.csv", index=False
+    )
+    _write_bundle_manifest(
+        bundle_dir,
+        [
+            ("features__route_id.csv", ["route_id"]),
+            ("clash__route_id.csv", ["route_id"]),
+            ("features__period.csv", ["period"]),
+        ],
+    )
+    monkeypatch.setattr(rpm, "ANCHOR_PATH", anchor_path)
+    monkeypatch.setattr(rpm, "BUNDLE_DIR", bundle_dir)
+    monkeypatch.setattr(rpm, "MANIFEST_PATH", manifest_path)
+
+    with pytest.raises(ValueError, match="total_pop"):
+        rpm.assemble_model_table()
+
+
 def test_assemble_model_table_rejects_hash_mismatch(tmp_path, monkeypatch) -> None:
     """A bundle edited after the manifest was written aborts the run when verifying."""
     anchor_path, bundle_dir, manifest_path = _make_anchor_and_bundles(tmp_path)
@@ -259,6 +317,26 @@ def test_collapse_panel_anchor_rolls_up_to_one_row_per_route(monkeypatch) -> Non
     # Route 101's zero-boarding month is excluded, so its mean is 100, not 50.
     r101 = out.loc[out["route_id"] == "101"].iloc[0]
     assert r101["ntd_boardings"] == 100.0
+    assert r101["revenue_hours"] == 10.0
+
+
+def test_collapse_panel_anchor_drops_nan_months_with_zeros(monkeypatch) -> None:
+    """NaN-boardings months are excluded so revenue averages use the same months."""
+    monkeypatch.setattr(rpm, "ANCHOR_AGG", "mean")
+    monkeypatch.setattr(rpm, "ANCHOR_EXCLUDE_ZERO_MONTHS", True)
+    panel = pd.DataFrame(
+        {
+            "route_id": rpm._canonical_key(pd.Series(["101", "101", "101", "102", "102"])),
+            "ntd_boardings": [100.0, np.nan, 0.0, 200.0, 400.0],
+            "revenue_hours": [10.0, 77.0, 99.0, 20.0, 40.0],
+        }
+    )
+    out = rpm._collapse_panel_anchor(panel)
+
+    r101 = out.loc[out["route_id"] == "101"].iloc[0]
+    assert r101["ntd_boardings"] == 100.0
+    # Neither the NaN month's 77 hours nor the zero month's 99 leak into the mean:
+    # mean() alone would skip the NaN for boardings but still count its hours.
     assert r101["revenue_hours"] == 10.0
 
 
