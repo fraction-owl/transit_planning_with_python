@@ -592,6 +592,17 @@ def main(argv: Sequence[str] | None = None) -> None:
         format="%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+    if (
+        Path(args.gtfs_dir) == GTFS_DIR
+        or Path(args.schools_path) == SCHOOLS_PATH
+        or Path(args.output_dir) == OUTPUT_DIR
+    ):
+        logging.warning(
+            "GTFS_DIR, SCHOOLS_PATH, and/or OUTPUT_DIR are still set to their default "
+            "placeholder paths. Update the CONFIGURATION section (or pass "
+            "--gtfs-dir/--schools-path/--output-dir) before running."
+        )
+        return
     run(
         gtfs_dir=args.gtfs_dir,
         schools_path=args.schools_path,

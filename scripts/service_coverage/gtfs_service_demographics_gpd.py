@@ -2362,6 +2362,17 @@ def main(argv: Sequence[str] | None = None) -> None:
         format="%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+    if (
+        str(args.gtfs_path) == GTFS_DATA_PATH
+        or str(args.demographics_shp) == DEMOGRAPHICS_SHP_PATH
+        or str(args.output_dir) == OUTPUT_DIRECTORY
+    ):
+        logging.warning(
+            "GTFS_DATA_PATH, DEMOGRAPHICS_SHP_PATH, and/or OUTPUT_DIRECTORY are still set to "
+            "their default placeholder values. Update the CONFIGURATION section (or pass "
+            "--gtfs-path/--demographics-shp/--output-dir) before running."
+        )
+        return
     try:
         run(
             analysis_mode=args.analysis_mode,
