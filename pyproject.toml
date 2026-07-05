@@ -111,13 +111,19 @@ extra-paths = ["scripts/ridership_tools", "scripts/operations_tools"]
 
 [tool.ty.rules]
 unsupported-operator = "error"
+# Restored to "error": the typing stubs in requirements-dev.txt let ty resolve
+# every third-party import in the CI-checked tree (0 diagnostics as of
+# ty 0.0.56), so any new hit is a genuine typo or missing dependency.
+unresolved-import = "error"
+# Still "warn": 5 pre-existing diagnostics, mostly geopandas/shapely signatures
+# where the runtime type is fine (e.g. GeoDataFrame ops typed as returning
+# DataFrame). Promote alongside the stub-noise rules below once those call
+# sites are cleaned up.
 invalid-return-type = "warn"
 # Downgraded from "error" to "warn" to unblock CI: these fire only on
-# pre-existing, repo-wide diagnostics (missing third-party stubs behind
-# unresolved-import; a few DataFrame/GeoDataFrame and Timestamp/NaT assignments
-# in unrelated modules). They stay visible as warnings; restore to "error"
-# after a dedicated type-cleanup pass.
-unresolved-import = "warn"
+# pre-existing diagnostics (~165 as of ty 0.0.56), dominated by
+# pandas-stubs/geopandas overload noise. They stay visible as warnings;
+# restore to "error" after a dedicated type-cleanup pass.
 invalid-assignment = "warn"
 invalid-argument-type = "warn"
 not-subscriptable = "warn"
