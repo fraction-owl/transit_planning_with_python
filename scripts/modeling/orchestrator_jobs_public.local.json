@@ -34,6 +34,16 @@
       ]
     },
     {
+      "script": "route_transfer_calculator.py",
+      "cmd": ["{python}", "{script}",
+              "--gtfs-dirs", "{input}/gtfs_input/connector_gtfs_2026_04_29",
+              "--output-dir", "{output}"],
+      "outputs": [
+        {"file": "route_transfers_summary.csv", "join_keys": ["route_id"],
+         "keep_cols": ["transfer_route_count"]}
+      ]
+    },
+    {
       "script": "points_of_interest_coverage_gpd.py",
       "cmd": ["{python}", "{script}",
               "--gtfs-dir", "{input}/gtfs_input/connector_gtfs_2026_04_29",

@@ -66,8 +66,26 @@ def test_service_ids_active_on_day_reads_calendar_flags() -> None:
     assert service_ids_active_on_day(calendar, "saturday") == {"weekend"}
 
 
+def test_service_ids_active_on_day_weekday_keeps_any_monday_to_friday_service() -> None:
+    calendar = pd.DataFrame(
+        {
+            "service_id": ["weekday", "friday_only", "weekend", "daily"],
+            "monday": ["1", "0", "0", "1"],
+            "tuesday": ["1", "0", "0", "1"],
+            "wednesday": ["1", "0", "0", "1"],
+            "thursday": ["1", "0", "0", "1"],
+            "friday": ["1", "1", "0", "1"],
+            "saturday": ["0", "0", "1", "1"],
+            "sunday": ["0", "0", "1", "1"],
+        }
+    )
+    # Daily service runs on weekdays too; weekend-only service is excluded.
+    assert service_ids_active_on_day(calendar, "weekday") == {"weekday", "friday_only", "daily"}
+
+
 def test_service_ids_active_on_day_none_calendar_returns_none() -> None:
     assert service_ids_active_on_day(None, "monday") is None
+    assert service_ids_active_on_day(None, "weekday") is None
 
 
 def test_service_ids_active_on_day_invalid_day_raises() -> None:
@@ -188,10 +206,35 @@ def test_build_output_tables_includes_zero_transfer_targets() -> None:
     }
     summary, detail = build_output_tables(results, routes)
 
-    assert list(summary["target_route_id"]) == ["A"]
+    assert list(summary["route_id"]) == ["A"]
     row = summary.iloc[0]
     assert row["transfer_route_count"] == 1
     assert row["transfer_routes"] == "B"
     assert len(detail) == 1
     assert detail.iloc[0]["min_transfer_wait_min"] == pytest.approx(5.0)
     assert not bool(detail.iloc[0]["cross_feed"])
+
+
+# ---------------------------------------------------------------------------
+# parse_args
+# ---------------------------------------------------------------------------
+
+
+def test_parse_args_defaults_to_weekday_filter() -> None:
+    args = rtc.parse_args([])
+    assert args.day == "weekday"
+
+
+def test_parse_args_overrides() -> None:
+    args = rtc.parse_args(
+        ["--gtfs-dirs", "feed_a", "feed_b", "--output-dir", "out", "--day", "all"]
+    )
+    assert args.gtfs_dirs == ["feed_a", "feed_b"]
+    assert str(args.output_dir) == "out"
+    assert args.day == "all"
+
+
+def test_parse_args_ignores_unknown_orchestrator_tokens() -> None:
+    # The orchestrator's DEFAULT_CMD_TEMPLATE passes --input-dir; it must not crash.
+    args = rtc.parse_args(["--input-dir", "somewhere", "--gtfs-dirs", "feed_a"])
+    assert args.gtfs_dirs == ["feed_a"]

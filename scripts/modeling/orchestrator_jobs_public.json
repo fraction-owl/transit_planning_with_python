@@ -15,7 +15,12 @@
     "Those are NTD-sourced supply quantities that live on the anchor (the NTD figures are more",
     "accurate than the schedule-derived GTFS copy), and prep_features_public governance forbids them",
     "from any feature bundle; without an explicit keep_cols, inference would ship them and the",
-    "run would fail closed."
+    "run would fail closed.",
+    "NOTE: route_transfer_calculator.py also writes route_transfers_detail.csv (one row per",
+    "target/connector pair). It is deliberately not described: it has no route_id column, so",
+    "inference finds no join key and skips it. Only the route_id-keyed summary ships, and only",
+    "transfer_route_count (the transfer_routes column is a comma-separated string, not a",
+    "predictor). The script defaults to weekday (non-holiday) service via its --day filter."
   ],
   "scripts": [
     {
@@ -37,6 +42,15 @@
       "outputs": [
         {"file": "headway_span_by_route.csv", "join_keys": ["route_id"],
          "keep_cols": ["avg_headway_min", "span_hrs"]}
+      ]
+    },
+    {
+      "script": "route_transfer_calculator.py",
+      "cmd": ["{python}", "{script}", "--gtfs-dirs", "{input}/gtfs",
+              "--output-dir", "{output}"],
+      "outputs": [
+        {"file": "route_transfers_summary.csv", "join_keys": ["route_id"],
+         "keep_cols": ["transfer_route_count"]}
       ]
     },
     {
@@ -97,6 +111,8 @@
     {"file": "cabi_coverage_by_route.csv", "join_keys": ["route_id"],
      "keep_cols": ["cabi_stations_served", "cabi_weekday_riders_served"]},
     {"file": "headway_span_by_route.csv", "join_keys": ["route_id"],
-     "keep_cols": ["avg_headway_min", "span_hrs"]}
+     "keep_cols": ["avg_headway_min", "span_hrs"]},
+    {"file": "route_transfers_summary.csv", "join_keys": ["route_id"],
+     "keep_cols": ["transfer_route_count"]}
   ]
 }
