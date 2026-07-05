@@ -62,6 +62,66 @@ def test_filter_for_otp_drops_skipped_and_nontimepoint(scored: pd.DataFrame) -> 
     assert scored["dev_min"].notna().all()
 
 
+def test_summarize_unscorable_splits_reasons() -> None:
+    """Missing-actual (AVL dropout) and missing-schedule rows are told apart."""
+    ts = pd.Timestamp("2025-01-02T06:00:00")
+    df = pd.DataFrame(
+        {
+            "timepoint": ["TRUE", "TRUE", "TRUE", "FALSE"],
+            "schedule_relationship": ["Scheduled"] * 4,
+            "schedule_departure_time": [ts, ts, pd.NaT, ts],
+            "schedule_arrival_time": [ts, ts, pd.NaT, ts],
+            "actual_departure_time": [ts, pd.NaT, ts, pd.NaT],
+            "actual_arrival_time": [ts, pd.NaT, ts, pd.NaT],
+        }
+    )
+    out = target.summarize_unscorable(target.compute_stop_deviations(df), timepoints_only=True)
+    assert out == {
+        "candidates": 3,  # the FALSE-timepoint row is not eligible
+        "scored": 1,
+        "missing_actual_time": 1,
+        "missing_schedule_time": 1,
+    }
+
+
+def test_compute_trip_coverage_counts_unobserved_trips() -> None:
+    """Scheduled in-service trips with zero scored visits appear in the denominator."""
+    trips = pd.DataFrame(
+        {
+            "trip_id_performed": ["T1", "T2", "T3", "T4"],
+            "route_id": ["101", "101", "101", "101"],
+            "service_date": ["2025-01-02"] * 4,
+            "schedule_relationship": ["Scheduled", "Scheduled", "Scheduled", "Canceled"],
+            "trip_type": ["In service"] * 4,
+        }
+    )
+    scored = pd.DataFrame({"trip_id_performed": ["T1", "T1", "T2"]})
+    cov = target.compute_trip_coverage(trips, scored)
+
+    route = cov.loc[(cov["level"] == "route") & (cov["route_id"] == "101")]
+    assert len(route) == 1
+    row = route.iloc[0]
+    assert row["month"] == "2025-01"
+    assert row["trips_scheduled"] == 3  # Canceled T4 is excluded
+    assert row["trips_observed"] == 2  # T3 produced no visits
+    assert row["pct_trips_observed"] == pytest.approx(66.7)
+    assert row["evaluated_visits"] == 3
+    assert row["visits_per_observed_trip"] == pytest.approx(1.5)
+
+    overall = cov.loc[cov["level"] == "overall"]
+    assert set(overall["route_id"].unique()) == {"ALL"}
+    assert overall.iloc[0]["trips_scheduled"] == 3
+
+
+def test_compute_trip_coverage_on_fixtures(scored: pd.DataFrame) -> None:
+    """Fixture coverage is well-formed: bounded percentages, both levels present."""
+    tp = target.load_trips_performed(TRIPS_PERFORMED)
+    cov = target.compute_trip_coverage(tp, scored)
+    assert set(cov["level"].unique()) == {"route", "overall"}
+    assert (cov["trips_observed"] <= cov["trips_scheduled"]).all()
+    assert cov["pct_trips_observed"].between(0, 100).all()
+
+
 def test_classify_otp_buckets() -> None:
     """Classification respects the inclusive on-time window."""
     df = pd.DataFrame({"dev_min": [-5.0, -1.0, 0.0, 5.0, 7.0]})
@@ -108,6 +168,7 @@ def test_run_writes_tables_and_charts(tmp_path: Path) -> None:
     assert not long_table.empty
 
     assert (tmp_path / target.PROCESSED_FILENAME).exists()
+    assert (tmp_path / target.COVERAGE_FILENAME).exists()
     assert (tmp_path / "otp_monthly_route.csv").exists()
     pngs = list((tmp_path / "plots").glob("*.png"))
     assert pngs, "expected at least one OTP chart"

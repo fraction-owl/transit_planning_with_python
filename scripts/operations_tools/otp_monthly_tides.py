@@ -25,6 +25,9 @@ Outputs:
      columns = month, values = % on-time) for quick human scanning.
   3) PNG line charts of % on-time over time, one per group within each level,
      with a dashed reference line at the configured OTP standard.
+  4) ``otp_coverage_monthly.csv`` - trip-level AVL coverage per route and month
+     (see "AVL coverage" below), so differential coverage can be spotted before
+     the OTP numbers are trusted.
 
 Normalization
 -------------
@@ -37,6 +40,28 @@ TRUE (when ``TIMEPOINTS_ONLY`` is set), ``schedule_relationship`` is
 finite scheduled-vs-actual deviation could be computed.  Raw counts are kept
 alongside the percentages so cells backed by very little data can be spotted
 and, if desired, re-weighted downstream.
+
+AVL coverage (observed-only exports)
+------------------------------------
+Most AVL-derived ``stop_visits`` exports are *observed-only*: a row exists only
+when the vehicle actually reported at the stop, so the file itself cannot show
+what is missing.  A trip whose AVL unit was dead (or whose block never matched)
+simply contributes no rows, and if such gaps correlate with route or time of
+day, the naive visit-pooled OTP above is silently biased.  ``trips_performed``
+closes that gap from the schedule side -- it lists every scheduled trip on the
+service day (that is what makes ``schedule_relationship = Canceled`` possible),
+so scheduled in-service trips with zero scorable timepoint visits are
+recoverable even though ``stop_visits`` never mentions them.
+
+This script therefore also writes ``otp_coverage_monthly.csv``: per route and
+month (plus an overall series), the number of scheduled in-service trips, how
+many of them produced at least one scored timepoint visit, the resulting
+percent-of-trips-observed, and the mean scored visits per observed trip.  Cells
+whose coverage falls below ``COVERAGE_WARN_PCT`` are logged as warnings.  The
+OTP estimator itself stays naive (visit-pooled within each month); the coverage
+table is the evidence for deciding whether that is safe -- flat, high coverage
+means yes, while coverage that varies by route or month means the affected
+cells deserve caution or reweighting downstream.
 
 Typical usage
 -------------
@@ -94,8 +119,14 @@ OTP_STANDARD: float = 85.0
 # departure timestamp is missing (e.g. terminal stops on some feeds).
 LOG_LEVEL: int = logging.INFO
 
+# Warn when, within a (route, month) cell, the share of scheduled in-service
+# trips that produced at least one scored timepoint visit falls below this
+# percentage. Purely a logging threshold; no rows are dropped.
+COVERAGE_WARN_PCT: float = 90.0
+
 # Filenames
 PROCESSED_FILENAME: str = "otp_monthly_processed.csv"
+COVERAGE_FILENAME: str = "otp_coverage_monthly.csv"
 
 # =============================================================================
 # DATA STRUCTURES
@@ -256,6 +287,51 @@ def filter_for_otp(df: pd.DataFrame, timepoints_only: bool = TIMEPOINTS_ONLY) ->
     return out.copy()
 
 
+def summarize_unscorable(
+    df: pd.DataFrame,
+    timepoints_only: bool = TIMEPOINTS_ONLY,
+) -> Dict[str, int]:
+    """Break down why otherwise-eligible visits could not be scored.
+
+    ``dev_min`` going NaN has two very different causes: no actual timestamp
+    (an AVL dropout on a row the export chose to emit anyway) versus no
+    schedule timestamp (a data-quality defect in the export's schedule join).
+    In an observed-only export the first should be near zero, so a nonzero
+    ``missing_schedule_time`` is the number to chase with the AVL vendor.
+
+    Args:
+        df: Stop visits with a ``dev_min`` column, before :func:`filter_for_otp`.
+        timepoints_only: Apply the same timepoint filter as scoring, so the
+            counts describe the same candidate pool.
+
+    Returns:
+        Dict with ``candidates`` (eligible visits), ``scored`` (finite
+        deviation), ``missing_actual_time``, and ``missing_schedule_time``.
+        Rows missing both timestamps count under ``missing_schedule_time``.
+    """
+    sub = df
+    if timepoints_only and "timepoint" in sub.columns:
+        sub = sub.loc[sub["timepoint"].astype(str).str.upper() == "TRUE"]
+    if "schedule_relationship" in sub.columns:
+        sub = sub.loc[sub["schedule_relationship"].fillna("Scheduled") == "Scheduled"]
+
+    unscorable = sub.loc[sub["dev_min"].isna()]
+    if "schedule_departure_time" in unscorable.columns:
+        sched = unscorable["schedule_departure_time"]
+        if "schedule_arrival_time" in unscorable.columns:
+            sched = sched.fillna(unscorable["schedule_arrival_time"])
+    else:
+        sched = pd.Series(pd.NaT, index=unscorable.index)
+    missing_schedule = int(sched.isna().sum())
+
+    return {
+        "candidates": int(len(sub)),
+        "scored": int(len(sub) - len(unscorable)),
+        "missing_actual_time": int(len(unscorable) - missing_schedule),
+        "missing_schedule_time": missing_schedule,
+    }
+
+
 def classify_otp(
     df: pd.DataFrame,
     early_min: float = EARLY_MIN,
@@ -367,6 +443,86 @@ def build_all_levels(
     return results
 
 
+def compute_trip_coverage(
+    trips_performed: pd.DataFrame,
+    scored: pd.DataFrame,
+) -> pd.DataFrame:
+    """Trip-level AVL coverage per route and month, from the schedule side.
+
+    Observed-only ``stop_visits`` exports emit rows only when the vehicle
+    reported, so a trip with a dead AVL unit leaves no trace there. This builds
+    the denominator from ``trips_performed`` instead: every scheduled
+    in-service trip (the same Canceled / non-revenue filter as
+    :func:`join_trip_attributes`, so the pools match) is checked for at least
+    one scored timepoint visit.
+
+    Args:
+        trips_performed: Output of :func:`load_trips_performed`, after any
+            route include/exclude filtering.
+        scored: Fully scored visits (post :func:`filter_for_otp`), whose
+            ``trip_id_performed`` values mark a trip as observed.
+
+    Returns:
+        Tidy DataFrame with one row per (``level``, ``route_id``, ``month``)
+        for levels ``route`` and ``overall`` (``route_id`` = ``"ALL"``),
+        carrying ``trips_scheduled``, ``trips_observed``,
+        ``pct_trips_observed``, ``evaluated_visits``, and
+        ``visits_per_observed_trip``.
+    """
+    trips = trips_performed.copy()
+    if "schedule_relationship" in trips.columns:
+        trips = trips.loc[trips["schedule_relationship"].fillna("Scheduled") != "Canceled"]
+    if "trip_type" in trips.columns:
+        trips = trips.loc[trips["trip_type"].fillna("In service") == "In service"]
+    trips = trips.drop_duplicates("trip_id_performed").copy()
+    trips["month"] = pd.to_datetime(trips["service_date"], errors="coerce").dt.strftime("%Y-%m")
+
+    if scored.empty:
+        visit_counts = pd.Series(dtype="int64")
+    else:
+        visit_counts = scored.groupby("trip_id_performed").size()
+    trips["evaluated_visits"] = trips["trip_id_performed"].map(visit_counts).fillna(0).astype(int)
+    trips["_observed"] = trips["evaluated_visits"] > 0
+
+    def _reduce(frame: pd.DataFrame, keys: List[str]) -> pd.DataFrame:
+        out = (
+            frame.groupby(keys, dropna=False)
+            .agg(
+                trips_scheduled=("trip_id_performed", "size"),
+                trips_observed=("_observed", "sum"),
+                evaluated_visits=("evaluated_visits", "sum"),
+            )
+            .reset_index()
+        )
+        out["trips_observed"] = out["trips_observed"].astype(int)
+        return out
+
+    by_route = _reduce(trips, ["route_id", "month"])
+    by_route.insert(0, "level", "route")
+    overall = _reduce(trips, ["month"])
+    overall.insert(0, "level", "overall")
+    overall.insert(1, "route_id", "ALL")
+
+    cov = pd.concat([by_route, overall], ignore_index=True)
+    cov["pct_trips_observed"] = (cov["trips_observed"] / cov["trips_scheduled"] * 100.0).round(1)
+    cov["visits_per_observed_trip"] = np.where(
+        cov["trips_observed"] > 0,
+        cov["evaluated_visits"] / cov["trips_observed"].replace(0, np.nan),
+        np.nan,
+    ).round(1)
+    cols = [
+        "level",
+        "route_id",
+        "month",
+        "trips_scheduled",
+        "trips_observed",
+        "pct_trips_observed",
+        "evaluated_visits",
+        "visits_per_observed_trip",
+    ]
+    return cov[cols].sort_values(["level", "route_id", "month"], ignore_index=True)
+
+
 def make_long_table(levels: Mapping[str, pd.DataFrame]) -> pd.DataFrame:
     """Concatenate per-level frames into a single tidy long table.
 
@@ -422,6 +578,14 @@ def _slug(value: object) -> str:
     while "__" in txt:
         txt = txt.replace("__", "_")
     return txt.strip("_") or "group"
+
+
+def export_coverage(coverage: pd.DataFrame, out_dir: Path) -> Path:
+    """Write the trip-level AVL coverage table and return its path."""
+    ensure_dir(out_dir)
+    coverage_path = out_dir / COVERAGE_FILENAME
+    coverage.to_csv(coverage_path, index=False)
+    return coverage_path
 
 
 def export_tables(long_table: pd.DataFrame, out_dir: Path) -> List[Path]:
@@ -501,24 +665,63 @@ def run(cfg: Config) -> pd.DataFrame:
     """
     stop_visits = load_stop_visits(cfg.stop_visits_path)
     trips = load_trips_performed(cfg.trips_performed_path)
-    joined = join_trip_attributes(stop_visits, trips)
 
+    # Route filters are applied to trips_performed (route_id's source of truth)
+    # so the OTP join and the coverage denominator see the same trip pool.
     if cfg.routes_to_include:
         keep = {str(r) for r in cfg.routes_to_include}
-        joined = joined.loc[joined["route_id"].astype(str).isin(keep)]
+        trips = trips.loc[trips["route_id"].astype(str).isin(keep)]
     if cfg.routes_to_exclude:
         drop = {str(r) for r in cfg.routes_to_exclude}
-        joined = joined.loc[~joined["route_id"].astype(str).isin(drop)]
+        trips = trips.loc[~trips["route_id"].astype(str).isin(drop)]
+
+    joined = join_trip_attributes(stop_visits, trips)
+
+    deviated = compute_stop_deviations(joined)
+    unscorable = summarize_unscorable(deviated, cfg.timepoints_only)
+    if unscorable["missing_schedule_time"]:
+        logging.warning(
+            "%d of %d eligible timepoint visits lack a schedule timestamp and cannot "
+            "be scored -- a data-quality defect in the export's schedule join, not an "
+            "AVL gap.",
+            unscorable["missing_schedule_time"],
+            unscorable["candidates"],
+        )
+    if unscorable["missing_actual_time"]:
+        logging.info(
+            "%d of %d eligible timepoint visits have a schedule but no actual "
+            "timestamp (within-row AVL dropouts).",
+            unscorable["missing_actual_time"],
+            unscorable["candidates"],
+        )
 
     scored = (
-        joined.pipe(compute_stop_deviations)
-        .pipe(filter_for_otp, cfg.timepoints_only)
+        deviated.pipe(filter_for_otp, cfg.timepoints_only)
         .pipe(classify_otp, cfg.early_min, cfg.late_min)
         .pipe(add_month)
     )
 
     levels = build_all_levels(scored, cfg.corridors)
     long_table = make_long_table(levels)
+
+    coverage = compute_trip_coverage(trips, scored)
+    coverage_path = export_coverage(coverage, cfg.output_dir)
+    logging.info("Wrote trip-coverage table: %s", coverage_path)
+    low = coverage.loc[
+        (coverage["level"] == "route") & (coverage["pct_trips_observed"] < COVERAGE_WARN_PCT)
+    ]
+    if not low.empty:
+        logging.warning(
+            "%d (route, month) cell(s) have < %.0f%% of scheduled in-service trips "
+            "observed (worst: route %s in %s at %.1f%%). OTP for these cells rests on "
+            "a nonrandom subset of trips -- inspect %s before trusting rollups.",
+            len(low),
+            COVERAGE_WARN_PCT,
+            low.loc[low["pct_trips_observed"].idxmin(), "route_id"],
+            low.loc[low["pct_trips_observed"].idxmin(), "month"],
+            low["pct_trips_observed"].min(),
+            COVERAGE_FILENAME,
+        )
 
     paths = export_tables(long_table, cfg.output_dir)
     for p in paths:
