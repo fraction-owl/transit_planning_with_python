@@ -85,6 +85,7 @@ transit_planning_with_python/
 │   │   ├── otp_monthly_tides.py
 │   │   ├── route_runtime_tides.py
 │   │   ├── segment_runtime_tides.py
+│   │   ├── tides_stop_otp_flagger.py
 │   │   ├── trip_runtime_diagnostics.py
 │   │   └── trip_runtime_tides.py
 │   ├── ridership_tools/
@@ -227,6 +228,7 @@ transit_planning_with_python/
 │   ├── test_stop_v_conflict_checker_gpd.py
 │   ├── test_stop_vs_roadname_checker_gpd.py
 │   ├── test_stops_ridership_joiner_gpd.py
+│   ├── test_tides_stop_otp_flagger.py
 │   ├── test_time_band_exporter.py
 │   ├── test_timepoint_schedule_exporter.py
 │   ├── test_trip_runtime_diagnostics.py
