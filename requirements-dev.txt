@@ -17,7 +17,10 @@ ruff==0.15.12                # Linting & formatting
 pre-commit                   # Local git hooks (ruff)
 
 # Type checking
-ty                           # Non-blocking type checks
+# Pinned while [tool.ty.rules] entries are promoted to "error": ty is pre-1.0
+# and new releases add or reclassify diagnostics, which would break CI on an
+# unplanned upgrade. Bump deliberately and re-run `ty check scripts`.
+ty==0.0.56                   # Type checks; error-level rules block CI
 
 # Data Processing
 polars==0.20.31              # Fast DataFrames (used by dev fixture builders)
