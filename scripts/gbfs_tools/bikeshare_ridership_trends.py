@@ -471,6 +471,7 @@ def main(argv: list[str] | None = None) -> int:
     except (ValueError, FileNotFoundError) as exc:
         logger.error("%s", exc)
         return 2
+    logger.info("Script completed successfully.")
     return 0
 
 

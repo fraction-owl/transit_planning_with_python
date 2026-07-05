@@ -599,6 +599,17 @@ def main(argv: Sequence[str] | None = None) -> None:
         format="%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+    if (
+        Path(args.gtfs_dir) == GTFS_DIR
+        or Path(args.shp_input_dir) == SHP_INPUT_DIR
+        or Path(args.output_dir) == OUTPUT_DIR
+    ):
+        logging.warning(
+            "GTFS_DIR, SHP_INPUT_DIR, and/or OUTPUT_DIR are still set to their default "
+            "placeholder paths. Update the CONFIGURATION section (or pass "
+            "--gtfs-dir/--shp-input-dir/--output-dir) before running."
+        )
+        return
     run(
         gtfs_dir=args.gtfs_dir,
         shp_input_dir=args.shp_input_dir,

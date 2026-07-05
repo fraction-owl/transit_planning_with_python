@@ -215,6 +215,7 @@ def run(
         output_path = _joined_output_path(geometry_input, output_dir)
         export_layer(joined, output_path)
         logger.info("Joined ridership onto %d stations -> %s", len(joined), output_path)
+    logger.info("Script completed successfully.")
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:

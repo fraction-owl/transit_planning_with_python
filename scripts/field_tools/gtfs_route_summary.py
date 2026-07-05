@@ -597,6 +597,16 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(message)s",
     )
 
+    if (
+        GTFS_FOLDER_PATH == _DEFAULT_GTFS_FOLDER_PATH
+        or BASE_OUTPUT_PATH == _DEFAULT_BASE_OUTPUT_PATH
+    ):
+        logging.warning(
+            "GTFS_FOLDER_PATH and/or BASE_OUTPUT_PATH are still set to their default "
+            "placeholder values. Please update them in the CONFIGURATION section before running."
+        )
+        return
+
     logging.info("==== GTFS Route Summary ====")
     logging.info("GTFS dir      : %s", GTFS_FOLDER_PATH)
     logging.info("Output        : %s", os.path.join(BASE_OUTPUT_PATH, OUTPUT_FILENAME))
@@ -644,6 +654,7 @@ def main() -> None:
             return
 
         export_to_xlsx(summary, os.path.join(BASE_OUTPUT_PATH, OUTPUT_FILENAME))
+        logging.info("Script completed successfully.")
 
     except (OSError, ValueError, RuntimeError) as exc:
         logging.error("Pipeline failed: %s", exc)
