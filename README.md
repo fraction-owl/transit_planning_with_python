@@ -50,9 +50,11 @@ The repository is organized for ease of use, with:
 
 ## 🛠️ Requirements
 
-- Python 3.9+
+- Python — the required version depends on which scripts you run:
+  - **Scripts that run inside ArcGIS Pro** — the `*_arcpy` variants plus any script that only needs the Pro-bundled stack (pandas, networkx, matplotlib, …): **Python 3.9+**, i.e. the Python that ships with ArcGIS Pro 3.0 or later. Nothing extra to install — see `requirements-arcpro.txt` for what Pro already bundles.
+  - **Scripts using the open-source geospatial stack** — anything importing geopandas, shapely, rapidfuzz, etc. (most `*_gpd` scripts): **Python 3.12+** in your own environment, installed with `pip install -r requirements.txt`. These cannot run in ArcGIS Pro's bundled Python.
 - Common libraries like pandas, geopandas, matplotlib, networkx, and others.
-  - **ArcGIS Pro users:** required libraries already ship with ArcGIS Pro — see `requirements_arcpro.txt` for a reference list.
+  - **ArcGIS Pro users:** required libraries already ship with ArcGIS Pro — see `requirements-arcpro.txt` for a reference list.
   - **Non-ArcGIS / home users:** install the open-source stack with `pip install -r requirements.txt`.
 
 ## 🧑‍💻 How to Use
@@ -103,7 +105,7 @@ Jupyter Notebook is a powerful tool for running Python scripts in an interactive
 ### 🏡 Option B: Setting Up Python on a Home Computer
 
 1. **Download and Install Python**
-   - Visit the [official Python website](https://www.python.org/downloads/) and download Python 3.9 or later.
+   - Visit the [official Python website](https://www.python.org/downloads/) and download Python 3.12 or later.
    - During installation, ensure you check the option to **"Add Python to PATH"**. This step is crucial for the command-line tools to work correctly.
 
 2. **Install JupyterLab and Required Libraries**
@@ -145,7 +147,7 @@ If you encounter any issues while installing Python or libraries, or if JupyterL
      python --version
      ```
 
-   If this command doesn't show a Python version (e.g., `Python 3.11.5`), Python may not be installed correctly, or it isn't added to your PATH. In that case:
+   If this command doesn't show a Python version (e.g., `Python 3.12.5`), Python may not be installed correctly, or it isn't added to your PATH. In that case:
    - Reinstall Python from the [official website](https://www.python.org/downloads/).
    - During installation, ensure the option **"Add Python to PATH"** is checked.
    - Or proceed to **Step 3: Fixing PATH Issues**

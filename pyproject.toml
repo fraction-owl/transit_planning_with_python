@@ -7,6 +7,12 @@
 # ruff
 # ----------------------------------------------------------------
 [tool.ruff]
+# Lint/type-check baseline matching CI and the open-source stack (see
+# requirements.txt). Scripts that run inside ArcGIS Pro's bundled Python
+# additionally keep a 3.9 runtime floor, enforced by
+# dev_tools/audit_python_floor.py rather than by ruff, because tier
+# membership is import-based (arcpy/Pro-bundled vs geopandas stack) and
+# can't be expressed as a filename glob.
 target-version = "py312"
 line-length    = 100
 
@@ -78,9 +84,10 @@ ignore = [
               #   cost is negligible for this repo and the
               #   refactor noise isn't worth it.
     "TC003",  # Same rationale for standard-library imports.
-    "B905",   # zip() without strict= is intentional: strict= was
-              #   added in Python 3.10 and this codebase targets
-              #   3.9+.
+    "B905",   # zip() without strict= is tolerated: ArcPro-tier scripts
+              #   (arcpy + anything runnable on Pro's bundled stack)
+              #   keep a Python 3.9 floor, where strict= doesn't exist
+              #   (added in 3.10). See dev_tools/audit_python_floor.py.
 ]
 
 [tool.ruff.lint.per-file-ignores]

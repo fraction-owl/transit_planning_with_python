@@ -92,6 +92,13 @@ Many common issues are auto-corrected by Ruff on PRs.
   - Consistent import ordering (`isort`-compatible)
   - Type annotations and type-checking imports, with some leniency for `Any` (`ANN401` is ignored)
   - Pandas best practices (`pandas-vet`)
+  - **Python version floors** (via `dev_tools/audit_python_floor.py`): scripts that can run inside
+    ArcGIS Pro's bundled Python — the `*_arcpy` variants plus any script that doesn't import the
+    open-source geospatial stack (geopandas, shapely, rapidfuzz, …) — must stay **Python 3.9**
+    compatible: no 3.10+ syntax (e.g. `match`), and no `X | Y` union annotations in function
+    signatures or module/class-level variables unless the file has
+    `from __future__ import annotations`. Scripts importing the open-source stack follow the
+    repo-wide **3.12** baseline. The tier is determined by a script's imports, not its filename.
         
 **Note:** Ruff auto-fixes for unused imports (`F401`), docstring styling (`D`), and import sorting (`I`) are pushed
 back to your PR branch automatically by the GitHub Actions workflow. While `ty` is configured to simply warn for

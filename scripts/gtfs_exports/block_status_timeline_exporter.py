@@ -7,6 +7,8 @@ Typically used interactively within a Jupyter notebook or ArcGIS Pro environment
 though direct execution via the command line is also supported.
 """
 
+from __future__ import annotations
+
 import logging
 import os
 from collections.abc import Mapping, Sequence

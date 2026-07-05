@@ -42,6 +42,11 @@ jobs:
       - name: Lint with Ruff
         run: ruff check .
 
+      - name: Audit Python version floors
+        # ArcPro-tier scripts (arcpy + anything runnable on Pro's bundled
+        # stack) must stay Python 3.9 compatible; see CONTRIBUTING.md.
+        run: python dev_tools/audit_python_floor.py
+
       - name: Type check with Ty
         # ty is pre-1.0 and currently surfaces pandas/geopandas-stubs typing noise as
         # warning-level diagnostics; a newer ty started exiting non-zero on warnings.
