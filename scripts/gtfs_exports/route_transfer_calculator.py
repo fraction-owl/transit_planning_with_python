@@ -18,24 +18,37 @@ get off, and board route B. The time check uses A's arrival times at the
 alighting stop and B's departure times at the (possibly different) nearby
 boarding stop.
 
+By default only regular weekday service is considered: ``DAY_OF_WEEK`` is
+``"weekday"``, which keeps trips whose calendar.txt service runs on at least one
+of Monday–Friday. Weekend-only service is excluded, and because
+``calendar_dates.txt`` exceptions are never consulted, holiday-exception service
+never enters the pool either. Set a single day name to filter to that day, or
+``None`` / ``--day all`` to pool every trip regardless of service day (which can
+pair trips that never run on the same day — inflating counts).
+
 Inputs:
     - One or more GTFS feed folders, each with stops.txt, routes.txt, trips.txt,
-      and stop_times.txt. calendar.txt is used when a day-of-week filter is set.
+      and stop_times.txt. calendar.txt is used when a day filter is set.
 
 Outputs:
-    - A summary CSV: one row per target route with a transfer count and the
-      comma-separated list of routes it can transfer to.
+    - A summary CSV keyed on ``route_id``: one row per target route with a
+      transfer count and the comma-separated list of routes it can transfer to.
     - An optional detail CSV: one row per (target route, connector route) pair
       with the number of qualifying stop pairs, nearest walk distance, and the
       shortest feasible wait observed.
+
+Defaults come from the CONFIGURATION block; ``--gtfs-dirs`` / ``--output-dir`` /
+``--day`` / ``--log-level`` override them, so the script can run standalone or
+under the prep_features_public.py orchestrator.
 """
 
 from __future__ import annotations
 
+import argparse
 import logging
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 import geopandas as gpd
 import numpy as np
@@ -99,10 +112,13 @@ MIN_TRANSFER_BUFFER_MINUTES: float = 0.0
 # Longest a rider will wait at the connector stop, in minutes.
 MAX_TRANSFER_WAIT_MINUTES: float = 30.0
 
-# Optional day-of-week filter (e.g., "monday"). Uses calendar.txt to keep only
-# trips whose service runs that day, so feeder/connector trips share a day. None
-# keeps all trips. Feeds without calendar.txt fall back to all trips with a warning.
-DAY_OF_WEEK: Optional[str] = None
+# Service-day filter. "weekday" (the default) keeps trips whose calendar.txt
+# service runs on at least one of Monday-Friday — regular weekday service, with
+# weekend-only service excluded and holiday exceptions naturally absent because
+# calendar_dates.txt is never consulted. A single day name (e.g., "monday")
+# keeps only that day's service. None keeps all trips regardless of service day.
+# Feeds without calendar.txt fall back to all trips with a warning.
+DAY_OF_WEEK: Optional[str] = "weekday"
 
 # --- Output ---------------------------------------------------------------
 SUMMARY_FILENAME = "route_transfers_summary.csv"
@@ -174,26 +190,37 @@ def distance_to_meters(distance: float, unit: str) -> float:
 
 
 def service_ids_active_on_day(calendar_df: Optional[pd.DataFrame], day: str) -> Optional[set[str]]:
-    """Return the set of service_ids whose regular service runs on a weekday.
+    """Return the set of service_ids whose regular service runs on the given day.
 
     Only ``calendar.txt`` weekly flags are consulted; date-specific exceptions in
-    ``calendar_dates.txt`` are not mapped to weekdays. When the calendar is
-    unavailable, None is returned to signal "do not filter".
+    ``calendar_dates.txt`` are not mapped to weekdays, so holiday-exception
+    service never qualifies. When the calendar is unavailable, None is returned
+    to signal "do not filter".
 
     Args:
         calendar_df: Parsed calendar.txt, or None if the feed has none.
-        day: Lowercase weekday name, e.g. ``"monday"``.
+        day: Lowercase day name (e.g. ``"monday"``), or ``"weekday"`` to keep
+            every service_id that runs on at least one of Monday-Friday.
 
     Returns:
         A set of service_id strings active on ``day``, or None when no calendar is
         available to filter on.
     """
     key = day.lower()
-    if key not in _DAY_COLUMNS:
-        raise ValueError(f"DAY_OF_WEEK must be one of {_DAY_COLUMNS}, got '{day}'.")
-    if calendar_df is None or calendar_df.empty or key not in calendar_df.columns:
+    if key != "weekday" and key not in _DAY_COLUMNS:
+        raise ValueError(f"DAY_OF_WEEK must be 'weekday' or one of {_DAY_COLUMNS}, got '{day}'.")
+    if calendar_df is None or calendar_df.empty:
         return None
-    active = calendar_df.loc[calendar_df[key].astype(str) == "1", "service_id"]
+
+    day_cols = _DAY_COLUMNS[:5] if key == "weekday" else (key,)
+    present = [c for c in day_cols if c in calendar_df.columns]
+    if not present:
+        return None
+
+    mask = pd.Series(False, index=calendar_df.index)
+    for col in present:
+        mask |= calendar_df[col].astype(str) == "1"
+    active = calendar_df.loc[mask, "service_id"]
     return {str(s) for s in active}
 
 
@@ -574,8 +601,9 @@ def build_output_tables(
 
     Returns:
         A ``(summary, detail)`` tuple. The summary has one row per target route
-        (including targets with zero transfers); the detail has one row per
-        (target, connector) pair.
+        (including targets with zero transfers), keyed on ``route_id`` so it can
+        be joined downstream (e.g. by the prep_features_public.py orchestrator);
+        the detail has one row per (target, connector) pair.
     """
     summary_rows: list[dict[str, object]] = []
     detail_rows: list[dict[str, object]] = []
@@ -596,10 +624,10 @@ def build_output_tables(
 
         summary_rows.append(
             {
-                "target_feed": target_feed,
-                "target_route_id": str(target["route_id"]),
-                "target_route_short_name": str(target["route_short_name"]),
-                "target_route_long_name": str(target["route_long_name"]),
+                "feed": target_feed,
+                "route_id": str(target["route_id"]),
+                "route_short_name": str(target["route_short_name"]),
+                "route_long_name": str(target["route_long_name"]),
                 "transfer_route_count": len(labelled),
                 "transfer_routes": ", ".join(label for label, _, _ in labelled),
             }
@@ -626,9 +654,7 @@ def build_output_tables(
                 }
             )
 
-    summary = pd.DataFrame(summary_rows).sort_values(
-        ["target_feed", "target_route_short_name", "target_route_id"]
-    )
+    summary = pd.DataFrame(summary_rows).sort_values(["feed", "route_short_name", "route_id"])
     detail = pd.DataFrame(detail_rows)
     return summary, detail
 
@@ -638,21 +664,67 @@ def build_output_tables(
 # =============================================================================
 
 
-def main() -> None:
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    """Parse command-line arguments, defaulting to the configuration block.
+
+    ``parse_known_args`` is used so a notebook kernel's injected argv (or the
+    orchestrator's extra ``--input-dir`` token) does not raise ``SystemExit: 2``.
+    """
+    parser = argparse.ArgumentParser(
+        description=(
+            "Compute the routes each target route can transfer to across one or more "
+            "GTFS feeds. Defaults come from the CONFIGURATION block at the top of this file."
+        )
+    )
+    parser.add_argument(
+        "--gtfs-dirs",
+        nargs="+",
+        default=list(GTFS_FEEDS),
+        help="One or more GTFS feed folders (pooled into a single network).",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=OUTPUT_DIR,
+        help="Directory the summary/detail CSVs are written to.",
+    )
+    parser.add_argument(
+        "--day",
+        default=DAY_OF_WEEK if DAY_OF_WEEK is not None else "all",
+        help=(
+            "Service-day filter: 'weekday' (any Mon-Fri service; default), a single "
+            "day name (monday..sunday), or 'all' to keep every trip."
+        ),
+    )
+    parser.add_argument(
+        "--log-level",
+        default=logging.getLevelName(LOG_LEVEL),
+        help="DEBUG / INFO / WARNING / ERROR.",
+    )
+    args, _unknown = parser.parse_known_args(argv)
+    return args
+
+
+def main(argv: Sequence[str] | None = None) -> None:
     """Run the route transfer calculation and write the output CSV(s)."""
+    args = parse_args(argv)
     logging.basicConfig(
-        level=LOG_LEVEL,
+        level=getattr(logging, str(args.log_level).upper(), LOG_LEVEL),
         format="%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    feeds = [f for f in GTFS_FEEDS if f and f != _PLACEHOLDER_FEED]
-    if not feeds or OUTPUT_DIR == _PLACEHOLDER_OUTPUT:
+    feeds = [str(f) for f in args.gtfs_dirs if f and str(f) != _PLACEHOLDER_FEED]
+    output_dir = Path(args.output_dir)
+    if not feeds or output_dir == _PLACEHOLDER_OUTPUT:
         logging.warning(
-            "GTFS_FEEDS and/or OUTPUT_DIR are still set to placeholder values. "
-            "Update the CONFIGURATION section before running."
+            "GTFS feed folder(s) and/or the output folder are still set to placeholder "
+            "values. Update the CONFIGURATION section or pass --gtfs-dirs/--output-dir."
         )
         return
+
+    day_token = str(args.day).strip().lower()
+    day_filter: Optional[str] = None if day_token in ("", "all", "none") else day_token
 
     labels = _unique_labels(feeds, FEED_LABELS)
 
@@ -676,10 +748,11 @@ def main() -> None:
     stop_times = pd.concat([feed["stop_times"] for feed in loaded], ignore_index=True)
 
     keep_service_ids: dict[str, Optional[set[str]]] = {}
-    if DAY_OF_WEEK is not None:
+    if day_filter is not None:
+        logging.info("Service-day filter: %s.", day_filter)
         for feed in loaded:
             label = str(feed["routes"]["feed"].iloc[0])
-            ids = service_ids_active_on_day(feed["calendar"], DAY_OF_WEEK)
+            ids = service_ids_active_on_day(feed["calendar"], day_filter)
             if ids is None:
                 logging.warning(
                     "Feed '%s': no usable calendar.txt for day filter; keeping all trips.",
@@ -687,6 +760,7 @@ def main() -> None:
                 )
             keep_service_ids[label] = ids
     else:
+        logging.info("No service-day filter: pooling all trips regardless of service day.")
         keep_service_ids = {str(feed["routes"]["feed"].iloc[0]): None for feed in loaded}
 
     stops_gdf = _project_stops(stops)
@@ -702,13 +776,13 @@ def main() -> None:
     results = compute_transfers(stops_gdf, events, routes, radius_m)
     summary, detail = build_output_tables(results, routes)
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    summary_path = OUTPUT_DIR / SUMMARY_FILENAME
+    os.makedirs(output_dir, exist_ok=True)
+    summary_path = output_dir / SUMMARY_FILENAME
     summary.to_csv(summary_path, index=False)
     logging.info("Wrote summary for %d target route(s) -> %s", len(summary), summary_path)
 
     if WRITE_DETAIL:
-        detail_path = OUTPUT_DIR / DETAIL_FILENAME
+        detail_path = output_dir / DETAIL_FILENAME
         detail.to_csv(detail_path, index=False)
         logging.info("Wrote %d transfer pair(s) -> %s", len(detail), detail_path)
 
