@@ -78,9 +78,10 @@ ignore = [
               #   cost is negligible for this repo and the
               #   refactor noise isn't worth it.
     "TC003",  # Same rationale for standard-library imports.
-    "B905",   # zip() without strict= is intentional: strict= was
-              #   added in Python 3.10 and this codebase targets
-              #   3.9+.
+    "B905",   # zip() without strict= is tolerated: the arcpy script
+              #   variants run under ArcGIS Pro's bundled Python
+              #   (<3.10, no strict= support), and the ~130 existing
+              #   call sites elsewhere predate the 3.12 floor.
 ]
 
 [tool.ruff.lint.per-file-ignores]
