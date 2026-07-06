@@ -741,6 +741,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     end_label = end_month if end_dt is not None else "latest on disk"
     if not periods:
         logging.warning("No discovered workbooks fall in %s..%s.", start_label, end_label)
+        logging.error(
+            "No in-range workbooks were found under %s; the anchor cannot be built.", data_root
+        )
+        sys.exit(1)
 
     logging.info("=== STEP 1: READ WORKBOOKS (%s..%s) ===", start_label, end_label)
     raw = load_raw(workbooks, periods, selected_periods)

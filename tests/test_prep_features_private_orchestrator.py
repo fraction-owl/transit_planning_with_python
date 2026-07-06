@@ -218,10 +218,11 @@ def test_end_to_end_real_scripts_via_registry(tmp_path: Path) -> None:
     """Drive the real private scripts through the actual jobs.private.json registry."""
     input_dir = tmp_path / "input"
     (input_dir / "tides").mkdir(parents=True, exist_ok=True)
-    (input_dir / "ntd").mkdir(parents=True, exist_ok=True)
     shutil.copy(STOP_VISITS, input_dir / "tides" / "stop_visits.csv")
     shutil.copy(TRIPS_PERFORMED, input_dir / "tides" / "trips_performed.csv")
-    _write_ntd_workbook(input_dir / "ntd" / "JULY 2025 NTD.xlsx")
+    # The NTD workbooks sit loose in the input root (the registry passes
+    # --data-root {input}), unlike the TIDES exports in their topic subfolder.
+    _write_ntd_workbook(input_dir / "JULY 2025 NTD.xlsx")
 
     bundles = pf.orchestrate(
         scripts_dir=Path("scripts"),
