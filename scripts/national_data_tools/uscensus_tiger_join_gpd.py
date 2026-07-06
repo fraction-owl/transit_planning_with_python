@@ -14,7 +14,8 @@ Stages
         GeoDataFrame, with the same optional FIPS filter applied.
 3) Join stage (GeoPandas):
         Merge attributes onto block geometry on the 15-digit block FIPS
-        identifier and write the final output.
+        identifier, optionally patch in supplemental job sites missing from
+        LODES (see ``SUPPLEMENTAL_JOBS_CSV``), and write the final output.
 
 Configuration
 -------------
@@ -126,6 +127,20 @@ INTERMEDIATE_MERGED_SHP: str | None = (
 #: Final joined geometry + attributes filename (Stage 3 output).
 FINAL_JOINED_FEATURES_NAME: str = "va_md_dc_blocks_plus_data.shp"
 FINAL_JOINED_FEATURES: str = str(Path(OUTPUT_DIR) / FINAL_JOINED_FEATURES_NAME)
+
+# ---- Supplemental job sites (optional) ---------------------------------------
+#: Optional CSV of job sites absent from the LODES WAC extract — employers that
+#: are suppressed for national-security reasons, uniformed-military headcounts,
+#: or developments newer than the WAC vintage. Required columns: ``name``,
+#: ``lat`` / ``lon`` (WGS 84 decimal degrees), ``jobs``. Optional columns:
+#: ``wage_class`` (``low`` / ``mid`` / ``high`` / ``unknown``; default
+#: ``unknown``) and ``source_note`` (free text recording where the estimate
+#: came from). Each site's jobs are added to the block polygon containing the
+#: point: always to ``tot_empl``, plus the matching wage column. ``unknown``
+#: goes to a separate ``unk_wage`` column so the LODES-sourced low/mid/high
+#: bands are never contaminated by estimates. A site falling outside every
+#: block (e.g. outside the FIPS filter) aborts the run. None disables the patch.
+SUPPLEMENTAL_JOBS_CSV: str | Path | None = None
 
 # ---- Join settings ----------------------------------------------------------
 LEFT_KEY: Final[str] = "GEOID20"  # 15-digit block ID in geometry
@@ -1244,6 +1259,142 @@ def attach_demographics_to_blocks(
 
 
 # =============================================================================
+# SUPPLEMENTAL JOB SITES (optional LODES patch)
+# =============================================================================
+
+#: Columns every supplemental job-sites CSV must provide.
+SUPPLEMENTAL_REQUIRED_COLS: Final[tuple[str, ...]] = ("name", "lat", "lon", "jobs")
+
+#: Accepted ``wage_class`` values and the block column each one adds to.
+#: ``unknown`` gets its own column so the LODES low/mid/high bands stay pure.
+SUPPLEMENTAL_WAGE_COLS: Final[dict[str, str]] = {
+    "low": "low_wage",
+    "mid": "mid_wage",
+    "high": "high_wage",
+    "unknown": "unk_wage",
+}
+
+
+def load_supplemental_jobs(path: str | Path) -> pd.DataFrame:
+    """Load and validate a supplemental job-sites CSV.
+
+    Args:
+        path: CSV with ``name``, ``lat``, ``lon``, ``jobs`` columns, plus
+            optional ``wage_class`` and ``source_note`` (see
+            ``SUPPLEMENTAL_JOBS_CSV``). Header names are case-insensitive.
+
+    Returns:
+        The validated table with lowercase column names, numeric ``lat`` /
+        ``lon`` / ``jobs``, and a normalized ``wage_class`` column.
+
+    Raises:
+        ValueError: If required columns are missing, coordinates or job counts
+            are non-numeric or non-positive, or a ``wage_class`` value is not
+            one of ``SUPPLEMENTAL_WAGE_COLS``.
+    """
+    sites = pd.read_csv(path)
+    sites.columns = [str(c).strip().lower() for c in sites.columns]
+
+    missing = [c for c in SUPPLEMENTAL_REQUIRED_COLS if c not in sites.columns]
+    if missing:
+        raise ValueError(f"Supplemental jobs CSV '{path}' is missing column(s): {missing}")
+
+    for col in ("lat", "lon", "jobs"):
+        sites[col] = pd.to_numeric(sites[col], errors="coerce")
+    bad = sites[sites[["lat", "lon", "jobs"]].isna().any(axis=1) | (sites["jobs"] <= 0)]
+    if not bad.empty:
+        raise ValueError(
+            f"Supplemental jobs CSV '{path}' has non-numeric coordinates or non-positive "
+            f"job counts for site(s): {bad['name'].astype(str).tolist()}"
+        )
+
+    if "wage_class" not in sites.columns:
+        sites["wage_class"] = "unknown"
+    sites["wage_class"] = sites["wage_class"].fillna("unknown").astype(str).str.strip().str.lower()
+    unknown_classes = sorted(set(sites["wage_class"]) - set(SUPPLEMENTAL_WAGE_COLS))
+    if unknown_classes:
+        raise ValueError(
+            f"Supplemental jobs CSV '{path}' has unrecognized wage_class value(s) "
+            f"{unknown_classes}; use one of {sorted(SUPPLEMENTAL_WAGE_COLS)}."
+        )
+
+    logging.info(
+        "Loaded %d supplemental job site(s) totalling %d job(s) from '%s'.",
+        len(sites),
+        int(sites["jobs"].sum()),
+        path,
+    )
+    return sites
+
+
+def apply_supplemental_jobs(joined: GeoDataFrame, sites: pd.DataFrame) -> GeoDataFrame:
+    """Add each supplemental site's jobs to the block polygon containing it.
+
+    Every site's jobs are added to the containing block's ``tot_empl`` and to
+    the wage column its ``wage_class`` maps to (``unknown`` -> ``unk_wage``).
+    Any of those columns missing from *joined* (e.g. no LODES files were
+    supplied) are created at 0 first.
+
+    Args:
+        joined: The Stage 3 block layer (geometry plus job columns).
+        sites: Validated table from :func:`load_supplemental_jobs`.
+
+    Returns:
+        A copy of *joined* with the patched job totals.
+
+    Raises:
+        ValueError: If any site falls outside every block polygon — a wrong
+            coordinate or a FIPS filter that excludes the site's county should
+            abort the run, not silently drop the jobs.
+    """
+    if sites.empty:
+        return joined
+    joined = joined.copy()
+
+    points = gpd.GeoDataFrame(
+        sites.reset_index(drop=True),
+        geometry=gpd.points_from_xy(sites["lon"], sites["lat"]),
+        crs="EPSG:4326",
+    )
+    if joined.crs is not None:
+        points = points.to_crs(joined.crs)
+
+    hits = gpd.sjoin(points, joined[[joined.geometry.name]], how="left", predicate="within")
+    # A point exactly on a shared boundary matches both blocks; keep the first.
+    hits = hits[~hits.index.duplicated(keep="first")]
+
+    unmatched = hits.loc[hits["index_right"].isna(), "name"].astype(str).tolist()
+    if unmatched:
+        raise ValueError(
+            f"Supplemental job site(s) {unmatched} fall outside every block polygon. "
+            "Check the coordinates, and that FIPS_TO_FILTER includes their county."
+        )
+
+    for col in ("tot_empl", *SUPPLEMENTAL_WAGE_COLS.values()):
+        if col not in joined.columns:
+            joined[col] = 0.0
+        joined[col] = pd.to_numeric(joined[col], errors="coerce").fillna(0.0)
+
+    for row in hits.itertuples(index=False):
+        block_idx = row.index_right
+        jobs = float(row.jobs)
+        wage_col = SUPPLEMENTAL_WAGE_COLS[str(row.wage_class)]
+        joined.loc[block_idx, "tot_empl"] += jobs
+        joined.loc[block_idx, wage_col] += jobs
+        block_label = (
+            str(joined.loc[block_idx, LEFT_KEY]) if LEFT_KEY in joined.columns else str(block_idx)
+        )
+        logging.info(
+            "Supplemental site '%s': +%d job(s) (%s wage) -> block %s.",
+            row.name,
+            int(jobs),
+            row.wage_class,
+            block_label,
+        )
+    return joined
+
+
+# =============================================================================
 # SHARED OUTPUT HELPERS
 # =============================================================================
 
@@ -1488,6 +1639,7 @@ def run(
     fips_to_filter: Sequence[str] | None = None,
     intermediate_combined_csv: str | None = None,
     intermediate_merged_shp: str | None = None,
+    supplemental_jobs_csv: str | Path | None = None,
 ) -> None:
     """Run the full three-stage pipeline.
 
@@ -1509,6 +1661,9 @@ def run(
     )
     intermediate_merged_shp = (
         INTERMEDIATE_MERGED_SHP if intermediate_merged_shp is None else intermediate_merged_shp
+    )
+    supplemental_jobs_csv = (
+        SUPPLEMENTAL_JOBS_CSV if supplemental_jobs_csv is None else supplemental_jobs_csv
     )
 
     # Optional intermediates left at their placeholder mean "don't write them",
@@ -1572,6 +1727,19 @@ def run(
         # -------- Stage 3: attach demographics onto geometry --------
         logging.info("Stage 3/3: attaching demographics onto block geometry")
         joined = attach_demographics_to_blocks(blocks_gdf, tract_attrs, block_jobs)
+
+        # Optional patch: job sites missing from LODES (drop-folder friendly —
+        # a configured path whose file was simply not dropped is skipped).
+        if supplemental_jobs_csv is not None and not _is_blank(str(supplemental_jobs_csv)):
+            supp_path = Path(supplemental_jobs_csv)
+            if supp_path.exists():
+                sites = load_supplemental_jobs(supp_path)
+                joined = apply_supplemental_jobs(joined, sites)
+            else:
+                logging.warning(
+                    "Supplemental jobs CSV '%s' not found; job patch skipped.", supp_path
+                )
+
         write_geo(joined, final_joined_features)
 
         logging.info("Pipeline completed successfully.")
@@ -1624,6 +1792,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Stage 2 merged geometry path (empty string to skip).",
     )
     parser.add_argument(
+        "--supplemental-jobs",
+        default=SUPPLEMENTAL_JOBS_CSV,
+        help=(
+            "Optional CSV of job sites missing from LODES (name, lat, lon, jobs "
+            "[, wage_class, source_note]); skipped with a warning if the file is absent."
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         default=logging.getLevelName(LOG_LEVEL),
         help="DEBUG / INFO / WARNING / ERROR.",
@@ -1647,6 +1823,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         fips_to_filter=args.fips,
         intermediate_combined_csv=args.intermediate_csv,
         intermediate_merged_shp=args.intermediate_shp,
+        supplemental_jobs_csv=args.supplemental_jobs,
     )
 
 

@@ -91,7 +91,8 @@
     {
       "script": "uscensus_tiger_join_gpd.py",
       "cmd": ["{python}", "{script}", "--input-csv-dir", "{input}/census",
-              "--input-shp-dir", "{input}/tiger", "--output", "{output}/census_tiger_join.shp"]
+              "--input-shp-dir", "{input}/tiger", "--output", "{output}/census_tiger_join.shp",
+              "--supplemental-jobs", "{input}/census/supplemental_jobs.csv"]
     }
   ],
   "outputs": [
