@@ -168,14 +168,36 @@ DROP_NONPOSITIVE_DEPENDENT: Final[bool] = True
 # with your agency's express route numbers.
 EXPRESS_ROUTES: Final[tuple[str, ...]] = ("101", "202", "303")  # <<< EDIT ME
 
-# --- Diagnostic overlays (attached to RoutePerformance, NOT regressors) ------
-# Service levers + equity context to explain why a route under/over-performs.
+# --- Diagnostic overlays (attached to RoutePerformance + Correlations, NOT regressors) ------
+# Two roles, neither in the fit: (a) service levers + equity context that explain why a
+# route under/over-performs, and (b) a screening bench of candidate features not (yet)
+# promoted to PREDICTORS. Everything here flows into the Correlations sheet (bivariate
+# corr with the DV) and RoutePerformance without touching the coefficients — and, unlike
+# a predictor, an overlay is never in the dropna subset, so a sparse candidate (e.g.
+# bikeshare) can be assessed here without silently costing modeled routes. A candidate
+# that correlates cleanly here is a promotion candidate for PREDICTORS. Columns absent
+# from the assembled table are silently skipped, so the bench can list more than any one
+# agency's bundles will supply.
 OVERLAY_COLS: Final[tuple[str, ...]] = (
+    # Service levers + demand context (diagnostic).
     "median_headway_min",
     "span_hours",
     "avg_speed_mph",
     "n_competitor_routes",
     "trips_per_day",
+    # Candidate features under evaluation — screen via Correlations before promoting.
+    "jobs_served",  # employment reached at POI job sites      [POI coverage]
+    "sites_served",  # POI destinations reached                 [POI coverage]
+    "schools_served",  # schools reached                          [school coverage]
+    "enrollment_served",  # total enrollment reached (all grades)    [school coverage]
+    "enrollment_1_8_served",  # K-8 enrollment reached                   [school coverage]
+    "cabi_stations_served",  # bikeshare docks reached (first/last mi)  [bikeshare]
+    "cabi_weekday_riders_served",  # bikeshare demand reached                 [bikeshare]
+    "n_stops",  # stop count (access points)               [GTFS]
+    "route_length_mi",  # route length (scale)                     [GTFS]
+    "n_directions",  # 1 = loop, 2 = bidirectional              [GTFS]
+    "pct_day_with_service",  # span coverage completeness               [GTFS]
+    "competitor_trips_at_shared_stops",  # raw competing supply at shared stops [GTFS]
 )
 # Equity percentages derived as count / denominator (both from demographics).
 EQUITY_PCT_SPEC: Final[tuple[tuple[str, str, str], ...]] = (
