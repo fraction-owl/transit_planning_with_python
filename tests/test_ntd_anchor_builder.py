@@ -41,6 +41,7 @@ def _raw_row(
     board: float,
     hours: float,
     rev_miles: float,
+    days: float,
     service_period: str = "Weekday",
 ) -> dict[str, object]:
     """One tidy pre-aggregation row matching load_raw's output schema."""
@@ -50,6 +51,7 @@ def _raw_row(
         mod._BOARD: board,
         mod._HOURS: hours,
         mod._REVMILES: rev_miles,
+        mod._DAYS: days,
         "_period_key": datetime.strptime(period_ym, "%Y-%m").strftime("%b-%Y"),
         "_period_ym": period_ym,
     }
@@ -198,6 +200,24 @@ def test_normalise_service_period(value: str, expected: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# column-name helpers
+# ---------------------------------------------------------------------------
+
+
+def test_avg_col_names_daily_average_column() -> None:
+    assert mod.avg_col("weekday", mod.BOARDINGS_OUT) == "weekday_avg_ntd_boardings"
+    assert mod.avg_col("saturday", mod.HOURS_OUT) == "saturday_avg_revenue_hours"
+
+
+def test_days_col_names_service_day_count() -> None:
+    assert mod.days_col("sunday") == "sunday_service_days"
+
+
+def test_dv_column_is_weekday_boardings_average() -> None:
+    assert mod.DV_COLUMN == "weekday_avg_ntd_boardings"
+
+
+# ---------------------------------------------------------------------------
 # discover_workbooks
 # ---------------------------------------------------------------------------
 
@@ -274,22 +294,31 @@ def test_periods_in_range_open_end_clamps_only_start() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_read_month_workbook_keeps_only_selected_periods(tmp_path: Path) -> None:
+def test_read_month_workbook_keeps_all_three_service_days(tmp_path: Path) -> None:
     path = _write_workbook(tmp_path / "JULY 2024.xlsx", _one_month_rows())
-    out = mod.read_month_workbook("Jul-2024", path, ["Weekday"])
-    assert set(out["_service_period"]) == {"Weekday"}
+    out = mod.read_month_workbook("Jul-2024", path)
+    assert set(out["_service_period"]) == {"Weekday", "Saturday", "Sunday"}
     assert set(out[mod.ROUTE_ID_OUT]) == {"101", "202"}
 
 
-def test_read_month_workbook_revenue_miles_is_per_day_times_days(tmp_path: Path) -> None:
+def test_read_month_workbook_drops_unknown_service_periods(tmp_path: Path) -> None:
+    rows = _one_month_rows()
+    rows["SERVICE_PERIOD"] = ["Weekday", "Holiday", "Sunday", "Weekday", "Saturday", "Sunday"]
+    path = _write_workbook(tmp_path / "JULY 2024.xlsx", rows)
+    out = mod.read_month_workbook("Jul-2024", path)
+    assert "Holiday" not in set(out["_service_period"])
+
+
+def test_read_month_workbook_retains_days_and_monthly_revenue_miles(tmp_path: Path) -> None:
     path = _write_workbook(tmp_path / "JULY 2024.xlsx", _one_month_rows())
-    out = mod.read_month_workbook("Jul-2024", path, ["Weekday"])
-    row_101 = out[out[mod.ROUTE_ID_OUT] == "101"].iloc[0]
-    assert row_101[mod._REVMILES] == pytest.approx(520.0 * 22.0)
+    out = mod.read_month_workbook("Jul-2024", path)
+    wk_101 = out[(out[mod.ROUTE_ID_OUT] == "101") & (out["_service_period"] == "Weekday")].iloc[0]
+    assert wk_101[mod._DAYS] == pytest.approx(22.0)
+    assert wk_101[mod._REVMILES] == pytest.approx(520.0 * 22.0)
 
 
 def test_read_month_workbook_missing_file_returns_empty(tmp_path: Path) -> None:
-    out = mod.read_month_workbook("Jul-2024", tmp_path / "nope.xlsx", ["Weekday"])
+    out = mod.read_month_workbook("Jul-2024", tmp_path / "nope.xlsx")
     assert out.empty
 
 
@@ -297,7 +326,7 @@ def test_read_month_workbook_missing_column_returns_empty(tmp_path: Path) -> Non
     rows = _one_month_rows()
     del rows["REV_MILES"]
     path = _write_workbook(tmp_path / "JULY 2024.xlsx", rows)
-    out = mod.read_month_workbook("Jul-2024", path, ["Weekday"])
+    out = mod.read_month_workbook("Jul-2024", path)
     assert out.empty
 
 
@@ -306,83 +335,75 @@ def test_read_month_workbook_missing_column_returns_empty(tmp_path: Path) -> Non
 # ---------------------------------------------------------------------------
 
 
-def _raw_two_months() -> pd.DataFrame:
+def _raw_three_days_two_months() -> pd.DataFrame:
+    """Route 101 across two months x three service days; route 202 weekday-only."""
     return pd.DataFrame(
         [
-            _raw_row("101", "2024-07", 6278.0, 803.0, 11440.0),
-            _raw_row("101", "2024-08", 6000.0, 800.0, 11000.0),
-            _raw_row("202", "2024-07", 3801.0, 682.0, 9020.0),
+            _raw_row("101", "2024-07", 6278.0, 803.0, 11440.0, 22.0, "Weekday"),
+            _raw_row("101", "2024-07", 575.0, 109.5, 1497.6, 4.0, "Saturday"),
+            _raw_row("101", "2024-07", 556.0, 127.7, 1690.0, 5.0, "Sunday"),
+            _raw_row("101", "2024-08", 6000.0, 800.0, 11000.0, 21.0, "Weekday"),
+            _raw_row("202", "2024-07", 3801.0, 682.0, 9020.0, 22.0, "Weekday"),
         ]
     )
 
 
-def test_build_anchor_panel_one_row_per_route_period() -> None:
-    result = mod.build_anchor(_raw_two_months(), "panel")
-    assert list(result.columns) == [
-        mod.ROUTE_ID_OUT,
-        mod.PERIOD_OUT,
-        mod.BOARDINGS_OUT,
-        mod.HOURS_OUT,
-        mod.REVMILES_OUT,
-    ]
+def test_build_anchor_cross_section_wide_schema() -> None:
+    result = mod.build_anchor(_raw_three_days_two_months(), "cross_section")
+    assert list(result.columns) == mod.output_columns("cross_section")
+    # One row per route.
+    assert list(result[mod.ROUTE_ID_OUT]) == ["101", "202"]
+
+
+def test_build_anchor_panel_wide_schema_one_row_per_route_period() -> None:
+    result = mod.build_anchor(_raw_three_days_two_months(), "panel")
+    assert list(result.columns) == mod.output_columns("panel")
+    # 101 appears for 2024-07 and 2024-08; 202 only for 2024-07.
     assert len(result) == 3
-
-
-def test_build_anchor_panel_sorted_by_route_then_period() -> None:
-    result = mod.build_anchor(_raw_two_months(), "panel")
     assert list(result[mod.PERIOD_OUT]) == ["2024-07", "2024-08", "2024-07"]
-    assert list(result[mod.ROUTE_ID_OUT]) == ["101", "101", "202"]
 
 
-def test_build_anchor_cross_section_pools_periods() -> None:
-    result = mod.build_anchor(_raw_two_months(), "cross_section")
-    assert mod.PERIOD_OUT not in result.columns
-    row_101 = result[result[mod.ROUTE_ID_OUT] == "101"].iloc[0]
-    # 101 pooled across both months: 6278 + 6000 boardings.
-    assert row_101[mod.BOARDINGS_OUT] == pytest.approx(6278.0 + 6000.0)
+def test_build_anchor_weekday_average_is_day_weighted() -> None:
+    """Pooled weekday boardings average = sum(board) / sum(days) across months."""
+    result = mod.build_anchor(_raw_three_days_two_months(), "cross_section")
+    r101 = result[result[mod.ROUTE_ID_OUT] == "101"].iloc[0]
+    expected = (6278.0 + 6000.0) / (22.0 + 21.0)
+    assert r101[mod.avg_col("weekday", mod.BOARDINGS_OUT)] == pytest.approx(round(expected, 2))
 
 
-def test_build_anchor_sums_within_group() -> None:
-    raw = pd.DataFrame(
-        [
-            _raw_row("101", "2024-07", 6278.0, 803.0, 11440.0, "Weekday"),
-            _raw_row("101", "2024-07", 575.0, 109.5, 1497.6, "Saturday"),
-        ]
-    )
-    result = mod.build_anchor(raw, "panel")
-    row = result.iloc[0]
-    assert row[mod.BOARDINGS_OUT] == pytest.approx(6278.0 + 575.0)
-    assert row[mod.HOURS_OUT] == pytest.approx(803.0 + 109.5)
+def test_build_anchor_saturday_average_and_service_days() -> None:
+    result = mod.build_anchor(_raw_three_days_two_months(), "cross_section")
+    r101 = result[result[mod.ROUTE_ID_OUT] == "101"].iloc[0]
+    assert r101[mod.avg_col("saturday", mod.BOARDINGS_OUT)] == pytest.approx(575.0 / 4.0)
+    assert r101[mod.days_col("saturday")] == 4
 
 
-def test_build_anchor_rounds_supply_to_two_decimals() -> None:
-    raw = pd.DataFrame([_raw_row("101", "2024-07", 100.0, 1.005, 2.346)])
-    result = mod.build_anchor(raw, "panel")
-    row = result.iloc[0]
-    assert row[mod.HOURS_OUT] == pytest.approx(1.0)
-    assert row[mod.REVMILES_OUT] == pytest.approx(2.35)
+def test_build_anchor_revenue_miles_average_uses_monthly_totals() -> None:
+    result = mod.build_anchor(_raw_three_days_two_months(), "cross_section")
+    r101 = result[result[mod.ROUTE_ID_OUT] == "101"].iloc[0]
+    expected = (11440.0 + 11000.0) / (22.0 + 21.0)
+    assert r101[mod.avg_col("weekday", mod.REVMILES_OUT)] == pytest.approx(round(expected, 2))
+
+
+def test_build_anchor_no_weekend_service_is_nan_with_zero_days() -> None:
+    """A weekday-only route has NaN weekend averages and zero weekend service_days."""
+    result = mod.build_anchor(_raw_three_days_two_months(), "cross_section")
+    r202 = result[result[mod.ROUTE_ID_OUT] == "202"].iloc[0]
+    assert pd.isna(r202[mod.avg_col("saturday", mod.BOARDINGS_OUT)])
+    assert pd.isna(r202[mod.avg_col("sunday", mod.HOURS_OUT)])
+    assert r202[mod.days_col("saturday")] == 0
+    assert r202[mod.days_col("sunday")] == 0
 
 
 def test_build_anchor_empty_panel_has_schema() -> None:
     result = mod.build_anchor(pd.DataFrame(), "panel")
-    assert list(result.columns) == [
-        mod.ROUTE_ID_OUT,
-        mod.PERIOD_OUT,
-        mod.BOARDINGS_OUT,
-        mod.HOURS_OUT,
-        mod.REVMILES_OUT,
-    ]
+    assert list(result.columns) == mod.output_columns("panel")
     assert result.empty
 
 
 def test_build_anchor_empty_cross_section_has_schema() -> None:
     result = mod.build_anchor(pd.DataFrame(), "cross_section")
-    assert list(result.columns) == [
-        mod.ROUTE_ID_OUT,
-        mod.BOARDINGS_OUT,
-        mod.HOURS_OUT,
-        mod.REVMILES_OUT,
-    ]
+    assert list(result.columns) == mod.output_columns("cross_section")
 
 
 # ---------------------------------------------------------------------------
@@ -390,51 +411,53 @@ def test_build_anchor_empty_cross_section_has_schema() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _anchor_frame(boardings: list[float], hours: list[float] | None = None) -> pd.DataFrame:
-    n = len(boardings)
-    return pd.DataFrame(
-        {
-            mod.ROUTE_ID_OUT: [str(i) for i in range(n)],
-            mod.BOARDINGS_OUT: boardings,
-            mod.HOURS_OUT: hours if hours is not None else [100.0] * n,
-            mod.REVMILES_OUT: [500.0] * n,
-        }
-    )
+def _wide_anchor(
+    weekday_boardings: list[float], weekday_hours: list[float] | None = None
+) -> pd.DataFrame:
+    """A minimal wide cross-section anchor frame with the full column set."""
+    n = len(weekday_boardings)
+    data: dict[str, list[object]] = {mod.ROUTE_ID_OUT: [str(i) for i in range(n)]}
+    for day, _ in mod.SERVICE_DAYS:
+        board = weekday_boardings if day == "weekday" else [100.0] * n
+        hours = (
+            (weekday_hours if weekday_hours is not None else [50.0] * n)
+            if day == "weekday"
+            else [50.0] * n
+        )
+        data[mod.avg_col(day, mod.BOARDINGS_OUT)] = board
+        data[mod.avg_col(day, mod.HOURS_OUT)] = hours
+        data[mod.avg_col(day, mod.REVMILES_OUT)] = [500.0] * n
+        data[mod.days_col(day)] = [22] * n
+    return pd.DataFrame(data)
 
 
-def test_clean_anchor_drops_nonpositive_when_flag_true() -> None:
-    anchor = _anchor_frame([100.0, 0.0, -5.0, 200.0])
+def test_clean_anchor_drops_nonpositive_weekday_dv_when_flag_true() -> None:
+    anchor = _wide_anchor([100.0, 0.0, -5.0, 200.0])
     with patch.object(mod, "DROP_NONPOSITIVE_BOARDINGS", True):
         result = mod.clean_anchor(anchor)
-    assert list(result[mod.BOARDINGS_OUT]) == [100.0, 200.0]
+    assert list(result[mod.DV_COLUMN]) == [100.0, 200.0]
 
 
 def test_clean_anchor_keeps_nonpositive_when_flag_false() -> None:
-    anchor = _anchor_frame([100.0, 0.0, 200.0])
+    anchor = _wide_anchor([100.0, 0.0, 200.0])
     with patch.object(mod, "DROP_NONPOSITIVE_BOARDINGS", False):
         result = mod.clean_anchor(anchor)
     assert len(result) == 3
 
 
-def test_clean_anchor_warns_on_nan_supply(caplog: pytest.LogCaptureFixture) -> None:
-    anchor = _anchor_frame([100.0], hours=[float("nan")])
+def test_clean_anchor_warns_on_nan_weekday_supply(caplog: pytest.LogCaptureFixture) -> None:
+    anchor = _wide_anchor([100.0], weekday_hours=[float("nan")])
     with caplog.at_level(logging.WARNING):
         mod.clean_anchor(anchor)
-    assert "NaN" in caplog.text
+    assert "NaN weekday" in caplog.text
 
 
 # ---------------------------------------------------------------------------
-# day_type_filename / "each" service-day mode
+# main (end-to-end)
 # ---------------------------------------------------------------------------
 
 
-def test_day_type_filename_suffixes_stem() -> None:
-    assert mod.day_type_filename("ntd_anchor.csv", "weekday") == "ntd_anchor_weekday.csv"
-    assert mod.day_type_filename("anchor.v2.csv", "sunday") == "anchor.v2_sunday.csv"
-
-
-def test_main_each_writes_one_anchor_per_service_day(tmp_path: Path) -> None:
-    """'each' builds all three single-day anchors from one workbook pass."""
+def test_main_writes_wide_anchor_with_all_service_days(tmp_path: Path) -> None:
     data_root = tmp_path / "data"
     out_dir = tmp_path / "out"
     data_root.mkdir()
@@ -448,58 +471,43 @@ def test_main_each_writes_one_anchor_per_service_day(tmp_path: Path) -> None:
             str(out_dir),
             "--grain",
             "cross_section",
-            "--service-day",
-            "each",
-        ]
-    )
-
-    frames: dict[str, pd.DataFrame] = {}
-    for day in ("weekday", "saturday", "sunday"):
-        path = out_dir / f"ntd_anchor_{day}.csv"
-        assert path.exists(), f"missing {path.name}"
-        df = pd.read_csv(path)
-        assert set(df[mod.SERVICE_DAY_OUT]) == {day}
-        frames[day] = df.assign(**{mod.ROUTE_ID_OUT: df[mod.ROUTE_ID_OUT].astype(str)})
-
-    # Each anchor carries only that day's measures: route 101's weekday boardings/
-    # hours stay separate from its Saturday figures, keeping DV and supply on the
-    # same day-type basis.
-    wk_101 = frames["weekday"].set_index(mod.ROUTE_ID_OUT).loc["101"]
-    sat_101 = frames["saturday"].set_index(mod.ROUTE_ID_OUT).loc["101"]
-    assert wk_101[mod.BOARDINGS_OUT] == pytest.approx(6278.0)
-    assert wk_101[mod.HOURS_OUT] == pytest.approx(803.0)
-    assert sat_101[mod.BOARDINGS_OUT] == pytest.approx(575.0)
-    assert sat_101[mod.HOURS_OUT] == pytest.approx(109.5)
-
-    assert (out_dir / "ntd_anchor_builder_runlog.txt").exists()
-
-
-def test_main_single_day_keeps_plain_filename(tmp_path: Path) -> None:
-    """A single-day run still writes OUTPUT_FILENAME unchanged, stamped with the day."""
-    data_root = tmp_path / "data"
-    out_dir = tmp_path / "out"
-    data_root.mkdir()
-    _write_workbook(data_root / "JULY 2024 NTD.xlsx", _one_month_rows())
-
-    mod.main(
-        [
-            "--data-root",
-            str(data_root),
-            "--output-dir",
-            str(out_dir),
-            "--grain",
-            "cross_section",
-            "--service-day",
-            "saturday",
         ]
     )
 
     path = out_dir / "ntd_anchor.csv"
     assert path.exists()
     df = pd.read_csv(path)
-    assert set(df[mod.SERVICE_DAY_OUT]) == {"saturday"}
-    row_101 = df[df[mod.ROUTE_ID_OUT].astype(str) == "101"].iloc[0]
-    assert row_101[mod.BOARDINGS_OUT] == pytest.approx(575.0)
+    assert list(df.columns) == mod.output_columns("cross_section")
+
+    r101 = df[df[mod.ROUTE_ID_OUT].astype(str) == "101"].iloc[0]
+    # Weekday boardings average = 6278 / 22 (single month).
+    assert r101[mod.DV_COLUMN] == pytest.approx(round(6278.0 / 22.0, 2))
+    # Saturday average kept separate on its own day basis.
+    assert r101[mod.avg_col("saturday", mod.BOARDINGS_OUT)] == pytest.approx(round(575.0 / 4.0, 2))
+    assert r101[mod.days_col("weekday")] == 22
+
+    assert (out_dir / "ntd_anchor_builder_runlog.txt").exists()
+
+
+def test_main_aborts_when_no_workbooks_in_range(tmp_path: Path) -> None:
+    """Empty discovery exits nonzero and writes no anchor (the #96 fail-loud guard)."""
+    data_root = tmp_path / "empty"
+    out_dir = tmp_path / "out"
+    data_root.mkdir()
+
+    with pytest.raises(SystemExit) as exc:
+        mod.main(
+            [
+                "--data-root",
+                str(data_root),
+                "--output-dir",
+                str(out_dir),
+                "--grain",
+                "cross_section",
+            ]
+        )
+    assert exc.value.code == 1
+    assert not (out_dir / "ntd_anchor.csv").exists()
 
 
 # ---------------------------------------------------------------------------
