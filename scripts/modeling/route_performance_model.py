@@ -14,6 +14,14 @@ controlled, so the residual is a productivity-adjusted over/under read rather th
 deliberately NOT regressors: they ride alongside the residual as diagnostic overlays
 so an underperformer can be read as thin-service vs car-oriented-market vs cannibalized.
 
+Express routes ride a different demand curve (peak-only, long-haul, park-and-ride) and
+tend to dominate both residual tails, distorting the local-network fit. The
+ANALYZE_EXPRESS_SEPARATELY knob decides their fate: when True (the default) they are
+pulled OUT of the main model — which is then fit on the local network only — and, when
+enough express routes are flagged to fit, a parallel express-only model is fit and
+written to its own ``*_express`` outputs; when False they stay pooled in one model with
+is_express as a 0/1 regressor (the original behavior).
+
 This is the secured-box fit (PART B): the NTD anchor (the dependent variable plus the
 service-supplied predictors revenue_hours / revenue_miles) is read here and never
 leaves; the non-NTD feature tables (GTFS competition + demographics) are prepped on the
@@ -28,10 +36,10 @@ Inputs:
                    is joined only if every one of its join keys is present in the anchor,
                    so a cross-sectional (route_id) anchor auto-skips a period bundle.
 
-Outputs:
-    route_performance_results.xlsx
-        ModelSummary | Coefficients | RoutePerformance | Correlations
-    diagnostic plots + a run-log sidecar.
+Outputs (one parallel set per fitted model — see the express knob above):
+    route_performance_results[_express].xlsx
+        ModelSummary | Coefficients | RoutePerformance | Correlations | CollinearityMatrix
+    diagnostic plots + a run-log sidecar, each tagged to match its workbook.
 
 ArcGIS Pro Python stack only (numpy / scipy / pandas / matplotlib); no statsmodels,
 scikit-learn, or pyarrow. Runs in a notebook via %run or as a script.
@@ -125,10 +133,22 @@ LOG_PREDICTORS: Final[tuple[str, ...]] = (
 )
 LOG_DEPENDENT: Final[bool] = True
 
-# --- Service-type flag -------------------------------------------------------
+# --- Service-type flag / express handling ------------------------------------
 # Routes flagged is_express = 1; everything else 0. Replace these placeholders
 # with your agency's express route numbers.
 EXPRESS_ROUTES: Final[tuple[str, ...]] = ("101", "202", "303")  # <<< EDIT ME
+
+# How express routes are modeled. Express service rides a different demand curve
+# (peak-only, long-haul, park-and-ride) and tends to dominate both residual tails,
+# so pooling it with the local network can distort the local fit.
+#   True  (default) -> pull express routes OUT of the main model (fit on the local
+#                      network only) and, when enough express routes are flagged to
+#                      fit, run a parallel express-only model with its own *_express
+#                      workbook / plots / run log. is_express is dropped as a
+#                      regressor here (it is constant within each segment).
+#   False           -> leave express routes IN one pooled model with is_express as a
+#                      0/1 regressor (the original behavior).
+ANALYZE_EXPRESS_SEPARATELY: Final[bool] = True
 
 # --- Diagnostic overlays (attached to RoutePerformance, NOT regressors) ------
 # Service levers + equity context to explain why a route under/over-performs.
@@ -154,8 +174,10 @@ SE_TYPE: Final[str] = "HC1"  # "classical" or "HC1"
 VIF_THRESHOLD: Final[float] = 10.0
 # Std-residual magnitude beyond which a route is flagged strongly over/under.
 PERF_FLAG_SD: Final[float] = 1.0
-# Add an is_express 0/1 column to the RoutePerformance sheet (express routes
-# dominate both residual tails, so it's handy for filtering/sorting them out).
+# Add an is_express 0/1 column to the RoutePerformance sheet (handy for filtering
+# express routes out when they are pooled in). Only bites in the pooled model
+# (ANALYZE_EXPRESS_SEPARATELY = False); when express routes are analyzed separately
+# each workbook already holds a single service type, so the column is omitted.
 SHOW_EXPRESS_COLUMN: Final[bool] = True
 
 MAKE_PLOTS: Final[bool] = True
@@ -439,23 +461,40 @@ def derive_features(df: pd.DataFrame) -> pd.DataFrame:
 # =============================================================================
 
 
+def effective_predictors() -> tuple[str, ...]:
+    """Regressor set actually fed to the OLS, given the express-handling mode.
+
+    When express routes are analyzed separately the is_express flag is constant
+    within each fitted segment (all-0 for the local model, all-1 for the express
+    model), so it is dropped — a constant column is collinear with the intercept and
+    would make the design matrix singular. It only earns its keep as a regressor in
+    the pooled model, where both service types share one fit.
+    """
+    if ANALYZE_EXPRESS_SEPARATELY:
+        return tuple(p for p in PREDICTORS if p != "is_express")
+    return PREDICTORS
+
+
 def build_design_matrix(
     df: pd.DataFrame,
+    predictors: tuple[str, ...] = PREDICTORS,
 ) -> tuple[np.ndarray, np.ndarray, list[str], pd.DataFrame, np.ndarray]:
     """Construct the response vector and design matrix; drop incomplete rows.
 
-    Returns (y, X, term_names, model_frame, keep_mask). ``model_frame`` is the
-    cleaned, kept-row frame (untransformed) so per-route outputs and overlays can
-    be aligned back to it.
+    ``predictors`` is the regressor set for this fit; the express-handling mode may
+    trim it (e.g. dropping the constant is_express flag in separate mode). Returns
+    (y, X, term_names, model_frame, keep_mask). ``model_frame`` is the cleaned,
+    kept-row frame (untransformed) so per-route outputs and overlays can be aligned
+    back to it.
     """
-    missing = [c for c in PREDICTORS if c not in df.columns]
+    missing = [c for c in predictors if c not in df.columns]
     if missing:
         raise KeyError(
             f"Configured predictors not in the assembled table: {missing}. "
             f"Available columns: {sorted(df.columns)}"
         )
 
-    used = [DEPENDENT_VAR, *PREDICTORS]
+    used = [DEPENDENT_VAR, *predictors]
     frame = df[
         [
             ROUTE_KEY,
@@ -484,7 +523,7 @@ def build_design_matrix(
         y = np.log(y)
 
     columns: dict[str, np.ndarray] = {}
-    for col in PREDICTORS:
+    for col in predictors:
         values = frame[col].to_numpy(dtype=float)
         name = col
         if col in LOG_PREDICTORS:
@@ -651,7 +690,9 @@ def build_coefficient_frame(result: OLSResult) -> pd.DataFrame:
     )
 
 
-def build_route_performance(result: OLSResult, model_frame: pd.DataFrame) -> pd.DataFrame:
+def build_route_performance(
+    result: OLSResult, model_frame: pd.DataFrame, predictors: tuple[str, ...] = PREDICTORS
+) -> pd.DataFrame:
     """Per-route potential (fitted), over/under (residual), and diagnostic overlays."""
     out = pd.DataFrame({ROUTE_KEY: model_frame[ROUTE_KEY].to_numpy()})
     out[DEPENDENT_VAR] = model_frame[DEPENDENT_VAR].to_numpy()
@@ -679,7 +720,7 @@ def build_route_performance(result: OLSResult, model_frame: pd.DataFrame) -> pd.
 
     # Model fundamentals: the raw regressor values, so each route's drivers sit next
     # to its residual. Shown untransformed even where the fit logs them.
-    fundamentals = [c for c in PREDICTORS if c != "is_express" and c in model_frame.columns]
+    fundamentals = [c for c in predictors if c != "is_express" and c in model_frame.columns]
     for col in fundamentals:
         out[col] = pd.to_numeric(model_frame[col], errors="coerce").to_numpy()
 
@@ -693,12 +734,21 @@ def build_route_performance(result: OLSResult, model_frame: pd.DataFrame) -> pd.
     return out.sort_values("std_residual").reset_index(drop=True)
 
 
-def export_results(result: OLSResult, model_frame: pd.DataFrame) -> Path:
-    """Write the five-sheet results workbook and return its path."""
-    workbook = OUTPUT_DIR / "route_performance_results.xlsx"
+def export_results(
+    result: OLSResult,
+    model_frame: pd.DataFrame,
+    predictors: tuple[str, ...] = PREDICTORS,
+    suffix: str = "",
+) -> Path:
+    """Write the five-sheet results workbook and return its path.
+
+    ``suffix`` tags the filename so parallel segments (e.g. the express-only model)
+    write alongside the main one without clobbering it.
+    """
+    workbook = OUTPUT_DIR / f"route_performance_results{suffix}.xlsx"
     summary = build_summary_frame(result)
     coef = build_coefficient_frame(result)
-    performance = build_route_performance(result, model_frame)
+    performance = build_route_performance(result, model_frame, predictors)
     numeric = model_frame.select_dtypes(include="number")
 
     # (1) Bivariate correlation of every numeric variable (regressors + overlays +
@@ -713,10 +763,10 @@ def export_results(result: OLSResult, model_frame: pd.DataFrame) -> Path:
     else:
         corr_with_target = pd.DataFrame(columns=["variable", f"corr_with_{DEPENDENT_VAR}"])
 
-    # (2) Full correlation matrix restricted to the MODELED variables (DV + the nine
+    # (2) Full correlation matrix restricted to the MODELED variables (DV + the
     # regressors) — a focused collinearity companion to the VIF column. Raw, untransformed
     # variables; VIF in Coefficients reflects the logged design matrix.
-    modeled = [c for c in [DEPENDENT_VAR, *PREDICTORS] if c in numeric.columns]
+    modeled = [c for c in [DEPENDENT_VAR, *predictors] if c in numeric.columns]
     collinearity = numeric[modeled].corr().reset_index().rename(columns={"index": "variable"})
 
     with pd.ExcelWriter(workbook) as writer:
@@ -730,16 +780,21 @@ def export_results(result: OLSResult, model_frame: pd.DataFrame) -> Path:
     return workbook
 
 
-def make_diagnostic_plots(result: OLSResult) -> None:
-    """Write the residuals-vs-fitted, normal Q-Q, and predicted-vs-actual plots."""
+def make_diagnostic_plots(result: OLSResult, suffix: str = "", label: str = "") -> None:
+    """Write the residuals-vs-fitted, normal Q-Q, and predicted-vs-actual plots.
+
+    ``suffix`` tags the filenames and ``label`` (when given) is appended to each
+    plot title, so a parallel segment's plots sit beside the main ones.
+    """
     figsize, dpi = (8, 6), 120
+    tag = f" — {label}" if label else ""
 
     fig, ax = plt.subplots(figsize=figsize)
     ax.scatter(result.fitted, result.residuals, s=18, alpha=0.7)
     ax.axhline(0.0, color="red", linewidth=1)
-    ax.set(xlabel="Fitted (log boardings)", ylabel="Residual", title="Residuals vs. Fitted")
+    ax.set(xlabel="Fitted (log boardings)", ylabel="Residual", title=f"Residuals vs. Fitted{tag}")
     fig.tight_layout()
-    fig.savefig(OUTPUT_DIR / "diag_residuals_vs_fitted.png", dpi=dpi)
+    fig.savefig(OUTPUT_DIR / f"diag_residuals_vs_fitted{suffix}.png", dpi=dpi)
     plt.close(fig)
 
     resid_sd = result.residuals.std(ddof=0)
@@ -749,9 +804,9 @@ def make_diagnostic_plots(result: OLSResult) -> None:
     ax.scatter(osm, osr, s=18, alpha=0.7)
     lims = [min(osm.min(), osr.min()), max(osm.max(), osr.max())]
     ax.plot(lims, lims, color="red", linewidth=1)
-    ax.set(xlabel="Theoretical quantiles", ylabel="Std residuals", title="Normal Q-Q")
+    ax.set(xlabel="Theoretical quantiles", ylabel="Std residuals", title=f"Normal Q-Q{tag}")
     fig.tight_layout()
-    fig.savefig(OUTPUT_DIR / "diag_qq.png", dpi=dpi)
+    fig.savefig(OUTPUT_DIR / f"diag_qq{suffix}.png", dpi=dpi)
     plt.close(fig)
 
     actual = result.fitted + result.residuals
@@ -759,12 +814,12 @@ def make_diagnostic_plots(result: OLSResult) -> None:
     ax.scatter(actual, result.fitted, s=18, alpha=0.7)
     lims = [min(actual.min(), result.fitted.min()), max(actual.max(), result.fitted.max())]
     ax.plot(lims, lims, color="red", linewidth=1)
-    ax.set(xlabel="Actual (log)", ylabel="Predicted (log)", title="Predicted vs. Actual")
+    ax.set(xlabel="Actual (log)", ylabel="Predicted (log)", title=f"Predicted vs. Actual{tag}")
     fig.tight_layout()
-    fig.savefig(OUTPUT_DIR / "diag_predicted_vs_actual.png", dpi=dpi)
+    fig.savefig(OUTPUT_DIR / f"diag_predicted_vs_actual{suffix}.png", dpi=dpi)
     plt.close(fig)
 
-    logging.info("Diagnostic plots written to '%s'.", OUTPUT_DIR)
+    logging.info("Diagnostic plots%s written to '%s'.", f" ({label})" if label else "", OUTPUT_DIR)
 
 
 def _extract_config_block() -> str:
@@ -787,17 +842,26 @@ def _extract_config_block() -> str:
     return "\n".join(lines[begin + 1 : end])
 
 
-def write_run_log(result: OLSResult, provenance: list[tuple[str, str]]) -> None:
-    """Write the run-log sidecar (timestamp, fit headline, bundle provenance, config)."""
-    log_path = OUTPUT_DIR / "route_performance_model_runlog.txt"
+def write_run_log(
+    result: OLSResult, provenance: list[tuple[str, str]], suffix: str = "", label: str = ""
+) -> None:
+    """Write the run-log sidecar (timestamp, fit headline, bundle provenance, config).
+
+    ``suffix`` tags the filename and ``label`` names the segment, so each parallel
+    model gets its own sidecar next to its workbook and plots.
+    """
+    log_path = OUTPUT_DIR / f"route_performance_model_runlog{suffix}.txt"
     bundle_lines = (
         [f"  {name}  sha256={sha}" for name, sha in provenance] if provenance else ["  (none)"]
     )
+    express_mode = "separate (express pulled out)" if ANALYZE_EXPRESS_SEPARATELY else "pooled"
     lines = [
         "=" * 72,
         "CROSS-SECTIONAL ROUTE RIDERSHIP MODEL RUN LOG (ENGINE 1, secured box)",
         "=" * 72,
         f"Run timestamp:    {dt.datetime.now().isoformat(timespec='seconds')}",
+        *([f"Segment:          {label}"] if label else []),
+        f"Express handling: {express_mode}",
         f"Anchor:           {ANCHOR_PATH}",
         f"Bundle dir:       {BUNDLE_DIR}",
         f"Manifest:         {MANIFEST_PATH}",
@@ -820,9 +884,9 @@ def write_run_log(result: OLSResult, provenance: list[tuple[str, str]]) -> None:
     logging.info("Run log written to '%s'.", log_path)
 
 
-def log_report(result: OLSResult) -> None:
+def log_report(result: OLSResult, label: str = "") -> None:
     """Log the fit headline and per-term coefficient significance to the logger."""
-    logging.info("=== MODEL FIT ===")
+    logging.info("=== MODEL FIT%s ===", f" ({label})" if label else "")
     logging.info("Routes: %d | Params: %d | SE: %s", result.n_obs, result.n_params, result.se_type)
     logging.info(
         "R2=%.4f | adjR2=%.4f | LOO-R2=%.4f | DW=%.3f | cond=%.1f",
@@ -845,8 +909,36 @@ def log_report(result: OLSResult) -> None:
 # =============================================================================
 
 
+def run_segment(
+    table: pd.DataFrame,
+    predictors: tuple[str, ...],
+    provenance: list[tuple[str, str]],
+    *,
+    suffix: str = "",
+    label: str = "",
+) -> OLSResult:
+    """Fit one segment (all routes, local-only, or express-only) and write its outputs.
+
+    The workbook, plots, and run log are each tagged with ``suffix`` so a parallel
+    segment writes alongside the main one without clobbering it.
+    """
+    y, x_matrix, term_names, model_frame, _ = build_design_matrix(table, predictors)
+    result = fit_ols(y, x_matrix, term_names, SE_TYPE)
+    log_report(result, label=label)
+    export_results(result, model_frame, predictors, suffix=suffix)
+    if MAKE_PLOTS:
+        make_diagnostic_plots(result, suffix=suffix, label=label)
+    write_run_log(result, provenance, suffix=suffix, label=label)
+    return result
+
+
 def run() -> Optional[OLSResult]:
-    """Assemble the route table, fit the cross-sectional model, and export results."""
+    """Assemble the route table, fit the cross-sectional model(s), and export results.
+
+    Returns the main (pooled or local-network) model's result; when express routes
+    are analyzed separately the parallel express-only model is written to its own
+    ``*_express`` outputs but not returned.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -865,17 +957,63 @@ def run() -> Optional[OLSResult]:
     if DEPENDENT_VAR not in table.columns:
         raise KeyError(f"Dependent variable '{DEPENDENT_VAR}' not in the assembled table.")
 
-    y, x_matrix, term_names, model_frame, _ = build_design_matrix(table)
-    result = fit_ols(y, x_matrix, term_names, SE_TYPE)
-    log_report(result)
+    predictors = effective_predictors()
 
-    export_results(result, model_frame)
-    if MAKE_PLOTS:
-        make_diagnostic_plots(result)
-    write_run_log(result, provenance)
+    if not ANALYZE_EXPRESS_SEPARATELY:
+        # Pooled: one model over all routes, is_express carried as a 0/1 regressor.
+        result = run_segment(table, predictors, provenance)
+        logging.info("Done.")
+        return result
+
+    # Separate: pull express routes OUT of the main model (fit on the local network
+    # only) and, when there are enough express routes to fit, run a parallel
+    # express-only model with its own *_express outputs.
+    if "is_express" in table.columns:
+        is_exp = pd.to_numeric(table["is_express"], errors="coerce").fillna(0) > 0
+    else:
+        is_exp = pd.Series(False, index=table.index)
+    local_table = table[~is_exp].reset_index(drop=True)
+    express_table = table[is_exp].reset_index(drop=True)
+    logging.info(
+        "Express handling = separate: %d local route(s), %d express route(s).",
+        len(local_table),
+        len(express_table),
+    )
+
+    main_result = run_segment(
+        local_table,
+        predictors,
+        provenance,
+        label="main / local (express pulled out)",
+    )
+
+    n_express = len(express_table)
+    min_needed = len(predictors) + 2  # intercept + regressors + >=1 residual dof
+    if n_express == 0:
+        logging.info("No express routes flagged; skipping the parallel express model.")
+    elif n_express < min_needed:
+        logging.warning(
+            "Only %d express route(s) flagged (need >= %d to fit); skipping the parallel "
+            "express model. They remain excluded from the main model.",
+            n_express,
+            min_needed,
+        )
+    else:
+        try:
+            run_segment(
+                express_table,
+                predictors,
+                provenance,
+                suffix="_express",
+                label="express only",
+            )
+        except (ValueError, KeyError, np.linalg.LinAlgError) as exc:
+            # The express segment is a nice-to-have; a degenerate express sub-sample
+            # (e.g. a predictor constant among express routes) must not sink the run.
+            logging.warning("Express-only model could not be fit (%s); skipping it.", exc)
 
     logging.info("Done.")
-    return result
+    return main_result
 
 
 if __name__ == "__main__":
