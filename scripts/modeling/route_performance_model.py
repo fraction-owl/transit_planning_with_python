@@ -139,11 +139,15 @@ PREDICTORS: Final[tuple[str, ...]] = (
     "Metrorail_Stations",  # Metro connections (count)             [demographics]
     "shared_stop_share",  # network redundancy                    [GTFS]
     "competition_intensity",  # cannibalization at shared stops       [GTFS]
+    "transfer_route_count",  # network connectivity / feeder pull     [GTFS]
+    "stops_per_mile",  # stop access density (local vs limited) [GTFS]
     "is_express",  # service-type flag (derived below)
 )
 
 # Predictors to log1p (zeros handled). Counts/quantities are right-skewed; shares,
-# the Metro count, and the binary flag are left linear.
+# rates (stops_per_mile), the small Metro/transfer counts, and the binary flag are
+# left linear (transfer_route_count is a low-count integer, so its raw scale reads
+# as "each extra connection", not a log-elasticity).
 LOG_PREDICTORS: Final[tuple[str, ...]] = (
     "weekday_avg_revenue_hours",
     "total_pop",
@@ -906,7 +910,7 @@ def export_results(
     else:
         corr_with_target = pd.DataFrame(columns=["variable", f"corr_with_{DEPENDENT_VAR}"])
 
-    # (2) Full correlation matrix restricted to the MODELED variables (DV + the nine
+    # (2) Full correlation matrix restricted to the MODELED variables (DV + the
     # regressors) — a focused collinearity companion to the VIF column. Raw, untransformed
     # variables; VIF in Coefficients reflects the logged design matrix.
     modeled = [c for c in [DEPENDENT_VAR, *PREDICTORS] if c in numeric.columns]
