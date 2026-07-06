@@ -75,7 +75,8 @@
       "cmd": ["{python}", "{script}",
               "--input-csv-dir", "{input}/census_input/tables",
               "--input-shp-dir", "{input}/census_input/shps",
-              "--output", "{output}/census_tiger_join.shp"]
+              "--output", "{output}/census_tiger_join.shp",
+              "--supplemental-jobs", "{input}/census_input/supplemental_jobs.csv"]
     },
     {
       "script": "gtfs_service_demographics_gpd.py",

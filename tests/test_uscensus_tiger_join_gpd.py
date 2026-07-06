@@ -12,7 +12,7 @@ from typing import Any
 import geopandas as gpd
 import pandas as pd
 import pytest
-from shapely.geometry import Point
+from shapely.geometry import Point, box
 
 from scripts.national_data_tools import uscensus_tiger_join_gpd as mod
 
@@ -936,6 +936,138 @@ def test_attach_demographics_joins_block_jobs_and_fills_unmatched() -> None:
     result = mod.attach_demographics_to_blocks(blocks, pd.DataFrame(), jobs).set_index("GEOID20")
     assert result.loc["110010001001001", "tot_empl"] == 9.0
     assert result.loc["110010001001002", "tot_empl"] == 0.0  # unmatched block -> 0
+
+
+# =============================================================================
+# load_supplemental_jobs / apply_supplemental_jobs
+# =============================================================================
+
+
+def _square_blocks() -> gpd.GeoDataFrame:
+    """Two unit-square blocks side by side: A spans x 0-1, B spans x 1-2."""
+    return gpd.GeoDataFrame(
+        {
+            "GEOID20": ["110010001001001", "110010001001002"],
+            "tot_empl": [10.0, 20.0],
+            "low_wage": [4.0, 8.0],
+            "mid_wage": [3.0, 6.0],
+            "high_wage": [3.0, 6.0],
+            "geometry": [box(0, 0, 1, 1), box(1, 0, 2, 1)],
+        },
+        crs="EPSG:4326",
+    )
+
+
+def test_load_supplemental_jobs_reads_repo_fixture() -> None:
+    sites = mod.load_supplemental_jobs(FIXTURE_DIR / "supplemental_jobs.csv")
+    assert len(sites) == 2
+    assert sites["wage_class"].tolist() == ["unknown", "unknown"]
+    assert sites["jobs"].tolist() == [26000, 15000]
+    # Both sites are in the repo's default study area (VA side of the DC region).
+    assert sites["lat"].between(38.8, 39.0).all()
+    assert sites["lon"].between(-77.2, -77.0).all()
+
+
+def test_load_supplemental_jobs_missing_column_raises(tmp_path: Path) -> None:
+    path = tmp_path / "supp.csv"
+    path.write_text("name,lat,lon\nsite_a,38.9,-77.0\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="missing column"):
+        mod.load_supplemental_jobs(path)
+
+
+def test_load_supplemental_jobs_nonpositive_jobs_raises(tmp_path: Path) -> None:
+    path = tmp_path / "supp.csv"
+    path.write_text("name,lat,lon,jobs\nsite_a,38.9,-77.0,0\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="non-positive"):
+        mod.load_supplemental_jobs(path)
+
+
+def test_load_supplemental_jobs_bad_wage_class_raises(tmp_path: Path) -> None:
+    path = tmp_path / "supp.csv"
+    path.write_text("name,lat,lon,jobs,wage_class\nsite_a,38.9,-77.0,5,exec\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="wage_class"):
+        mod.load_supplemental_jobs(path)
+
+
+def test_load_supplemental_jobs_defaults_wage_class_to_unknown(tmp_path: Path) -> None:
+    path = tmp_path / "supp.csv"
+    path.write_text("name,lat,lon,jobs\nsite_a,38.9,-77.0,5\n", encoding="utf-8")
+    sites = mod.load_supplemental_jobs(path)
+    assert sites["wage_class"].tolist() == ["unknown"]
+
+
+def test_apply_supplemental_jobs_adds_to_containing_block() -> None:
+    blocks = _square_blocks()
+    sites = pd.DataFrame(
+        {
+            "name": ["site_a"],
+            "lat": [0.5],
+            "lon": [0.5],
+            "jobs": [100.0],
+            "wage_class": ["unknown"],
+        }
+    )
+    result = mod.apply_supplemental_jobs(blocks, sites).set_index("GEOID20")
+    # Jobs land in block A only, in tot_empl + the new unk_wage column; the
+    # LODES-sourced wage bands are untouched.
+    assert result.loc["110010001001001", "tot_empl"] == 110.0
+    assert result.loc["110010001001001", "unk_wage"] == 100.0
+    assert result.loc["110010001001001", "low_wage"] == 4.0
+    assert result.loc["110010001001002", "tot_empl"] == 20.0
+    assert result.loc["110010001001002", "unk_wage"] == 0.0
+    # The input frame is not mutated.
+    assert blocks["tot_empl"].tolist() == [10.0, 20.0]
+
+
+def test_apply_supplemental_jobs_wage_class_routes_to_matching_band() -> None:
+    blocks = _square_blocks()
+    sites = pd.DataFrame(
+        {
+            "name": ["site_a"],
+            "lat": [0.5],
+            "lon": [1.5],
+            "jobs": [50.0],
+            "wage_class": ["high"],
+        }
+    )
+    result = mod.apply_supplemental_jobs(blocks, sites).set_index("GEOID20")
+    assert result.loc["110010001001002", "tot_empl"] == 70.0
+    assert result.loc["110010001001002", "high_wage"] == 56.0
+    assert result.loc["110010001001002", "unk_wage"] == 0.0
+
+
+def test_apply_supplemental_jobs_creates_missing_job_columns() -> None:
+    blocks = gpd.GeoDataFrame(
+        {"GEOID20": ["110010001001001"], "geometry": [box(0, 0, 1, 1)]},
+        crs="EPSG:4326",
+    )
+    sites = pd.DataFrame(
+        {
+            "name": ["site_a"],
+            "lat": [0.5],
+            "lon": [0.5],
+            "jobs": [7.0],
+            "wage_class": ["unknown"],
+        }
+    )
+    result = mod.apply_supplemental_jobs(blocks, sites)
+    assert result["tot_empl"].tolist() == [7.0]
+    assert result["unk_wage"].tolist() == [7.0]
+
+
+def test_apply_supplemental_jobs_outside_all_blocks_raises() -> None:
+    blocks = _square_blocks()
+    sites = pd.DataFrame(
+        {
+            "name": ["site_offgrid"],
+            "lat": [5.0],
+            "lon": [5.0],
+            "jobs": [10.0],
+            "wage_class": ["unknown"],
+        }
+    )
+    with pytest.raises(ValueError, match="site_offgrid"):
+        mod.apply_supplemental_jobs(blocks, sites)
 
 
 # =============================================================================
