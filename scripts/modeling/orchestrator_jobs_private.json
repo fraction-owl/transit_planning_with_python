@@ -21,7 +21,7 @@
     {
       "script": "ntd_anchor_builder.py",
       "cmd": ["{python}", "{script}",
-              "--data-root", "{input}/ntd",
+              "--data-root", "{input}",
               "--output-dir", "{output}",
               "--grain", "cross_section",
               "--service-day", "weekday"],
