@@ -307,3 +307,22 @@ def test_extract_zips_unpacks_into_input_root(tmp_path: Path) -> None:
 
     assert (sub / "feed" / "stops.txt").exists()
     assert (sub / "feed") in written
+
+
+def test_run_log_records_registry_scripts_not_found(tmp_path: Path) -> None:
+    """A registry script missing from the scripts dir must be visible in the run log."""
+    run = pf.ScriptRun(
+        script="present.py",
+        cmd=["python", "present.py"],
+        exit_code=0,
+        duration_s=1.0,
+        log_path="present.log",
+        timed_out=False,
+        output_files=["out.csv"],
+    )
+    ok = pf.write_run_log(tmp_path, [], [run], missing_scripts=["gtfs_route_features.py"])
+    assert ok
+    text = (tmp_path / "prep_features_public_runlog.txt").read_text(encoding="utf-8")
+    assert "present.py" in text
+    assert "gtfs_route_features.py  NOT FOUND" in text
+    assert "missing from every bundle" in text

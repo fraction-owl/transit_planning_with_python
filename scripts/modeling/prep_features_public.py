@@ -889,8 +889,15 @@ def write_run_log(
     bundles: list[BundleResult],
     runs: list[ScriptRun],
     source_path: Path = SELF_PATH,
+    missing_scripts: Sequence[str] = (),
 ) -> bool:
-    """Write a run log of the configuration block plus the script + bundle summary."""
+    """Write a run log of the configuration block plus the script + bundle summary.
+
+    ``missing_scripts`` are registry-listed scripts that were never found on disk;
+    they are recorded alongside the scripts that ran so a feature silently absent
+    from the bundles (e.g. a stale run folder missing one script) is visible in
+    the artifact a human actually reads, not just in the console output.
+    """
     log_path = output_dir / "prep_features_public_runlog.txt"
 
     try:
@@ -907,6 +914,11 @@ def write_run_log(
             script_lines.append(f"  {r.script}  {status}  {r.duration_s:.1f}s  outputs=[{files}]")
     else:
         script_lines = ["  (none)"]
+    for name in missing_scripts:
+        script_lines.append(
+            f"  {name}  NOT FOUND — listed in the registry but absent from the scripts dir; "
+            "its features are missing from every bundle"
+        )
 
     if bundles:
         bundle_lines = [
@@ -1001,6 +1013,8 @@ def orchestrate(
     )
     if not scripts:
         logging.warning("No feature scripts discovered under %s.", scripts_dir)
+    resolved_names = {name for name, _, _ in scripts}
+    missing_scripts = [name for name in registry_scripts if name not in resolved_names]
 
     out_root = work_dir / "out"
     log_root = work_dir / "logs"
@@ -1102,7 +1116,10 @@ def orchestrate(
         )
 
     write_manifest(output_dir, bundles)
-    if not write_run_log(output_dir, bundles, runs, source_path) and require_run_log:
+    if (
+        not write_run_log(output_dir, bundles, runs, source_path, missing_scripts=missing_scripts)
+        and require_run_log
+    ):
         raise RuntimeError(
             "Run log could not be written. Set REQUIRE_RUN_LOG = False to suppress this "
             "error when a sidecar file is genuinely impossible."

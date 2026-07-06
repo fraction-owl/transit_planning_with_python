@@ -23,6 +23,9 @@ Features produced (one row per route, keyed on ``route_id`` = GTFS route_short_n
         route_length_mi       representative one-way length (longest shape the route uses)
         route_length_modal_mi one-way length of the modal shape variant (shape most trips run)
         avg_speed_mph         revenue_miles / revenue_hours
+        n_directions          distinct trips.txt direction_id values among the day's trips
+                              (2 = bidirectional, 1 = one-way or loop; NaN when the feed
+                              provides no usable direction_id)
 
     Network structure / redundancy:
         n_stops                          distinct stops served by the route
@@ -500,6 +503,23 @@ def compute_route_supply_metrics(
 
     out = trips_per_day.merge(agg, on="route_id", how="left")
 
+    # Direction count: 2 = bidirectional, 1 = one-way or loop service. Blank
+    # direction_id values carry no information and are ignored; a feed with no
+    # usable direction_id at all yields NaN rather than a fake 1.
+    if "direction_id" in trips.columns:
+        dirs = trips[["route_id", "direction_id"]].copy()
+        dirs["direction_id"] = dirs["direction_id"].astype("string").str.strip()
+        dirs = dirs[dirs["direction_id"].notna() & (dirs["direction_id"] != "")]
+        n_dir = (
+            dirs.groupby("route_id", dropna=False)["direction_id"]
+            .nunique()
+            .rename("n_directions")
+            .reset_index()
+        )
+        out = out.merge(n_dir, on="route_id", how="left")
+    else:
+        out["n_directions"] = np.nan
+
     coverage = _service_day_coverage(trips_t[["route_id", "start_sec"]])
     out = out.merge(coverage, on="route_id", how="left")
 
@@ -714,6 +734,10 @@ def collapse_to_route_number(metrics: pd.DataFrame, route_col: str) -> pd.DataFr
         revenue_miles=("revenue_miles", "sum"),
         route_length_mi=("route_length_mi", "max"),
         n_stops=("n_stops", "sum"),
+        # Max, not sum: two one-way route_id variants of one public number are
+        # usually the same corridor, so summing would double-count. Approximate,
+        # like every other collision aggregate (collisions are logged above).
+        n_directions=("n_directions", "max"),
         n_competitor_routes=("n_competitor_routes", "max"),
         competitor_trips_at_shared_stops=("competitor_trips_at_shared_stops", "sum"),
         min_start_sec=("min_start_sec", "min"),
@@ -916,6 +940,7 @@ def run(
         "route_length_mi",
         "route_length_modal_mi",
         "avg_speed_mph",
+        "n_directions",
         "n_stops",
         "stops_per_mile",
         "shared_stop_share",

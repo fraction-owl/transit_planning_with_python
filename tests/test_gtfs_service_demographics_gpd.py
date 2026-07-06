@@ -566,6 +566,16 @@ def test_commute_count_fields_are_synthetic_fields() -> None:
         assert field in SYNTHETIC_FIELDS
 
 
+def test_unk_wage_propagates_from_supplemental_jobs_patch() -> None:
+    # uscensus_tiger_join_gpd's supplemental-jobs patch writes unk_wage; it must be
+    # apportioned to routes like the other job counts (and treated as employment in
+    # the express directional accounting), or the patch is invisible route-level.
+    from scripts.service_coverage.gtfs_service_demographics_gpd import EXPRESS_EMPLOYMENT_FIELDS
+
+    assert "unk_wage" in SYNTHETIC_FIELDS
+    assert "unk_wage" in EXPRESS_EMPLOYMENT_FIELDS
+
+
 def test_clip_and_calculate_commute_counts_area_weight_and_recover_share() -> None:
     result = clip_and_calculate_synthetic_fields(
         _commute_demographics(), _half_buffer(), ["cmt_wrkrs", "cmt_trnst"]

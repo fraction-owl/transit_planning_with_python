@@ -30,7 +30,7 @@
       "outputs": [
         {"file": "gtfs_route_features.csv", "join_keys": ["route_id"],
          "keep_cols": ["trips_per_day", "span_hours", "median_headway_min", "pct_day_with_service",
-                       "route_length_mi", "route_length_modal_mi", "avg_speed_mph", "n_stops",
+                       "route_length_mi", "route_length_modal_mi", "avg_speed_mph", "n_directions", "n_stops",
                        "stops_per_mile", "shared_stop_share", "n_competitor_routes",
                        "competitor_trips_at_shared_stops", "competition_intensity"]}
       ]
@@ -98,7 +98,7 @@
   "outputs": [
     {"file": "gtfs_route_features.csv", "join_keys": ["route_id"],
      "keep_cols": ["trips_per_day", "span_hours", "median_headway_min", "pct_day_with_service",
-                   "route_length_mi", "route_length_modal_mi", "avg_speed_mph", "n_stops",
+                   "route_length_mi", "route_length_modal_mi", "avg_speed_mph", "n_directions", "n_stops",
                    "stops_per_mile", "shared_stop_share", "n_competitor_routes",
                    "competitor_trips_at_shared_stops", "competition_intensity"]},
     {"file": "exogenous_monthly.csv", "join_keys": ["period"],
