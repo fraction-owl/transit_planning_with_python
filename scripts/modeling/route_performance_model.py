@@ -83,16 +83,17 @@ ANCHOR_AGG: Final[str] = "mean"  # <<< EDIT ME
 ANCHOR_EXCLUDE_ZERO_MONTHS: Final[bool] = True
 
 # --- Service-day contract ------------------------------------------------------
-# ntd_anchor_builder.py stamps every anchor row with the service day it represents
-# ("weekday" / "saturday" / "sunday" / "combined") and keeps the DV and the supply
-# predictors on that same basis (boardings, revenue_hours, and revenue_miles are
-# all summed over the same service-day rows — the pairing this model's
-# productivity control depends on). When EXPECTED_SERVICE_DAY is set, the run
-# aborts if the anchor's stamp disagrees (e.g. a combined anchor fed to a
-# weekday-only analysis); set it to "" to accept any anchor. An anchor without
-# the stamp column only warns, so pre-existing anchors still run.
+# The wide anchor from ntd_anchor_builder.py encodes the service day in the column
+# names (weekday_/saturday_/sunday_avg_*) rather than a per-row stamp, and this
+# model already pins the day by targeting weekday_avg_ntd_boardings with the
+# weekday supply averages — so DV and predictors are guaranteed on the same
+# (weekday) basis. EXPECTED_SERVICE_DAY is therefore left blank: a wide anchor has
+# no single service_day stamp to verify. It is retained only to keep verifying a
+# legacy single-day anchor (one stamped service_day column); set it non-empty
+# ("weekday" / "saturday" / "sunday" / "combined") only when pointing ANCHOR_PATH
+# at such a legacy stamped anchor.
 SERVICE_DAY_COLUMN: Final[str] = "service_day"
-EXPECTED_SERVICE_DAY: Final[str] = "weekday"  # <<< EDIT ME ("" = accept any)
+EXPECTED_SERVICE_DAY: Final[str] = ""  # <<< EDIT ME ("" = accept any / wide anchor)
 
 # Feature bundles produced by prep_features_public.py (PART A) and transferred in.
 # BUNDLE_DIR holds the bundle CSVs; MANIFEST_PATH is the JSON sidecar listing each
@@ -115,7 +116,11 @@ MIN_BUNDLE_MATCH_RATE: Final[float] = 0.9
 OUTPUT_DIR: Final[Path] = Path(r"Path\To\Your\output")  # <<< EDIT ME
 
 ROUTE_KEY: Final[str] = "route_id"
-DEPENDENT_VAR: Final[str] = "ntd_boardings"
+# The anchor breaks out all three service days on a daily-average basis
+# (weekday_/saturday_/sunday_avg_ntd_boardings, ..._avg_revenue_hours, ...). This
+# model targets the weekday boardings average, paired with the weekday supply
+# averages below; the saturday/sunday columns ride along unused here.
+DEPENDENT_VAR: Final[str] = "weekday_avg_ntd_boardings"
 
 # Rename messy source columns to the names used below (applied after load). The
 # demographics export ships shapefile-derived counts like "Metrorail_Stations.shp".
@@ -126,7 +131,7 @@ COLUMN_ALIASES: Final[dict[str, str]] = {
 
 # --- Core regressors (predict potential) ------------------------------------
 PREDICTORS: Final[tuple[str, ...]] = (
-    "revenue_hours",  # supply quantity / productivity offset  [anchor/NTD]
+    "weekday_avg_revenue_hours",  # supply quantity / productivity offset  [anchor/NTD]
     "total_pop",  # population scale                       [demographics]
     "tot_empl",  # employment                            [demographics]
     "enrollment_9_12_served",  # high-school enrollment reached        [demographics]
@@ -140,7 +145,7 @@ PREDICTORS: Final[tuple[str, ...]] = (
 # Predictors to log1p (zeros handled). Counts/quantities are right-skewed; shares,
 # the Metro count, and the binary flag are left linear.
 LOG_PREDICTORS: Final[tuple[str, ...]] = (
-    "revenue_hours",
+    "weekday_avg_revenue_hours",
     "total_pop",
     "tot_empl",
     "enrollment_9_12_served",

@@ -128,8 +128,8 @@ def test_derive_features_flags_express_and_equity_pct() -> None:
 
 def test_end_to_end_export(tmp_path, monkeypatch) -> None:
     """A full design-matrix build, fit, and export writes the expected sheets."""
-    monkeypatch.setattr(rpm, "PREDICTORS", ("revenue_hours", "total_pop"))
-    monkeypatch.setattr(rpm, "LOG_PREDICTORS", ("revenue_hours", "total_pop"))
+    monkeypatch.setattr(rpm, "PREDICTORS", ("weekday_avg_revenue_hours", "total_pop"))
+    monkeypatch.setattr(rpm, "LOG_PREDICTORS", ("weekday_avg_revenue_hours", "total_pop"))
     monkeypatch.setattr(rpm, "OUTPUT_DIR", tmp_path)
 
     rng = np.random.default_rng(7)
@@ -140,14 +140,14 @@ def test_end_to_end_export(tmp_path, monkeypatch) -> None:
     table = pd.DataFrame(
         {
             "route_id": [str(i) for i in range(n)],
-            "ntd_boardings": boardings,
-            "revenue_hours": hours,
+            "weekday_avg_ntd_boardings": boardings,
+            "weekday_avg_revenue_hours": hours,
             "total_pop": pop,
         }
     )
 
     y, x_matrix, names, frame = rpm.build_design_matrix(table)
-    assert names == ["intercept", "log_revenue_hours", "log_total_pop"]
+    assert names == ["intercept", "log_weekday_avg_revenue_hours", "log_total_pop"]
 
     result = rpm.fit_ols(y, x_matrix, names, se_type="HC1")
     workbook = rpm.export_results(result, frame)
@@ -176,7 +176,7 @@ def test_end_to_end_export(tmp_path, monkeypatch) -> None:
 
     # Duan smearing puts fitted_potential on the mean (not median) boardings
     # scale, so its mean tracks the actual mean closely on clean data.
-    ratio = perf["fitted_potential"].mean() / perf["ntd_boardings"].mean()
+    ratio = perf["fitted_potential"].mean() / perf["weekday_avg_ntd_boardings"].mean()
     assert 0.9 < ratio < 1.1
 
 
@@ -208,10 +208,10 @@ def _make_anchor_and_bundles(tmp_path) -> tuple[Path, Path, Path]:
     pd.DataFrame(
         {
             "route_id": ["101", "102", "103"],
-            "ntd_boardings": [1000.0, 2000.0, 3000.0],
+            "weekday_avg_ntd_boardings": [1000.0, 2000.0, 3000.0],
             # Supply lives on the NTD anchor (more accurate than the GTFS copy).
-            "revenue_hours": [50.0, 80.0, 120.0],
-            "revenue_miles": [500.0, 800.0, 1200.0],
+            "weekday_avg_revenue_hours": [50.0, 80.0, 120.0],
+            "weekday_avg_revenue_miles": [500.0, 800.0, 1200.0],
         }
     ).to_csv(anchor_path, index=False)
 
@@ -253,7 +253,7 @@ def test_assemble_model_table_joins_route_bundle_and_skips_period(tmp_path, monk
     # Feature columns from the route_id bundle are joined on.
     assert {"total_pop", "shared_stop_share", "competition_intensity"} <= set(merged.columns)
     # Supply columns stay on the anchor (sourced from NTD, never from a bundle).
-    assert {"revenue_hours", "revenue_miles"} <= set(merged.columns)
+    assert {"weekday_avg_revenue_hours", "weekday_avg_revenue_miles"} <= set(merged.columns)
     # The COLUMN_ALIASES rename is applied to bundle columns too.
     assert "Metrorail_Stations" in merged.columns and "Metrorail_Stations.shp" not in merged.columns
     # The period bundle was skipped, so none of its columns leak in.
@@ -359,8 +359,8 @@ def test_collapse_panel_anchor_rolls_up_to_one_row_per_route(monkeypatch) -> Non
     panel = pd.DataFrame(
         {
             "route_id": rpm._canonical_key(pd.Series(["101", "101", "102", "102"])),
-            "ntd_boardings": [100.0, 0.0, 200.0, 400.0],  # the zero month is dropped
-            "revenue_hours": [10.0, 99.0, 20.0, 40.0],
+            "weekday_avg_ntd_boardings": [100.0, 0.0, 200.0, 400.0],  # the zero month is dropped
+            "weekday_avg_revenue_hours": [10.0, 99.0, 20.0, 40.0],
         }
     )
     out = rpm._collapse_panel_anchor(panel)
@@ -368,8 +368,8 @@ def test_collapse_panel_anchor_rolls_up_to_one_row_per_route(monkeypatch) -> Non
     assert sorted(out["route_id"]) == ["101", "102"]
     # Route 101's zero-boarding month is excluded, so its mean is 100, not 50.
     r101 = out.loc[out["route_id"] == "101"].iloc[0]
-    assert r101["ntd_boardings"] == 100.0
-    assert r101["revenue_hours"] == 10.0
+    assert r101["weekday_avg_ntd_boardings"] == 100.0
+    assert r101["weekday_avg_revenue_hours"] == 10.0
 
 
 def test_collapse_panel_anchor_drops_nan_months_with_zeros(monkeypatch) -> None:
@@ -379,29 +379,29 @@ def test_collapse_panel_anchor_drops_nan_months_with_zeros(monkeypatch) -> None:
     panel = pd.DataFrame(
         {
             "route_id": rpm._canonical_key(pd.Series(["101", "101", "101", "102", "102"])),
-            "ntd_boardings": [100.0, np.nan, 0.0, 200.0, 400.0],
-            "revenue_hours": [10.0, 77.0, 99.0, 20.0, 40.0],
+            "weekday_avg_ntd_boardings": [100.0, np.nan, 0.0, 200.0, 400.0],
+            "weekday_avg_revenue_hours": [10.0, 77.0, 99.0, 20.0, 40.0],
         }
     )
     out = rpm._collapse_panel_anchor(panel)
 
     r101 = out.loc[out["route_id"] == "101"].iloc[0]
-    assert r101["ntd_boardings"] == 100.0
+    assert r101["weekday_avg_ntd_boardings"] == 100.0
     # Neither the NaN month's 77 hours nor the zero month's 99 leak into the mean:
     # mean() alone would skip the NaN for boardings but still count its hours.
-    assert r101["revenue_hours"] == 10.0
+    assert r101["weekday_avg_revenue_hours"] == 10.0
 
 
 def test_log_dependent_rejects_nonpositive(monkeypatch) -> None:
     """A non-positive dependent under the log transform must raise when not dropping."""
-    monkeypatch.setattr(rpm, "PREDICTORS", ("revenue_hours",))
-    monkeypatch.setattr(rpm, "LOG_PREDICTORS", ("revenue_hours",))
+    monkeypatch.setattr(rpm, "PREDICTORS", ("weekday_avg_revenue_hours",))
+    monkeypatch.setattr(rpm, "LOG_PREDICTORS", ("weekday_avg_revenue_hours",))
     monkeypatch.setattr(rpm, "DROP_NONPOSITIVE_DEPENDENT", False)
     table = pd.DataFrame(
         {
             "route_id": ["1", "2", "3"],
-            "ntd_boardings": [100.0, 0.0, 300.0],  # a zero is invalid under log
-            "revenue_hours": [10.0, 20.0, 30.0],
+            "weekday_avg_ntd_boardings": [100.0, 0.0, 300.0],  # a zero is invalid under log
+            "weekday_avg_revenue_hours": [10.0, 20.0, 30.0],
         }
     )
     with pytest.raises(ValueError):
@@ -410,14 +410,14 @@ def test_log_dependent_rejects_nonpositive(monkeypatch) -> None:
 
 def test_log_dependent_drops_nonpositive_when_enabled(monkeypatch) -> None:
     """Non-operating routes (zero boardings on this day type) are dropped, not fatal."""
-    monkeypatch.setattr(rpm, "PREDICTORS", ("revenue_hours",))
-    monkeypatch.setattr(rpm, "LOG_PREDICTORS", ("revenue_hours",))
+    monkeypatch.setattr(rpm, "PREDICTORS", ("weekday_avg_revenue_hours",))
+    monkeypatch.setattr(rpm, "LOG_PREDICTORS", ("weekday_avg_revenue_hours",))
     monkeypatch.setattr(rpm, "DROP_NONPOSITIVE_DEPENDENT", True)
     table = pd.DataFrame(
         {
             "route_id": ["1", "2", "3"],
-            "ntd_boardings": [100.0, 0.0, 300.0],  # e.g. route 2 runs no Saturday service
-            "revenue_hours": [10.0, 20.0, 30.0],
+            "weekday_avg_ntd_boardings": [100.0, 0.0, 300.0],  # e.g. a route with no service
+            "weekday_avg_revenue_hours": [10.0, 20.0, 30.0],
         }
     )
     y, x_matrix, _, frame = rpm.build_design_matrix(table)

@@ -1,40 +1,46 @@
 """Build the NTD regression anchor table from monthly ridership workbooks.
 
 Collapses the per-service-period NTD monthly workbooks (Weekday / Saturday /
-Sunday rows) into the single anchor table consumed by the ridership regression
+Sunday rows) into the anchor table consumed by the ridership regression
 (PART B). The anchor holds the dependent variable plus the "service supplied"
-predictors, keyed to whatever grain the model expects:
+predictors, broken out for all three service days on a daily-average basis and
+keyed to whatever grain the model expects:
 
     - GRAIN = "cross_section" -> one row per route_id, pooled over all periods
       in range (suitable for JOIN_KEYS = ("route_id",)).
     - GRAIN = "panel"         -> one row per route_id x period, with ``period``
       formatted as ``%Y-%m`` (suitable for JOIN_KEYS = ("route_id", "period")).
 
-The workbooks carry separate Weekday / Saturday / Sunday rows. SERVICE_DAY_SELECTION
-picks which of those each anchor row represents: a single service day in
-isolation ("weekday" / "saturday" / "sunday"), all three summed into a
-full-week monthly total ("combined"), or "each" to build all three single-day
-anchors in one pass (one CSV per day, the day suffixed onto OUTPUT_FILENAME).
-The choice is stamped onto every row as the SERVICE_DAY_OUT column so the
-regression can confirm the service day it analyzes.
+Each row carries the three service days side by side, every measure expressed as
+a **daily average** (the monthly total divided by that service day's operating
+days). For each of weekday / saturday / sunday the anchor emits:
+
+    - <day>_avg_ntd_boardings  = sum(MTH_BOARD)      / sum(DAYS)
+    - <day>_avg_revenue_hours  = sum(MTH_REV_HOURS)  / sum(DAYS)
+    - <day>_avg_revenue_miles  = sum(REV_MILES*DAYS) / sum(DAYS)
+    - <day>_service_days       = sum(DAYS)   (lets a consumer recover the
+                                 monthly total as average x service_days)
+
+Averaging is day-weighted (numerator summed over the in-range months, divided by
+the summed operating days), matching how ntd_monthly_summary.py derives its
+DAILY_AVG. A service day a route never operates yields NaN averages and zero
+service_days (an honest "no service", not "ran empty"). The regression targets
+``weekday_avg_ntd_boardings`` as its dependent variable; the saturday / sunday
+columns ride along for other consumers.
 
 Workbooks are discovered by scanning DATA_ROOT: each file is assumed to hold a
 single worksheet, and its month/year are parsed from the filename (full or
 3-letter month, 4-digit year, in any order or separator). No hand-maintained
 catalogue is required.
 
-Output is a CSV written to OUTPUT_DIR / OUTPUT_FILENAME (or one day-suffixed CSV
-per service day under "each"), plus a run-log sidecar. Point the regression's
-ANCHOR_PATH at the CSV for the service day being modeled.
+Output is a CSV written to OUTPUT_DIR / OUTPUT_FILENAME, plus a run-log sidecar.
+Point the regression's ANCHOR_PATH at the CSV.
 
 Measure conventions (kept consistent with ntd_monthly_summary.py):
-    - boardings   = sum of MTH_BOARD across the selected service periods
-      (already monthly).
-    - hours       = sum of MTH_REV_HOURS across the selected service periods
-      (already monthly).
-    - revenue_miles = sum of (REV_MILES * DAYS) across the selected service
-      periods, i.e. the monthly revenue-mile total, matching the monthly
-      summary's MTH_REV_MILES.
+    - boardings   = MTH_BOARD (already monthly), summed then averaged per day.
+    - hours       = MTH_REV_HOURS (already monthly), summed then averaged per day.
+    - revenue_miles = REV_MILES * DAYS, i.e. the monthly revenue-mile total,
+      summed then averaged per day.
 """
 
 from __future__ import annotations
@@ -94,58 +100,38 @@ START_MONTH: Final[str] = ""
 END_MONTH: Final[str] = ""
 
 # -----------------------------------------------------------------------------
-#  Service-day selection
-# -----------------------------------------------------------------------------
-
-# Which service-day type each anchor row represents. NTD monthly workbooks carry
-# separate Weekday / Saturday / Sunday rows; this selects which to fold into each
-# anchor row:
-#   - "weekday" / "saturday" / "sunday" -> isolate that single service day.
-#   - "combined"                        -> sum all three into a full-week monthly
-#                                          total (the historical behaviour).
-#   - "each"                            -> build all three single-day anchors in
-#                                          one pass, writing one CSV per day with
-#                                          the day suffixed onto OUTPUT_FILENAME
-#                                          (ntd_anchor_weekday.csv, ...).
-# Whatever is chosen, the measures (boardings, hours, revenue miles) are summed
-# over exactly the selected service period(s), so a single-day anchor carries that
-# day's totals and a combined anchor carries the full-week totals.
-SERVICE_DAY_SELECTION: Final[str] = "weekday"
-
-# Output column recording SERVICE_DAY_SELECTION on every anchor row. Set this to
-# match the regression's SERVICE_DAY_COLUMN so its service-day filter can assert
-# the anchor's service day and abort on a mismatch (e.g. a combined anchor fed to
-# a weekday-only run).
-SERVICE_DAY_OUT: Final[str] = "service_day"
-
-# -----------------------------------------------------------------------------
 #  Output schema (align these with the regression's config)
 # -----------------------------------------------------------------------------
 
-# Join key / dependent / supply-predictor column names as they should appear in
-# the anchor. ROUTE_ID_OUT must equal the regression's JOIN_KEYS route key;
-# BOARDINGS_OUT must equal DEPENDENT_VAR; HOURS_OUT and REVMILES_OUT must appear
-# in the regression's PREDICTORS.
+# The anchor breaks out all three service days side by side, each measure on a
+# daily-average basis. Per-day columns are named "<day>_avg_<measure>" (plus
+# "<day>_service_days"); the measure roots below must match the regression's
+# expectations. The regression's DEPENDENT_VAR should be the weekday boardings
+# average (weekday_avg_ntd_boardings) and its supply predictor the weekday hours
+# average (weekday_avg_revenue_hours).
 ROUTE_ID_OUT: Final[str] = "route_id"
 PERIOD_OUT: Final[str] = "period"  # panel only
 BOARDINGS_OUT: Final[str] = "ntd_boardings"
 REVMILES_OUT: Final[str] = "revenue_miles"
 
 # The workbooks expose revenue hours (MTH_REV_HOURS), not scheduled hours. This
-# is emitted honestly as "revenue_hours" by default. The regression config names
-# this predictor "scheduled_hours" -> EITHER rename that predictor to
-# "revenue_hours", OR set this to "scheduled_hours" to alias revenue hours as the
-# supply measure (a documented approximation). Do not leave the two mismatched.
+# is emitted honestly as "revenue_hours". The regression names this predictor
+# "revenue_hours" (weekday_avg_revenue_hours) rather than "scheduled_hours".
 HOURS_OUT: Final[str] = "revenue_hours"
+
+# Suffix for the per-day operating-day count column (weekday_service_days, ...).
+DAYS_OUT: Final[str] = "service_days"
 
 # -----------------------------------------------------------------------------
 #  Cleaning behaviour
 # -----------------------------------------------------------------------------
 
-# Drop aggregated rows whose total boardings are <= 0. The regression log-
-# transforms the dependent variable (LOG_DEPENDENT) and rejects non-positive
-# values, so these rows cannot be modeled. When False, they are retained and a
-# warning is emitted instead.
+# Drop routes whose weekday boardings average (the modeled dependent variable)
+# is <= 0 or NaN. The regression log-transforms the dependent variable
+# (LOG_DEPENDENT) and rejects non-positive values, so these rows cannot be
+# modeled. When False, they are retained and a warning is emitted instead.
+# Saturday / Sunday gaps are never dropped: a route with no weekend service
+# keeps its NaN weekend averages.
 DROP_NONPOSITIVE_BOARDINGS: Final[bool] = True
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
@@ -166,23 +152,21 @@ REQUIRED_COLS: Final[list[str]] = [
     "DAYS",
 ]
 
-# Canonical service-period label set for each SERVICE_DAY_SELECTION value. The
-# selected labels are both the rows kept from each workbook and the rows summed
-# into one anchor row. Labels match normalise_service_period's output.
-_SERVICE_DAY_SETS: Final[dict[str, list[str]]] = {
-    "weekday": ["Weekday"],
-    "saturday": ["Saturday"],
-    "sunday": ["Sunday"],
-    "combined": ["Weekday", "Saturday", "Sunday"],
-}
-
-# The single-day selections built by SERVICE_DAY_SELECTION = "each", in output order.
-_EACH_SELECTIONS: Final[list[str]] = ["weekday", "saturday", "sunday"]
+# The three service days broken out into the wide anchor, in output order, as
+# (column prefix, canonical SERVICE_PERIOD label). Labels match
+# normalise_service_period's output; prefixes name the output columns.
+SERVICE_DAYS: Final[list[tuple[str, str]]] = [
+    ("weekday", "Weekday"),
+    ("saturday", "Saturday"),
+    ("sunday", "Sunday"),
+]
+CANONICAL_DAY_LABELS: Final[list[str]] = [label for _, label in SERVICE_DAYS]
 
 # Internal (pre-rename) measure column names.
 _BOARD: Final[str] = "_board"
 _HOURS: Final[str] = "_hours"
 _REVMILES: Final[str] = "_rev_miles"
+_DAYS: Final[str] = "_days"
 
 # Month-token lookup (full names and 3-letter abbreviations -> month number),
 # plus a regex that finds any of them as a whole word, longest-first.
@@ -201,6 +185,25 @@ _YEAR_RE: Final[re.Pattern[str]] = re.compile(r"\b(20\d{2})\b")
 # =============================================================================
 # HELPERS
 # =============================================================================
+
+
+def avg_col(day: str, measure: str) -> str:
+    """Name the daily-average column for a service day + measure (e.g. weekday_avg_ntd_boardings).
+
+    Args:
+        day: Service-day prefix (weekday / saturday / sunday).
+        measure: Measure root (BOARDINGS_OUT / HOURS_OUT / REVMILES_OUT).
+    """
+    return f"{day}_avg_{measure}"
+
+
+def days_col(day: str) -> str:
+    """Name the operating-day-count column for a service day (e.g. weekday_service_days)."""
+    return f"{day}_{DAYS_OUT}"
+
+
+# The regression's dependent variable: the weekday boardings daily average.
+DV_COLUMN: Final[str] = avg_col("weekday", BOARDINGS_OUT)
 
 
 def parse_month(value: str) -> datetime:
@@ -290,12 +293,6 @@ def normalise_service_period(value: Any) -> str:
     return mapping.get(str(value).strip().lower(), str(value).strip())
 
 
-def day_type_filename(base: str, service_day: str) -> str:
-    """Suffix an anchor filename with its service day (ntd_anchor.csv -> ntd_anchor_weekday.csv)."""
-    p = Path(base)
-    return f"{p.stem}_{service_day}{p.suffix}"
-
-
 def discover_workbooks(data_root: Path) -> dict[str, Path]:
     """Scan ``data_root`` and map each ``Mon-YYYY`` period to its workbook.
 
@@ -354,17 +351,17 @@ def periods_in_range(
 # =============================================================================
 
 
-def read_month_workbook(period: str, path: Path, keep_periods: list[str]) -> pd.DataFrame:
+def read_month_workbook(period: str, path: Path) -> pd.DataFrame:
     """Read one workbook's only sheet and return tidy measure rows.
 
-    Returns an empty frame (with a warning) if the file is missing or lacks a
-    required column, so a single bad month does not abort the build.
+    Keeps the Weekday / Saturday / Sunday rows (any other service-period label is
+    dropped) and retains the operating-day count so the wide anchor can average
+    per day. Returns an empty frame (with a warning) if the file is missing or
+    lacks a required column, so a single bad month does not abort the build.
 
     Args:
         period: ``Mon-YYYY`` key for this workbook.
         path: Path to the workbook on disk.
-        keep_periods: Service-period labels to retain (rows with any other label
-            are dropped). Driven by SERVICE_DAY_SELECTION.
     """
     if not path.exists():
         logging.warning("Workbook missing on disk: %s (period=%s)", path, period)
@@ -393,35 +390,31 @@ def read_month_workbook(period: str, path: Path, keep_periods: list[str]) -> pd.
     out["_service_period"] = df["SERVICE_PERIOD"].apply(normalise_service_period)
     out[_BOARD] = pd.to_numeric(df["MTH_BOARD"], errors="coerce")
     out[_HOURS] = pd.to_numeric(df["MTH_REV_HOURS"], errors="coerce")
+    out[_DAYS] = pd.to_numeric(df["DAYS"], errors="coerce")
     # Monthly revenue miles = per-day revenue miles * service days, matching
     # ntd_monthly_summary's MTH_REV_MILES derivation.
-    out[_REVMILES] = pd.to_numeric(df["REV_MILES"], errors="coerce") * pd.to_numeric(
-        df["DAYS"], errors="coerce"
-    )
+    out[_REVMILES] = pd.to_numeric(df["REV_MILES"], errors="coerce") * out[_DAYS]
     out["_period_key"] = period
     out["_period_ym"] = to_period_ym(period)
 
-    out = out[out["_service_period"].isin(keep_periods)]
+    out = out[out["_service_period"].isin(CANONICAL_DAY_LABELS)]
     out = out[out[ROUTE_ID_OUT].astype(bool) & (out[ROUTE_ID_OUT].str.lower() != "nan")]
     return out
 
 
-def load_raw(
-    workbooks: dict[str, Path], periods: list[str], keep_periods: list[str]
-) -> pd.DataFrame:
+def load_raw(workbooks: dict[str, Path], periods: list[str]) -> pd.DataFrame:
     """Read and concatenate every in-range workbook into one tidy frame.
 
     Args:
         workbooks: Period -> path map from :func:`discover_workbooks`.
         periods: In-range period keys to read, chronologically.
-        keep_periods: Service-period labels to retain (see SERVICE_DAY_SELECTION).
     """
     frames: list[pd.DataFrame] = []
     for period in periods:
         path = workbooks.get(period)
         if path is None:
             continue
-        df = read_month_workbook(period, path, keep_periods)
+        df = read_month_workbook(period, path)
         if df.empty:
             continue
         frames.append(df)
@@ -435,6 +428,7 @@ def load_raw(
                 _BOARD,
                 _HOURS,
                 _REVMILES,
+                _DAYS,
                 "_period_key",
                 "_period_ym",
             ]
@@ -442,73 +436,121 @@ def load_raw(
     return pd.concat(frames, ignore_index=True)
 
 
+def output_columns(grain: str) -> list[str]:
+    """Ordered wide-anchor columns for the requested grain."""
+    cols = [ROUTE_ID_OUT]
+    if grain == "panel":
+        cols.append(PERIOD_OUT)
+    for day, _ in SERVICE_DAYS:
+        cols += [
+            avg_col(day, BOARDINGS_OUT),
+            avg_col(day, HOURS_OUT),
+            avg_col(day, REVMILES_OUT),
+            days_col(day),
+        ]
+    return cols
+
+
 def build_anchor(raw: pd.DataFrame, grain: str) -> pd.DataFrame:
-    """Collapse service periods and aggregate to the requested grain.
+    """Aggregate to the requested grain, breaking out all three service days wide.
+
+    Every measure is emitted as a day-weighted daily average (summed numerator
+    over the in-range months, divided by the summed operating days), alongside
+    each day's operating-day count. A service day a route never operated yields
+    NaN averages and zero ``service_days``.
 
     Args:
         raw: Tidy per-service-period rows from :func:`load_raw`.
         grain: ``"cross_section"`` or ``"panel"``.
 
     Returns:
-        The anchor table with output-schema column names.
+        The wide anchor table with output-schema column names.
     """
+    ordered = output_columns(grain)
     if raw.empty:
-        cols = [ROUTE_ID_OUT, BOARDINGS_OUT, HOURS_OUT, REVMILES_OUT]
-        if grain == "panel":
-            cols.insert(1, PERIOD_OUT)
-        return pd.DataFrame(columns=cols)
+        return pd.DataFrame(columns=ordered)
 
     group_keys = [ROUTE_ID_OUT] if grain == "cross_section" else [ROUTE_ID_OUT, "_period_ym"]
-    agg = raw.groupby(group_keys, as_index=False).agg(
-        **{
-            BOARDINGS_OUT: (_BOARD, "sum"),
-            HOURS_OUT: (_HOURS, "sum"),
-            REVMILES_OUT: (_REVMILES, "sum"),
-        }
+    sums = raw.groupby(group_keys + ["_service_period"], as_index=False).agg(
+        _b=(_BOARD, "sum"),
+        _h=(_HOURS, "sum"),
+        _m=(_REVMILES, "sum"),
+        _d=(_DAYS, "sum"),
     )
 
-    # Round the supply measures to 2 decimals for the published anchor.
-    # round() preserves NaN and sign, so clean_anchor's checks still apply.
-    agg[[HOURS_OUT, REVMILES_OUT]] = agg[[HOURS_OUT, REVMILES_OUT]].round(2)
+    # Day-weighted daily averages; a zero operating-day count means the route did
+    # not run that service day, so the average is NaN rather than a divide error.
+    denom = sums["_d"].replace(0, float("nan"))
+    sums["_avg_b"] = (sums["_b"] / denom).round(2)
+    sums["_avg_h"] = (sums["_h"] / denom).round(2)
+    sums["_avg_m"] = (sums["_m"] / denom).round(2)
+
+    result: pd.DataFrame | None = None
+    for day, label in SERVICE_DAYS:
+        sub = sums.loc[
+            sums["_service_period"] == label,
+            group_keys + ["_avg_b", "_avg_h", "_avg_m", "_d"],
+        ].rename(
+            columns={
+                "_avg_b": avg_col(day, BOARDINGS_OUT),
+                "_avg_h": avg_col(day, HOURS_OUT),
+                "_avg_m": avg_col(day, REVMILES_OUT),
+                "_d": days_col(day),
+            }
+        )
+        result = sub if result is None else result.merge(sub, on=group_keys, how="outer")
+
+    assert result is not None  # SERVICE_DAYS is non-empty
+    # Routes/periods with no rows for a service day get a 0 operating-day count.
+    for day, _ in SERVICE_DAYS:
+        result[days_col(day)] = result[days_col(day)].fillna(0).astype(int)
 
     if grain == "panel":
-        agg = agg.rename(columns={"_period_ym": PERIOD_OUT})
-        agg = agg.sort_values([ROUTE_ID_OUT, PERIOD_OUT], ignore_index=True)
-        ordered = [ROUTE_ID_OUT, PERIOD_OUT, BOARDINGS_OUT, HOURS_OUT, REVMILES_OUT]
+        result = result.rename(columns={"_period_ym": PERIOD_OUT})
+        result = result.sort_values([ROUTE_ID_OUT, PERIOD_OUT], ignore_index=True)
     else:
-        agg = agg.sort_values([ROUTE_ID_OUT], ignore_index=True)
-        ordered = [ROUTE_ID_OUT, BOARDINGS_OUT, HOURS_OUT, REVMILES_OUT]
+        result = result.sort_values([ROUTE_ID_OUT], ignore_index=True)
 
-    return agg[ordered]
+    return result[ordered]
 
 
 def clean_anchor(anchor: pd.DataFrame) -> pd.DataFrame:
-    """Warn on / drop non-modelable rows (non-positive boardings, NaN supply)."""
-    nan_supply = int(anchor[[HOURS_OUT, REVMILES_OUT]].isna().any(axis=1).sum())
+    """Warn on / drop non-modelable rows, judged by the weekday dependent variable.
+
+    The modeled series is the weekday boardings average (``DV_COLUMN``) paired
+    with the weekday supply averages. Weekend gaps (NaN saturday/sunday columns)
+    are expected and left untouched.
+    """
+    if anchor.empty:
+        return anchor
+
+    wk_hours = avg_col("weekday", HOURS_OUT)
+    wk_miles = avg_col("weekday", REVMILES_OUT)
+    nan_supply = int(anchor[[wk_hours, wk_miles]].isna().any(axis=1).sum())
     if nan_supply:
         logging.warning(
-            "%d row(s) have NaN %s/%s; the regression will drop these when building "
-            "the design matrix.",
+            "%d row(s) have NaN weekday %s/%s; the regression will drop these when "
+            "building the design matrix.",
             nan_supply,
-            HOURS_OUT,
-            REVMILES_OUT,
+            wk_hours,
+            wk_miles,
         )
 
-    nonpos = anchor[BOARDINGS_OUT] <= 0
+    nonpos = anchor[DV_COLUMN].isna() | (anchor[DV_COLUMN] <= 0)
     n_nonpos = int(nonpos.sum())
     if n_nonpos and DROP_NONPOSITIVE_BOARDINGS:
         logging.warning(
-            "Dropping %d row(s) with %s <= 0 (cannot be log-transformed downstream).",
+            "Dropping %d row(s) with %s <= 0 or missing (cannot be log-transformed downstream).",
             n_nonpos,
-            BOARDINGS_OUT,
+            DV_COLUMN,
         )
         anchor = anchor[~nonpos].reset_index(drop=True)
     elif n_nonpos:
         logging.warning(
-            "%d row(s) have %s <= 0 and were KEPT; the regression's LOG_DEPENDENT will "
-            "abort unless these are removed.",
+            "%d row(s) have %s <= 0 or missing and were KEPT; the regression's "
+            "LOG_DEPENDENT will abort unless these are removed.",
             n_nonpos,
-            BOARDINGS_OUT,
+            DV_COLUMN,
         )
     return anchor
 
@@ -638,12 +680,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="One row per route ('cross_section') or per route x month ('panel').",
     )
     p.add_argument(
-        "--service-day",
-        default=SERVICE_DAY_SELECTION,
-        help="weekday / saturday / sunday / combined, or 'each' to write all three "
-        "single-day anchors in one pass.",
-    )
-    p.add_argument(
         "--start-month",
         default=START_MONTH,
         help="Inclusive start as 'Mon-YYYY' (blank = earliest).",
@@ -676,21 +712,6 @@ def main(argv: Sequence[str] | None = None) -> None:
         logging.error("--grain must be 'cross_section' or 'panel', got '%s'.", grain)
         sys.exit(1)
 
-    selection = args.service_day.strip().lower()
-    if selection not in _SERVICE_DAY_SETS and selection != "each":
-        logging.error(
-            "--service-day must be one of %s, got '%s'.",
-            sorted([*_SERVICE_DAY_SETS, "each"]),
-            args.service_day,
-        )
-        sys.exit(1)
-    # "each" reads every service-period row once, then builds the three single-day
-    # anchors from the same tidy frame (one workbook pass, three CSVs).
-    selections = _EACH_SELECTIONS if selection == "each" else [selection]
-    selected_periods = (
-        _SERVICE_DAY_SETS["combined"] if selection == "each" else _SERVICE_DAY_SETS[selection]
-    )
-
     if (
         str(data_root) == r"Path\To\Your\NTD_Folder"
         or str(output_dir) == r"Path\To\Your\Output\Folder"
@@ -700,18 +721,6 @@ def main(argv: Sequence[str] | None = None) -> None:
             "in the CONFIGURATION section, or pass --data-root/--output-dir, before running."
         )
         return
-
-    if HOURS_OUT != "scheduled_hours":
-        logging.info(
-            "Emitting supply-hours column as '%s'. Ensure the regression's PREDICTORS "
-            "names it '%s' (not 'scheduled_hours').",
-            HOURS_OUT,
-            HOURS_OUT,
-        )
-
-    logging.info(
-        "Service-day selection: '%s' (periods summed: %s).", selection, ", ".join(selected_periods)
-    )
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -747,40 +756,25 @@ def main(argv: Sequence[str] | None = None) -> None:
         sys.exit(1)
 
     logging.info("=== STEP 1: READ WORKBOOKS (%s..%s) ===", start_label, end_label)
-    raw = load_raw(workbooks, periods, selected_periods)
+    raw = load_raw(workbooks, periods)
 
+    logging.info("=== STEP 2: AGGREGATE TO '%s' GRAIN (all service days, daily average) ===", grain)
+    anchor = clean_anchor(build_anchor(raw, grain))
+
+    out_path = output_dir / output_filename
+    anchor.to_csv(out_path, index=False)
+    logging.info("Anchor written: %s (%d rows, %d cols).", out_path, *anchor.shape)
+
+    n_routes = anchor[ROUTE_ID_OUT].nunique() if not anchor.empty else 0
     summary_lines = [
         f"Grain:            {grain}",
-        f"Service day:      {selection} (periods read: {', '.join(selected_periods)})",
         f"Period range:     {start_label}..{end_label}",
         f"Workbooks found:  {len(workbooks)}",
         f"Periods loaded:   {len(periods)} ({', '.join(periods) or 'none'})",
+        f"{output_filename}: {len(anchor)} row(s), {n_routes} route(s)",
     ]
-
-    for sel in selections:
-        sub = (
-            raw[raw["_service_period"].isin(_SERVICE_DAY_SETS[sel])] if selection == "each" else raw
-        )
-        logging.info("=== STEP 2: AGGREGATE TO '%s' GRAIN ('%s') ===", grain, sel)
-        anchor = build_anchor(sub, grain)
-        anchor = clean_anchor(anchor)
-
-        # Stamp the service-day selection onto every row so the regression can assert
-        # which service day it is analyzing.
-        insert_at = 2 if grain == "panel" else 1
-        anchor.insert(insert_at, SERVICE_DAY_OUT, sel)
-
-        filename = (
-            day_type_filename(output_filename, sel) if selection == "each" else output_filename
-        )
-        out_path = output_dir / filename
-        anchor.to_csv(out_path, index=False)
-        logging.info("Anchor written: %s (%d rows, %d cols).", out_path, *anchor.shape)
-
-        n_routes = anchor[ROUTE_ID_OUT].nunique() if not anchor.empty else 0
-        summary_lines.append(f"[{sel}] {filename}: {len(anchor)} row(s), {n_routes} route(s)")
-        if grain == "panel" and not anchor.empty:
-            summary_lines.append(f"[{sel}]   unique periods: {anchor[PERIOD_OUT].nunique()}")
+    if grain == "panel" and not anchor.empty:
+        summary_lines.append(f"  unique periods: {anchor[PERIOD_OUT].nunique()}")
 
     if not write_run_log(output_dir, summary_lines) and REQUIRE_RUN_LOG:
         logging.error(

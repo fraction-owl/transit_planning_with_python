@@ -201,17 +201,37 @@ def test_hygiene_fails_when_join_key_listed_in_keepcols(tmp_path: Path) -> None:
 
 
 def _write_ntd_workbook(path: Path) -> None:
-    """Write a minimal NTD monthly workbook matching ntd_anchor_builder's schema."""
-    pd.DataFrame(
-        {
-            "ROUTE_NAME": ["101", "202", "303"],
-            "SERVICE_PERIOD": ["Weekday", "Weekday", "Weekday"],
-            "MTH_BOARD": [6000.0, 4000.0, 2000.0],
-            "MTH_REV_HOURS": [800.0, 600.0, 400.0],
-            "REV_MILES": [500.0, 400.0, 300.0],
-            "DAYS": [22.0, 22.0, 22.0],
-        }
-    ).to_excel(path, index=False, sheet_name="Sheet1")
+    """Write a minimal NTD monthly workbook matching ntd_anchor_builder's schema.
+
+    Carries all three service days so the wide anchor exercises the weekday /
+    saturday / sunday breakout end to end.
+    """
+    routes = ["101", "202", "303"]
+    rows: dict[str, list[object]] = {
+        "ROUTE_NAME": [],
+        "SERVICE_PERIOD": [],
+        "MTH_BOARD": [],
+        "MTH_REV_HOURS": [],
+        "REV_MILES": [],
+        "DAYS": [],
+    }
+    # (service_period, days, board/hours/miles scale) per weekday/saturday/sunday.
+    day_specs = [("Weekday", 22.0, 1.0), ("Saturday", 4.0, 0.4), ("Sunday", 5.0, 0.35)]
+    base = {
+        "101": (6000.0, 800.0, 500.0),
+        "202": (4000.0, 600.0, 400.0),
+        "303": (2000.0, 400.0, 300.0),
+    }
+    for route in routes:
+        b, h, m = base[route]
+        for period, days, scale in day_specs:
+            rows["ROUTE_NAME"].append(route)
+            rows["SERVICE_PERIOD"].append(period)
+            rows["MTH_BOARD"].append(round(b * scale, 1))
+            rows["MTH_REV_HOURS"].append(round(h * scale, 1))
+            rows["REV_MILES"].append(round(m * scale, 1))
+            rows["DAYS"].append(days)
+    pd.DataFrame(rows).to_excel(path, index=False, sheet_name="Sheet1")
 
 
 def test_end_to_end_real_scripts_via_registry(tmp_path: Path) -> None:
@@ -237,12 +257,20 @@ def test_end_to_end_real_scripts_via_registry(tmp_path: Path) -> None:
     assert "features__route_id.csv" in names
 
     route_bundle = pd.read_csv(tmp_path / "private_features" / "features__route_id.csv")
-    # The route-level table carries the DV plus the OTP and runtime features.
+    # The route-level table carries the weekday DV, the broken-out saturday/sunday
+    # daily averages, and the OTP and runtime features.
     for col in (
-        "ntd_boardings",
-        "revenue_hours",
-        "revenue_miles",
+        "weekday_avg_ntd_boardings",
+        "weekday_avg_revenue_hours",
+        "weekday_avg_revenue_miles",
+        "saturday_avg_ntd_boardings",
+        "sunday_avg_ntd_boardings",
+        "weekday_service_days",
         "pct_on_time",
         "runtime_mean_min",
     ):
         assert col in route_bundle.columns, f"missing {col} in {list(route_bundle.columns)}"
+
+    # Weekday boardings average = 6000 / 22 for route 101 (single month).
+    r101 = route_bundle[route_bundle["route_id"].astype(str) == "101"].iloc[0]
+    assert r101["weekday_avg_ntd_boardings"] == pytest.approx(round(6000.0 / 22.0, 2))
