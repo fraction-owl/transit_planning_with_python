@@ -214,7 +214,7 @@ EXPRESS_ZERO_DESTINATION_POPULATION: bool = True
 # walk-scaled at every stop; every other synthetic field is treated as
 # residence-based (population / households / residents), drive-scaled at the
 # origin stops and walk-scaled elsewhere.
-EXPRESS_EMPLOYMENT_FIELDS: list[str] = ["tot_empl", "low_wage", "mid_wage", "high_wage"]
+EXPRESS_EMPLOYMENT_FIELDS: list[str] = ["tot_empl", "low_wage", "mid_wage", "high_wage", "unk_wage"]
 
 # Isochrone settings (only used when SERVICE_AREA_METHOD == "isochrone")
 ISOCHRONE_WALK_TIME_MIN = 10.0  # Walk-time budget in minutes
@@ -236,6 +236,7 @@ SYNTHETIC_FIELDS = [
     "low_wage",
     "mid_wage",
     "high_wage",
+    "unk_wage",  # supplemental job sites patched in by uscensus_tiger_join_gpd
     "low_income",  # households under the low-income bands
     "minority",  # non-white-alone residents
     "lep",  # limited-English-proficiency residents

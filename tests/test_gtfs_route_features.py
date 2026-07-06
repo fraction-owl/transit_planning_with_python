@@ -145,6 +145,65 @@ def test_no_shapes_yields_nan_lengths() -> None:
 
 
 # ---------------------------------------------------------------------------
+# compute_route_supply_metrics  (n_directions)
+# ---------------------------------------------------------------------------
+
+
+def test_n_directions_counts_unique_direction_ids() -> None:
+    # A runs both directions; B is one-way (all trips direction 0).
+    trips = pd.DataFrame(
+        {
+            "route_id": ["A", "A", "A", "B", "B"],
+            "trip_id": ["t1", "t2", "t3", "t4", "t5"],
+            "shape_id": ["S", "S", "S", "S", "S"],
+            "direction_id": ["0", "1", "0", "0", "0"],
+        }
+    )
+    stop_times = _two_stop_times(
+        [
+            ("t1", "06:00:00", "06:30:00"),
+            ("t2", "07:00:00", "07:30:00"),
+            ("t3", "08:00:00", "08:30:00"),
+            ("t4", "06:00:00", "06:30:00"),
+            ("t5", "07:00:00", "07:30:00"),
+        ]
+    )
+    shape_len = pd.DataFrame({"shape_id": ["S"], "shape_len_m": [8046.72]})
+    supply = compute_route_supply_metrics(trips, stop_times, shape_len).set_index("route_id")
+    assert supply.loc["A", "n_directions"] == 2
+    assert supply.loc["B", "n_directions"] == 1
+
+
+def test_n_directions_ignores_blanks_and_handles_missing_column() -> None:
+    # Blank direction_id rows carry no information; all-blank -> NaN, not 1.
+    trips = pd.DataFrame(
+        {
+            "route_id": ["A", "A", "B"],
+            "trip_id": ["t1", "t2", "t3"],
+            "shape_id": ["S", "S", "S"],
+            "direction_id": ["1", "", None],
+        }
+    )
+    stop_times = _two_stop_times(
+        [
+            ("t1", "06:00:00", "06:30:00"),
+            ("t2", "07:00:00", "07:30:00"),
+            ("t3", "06:00:00", "06:30:00"),
+        ]
+    )
+    shape_len = pd.DataFrame({"shape_id": ["S"], "shape_len_m": [8046.72]})
+    supply = compute_route_supply_metrics(trips, stop_times, shape_len).set_index("route_id")
+    assert supply.loc["A", "n_directions"] == 1
+    assert pd.isna(supply.loc["B", "n_directions"])
+
+    # Feed without a direction_id column at all -> NaN for every route.
+    no_dir = compute_route_supply_metrics(
+        trips.drop(columns="direction_id"), stop_times, shape_len
+    ).set_index("route_id")
+    assert no_dir["n_directions"].isna().all()
+
+
+# ---------------------------------------------------------------------------
 # collapse_to_route_number  (multiple GTFS route_ids -> one public number)
 # ---------------------------------------------------------------------------
 
@@ -161,6 +220,7 @@ def _collision_metrics() -> pd.DataFrame:
             "route_length_modal_mi": [4.0, 8.0],
             "pct_day_with_service": [50.0, 90.0],
             "median_headway_min": [20.0, 10.0],
+            "n_directions": [1, 2],
             "n_stops": [10, 20],
             "shared_stop_share": [0.5, 0.5],
             "n_competitor_routes": [2, 3],
@@ -180,6 +240,8 @@ def test_collision_uses_trips_weighted_means_for_new_cols() -> None:
     assert collapsed.loc["100", "route_length_modal_mi"] == pytest.approx(7.0)
     # route_length_mi still takes the max extent across sub-routes.
     assert collapsed.loc["100", "route_length_mi"] == pytest.approx(12.0)
+    # n_directions takes the max (two one-way variants stay conservative, not summed).
+    assert collapsed.loc["100", "n_directions"] == 2
 
 
 def test_no_collision_passes_new_columns_through() -> None:
@@ -187,3 +249,4 @@ def test_no_collision_passes_new_columns_through() -> None:
     collapsed = collapse_to_route_number(solo, route_col="route_short_name").set_index("route_id")
     assert collapsed.loc["100", "pct_day_with_service"] == pytest.approx(50.0)
     assert collapsed.loc["100", "route_length_modal_mi"] == pytest.approx(4.0)
+    assert collapsed.loc["100", "n_directions"] == 1
