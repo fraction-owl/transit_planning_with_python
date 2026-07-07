@@ -190,7 +190,7 @@ def test_end_to_end_export(tmp_path, monkeypatch) -> None:
 
 
 def test_run_guard_rejects_is_express_predictor_when_excluding(monkeypatch, tmp_path) -> None:
-    """Holding express out AND keeping is_express a regressor is a singular design; run() refuses."""
+    """Excluding express while is_express is still a regressor is singular; run() refuses."""
     # Non-placeholder paths so run() passes the '# <<< EDIT ME' guard and reaches the check.
     for attr in ("ANCHOR_PATH", "BUNDLE_DIR", "MANIFEST_PATH", "OUTPUT_DIR"):
         monkeypatch.setattr(rpm, attr, tmp_path / attr.lower())
@@ -225,7 +225,7 @@ def test_build_express_bench_none_when_empty() -> None:
     assert rpm.build_express_bench(pd.DataFrame()) is None
 
 
-def _result_from(y, x_matrix, names):
+def _result_from(y, x_matrix, names) -> rpm.OLSResult:
     """Fit and return an OLSResult (thin helper for the supply-vs-demand tests)."""
     return rpm.fit_ols(y, x_matrix, names, se_type="HC1")
 

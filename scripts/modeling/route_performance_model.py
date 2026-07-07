@@ -1052,7 +1052,7 @@ def export_results(
     express_frame: Optional[pd.DataFrame] = None,
     demand_result: Optional[OLSResult] = None,
 ) -> Path:
-    """Write the results workbook (ExpressBench when express held out; demand-diagnostic sheets when fit)."""
+    """Write the results workbook, with ExpressBench / demand-diagnostic sheets when applicable."""
     workbook = OUTPUT_DIR / "route_performance_results.xlsx"
     summary = build_summary_frame(result, service_day)
     coef = build_coefficient_frame(result)
