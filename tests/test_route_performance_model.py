@@ -111,8 +111,9 @@ def test_canonical_key_normalizes_join_values() -> None:
     assert out.tolist() == ["159", "159", "42", "", "RT5", "RT5"]
 
 
-def test_derive_features_flags_express_and_equity_pct() -> None:
+def test_derive_features_flags_express_and_equity_pct(monkeypatch) -> None:
     """Express routes get a 1/0 flag and equity %s divide count by denominator."""
+    monkeypatch.setattr(rpm, "EXPRESS_ROUTES", ("101",))
     table = pd.DataFrame(
         {
             "route_id": ["101", "100"],  # 101 is in EXPRESS_ROUTES, 100 is not
@@ -124,6 +125,14 @@ def test_derive_features_flags_express_and_equity_pct() -> None:
 
     assert out["is_express"].tolist() == [1.0, 0.0]
     np.testing.assert_allclose(out["pct_low_income"], [0.25, 0.20])
+
+
+def test_derive_features_empty_express_flags_nothing() -> None:
+    """The default empty EXPRESS_ROUTES flags no route, so the feature is a no-op."""
+    table = pd.DataFrame({"route_id": ["101", "202", "303"]})
+    out = rpm.derive_features(table)
+
+    assert out["is_express"].tolist() == [0.0, 0.0, 0.0]
 
 
 def test_end_to_end_export(tmp_path, monkeypatch) -> None:
@@ -178,6 +187,114 @@ def test_end_to_end_export(tmp_path, monkeypatch) -> None:
     # scale, so its mean tracks the actual mean closely on clean data.
     ratio = perf["fitted_potential"].mean() / perf["weekday_avg_ntd_boardings"].mean()
     assert 0.9 < ratio < 1.1
+
+
+def test_run_guard_rejects_is_express_predictor_when_excluding(monkeypatch, tmp_path) -> None:
+    """Excluding express while is_express is still a regressor is singular; run() refuses."""
+    # Non-placeholder paths so run() passes the '# <<< EDIT ME' guard and reaches the check.
+    for attr in ("ANCHOR_PATH", "BUNDLE_DIR", "MANIFEST_PATH", "OUTPUT_DIR"):
+        monkeypatch.setattr(rpm, attr, tmp_path / attr.lower())
+    monkeypatch.setattr(rpm, "EXCLUDE_EXPRESS_FROM_FIT", True)
+    monkeypatch.setattr(rpm, "PREDICTORS", ("weekday_avg_revenue_hours", "is_express"))
+
+    with pytest.raises(ValueError, match="is_express"):
+        rpm.run()
+
+
+def test_build_express_bench_ranks_by_productivity() -> None:
+    """The bench reports boardings per revenue hour and sorts most- to least-productive."""
+    express = pd.DataFrame(
+        {
+            "route_id": ["A", "B"],
+            "weekday_avg_ntd_boardings": [100.0, 300.0],
+            "weekday_avg_revenue_hours": [10.0, 100.0],  # PPH 10 (A) vs 3 (B)
+        }
+    )
+    bench = rpm.build_express_bench(express)
+
+    assert list(bench["route_id"]) == ["A", "B"]  # A is more productive -> first
+    np.testing.assert_allclose(bench["boardings_per_rev_hour"], [10.0, 3.0])
+    # A descriptive bench, never a fitted expectation.
+    assert "fitted_potential" not in bench.columns
+    assert "residual" not in bench.columns
+
+
+def test_build_express_bench_none_when_empty() -> None:
+    """No held-out express routes -> no bench (and no ExpressBench sheet downstream)."""
+    assert rpm.build_express_bench(None) is None
+    assert rpm.build_express_bench(pd.DataFrame()) is None
+
+
+def _result_from(y, x_matrix, names) -> rpm.OLSResult:
+    """Fit and return an OLSResult (thin helper for the supply-vs-demand tests)."""
+    return rpm.fit_ols(y, x_matrix, names, se_type="HC1")
+
+
+def test_supply_vs_demand_surfaces_masked_demand() -> None:
+    """A demand feature masked by a collinear supply term is flagged SURFACED without it."""
+    rng = np.random.default_rng(3)
+    n = 200
+    demand = rng.normal(0.0, 1.0, n)
+    # Supply is nearly collinear with demand, so in the joint fit the demand term's
+    # signal is absorbed by supply; y is actually driven by demand.
+    supply = demand + rng.normal(0.0, 0.05, n)
+    y = 1.0 + 0.8 * demand + rng.normal(0.0, 0.5, n)
+    names = ["intercept", "log_weekday_avg_revenue_hours", "total_pop"]
+    x_full = np.column_stack([np.ones(n), supply, demand])
+
+    primary = _result_from(y, x_full, names)
+    keep = [0, 2]  # drop the supply column
+    demand_fit = _result_from(y, x_full[:, keep], [names[i] for i in keep])
+
+    svd = rpm.build_supply_vs_demand(primary, demand_fit)
+    by_term = svd.set_index("term")
+    assert (
+        by_term.loc["log_weekday_avg_revenue_hours", "note"]
+        == "supply term — removed in demand model"
+    )
+    assert pd.isna(by_term.loc["log_weekday_avg_revenue_hours", "coef_no_supply"])
+    # total_pop is non-significant with the collinear supply term in, significant without it.
+    assert by_term.loc["total_pop", "p_with_supply"] >= 0.05
+    assert by_term.loc["total_pop", "p_no_supply"] < 0.05
+    assert by_term.loc["total_pop", "note"] == "SURFACED (<0.05 without supply)"
+
+
+def test_export_writes_express_and_demand_sheets(tmp_path, monkeypatch) -> None:
+    """When an express frame and a demand fit are passed, their sheets are added."""
+    monkeypatch.setattr(rpm, "PREDICTORS", ("weekday_avg_revenue_hours", "total_pop"))
+    monkeypatch.setattr(rpm, "LOG_PREDICTORS", ("weekday_avg_revenue_hours", "total_pop"))
+    monkeypatch.setattr(rpm, "OUTPUT_DIR", tmp_path)
+
+    rng = np.random.default_rng(11)
+    n = 60
+    hours = rng.uniform(50, 500, n)
+    pop = rng.uniform(1000, 50000, n)
+    boardings = np.exp(1.0 + 0.6 * np.log(hours) + 0.3 * np.log(pop) + rng.normal(0, 0.1, n))
+    table = pd.DataFrame(
+        {
+            "route_id": [str(i) for i in range(n)],
+            "weekday_avg_ntd_boardings": boardings,
+            "weekday_avg_revenue_hours": hours,
+            "total_pop": pop,
+        }
+    )
+    y, x_matrix, names, frame = rpm.build_design_matrix(table)
+    result = rpm.fit_ols(y, x_matrix, names, se_type="HC1")
+    keep = [i for i, nm in enumerate(names) if nm != "log_weekday_avg_revenue_hours"]
+    demand_result = rpm.fit_ols(y, x_matrix[:, keep], [names[i] for i in keep], se_type="HC1")
+
+    express_frame = pd.DataFrame(
+        {
+            "route_id": ["X1", "X2"],
+            "weekday_avg_ntd_boardings": [500.0, 120.0],
+            "weekday_avg_revenue_hours": [20.0, 30.0],
+        }
+    )
+    workbook = rpm.export_results(result, frame, None, express_frame, demand_result)
+
+    sheets = pd.read_excel(workbook, sheet_name=None)
+    assert {"ExpressBench", "DemandModelCoef", "SupplyVsDemand"} <= set(sheets)
+    assert list(sheets["ExpressBench"]["route_id"]) == ["X1", "X2"]  # 25 PPH before 4 PPH
 
 
 def _write_bundle_manifest(bundle_dir, entries) -> None:
