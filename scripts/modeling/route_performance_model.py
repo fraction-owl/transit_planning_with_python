@@ -14,6 +14,13 @@ controlled, so the residual is a productivity-adjusted over/under read rather th
 deliberately NOT regressors: they ride alongside the residual as diagnostic overlays
 so an underperformer can be read as thin-service vs car-oriented-market vs cannibalized.
 
+Express routes are held out of the fit (EXCLUDE_EXPRESS_FROM_FIT) rather than modeled
+with a dummy: their ridership comes from park-and-ride catchment and destination
+employment cores that the buffer-based demand features (population, enrollment, schools)
+do not measure, so pooling them both mis-scores every express route and pulls the
+land-use coefficients toward zero for the local routes the features actually describe.
+They are reported descriptively (boardings per revenue hour) on the ExpressBench sheet.
+
 This is the secured-box fit (PART B): the NTD anchor (the dependent variable plus the
 service-supplied predictors revenue_hours / revenue_miles) is read here and never
 leaves; the non-NTD feature tables (GTFS competition + demographics) are prepped on the
@@ -35,6 +42,7 @@ Inputs:
 Outputs:
     route_performance_results.xlsx
         ModelSummary | Coefficients | RoutePerformance | Correlations | CollinearityMatrix
+        | ExpressBench (descriptive; only when express routes are held out of the fit)
     diagnostic plots + a run-log sidecar.
 
 ArcGIS Pro Python stack only (numpy / scipy / pandas / matplotlib); no statsmodels,
@@ -141,7 +149,11 @@ PREDICTORS: Final[tuple[str, ...]] = (
     "competition_intensity",  # cannibalization at shared stops       [GTFS]
     "transfer_route_count",  # network connectivity / feeder pull     [GTFS]
     "stops_per_mile",  # stop access density (local vs limited) [GTFS]
-    "is_express",  # service-type flag (derived below)
+    # NOTE: is_express is intentionally NOT a regressor. Express routes are held out
+    # of the fit (EXCLUDE_EXPRESS_FROM_FIT) and benchmarked descriptively instead,
+    # because the buffer-based demand features misrepresent their catchment. To
+    # restore the old pooled model with an express intercept dummy, re-add
+    # "is_express" here and set EXCLUDE_EXPRESS_FROM_FIT = False.
 )
 
 # Predictors to log1p (zeros handled). Counts/quantities are right-skewed; shares,
@@ -164,9 +176,36 @@ LOG_DEPENDENT: Final[bool] = True
 DROP_NONPOSITIVE_DEPENDENT: Final[bool] = True
 
 # --- Service-type flag -------------------------------------------------------
-# Routes flagged is_express = 1; everything else 0. Replace these placeholders
-# with your agency's express route numbers.
-EXPRESS_ROUTES: Final[tuple[str, ...]] = ("101", "202", "303")  # <<< EDIT ME
+# Routes flagged is_express = 1; everything else 0. List your agency's express
+# route numbers here. Leave it empty (the default) if your system has no express
+# routes — nothing is flagged, nothing is held out, and no ExpressBench sheet is
+# written, so the express machinery below is a no-op you can ignore entirely.
+EXPRESS_ROUTES: Final[tuple[str, ...]] = ()  # <<< EDIT ME (empty = no express routes)
+
+# When True, express routes are dropped from the regression entirely (not modeled
+# with a dummy) and reported descriptively on the ExpressBench sheet instead. Their
+# ridership is driven by park-and-ride catchment and destination employment cores
+# that the buffer-based demand features (total_pop, enrollment_*, schools) do not
+# capture, so pooling them (a) mis-scores every express route against a local-demand
+# model and (b) drags the land-use coefficients toward zero for the local routes the
+# features actually describe. Set False (and re-add "is_express" to PREDICTORS) only
+# to reproduce the old pooled fit with an express intercept shift. Harmless to leave
+# True when EXPRESS_ROUTES is empty: no routes are flagged, so nothing is held out.
+EXCLUDE_EXPRESS_FROM_FIT: Final[bool] = True
+
+# --- Demand diagnostic (supply-free companion fit) ---------------------------
+# The primary fit includes log(revenue_hours), which dominates and is collinear with
+# the demand features (service is allocated where the riders already are), so a
+# land-use coefficient can read non-significant simply because revenue_hours has
+# already absorbed its signal. When True, a second model is fit on the SAME local
+# routes with the supply term removed — a pure demand model — and its coefficients are
+# dropped beside the primary ones (SupplyVsDemand sheet). A feature that jumps to
+# significant here is a demand driver currently MASKED by supply, not an absent effect.
+# NOTE: this demand model's residual is NOT productivity-adjusted (the "this route is
+# just small" artifact returns), so it is a diagnostic companion only, never the
+# prioritization engine — read its coefficients, not its residuals.
+SUPPLY_PREDICTOR: Final[str] = "weekday_avg_revenue_hours"
+FIT_DEMAND_DIAGNOSTIC: Final[bool] = True
 
 # --- Diagnostic overlays (attached to RoutePerformance + Correlations, NOT regressors) ------
 # Two roles, neither in the fit: (a) service levers + equity context that explain why a
@@ -910,10 +949,100 @@ def build_route_performance(result: OLSResult, model_frame: pd.DataFrame) -> pd.
     return out.sort_values("studentized_residual").reset_index(drop=True)
 
 
+def build_express_bench(express_frame: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    """Descriptive productivity bench for the express routes held out of the fit.
+
+    Express routes are not scored against the local-demand model (their catchment is
+    not what the buffer features measure), so instead of a residual they get a plain
+    productivity read — weekday boardings per revenue hour — next to their raw
+    fundamentals and service levers, sorted most- to least-productive. This is a
+    ranking aid, not a model output: there is deliberately no "expected" boardings or
+    residual column here, because a local-demand fit has no standing to call an express
+    route over- or under-performing.
+    """
+    if express_frame is None or express_frame.empty:
+        return None
+
+    boardings_col = DEPENDENT_VAR
+    rev_hours_col = "weekday_avg_revenue_hours"
+    out = pd.DataFrame({ROUTE_KEY: express_frame[ROUTE_KEY].to_numpy()})
+    boardings = pd.to_numeric(express_frame.get(boardings_col), errors="coerce")
+    out[boardings_col] = boardings.to_numpy()
+
+    if rev_hours_col in express_frame.columns:
+        rev_hours = pd.to_numeric(express_frame[rev_hours_col], errors="coerce")
+        out[rev_hours_col] = rev_hours.to_numpy()
+        with np.errstate(divide="ignore", invalid="ignore"):
+            out["boardings_per_rev_hour"] = (boardings / rev_hours.replace(0, np.nan)).to_numpy()
+
+    # Raw fundamentals + a few service levers, so the bench reads like RoutePerformance
+    # without implying a fitted expectation. is_express is dropped (constant here).
+    context_cols = [
+        c
+        for c in (*PREDICTORS, "span_hours", "median_headway_min", "avg_speed_mph", "trips_per_day")
+        if c not in {boardings_col, rev_hours_col, "is_express"} and c in express_frame.columns
+    ]
+    for col in context_cols:
+        out[col] = pd.to_numeric(express_frame[col], errors="coerce").to_numpy()
+
+    sort_key = "boardings_per_rev_hour" if "boardings_per_rev_hour" in out.columns else boardings_col
+    return out.sort_values(sort_key, ascending=False).reset_index(drop=True)
+
+
+def build_supply_vs_demand(primary: OLSResult, demand: OLSResult) -> pd.DataFrame:
+    """Side-by-side coefficient comparison of the primary fit vs. the supply-free fit.
+
+    One row per non-intercept term, showing the coefficient / p-value / standardized
+    coefficient with the supply term in (primary) and out (demand). The ``note`` column
+    calls out the read leadership cares about: a term that was non-significant with
+    revenue_hours in but crosses p<0.05 once it is removed was MASKED by supply, i.e. a
+    real demand driver the primary model could not surface. The supply term itself shows
+    only its primary column (it is absent from the demand model by construction).
+    """
+
+    def as_map(res: OLSResult, attr: str) -> dict[str, float]:
+        return dict(zip(res.term_names, getattr(res, attr)))
+
+    p_coef, p_p, p_sc = as_map(primary, "params"), as_map(primary, "p_values"), as_map(primary, "std_coef")
+    d_coef, d_p, d_sc = as_map(demand, "params"), as_map(demand, "p_values"), as_map(demand, "std_coef")
+    removed = set(primary.term_names) - set(demand.term_names)
+
+    rows: list[dict[str, object]] = []
+    for term in primary.term_names:
+        if term == "intercept":
+            continue
+        wp, np_p = p_p.get(term), d_p.get(term)
+        if term in removed:
+            note = "supply term — removed in demand model"
+        elif wp is not None and np_p is not None and wp >= 0.05 and np_p < 0.05:
+            note = "SURFACED (<0.05 without supply)"
+        elif wp is not None and np_p is not None and np_p < wp:
+            note = "stronger without supply"
+        else:
+            note = ""
+        rows.append(
+            {
+                "term": term,
+                "coef_with_supply": p_coef.get(term),
+                "p_with_supply": wp,
+                "std_coef_with_supply": p_sc.get(term),
+                "coef_no_supply": d_coef.get(term, np.nan),
+                "p_no_supply": d_p.get(term, np.nan),
+                "std_coef_no_supply": d_sc.get(term, np.nan),
+                "note": note,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def export_results(
-    result: OLSResult, model_frame: pd.DataFrame, service_day: Optional[str] = None
+    result: OLSResult,
+    model_frame: pd.DataFrame,
+    service_day: Optional[str] = None,
+    express_frame: Optional[pd.DataFrame] = None,
+    demand_result: Optional[OLSResult] = None,
 ) -> Path:
-    """Write the five-sheet results workbook and return its path."""
+    """Write the results workbook (ExpressBench when express held out; demand-diagnostic sheets when fit)."""
     workbook = OUTPUT_DIR / "route_performance_results.xlsx"
     summary = build_summary_frame(result, service_day)
     coef = build_coefficient_frame(result)
@@ -938,12 +1067,25 @@ def export_results(
     modeled = [c for c in [DEPENDENT_VAR, *PREDICTORS] if c in numeric.columns]
     collinearity = numeric[modeled].corr().reset_index().rename(columns={"index": "variable"})
 
+    express_bench = build_express_bench(express_frame)
+
     with pd.ExcelWriter(workbook) as writer:
         summary.to_excel(writer, sheet_name="ModelSummary", index=False)
         coef.to_excel(writer, sheet_name="Coefficients", index=False)
         performance.to_excel(writer, sheet_name="RoutePerformance", index=False)
         corr_with_target.to_excel(writer, sheet_name="Correlations", index=False)
         collinearity.to_excel(writer, sheet_name="CollinearityMatrix", index=False)
+        if express_bench is not None and not express_bench.empty:
+            express_bench.to_excel(writer, sheet_name="ExpressBench", index=False)
+            logging.info("ExpressBench sheet written for %d held-out express route(s).", len(express_bench))
+        if demand_result is not None:
+            build_coefficient_frame(demand_result).to_excel(
+                writer, sheet_name="DemandModelCoef", index=False
+            )
+            build_supply_vs_demand(result, demand_result).to_excel(
+                writer, sheet_name="SupplyVsDemand", index=False
+            )
+            logging.info("Demand-diagnostic sheets written (DemandModelCoef, SupplyVsDemand).")
 
     logging.info("Results workbook written to '%s'.", workbook)
     return workbook
@@ -1085,6 +1227,14 @@ def run() -> Optional[OLSResult]:
         logging.warning("Set the input/output paths (marked '# <<< EDIT ME') before running.")
         return None
 
+    if EXCLUDE_EXPRESS_FROM_FIT and "is_express" in PREDICTORS:
+        raise ValueError(
+            "EXCLUDE_EXPRESS_FROM_FIT is True but 'is_express' is still in PREDICTORS. "
+            "With express routes held out of the fit, is_express is constant (all 0) and "
+            "would make the design matrix singular. Remove 'is_express' from PREDICTORS, "
+            "or set EXCLUDE_EXPRESS_FROM_FIT = False to fit the pooled model with a dummy."
+        )
+
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     table, provenance, service_day = assemble_model_table()
@@ -1092,11 +1242,55 @@ def run() -> Optional[OLSResult]:
     if DEPENDENT_VAR not in table.columns:
         raise KeyError(f"Dependent variable '{DEPENDENT_VAR}' not in the assembled table.")
 
+    # Express routes run on a different demand construct than the buffer-based features
+    # measure, so they are held out of the fit and benchmarked descriptively instead
+    # (see EXCLUDE_EXPRESS_FROM_FIT). Splitting here keeps the design matrix, the
+    # residuals, and every correlation on the modeled (local) routes only.
+    express_frame: Optional[pd.DataFrame] = None
+    if EXCLUDE_EXPRESS_FROM_FIT:
+        is_exp = table["is_express"] == 1
+        express_frame = table[is_exp].copy()
+        table = table[~is_exp].copy()
+        logging.info(
+            "Held %d express route(s) out of the fit; %d local route(s) remain to model.",
+            len(express_frame),
+            len(table),
+        )
+
     y, x_matrix, term_names, model_frame = build_design_matrix(table)
     result = fit_ols(y, x_matrix, term_names, SE_TYPE)
     log_report(result)
 
-    export_results(result, model_frame, service_day)
+    # Supply-free companion fit: same response, same local rows, same transforms, with
+    # the supply column dropped from the design so a demand feature masked by
+    # revenue_hours can show itself. Slicing the already-built matrix (rather than
+    # rebuilding) guarantees the two models sit on an identical route set.
+    demand_result: Optional[OLSResult] = None
+    if FIT_DEMAND_DIAGNOSTIC:
+        supply_term = (
+            f"log_{SUPPLY_PREDICTOR}" if SUPPLY_PREDICTOR in LOG_PREDICTORS else SUPPLY_PREDICTOR
+        )
+        if supply_term in term_names:
+            keep = [i for i, name in enumerate(term_names) if name != supply_term]
+            demand_result = fit_ols(
+                y, x_matrix[:, keep], [term_names[i] for i in keep], SE_TYPE
+            )
+            logging.info(
+                "Demand diagnostic (supply term '%s' removed): adjR2=%.4f LOO=%.4f — expected "
+                "LOWER than the primary fit; this is a demand model, read its coefficients not "
+                "its residuals.",
+                supply_term,
+                demand_result.adj_r_squared,
+                demand_result.loo_r_squared,
+            )
+        else:
+            logging.warning(
+                "FIT_DEMAND_DIAGNOSTIC is set but supply term '%s' is not in the model; "
+                "skipping the demand companion.",
+                supply_term,
+            )
+
+    export_results(result, model_frame, service_day, express_frame, demand_result)
     if MAKE_PLOTS:
         make_diagnostic_plots(result)
     write_run_log(result, provenance, service_day)
