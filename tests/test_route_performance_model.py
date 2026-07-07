@@ -248,7 +248,10 @@ def test_supply_vs_demand_surfaces_masked_demand() -> None:
 
     svd = rpm.build_supply_vs_demand(primary, demand_fit)
     by_term = svd.set_index("term")
-    assert by_term.loc["log_weekday_avg_revenue_hours", "note"] == "supply term — removed in demand model"
+    assert (
+        by_term.loc["log_weekday_avg_revenue_hours", "note"]
+        == "supply term — removed in demand model"
+    )
     assert pd.isna(by_term.loc["log_weekday_avg_revenue_hours", "coef_no_supply"])
     # total_pop is non-significant with the collinear supply term in, significant without it.
     assert by_term.loc["total_pop", "p_with_supply"] >= 0.05

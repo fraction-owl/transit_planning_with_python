@@ -985,7 +985,9 @@ def build_express_bench(express_frame: Optional[pd.DataFrame]) -> Optional[pd.Da
     for col in context_cols:
         out[col] = pd.to_numeric(express_frame[col], errors="coerce").to_numpy()
 
-    sort_key = "boardings_per_rev_hour" if "boardings_per_rev_hour" in out.columns else boardings_col
+    sort_key = (
+        "boardings_per_rev_hour" if "boardings_per_rev_hour" in out.columns else boardings_col
+    )
     return out.sort_values(sort_key, ascending=False).reset_index(drop=True)
 
 
@@ -1003,8 +1005,16 @@ def build_supply_vs_demand(primary: OLSResult, demand: OLSResult) -> pd.DataFram
     def as_map(res: OLSResult, attr: str) -> dict[str, float]:
         return dict(zip(res.term_names, getattr(res, attr)))
 
-    p_coef, p_p, p_sc = as_map(primary, "params"), as_map(primary, "p_values"), as_map(primary, "std_coef")
-    d_coef, d_p, d_sc = as_map(demand, "params"), as_map(demand, "p_values"), as_map(demand, "std_coef")
+    p_coef, p_p, p_sc = (
+        as_map(primary, "params"),
+        as_map(primary, "p_values"),
+        as_map(primary, "std_coef"),
+    )
+    d_coef, d_p, d_sc = (
+        as_map(demand, "params"),
+        as_map(demand, "p_values"),
+        as_map(demand, "std_coef"),
+    )
     removed = set(primary.term_names) - set(demand.term_names)
 
     rows: list[dict[str, object]] = []
@@ -1077,7 +1087,9 @@ def export_results(
         collinearity.to_excel(writer, sheet_name="CollinearityMatrix", index=False)
         if express_bench is not None and not express_bench.empty:
             express_bench.to_excel(writer, sheet_name="ExpressBench", index=False)
-            logging.info("ExpressBench sheet written for %d held-out express route(s).", len(express_bench))
+            logging.info(
+                "ExpressBench sheet written for %d held-out express route(s).", len(express_bench)
+            )
         if demand_result is not None:
             build_coefficient_frame(demand_result).to_excel(
                 writer, sheet_name="DemandModelCoef", index=False
@@ -1272,9 +1284,7 @@ def run() -> Optional[OLSResult]:
         )
         if supply_term in term_names:
             keep = [i for i, name in enumerate(term_names) if name != supply_term]
-            demand_result = fit_ols(
-                y, x_matrix[:, keep], [term_names[i] for i in keep], SE_TYPE
-            )
+            demand_result = fit_ols(y, x_matrix[:, keep], [term_names[i] for i in keep], SE_TYPE)
             logging.info(
                 "Demand diagnostic (supply term '%s' removed): adjR2=%.4f LOO=%.4f — expected "
                 "LOWER than the primary fit; this is a demand model, read its coefficients not "
