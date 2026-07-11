@@ -64,6 +64,13 @@ from scipy import stats
 CONFIG_BEGIN_MARKER: str = "# === BEGIN CONFIG ==="
 CONFIG_END_MARKER: str = "# === END CONFIG ==="
 
+# Path to this file, used to extract the config block for the run log. ``__file__``
+# is undefined when the code is pasted into a notebook cell, so a configured
+# fallback keeps the run log working there too.
+SELF_PATH: Final[Path] = (
+    Path(__file__) if "__file__" in globals() else Path("monthly_ridership_model.py")
+)
+
 
 # =============================================================================
 # CONFIGURATION
@@ -1113,7 +1120,7 @@ def write_run_log(
     log_path = output_dir / "monthly_ridership_model_runlog.txt"
 
     try:
-        config_text: str = extract_config_block(Path(__file__))
+        config_text: str = extract_config_block(SELF_PATH)
     except (OSError, ValueError) as exc:
         logging.error("Could not extract config block for run log: %s", exc)
         return False
@@ -1137,7 +1144,7 @@ def write_run_log(
         f"Output directory: {output_dir}",
         f"Anchor:           {anchor_path if anchor_path is not None else '(not recorded)'}",
         f"Anchor SHA-256:   {anchor_sha}",
-        f"Source script:    {Path(__file__).resolve()}",
+        f"Source script:    {SELF_PATH.resolve() if SELF_PATH.exists() else SELF_PATH}",
         "",
         "-" * 72,
         "FEATURE BUNDLE PROVENANCE (verified SHA-256 of joined bundles)",
