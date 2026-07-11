@@ -91,6 +91,13 @@ except ImportError as exc:  # pragma: no cover - exercised only without sklearn
 CONFIG_BEGIN_MARKER: str = "# === BEGIN CONFIG ==="
 CONFIG_END_MARKER: str = "# === END CONFIG ==="
 
+# Path to this file, used to extract the config block for the run log. ``__file__``
+# is undefined when the code is pasted into a notebook cell, so a configured
+# fallback keeps the run log working there too.
+SELF_PATH: Final[Path] = (
+    Path(__file__) if "__file__" in globals() else Path("ridership_ml_model.py")
+)
+
 
 # =============================================================================
 # CONFIGURATION
@@ -1024,7 +1031,7 @@ def write_run_log(output_dir: Path) -> bool:
     log_path = output_dir / "ridership_ml_model_runlog.txt"
 
     try:
-        config_text: str = extract_config_block(Path(__file__))
+        config_text: str = extract_config_block(SELF_PATH)
     except (OSError, ValueError) as exc:
         logging.error("Could not extract config block for run log: %s", exc)
         return False
@@ -1035,7 +1042,7 @@ def write_run_log(output_dir: Path) -> bool:
         "=" * 72,
         f"Run timestamp:    {datetime.now().isoformat(timespec='seconds')}",
         f"Output directory: {output_dir}",
-        f"Source script:    {Path(__file__).resolve()}",
+        f"Source script:    {SELF_PATH.resolve() if SELF_PATH.exists() else SELF_PATH}",
         "",
         "-" * 72,
         "CONFIGURATION (verbatim from source)",

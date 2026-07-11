@@ -419,6 +419,14 @@ def extract_config_block(source_file: Path) -> str:
     return "\n".join(lines[begin_idx + 1 : end_idx])
 
 
+def resolve_source_file() -> Path | None:
+    """Best-effort path to this script's source (``None`` in notebooks)."""
+    try:
+        return Path(__file__).resolve()
+    except NameError:
+        return None
+
+
 def write_run_log(output_folder: Path) -> bool:
     """Write a run log of the configuration block into *output_folder*.
 
@@ -427,11 +435,17 @@ def write_run_log(output_folder: Path) -> bool:
     """
     log_path = output_folder / "stops_ridership_joiner_gpd_runlog.txt"
 
-    try:
-        config_text: str = extract_config_block(Path(__file__))
-    except (OSError, ValueError) as exc:
-        logging.error("Could not extract config block for run log: %s", exc)
-        return False
+    source_file = resolve_source_file()
+    if source_file is None:
+        config_text = "(config block unavailable: interactive session, no __file__ on disk)"
+        source_display = "<interactive>"
+    else:
+        try:
+            config_text = extract_config_block(source_file)
+        except (OSError, ValueError) as exc:
+            logging.error("Could not extract config block for run log: %s", exc)
+            return False
+        source_display = str(source_file)
 
     lines: list[str] = [
         "=" * 72,
@@ -439,7 +453,7 @@ def write_run_log(output_folder: Path) -> bool:
         "=" * 72,
         f"Run timestamp:    {datetime.now().isoformat(timespec='seconds')}",
         f"Output folder:    {output_folder}",
-        f"Source script:    {Path(__file__).resolve()}",
+        f"Source script:    {source_display}",
         "",
         "-" * 72,
         "CONFIGURATION (verbatim from source)",

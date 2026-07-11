@@ -458,6 +458,14 @@ def extract_config_block(source_file: Path) -> str:
     return "\n".join(lines[begin_idx + 1 : end_idx])
 
 
+def resolve_source_file() -> Path | None:
+    """Best-effort path to this script's source (``None`` in notebooks)."""
+    try:
+        return Path(__file__).resolve()
+    except NameError:
+        return None
+
+
 def write_run_log(output_file: str) -> bool:
     """Write a sidecar _runlog.txt alongside *output_file* capturing the config block.
 
@@ -467,11 +475,17 @@ def write_run_log(output_file: str) -> bool:
     out_path = Path(output_file)
     log_path = out_path.with_name(f"{out_path.stem}_runlog.txt")
 
-    try:
-        config_text: str = extract_config_block(Path(__file__))
-    except (OSError, ValueError) as exc:
-        logging.error("Could not extract config block for run log: %s", exc)
-        return False
+    source_file = resolve_source_file()
+    if source_file is None:
+        config_text = "(config block unavailable: interactive session, no __file__ on disk)"
+        source_display = "<interactive>"
+    else:
+        try:
+            config_text = extract_config_block(source_file)
+        except (OSError, ValueError) as exc:
+            logging.error("Could not extract config block for run log: %s", exc)
+            return False
+        source_display = str(source_file)
 
     lines: list[str] = [
         "=" * 72,
@@ -479,7 +493,7 @@ def write_run_log(output_file: str) -> bool:
         "=" * 72,
         f"Run timestamp:   {dt.datetime.now().isoformat(timespec='seconds')}",
         f"Output file:     {output_file}",
-        f"Source script:   {Path(__file__).resolve()}",
+        f"Source script:   {source_display}",
         "",
         "-" * 72,
         "CONFIGURATION (verbatim from source)",
