@@ -140,6 +140,44 @@ def test_load_gtfs_data_dtype_mapping_string(tmp_path) -> None:
     assert df.loc[0, "stop_id"] == "001"
 
 
+def test_load_gtfs_data_full_spec_fixture_loads_with_defaults() -> None:
+    """The gtfs_basic fixture covers the full 13-file GTFS spec.
+
+    With files=None, load_gtfs_data attempts the standard 13 GTFS text files
+    and raises if any is missing, so this doubles as a guard that the fixture
+    stays spec-complete.
+    """
+    fixture = Path(__file__).parent / "fixtures" / "gtfs_basic"
+
+    result = load_gtfs_data(str(fixture))
+
+    assert set(result.keys()) == {
+        "agency",
+        "stops",
+        "routes",
+        "trips",
+        "stop_times",
+        "calendar",
+        "calendar_dates",
+        "fare_attributes",
+        "fare_rules",
+        "feed_info",
+        "frequencies",
+        "shapes",
+        "transfers",
+    }
+    # Cross-file referential integrity for the optional files.
+    trips = result["trips"]
+    assert set(result["frequencies"]["trip_id"]) <= set(trips["trip_id"])
+    assert set(result["fare_rules"]["route_id"]) <= set(result["routes"]["route_id"])
+    assert set(trips["shape_id"]) == set(result["shapes"]["shape_id"])
+    stop_ids = set(result["stops"]["stop_id"])
+    assert set(result["transfers"]["from_stop_id"]) <= stop_ids
+    assert set(result["transfers"]["to_stop_id"]) <= stop_ids
+    assert set(result["fare_rules"]["fare_id"]) <= set(result["fare_attributes"]["fare_id"])
+    assert set(result["calendar_dates"]["service_id"]) <= set(result["calendar"]["service_id"])
+
+
 # ---------------------------------------------------------------------------
 # zip archive support
 # ---------------------------------------------------------------------------

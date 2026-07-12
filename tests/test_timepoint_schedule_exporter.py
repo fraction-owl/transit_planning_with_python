@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+from pathlib import Path
+
+import openpyxl
 import pandas as pd
 
 from scripts.gtfs_exports.timepoint_schedule_exporter import (
+    MAX_COLUMN_WIDTH,
     MISSING_TIME,
     adjust_time,
     apply_in_out_filters,
     build_service_id_schedule_map,
+    export_to_excel_multiple_sheets,
     format_output_folder_name,
     get_all_route_short_names,
     map_service_id_to_schedule,
@@ -310,3 +315,34 @@ def test_build_service_id_schedule_map_override_takes_precedence() -> None:
         assert mapping["1"] == "CustomLabel"
     finally:
         mod.SERVICE_LABEL_OVERRIDES = orig
+
+
+# ---------------------------------------------------------------------------
+# export_to_excel_multiple_sheets — real openpyxl output
+# ---------------------------------------------------------------------------
+
+
+def test_export_to_excel_multiple_sheets_writes_real_workbook(tmp_path: Path) -> None:
+    out = tmp_path / "schedule.xlsx"
+    df = pd.DataFrame({"Route": ["R1", "R1"], "Main St & Doe St": ["07:10", "12:10"]})
+
+    export_to_excel_multiple_sheets({"Weekday_0": df, "Saturday_0": pd.DataFrame()}, str(out))
+
+    wb = openpyxl.load_workbook(out)
+    # The empty DataFrame's sheet is skipped, the populated one written.
+    assert wb.sheetnames == ["Weekday_0"]
+    ws = wb["Weekday_0"]
+    rows = list(ws.iter_rows(values_only=True))
+    assert rows[0] == ("Route", "Main St & Doe St")
+    assert rows[1] == ("R1", "07:10")
+    assert rows[2] == ("R1", "12:10")
+    # Styling applied by the real export path.
+    assert ws["A1"].alignment.wrap_text is True
+    assert ws["A2"].alignment.horizontal == "left"
+    assert ws.column_dimensions["A"].width <= MAX_COLUMN_WIDTH
+
+
+def test_export_to_excel_multiple_sheets_empty_dict_writes_nothing(tmp_path: Path) -> None:
+    out = tmp_path / "schedule.xlsx"
+    export_to_excel_multiple_sheets({}, str(out))
+    assert not out.exists()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import openpyxl
 import pandas as pd
 import pytest
 
@@ -10,6 +11,7 @@ from scripts.gtfs_exports.segment_speed_exporter import (
     band_rows,
     build_index,
     convert_distance,
+    export_excel,
     minutes_to_hhmm,
     mph,
     parse_time_to_minutes,
@@ -277,3 +279,33 @@ def test_band_rows_frtime_is_min() -> None:
     # band_rows converts minutes to HH:MM strings via minutes_to_hhmm
     assert bands.iloc[0]["FrTime"] == "07:00"
     assert bands.iloc[0]["ToTime"] == "08:00"
+
+
+# ---------------------------------------------------------------------------
+# export_excel — real openpyxl output
+# ---------------------------------------------------------------------------
+
+
+def test_export_excel_writes_real_workbook(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import scripts.gtfs_exports.segment_speed_exporter as mod
+
+    monkeypatch.setattr(mod, "OUTPUT_FOLDER", tmp_path)
+    monkeypatch.setattr(mod, "FILTER_IN_ROUTE_SHORT_NAMES", [])
+    monkeypatch.setattr(mod, "FILTER_IN_SERVICE_IDS", [])
+
+    gtfs = _minimal_gtfs()
+    idx, pat_lut, speed_lut, header_lut = build_index(gtfs)
+    bands = band_rows(idx)
+    export_excel(bands, pat_lut, speed_lut, header_lut, gtfs["routes"])
+
+    out = tmp_path / "route_101_cal1_speed_table.xlsx"
+    assert out.exists()
+
+    wb = openpyxl.load_workbook(out)
+    assert wb.sheetnames == ["Dir_0"]
+    rows = list(wb["Dir_0"].iter_rows(values_only=True))
+    assert rows[0][:4] == ("Pattern", "FrTime", "ToTime", "Mean_mph")
+    # Single trip: 1 mile in 10 minutes = 6 mph, band spans 07:00 only.
+    assert rows[1][1] == "07:00"
+    assert rows[1][2] == "07:00"
+    assert rows[1][3] == pytest.approx(6.0, rel=0.01)

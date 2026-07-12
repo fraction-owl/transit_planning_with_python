@@ -1,0 +1,2 @@
+feed_publisher_name,feed_publisher_url,feed_lang,feed_start_date,feed_end_date,feed_version
+Your Transit Agency,https://www.yourtransitagency.gov,en,20260101,20261231,2026.01-basic

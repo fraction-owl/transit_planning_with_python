@@ -851,8 +851,9 @@ def run() -> None:
         # no clusters needed anymore
         block_df = process_block(blk_data, blk_id, timeline)
 
-        # determine interlined routes for this block
-        route_set = set(block_df["Route"].dropna())
+        # determine interlined routes for this block; inactive minutes carry
+        # an empty-string Route, which is not a route
+        route_set = set(block_df["Route"].dropna()) - {""}
         interlined_map = {
             r: ",".join(sorted(route_set - {r})) if len(route_set) > 1 else "" for r in route_set
         }

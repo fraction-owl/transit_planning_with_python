@@ -1,18 +1,26 @@
 from __future__ import annotations
 
+from pathlib import Path
+
+import openpyxl
 import pandas as pd
 import pytest
 
 from scripts.gtfs_exports.stop_pattern_exporter import (
     assign_pattern_ids,
+    compute_earliest_start_times,
     convert_distance,
+    export_patterns_to_excel,
     filter_trips,
     format_service_id_folder_name,
     forward_match_pattern_to_master,
+    generate_unique_patterns,
     is_number,
     minutes_to_hhmm,
     parse_time_to_minutes,
 )
+
+FIXTURES = Path(__file__).parent / "fixtures"
 
 # ---------------------------------------------------------------------------
 # is_number
@@ -260,3 +268,58 @@ def test_assign_pattern_ids_trip_count_preserved() -> None:
     }
     records = assign_pattern_ids(patterns_dict)
     assert records[0]["trip_count"] == 5
+
+
+# ---------------------------------------------------------------------------
+# export_patterns_to_excel — pipeline against gtfs_basic, real openpyxl output
+# ---------------------------------------------------------------------------
+
+
+def test_export_patterns_to_excel_writes_real_workbooks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import scripts.gtfs_exports.stop_pattern_exporter as mod
+
+    monkeypatch.setattr(mod, "OUTPUT_DIR", tmp_path)
+
+    fixture = FIXTURES / "gtfs_basic"
+    gtfs = mod.load_gtfs_data(
+        str(fixture),
+        files=("stops.txt", "trips.txt", "stop_times.txt", "routes.txt"),
+        dtype=str,
+    )
+    stops_df = gtfs["stops"]
+    trips_df = gtfs["trips"]
+    stop_times_df = gtfs["stop_times"]
+    routes_df = gtfs["routes"]
+    stop_times_df["stop_sequence"] = pd.to_numeric(stop_times_df["stop_sequence"], errors="raise")
+
+    filtered_trips = filter_trips(trips_df, routes_df, cal_ids=[])
+    patterns_dict = generate_unique_patterns(filtered_trips, stop_times_df, stops_df)
+    records = assign_pattern_ids(patterns_dict)
+    compute_earliest_start_times(records, stop_times_df)
+    export_patterns_to_excel(records, routes_df, trips_df, stop_times_df, stops_df, None)
+
+    # One workbook per route, all under the calendar_<service_id> subfolder.
+    workbooks = sorted(p.name for p in tmp_path.rglob("*.xlsx"))
+    signup = mod.SIGNUP_NAME
+    assert workbooks == [f"R{n}_WKDY_{signup}.xlsx" for n in (1, 2, 3)]
+    assert (tmp_path / "calendar_WKDY" / f"R1_WKDY_{signup}.xlsx").exists()
+
+    wb = openpyxl.load_workbook(tmp_path / "calendar_WKDY" / f"R1_WKDY_{signup}.xlsx")
+    assert wb.sheetnames == ["Dir0"]
+    rows = list(wb["Dir0"].iter_rows(values_only=True))
+    assert rows[0][:6] == (
+        "Route",
+        "Direction",
+        "Calendar (service_id)",
+        "Pattern ID",
+        "Trip Count",
+        "Earliest Start Time",
+    )
+    # Master trip stop names follow the fixed columns (R1 serves S1..S6).
+    assert rows[0][6] == "Main St & Mt Vernon Ln"
+    assert rows[0][11] == "Main St & Beacon Hill Rd"
+    # R1's three trips collapse into one pattern starting at 07:00.
+    assert len(rows) == 2
+    assert rows[1][:6] == ("R1", "0", "WKDY", 1, 3, "07:00")
