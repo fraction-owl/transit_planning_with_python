@@ -172,9 +172,7 @@ def _nearby_routes(
         )
         merged["dist"] = merged.geometry.distance(loc.geometry)
 
-        nearest = merged.groupby(["route_short_name", "direction_id"], as_index=False).apply(
-            lambda x: x.loc[x.dist.idxmin()]
-        )
+        nearest = merged.loc[merged.groupby(["route_short_name", "direction_id"])["dist"].idxmin()]
 
         pair_set = {(r, d) for r, d in zip(nearest.route_short_name, nearest.direction_id)}
         routes = ", ".join(sorted(f"{r} (dir {d})" for r, d in pair_set))

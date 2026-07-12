@@ -15,6 +15,7 @@ Features:
 from __future__ import annotations
 
 import logging
+import math
 import re
 import sys
 from dataclasses import dataclass
@@ -256,10 +257,15 @@ def safe_div(
 ) -> float | None:
     """Divide with protective zero handling."""
     try:
+        # NumPy scalars divide by zero without raising ZeroDivisionError
+        # (they warn and yield nan/inf), so guard the denominator explicitly.
+        if pd.isna(numerator) or pd.isna(denominator) or denominator == 0:
+            return None
         # MyPy may complain about mixed float/int division but it's safe here
-        return round(numerator / denominator, precision)
+        result = round(numerator / denominator, precision)
     except (ZeroDivisionError, TypeError):
         return None
+    return result if math.isfinite(result) else None
 
 
 def normalise_columns(df: pd.DataFrame) -> pd.DataFrame:

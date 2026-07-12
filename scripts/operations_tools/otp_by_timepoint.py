@@ -356,7 +356,7 @@ def add_year_month_column(df: pd.DataFrame) -> pd.DataFrame:
 
     date_parsed = None
     if "Date" in df.columns:
-        date_parsed = pd.to_datetime(df["Date"], errors="coerce", infer_datetime_format=True)
+        date_parsed = pd.to_datetime(df["Date"], errors="coerce")
         if date_parsed.notna().any():
             df["Year-Month"] = date_parsed.dt.to_period("M").astype(str)
         else:
@@ -758,7 +758,9 @@ def pivot_monthly_by_stop(
             )
         )
 
-        pivot = g.pivot_table(index="Year-Month", columns="TPORD", values=metric, aggfunc="first")
+        pivot = g.pivot_table(
+            index="Year-Month", columns="TPORD", values=metric, aggfunc="first", observed=False
+        )
 
         missing_cols = [o for o in cfg_orders if o not in pivot.columns]
         if missing_cols:
