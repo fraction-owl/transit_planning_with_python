@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import zipfile
 from pathlib import Path
 from typing import Iterable
@@ -176,6 +177,41 @@ def test_load_gtfs_data_full_spec_fixture_loads_with_defaults() -> None:
     assert set(result["transfers"]["to_stop_id"]) <= stop_ids
     assert set(result["fare_rules"]["fare_id"]) <= set(result["fare_attributes"]["fare_id"])
     assert set(result["calendar_dates"]["service_id"]) <= set(result["calendar"]["service_id"])
+
+
+def test_load_gtfs_data_read_oserror_propagates_unwrapped(tmp_path, monkeypatch) -> None:
+    """An OS-level read failure propagates as OSError, not a remapped RuntimeError."""
+    folder = _mk_gtfs_dir(tmp_path, files=[("stops.txt", "stop_id\n001\n")])
+
+    def _boom(*args: object, **kwargs: object) -> None:
+        raise OSError("simulated read failure")
+
+    monkeypatch.setattr(pd, "read_csv", _boom)
+    with pytest.raises(OSError, match="simulated read failure"):
+        load_gtfs_data(folder, files=("stops.txt",))
+
+
+def test_load_gtfs_data_logs_to_module_logger_by_default(tmp_path, caplog) -> None:
+    """Progress messages go to the utils.gtfs_helpers logger, not the root logger."""
+    folder = _mk_gtfs_dir(tmp_path, files=[("stops.txt", "stop_id\n001\n")])
+
+    with caplog.at_level(logging.INFO, logger="utils.gtfs_helpers"):
+        load_gtfs_data(folder, files=("stops.txt",))
+
+    records = [r for r in caplog.records if "Loaded stops.txt" in r.getMessage()]
+    assert records and all(r.name == "utils.gtfs_helpers" for r in records)
+
+
+def test_load_gtfs_data_accepts_custom_logger(tmp_path, caplog) -> None:
+    """A caller-supplied logger receives the progress messages instead."""
+    folder = _mk_gtfs_dir(tmp_path, files=[("stops.txt", "stop_id\n001\n")])
+    custom = logging.getLogger("my_script_logger")
+
+    with caplog.at_level(logging.INFO, logger="my_script_logger"):
+        load_gtfs_data(folder, files=("stops.txt",), logger=custom)
+
+    records = [r for r in caplog.records if "Loaded stops.txt" in r.getMessage()]
+    assert records and all(r.name == "my_script_logger" for r in records)
 
 
 # ---------------------------------------------------------------------------
