@@ -49,30 +49,30 @@ def _write_gtfs(gtfs_dir: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# hhmmss_to_min
+# parse_time_to_minutes
 # ---------------------------------------------------------------------------
 
 
-def test_hhmmss_to_min_basic_conversion() -> None:
-    assert target.hhmmss_to_min("06:30:00") == 390
-    assert target.hhmmss_to_min("06:30") == 390
+def test_parse_time_to_minutes_basic_conversion() -> None:
+    assert target.parse_time_to_minutes("06:30:00") == 390
+    assert target.parse_time_to_minutes("06:30") == 390
 
 
-def test_hhmmss_to_min_preserves_times_past_midnight() -> None:
-    assert target.hhmmss_to_min("25:30:00") == 1530
+def test_parse_time_to_minutes_preserves_times_past_midnight() -> None:
+    assert target.parse_time_to_minutes("25:30:00") == 1530
 
 
-def test_hhmmss_to_min_rounds_seconds() -> None:
-    assert target.hhmmss_to_min("06:00:31") == 361
-    assert target.hhmmss_to_min("06:00:29") == 360
+def test_parse_time_to_minutes_rounds_seconds() -> None:
+    assert target.parse_time_to_minutes("06:00:31") == 361
+    assert target.parse_time_to_minutes("06:00:29") == 360
     # Python banker's rounding: exactly 30 s rounds to the even value (0).
-    assert target.hhmmss_to_min("06:00:30") == 360
+    assert target.parse_time_to_minutes("06:00:30") == 360
 
 
-def test_hhmmss_to_min_invalid_values_return_none() -> None:
-    assert target.hhmmss_to_min("not a time") is None
-    assert target.hhmmss_to_min(None) is None
-    assert target.hhmmss_to_min(360) is None
+def test_parse_time_to_minutes_invalid_values_return_none() -> None:
+    assert target.parse_time_to_minutes("not a time") is None
+    assert target.parse_time_to_minutes(None) is None
+    assert target.parse_time_to_minutes(360) is None
 
 
 # ---------------------------------------------------------------------------

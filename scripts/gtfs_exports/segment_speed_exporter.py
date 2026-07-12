@@ -21,7 +21,7 @@ import os
 import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple, TypedDict, Union, cast
+from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple, TypedDict, Union, cast
 
 import pandas as pd
 from openpyxl import Workbook
@@ -42,7 +42,9 @@ FILTER_IN_SERVICE_IDS: List[str] = ["3"]
 FILTER_OUT_SERVICE_IDS: List[str] = []
 
 EXPORT_TIMEPOINTS_ONLY: bool = True
-INPUT_DISTANCE_UNIT: str = "meters"  # "meters" or "feet"
+# Unit of shape_dist_traveled in the GTFS feed: "feet", "meters", or "km".
+# Output speeds are always mph, so distances are converted to miles internally.
+INPUT_DISTANCE_UNIT: Literal["feet", "meters", "km"] = "meters"
 MISSING_VAL: str = "–"
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
@@ -51,7 +53,6 @@ LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
 # CONSTANTS
 # -----------------------------------------------------------------------------
 
-_TIME_RE: re.Pattern[str] = re.compile(r"^(?P<h>\d{1,2}):(?P<m>\d{2})(?::(?P<s>\d{2}))?$")
 REQ_FILES: Tuple[str, ...] = ("trips.txt", "stop_times.txt", "routes.txt", "stops.txt")
 
 # -----------------------------------------------------------------------------
@@ -74,68 +75,106 @@ class SpeedRecord(TypedDict):
 # =============================================================================
 
 
-def hhmmss_to_minutes(time_literal: Optional[str]) -> Optional[int]:
-    """Convert an ``HH:MM[:SS]`` string to minutes past midnight.
+def parse_time_to_minutes(time_value: Optional[str]) -> Optional[int]:
+    """Convert an ``HH:MM[:SS]`` time string to integer minutes past midnight.
+
+    GTFS times may exceed 24:00 (e.g. ``"25:30:00"`` for a 1:30 AM trip on
+    the following calendar day); those values are preserved as integers
+    greater than or equal to 1440. Seconds, when present, are rounded to the
+    nearest minute.
 
     Args:
-        time_literal: Time such as ``"7:05"``, ``"07:05:30"``, or ``"23:59:59"``.
-            Leading/trailing whitespace is ignored.  A value of *None* propagates.
+        time_value: Time string such as ``"7:05"``, ``"07:05:00"``, or
+            ``"26:30:00"``. Leading/trailing whitespace is ignored.
+            Non-string or malformed values yield ``None``.
 
     Returns:
-        Minutes since 00 : 00 (GTFS local day) or *None* if parsing fails.
+        Minutes since midnight, or ``None`` if the value cannot be parsed.
     """
-    if time_literal is None or not isinstance(time_literal, str):
+    if not isinstance(time_value, str):
         return None
-
-    match = _TIME_RE.match(time_literal.strip())
-    if match is None:
+    parts = time_value.strip().split(":")
+    if len(parts) not in (2, 3):
         return None
-
-    hours = int(match.group("h"))
-    minutes = int(match.group("m"))
-    seconds = int(match.group("s") or 0)
+    try:
+        hours = int(parts[0])
+        minutes = int(parts[1])
+        seconds = int(parts[2]) if len(parts) == 3 else 0
+    except ValueError:
+        return None
+    if hours < 0 or not 0 <= minutes < 60 or not 0 <= seconds < 60:
+        return None
     return hours * 60 + minutes + round(seconds / 60)
 
 
-def minutes_to_hhmm(total_minutes: Optional[int]) -> str:
-    """Convert minutes past midnight to a ``HH:MM`` string.
+def minutes_to_hhmm(minutes: Optional[float], missing: str = "") -> str:
+    """Convert minutes past midnight to a zero-padded ``HH:MM`` string.
+
+    GTFS service days may exceed 24 hours, so values of 1440 minutes or more
+    format with hours >= 24 (e.g. ``1590`` -> ``"26:30"``).
 
     Args:
-        total_minutes: Minutes since 00 : 00.  *None* yields :data:`MISSING_VAL`.
+        minutes: Minutes since midnight (may be fractional; rounded to the
+            nearest minute). ``None`` and NaN yield ``missing``.
+        missing: String returned for missing values, e.g. ``""`` or a
+            sentinel such as ``"–"``.
 
     Returns:
-        A zero-padded ``HH:MM`` string or the sentinel if *total_minutes* is *None*.
+        Zero-padded ``HH:MM`` string, or ``missing`` when *minutes* is
+        ``None``/NaN.
     """
-    if total_minutes is None:
-        return MISSING_VAL
-    hours, minutes = divmod(int(round(total_minutes)), 60)
-    return f"{hours}:{minutes:02d}"
+    if minutes is None or pd.isna(minutes):
+        return missing
+    hours, mins = divmod(int(round(minutes)), 60)
+    return f"{hours:02d}:{mins:02d}"
 
 
-def convert_to_miles(dist: Union[str, float, int, None]) -> Optional[float]:
-    """Convert ``shape_dist_traveled`` to statute miles.
+def convert_distance(
+    value: Any,
+    input_unit: str,
+    output_unit: Literal["miles", "km"] = "miles",
+) -> Optional[float]:
+    """Convert a distance value between transit-planning units.
 
     Args:
-        dist: Distance value in metres/feet (per :data:`INPUT_DISTANCE_UNIT`) or a
-            textual representation.  ``None`` or empty values propagate.
+        value: Distance as a number or numeric string. ``None``, NaN, and
+            empty/whitespace strings yield ``None``.
+        input_unit: Unit of *value*: ``"feet"``, ``"meters"``, ``"km"``, or
+            ``"miles"`` (case-insensitive).
+        output_unit: Unit to convert to: ``"miles"`` or ``"km"``.
 
     Returns:
-        Distance in miles, or *None* if conversion fails.
+        The converted distance as a float, or ``None`` when *value* is
+        missing or cannot be interpreted as a number.
+
+    Raises:
+        ValueError: If *input_unit* or *output_unit* is not a supported unit.
     """
-    if dist in ("", None) or (isinstance(dist, float) and pd.isna(dist)):
+    meters_per_input_unit = {"feet": 0.3048, "meters": 1.0, "km": 1000.0, "miles": 1609.344}
+    meters_per_output_unit = {"miles": 1609.344, "km": 1000.0}
+
+    input_factor = meters_per_input_unit.get(str(input_unit).strip().lower())
+    if input_factor is None:
+        raise ValueError(
+            f"Unsupported input_unit {input_unit!r}; "
+            f"expected one of {sorted(meters_per_input_unit)}."
+        )
+    output_factor = meters_per_output_unit.get(str(output_unit).strip().lower())
+    if output_factor is None:
+        raise ValueError(
+            f"Unsupported output_unit {output_unit!r}; "
+            f"expected one of {sorted(meters_per_output_unit)}."
+        )
+
+    if value is None or (isinstance(value, str) and not value.strip()):
         return None
-
+    if pd.isna(value):
+        return None
     try:
-        numeric = float(dist)
+        numeric = float(value)
     except (TypeError, ValueError):
         return None
-
-    unit = INPUT_DISTANCE_UNIT.lower()
-    if unit == "meters":
-        return numeric / 1_609.344
-    if unit == "feet":
-        return numeric / 5_280.0
-    return numeric  # Fallback: assume caller passed miles
+    return numeric * input_factor / output_factor
 
 
 def mph(dist_miles: Optional[float], runtime_min: Optional[int]) -> Union[float, str]:
@@ -270,9 +309,9 @@ def segment_metrics(grp: pd.DataFrame) -> Tuple[SegSpeeds, float, int]:
 
     for _, row in grp.iterrows():
         times.append(
-            hhmmss_to_minutes(cast("str", row.get("departure_time") or row.get("arrival_time")))
+            parse_time_to_minutes(cast("str", row.get("departure_time") or row.get("arrival_time")))
         )
-        dists.append(convert_to_miles(row.get("shape_dist_traveled")))
+        dists.append(convert_distance(row.get("shape_dist_traveled"), INPUT_DISTANCE_UNIT, "miles"))
 
     run_min: List[Union[int, str]] = [MISSING_VAL]
     seg_mi: List[Union[float, str]] = [MISSING_VAL]
@@ -380,7 +419,7 @@ def build_index(
         )
 
         first_seg = seg_speeds[1] if len(seg_speeds) > 1 else MISSING_VAL
-        start_min = hhmmss_to_minutes(
+        start_min = parse_time_to_minutes(
             cast(
                 "str",
                 grp.iloc[0].get("departure_time") or grp.iloc[0].get("arrival_time"),
@@ -427,8 +466,8 @@ def band_rows(index_df: pd.DataFrame) -> pd.DataFrame:
         .sort_values(["direction_id", "FrTime_min"])
     )
 
-    out["FrTime"] = out["FrTime_min"].apply(minutes_to_hhmm)
-    out["ToTime"] = out["ToTime_min"].apply(minutes_to_hhmm)
+    out["FrTime"] = out["FrTime_min"].apply(lambda m: minutes_to_hhmm(m, MISSING_VAL))
+    out["ToTime"] = out["ToTime_min"].apply(lambda m: minutes_to_hhmm(m, MISSING_VAL))
     return out.drop(columns=["FrTime_min", "ToTime_min"])
 
 

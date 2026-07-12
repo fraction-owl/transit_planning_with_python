@@ -12,28 +12,28 @@ from scripts.gtfs_exports.bus_block_exporter import (
     load_gtfs_data,
     mark_first_and_last_stops,
     minutes_to_hhmm,
+    parse_time_to_minutes,
     process_block,
-    time_to_minutes,
     validate_folders,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
 # ---------------------------------------------------------------------------
-# time_to_minutes
+# parse_time_to_minutes
 # ---------------------------------------------------------------------------
 
 
-def test_time_to_minutes_basic() -> None:
-    assert time_to_minutes("08:30:00") == 510
+def test_parse_time_to_minutes_basic() -> None:
+    assert parse_time_to_minutes("08:30:00") == 510
 
 
-def test_time_to_minutes_past_midnight() -> None:
-    assert time_to_minutes("25:00:00") == 1500
+def test_parse_time_to_minutes_past_midnight() -> None:
+    assert parse_time_to_minutes("25:00:00") == 1500
 
 
-def test_time_to_minutes_no_seconds() -> None:
-    assert time_to_minutes("08:30") == 510
+def test_parse_time_to_minutes_no_seconds() -> None:
+    assert parse_time_to_minutes("08:30") == 510
 
 
 # ---------------------------------------------------------------------------

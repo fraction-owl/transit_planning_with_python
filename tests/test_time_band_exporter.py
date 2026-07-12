@@ -8,10 +8,10 @@ import pytest
 from scripts.gtfs_exports.time_band_exporter import (
     MISSING_TIME,
     build_index,
-    hhmmss_to_min,
     load_gtfs,
     make_bands,
-    min_to_hhmm,
+    minutes_to_hhmm,
+    parse_time_to_minutes,
     safe_sheet,
     segment_runtimes,
 )
@@ -19,45 +19,45 @@ from scripts.gtfs_exports.time_band_exporter import (
 FIXTURES = Path(__file__).parent / "fixtures"
 
 # ---------------------------------------------------------------------------
-# hhmmss_to_min
+# parse_time_to_minutes
 # ---------------------------------------------------------------------------
 
 
-def test_hhmmss_to_min_basic() -> None:
-    assert hhmmss_to_min("07:05:00") == 425
+def test_parse_time_to_minutes_basic() -> None:
+    assert parse_time_to_minutes("07:05:00") == 425
 
 
-def test_hhmmss_to_min_no_seconds() -> None:
-    assert hhmmss_to_min("07:05") == 425
+def test_parse_time_to_minutes_no_seconds() -> None:
+    assert parse_time_to_minutes("07:05") == 425
 
 
-def test_hhmmss_to_min_past_midnight() -> None:
-    assert hhmmss_to_min("25:00:00") == 1500
+def test_parse_time_to_minutes_past_midnight() -> None:
+    assert parse_time_to_minutes("25:00:00") == 1500
 
 
-def test_hhmmss_to_min_none_returns_none() -> None:
-    assert hhmmss_to_min(None) is None  # type: ignore[arg-type]
+def test_parse_time_to_minutes_none_returns_none() -> None:
+    assert parse_time_to_minutes(None) is None
 
 
-def test_hhmmss_to_min_malformed_returns_none() -> None:
-    assert hhmmss_to_min("bad") is None
+def test_parse_time_to_minutes_malformed_returns_none() -> None:
+    assert parse_time_to_minutes("bad") is None
 
 
 # ---------------------------------------------------------------------------
-# min_to_hhmm
+# minutes_to_hhmm
 # ---------------------------------------------------------------------------
 
 
-def test_min_to_hhmm_basic() -> None:
-    assert min_to_hhmm(425) == "7:05"
+def test_minutes_to_hhmm_basic() -> None:
+    assert minutes_to_hhmm(425) == "07:05"
 
 
-def test_min_to_hhmm_midnight() -> None:
-    assert min_to_hhmm(0) == "0:00"
+def test_minutes_to_hhmm_midnight() -> None:
+    assert minutes_to_hhmm(0) == "00:00"
 
 
-def test_min_to_hhmm_none_returns_sentinel() -> None:
-    assert min_to_hhmm(None) == MISSING_TIME
+def test_minutes_to_hhmm_none_returns_sentinel() -> None:
+    assert minutes_to_hhmm(None, MISSING_TIME) == MISSING_TIME
 
 
 # ---------------------------------------------------------------------------

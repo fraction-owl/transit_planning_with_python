@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import re
 import sys
 from pathlib import Path
 from typing import Final, Optional, Sequence
@@ -61,7 +60,6 @@ LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
 # CONSTANTS
 # =============================================================================
 
-_TIME_RE: re.Pattern[str] = re.compile(r"^(?P<h>\d{1,2}):(?P<m>\d{2})(?::(?P<s>\d{2}))?$")
 REQ_FILES: Final[tuple[str, ...]] = (
     "trips.txt",
     "stop_times.txt",
@@ -79,19 +77,36 @@ _DAY_COLS: Final[dict[str, list[str]]] = {
 # =============================================================================
 
 
-def hhmmss_to_min(time_str: Optional[str]) -> Optional[int]:
-    """Convert ``HH:MM`` or ``HH:MM:SS`` to minutes past midnight.
+def parse_time_to_minutes(time_value: Optional[str]) -> Optional[int]:
+    """Convert an ``HH:MM[:SS]`` time string to integer minutes past midnight.
 
-    GTFS times can exceed 24:00 (e.g. ``"25:30:00"`` for a 1:30 AM trip
-    starting on the next calendar day).  Those values are preserved as
-    integers ≥ 1440 so that span calculations remain correct.
+    GTFS times may exceed 24:00 (e.g. ``"25:30:00"`` for a 1:30 AM trip on
+    the following calendar day); those values are preserved as integers
+    greater than or equal to 1440. Seconds, when present, are rounded to the
+    nearest minute.
+
+    Args:
+        time_value: Time string such as ``"7:05"``, ``"07:05:00"``, or
+            ``"26:30:00"``. Leading/trailing whitespace is ignored.
+            Non-string or malformed values yield ``None``.
+
+    Returns:
+        Minutes since midnight, or ``None`` if the value cannot be parsed.
     """
-    if not isinstance(time_str, str):
+    if not isinstance(time_value, str):
         return None
-    m = _TIME_RE.match(time_str.strip())
-    if m is None:
+    parts = time_value.strip().split(":")
+    if len(parts) not in (2, 3):
         return None
-    return int(m.group("h")) * 60 + int(m.group("m")) + round(int(m.group("s") or 0) / 60)
+    try:
+        hours = int(parts[0])
+        minutes = int(parts[1])
+        seconds = int(parts[2]) if len(parts) == 3 else 0
+    except ValueError:
+        return None
+    if hours < 0 or not 0 <= minutes < 60 or not 0 <= seconds < 60:
+        return None
+    return hours * 60 + minutes + round(seconds / 60)
 
 
 def load_gtfs(folder: Path) -> dict[str, pd.DataFrame]:
@@ -145,7 +160,7 @@ def first_departures(stop_times: pd.DataFrame, trip_ids: set[str]) -> pd.DataFra
     """
     st = stop_times[stop_times["trip_id"].isin(trip_ids)].copy()
     st["stop_sequence"] = pd.to_numeric(st["stop_sequence"], errors="coerce")
-    st["departure_min"] = st["departure_time"].map(hhmmss_to_min)
+    st["departure_min"] = st["departure_time"].map(parse_time_to_minutes)
     st = st.dropna(subset=["stop_sequence", "departure_min"])
     first = st.sort_values("stop_sequence").groupby("trip_id", sort=False).first().reset_index()
     return first[["trip_id", "departure_min"]]
