@@ -13,6 +13,10 @@ Also outputs:
   optional nearest_id_matches)
 - gtfs_stop_diff.log
 
+When route context is enabled (the default), each stop is annotated with the
+routes that serve it (via stop_times -> trips -> routes). This is informational
+only and never affects the modified/unchanged classification.
+
 No arcpy / geopandas. pandas + numpy + scipy only.
 """
 
@@ -45,6 +49,11 @@ OVERLAP_WARN_THRESHOLD = 0.10  # warn if overlap fraction < 10%
 
 ENABLE_NEAREST_MATCHES_WHEN_LOW_OVERLAP = True
 NEAREST_MATCHES_MAX_FEET = 500.0  # only report nearest matches within this distance
+
+# Route context: annotate each stop with the routes that serve it (via
+# stop_times -> trips -> routes). This is informational only; route changes
+# do NOT affect the modified/unchanged classification.
+ENABLE_ROUTE_CONTEXT = True
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
 
@@ -237,6 +246,138 @@ def load_stops(gtfs_path: Path, label: str) -> pd.DataFrame:
 
 
 # =============================================================================
+# Route context
+# =============================================================================
+
+
+def _route_display_label(row: pd.Series) -> str:
+    """Best human-readable label for a route: short name, else long name, else ID."""
+    short = str(row.get("route_short_name") or "").strip()
+    if short and short.lower() != "nan":
+        return short
+    long_name = str(row.get("route_long_name") or "").strip()
+    if long_name and long_name.lower() != "nan":
+        return long_name
+    return str(row.get("route_id") or "").strip()
+
+
+def _route_sort_key(label: str) -> tuple[int, int, str]:
+    """Sort numeric route labels numerically, then everything else alphabetically."""
+    if label.isdigit():
+        return (0, int(label), label)
+    return (1, 0, label)
+
+
+def load_stop_route_pairs(gtfs_path: Path, label: str) -> pd.DataFrame | None:
+    """Build unique (stop_id, route_id, route_label) pairs for a feed.
+
+    Uses stop_times → trips → routes joins over the entire feed (all service
+    days). Returns ``None`` (with a warning) if the required files or columns
+    are unavailable, so downstream steps can degrade gracefully.
+    """
+    try:
+        data = load_gtfs_data(str(gtfs_path), files=["routes.txt", "trips.txt"])
+    except (OSError, ValueError, RuntimeError) as exc:
+        logging.warning(
+            "%s: could not load routes.txt/trips.txt for route context (%s). "
+            "Route context will be skipped.",
+            label,
+            exc,
+        )
+        return None
+
+    routes = data["routes"].copy()
+    trips = data["trips"].copy()
+
+    if "route_id" not in routes.columns:
+        logging.warning("%s: routes.txt missing 'route_id'; skipping route context.", label)
+        return None
+    if not {"trip_id", "route_id"}.issubset(trips.columns):
+        logging.warning(
+            "%s: trips.txt missing 'trip_id'/'route_id'; skipping route context.", label
+        )
+        return None
+
+    # stop_times can be large, so read only the two columns we need rather
+    # than going through load_gtfs_data (which loads every column).
+    st_path = os.path.join(str(gtfs_path), "stop_times.txt")
+    if not os.path.exists(st_path):
+        logging.warning("%s: stop_times.txt not found; skipping route context.", label)
+        return None
+    try:
+        stop_times = pd.read_csv(st_path, dtype=str, usecols=["trip_id", "stop_id"])
+    except ValueError as exc:
+        logging.warning(
+            "%s: stop_times.txt missing 'trip_id'/'stop_id' (%s); skipping route context.",
+            label,
+            exc,
+        )
+        return None
+
+    stop_times["trip_id"] = normalize_text(stop_times["trip_id"])
+    stop_times["stop_id"] = normalize_text(stop_times["stop_id"])
+    trips["trip_id"] = normalize_text(trips["trip_id"])
+    trips["route_id"] = normalize_text(trips["route_id"])
+    routes["route_id"] = normalize_text(routes["route_id"])
+
+    routes["route_label"] = routes.apply(_route_display_label, axis=1)
+    label_by_route_id = dict(zip(routes["route_id"], routes["route_label"]))
+
+    pairs = stop_times.merge(trips[["trip_id", "route_id"]], on="trip_id", how="inner")[
+        ["stop_id", "route_id"]
+    ].drop_duplicates()
+    if pairs.empty:
+        logging.warning("%s: no stop/route pairs found; skipping route context.", label)
+        return None
+
+    # Fall back to the raw route_id if it has no entry in routes.txt.
+    pairs["route_label"] = pairs["route_id"].map(label_by_route_id)
+    pairs["route_label"] = pairs["route_label"].fillna(pairs["route_id"])
+
+    logging.info(
+        "%s: built %s stop/route pairs (%s routes, %s stops with service).",
+        label,
+        len(pairs),
+        pairs["route_id"].nunique(),
+        pairs["stop_id"].nunique(),
+    )
+    return pairs.reset_index(drop=True)
+
+
+def build_stop_routes_table(pairs: pd.DataFrame | None) -> pd.DataFrame | None:
+    """Collapse stop/route pairs into stop_id → routes (semicolon list) + route_count."""
+    if pairs is None:
+        return None
+
+    grouped = pairs.groupby("stop_id").agg(
+        routes=("route_label", lambda s: "; ".join(sorted(set(s), key=_route_sort_key))),
+        route_count=("route_id", "nunique"),
+    )
+    return grouped.reset_index()
+
+
+def attach_route_context(
+    stops_df: pd.DataFrame, stop_routes: pd.DataFrame | None, label: str
+) -> pd.DataFrame:
+    """Left-join route context onto a stops table; no-op if context unavailable."""
+    if stop_routes is None:
+        return stops_df
+
+    out = stops_df.merge(stop_routes, on="stop_id", how="left")
+    out["routes"] = out["routes"].fillna("")
+    out["route_count"] = out["route_count"].fillna(0).astype(int)
+
+    unserved = int((out["route_count"] == 0).sum())
+    if unserved > 0:
+        logging.info(
+            "%s: %s stops have no trips in stop_times.txt (routes column left blank).",
+            label,
+            unserved,
+        )
+    return out
+
+
+# =============================================================================
 # Distance
 # =============================================================================
 
@@ -270,7 +411,11 @@ def meters_to_feet(meters: np.ndarray) -> np.ndarray:
 
 
 def pick_attribute_columns(before: pd.DataFrame, after: pd.DataFrame) -> list[str]:
-    """Columns to compare for attribute changes (only those present in both feeds)."""
+    """Columns to compare for attribute changes (only those present in both feeds).
+
+    Note: 'routes' / 'route_count' are deliberately excluded — route context is
+    informational and must not drive the modified/unchanged classification.
+    """
     candidates = [
         "stop_name",
         "stop_code",
@@ -306,6 +451,10 @@ def compare_stops(
     relocate_threshold_ft: float,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, Summary, pd.DataFrame | None]:
     """Compare stops from two GTFS feeds.
+
+    If the input frames carry a ``routes`` column (see attach_route_context),
+    it is passed through to every output — including ``routes_before`` /
+    ``routes_after`` on the modified sheet — but never affects classification.
 
     Returns:
         modified_df, deleted_df, new_df, unchanged_df, summary, nearest_matches(optional)
@@ -427,9 +576,9 @@ def compare_stops(
     before_cols = [c for c in modified_df.columns if c.endswith("_before")]
     after_cols = [c for c in modified_df.columns if c.endswith("_after")]
 
-    # Prefer to show stop_name/lat/lon early
+    # Prefer to show stop_name/lat/lon/routes early
     def sort_cols(cols: list[str]) -> list[str]:
-        priority = {"stop_name": 0, "stop_lat": 1, "stop_lon": 2}
+        priority = {"stop_name": 0, "stop_lat": 1, "stop_lon": 2, "routes": 3, "route_count": 4}
         return sorted(
             cols,
             key=lambda x: (
@@ -487,9 +636,16 @@ def try_build_nearest_matches(
     """Optional helper when stop_id overlap is very low.
 
     For each AFTER stop, finds nearest BEFORE stop by coordinates (within max_feet).
+    If route context is present on the inputs, the routes serving each stop are
+    included — helpful for confirming that a candidate ID rekeying is plausible.
     """
-    b = before[["stop_id", "stop_lat", "stop_lon"]].dropna().copy()
-    a = after[["stop_id", "stop_lat", "stop_lon"]].dropna().copy()
+    has_routes = "routes" in before.columns and "routes" in after.columns
+
+    b_cols = ["stop_id", "stop_lat", "stop_lon"] + (["routes"] if has_routes else [])
+    a_cols = ["stop_id", "stop_lat", "stop_lon"] + (["routes"] if has_routes else [])
+
+    b = before[b_cols].dropna(subset=["stop_lat", "stop_lon"]).copy()
+    a = after[a_cols].dropna(subset=["stop_lat", "stop_lon"]).copy()
     if b.empty or a.empty:
         logging.info("Insufficient valid coordinates for nearest-match output.")
         return None
@@ -515,13 +671,16 @@ def try_build_nearest_matches(
     )
     dist_ft = meters_to_feet(meters)
 
-    out = pd.DataFrame(
-        {
-            "after_stop_id": a["stop_id"].to_numpy(),
-            "nearest_before_stop_id": nearest_before_ids,
-            "nearest_distance_ft": dist_ft,
-        }
-    )
+    data: dict[str, Any] = {
+        "after_stop_id": a["stop_id"].to_numpy(),
+        "nearest_before_stop_id": nearest_before_ids,
+        "nearest_distance_ft": dist_ft,
+    }
+    if has_routes:
+        data["after_routes"] = a["routes"].to_numpy()
+        data["nearest_before_routes"] = b["routes"].to_numpy()[idx]
+
+    out = pd.DataFrame(data)
     out = (
         out.loc[out["nearest_distance_ft"] <= max_feet]
         .sort_values("nearest_distance_ft")
@@ -603,6 +762,7 @@ def run_compare(
     after_dir: Path = AFTER_GTFS_DIR,
     out_dir: Path = OUTPUT_DIR,
     threshold_feet: float = RELOCATE_THRESHOLD_FEET,
+    include_route_context: bool = ENABLE_ROUTE_CONTEXT,
 ) -> Summary:
     """Run the comparison (notebook-friendly) and write outputs."""
     setup_logging(out_dir)
@@ -611,9 +771,22 @@ def run_compare(
     logging.info("After GTFS:  %s", after_dir)
     logging.info("Output dir:  %s", out_dir)
     logging.info("Relocation threshold: %.1f ft", threshold_feet)
+    logging.info("Route context: %s", "enabled" if include_route_context else "disabled")
 
     before_df = load_stops(before_dir, label="before")
     after_df = load_stops(after_dir, label="after")
+
+    if include_route_context:
+        before_df = attach_route_context(
+            before_df,
+            build_stop_routes_table(load_stop_route_pairs(before_dir, label="before")),
+            label="before",
+        )
+        after_df = attach_route_context(
+            after_df,
+            build_stop_routes_table(load_stop_route_pairs(after_dir, label="after")),
+            label="after",
+        )
 
     modified_df, deleted_df, new_df, _unchanged_df, summary, nearest_matches = compare_stops(
         before=before_df,
@@ -661,6 +834,11 @@ def parse_args(argv: Sequence[str] | None = None) -> tuple[argparse.Namespace, l
         default=RELOCATE_THRESHOLD_FEET,
         help="Relocation threshold in feet",
     )
+    parser.add_argument(
+        "--no-route-context",
+        action="store_true",
+        help="Skip attaching routes-serving-stop context columns to outputs",
+    )
     args, unknown = parser.parse_known_args(list(argv) if argv is not None else None)
     return args, unknown
 
@@ -688,6 +866,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         after_dir=args.after,
         out_dir=args.out,
         threshold_feet=args.threshold_feet,
+        include_route_context=not args.no_route_context,
     )
     logging.info("Script completed successfully.")
 
