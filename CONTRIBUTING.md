@@ -37,7 +37,7 @@ Participation is welcome from anyone, whether you’re new to Python, an experie
 - **Run logs are required.** Any script that produces an output file must write a matching `_runlog.txt` sidecar (same directory, same stem). A `REQUIRE_RUN_LOG: bool = True` config variable controls enforcement: when `True` (the default), a failed log write aborts the script so analysts are never left with an untraced output. Set it to `False` only when writing to a genuinely read-only location.
 - Default to:
   - **Washington, DC CRS** unless otherwise noted (chosen because DC is the U.S. capital).
-  - **Imperial units** (feet/miles), with metric option available and clearly noted.
+  - **Imperial units** (feet/miles) as the default output. Convert distances through the canonical `convert_distance` helper (`utils/distance_helpers.py`), which takes an explicit `output_unit` flag (`"miles"` or `"km"`) rather than hardcoding miles; scripts' `INPUT_DISTANCE_UNIT` settings accept `"feet"`, `"meters"`, or `"km"`.
 
 ## 🧪 Testing & Review
 
