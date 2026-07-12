@@ -58,6 +58,7 @@ OPEN_SOURCE_ONLY_LIBS: frozenset[str] = frozenset(
         "geopandas",
         "momepy",
         "osmnx",
+        "polars",
         "pyproj",
         "rapidfuzz",
         "rtree",
