@@ -14,7 +14,8 @@ numpy==1.26.4                # Numerical computing
 scipy==1.12.0                # Scientific computing and optimization
 
 # Fast DataFrames (open-source stack only — NOT bundled with ArcGIS Pro)
-# Required by scripts/gbfs_tools/bikeshare_ridership_trends.py; also used by
+# Required by scripts/gbfs_tools/bikeshare_ridership_trends_polars.py (the
+# pandas twin bikeshare_ridership_trends.py needs no polars); also used by
 # the dev fixture builders (dev_tools/build_cacensus_fixtures.py).
 polars==0.20.31              # Columnar DataFrame engine for large trip extracts
 

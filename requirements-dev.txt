@@ -24,8 +24,8 @@ ty==0.0.56                   # Type checks; error-level rules block CI
 
 # Data Processing
 # polars moved to requirements.txt: it is now a runtime dependency
-# (scripts/gbfs_tools/bikeshare_ridership_trends.py) as well as a dev
-# fixture-builder dependency, and CI/dev installs both files.
+# (scripts/gbfs_tools/bikeshare_ridership_trends_polars.py) as well as a
+# dev fixture-builder dependency, and CI/dev installs both files.
 
 # ------------- Typing stubs (temporary) -------------------------------------
 pandas-stubs==2.2.*

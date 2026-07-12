@@ -6,6 +6,13 @@ named ``YYYYMM-capitalbikeshare-tripdata.csv``, as produced by
 ``.zip`` archive, and exports tables and charts describing how ridership
 changes over time, both system-wide and for each individual station.
 
+This is the polars twin of ``bikeshare_ridership_trends.py``: same inputs,
+same outputs (the aggregate tables are byte-identical), but built on polars,
+which keeps the load/aggregate steps fast on multi-year, full-size vendor
+extracts. polars belongs to the open-source stack (see requirements.txt) and
+is not available in ArcGIS Pro's bundled Python -- inside ArcGIS Pro, use the
+pandas original instead.
+
 ------------------------------------------------------------------------------
 RUNNING IT
 ------------------------------------------------------------------------------
@@ -13,7 +20,7 @@ Notebook / manual: edit the CONFIG block below, then run the file (or call
 ``run()``). No command-line arguments are needed.
 
 Command line: every CONFIG value has a matching flag that overrides it, e.g.
-    python scripts/gbfs_tools/bikeshare_ridership_trends.py \\
+    python scripts/gbfs_tools/bikeshare_ridership_trends_polars.py \\
         --input tests/fixtures/capitalbikeshare_fixtures_24mo.zip \\
         --output-dir out/bikeshare_trends
 
@@ -43,16 +50,16 @@ trends include months with zero activity rather than skipping them.
 from __future__ import annotations
 
 import argparse
-import io
 import logging
 import re
 import sys
 import zipfile
+from datetime import datetime
 from pathlib import Path
 
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
-import pandas as pd
+import polars as pl
 
 # ===========================================================================
 # CONFIG  --  notebook users edit these; CLI flags override them
@@ -81,7 +88,8 @@ LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
 TRIP_FILE_GLOB = "*-capitalbikeshare-tripdata.csv"
 
 # Columns whose blanks are meaningful (dockless trips) and whose values must
-# not be coerced to floats, so they are read as strings with NA filtering off.
+# not be coerced to floats, so they are forced to Utf8 with blanks kept as
+# empty strings rather than nulls.
 _STRING_COLUMNS = (
     "ride_id",
     "rideable_type",
@@ -108,6 +116,8 @@ logging.getLogger("matplotlib").setLevel(logging.WARNING)
 # Windows-1252 byte (e.g. 0x9c) that makes a strict UTF-8 read abort the whole
 # run. Decode order: UTF-8 (BOM-aware) first, then cp1252, then latin-1 -- the
 # last accepts every byte, so one oddly encoded file no longer sinks the rest.
+# (polars itself only decodes utf8/utf8-lossy, and lossy would silently mangle
+# the cp1252 characters instead of preserving them.)
 _ENCODINGS = ("utf-8-sig", "cp1252", "latin-1")
 
 
@@ -133,7 +143,7 @@ def _decode_csv(data: bytes, source_name: str) -> str:
     return data.decode("latin-1", errors="replace")
 
 
-def _read_one(data: bytes, source_name: str) -> pd.DataFrame:
+def _read_one(data: bytes, source_name: str) -> pl.DataFrame:
     """Read a single trip CSV from raw bytes, keeping blanks as empty strings.
 
     Args:
@@ -143,17 +153,15 @@ def _read_one(data: bytes, source_name: str) -> pd.DataFrame:
     Returns:
         The trips in one extract, with a ``source_file`` column added.
     """
-    frame = pd.read_csv(
-        io.StringIO(_decode_csv(data, source_name)),
-        dtype={col: "string" for col in _STRING_COLUMNS},
-        keep_default_na=False,
-        na_filter=False,
+    frame = pl.read_csv(
+        _decode_csv(data, source_name).encode("utf-8"),
+        schema_overrides={col: pl.Utf8 for col in _STRING_COLUMNS},
+        missing_utf8_is_empty_string=True,
     )
-    frame["source_file"] = source_name
-    return frame
+    return frame.with_columns(pl.lit(source_name).alias("source_file"))
 
 
-def load_trips(input_path: Path) -> pd.DataFrame:
+def load_trips(input_path: Path) -> pl.DataFrame:
     """Concatenate every monthly trip extract under ``input_path``.
 
     Args:
@@ -171,7 +179,7 @@ def load_trips(input_path: Path) -> pd.DataFrame:
     if not input_path.exists():
         raise FileNotFoundError(f"INPUT not found: {input_path}")
 
-    frames: list[pd.DataFrame] = []
+    frames: list[pl.DataFrame] = []
     if input_path.suffix.lower() == ".zip":
         with zipfile.ZipFile(input_path) as archive:
             members = sorted(
@@ -192,10 +200,13 @@ def load_trips(input_path: Path) -> pd.DataFrame:
     if not frames:
         raise ValueError(f"No '{TRIP_FILE_GLOB}' files found under {input_path}")
 
-    trips = pd.concat(frames, ignore_index=True)
-    started = pd.to_datetime(trips["started_at"])
-    trips.insert(0, "month", started.dt.strftime("%Y-%m"))
-    trips = trips.sort_values("started_at", kind="stable").reset_index(drop=True)
+    # ``diagonal`` unions columns across extracts (like pandas.concat) in case
+    # a vendor month adds or drops a field.
+    trips = pl.concat(frames, how="diagonal")
+    trips = trips.with_columns(
+        pl.col("started_at").str.to_datetime().dt.strftime("%Y-%m").alias("month")
+    )
+    trips = trips.select("month", pl.exclude("month")).sort("started_at", maintain_order=True)
     logger.info("Loaded %d trips from %d file(s).", len(trips), len(frames))
     return trips
 
@@ -205,7 +216,7 @@ def load_trips(input_path: Path) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 
-def build_system_monthly(trips: pd.DataFrame) -> pd.DataFrame:
+def build_system_monthly(trips: pl.DataFrame) -> pl.DataFrame:
     """Aggregate trips to one row per month with split-out counts.
 
     Args:
@@ -215,25 +226,38 @@ def build_system_monthly(trips: pd.DataFrame) -> pd.DataFrame:
         One row per month (sorted) with ``total_trips``, member/casual and
         electric/classic splits, and the dockless (blank start station) count.
     """
-    grouped = trips.groupby("month", sort=True)
-    summary = pd.DataFrame({"total_trips": grouped.size()})
-    summary["member_trips"] = grouped.apply(
-        lambda g: int((g["member_casual"] == "member").sum()), include_groups=False
+    return (
+        trips.group_by("month")
+        .agg(
+            pl.len().cast(pl.Int64).alias("total_trips"),
+            (pl.col("member_casual") == "member").sum().cast(pl.Int64).alias("member_trips"),
+            (pl.col("rideable_type") == "electric_bike")
+            .sum()
+            .cast(pl.Int64)
+            .alias("electric_trips"),
+            (pl.col("start_station_id").str.len_chars() == 0)
+            .sum()
+            .cast(pl.Int64)
+            .alias("dockless_start_trips"),
+        )
+        .with_columns(
+            (pl.col("total_trips") - pl.col("member_trips")).alias("casual_trips"),
+            (pl.col("total_trips") - pl.col("electric_trips")).alias("classic_trips"),
+        )
+        .select(
+            "month",
+            "total_trips",
+            "member_trips",
+            "casual_trips",
+            "electric_trips",
+            "classic_trips",
+            "dockless_start_trips",
+        )
+        .sort("month")
     )
-    summary["casual_trips"] = summary["total_trips"] - summary["member_trips"]
-    summary["electric_trips"] = grouped.apply(
-        lambda g: int((g["rideable_type"] == "electric_bike").sum()),
-        include_groups=False,
-    )
-    summary["classic_trips"] = summary["total_trips"] - summary["electric_trips"]
-    summary["dockless_start_trips"] = grouped.apply(
-        lambda g: int((g["start_station_id"].str.len() == 0).sum()),
-        include_groups=False,
-    )
-    return summary.reset_index()
 
 
-def build_station_monthly(trips: pd.DataFrame) -> pd.DataFrame:
+def build_station_monthly(trips: pl.DataFrame) -> pl.DataFrame:
     """Aggregate trips to one row per (month, station) with activity counts.
 
     Departures count trips leaving a station; arrivals count trips ending at a
@@ -248,44 +272,44 @@ def build_station_monthly(trips: pd.DataFrame) -> pd.DataFrame:
         One row per (month, station_id), sorted, with ``station_name``,
         ``departures``, ``arrivals``, and ``total`` columns.
     """
-    months = sorted(trips["month"].unique())
+    months = trips.get_column("month").unique().sort()
 
-    def _counts(id_col: str, name_col: str, label: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-        docked = trips[trips[id_col].str.len() > 0]
-        out = (
-            docked.groupby(["month", id_col], sort=False)
-            .size()
-            .reset_index(name=label)
-            .rename(columns={id_col: "station_id"})
+    def _counts(id_col: str, name_col: str, label: str) -> tuple[pl.DataFrame, pl.DataFrame]:
+        docked = trips.filter(pl.col(id_col).str.len_chars() > 0)
+        counts = (
+            docked.group_by("month", id_col)
+            .agg(pl.len().cast(pl.Int64).alias(label))
+            .rename({id_col: "station_id"})
         )
-        names = docked[[id_col, name_col]].rename(
-            columns={id_col: "station_id", name_col: "station_name"}
+        names = docked.select(
+            pl.col(id_col).alias("station_id"),
+            pl.col(name_col).alias("station_name"),
         )
-        return out, names
+        return counts, names
 
     departures, dep_names = _counts("start_station_id", "start_station_name", "departures")
     arrivals, arr_names = _counts("end_station_id", "end_station_name", "arrivals")
 
-    # One name per id (first non-blank seen), preserving any trailing whitespace.
-    names = (
-        pd.concat([dep_names, arr_names], ignore_index=True)
-        .drop_duplicates("station_id", keep="first")
-        .set_index("station_id")["station_name"]
+    # One name per id (first seen), preserving any trailing whitespace.
+    names = pl.concat([dep_names, arr_names]).unique(
+        subset="station_id", keep="first", maintain_order=True
     )
-    station_ids = sorted(names.index)
 
-    grid = pd.MultiIndex.from_product([months, station_ids], names=["month", "station_id"])
-    station = (
-        departures.merge(arrivals, on=["month", "station_id"], how="outer")
-        .set_index(["month", "station_id"])
-        .reindex(grid, fill_value=0)
-        .reset_index()
+    grid = pl.DataFrame({"month": months}).join(
+        names.select("station_id").sort("station_id"), how="cross"
     )
-    station["departures"] = station["departures"].fillna(0).astype(int)
-    station["arrivals"] = station["arrivals"].fillna(0).astype(int)
-    station["total"] = station["departures"] + station["arrivals"]
-    station.insert(2, "station_name", station["station_id"].map(names))
-    return station.sort_values(["station_id", "month"]).reset_index(drop=True)
+    return (
+        grid.join(departures, on=["month", "station_id"], how="left", coalesce=True)
+        .join(arrivals, on=["month", "station_id"], how="left", coalesce=True)
+        .join(names, on="station_id", how="left", coalesce=True)
+        .with_columns(
+            pl.col("departures").fill_null(0),
+            pl.col("arrivals").fill_null(0),
+        )
+        .with_columns((pl.col("departures") + pl.col("arrivals")).alias("total"))
+        .select("month", "station_id", "station_name", "departures", "arrivals", "total")
+        .sort("station_id", "month")
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -293,7 +317,7 @@ def build_station_monthly(trips: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 
-def plot_system_trend(system_monthly: pd.DataFrame, out_path: Path) -> None:
+def plot_system_trend(system_monthly: pl.DataFrame, out_path: Path) -> None:
     """Draw and save the system-wide monthly ridership trend.
 
     Args:
@@ -302,10 +326,10 @@ def plot_system_trend(system_monthly: pd.DataFrame, out_path: Path) -> None:
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=(11, 5))
-    x = pd.to_datetime(system_monthly["month"], format="%Y-%m")
-    ax.plot(x, system_monthly["total_trips"], marker="o", label="All trips")
-    ax.plot(x, system_monthly["member_trips"], marker=".", label="Member")
-    ax.plot(x, system_monthly["casual_trips"], marker=".", label="Casual")
+    x = _month_datetimes(system_monthly.get_column("month"))
+    ax.plot(x, system_monthly.get_column("total_trips"), marker="o", label="All trips")
+    ax.plot(x, system_monthly.get_column("member_trips"), marker=".", label="Member")
+    ax.plot(x, system_monthly.get_column("casual_trips"), marker=".", label="Casual")
     ax.set_title("System ridership over time")
     ax.set_xlabel("Month")
     ax.set_ylabel("Trips")
@@ -319,7 +343,7 @@ def plot_system_trend(system_monthly: pd.DataFrame, out_path: Path) -> None:
 
 
 def plot_station_trends(
-    station_monthly: pd.DataFrame, out_dir: Path, max_plots: int = 0
+    station_monthly: pl.DataFrame, out_dir: Path, max_plots: int = 0
 ) -> list[Path]:
     """Draw and save a monthly ridership trend chart per station.
 
@@ -333,19 +357,23 @@ def plot_station_trends(
         The chart paths written, busiest station first.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
-    totals = station_monthly.groupby("station_id")["total"].sum().sort_values(ascending=False)
+    totals = (
+        station_monthly.group_by("station_id")
+        .agg(pl.col("total").sum())
+        .sort("total", descending=True)
+    )
     if max_plots and max_plots > 0:
         totals = totals.head(max_plots)
 
     written: list[Path] = []
-    for station_id in totals.index:
-        rows = station_monthly[station_monthly["station_id"] == station_id]
-        name = str(rows["station_name"].iloc[0]).strip()
+    for station_id in totals.get_column("station_id"):
+        rows = station_monthly.filter(pl.col("station_id") == station_id)
+        name = str(rows.get_column("station_name")[0]).strip()
         fig, ax = plt.subplots(figsize=(11, 4.5))
-        x = pd.to_datetime(rows["month"], format="%Y-%m")
-        ax.plot(x, rows["total"], marker="o", label="Total")
-        ax.plot(x, rows["departures"], marker=".", label="Departures")
-        ax.plot(x, rows["arrivals"], marker=".", label="Arrivals")
+        x = _month_datetimes(rows.get_column("month"))
+        ax.plot(x, rows.get_column("total"), marker="o", label="Total")
+        ax.plot(x, rows.get_column("departures"), marker=".", label="Departures")
+        ax.plot(x, rows.get_column("arrivals"), marker=".", label="Arrivals")
         ax.set_title(f"Ridership over time -- {name} ({station_id})")
         ax.set_xlabel("Month")
         ax.set_ylabel("Trips")
@@ -359,6 +387,11 @@ def plot_station_trends(
         plt.close(fig)
         written.append(path)
     return written
+
+
+def _month_datetimes(months: pl.Series) -> list[datetime]:
+    """Convert ``YYYY-MM`` month labels to datetimes for a matplotlib date axis."""
+    return [datetime.strptime(month, "%Y-%m") for month in months]
 
 
 def _format_month_axis(fig: plt.Figure, ax: plt.Axes, n_months: int) -> None:
@@ -400,9 +433,9 @@ def generate_and_write(
     system_monthly = build_system_monthly(trips)
     station_monthly = build_station_monthly(trips)
 
-    trips.to_csv(out_dir / "trips_concatenated.csv", index=False)
-    system_monthly.to_csv(out_dir / "monthly_system_ridership.csv", index=False)
-    station_monthly.to_csv(out_dir / "monthly_station_ridership.csv", index=False)
+    trips.write_csv(out_dir / "trips_concatenated.csv")
+    system_monthly.write_csv(out_dir / "monthly_system_ridership.csv")
+    station_monthly.write_csv(out_dir / "monthly_station_ridership.csv")
 
     plots_dir = out_dir / "plots"
     system_plot = plots_dir / "system_ridership_trend.png"
