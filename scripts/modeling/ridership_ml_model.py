@@ -187,12 +187,18 @@ FEATURE_TABLES: Final[list[FeatureTable]] = [
     ),
     # Capital Bikeshare (CABI) stations reached by each route. Like schools,
     # these come with a measurable level of activity, so we bring in both the
-    # count served and the weekday average ridership those stations carry.
+    # count served and the average daily ridership those stations carry by day
+    # type (weekday / Saturday / Sunday, holidays counted as Sundays upstream).
     FeatureTable(
         label="cabi_coverage",
         path=Path(r"Path\To\Your\cabi_coverage_by_route.csv"),
         join_keys=("route_id",),
-        keep_cols=("cabi_stations_served", "cabi_weekday_riders_served"),
+        keep_cols=(
+            "cabi_stations_served",
+            "cabi_weekday_riders_served",
+            "cabi_saturday_riders_served",
+            "cabi_sunday_riders_served",
+        ),
     ),
     # Headway and span from headway_span_exporter.py (weekday default).
     FeatureTable(
@@ -237,6 +243,11 @@ PREDICTORS: Final[tuple[str, ...]] = (
     "enrollment_served",
     "cabi_stations_served",
     "cabi_weekday_riders_served",
+    # Saturday/Sunday bikeshare averages ship alongside the weekday figure.
+    # The three day-type columns are strongly correlated across stations, so
+    # analysts trimming a collinear fit will usually keep weekday only.
+    "cabi_saturday_riders_served",
+    "cabi_sunday_riders_served",
 )
 
 # Categorical columns to one-hot encode (first level dropped as the reference).
@@ -276,6 +287,11 @@ LOG_PREDICTORS: Final[tuple[str, ...]] = (
     "enrollment_served",
     "cabi_stations_served",
     "cabi_weekday_riders_served",
+    # Saturday/Sunday bikeshare averages ship alongside the weekday figure.
+    # The three day-type columns are strongly correlated across stations, so
+    # analysts trimming a collinear fit will usually keep weekday only.
+    "cabi_saturday_riders_served",
+    "cabi_sunday_riders_served",
 )
 
 # -----------------------------------------------------------------------------

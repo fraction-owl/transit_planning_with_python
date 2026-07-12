@@ -195,3 +195,81 @@ def test_max_station_plots_caps_chart_count(tmp_path: Path) -> None:
     )
     station_pngs = list((tmp_path / "plots" / "stations").glob("*.png"))
     assert len(station_pngs) == 3
+
+
+# ---------------------------------------------------------------------------
+# build_station_daytype_averages
+# ---------------------------------------------------------------------------
+
+# The 24-month fixture spans 2024-05-01 .. 2026-04-30 (730 calendar days):
+# 500 non-holiday weekdays, 104 Saturdays, and 126 Sunday-equivalents (104
+# true Sundays + 22 observed federal holidays falling on a weekday).
+_EXPECTED_DAYS = {"weekday": 500, "saturday": 104, "sunday": 126}
+
+
+def test_daytype_day_counts_match_covered_calendar(trips: pl.DataFrame) -> None:
+    daytype = mod.build_station_daytype_averages(trips)
+    for day_type, expected in _EXPECTED_DAYS.items():
+        assert (daytype.get_column(f"{day_type}_days") == expected).all()
+
+
+def test_daytype_one_row_per_station(trips: pl.DataFrame) -> None:
+    daytype = mod.build_station_daytype_averages(trips)
+    station = mod.build_station_monthly(trips)
+    assert (
+        daytype.get_column("station_id").sort().to_list()
+        == station.get_column("station_id").unique().sort().to_list()
+    )
+
+
+def test_daytype_averages_reconcile_with_total_activity(trips: pl.DataFrame) -> None:
+    # Un-averaging (avg x day count) must recover every docked departure and
+    # arrival, up to the 4-decimal rounding of the averages.
+    daytype = mod.build_station_daytype_averages(trips)
+    recovered = sum(
+        (
+            daytype.get_column(f"avg_{day_type}_riders") * daytype.get_column(f"{day_type}_days")
+        ).sum()
+        for day_type in mod.DAY_TYPES
+    )
+    docked = (trips.get_column("start_station_id").str.len_chars() > 0).sum() + (
+        trips.get_column("end_station_id").str.len_chars() > 0
+    ).sum()
+    assert abs(recovered - docked) < 0.5
+
+
+def test_daytype_table_matches_pandas_twin_byte_for_byte(
+    trips: pl.DataFrame, tmp_path: Path
+) -> None:
+    # The module docstring promises byte-identical aggregate tables; hold the
+    # new day-type table to that for the shared fixture.
+    from scripts.gbfs_tools import bikeshare_ridership_trends as pandas_mod
+
+    pandas_trips = pandas_mod.load_trips(FIXTURE_ZIP)
+    pandas_mod.build_station_daytype_averages(pandas_trips).to_csv(
+        tmp_path / "pandas.csv", index=False
+    )
+    mod.build_station_daytype_averages(trips).write_csv(tmp_path / "polars.csv")
+    assert (tmp_path / "pandas.csv").read_bytes() == (tmp_path / "polars.csv").read_bytes()
+
+
+def test_generate_and_write_produces_daytype_table(tmp_path: Path) -> None:
+    result = mod.generate_and_write(
+        input_path=str(FIXTURE_ZIP),
+        output_dir=str(tmp_path),
+        max_station_plots=1,
+    )
+    out_csv = tmp_path / "station_daytype_ridership.csv"
+    assert out_csv.exists()
+    written = pl.read_csv(out_csv, schema_overrides={"station_id": pl.Utf8})
+    assert written.columns == [
+        "station_id",
+        "station_name",
+        "avg_weekday_riders",
+        "avg_saturday_riders",
+        "avg_sunday_riders",
+        "weekday_days",
+        "saturday_days",
+        "sunday_days",
+    ]
+    assert len(written) == result["station_daytype"].get_column("station_id").n_unique()

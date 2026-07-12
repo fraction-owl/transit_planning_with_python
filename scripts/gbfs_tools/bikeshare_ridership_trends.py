@@ -31,6 +31,9 @@ In OUTPUT_DIR:
     departing, arriving, and total activity. Dockless trips with a blank
     station are excluded from the per-station table but still counted in the
     system totals.
+  * ``station_daytype_ridership.csv`` -- one row per station: average daily
+    ridership (departures + arrivals) on weekdays, Saturdays, and Sundays,
+    plus the day counts used as denominators.
   * ``plots/system_ridership_trend.png`` -- system-wide trips per month.
   * ``plots/stations/station_<id>.png`` -- one trend chart per station.
 
@@ -38,16 +41,28 @@ Station ridership counts both departures (trips whose start station is the
 station) and arrivals (trips whose end station is the station); ``total`` is
 their sum. The per-station table and charts span every month in the data so
 trends include months with zero activity rather than skipping them.
+
+Day-type averages divide each station's total activity on weekday / Saturday /
+Sunday dates by the number of such dates in the covered calendar (every day of
+every month present in the data, so zero-activity days count). HOLIDAY RULE:
+observed U.S. federal holidays are classified as Sunday-equivalent -- the
+standard transit convention (holidays run Sunday service) -- so
+``avg_weekday_riders`` covers non-holiday weekdays only, matching the
+weekday posture of the GTFS-side feature scripts. A trip is attributed to the
+day type of its start date.
 """
 
 from __future__ import annotations
 
 import argparse
+import calendar
+import datetime as dt
 import io
 import logging
 import re
 import sys
 import zipfile
+from collections import Counter
 from pathlib import Path
 
 import matplotlib.dates as mdates
@@ -288,6 +303,162 @@ def build_station_monthly(trips: pd.DataFrame) -> pd.DataFrame:
     return station.sort_values(["station_id", "month"]).reset_index(drop=True)
 
 
+def federal_holidays_observed(year: int) -> set[dt.date]:
+    """Return the observed dates of the U.S. federal holidays of *year*.
+
+    Covers the eleven holidays of 5 U.S.C. 6103: New Year's Day, Birthday of
+    Martin Luther King Jr. (3rd Monday of January), Washington's Birthday
+    (3rd Monday of February), Memorial Day (last Monday of May), Juneteenth
+    (June 19, from its 2021 establishment onward), Independence Day, Labor
+    Day (1st Monday of September), Columbus Day (2nd Monday of October),
+    Veterans Day, Thanksgiving (4th Thursday of November), and Christmas.
+
+    Fixed-date holidays falling on a Saturday are observed on the preceding
+    Friday and those falling on a Sunday on the following Monday, so an
+    observed date can land in the *previous* calendar year (e.g. New Year's
+    Day 2022 was observed on 2021-12-31). Callers classifying a span of dates
+    should therefore union this set over ``range(first_year, last_year + 2)``.
+
+    Args:
+        year: Calendar year whose holidays are computed.
+
+    Returns:
+        The observed dates of *year*'s federal holidays.
+    """
+
+    def nth_weekday(month: int, weekday: int, n: int) -> dt.date:
+        first = dt.date(year, month, 1)
+        offset = (weekday - first.weekday()) % 7
+        return first + dt.timedelta(days=offset + 7 * (n - 1))
+
+    def last_monday(month: int) -> dt.date:
+        next_month = dt.date(year + (month == 12), month % 12 + 1, 1)
+        last = next_month - dt.timedelta(days=1)
+        return last - dt.timedelta(days=last.weekday())
+
+    def observed(day: dt.date) -> dt.date:
+        if day.weekday() == 5:  # Saturday -> preceding Friday
+            return day - dt.timedelta(days=1)
+        if day.weekday() == 6:  # Sunday -> following Monday
+            return day + dt.timedelta(days=1)
+        return day
+
+    fixed = [
+        dt.date(year, 1, 1),  # New Year's Day
+        dt.date(year, 7, 4),  # Independence Day
+        dt.date(year, 11, 11),  # Veterans Day
+        dt.date(year, 12, 25),  # Christmas Day
+    ]
+    if year >= 2021:
+        fixed.append(dt.date(year, 6, 19))  # Juneteenth
+    floating = [
+        nth_weekday(1, 0, 3),  # Birthday of Martin Luther King Jr.
+        nth_weekday(2, 0, 3),  # Washington's Birthday
+        last_monday(5),  # Memorial Day
+        nth_weekday(9, 0, 1),  # Labor Day
+        nth_weekday(10, 0, 2),  # Columbus Day
+        nth_weekday(11, 3, 4),  # Thanksgiving Day
+    ]
+    return {observed(day) for day in fixed} | set(floating)
+
+
+#: Day-type labels, in output order.
+DAY_TYPES: tuple[str, ...] = ("weekday", "saturday", "sunday")
+
+
+def _calendar_dates(months: list[str]) -> list[dt.date]:
+    """Return every calendar date of the given ``YYYY-MM`` months, sorted."""
+    dates: list[dt.date] = []
+    for month in sorted(months):
+        year, month_num = int(month[:4]), int(month[5:7])
+        n_days = calendar.monthrange(year, month_num)[1]
+        dates.extend(dt.date(year, month_num, day) for day in range(1, n_days + 1))
+    return dates
+
+
+def _day_type(day: dt.date, holidays: set[dt.date]) -> str:
+    """Classify a date as weekday / saturday / sunday (holidays -> sunday)."""
+    if day in holidays or day.weekday() == 6:
+        return "sunday"
+    if day.weekday() == 5:
+        return "saturday"
+    return "weekday"
+
+
+def build_station_daytype_averages(trips: pd.DataFrame) -> pd.DataFrame:
+    """Compute average daily ridership per station by day type.
+
+    Every calendar date of every month present in the data is classified as
+    weekday, Saturday, or Sunday, with observed U.S. federal holidays counted
+    as Sunday-equivalent (see the module docstring for the full holiday rule).
+    Each station's activity -- departures plus arrivals, with a trip
+    attributed to the day type of its *start* date -- is summed per day type
+    and divided by the number of such dates in the covered calendar, so days
+    with zero activity pull the average down rather than being skipped.
+    Dockless trips with a blank station are excluded, as in
+    :func:`build_station_monthly`.
+
+    Args:
+        trips: Concatenated trips, as returned by :func:`load_trips`.
+
+    Returns:
+        One row per station_id (sorted) with ``station_name``,
+        ``avg_weekday_riders``, ``avg_saturday_riders``, ``avg_sunday_riders``
+        (rounded to 4 decimals), and the ``weekday_days`` / ``saturday_days``
+        / ``sunday_days`` denominators (identical on every row).
+    """
+    dates = _calendar_dates(sorted(trips["month"].unique()))
+    years = range(dates[0].year, dates[-1].year + 2)
+    holidays = set().union(*(federal_holidays_observed(year) for year in years))
+    day_counts = Counter(_day_type(day, holidays) for day in dates)
+
+    type_by_date = {day: _day_type(day, holidays) for day in dates}
+    trips = trips.assign(day_type=pd.to_datetime(trips["started_at"]).dt.date.map(type_by_date))
+
+    def _counts(id_col: str, name_col: str, label: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+        docked = trips[trips[id_col].str.len() > 0]
+        out = (
+            docked.groupby(["day_type", id_col], sort=False)
+            .size()
+            .reset_index(name=label)
+            .rename(columns={id_col: "station_id"})
+        )
+        names = docked[[id_col, name_col]].rename(
+            columns={id_col: "station_id", name_col: "station_name"}
+        )
+        return out, names
+
+    departures, dep_names = _counts("start_station_id", "start_station_name", "departures")
+    arrivals, arr_names = _counts("end_station_id", "end_station_name", "arrivals")
+
+    names = (
+        pd.concat([dep_names, arr_names], ignore_index=True)
+        .drop_duplicates("station_id", keep="first")
+        .set_index("station_id")["station_name"]
+    )
+    station_ids = sorted(names.index)
+
+    grid = pd.MultiIndex.from_product([DAY_TYPES, station_ids], names=["day_type", "station_id"])
+    activity = (
+        departures.merge(arrivals, on=["day_type", "station_id"], how="outer")
+        .set_index(["day_type", "station_id"])
+        .reindex(grid, fill_value=0)
+        .reset_index()
+    )
+    activity["total"] = activity["departures"].fillna(0) + activity["arrivals"].fillna(0)
+
+    wide = activity.pivot_table(
+        index="station_id", columns="day_type", values="total", aggfunc="sum"
+    )
+    summary = pd.DataFrame(index=pd.Index(station_ids, name="station_id"))
+    summary["station_name"] = names
+    for day_type in DAY_TYPES:
+        summary[f"avg_{day_type}_riders"] = (wide[day_type] / day_counts[day_type]).round(4)
+    for day_type in DAY_TYPES:
+        summary[f"{day_type}_days"] = day_counts[day_type]
+    return summary.reset_index()
+
+
 # ---------------------------------------------------------------------------
 # Charts
 # ---------------------------------------------------------------------------
@@ -399,21 +570,24 @@ def generate_and_write(
     trips = load_trips(Path(input_path))
     system_monthly = build_system_monthly(trips)
     station_monthly = build_station_monthly(trips)
+    station_daytype = build_station_daytype_averages(trips)
 
     trips.to_csv(out_dir / "trips_concatenated.csv", index=False)
     system_monthly.to_csv(out_dir / "monthly_system_ridership.csv", index=False)
     station_monthly.to_csv(out_dir / "monthly_station_ridership.csv", index=False)
+    station_daytype.to_csv(out_dir / "station_daytype_ridership.csv", index=False)
 
     plots_dir = out_dir / "plots"
     system_plot = plots_dir / "system_ridership_trend.png"
     plot_system_trend(system_monthly, system_plot)
     station_plots = plot_station_trends(station_monthly, plots_dir / "stations", max_station_plots)
 
-    logger.info("Wrote 3 tables and %d charts to %s", 1 + len(station_plots), out_dir)
+    logger.info("Wrote 4 tables and %d charts to %s", 1 + len(station_plots), out_dir)
     return {
         "trips": trips,
         "system": system_monthly,
         "station": station_monthly,
+        "station_daytype": station_daytype,
         "system_plot": system_plot,
         "station_plots": station_plots,
     }
