@@ -125,14 +125,15 @@ from `pyproject.toml` and uses the same ruff version that CI does (pinned in `re
 
 ### Requirements files
 
-The repository uses two requirements files:
+The repository uses three requirements files:
 
 | File | Purpose |
 |---|---|
-| `requirements.txt` | Open-source / non-ArcGIS stack (geopandas, rapidfuzz, etc.) plus all CI and dev tooling (ruff, ty, pytest). Used by CI. **This is the pip install target.** |
+| `requirements.txt` | Open-source / non-ArcGIS runtime stack (geopandas, rapidfuzz, etc.). **This is the pip install target for running the scripts.** |
+| `requirements-dev.txt` | Dev and CI tooling (pytest, ruff, ty, pre-commit, typing stubs). Install alongside `requirements.txt` when contributing: `pip install -r requirements.txt -r requirements-dev.txt`. CI installs both. |
 | `requirements-arcpro.txt` | Reference only — documents packages already present in the ArcGIS Pro Python environment. Nothing here needs to be pip-installed. |
 
-If you add a new pip-installable dependency, add it to `requirements.txt`. If you're noting that something is available in the ArcGIS Pro environment, add it to `requirements-arcpro.txt` as a comment or entry with a note.
+If you add a new runtime dependency, add it to `requirements.txt`; if it's a test/lint/type-checking tool, add it to `requirements-dev.txt`. If you're noting that something is available in the ArcGIS Pro environment, add it to `requirements-arcpro.txt` as a comment or entry with a note.
 
 ## 🌳 GitHub Contribution Workflow
 
