@@ -13,6 +13,11 @@ pandas==2.2.3                # Data manipulation and analysis
 numpy==1.26.4                # Numerical computing
 scipy==1.12.0                # Scientific computing and optimization
 
+# Fast DataFrames (open-source stack only — NOT bundled with ArcGIS Pro)
+# Required by scripts/gbfs_tools/bikeshare_ridership_trends.py; also used by
+# the dev fixture builders (dev_tools/build_cacensus_fixtures.py).
+polars==0.20.31              # Columnar DataFrame engine for large trip extracts
+
 # Machine Learning (open-source stack only — NOT bundled with ArcGIS Pro)
 # Required by scripts/modeling/ridership_ml_model.py (random-forest + gradient-
 # boosting ridership models). The linear ridership_regression_model.py needs
