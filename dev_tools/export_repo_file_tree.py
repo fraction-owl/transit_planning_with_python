@@ -39,10 +39,19 @@ def build_tree(root: str) -> Dict[str, Any]:
       subdir_name -> nested dict
       '__files__' -> sorted list of filenames in this dir
     """
+    excluded_dirs = (
+        ".git",
+        "__pycache__",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".mypy_cache",
+        ".ipynb_checkpoints",
+        ".venv",
+        "venv",
+    )
     tree = {}
     for dirpath, dirs, files in os.walk(root):
-        # Exclude .git and __pycache__ directories
-        dirs[:] = [d for d in dirs if d not in (".git", "__pycache__")]
+        dirs[:] = [d for d in dirs if d not in excluded_dirs]
 
         if not files:
             continue
