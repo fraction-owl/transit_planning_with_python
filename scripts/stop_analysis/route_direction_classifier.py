@@ -19,6 +19,7 @@ Outputs:
 import logging
 import math
 import os
+import zipfile
 from collections.abc import Mapping, Sequence
 from typing import Any, Optional
 
@@ -58,35 +59,46 @@ LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
 
 
 def load_gtfs_data(
-    gtfs_folder_path: str,
+    gtfs_path: str,
     files: Optional[Sequence[str]] = None,
     dtype: str | type[str] | Mapping[str, Any] = str,
+    logger: Optional[logging.Logger] = None,
 ) -> dict[str, pd.DataFrame]:
     """Load one or more GTFS text files into memory.
 
     Args:
-        gtfs_folder_path: Absolute or relative path to the folder
-            containing the GTFS feed.
+        gtfs_path: Absolute or relative path to the folder containing the
+            GTFS feed, or to a ``.zip`` archive of it — the form GTFS
+            producers and most open-data portals distribute feeds in. Zip
+            members may sit at the archive root or nested one level inside
+            a single wrapper folder; both layouts are handled.
         files: Explicit sequence of file names to load. If ``None``,
             the standard 13 GTFS text files are attempted.
         dtype: Value forwarded to :pyfunc:`pandas.read_csv(dtype=…)` to
             control column dtypes. Supply a mapping for per-column dtypes.
+        logger: Logger for progress messages. Defaults to this module's
+            logger (``logging.getLogger(__name__)``) rather than the root
+            logger, so callers keep control of handler configuration.
 
     Returns:
         Mapping of file stem → :class:`pandas.DataFrame`; for example,
         ``data["trips"]`` holds the parsed *trips.txt* table.
 
     Raises:
-        OSError: Folder missing or one of *files* not present.
-        ValueError: Empty file or CSV parser failure.
-        RuntimeError: Generic OS error while reading a file.
+        OSError: Path missing, one of *files* not present in the feed, or
+            an OS-level failure while reading a file.
+        ValueError: *gtfs_path* is neither a directory nor a valid ``.zip``
+            file, a requested file matches more than one location inside
+            the zip, a file is empty, or the CSV parser fails.
 
     Notes:
         All columns default to ``str`` to avoid pandas’ type-inference
         pitfalls (e.g. leading zeros in IDs).
     """
-    if not os.path.exists(gtfs_folder_path):
-        raise OSError(f"The directory '{gtfs_folder_path}' does not exist.")
+    log = logger if logger is not None else logging.getLogger(__name__)
+
+    if not os.path.exists(gtfs_path):
+        raise OSError(f"The path '{gtfs_path}' does not exist.")
 
     if files is None:
         files = (
@@ -105,37 +117,69 @@ def load_gtfs_data(
             "transfers.txt",
         )
 
-    missing = [
-        file_name
-        for file_name in files
-        if not os.path.exists(os.path.join(gtfs_folder_path, file_name))
-    ]
-    if missing:
-        raise OSError(f"Missing GTFS files in '{gtfs_folder_path}': {', '.join(missing)}")
+    is_zip = os.path.isfile(gtfs_path) and gtfs_path.lower().endswith(".zip")
+    if not is_zip and not os.path.isdir(gtfs_path):
+        raise ValueError(f"'{gtfs_path}' is neither a directory nor a .zip file.")
 
-    data: dict[str, pd.DataFrame] = {}
-    for file_name in files:
-        key = file_name.replace(".txt", "")
-        file_path = os.path.join(gtfs_folder_path, file_name)
+    archive: zipfile.ZipFile | None = None
+    members_by_name: dict[str, list[str]] = {}
+    if is_zip:
         try:
-            df = pd.read_csv(file_path, dtype=dtype, low_memory=False)
-            data[key] = df
-            logging.info("Loaded %s (%d records).", file_name, len(df))
+            archive = zipfile.ZipFile(gtfs_path)
+        except zipfile.BadZipFile as exc:
+            raise ValueError(f"'{gtfs_path}' is not a valid zip archive.") from exc
+        for name in archive.namelist():
+            members_by_name.setdefault(os.path.basename(name), []).append(name)
 
-        except pd.errors.EmptyDataError as exc:
-            raise ValueError(f"File '{file_name}' in '{gtfs_folder_path}' is empty.") from exc
+    try:
+        missing: list[str] = []
+        ambiguous: list[str] = []
+        resolved: dict[str, str] = {}
+        for file_name in files:
+            if archive is None:
+                if not os.path.exists(os.path.join(gtfs_path, file_name)):
+                    missing.append(file_name)
+                continue
+            candidates = members_by_name.get(file_name, [])
+            if not candidates:
+                missing.append(file_name)
+            elif len(candidates) > 1:
+                ambiguous.append(file_name)
+            else:
+                resolved[file_name] = candidates[0]
 
-        except pd.errors.ParserError as exc:
+        if ambiguous:
             raise ValueError(
-                f"Parser error in '{file_name}' in '{gtfs_folder_path}': {exc}"
-            ) from exc
+                f"Ambiguous GTFS files in '{gtfs_path}' (found in multiple "
+                f"locations): {', '.join(ambiguous)}"
+            )
+        if missing:
+            raise OSError(f"Missing GTFS files in '{gtfs_path}': {', '.join(missing)}")
 
-        except OSError as exc:
-            raise RuntimeError(
-                f"OS error reading file '{file_name}' in '{gtfs_folder_path}': {exc}"
-            ) from exc
+        data: dict[str, pd.DataFrame] = {}
+        for file_name in files:
+            key = file_name.replace(".txt", "")
+            try:
+                if archive is None:
+                    df = pd.read_csv(
+                        os.path.join(gtfs_path, file_name), dtype=dtype, low_memory=False
+                    )
+                else:
+                    with archive.open(resolved[file_name]) as handle:
+                        df = pd.read_csv(handle, dtype=dtype, low_memory=False)
+                data[key] = df
+                log.info("Loaded %s (%d records).", file_name, len(df))
 
-    return data
+            except pd.errors.EmptyDataError as exc:
+                raise ValueError(f"File '{file_name}' in '{gtfs_path}' is empty.") from exc
+
+            except pd.errors.ParserError as exc:
+                raise ValueError(f"Parser error in '{file_name}' in '{gtfs_path}': {exc}") from exc
+
+        return data
+    finally:
+        if archive is not None:
+            archive.close()
 
 
 def classify_direction(

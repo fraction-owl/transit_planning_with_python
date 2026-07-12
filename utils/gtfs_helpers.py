@@ -86,6 +86,7 @@ def load_gtfs_data(
     gtfs_path: str,
     files: Optional[Sequence[str]] = None,
     dtype: str | type[str] | Mapping[str, Any] = str,
+    logger: Optional[logging.Logger] = None,
 ) -> dict[str, pd.DataFrame]:
     """Load one or more GTFS text files into memory.
 
@@ -99,22 +100,27 @@ def load_gtfs_data(
             the standard 13 GTFS text files are attempted.
         dtype: Value forwarded to :pyfunc:`pandas.read_csv(dtype=…)` to
             control column dtypes. Supply a mapping for per-column dtypes.
+        logger: Logger for progress messages. Defaults to this module's
+            logger (``logging.getLogger(__name__)``) rather than the root
+            logger, so callers keep control of handler configuration.
 
     Returns:
         Mapping of file stem → :class:`pandas.DataFrame`; for example,
         ``data["trips"]`` holds the parsed *trips.txt* table.
 
     Raises:
-        OSError: Path missing, or one of *files* not present in the feed.
+        OSError: Path missing, one of *files* not present in the feed, or
+            an OS-level failure while reading a file.
         ValueError: *gtfs_path* is neither a directory nor a valid ``.zip``
             file, a requested file matches more than one location inside
             the zip, a file is empty, or the CSV parser fails.
-        RuntimeError: Generic OS error while reading a file.
 
     Notes:
         All columns default to ``str`` to avoid pandas’ type-inference
         pitfalls (e.g. leading zeros in IDs).
     """
+    log = logger if logger is not None else logging.getLogger(__name__)
+
     if not os.path.exists(gtfs_path):
         raise OSError(f"The path '{gtfs_path}' does not exist.")
 
@@ -186,18 +192,13 @@ def load_gtfs_data(
                     with archive.open(resolved[file_name]) as handle:
                         df = pd.read_csv(handle, dtype=dtype, low_memory=False)
                 data[key] = df
-                logging.info("Loaded %s (%d records).", file_name, len(df))
+                log.info("Loaded %s (%d records).", file_name, len(df))
 
             except pd.errors.EmptyDataError as exc:
                 raise ValueError(f"File '{file_name}' in '{gtfs_path}' is empty.") from exc
 
             except pd.errors.ParserError as exc:
                 raise ValueError(f"Parser error in '{file_name}' in '{gtfs_path}': {exc}") from exc
-
-            except OSError as exc:
-                raise RuntimeError(
-                    f"OS error reading file '{file_name}' in '{gtfs_path}': {exc}"
-                ) from exc
 
         return data
     finally:
