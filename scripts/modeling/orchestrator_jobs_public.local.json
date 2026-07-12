@@ -5,9 +5,12 @@
     "directly (gtfs_input/connector_gtfs_2026_04_29, poi_inputs, schools_input,",
     "census_input/tables, census_input/shps, cabi_input). Run with:",
     "  python prep_features_public.py --registry <this file> --input-dir ...\\input\\data --output-dir ...\\prepped_features",
-    "Caveats: (1) install scipy/geopandas/shapely first; (2) gbfs scripts omitted (no GBFS",
-    "source + multi-stage deps); (3) verify each script's real output filenames + keep_cols",
-    "against work\\out\\<script>\\ and adjust the outputs block if they differ."
+    "Caveats: (1) install scipy/geopandas/shapely first; (2) the GBFS-dependent entries",
+    "(gbfs_stations_exporter, cabi_coverage_by_route_gpd) need a gbfs_input/gbfs.json station",
+    "source; without one they fail and are skipped (run-what-you-can), while",
+    "bikeshare_ridership_trends still runs off cabi_input; (3) verify each script's real output",
+    "filenames + keep_cols against work\\out\\<script>\\ and adjust the outputs block if they",
+    "differ."
   ],
   "scripts": [
     {
@@ -65,10 +68,29 @@
               "--output-dir", "{output}"]
     },
     {
+      "script": "gbfs_stations_exporter.py",
+      "cmd": ["{python}", "{script}",
+              "--source", "{input}/gbfs_input/gbfs.json",
+              "--output-dir", "{output}"]
+    },
+    {
       "script": "bikeshare_ridership_trends.py",
       "cmd": ["{python}", "{script}",
               "--input", "{input}/cabi_input",
               "--output-dir", "{output}"]
+    },
+    {
+      "script": "cabi_coverage_by_route_gpd.py",
+      "cmd": ["{python}", "{script}",
+              "--gtfs-dir", "{input}/gtfs_input/connector_gtfs_2026_04_29",
+              "--stations-path", "{work}/out/gbfs_stations_exporter",
+              "--ridership-csv", "{work}/out/bikeshare_ridership_trends/station_daytype_ridership.csv",
+              "--output-dir", "{output}"],
+      "outputs": [
+        {"file": "cabi_coverage_by_route.csv", "join_keys": ["route_id"],
+         "keep_cols": ["cabi_stations_served", "cabi_weekday_riders_served",
+                       "cabi_saturday_riders_served", "cabi_sunday_riders_served"]}
+      ]
     },
     {
       "script": "uscensus_tiger_join_gpd.py",
@@ -93,6 +115,9 @@
      "keep_cols": ["avg_headway_min", "span_hrs"]},
     {"file": "school_coverage_by_route.csv", "join_keys": ["route_id"],
      "keep_cols": ["schools_served", "enrollment_served", "enrollment_1_8_served",
-                   "enrollment_9_12_served", "enrollment_postsec_served"]}
+                   "enrollment_9_12_served", "enrollment_postsec_served"]},
+    {"file": "cabi_coverage_by_route.csv", "join_keys": ["route_id"],
+     "keep_cols": ["cabi_stations_served", "cabi_weekday_riders_served",
+                   "cabi_saturday_riders_served", "cabi_sunday_riders_served"]}
   ]
 }

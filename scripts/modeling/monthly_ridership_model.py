@@ -151,6 +151,11 @@ PREDICTORS: Final[tuple[str, ...]] = (
     "enrollment_served",
     "cabi_stations_served",
     "cabi_weekday_riders_served",
+    # Saturday/Sunday bikeshare averages ship alongside the weekday figure.
+    # The three day-type columns are strongly correlated across stations, so
+    # analysts trimming a collinear fit will usually keep weekday only.
+    "cabi_saturday_riders_served",
+    "cabi_sunday_riders_served",
 )
 
 # Categorical columns to one-hot encode (first level dropped as the reference).
@@ -190,6 +195,11 @@ LOG_PREDICTORS: Final[tuple[str, ...]] = (
     "enrollment_served",
     "cabi_stations_served",
     "cabi_weekday_riders_served",
+    # Saturday/Sunday bikeshare averages ship alongside the weekday figure.
+    # The three day-type columns are strongly correlated across stations, so
+    # analysts trimming a collinear fit will usually keep weekday only.
+    "cabi_saturday_riders_served",
+    "cabi_sunday_riders_served",
 )
 
 # Standardize predictors to mean 0 / unit variance before fitting. Useful for

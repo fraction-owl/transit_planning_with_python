@@ -20,7 +20,14 @@
     "target/connector pair). It is deliberately not described: it has no route_id column, so",
     "inference finds no join key and skips it. Only the route_id-keyed summary ships, and only",
     "transfer_route_count (the transfer_routes column is a comma-separated string, not a",
-    "predictor). The script defaults to weekday (non-holiday) service via its --day filter."
+    "predictor). The script defaults to weekday (non-holiday) service via its --day filter.",
+    "NOTE: the CaBi chain is three stages. bikeshare_ridership_trends.py reads the monthly trip",
+    "extracts under {input}/cabi and writes station_daytype_ridership.csv (weekday/Saturday/",
+    "Sunday average ridership per station; observed federal holidays count as Sunday-equivalent,",
+    "so avg_weekday_riders is non-holiday weekdays, matching the GTFS-side features). Its tables",
+    "are month- or station_id-keyed, so inference rightly skips them all; only",
+    "cabi_coverage_by_route_gpd.py's route rollup ships. gbfs_ridership_join.py writes enriched",
+    "station GeoJSON for mapping only (never collected; the collector gathers csv/xlsx)."
   ],
   "scripts": [
     {
@@ -85,8 +92,28 @@
               "--output-dir", "{output}"]
     },
     {
+      "script": "bikeshare_ridership_trends.py",
+      "cmd": ["{python}", "{script}", "--input", "{input}/cabi",
+              "--output-dir", "{output}", "--max-station-plots", "0"]
+    },
+    {
+      "script": "cabi_coverage_by_route_gpd.py",
+      "cmd": ["{python}", "{script}", "--gtfs-dir", "{input}/gtfs",
+              "--stations-path", "{work}/out/gbfs_stations_exporter",
+              "--ridership-csv", "{work}/out/bikeshare_ridership_trends/station_daytype_ridership.csv",
+              "--output-dir", "{output}"],
+      "outputs": [
+        {"file": "cabi_coverage_by_route.csv", "join_keys": ["route_id"],
+         "keep_cols": ["cabi_stations_served", "cabi_weekday_riders_served",
+                       "cabi_saturday_riders_served", "cabi_sunday_riders_served"]}
+      ]
+    },
+    {
       "script": "gbfs_ridership_join.py",
-      "cmd": ["{python}", "{script}", "--output-dir", "{output}"]
+      "cmd": ["{python}", "{script}",
+              "--ridership-input", "{work}/out/bikeshare_ridership_trends/monthly_station_ridership.csv",
+              "--geojson-input", "{work}/out/gbfs_stations_exporter/gbfs_stations.geojson",
+              "--shapefile-input", "", "--output-dir", "{output}"]
     },
     {
       "script": "uscensus_tiger_join_gpd.py",
@@ -110,7 +137,8 @@
      "keep_cols": ["schools_served", "enrollment_served", "enrollment_1_8_served",
                    "enrollment_9_12_served", "enrollment_postsec_served"]},
     {"file": "cabi_coverage_by_route.csv", "join_keys": ["route_id"],
-     "keep_cols": ["cabi_stations_served", "cabi_weekday_riders_served"]},
+     "keep_cols": ["cabi_stations_served", "cabi_weekday_riders_served",
+                   "cabi_saturday_riders_served", "cabi_sunday_riders_served"]},
     {"file": "headway_span_by_route.csv", "join_keys": ["route_id"],
      "keep_cols": ["avg_headway_min", "span_hrs"]},
     {"file": "route_transfers_summary.csv", "join_keys": ["route_id"],

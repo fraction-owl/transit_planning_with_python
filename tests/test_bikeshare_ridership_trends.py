@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 from pathlib import Path
 
 import matplotlib
@@ -178,3 +179,94 @@ def test_max_station_plots_caps_chart_count(tmp_path: Path) -> None:
     )
     station_pngs = list((tmp_path / "plots" / "stations").glob("*.png"))
     assert len(station_pngs) == 3
+
+
+# ---------------------------------------------------------------------------
+# build_station_daytype_averages
+# ---------------------------------------------------------------------------
+
+# The 24-month fixture spans 2024-05-01 .. 2026-04-30: 731 - 1 = 730 calendar
+# days. Of those, 104 are Saturdays (none holiday-shifted), 104 are true
+# Sundays, and 22 are observed federal holidays falling on a weekday, which
+# the holiday rule reclassifies as Sunday-equivalent: 500 / 104 / 126.
+_EXPECTED_DAYS = {"weekday": 500, "saturday": 104, "sunday": 126}
+
+
+def test_daytype_day_counts_match_covered_calendar(trips: pd.DataFrame) -> None:
+    daytype = mod.build_station_daytype_averages(trips)
+    assert daytype["weekday_days"].eq(_EXPECTED_DAYS["weekday"]).all()
+    assert daytype["saturday_days"].eq(_EXPECTED_DAYS["saturday"]).all()
+    assert daytype["sunday_days"].eq(_EXPECTED_DAYS["sunday"]).all()
+
+
+def test_daytype_one_row_per_station(trips: pd.DataFrame) -> None:
+    daytype = mod.build_station_daytype_averages(trips)
+    station = mod.build_station_monthly(trips)
+    assert sorted(daytype["station_id"]) == sorted(station["station_id"].unique())
+    assert daytype["station_id"].is_monotonic_increasing
+
+
+def test_daytype_averages_reconcile_with_total_activity(trips: pd.DataFrame) -> None:
+    # Un-averaging (avg x day count) must recover every docked departure and
+    # arrival, up to the 4-decimal rounding of the averages.
+    daytype = mod.build_station_daytype_averages(trips)
+    recovered = sum(
+        (daytype[f"avg_{day_type}_riders"] * daytype[f"{day_type}_days"]).sum()
+        for day_type in mod.DAY_TYPES
+    )
+    docked = (trips["start_station_id"].str.len() > 0).sum() + (
+        trips["end_station_id"].str.len() > 0
+    ).sum()
+    assert abs(recovered - docked) < 0.5
+
+
+def test_daytype_holiday_weekday_counts_as_sunday(trips: pd.DataFrame) -> None:
+    # July 4, 2025 was a Friday. Trips starting that day must land in the
+    # Sunday bucket, not the weekday bucket.
+    started = pd.to_datetime(trips["started_at"])
+    holiday_trips = trips[started.dt.date == dt.date(2025, 7, 4)]
+    docked = holiday_trips[holiday_trips["start_station_id"].str.len() > 0]
+    assert not docked.empty, "fixture unexpectedly has no docked trips on 2025-07-04"
+
+    daytype = mod.build_station_daytype_averages(trips)
+    weekday_trips = trips[
+        started.dt.date.map(
+            lambda day: mod._day_type(
+                day,
+                set().union(*(mod.federal_holidays_observed(y) for y in range(2024, 2028))),
+            )
+        )
+        == "weekday"
+    ]
+    docked_weekday = (weekday_trips["start_station_id"].str.len() > 0).sum() + (
+        weekday_trips["end_station_id"].str.len() > 0
+    ).sum()
+    recovered_weekday = (daytype["avg_weekday_riders"] * daytype["weekday_days"]).sum()
+    assert abs(recovered_weekday - docked_weekday) < 0.5
+
+
+def test_daytype_excludes_dockless(tmp_path: Path, trips: pd.DataFrame) -> None:
+    daytype = mod.build_station_daytype_averages(trips)
+    assert (daytype["station_id"].str.len() > 0).all()
+
+
+def test_generate_and_write_produces_daytype_table(tmp_path: Path) -> None:
+    result = mod.generate_and_write(
+        input_path=str(FIXTURE_ZIP),
+        output_dir=str(tmp_path),
+        max_station_plots=1,
+    )
+    out_csv = tmp_path / "station_daytype_ridership.csv"
+    assert out_csv.exists()
+    written = pd.read_csv(out_csv, dtype={"station_id": str})
+    assert list(written.columns) == [
+        "station_id",
+        "station_name",
+        "avg_weekday_riders",
+        "avg_saturday_riders",
+        "avg_sunday_riders",
+        "weekday_days",
+        "saturday_days",
+        "sunday_days",
+    ]
+    assert len(written) == result["station_daytype"]["station_id"].nunique()
