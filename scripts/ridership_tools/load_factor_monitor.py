@@ -308,7 +308,9 @@ def create_route_workbooks(data_frame: pd.DataFrame) -> None:
 
             # Adjust column widths based on content
             for idx, col in enumerate(headers, start=1):
-                content_series = direction_df_sorted[col].astype(str)
+                # fillna after astype(str): pandas 3 keeps missing values as NaN
+                # through astype(str), and len(NaN) raises TypeError
+                content_series = direction_df_sorted[col].astype(str).fillna("")
                 max_length = max(content_series.map(len).max(), len(str(col)))
                 adjusted_width = max_length + 2
                 column_letter = get_column_letter(idx)
@@ -353,7 +355,9 @@ def export_to_excel(data_frame: pd.DataFrame, output_file: str) -> None:
 
         # Adjust column widths based on the maximum length of the content in each column
         for idx, col in enumerate(data_frame.columns, 1):
-            series = data_frame[col].astype(str)
+            # fillna after astype(str): pandas 3 keeps missing values as NaN
+            # through astype(str), and len(NaN) raises TypeError
+            series = data_frame[col].astype(str).fillna("")
             max_length = max(series.map(len).max(), len(str(col)))
             adjusted_width = max_length + 2  # Add extra space for clarity
             column_letter = get_column_letter(idx)
