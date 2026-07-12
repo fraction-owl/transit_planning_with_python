@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import openpyxl
 import pandas as pd
 import pytest
 
 from scripts.gtfs_exports.time_band_exporter import (
     MISSING_TIME,
     build_index,
+    export_excel,
     load_gtfs,
     make_bands,
     minutes_to_hhmm,
@@ -269,3 +271,40 @@ def test_make_bands_two_patterns_two_rows() -> None:
     )
     bands = make_bands(idx)
     assert len(bands) == 2
+
+
+# ---------------------------------------------------------------------------
+# export_excel — full pipeline against the gtfs_basic fixture, real openpyxl
+# ---------------------------------------------------------------------------
+
+
+def test_export_excel_full_pipeline_writes_real_workbooks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import scripts.gtfs_exports.time_band_exporter as mod
+
+    monkeypatch.setattr(mod, "OUTPUT_FOLDER", tmp_path)
+
+    data = load_gtfs(FIXTURES / "gtfs_basic")
+    idx, stop_dict, seg_dict, header_names = build_index(data)
+    bands = make_bands(idx)
+    export_excel(bands, stop_dict, seg_dict, header_names, data["routes"])
+
+    names = sorted(p.name for p in tmp_path.glob("*.xlsx"))
+    assert names == [
+        "route_R1_calWKDY_timeband_table.xlsx",
+        "route_R2_calWKDY_timeband_table.xlsx",
+        "route_R3_calWKDY_timeband_table.xlsx",
+    ]
+
+    wb = openpyxl.load_workbook(tmp_path / "route_R1_calWKDY_timeband_table.xlsx")
+    assert wb.sheetnames == ["Dir_0"]
+    rows = list(wb["Dir_0"].iter_rows(values_only=True))
+    assert rows[0][:4] == ("Pattern", "FrTime", "ToTime", "Total")
+    # Header continues with the pattern's stop names and codes.
+    assert rows[0][4] == "Main St & Mt Vernon Ln (1001)"
+    # R1's three trips share one pattern and identical runtimes → one band
+    # from the 07:00 trip to the 17:00 trip with 5-minute segments.
+    assert len(rows) == 2
+    assert rows[1][1:4] == ("07:00", "17:00", 3)
+    assert rows[1][5] == 5

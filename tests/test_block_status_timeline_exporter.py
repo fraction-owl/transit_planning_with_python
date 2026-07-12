@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import openpyxl
 import pandas as pd
 import pytest
 
@@ -243,3 +244,43 @@ def test_process_block_row_count_matches_timeline() -> None:
     timeline = range(415, 430)
     df = process_block(_make_block_subset(), "BLK1", timeline, [])
     assert len(df) == len(timeline)
+
+
+# ---------------------------------------------------------------------------
+# run_step1_gtfs_to_blocks — full pipeline against gtfs_basic, real xlsx output
+# ---------------------------------------------------------------------------
+
+
+def test_run_step1_writes_real_block_workbooks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import scripts.gtfs_exports.block_status_timeline_exporter as mod
+
+    fixture = Path(__file__).parent / "fixtures" / "gtfs_basic"
+    monkeypatch.setattr(mod, "GTFS_FOLDER_PATH", str(fixture))
+    monkeypatch.setattr(mod, "BLOCK_OUTPUT_FOLDER", str(tmp_path))
+    monkeypatch.setattr(mod, "CALENDAR_SERVICE_IDS", ["WKDY"])
+
+    mod.run_step1_gtfs_to_blocks()
+
+    names = sorted(p.name for p in tmp_path.glob("block_*.xlsx"))
+    # Six blocks; B1-B3 interline routes R1 and R2, B4-B6 are R3 only.
+    assert names == [
+        "block_B1_R1_R2.xlsx",
+        "block_B2_R1_R2.xlsx",
+        "block_B3_R1_R2.xlsx",
+        "block_B4_R3.xlsx",
+        "block_B5_R3.xlsx",
+        "block_B6_R3.xlsx",
+    ]
+
+    wb = openpyxl.load_workbook(tmp_path / "block_B1_R1_R2.xlsx")
+    ws = wb.active
+    header = [c.value for c in ws[1]]
+    for col in ("Timestamp", "Block", "Status"):
+        assert col in header, f"Missing column: {col}"
+    # One row per minute of the 26-hour timeline.
+    assert ws.max_row - 1 == mod.DEFAULT_HOURS * 60
+    status_col = header.index("Status") + 1
+    statuses = {ws.cell(row=r, column=status_col).value for r in range(2, ws.max_row + 1)}
+    assert len(statuses) > 1  # active statuses beyond the inactive filler

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import openpyxl
 import pandas as pd
 import pytest
 
@@ -228,3 +229,38 @@ def test_process_block_row_count() -> None:
     timeline = range(418, 428)
     df = process_block(_block_df(), "B1", timeline)
     assert len(df) == len(timeline)
+
+
+# ---------------------------------------------------------------------------
+# run — full pipeline against gtfs_basic, real xlsx output
+# ---------------------------------------------------------------------------
+
+
+def test_run_writes_real_block_workbooks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import scripts.gtfs_exports.bus_block_exporter as mod
+
+    fixture = FIXTURES / "gtfs_basic"
+    monkeypatch.setattr(mod, "GTFS_FOLDER_PATH", str(fixture))
+    monkeypatch.setattr(mod, "OUTPUT_FOLDER", str(tmp_path))
+    monkeypatch.setattr(mod, "CALENDAR_SERVICE_IDS", ["WKDY"])
+
+    mod.run()
+
+    names = sorted(p.name for p in tmp_path.glob("block_*.xlsx"))
+    assert names == [f"block_B{n}.xlsx" for n in range(1, 7)]
+
+    wb = openpyxl.load_workbook(tmp_path / "block_B1.xlsx")
+    ws = wb.active
+    header = [c.value for c in ws[1]]
+    for col in ("Timestamp", "Block", "Route", "Status", "Interlined Route"):
+        assert col in header, f"Missing column: {col}"
+    route_col = header.index("Route") + 1
+    inter_col = header.index("Interlined Route") + 1
+    pairs = {
+        (ws.cell(row=r, column=route_col).value, ws.cell(row=r, column=inter_col).value)
+        for r in range(2, ws.max_row + 1)
+    }
+    # Block B1 chains a trip on R1 with a trip on R2, so each route's rows
+    # list the other as interlined.
+    assert ("R1", "R2") in pairs
+    assert ("R2", "R1") in pairs

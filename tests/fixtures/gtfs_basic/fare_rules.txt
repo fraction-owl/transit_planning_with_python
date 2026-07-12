@@ -1,0 +1,4 @@
+fare_id,route_id,origin_id,destination_id,contains_id
+EXPRESS,R1,,,
+LOCAL,R2,,,
+LOCAL,R3,,,
