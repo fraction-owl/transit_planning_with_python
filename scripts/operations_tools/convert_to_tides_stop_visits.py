@@ -227,7 +227,6 @@ def parse_dt(series: pd.Series, *, col_name: str) -> pd.Series:
     dt = pd.to_datetime(
         normalize_dt_series(series),
         errors="coerce",
-        infer_datetime_format=True,
     )
     bad = int(dt.isna().sum())
     if bad:
