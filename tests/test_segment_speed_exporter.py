@@ -9,10 +9,10 @@ from scripts.gtfs_exports.segment_speed_exporter import (
     MISSING_VAL,
     band_rows,
     build_index,
-    convert_to_miles,
-    hhmmss_to_minutes,
+    convert_distance,
     minutes_to_hhmm,
     mph,
+    parse_time_to_minutes,
     safe_sheet,
     segment_metrics,
 )
@@ -20,28 +20,28 @@ from scripts.gtfs_exports.segment_speed_exporter import (
 FIXTURES = Path(__file__).parent / "fixtures"
 
 # ---------------------------------------------------------------------------
-# hhmmss_to_minutes
+# parse_time_to_minutes
 # ---------------------------------------------------------------------------
 
 
-def test_hhmmss_to_minutes_basic() -> None:
-    assert hhmmss_to_minutes("07:05:00") == 425
+def test_parse_time_to_minutes_basic() -> None:
+    assert parse_time_to_minutes("07:05:00") == 425
 
 
-def test_hhmmss_to_minutes_no_seconds() -> None:
-    assert hhmmss_to_minutes("07:05") == 425
+def test_parse_time_to_minutes_no_seconds() -> None:
+    assert parse_time_to_minutes("07:05") == 425
 
 
-def test_hhmmss_to_minutes_none_returns_none() -> None:
-    assert hhmmss_to_minutes(None) is None
+def test_parse_time_to_minutes_none_returns_none() -> None:
+    assert parse_time_to_minutes(None) is None
 
 
-def test_hhmmss_to_minutes_malformed_returns_none() -> None:
-    assert hhmmss_to_minutes("not-a-time") is None
+def test_parse_time_to_minutes_malformed_returns_none() -> None:
+    assert parse_time_to_minutes("not-a-time") is None
 
 
-def test_hhmmss_to_minutes_past_midnight() -> None:
-    assert hhmmss_to_minutes("25:00:00") == 1500
+def test_parse_time_to_minutes_past_midnight() -> None:
+    assert parse_time_to_minutes("25:00:00") == 1500
 
 
 # ---------------------------------------------------------------------------
@@ -50,45 +50,52 @@ def test_hhmmss_to_minutes_past_midnight() -> None:
 
 
 def test_minutes_to_hhmm_basic() -> None:
-    assert minutes_to_hhmm(425) == "7:05"
+    assert minutes_to_hhmm(425) == "07:05"
+
+
+def test_minutes_to_hhmm_none_returns_default_missing() -> None:
+    assert minutes_to_hhmm(None) == ""
 
 
 def test_minutes_to_hhmm_none_returns_sentinel() -> None:
-    assert minutes_to_hhmm(None) == MISSING_VAL
+    assert minutes_to_hhmm(None, MISSING_VAL) == MISSING_VAL
 
 
 # ---------------------------------------------------------------------------
-# convert_to_miles
+# convert_distance
 # ---------------------------------------------------------------------------
 
 
-def test_convert_to_miles_meters() -> None:
-    result = convert_to_miles(1609.344)
+def test_convert_distance_meters_to_miles() -> None:
+    result = convert_distance(1609.344, "meters")
     assert result == pytest.approx(1.0, rel=1e-4)
 
 
-def test_convert_to_miles_feet() -> None:
-    import scripts.gtfs_exports.segment_speed_exporter as mod
-
-    original = mod.INPUT_DISTANCE_UNIT
-    mod.INPUT_DISTANCE_UNIT = "feet"
-    try:
-        result = convert_to_miles(5280.0)
-        assert result == pytest.approx(1.0, rel=1e-4)
-    finally:
-        mod.INPUT_DISTANCE_UNIT = original
+def test_convert_distance_feet_to_miles() -> None:
+    result = convert_distance(5280.0, "feet")
+    assert result == pytest.approx(1.0, rel=1e-4)
 
 
-def test_convert_to_miles_none_returns_none() -> None:
-    assert convert_to_miles(None) is None
+def test_convert_distance_km_to_miles() -> None:
+    result = convert_distance(1.609344, "km")
+    assert result == pytest.approx(1.0, rel=1e-4)
 
 
-def test_convert_to_miles_empty_string_returns_none() -> None:
-    assert convert_to_miles("") is None
+def test_convert_distance_none_returns_none() -> None:
+    assert convert_distance(None, "meters") is None
 
 
-def test_convert_to_miles_non_numeric_returns_none() -> None:
-    assert convert_to_miles("abc") is None
+def test_convert_distance_empty_string_returns_none() -> None:
+    assert convert_distance("", "meters") is None
+
+
+def test_convert_distance_non_numeric_returns_none() -> None:
+    assert convert_distance("abc", "meters") is None
+
+
+def test_convert_distance_unknown_output_unit_raises() -> None:
+    with pytest.raises(ValueError, match="output_unit"):
+        convert_distance(1.0, "meters", "leagues")  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
@@ -268,5 +275,5 @@ def test_band_rows_frtime_is_min() -> None:
     )
     bands = band_rows(idx)
     # band_rows converts minutes to HH:MM strings via minutes_to_hhmm
-    assert bands.iloc[0]["FrTime"] == "7:00"
-    assert bands.iloc[0]["ToTime"] == "8:00"
+    assert bands.iloc[0]["FrTime"] == "07:00"
+    assert bands.iloc[0]["ToTime"] == "08:00"

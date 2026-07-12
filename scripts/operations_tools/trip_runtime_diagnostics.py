@@ -909,7 +909,7 @@ def _fisher_jenks(values: Sequence[float], k: int) -> List[int]:
     return sorted(bkpts)  # len == k‑1
 
 
-def _hhmm_to_minutes(s: pd.Series) -> pd.Series:
+def _hhmm_series_to_minutes(s: pd.Series) -> pd.Series:
     """Convert an `HH:MM string to minutes after midnight.
 
     Accepts hours `00 through 29 so that after‑midnight tokens
@@ -956,7 +956,7 @@ def suggest_time_bands(
     # ── 1. prepare ordered DF with numeric surrogate _t ──────────────
     df = (
         summary[["trip_start_time", "runtime_p85_min"]]
-        .assign(_t=_hhmm_to_minutes(summary["trip_start_time"]))
+        .assign(_t=_hhmm_series_to_minutes(summary["trip_start_time"]))
         .dropna(subset=["_t", "runtime_p85_min"])
         .sort_values("_t", kind="mergesort")
         .reset_index(drop=True)

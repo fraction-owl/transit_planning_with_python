@@ -53,11 +53,14 @@ FILTER_IN_CALENDAR_IDS: List[str] = []
 # Used in the output Excel filename for labeling the signup period or data snapshot.
 SIGNUP_NAME = "JAN_2025_Signup"
 
-# Unit of shape_dist_traveled in GTFS feed. Choose either "meters" or "feet".
-INPUT_DISTANCE_UNIT: Literal["meters", "feet"] = "meters"
+# Unit of shape_dist_traveled in the GTFS feed: "feet", "meters", or "km".
+INPUT_DISTANCE_UNIT: Literal["feet", "meters", "km"] = "meters"
 
-# If True, convert all distance values to miles (from INPUT_DISTANCE_UNIT).
-CONVERT_TO_MILES: bool = True
+# If True, convert all distance values from INPUT_DISTANCE_UNIT to OUTPUT_DISTANCE_UNIT.
+CONVERT_DISTANCES: bool = True
+
+# Unit distances are converted to when CONVERT_DISTANCES is True: "miles" or "km".
+OUTPUT_DISTANCE_UNIT: Literal["miles", "km"] = "miles"
 
 # If True, only include stops where timepoint == 1 in stop_times.txt.
 # Useful for focusing on scheduled timing stops rather than all intermediate stops.
@@ -90,74 +93,105 @@ def is_number(value: Any) -> bool:
         return False
 
 
-def convert_dist_to_miles(distance: Any, input_unit: str) -> Any:
-    """Convert a distance value to miles.
+def convert_distance(
+    value: Any,
+    input_unit: str,
+    output_unit: Literal["miles", "km"] = "miles",
+) -> Optional[float]:
+    """Convert a distance value between transit-planning units.
 
     Args:
-        distance: Raw distance value as string or number.
-        input_unit: The unit of input ('feet' or 'meters').
+        value: Distance as a number or numeric string. ``None``, NaN, and
+            empty/whitespace strings yield ``None``.
+        input_unit: Unit of *value*: ``"feet"``, ``"meters"``, ``"km"``, or
+            ``"miles"`` (case-insensitive).
+        output_unit: Unit to convert to: ``"miles"`` or ``"km"``.
 
     Returns:
-        Distance in miles, or original value if conversion is not possible.
+        The converted distance as a float, or ``None`` when *value* is
+        missing or cannot be interpreted as a number.
 
-    Warns:
-        Logs a warning if the unit is invalid or the value can't be converted.
+    Raises:
+        ValueError: If *input_unit* or *output_unit* is not a supported unit.
     """
-    if not CONVERT_TO_MILES or pd.isna(distance) or distance == "":
-        return distance
-    try:
-        num_distance = float(distance)
-    except ValueError:
-        logging.warning(f"Could not convert distance '{distance}' to float. Returning as-is.")
-        return distance
+    meters_per_input_unit = {"feet": 0.3048, "meters": 1.0, "km": 1000.0, "miles": 1609.344}
+    meters_per_output_unit = {"miles": 1609.344, "km": 1000.0}
 
-    if input_unit.lower() == "feet":
-        conv = 5280.0
-    elif input_unit.lower() == "meters":
-        conv = 1609.34
-    else:
-        logging.warning("Unknown distance unit '%s'. No conversion done.", input_unit)
-        conv = 1.0
-    return num_distance / conv
+    input_factor = meters_per_input_unit.get(str(input_unit).strip().lower())
+    if input_factor is None:
+        raise ValueError(
+            f"Unsupported input_unit {input_unit!r}; "
+            f"expected one of {sorted(meters_per_input_unit)}."
+        )
+    output_factor = meters_per_output_unit.get(str(output_unit).strip().lower())
+    if output_factor is None:
+        raise ValueError(
+            f"Unsupported output_unit {output_unit!r}; "
+            f"expected one of {sorted(meters_per_output_unit)}."
+        )
 
-
-def parse_time_to_minutes(time_str: str) -> Optional[float]:
-    """Convert HH:MM:SS to minutes past midnight.
-
-    Args:
-        time_str: A time string in HH:MM:SS format. Hours can exceed 24.
-
-    Returns:
-        Float minutes since midnight, or None if parsing fails.
-    """
-    if not isinstance(time_str, str):
+    if value is None or (isinstance(value, str) and not value.strip()):
         return None
-    parts = time_str.strip().split(":")
-    if len(parts) != 3:
+    if pd.isna(value):
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    return numeric * input_factor / output_factor
+
+
+def parse_time_to_minutes(time_value: Optional[str]) -> Optional[int]:
+    """Convert an ``HH:MM[:SS]`` time string to integer minutes past midnight.
+
+    GTFS times may exceed 24:00 (e.g. ``"25:30:00"`` for a 1:30 AM trip on
+    the following calendar day); those values are preserved as integers
+    greater than or equal to 1440. Seconds, when present, are rounded to the
+    nearest minute.
+
+    Args:
+        time_value: Time string such as ``"7:05"``, ``"07:05:00"``, or
+            ``"26:30:00"``. Leading/trailing whitespace is ignored.
+            Non-string or malformed values yield ``None``.
+
+    Returns:
+        Minutes since midnight, or ``None`` if the value cannot be parsed.
+    """
+    if not isinstance(time_value, str):
+        return None
+    parts = time_value.strip().split(":")
+    if len(parts) not in (2, 3):
         return None
     try:
         hours = int(parts[0])
         minutes = int(parts[1])
-        seconds = int(parts[2])
-        return hours * 60 + minutes + seconds / 60.0
-    except (TypeError, ValueError):
+        seconds = int(parts[2]) if len(parts) == 3 else 0
+    except ValueError:
         return None
+    if hours < 0 or not 0 <= minutes < 60 or not 0 <= seconds < 60:
+        return None
+    return hours * 60 + minutes + round(seconds / 60)
 
 
-def minutes_to_hhmm(minutes_val: Optional[float]) -> str:
-    """Convert minutes past midnight to HH:MM 24-hour format.
+def minutes_to_hhmm(minutes: Optional[float], missing: str = "") -> str:
+    """Convert minutes past midnight to a zero-padded ``HH:MM`` string.
+
+    GTFS service days may exceed 24 hours, so values of 1440 minutes or more
+    format with hours >= 24 (e.g. ``1590`` -> ``"26:30"``).
 
     Args:
-        minutes_val: Minutes since midnight.
+        minutes: Minutes since midnight (may be fractional; rounded to the
+            nearest minute). ``None`` and NaN yield ``missing``.
+        missing: String returned for missing values, e.g. ``""`` or a
+            sentinel such as ``"–"``.
 
     Returns:
-        Time string in HH:MM format, or empty string if invalid.
+        Zero-padded ``HH:MM`` string, or ``missing`` when *minutes* is
+        ``None``/NaN.
     """
-    if minutes_val is None or pd.isna(minutes_val):
-        return ""
-    total_minutes = int(round(minutes_val))  # Round to nearest minute
-    hours = total_minutes // 60
-    mins = total_minutes % 60
+    if minutes is None or pd.isna(minutes):
+        return missing
+    hours, mins = divmod(int(round(minutes)), 60)
     return f"{hours:02d}:{mins:02d}"
 
 
@@ -305,8 +339,10 @@ def generate_unique_patterns(
                     group_sub_dist_valid.iloc[-1]["shape_dist_traveled"]
                     - group_sub_dist_valid.iloc[0]["shape_dist_traveled"]
                 )
-                trip_distances[str(trip_id_val)] = convert_dist_to_miles(
-                    dist_val, INPUT_DISTANCE_UNIT
+                trip_distances[str(trip_id_val)] = (
+                    convert_distance(dist_val, INPUT_DISTANCE_UNIT, OUTPUT_DISTANCE_UNIT)
+                    if CONVERT_DISTANCES
+                    else dist_val
                 )
 
     # Build patterns
@@ -325,9 +361,13 @@ def generate_unique_patterns(
             else:
                 if pd.notna(shape_val) and pd.notna(prev_dist_val):
                     diff_numeric = shape_val - prev_dist_val
-                    diff_miles = convert_dist_to_miles(diff_numeric, INPUT_DISTANCE_UNIT)
-                    if pd.notna(diff_miles) and isinstance(diff_miles, (int, float)):
-                        dist_str = f"{diff_miles:.2f}" if diff_miles != 0 else "0.00"
+                    diff_dist = (
+                        convert_distance(diff_numeric, INPUT_DISTANCE_UNIT, OUTPUT_DISTANCE_UNIT)
+                        if CONVERT_DISTANCES
+                        else diff_numeric
+                    )
+                    if pd.notna(diff_dist) and isinstance(diff_dist, (int, float)):
+                        dist_str = f"{diff_dist:.2f}" if diff_dist != 0 else "0.00"
                     else:
                         dist_str = ""
                 else:
@@ -345,17 +385,17 @@ def generate_unique_patterns(
                 if is_number(dist_segment_str):
                     sum_seg += float(dist_segment_str)
 
-            full_trip_dist_miles = trip_distances.get(trip_id_val, None)
+            full_trip_dist = trip_distances.get(trip_id_val, None)
             if (
-                full_trip_dist_miles is not None
-                and isinstance(full_trip_dist_miles, (int, float))
-                and abs(sum_seg - full_trip_dist_miles) > 0.02
+                full_trip_dist is not None
+                and isinstance(full_trip_dist, (int, float))
+                and abs(sum_seg - full_trip_dist) > 0.02
             ):
                 logging.warning(
                     "Trip %s sum of segments=%.2f vs. full=%.2f mismatch >0.02",
                     trip_id_val,
                     sum_seg,
-                    full_trip_dist_miles,
+                    full_trip_dist,
                 )
 
         if group_sub.empty:

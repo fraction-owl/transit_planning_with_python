@@ -5,7 +5,7 @@ import pytest
 
 from scripts.gtfs_exports.stop_pattern_exporter import (
     assign_pattern_ids,
-    convert_dist_to_miles,
+    convert_distance,
     filter_trips,
     format_service_id_folder_name,
     forward_match_pattern_to_master,
@@ -44,43 +44,29 @@ def test_is_number_empty_returns_false() -> None:
 
 
 # ---------------------------------------------------------------------------
-# convert_dist_to_miles
+# convert_distance
 # ---------------------------------------------------------------------------
 
 
-def test_convert_dist_to_miles_meters() -> None:
-    import scripts.gtfs_exports.stop_pattern_exporter as mod
-
-    orig = mod.CONVERT_TO_MILES
-    mod.CONVERT_TO_MILES = True
-    try:
-        result = convert_dist_to_miles(1609.34, "meters")
-        assert result == pytest.approx(1.0, rel=0.01)
-    finally:
-        mod.CONVERT_TO_MILES = orig
+def test_convert_distance_meters_to_miles() -> None:
+    assert convert_distance(1609.344, "meters") == pytest.approx(1.0)
 
 
-def test_convert_dist_to_miles_feet() -> None:
-    import scripts.gtfs_exports.stop_pattern_exporter as mod
-
-    orig = mod.CONVERT_TO_MILES
-    mod.CONVERT_TO_MILES = True
-    try:
-        result = convert_dist_to_miles(5280.0, "feet")
-        assert result == pytest.approx(1.0, rel=0.01)
-    finally:
-        mod.CONVERT_TO_MILES = orig
+def test_convert_distance_feet_to_miles() -> None:
+    assert convert_distance(5280.0, "feet") == pytest.approx(1.0)
 
 
-def test_convert_dist_to_miles_convert_false_returns_original() -> None:
-    import scripts.gtfs_exports.stop_pattern_exporter as mod
+def test_convert_distance_km_to_miles() -> None:
+    assert convert_distance(1.609344, "km") == pytest.approx(1.0, rel=1e-4)
 
-    orig = mod.CONVERT_TO_MILES
-    mod.CONVERT_TO_MILES = False
-    try:
-        assert convert_dist_to_miles(1000.0, "meters") == 1000.0
-    finally:
-        mod.CONVERT_TO_MILES = orig
+
+def test_convert_distance_meters_to_km() -> None:
+    assert convert_distance(2500.0, "meters", "km") == pytest.approx(2.5)
+
+
+def test_convert_distance_unknown_unit_raises() -> None:
+    with pytest.raises(ValueError, match="input_unit"):
+        convert_distance(1.0, "furlongs")
 
 
 # ---------------------------------------------------------------------------
@@ -89,19 +75,23 @@ def test_convert_dist_to_miles_convert_false_returns_original() -> None:
 
 
 def test_parse_time_to_minutes_basic() -> None:
-    assert parse_time_to_minutes("07:05:30") == pytest.approx(425.5)
+    assert parse_time_to_minutes("07:05:00") == 425
 
 
 def test_parse_time_to_minutes_midnight() -> None:
-    assert parse_time_to_minutes("00:00:00") == pytest.approx(0.0)
+    assert parse_time_to_minutes("00:00:00") == 0
 
 
 def test_parse_time_to_minutes_not_string_returns_none() -> None:
-    assert parse_time_to_minutes(None) is None  # type: ignore[arg-type]
+    assert parse_time_to_minutes(None) is None
+
+
+def test_parse_time_to_minutes_no_seconds() -> None:
+    assert parse_time_to_minutes("07:05") == 425
 
 
 def test_parse_time_to_minutes_bad_format_returns_none() -> None:
-    assert parse_time_to_minutes("07:05") is None
+    assert parse_time_to_minutes("bad") is None
 
 
 # ---------------------------------------------------------------------------

@@ -11,30 +11,30 @@ from scripts.gtfs_exports.block_status_timeline_exporter import (
     get_status_for_minute,
     mark_first_and_last_stops,
     minutes_to_hhmm,
+    parse_time_to_minutes,
     process_block,
-    time_to_minutes,
     validate_folders,
 )
 
 # ---------------------------------------------------------------------------
-# time_to_minutes
+# parse_time_to_minutes
 # ---------------------------------------------------------------------------
 
 
-def test_time_to_minutes_hhmmss() -> None:
-    assert time_to_minutes("07:05:00") == 425
+def test_parse_time_to_minutes_hhmmss() -> None:
+    assert parse_time_to_minutes("07:05:00") == 425
 
 
-def test_time_to_minutes_hhmm_no_seconds() -> None:
-    assert time_to_minutes("07:05") == 425
+def test_parse_time_to_minutes_hhmm_no_seconds() -> None:
+    assert parse_time_to_minutes("07:05") == 425
 
 
-def test_time_to_minutes_past_midnight() -> None:
-    assert time_to_minutes("26:30:00") == 1590
+def test_parse_time_to_minutes_past_midnight() -> None:
+    assert parse_time_to_minutes("26:30:00") == 1590
 
 
-def test_time_to_minutes_seconds_rounded() -> None:
-    assert time_to_minutes("00:01:30") == 1
+def test_parse_time_to_minutes_seconds_rounded() -> None:
+    assert parse_time_to_minutes("00:01:30") == 1
 
 
 # ---------------------------------------------------------------------------
