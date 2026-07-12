@@ -1,3 +1,4 @@
+import openpyxl
 import pandas as pd
 import pytest
 
@@ -98,17 +99,11 @@ def test_process_data_filtering(input_df) -> None:
 
 
 def test_integration_exports(input_df, tmp_path, monkeypatch) -> None:
-    """Integration test for the export functions using temporary directory."""
-    # Monkeypatch OUTPUT_FILE so exports go to tmp_path
-    # The script uses os.path.dirname(OUTPUT_FILE) for create_route_workbooks
-    # And uses OUTPUT_FILE itself for export_to_excel
-
+    """Integration test for the export functions, including the real openpyxl paths."""
+    # create_route_workbooks writes to os.path.dirname(OUTPUT_FILE), and
+    # export_to_excel uses OUTPUT_FILE itself, so point it into tmp_path.
     fake_output_xlsx = tmp_path / "processed_stats.xlsx"
     monkeypatch.setattr(load_factor_monitor, "OUTPUT_FILE", str(fake_output_xlsx))
-
-    # Mock export functions for test isolation; we verify logic flow, not file I/O
-    monkeypatch.setattr(load_factor_monitor, "export_to_excel", lambda df, path: None)
-    monkeypatch.setattr(load_factor_monitor, "create_route_workbooks", lambda df: None)
 
     processed = load_factor_monitor.process_data(
         input_df,
@@ -118,20 +113,48 @@ def test_integration_exports(input_df, tmp_path, monkeypatch) -> None:
         decimals=4,
     )
 
-    # 1. Export CSV (Real I/O allowed for CSV)
+    # 1. Export CSV
     csv_out = tmp_path / "out.csv"
     load_factor_monitor.export_to_csv(processed, str(csv_out))
     assert csv_out.exists()
 
-    # 2. Export Excel (Combined) - Mocked
+    # 2. Export combined Excel, then read the workbook back to verify it
     load_factor_monitor.export_to_excel(processed, str(fake_output_xlsx))
-    # We cannot check file existence because it's mocked
+    assert fake_output_xlsx.exists()
 
-    # 3. Create route workbooks - Mocked
+    combined_wb = openpyxl.load_workbook(fake_output_xlsx)
+    combined_ws = combined_wb["Sheet1"]
+    assert [cell.value for cell in combined_ws[1]] == list(processed.columns)
+    assert combined_ws.max_row == len(processed) + 1  # header + one row per trip
+
+    # 3. Create route workbooks: one file per route, one sheet per direction
     load_factor_monitor.create_route_workbooks(processed)
-    # We cannot check file existence because it's mocked
 
-    # 4. Violation Log (Real I/O allowed for TXT)
+    expected_sheets_by_route = {
+        "10A": {"Outbound", "Inbound"},
+        "20B": {"Outbound", "Inbound"},
+        "30C": {"Outbound"},
+        "40D": {"Inbound"},
+    }
+    for route, directions in expected_sheets_by_route.items():
+        route_wb_path = tmp_path / f"{route}.xlsx"
+        assert route_wb_path.exists()
+        route_wb = openpyxl.load_workbook(route_wb_path)
+        assert set(route_wb.sheetnames) == directions
+
+    # Spot-check one sheet: 20B Inbound holds the single 17:45 violation trip
+    sheet = openpyxl.load_workbook(tmp_path / "20B.xlsx")["Inbound"]
+    headers = [cell.value for cell in sheet[1]]
+    assert headers == list(processed.columns)
+    assert all(cell.font.bold for cell in sheet[1])
+    assert sheet.max_row == 2
+    trip = dict(zip(headers, [cell.value for cell in sheet[2]]))
+    assert trip["SERIAL_NUMBER"] == 5
+    assert trip["MAX_LOAD"] == 50
+    assert trip["LOAD_FACTOR_VIOLATION"] == "TRUE"
+    assert sheet.cell(row=2, column=headers.index("TRIP_START_TIME") + 1).number_format == "hh:mm"
+
+    # 4. Violation Log
     log_out = tmp_path / "violations.txt"
     load_factor_monitor.write_violation_log(processed, str(log_out))
     assert log_out.exists()
