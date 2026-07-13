@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import geopandas as gpd
@@ -7,8 +8,10 @@ import pandas as pd
 import pytest
 from shapely.geometry import Point
 
+import scripts.service_coverage.cabi_coverage_by_route_gpd as cabi_mod
 from scripts.service_coverage.cabi_coverage_by_route_gpd import (
     _prepare_route_buffers,
+    _web_mercator_ground_scale,
     join_ridership_onto_stations,
     load_daytype_ridership,
     load_stations_layer,
@@ -141,6 +144,111 @@ def test_summarize_empty_stations_reports_zeros() -> None:
     assert list(summary["route_id"]) == ["R1"]
     assert summary["cabi_stations_served"].iloc[0] == 0
     assert summary["cabi_weekday_riders_served"].iloc[0] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# _prepare_route_buffers
+# ---------------------------------------------------------------------------
+
+
+def test_prepare_route_buffers_stop_mode_without_shape_id_column() -> None:
+    """shape_id is optional in GTFS; stop-buffer mode must not require it."""
+    tables = {
+        "routes": pd.DataFrame({"route_id": ["R1"]}),
+        "trips": pd.DataFrame({"route_id": ["R1"], "trip_id": ["T1"]}),
+        "stop_times": pd.DataFrame({"trip_id": ["T1"], "stop_id": ["S1"], "stop_sequence": [1]}),
+        "stops": pd.DataFrame({"stop_id": ["S1"], "stop_lat": [0.0], "stop_lon": [0.0]}),
+    }
+    buffers = _prepare_route_buffers(tables, use_shape_buffer=False, buffer_dist_ft=1320.0)
+    assert list(buffers["route_id"]) == ["R1"]
+    assert not buffers.geometry.is_empty.any()
+
+
+def test_prepare_route_buffers_shape_mode_missing_shape_id_raises() -> None:
+    """Shape-buffer mode without a trips.txt shape_id column fails clearly."""
+    tables = {
+        "routes": pd.DataFrame({"route_id": ["R1"]}),
+        "trips": pd.DataFrame({"route_id": ["R1"], "trip_id": ["T1"]}),
+        "stop_times": pd.DataFrame({"trip_id": ["T1"], "stop_id": ["S1"], "stop_sequence": [1]}),
+        "stops": pd.DataFrame({"stop_id": ["S1"], "stop_lat": [0.0], "stop_lon": [0.0]}),
+    }
+    with pytest.raises(ValueError, match="shape_id"):
+        _prepare_route_buffers(tables, use_shape_buffer=True, buffer_dist_ft=1320.0)
+
+
+def test_web_mercator_ground_scale_matches_inverse_cosine() -> None:
+    """At 38.9°N the Web Mercator correction is 1/cos(lat); elsewhere it is 1."""
+    scale = _web_mercator_ground_scale("EPSG:3857", pd.Series([38.9]))
+    assert scale == pytest.approx(1.0 / math.cos(math.radians(38.9)))
+    assert _web_mercator_ground_scale("EPSG:2283", pd.Series([38.9])) == 1.0
+    assert _web_mercator_ground_scale("EPSG:3857", pd.Series([], dtype=float)) == 1.0
+
+
+def test_stop_buffer_spans_true_ground_distance_at_dc_latitude() -> None:
+    """A ¼-mile buffer at DC latitude reaches a point ~1200 ft of *ground* away.
+
+    Web Mercator map "meters" shrink by cos(latitude) on the ground, so without
+    the correction a 1320 ft buffer only spans ~1027 ft at 38.9°N and this point
+    would be missed. A point beyond the radius stays outside (no over-buffering).
+    """
+    lat, lon = 38.9, -77.03
+    meters_per_deg_lon_ground = 111_320.0 * math.cos(math.radians(lat))
+    near_dlon = (1200 * 0.3048) / meters_per_deg_lon_ground  # ~1200 ft ground
+    far_dlon = (1500 * 0.3048) / meters_per_deg_lon_ground  # ~1500 ft ground
+    tables = {
+        "routes": pd.DataFrame({"route_id": ["R1"]}),
+        "trips": pd.DataFrame({"route_id": ["R1"], "trip_id": ["T1"]}),
+        "stop_times": pd.DataFrame({"trip_id": ["T1"], "stop_id": ["S1"], "stop_sequence": [1]}),
+        "stops": pd.DataFrame({"stop_id": ["S1"], "stop_lat": [lat], "stop_lon": [lon]}),
+    }
+    buffers = _prepare_route_buffers(tables, use_shape_buffer=False, buffer_dist_ft=1320.0)
+    points = gpd.GeoSeries(
+        [Point(lon + near_dlon, lat), Point(lon + far_dlon, lat)], crs="EPSG:4326"
+    ).to_crs("EPSG:3857")
+    catchment = buffers.geometry.iloc[0]
+    assert catchment.contains(points.iloc[0])
+    assert not catchment.contains(points.iloc[1])
+
+
+# ---------------------------------------------------------------------------
+# main (placeholder guard)
+# ---------------------------------------------------------------------------
+
+
+def test_main_blocks_unedited_placeholder_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With CONFIG untouched and no flags, main() warns and does not run."""
+    calls: list[dict] = []
+    monkeypatch.setattr(cabi_mod, "run", lambda **kw: calls.append(kw))
+    cabi_mod.main([])
+    assert calls == []
+
+
+def test_main_runs_after_config_edit(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The documented edit-CONFIG-then-run workflow must reach run()."""
+    calls: list[dict] = []
+    monkeypatch.setattr(cabi_mod, "run", lambda **kw: calls.append(kw))
+    monkeypatch.setattr(cabi_mod, "GTFS_DIR", tmp_path / "gtfs")
+    monkeypatch.setattr(cabi_mod, "STATIONS_PATH", tmp_path / "stations.geojson")
+    monkeypatch.setattr(cabi_mod, "RIDERSHIP_CSV", tmp_path / "ridership.csv")
+    cabi_mod.main([])
+    assert len(calls) == 1
+
+
+def test_main_runs_with_cli_flags_only(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Flags alone (CONFIG untouched) must also reach run()."""
+    calls: list[dict] = []
+    monkeypatch.setattr(cabi_mod, "run", lambda **kw: calls.append(kw))
+    cabi_mod.main(
+        [
+            "--gtfs-dir",
+            str(tmp_path / "gtfs"),
+            "--stations-path",
+            str(tmp_path / "stations.geojson"),
+            "--ridership-csv",
+            str(tmp_path / "ridership.csv"),
+        ]
+    )
+    assert len(calls) == 1
 
 
 # ---------------------------------------------------------------------------

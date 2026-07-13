@@ -40,7 +40,10 @@ Output
 Assumptions
 -----------
 - The projected CRS uses meters or feet; the buffer distance is given in feet
-  and converted to meters when the CRS is metric.
+  and converted to meters when the CRS is metric. Under the default Web
+  Mercator CRS the buffer is additionally scaled by ~1/cos(latitude) so it
+  spans a true ground distance (raw Web Mercator "meters" shrink with
+  latitude).
 - Stations with no ridership row (e.g. new docks with no recorded trips) still
   count toward ``cabi_stations_served`` but contribute 0 riders.
 """
@@ -49,12 +52,15 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import sys
 from pathlib import Path
 from typing import List, Mapping, Sequence
 
 import geopandas as gpd
 import pandas as pd
+from pyproj import CRS
+from pyproj.exceptions import CRSError
 from shapely.geometry import LineString
 from shapely.ops import unary_union
 
@@ -101,8 +107,10 @@ BUFFER_DIST_FT = 1320.0  # ¼ mile in feet
 OUTPUT_CSV_NAME = "cabi_coverage_by_route.csv"
 
 # Projected CRS used for buffering and the spatial join.
-# EPSG:3857 (Web Mercator) works globally; swap for a local CRS (e.g. "EPSG:2283"
-# for northern Virginia in feet) when higher spatial accuracy is needed.
+# EPSG:3857 (Web Mercator) works globally; its latitude-dependent scale
+# distortion is corrected automatically when buffering (see
+# _web_mercator_ground_scale). Swap for a local CRS (e.g. "EPSG:2283" for
+# northern Virginia in feet) when higher spatial accuracy is needed.
 PROJECTED_CRS = "EPSG:3857"
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
@@ -160,9 +168,17 @@ def _prepare_route_buffers(
         projected_crs: Projected CRS used for buffering.
 
     Raises:
-        ValueError: If shape-buffer mode is requested but shapes.txt is malformed.
+        ValueError: If shape-buffer mode is requested but trips.txt lacks a
+            ``shape_id`` column or shapes.txt is malformed.
     """
-    trips = tables["trips"][["route_id", "trip_id", "shape_id"]].copy()
+    # shape_id is optional in GTFS and only needed to buffer route geometry,
+    # so stop-buffer mode must not require the column.
+    trip_cols = ["route_id", "trip_id"]
+    if use_shape_buffer:
+        if "shape_id" not in tables["trips"].columns:
+            raise ValueError("trips.txt missing shape_id column (required for shape-buffer mode)")
+        trip_cols.append("shape_id")
+    trips = tables["trips"][trip_cols].copy()
     trips["route_id"] = trips["route_id"].astype(str)
 
     # Stops GeoDataFrame (always built; the default catchment buffers stops).
@@ -202,6 +218,7 @@ def _prepare_route_buffers(
     buff_dist = buffer_dist_ft
     if _crs_is_metric(stops.crs):
         buff_dist = buffer_dist_ft * 0.3048
+    buff_dist *= _web_mercator_ground_scale(stops.crs, tables["stops"]["stop_lat"])
 
     route_ids = route_shapes.index if route_shapes is not None else trips["route_id"].unique()
 
@@ -241,6 +258,46 @@ def _crs_is_metric(crs: object) -> bool:
     except (AttributeError, IndexError):
         return True  # default GTFS reprojection target (3857) is metric
     return "metre" in unit or "meter" in unit
+
+
+def _web_mercator_ground_scale(crs: object, latitudes: pd.Series) -> float:
+    """Return the Web Mercator map-per-ground distance factor, or 1.0 elsewhere.
+
+    Web Mercator (EPSG:3857) inflates distances by roughly ``1/cos(latitude)``:
+    at 39°N a true quarter mile spans ~1.29x as many map "meters", so a buffer
+    drawn in raw map units under-covers the ground by the same factor. Buffer
+    distances are multiplied by this factor so they span a true ground distance
+    at the analysis area's mean latitude. Any other CRS returns 1.0 (projected
+    local CRSs are treated as true-scale).
+
+    Args:
+        crs: The projected CRS in use (anything pyproj can parse).
+        latitudes: WGS 84 latitudes of the analysis features; their mean sets
+            the correction.
+
+    Returns:
+        The multiplier to apply to a ground distance before buffering.
+    """
+    try:
+        epsg = CRS.from_user_input(crs).to_epsg()
+    except CRSError:
+        return 1.0
+    if epsg != 3857:
+        return 1.0
+    lat = pd.to_numeric(latitudes, errors="coerce").dropna()
+    if lat.empty:
+        return 1.0
+    mean_lat = float(lat.mean())
+    if not -89.0 < mean_lat < 89.0:
+        return 1.0
+    scale = 1.0 / math.cos(math.radians(mean_lat))
+    logging.info(
+        "Web Mercator inflates distances by %.4f at latitude %.3f; scaling the "
+        "buffer to preserve ground distance.",
+        scale,
+        mean_lat,
+    )
+    return scale
 
 
 def _safe_to_str(value: object) -> str:
@@ -580,6 +637,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+# Literal placeholder input paths shipped in the CONFIGURATION block, frozen
+# here (do not edit) so main() can tell an unedited config from a real one. An
+# input equal to its placeholder in BOTH the CONFIG constant and the CLI arg
+# was customized nowhere. Comparing args against the live CONFIG constants
+# instead would always match whenever a flag is omitted (argparse defaults to
+# those constants), wrongly blocking the edit-CONFIG-then-run workflow.
+_PLACEHOLDER_GTFS_DIR = Path(r"data/gtfs")
+_PLACEHOLDER_STATIONS_PATH = Path(r"data/gbfs")
+_PLACEHOLDER_RIDERSHIP_CSV = Path(r"data/station_daytype_ridership.csv")
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     """Command-line entry point. Defaults fall back to the CONFIGURATION block."""
     args = parse_args(argv)
@@ -588,16 +656,33 @@ def main(argv: Sequence[str] | None = None) -> None:
         format="%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-    if (
-        Path(args.gtfs_dir) == GTFS_DIR
-        or Path(args.stations_path) == STATIONS_PATH
-        or Path(args.ridership_csv) == RIDERSHIP_CSV
-        or Path(args.output_dir) == OUTPUT_DIR
-    ):
+    unset = [
+        (name, flag)
+        for name, flag, arg_value, config_value, placeholder in (
+            ("GTFS_DIR", "--gtfs-dir", args.gtfs_dir, GTFS_DIR, _PLACEHOLDER_GTFS_DIR),
+            (
+                "STATIONS_PATH",
+                "--stations-path",
+                args.stations_path,
+                STATIONS_PATH,
+                _PLACEHOLDER_STATIONS_PATH,
+            ),
+            (
+                "RIDERSHIP_CSV",
+                "--ridership-csv",
+                args.ridership_csv,
+                RIDERSHIP_CSV,
+                _PLACEHOLDER_RIDERSHIP_CSV,
+            ),
+        )
+        if Path(arg_value) == placeholder and Path(config_value) == placeholder
+    ]
+    if unset:
         logging.warning(
-            "GTFS_DIR, STATIONS_PATH, RIDERSHIP_CSV, and/or OUTPUT_DIR are still set to "
-            "their default placeholder paths. Update the CONFIGURATION section (or pass "
-            "--gtfs-dir/--stations-path/--ridership-csv/--output-dir) before running."
+            "%s still point(s) at the placeholder path(s) from the CONFIGURATION "
+            "block. Update the CONFIGURATION section or pass %s before running.",
+            " and ".join(name for name, _ in unset),
+            " / ".join(flag for _, flag in unset),
         )
         return
     run(

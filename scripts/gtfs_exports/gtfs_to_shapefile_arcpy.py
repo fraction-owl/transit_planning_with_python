@@ -368,11 +368,14 @@ def _build_route_patterns(
 
     trips["trip_id"] = trips["trip_id"].astype(str)
     trips["route_id"] = trips["route_id"].astype(str)
-    trips["shape_id"] = trips["shape_id"].astype(str)
 
     trips["direction_id"] = pd.to_numeric(trips["direction_id"], errors="coerce")
     before = len(trips)
     trips = trips.dropna(subset=["shape_id", "direction_id"])
+    # Cast shape_id only after the dropna: casting first would turn missing
+    # values into the literal string "nan", which survives the drop and can
+    # even be selected as a route's most-common "shape".
+    trips["shape_id"] = trips["shape_id"].astype(str)
     trips["direction_id"] = trips["direction_id"].astype(int)
     dropped = before - len(trips)
     if dropped > 0:

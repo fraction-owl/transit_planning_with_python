@@ -47,6 +47,7 @@ ArcGIS Pro (arcpy) and pandas (bundled with Pro).
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 from pathlib import Path
@@ -102,8 +103,10 @@ BUFFER_DIST_FT = 1320.0  # ¼ mile in feet
 OUTPUT_CSV_NAME = "school_coverage_by_route.csv"
 
 # Projected spatial reference (WKID) used for buffering and the point-in-polygon
-# tests. EPSG:3857 (Web Mercator) works globally; swap for a local CRS
-# (e.g. 2283 for northern Virginia in feet) when higher spatial accuracy is needed.
+# tests. EPSG:3857 (Web Mercator) works globally; its latitude-dependent scale
+# distortion is corrected automatically when buffering (see
+# _buffer_distance_in_sr_units). Swap for a local CRS (e.g. 2283 for northern
+# Virginia in feet) when higher spatial accuracy is needed.
 PROJECTED_CRS_WKID = 3857
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
@@ -140,12 +143,25 @@ def _load_gtfs_tables(gtfs_dir: Path, need_shapes: bool) -> Mapping[str, pd.Data
     return tables
 
 
-def _buffer_distance_in_sr_units(target_sr: arcpy.SpatialReference, buffer_dist_ft: float) -> float:
+def _buffer_distance_in_sr_units(
+    target_sr: arcpy.SpatialReference,
+    buffer_dist_ft: float,
+    mean_latitude: Optional[float] = None,
+) -> float:
     """Convert a buffer distance in feet to the linear units of *target_sr*.
+
+    Web Mercator (WKID 3857 / 102100) inflates distances by roughly
+    ``1/cos(latitude)``: at 39°N a true quarter mile spans ~1.29x as many map
+    "meters", so a buffer drawn in raw map units under-covers the ground by
+    the same factor. When *target_sr* is Web Mercator and *mean_latitude* is
+    supplied, the distance is scaled up accordingly so it spans a true ground
+    distance at that latitude.
 
     Args:
         target_sr: Projected spatial reference used for geometry operations.
         buffer_dist_ft: Buffer distance in feet.
+        mean_latitude: Mean WGS 84 latitude of the analysis features, used to
+            correct Web Mercator's scale distortion. Ignored for other CRSs.
 
     Returns:
         Buffer distance expressed in the units of *target_sr*.
@@ -160,6 +176,19 @@ def _buffer_distance_in_sr_units(target_sr: arcpy.SpatialReference, buffer_dist_
         )
     meters_per_unit = target_sr.metersPerUnit or 1.0
     buffer_units = buffer_dist_ft * 0.3048 / meters_per_unit
+    if (
+        target_sr.factoryCode in (3857, 102100)
+        and mean_latitude is not None
+        and -89.0 < mean_latitude < 89.0
+    ):
+        scale = 1.0 / math.cos(math.radians(mean_latitude))
+        buffer_units *= scale
+        logging.info(
+            "Web Mercator inflates distances by %.4f at latitude %.3f; scaling "
+            "the buffer to preserve ground distance.",
+            scale,
+            mean_latitude,
+        )
     logging.debug(
         "Buffer distance: %.2f ft -> %.2f %s",
         buffer_dist_ft,
@@ -197,7 +226,6 @@ def _prepare_route_buffers(
             shapes.txt is malformed.
     """
     wgs84_sr = arcpy.SpatialReference(4326)
-    buff_dist = _buffer_distance_in_sr_units(target_sr, buffer_dist_ft)
 
     trips = tables["trips"].copy()
     trips["route_id"] = trips["route_id"].astype(str)
@@ -205,6 +233,10 @@ def _prepare_route_buffers(
     # stop_id -> (lon, lat), and route_id -> unique stop_ids (the default
     # catchment buffers stops).
     stops = tables["stops"][["stop_id", "stop_lat", "stop_lon"]]
+
+    lat_values = pd.to_numeric(stops["stop_lat"], errors="coerce").dropna()
+    mean_latitude = float(lat_values.mean()) if not lat_values.empty else None
+    buff_dist = _buffer_distance_in_sr_units(target_sr, buffer_dist_ft, mean_latitude)
     stop_coords = {
         row.stop_id: (row.stop_lon, row.stop_lat)
         for row in stops.itertuples(index=False)

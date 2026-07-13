@@ -13,6 +13,7 @@ from shapely.geometry import Point
 
 matplotlib.use("Agg")
 
+import scripts.service_coverage.points_of_interest_coverage_gpd as poi_mod
 from scripts.service_coverage.points_of_interest_coverage_gpd import (
     LAYER_SPECS,
     _count_features,
@@ -117,7 +118,7 @@ def test_load_gtfs_tables_returns_all_five_keys(tmp_path: Path) -> None:
     gtfs_dir = tmp_path / "gtfs"
     gtfs_dir.mkdir()
     _write_gtfs_files(gtfs_dir)
-    tables = _load_gtfs_tables(gtfs_dir)
+    tables = _load_gtfs_tables(gtfs_dir, need_shapes=True)
     assert set(tables) == {"routes", "trips", "stop_times", "stops", "shapes"}
 
 
@@ -128,7 +129,17 @@ def test_load_gtfs_tables_missing_file_raises(tmp_path: Path) -> None:
     _write_gtfs_files(gtfs_dir)
     (gtfs_dir / "stops.txt").unlink()
     with pytest.raises(FileNotFoundError):
-        _load_gtfs_tables(gtfs_dir)
+        _load_gtfs_tables(gtfs_dir, need_shapes=True)
+
+
+def test_load_gtfs_tables_stop_mode_omits_shapes(tmp_path: Path) -> None:
+    """Stop-buffer mode loads four tables and does not require shapes.txt."""
+    gtfs_dir = tmp_path / "gtfs"
+    gtfs_dir.mkdir()
+    _write_gtfs_files(gtfs_dir)
+    (gtfs_dir / "shapes.txt").unlink()
+    tables = _load_gtfs_tables(gtfs_dir, need_shapes=False)
+    assert set(tables) == {"routes", "trips", "stop_times", "stops"}
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +269,47 @@ def test_prepare_route_buffers_missing_shape_columns_raises() -> None:
     tables["shapes"] = pd.DataFrame({"shape_id": ["SH1"]})
     with pytest.raises(ValueError, match="missing required columns"):
         _prepare_route_buffers(tables, use_shape_buffer=True, buffer_dist_ft=1320.0)
+
+
+def test_prepare_route_buffers_stop_mode_without_shape_id_column() -> None:
+    """shape_id is optional in GTFS; stop-buffer mode must not require it."""
+    tables = _minimal_tables()
+    tables["trips"] = tables["trips"].drop(columns=["shape_id"])
+    del tables["shapes"]
+    result = _prepare_route_buffers(tables, use_shape_buffer=False, buffer_dist_ft=1320.0)
+    assert len(result) == 1
+    assert not result.geometry.is_empty.any()
+
+
+def test_prepare_route_buffers_shape_mode_missing_shape_id_raises() -> None:
+    """Shape-buffer mode without a trips.txt shape_id column fails clearly."""
+    tables = _minimal_tables()
+    tables["trips"] = tables["trips"].drop(columns=["shape_id"])
+    with pytest.raises(ValueError, match="shape_id"):
+        _prepare_route_buffers(tables, use_shape_buffer=True, buffer_dist_ft=1320.0)
+
+
+# ---------------------------------------------------------------------------
+# main (placeholder guard)
+# ---------------------------------------------------------------------------
+
+
+def test_main_blocks_unedited_placeholder_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With CONFIG untouched and no flags, main() warns and does not run."""
+    calls: list[dict] = []
+    monkeypatch.setattr(poi_mod, "run", lambda **kw: calls.append(kw))
+    poi_mod.main([])
+    assert calls == []
+
+
+def test_main_runs_after_config_edit(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The documented edit-CONFIG-then-run workflow must reach run()."""
+    calls: list[dict] = []
+    monkeypatch.setattr(poi_mod, "run", lambda **kw: calls.append(kw))
+    monkeypatch.setattr(poi_mod, "GTFS_DIR", tmp_path / "gtfs")
+    monkeypatch.setattr(poi_mod, "SHP_INPUT_DIR", tmp_path / "shp")
+    poi_mod.main([])
+    assert len(calls) == 1
 
 
 # ---------------------------------------------------------------------------
