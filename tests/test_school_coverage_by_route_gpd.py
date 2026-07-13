@@ -7,6 +7,7 @@ import pandas as pd
 import pytest
 from shapely.geometry import Point
 
+import scripts.service_coverage.school_coverage_by_route_gpd as school_mod
 from scripts.service_coverage.school_coverage_by_route_gpd import (
     _band_of_grade_column,
     _load_gtfs_tables,
@@ -120,6 +121,46 @@ def test_prepare_route_buffers_stop_mode_produces_one_polygon() -> None:
     )
     assert list(result["route_id"]) == ["R1"]
     assert not result.geometry.is_empty.any()
+
+
+def test_prepare_route_buffers_stop_mode_without_shape_id_column() -> None:
+    """shape_id is optional in GTFS; stop-buffer mode must not require it."""
+    tables = _minimal_tables()
+    tables["trips"] = tables["trips"].drop(columns=["shape_id"])
+    result = _prepare_route_buffers(tables, use_shape_buffer=False, buffer_dist_ft=1320.0)
+    assert list(result["route_id"]) == ["R1"]
+    assert not result.geometry.is_empty.any()
+
+
+def test_prepare_route_buffers_shape_mode_missing_shape_id_raises() -> None:
+    """Shape-buffer mode without a trips.txt shape_id column fails clearly."""
+    tables = _minimal_tables()
+    tables["trips"] = tables["trips"].drop(columns=["shape_id"])
+    with pytest.raises(ValueError, match="shape_id"):
+        _prepare_route_buffers(tables, use_shape_buffer=True, buffer_dist_ft=1320.0)
+
+
+# ---------------------------------------------------------------------------
+# main (placeholder guard)
+# ---------------------------------------------------------------------------
+
+
+def test_main_blocks_unedited_placeholder_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With CONFIG untouched and no flags, main() warns and does not run."""
+    calls: list[dict] = []
+    monkeypatch.setattr(school_mod, "run", lambda **kw: calls.append(kw))
+    school_mod.main([])
+    assert calls == []
+
+
+def test_main_runs_after_config_edit(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The documented edit-CONFIG-then-run workflow must reach run()."""
+    calls: list[dict] = []
+    monkeypatch.setattr(school_mod, "run", lambda **kw: calls.append(kw))
+    monkeypatch.setattr(school_mod, "GTFS_DIR", tmp_path / "gtfs")
+    monkeypatch.setattr(school_mod, "SCHOOLS_PATH", tmp_path / "schools")
+    school_mod.main([])
+    assert len(calls) == 1
 
 
 # ---------------------------------------------------------------------------
