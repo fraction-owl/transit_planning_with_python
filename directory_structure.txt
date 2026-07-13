@@ -86,7 +86,9 @@ transit_planning_with_python/
 │   │   ├── otp_monthly_tides.py
 │   │   ├── route_runtime_tides.py
 │   │   ├── segment_runtime_tides.py
+│   │   ├── stop_coverage_tides.py
 │   │   ├── tides_stop_otp_flagger.py
+│   │   ├── trip_coverage_tides.py
 │   │   ├── trip_runtime_diagnostics.py
 │   │   └── trip_runtime_tides.py
 │   ├── ridership_tools/
@@ -97,6 +99,7 @@ transit_planning_with_python/
 │   │   ├── ntd_monthly_summary.py
 │   │   ├── ntd_monthly_trends_export.py
 │   │   ├── ridership_from_tides.py
+│   │   ├── ridership_gtfs_coverage.py
 │   │   ├── stops_ridership_joiner_arcpy.py
 │   │   └── stops_ridership_joiner_gpd.py
 │   ├── service_coverage/
@@ -203,6 +206,7 @@ transit_planning_with_python/
 │   ├── test_gtfs_route_timeline.py
 │   ├── test_gtfs_service_by_district_gpd.py
 │   ├── test_gtfs_service_demographics_gpd.py
+│   ├── test_gtfs_service_expansion.py
 │   ├── test_gtfs_skipped_stop_flagger_gpd.py
 │   ├── test_gtfs_stop_diff.py
 │   ├── test_gtfs_stop_proximity_qc.py
@@ -225,6 +229,7 @@ transit_planning_with_python/
 │   ├── test_prep_features_public_orchestrator.py
 │   ├── test_printable_block_schedules.py
 │   ├── test_ridership_from_tides.py
+│   ├── test_ridership_gtfs_coverage.py
 │   ├── test_ridership_ml_model.py
 │   ├── test_route_direction_classifier.py
 │   ├── test_route_performance_model.py
@@ -236,6 +241,7 @@ transit_planning_with_python/
 │   ├── test_segment_speed_exporter.py
 │   ├── test_shapefile_helpers.py
 │   ├── test_site_route_proximity_gpd.py
+│   ├── test_stop_coverage_tides.py
 │   ├── test_stop_impacts_target_routes.py
 │   ├── test_stop_improvement_coverage_summary.py
 │   ├── test_stop_pattern_exporter.py
@@ -247,6 +253,7 @@ transit_planning_with_python/
 │   ├── test_tides_stop_otp_flagger.py
 │   ├── test_time_band_exporter.py
 │   ├── test_timepoint_schedule_exporter.py
+│   ├── test_trip_coverage_tides.py
 │   ├── test_trip_runtime_diagnostics.py
 │   ├── test_trip_runtime_tides.py
 │   ├── test_uscensus_table_build.py
