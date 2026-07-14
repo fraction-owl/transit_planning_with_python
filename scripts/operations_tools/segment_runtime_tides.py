@@ -42,7 +42,7 @@ import argparse
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Sequence
+from typing import Callable, Dict, List, Sequence
 
 import pandas as pd
 
@@ -289,7 +289,7 @@ def percentile_column(pct: float) -> str:
     return f"actual_p{label}_min"
 
 
-def _quantile_agg(pct: float):
+def _quantile_agg(pct: float) -> Callable[[pd.Series], float]:
     """Build an aggregation callable for the given percentile (0-100)."""
 
     def agg(series: pd.Series) -> float:
@@ -329,10 +329,7 @@ def summarize_segments(
         "n_obs": ("actual_runtime_min", "count"),
         "actual_median_min": ("actual_runtime_min", "median"),
         "actual_avg_min": ("actual_runtime_min", "mean"),
-        **{
-            col: ("actual_runtime_min", _quantile_agg(p))
-            for col, p in zip(pct_cols, percentiles)
-        },
+        **{col: ("actual_runtime_min", _quantile_agg(p)) for col, p in zip(pct_cols, percentiles)},
         "scheduled_min": ("scheduled_runtime_min", _mode_or_median),
         "recovery_after_min": ("recovery_after_min", "median"),
     }
@@ -371,9 +368,7 @@ def build_human_pivots(summary: pd.DataFrame) -> Dict[str, pd.DataFrame]:
     if summary.empty:
         return pivots
     metric_cols = [
-        c
-        for c in summary.columns
-        if c not in ("route_id", "direction_id", "seq", "segment")
+        c for c in summary.columns if c not in ("route_id", "direction_id", "seq", "segment")
     ]
     for (route, direction), g in summary.groupby(["route_id", "direction_id"], dropna=False):
         ordered = g.sort_values("seq").set_index("segment")
