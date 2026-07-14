@@ -15,6 +15,9 @@ Two views are exported:
   2) **Pivot table (for humans)** - one wide CSV per ``(route, direction)`` with
      segments as rows and a small set of summary columns:
        * ``actual_median_min``     - median observed running time
+       * ``actual_avg_min``        - mean observed running time
+       * ``actual_pNN_min``        - observed running-time percentiles (one
+         column per entry in ``PERCENTILES``, e.g. ``actual_p85_min``)
        * ``scheduled_min``         - modal scheduled running time
        * ``diff_min``              - actual median minus scheduled
        * ``recovery_after_min``    - median scheduled recovery (layover) time in
@@ -62,6 +65,11 @@ ROUTES_TO_EXCLUDE: Sequence[str] = ()
 # Minimum observations required for a segment to appear in the human pivot.
 MIN_OBS_FOR_PIVOT: int = 1
 
+# Percentiles (0-100) of the actual running time reported per segment, in
+# addition to the median and mean. Each value becomes an ``actual_pNN_min``
+# column. Override here or with the --percentiles CLI flag.
+PERCENTILES: Sequence[float] = (1, 5, 85, 95, 99)
+
 LOG_LEVEL: int = logging.INFO
 
 LONG_FILENAME: str = "segment_runtime_long.csv"
@@ -82,6 +90,7 @@ class Config:
     routes_to_include: Sequence[str] = ()
     routes_to_exclude: Sequence[str] = ()
     min_obs_for_pivot: int = MIN_OBS_FOR_PIVOT
+    percentiles: Sequence[float] = PERCENTILES
 
 
 # =============================================================================
@@ -272,10 +281,28 @@ def _mode_or_median(series: pd.Series) -> float:
     return float(s.median())
 
 
+def percentile_column(pct: float) -> str:
+    """Return the summary column name for a percentile, e.g. 85 -> ``actual_p85_min``."""
+    label = f"{pct:g}".replace(".", "_")
+    if float(pct) < 10 and "_" not in label:
+        label = f"0{label}"
+    return f"actual_p{label}_min"
+
+
+def _quantile_agg(pct: float):
+    """Build an aggregation callable for the given percentile (0-100)."""
+
+    def agg(series: pd.Series) -> float:
+        return series.quantile(pct / 100.0)
+
+    return agg
+
+
 def summarize_segments(
     segments: pd.DataFrame,
     recovery: pd.DataFrame,
     min_obs: int = MIN_OBS_FOR_PIVOT,
+    percentiles: Sequence[float] = PERCENTILES,
 ) -> pd.DataFrame:
     """Summarize each segment within each ``(route, direction)``.
 
@@ -283,24 +310,35 @@ def summarize_segments(
         segments: Long segment table from :func:`build_segments`.
         recovery: Per-trip recovery table from :func:`compute_block_recovery`.
         min_obs: Drop segments with fewer than this many observations.
+        percentiles: Percentiles (0-100) of the actual running time to report,
+            each as an ``actual_pNN_min`` column.
 
     Returns:
         DataFrame with one row per ``(route_id, direction_id, segment)`` and the
-        summary columns ``n_obs``, ``actual_median_min``, ``scheduled_min``,
-        ``diff_min``, ``recovery_after_min``.
+        summary columns ``n_obs``, ``actual_median_min``, ``actual_avg_min``,
+        one ``actual_pNN_min`` column per requested percentile,
+        ``scheduled_min``, ``diff_min``, ``recovery_after_min``.
     """
     if segments.empty:
         return segments
 
     seg = segments.merge(recovery, on="trip_id_performed", how="left")
 
+    pct_cols = [percentile_column(p) for p in percentiles]
+    agg_specs = {
+        "n_obs": ("actual_runtime_min", "count"),
+        "actual_median_min": ("actual_runtime_min", "median"),
+        "actual_avg_min": ("actual_runtime_min", "mean"),
+        **{
+            col: ("actual_runtime_min", _quantile_agg(p))
+            for col, p in zip(pct_cols, percentiles)
+        },
+        "scheduled_min": ("scheduled_runtime_min", _mode_or_median),
+        "recovery_after_min": ("recovery_after_min", "median"),
+    }
+
     grouped = seg.groupby(["route_id", "direction_id", "segment", "seq"], dropna=False)
-    summary = grouped.agg(
-        n_obs=("actual_runtime_min", "count"),
-        actual_median_min=("actual_runtime_min", "median"),
-        scheduled_min=("scheduled_runtime_min", _mode_or_median),
-        recovery_after_min=("recovery_after_min", "median"),
-    ).reset_index()
+    summary = grouped.agg(**agg_specs).reset_index()
 
     summary["diff_min"] = summary["actual_median_min"] - summary["scheduled_min"]
     summary = summary.loc[summary["n_obs"] >= min_obs]
@@ -312,6 +350,8 @@ def summarize_segments(
         "segment",
         "n_obs",
         "actual_median_min",
+        "actual_avg_min",
+        *pct_cols,
         "scheduled_min",
         "diff_min",
         "recovery_after_min",
@@ -330,11 +370,14 @@ def build_human_pivots(summary: pd.DataFrame) -> Dict[str, pd.DataFrame]:
     pivots: Dict[str, pd.DataFrame] = {}
     if summary.empty:
         return pivots
+    metric_cols = [
+        c
+        for c in summary.columns
+        if c not in ("route_id", "direction_id", "seq", "segment")
+    ]
     for (route, direction), g in summary.groupby(["route_id", "direction_id"], dropna=False):
         ordered = g.sort_values("seq").set_index("segment")
-        pivots[f"{route}_dir{direction}"] = ordered[
-            ["actual_median_min", "scheduled_min", "diff_min", "recovery_after_min", "n_obs"]
-        ]
+        pivots[f"{route}_dir{direction}"] = ordered[metric_cols]
     return pivots
 
 
@@ -404,7 +447,7 @@ def run(cfg: Config) -> pd.DataFrame:
 
     segments = build_segments(joined, cfg.timepoints_only)
     recovery = compute_block_recovery(trips)
-    summary = summarize_segments(segments, recovery, cfg.min_obs_for_pivot)
+    summary = summarize_segments(segments, recovery, cfg.min_obs_for_pivot, cfg.percentiles)
     pivots = build_human_pivots(summary)
 
     paths = export_outputs(segments, summary, pivots, cfg.output_dir)
@@ -430,7 +473,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--min-obs", type=int, default=MIN_OBS_FOR_PIVOT, help="Min observations per segment."
     )
+    p.add_argument(
+        "--percentiles",
+        default=",".join(f"{p:g}" for p in PERCENTILES),
+        help="Comma-separated actual-runtime percentiles (0-100) to report, e.g. '1,5,85,95,99'.",
+    )
     return p
+
+
+def parse_percentiles(raw: str) -> Sequence[float]:
+    """Parse a comma-separated percentile list, validating each is in (0, 100)."""
+    values: List[float] = []
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        value = float(token)
+        if not 0 < value < 100:
+            raise ValueError(f"Percentile out of range (0, 100): {token}")
+        values.append(value)
+    return tuple(values)
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -458,6 +520,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         routes_to_include=ROUTES_TO_INCLUDE,
         routes_to_exclude=ROUTES_TO_EXCLUDE,
         min_obs_for_pivot=args.min_obs,
+        percentiles=parse_percentiles(args.percentiles),
     )
 
     if not cfg.stop_visits_path.exists():
