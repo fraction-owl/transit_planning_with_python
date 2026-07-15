@@ -15,7 +15,7 @@ For analysts comfortable assembling their own modeling tables. The core is a two
 *Folder:* `modeling/`
 
 ### OTP & Runtime Diagnostics
-Stop guessing where buses are getting delayed. Pivot route-level OTP trends, diagnose runtime by trip event, and analyze segment-level runtimes. Roll on-time performance (`otp_by_route.py`) and running time (`runtime_by_route.py`) up to the route over a trailing window for demand modeling. A stop-level counterpart (`otp_by_stop_flagger.py`) inverts the route view and flags individual stops whose AVL data coverage or OTP falls well below the baselines of *multiple* routes serving them — a signature of stop-specific operational or data issues (mis-placed geofences, relocated stops, chronic congestion) that route rollups average away. Includes CleverWorks-to-TIDES converters for stop visits and trips performed.
+Stop guessing where buses are getting delayed. Pivot route-level OTP trends, diagnose runtime by trip event, and analyze segment-level runtimes. Roll on-time performance (`otp_by_route.py`) and running time (`runtime_by_route.py`) up to the route over a trailing window for demand modeling. A stop-level counterpart (`otp_by_stop.py`) inverts the route view — computing OTP and AVL data coverage per stop and natively flagging stops that fall well below the baselines of *multiple* routes serving them — a signature of stop-specific operational or data issues (mis-placed geofences, relocated stops, chronic congestion) that route rollups average away. Includes CleverWorks-to-TIDES converters for stop visits and trips performed.
 *Folder:* `operations_tools/`
 
 ### Service Coverage & Catchments *(arcpy + GeoPandas)*
