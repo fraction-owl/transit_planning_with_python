@@ -842,7 +842,7 @@ def write_run_log(output_dir: Path, summary_lines: List[str]) -> bool:
     Returns:
         ``True`` if the log was written successfully, ``False`` otherwise.
     """
-    log_path = output_dir / "otp_flags_by_stop_runlog.txt"
+    log_path = output_dir / "otp_by_stop_flagger_runlog.txt"
 
     source_file = resolve_source_file()
     if source_file is None:

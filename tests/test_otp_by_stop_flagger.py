@@ -1,4 +1,4 @@
-"""Tests for otp_flags_by_stop using the repo TIDES fixtures plus synthetic frames."""
+"""Tests for otp_by_stop_flagger using the repo TIDES fixtures plus synthetic frames."""
 
 import sys
 from pathlib import Path
@@ -9,7 +9,7 @@ import pytest
 script_dir = Path("scripts/operations_tools").resolve()
 sys.path.append(str(script_dir))
 
-import otp_flags_by_stop as target  # noqa: E402
+import otp_by_stop_flagger as target  # noqa: E402
 
 STOP_VISITS = Path("tests/fixtures/stop_visits.csv")
 TRIPS_PERFORMED = Path("tests/fixtures/trips_performed.csv")
@@ -326,7 +326,7 @@ def test_run_writes_tables_and_runlog(tmp_path: Path) -> None:
 
     assert (tmp_path / target.STOP_FLAGS_FILENAME).exists()
     assert (tmp_path / target.STOP_ROUTE_DETAIL_FILENAME).exists()
-    runlog = tmp_path / "otp_flags_by_stop_runlog.txt"
+    runlog = tmp_path / "otp_by_stop_flagger_runlog.txt"
     assert runlog.exists()
     text = runlog.read_text(encoding="utf-8")
     assert "CONFIGURATION (verbatim from source)" in text

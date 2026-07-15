@@ -82,8 +82,8 @@ transit_planning_with_python/
 │   │   ├── convert_to_tides_stop_visits.py
 │   │   ├── convert_to_tides_trips_performed.py
 │   │   ├── otp_by_route.py
+│   │   ├── otp_by_stop_flagger.py
 │   │   ├── otp_by_timepoint_from_avl.py
-│   │   ├── otp_flags_by_stop.py
 │   │   ├── otp_monthly_panel.py
 │   │   ├── runtime_by_route.py
 │   │   ├── runtime_by_segment.py
@@ -217,8 +217,8 @@ transit_planning_with_python/
 │   ├── test_ntd_monthly_summary.py
 │   ├── test_ntd_monthly_trends_export.py
 │   ├── test_otp_by_route.py
+│   ├── test_otp_by_stop_flagger.py
 │   ├── test_otp_by_timepoint_from_avl.py
-│   ├── test_otp_flags_by_stop.py
 │   ├── test_otp_monthly_panel.py
 │   ├── test_pipeline_contracts.py
 │   ├── test_points_of_interest_coverage_gpd.py
