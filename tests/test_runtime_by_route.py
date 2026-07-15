@@ -1,4 +1,4 @@
-"""Tests for route_runtime_tides using the repo TIDES fixtures."""
+"""Tests for runtime_by_route using the repo TIDES fixtures."""
 
 import sys
 from pathlib import Path
@@ -9,7 +9,7 @@ import pytest
 script_dir = Path("scripts/operations_tools").resolve()
 sys.path.append(str(script_dir))
 
-import route_runtime_tides as target  # noqa: E402
+import runtime_by_route as target  # noqa: E402
 
 STOP_VISITS = Path("tests/fixtures/stop_visits.csv")
 TRIPS_PERFORMED = Path("tests/fixtures/trips_performed.csv")
@@ -116,7 +116,7 @@ def test_run_writes_panel_rollup_and_runlog(tmp_path: Path) -> None:
 
     assert (tmp_path / target.PANEL_FILENAME).exists()
     assert (tmp_path / target.ROLLUP_FILENAME).exists()
-    assert (tmp_path / "route_runtime_tides_runlog.txt").exists()
+    assert (tmp_path / "runtime_by_route_runlog.txt").exists()
 
     rollup = pd.read_csv(tmp_path / target.ROLLUP_FILENAME)
     assert "runtime_mean_min" in rollup.columns

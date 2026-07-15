@@ -1,6 +1,6 @@
 """Maximum load (peak passenger load) from TIDES ``stop_visits``.
 
-This is the maximum-load counterpart to ``otp_monthly_tides.py``: it derives
+This is the maximum-load counterpart to ``otp_monthly_panel.py``: it derives
 each performed trip's peak passenger load directly from raw TIDES
 automated-passenger-counter (APC) events rather than consuming a vendor's
 pre-aggregated ridecheck export. It is meant for agencies that have TIDES

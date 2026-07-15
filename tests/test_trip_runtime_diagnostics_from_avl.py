@@ -8,7 +8,7 @@ import pandas as pd
 script_dir = Path("scripts/operations_tools").resolve()
 sys.path.append(str(script_dir))
 
-import trip_runtime_diagnostics as target  # noqa: E402
+import trip_runtime_diagnostics_from_avl as target  # noqa: E402
 
 FIXTURE_PATH = Path("tests/fixtures/trips_performed.csv")
 

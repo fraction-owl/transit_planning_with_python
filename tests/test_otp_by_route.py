@@ -10,7 +10,7 @@ script_dir = Path("scripts/operations_tools").resolve()
 sys.path.append(str(script_dir))
 
 import otp_by_route as target  # noqa: E402
-import otp_monthly_tides as otp_tides  # noqa: E402
+import otp_monthly_panel as otp_tides  # noqa: E402
 
 STOP_VISITS = Path("tests/fixtures/stop_visits.csv")
 TRIPS_PERFORMED = Path("tests/fixtures/trips_performed.csv")
@@ -50,7 +50,7 @@ def test_load_otp_panel_missing_column_raises(tmp_path: Path) -> None:
 
 
 def test_load_otp_panel_missing_file_raises(tmp_path: Path) -> None:
-    """A missing panel file points the user at otp_monthly_tides."""
+    """A missing panel file points the user at otp_monthly_panel."""
     with pytest.raises(FileNotFoundError, match="otp_monthly"):
         target.load_otp_panel(tmp_path / "nope.csv")
 
@@ -117,8 +117,8 @@ def test_run_writes_rollup_and_runlog(tmp_path: Path) -> None:
     assert set(rollup["route_id"]) == {"A"}
 
 
-def test_consumes_real_otp_monthly_tides_output(tmp_path: Path) -> None:
-    """Integration: roll up the panel that otp_monthly_tides actually writes."""
+def test_consumes_real_otp_monthly_panel_output(tmp_path: Path) -> None:
+    """Integration: roll up the panel that otp_monthly_panel actually writes."""
     otp_tides.run(
         otp_tides.Config(
             stop_visits_path=STOP_VISITS,

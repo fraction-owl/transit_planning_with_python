@@ -1,6 +1,6 @@
 """Flag stops with notably poor AVL data coverage and/or OTP across multiple routes.
 
-Route-level OTP and coverage rollups (see ``otp_monthly_tides.py``) average over
+Route-level OTP and coverage rollups (see ``otp_monthly_panel.py``) average over
 every stop a route serves, so a single problem stop hides inside the route mean
 and a stop-specific defect is easy to misread as a route problem. This script
 inverts the view: it works stop by stop, from TIDES ``stop_visits`` (stop-level
@@ -229,7 +229,7 @@ def filter_in_service(trips_performed: pd.DataFrame) -> pd.DataFrame:
 
     Canceled trips never served any stop and non-revenue trips carry no
     passengers, so neither belongs in the expected-service denominator or the
-    OTP pool. This is the same filter ``otp_monthly_tides.py`` applies before
+    OTP pool. This is the same filter ``otp_monthly_panel.py`` applies before
     its join, so the two scripts see the same trip pool.
 
     Args:
@@ -463,7 +463,7 @@ def build_expected_trips(
 
     Because ``trips_performed`` lists every scheduled in-service trip -- even
     ones whose AVL never reported -- this denominator counts whole-trip AVL
-    gaps against the stop, exactly like ``otp_monthly_tides.py`` does per route.
+    gaps against the stop, exactly like ``otp_monthly_panel.py`` does per route.
 
     Args:
         membership: Output of :func:`infer_pattern_stop_membership`.
@@ -842,7 +842,7 @@ def write_run_log(output_dir: Path, summary_lines: List[str]) -> bool:
     Returns:
         ``True`` if the log was written successfully, ``False`` otherwise.
     """
-    log_path = output_dir / "tides_stop_otp_flagger_runlog.txt"
+    log_path = output_dir / "otp_flags_by_stop_runlog.txt"
 
     source_file = resolve_source_file()
     if source_file is None:

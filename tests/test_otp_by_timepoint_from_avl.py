@@ -6,7 +6,7 @@ import pandas as pd
 import pytest
 
 # Import the script module
-from scripts.operations_tools import otp_by_timepoint
+from scripts.operations_tools import otp_by_timepoint_from_avl
 
 
 @pytest.fixture
@@ -37,7 +37,7 @@ def test_tides_data_processing(tides_input_csv: Path, tmp_path: Path) -> None:
 
     # Arguments for the script
     argv = [
-        "otp_by_timepoint.py",
+        "otp_by_timepoint_from_avl.py",
         "--input",
         str(tides_input_csv),
         "--outdir",
@@ -50,7 +50,7 @@ def test_tides_data_processing(tides_input_csv: Path, tmp_path: Path) -> None:
 
     with patch.object(sys, "argv", argv):
         # This should not raise SystemExit now
-        otp_by_timepoint.main()
+        otp_by_timepoint_from_avl.main()
 
     # Verification
     assert output_dir.exists()
