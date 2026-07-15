@@ -31,8 +31,8 @@ Inputs
   ``cabi_weekday_riders_served`` matches the non-holiday-weekday posture of
   the GTFS-side feature scripts.
 
-Output
-------
+Outputs
+-------
 - ``cabi_coverage_by_route.csv`` — columns ``route_id``, ``route_short_name``
   (when available), ``cabi_stations_served``, ``cabi_weekday_riders_served``,
   ``cabi_saturday_riders_served``, and ``cabi_sunday_riders_served``.

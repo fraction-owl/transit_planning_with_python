@@ -9,8 +9,8 @@ row with:
 - **Segment columns** – runtime (minutes) from the previous time-point
   (first cell is ``MISSING_TIME``)
 
-Output structure
-----------------
+Outputs
+-------
 - One Excel workbook per ``(route_id, service_id)``
 - One sheet per ``direction_id`` within that workbook
 """

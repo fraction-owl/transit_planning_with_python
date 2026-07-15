@@ -1,4 +1,4 @@
-"""Join ridership data to bus stop point features (GeoPandas port; no dataclass).
+"""Join ridership data to bus stop point features (GeoPandas port).
 
 This script merges stop-level ridership data from an Excel file with stop locations
 (from a shapefile/GeoPackage/GeoJSON/etc. or GTFS stops.txt), and optionally performs

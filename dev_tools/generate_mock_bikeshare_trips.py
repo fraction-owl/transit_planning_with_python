@@ -5,9 +5,8 @@ Writes one CSV per month (named like the real vendor files,
 build ridership-over-time charts against a realistic, lightweight stand-in for
 the public Capital Bikeshare (Lyft GBFS) extracts.
 
-------------------------------------------------------------------------------
-RUNNING IT
-------------------------------------------------------------------------------
+Typical usage
+-------------
 Notebook / manual: edit the CONFIG block below, then run the file (or call
 ``run()``). No command-line arguments needed -- pasting the module into a cell
 or ``%run``-ing it uses the CONFIG values.
@@ -18,9 +17,8 @@ Command line: every CONFIG value has a matching flag that overrides it, e.g.
         --input-extract "C:\\data\\202604-capitalbikeshare-tripdata.zip" \\
         --output-dir tests/fixtures/capitalbikeshare
 
-------------------------------------------------------------------------------
-WHAT IT PRODUCES
-------------------------------------------------------------------------------
+Outputs
+-------
 The total trip budget is spread across the months with structure, so an
 over-time chart has something to show rather than a flat line:
   * Seasonality: a smooth summer peak / winter trough (~3x peak-to-trough).

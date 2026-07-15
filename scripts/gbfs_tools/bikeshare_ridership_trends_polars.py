@@ -13,9 +13,8 @@ extracts. polars belongs to the open-source stack (see requirements.txt) and
 is not available in ArcGIS Pro's bundled Python -- inside ArcGIS Pro, use the
 pandas original instead.
 
-------------------------------------------------------------------------------
-RUNNING IT
-------------------------------------------------------------------------------
+Typical usage
+-------------
 Notebook / manual: edit the CONFIG block below, then run the file (or call
 ``run()``). No command-line arguments are needed.
 
@@ -24,9 +23,8 @@ Command line: every CONFIG value has a matching flag that overrides it, e.g.
         --input tests/fixtures/capitalbikeshare_fixtures_24mo.zip \\
         --output-dir out/bikeshare_trends
 
-------------------------------------------------------------------------------
-WHAT IT PRODUCES
-------------------------------------------------------------------------------
+Outputs
+-------
 In OUTPUT_DIR:
   * ``trips_concatenated.csv`` -- every trip from every monthly file stacked
     into one table, with an added ``month`` column (``YYYY-MM``) and a

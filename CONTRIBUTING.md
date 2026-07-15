@@ -115,6 +115,53 @@ pre-commit install
 After this, `ruff check` and `ruff format` run automatically on every `git commit`. The hook reads its config
 from `pyproject.toml` and uses the same ruff version that CI does (pinned in `requirements-dev.txt`).
 
+### 📝 Module docstrings
+
+A script's module docstring doubles as its README — for many users it is the only documentation
+they will read. Ruff enforces that a docstring exists and that it starts with a one-line summary;
+the structure below is house convention, audited by `dev_tools/check_style.py`
+(`docstring_sections` check):
+
+```python
+"""One-sentence imperative summary of what the script does.
+
+One to three short paragraphs: what the script computes, the key method
+decisions, and where it sits relative to neighboring scripts (if relevant).
+
+Inputs
+------
+- The files or tables the script reads, and which script or source produces
+  each one.
+
+Outputs
+-------
+- The files the script writes (names plus one-line contents).
+- A run-log sidecar capturing the verbatim CONFIGURATION block.
+
+Typical usage
+-------------
+Update the paths in the CONFIGURATION section (or pass the matching CLI
+flags) and run from a shell, ArcGIS Pro's Python window, or a Jupyter
+notebook.
+"""
+```
+
+Guidelines:
+
+- **Use these exact section names** — `Inputs`, `Outputs`, `Typical usage`. The style audit flags
+  the variants that have crept in over time (`Output`, `Typical use`, `Usage`, `RUNNING IT`,
+  `WHAT IT PRODUCES`, `Primary outputs include`, …). Either header format is accepted: an
+  underlined header as shown above, or a Google-style `Outputs:` line with an indented body.
+- `Outputs` (for any script that writes files) and `Typical usage` are expected for every script
+  under `scripts/`; `Inputs` is strongly encouraged.
+- Optional sections, when they earn their keep: `Notes`, `Assumptions`, `Limitations`, `Method`,
+  `Workflow` (numbered processing steps), `Requires` (software prerequisites, e.g. ArcGIS Pro),
+  and `Helpful links` (where to download the input data).
+- **Length:** most script docstrings land between 15 and 45 lines. Helper modules in `utils/`
+  need only a couple of lines — their function docstrings carry the detail. If a module docstring
+  grows past ~50 lines, keep what an analyst needs to *run and trust* the tool (inputs, outputs,
+  method, limitations) and move extended design rationale elsewhere.
+
 ## 📁 File Organization
 
 - Add new scripts to the appropriate subfolder within `scripts/`, based on function (e.g., `ridership_tools/`, `gtfs_exports/`).

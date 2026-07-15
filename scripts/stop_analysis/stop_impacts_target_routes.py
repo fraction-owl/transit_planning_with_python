@@ -10,7 +10,7 @@ determines if the stop is:
 The analysis accounts for specific service IDs (calendars) and output includes
 Day-of-Week codes to identify if stops are eliminated only on specific days.
 
-Output:
+Outputs:
     Writes `stop_route_calendar_impacts.csv` containing stop-level summaries and
     per-service-id classifications.
 """

@@ -25,8 +25,8 @@ Inputs
   GeoPackages, shapefiles, and GeoJSON files are supported (GeoJSON is
   converted in-memory via ``arcpy.conversion.JSONToFeatures``).
 
-Output
-------
+Outputs
+-------
 - ``school_coverage_by_route.csv`` — columns ``route_id``, ``route_short_name``
   (when available), ``schools_served``, ``enrollment_served`` (grand total), and
   the grade-band breakout ``enrollment_1_8_served``, ``enrollment_9_12_served``,
