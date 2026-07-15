@@ -1,4 +1,4 @@
-"""Tests for otp_monthly_tides using the repo TIDES fixtures."""
+"""Tests for otp_monthly_panel using the repo TIDES fixtures."""
 
 import sys
 from pathlib import Path
@@ -9,7 +9,7 @@ import pytest
 script_dir = Path("scripts/operations_tools").resolve()
 sys.path.append(str(script_dir))
 
-import otp_monthly_tides as target  # noqa: E402
+import otp_monthly_panel as target  # noqa: E402
 
 STOP_VISITS = Path("tests/fixtures/stop_visits.csv")
 TRIPS_PERFORMED = Path("tests/fixtures/trips_performed.csv")

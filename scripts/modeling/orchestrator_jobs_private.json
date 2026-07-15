@@ -8,7 +8,7 @@
     "the {input}/tides topic subfolder.",
     "{output} is each script's own output subdir, collected to attribute its tables.",
     "{work}/out/<script_stem>/ exposes an upstream script's outputs to a downstream one:",
-    "otp_by_route consumes otp_monthly_tides' panel that way.",
+    "otp_by_route consumes otp_monthly_panel's output that way.",
     "GOVERNANCE: unlike the public registry, the NTD dependent variable and the supply",
     "predictors ARE shipped here on purpose -- this side has no leakage boundary. The anchor",
     "breaks out all three service days on a daily-average basis (weekday/saturday/sunday x",
@@ -38,7 +38,7 @@
       ]
     },
     {
-      "script": "otp_monthly_tides.py",
+      "script": "otp_monthly_panel.py",
       "cmd": ["{python}", "{script}",
               "--stop-visits", "{input}/tides/stop_visits.csv",
               "--trips-performed", "{input}/tides/trips_performed.csv",
@@ -50,7 +50,7 @@
     {
       "script": "otp_by_route.py",
       "cmd": ["{python}", "{script}",
-              "--otp-processed", "{work}/out/otp_monthly_tides/otp_monthly_processed.csv",
+              "--otp-processed", "{work}/out/otp_monthly_panel/otp_monthly_processed.csv",
               "--output-dir", "{output}",
               "--window-months", "12",
               "--normalize"],
@@ -60,7 +60,7 @@
       ]
     },
     {
-      "script": "route_runtime_tides.py",
+      "script": "runtime_by_route.py",
       "cmd": ["{python}", "{script}",
               "--stop-visits", "{input}/tides/stop_visits.csv",
               "--trips-performed", "{input}/tides/trips_performed.csv",

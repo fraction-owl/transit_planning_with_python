@@ -32,7 +32,7 @@ Pipeline (identical shape to the public half):
               template, each into its own output subdir, capturing logs and
               applying a per-script timeout. Downstream scripts read an upstream
               script's output via ``{work}/out/<script_stem>/`` (e.g.
-              ``otp_by_route`` consumes ``otp_monthly_tides``'s panel).
+              ``otp_by_route`` consumes ``otp_monthly_panel``'s output).
     collect   Gather the ``*.csv`` / ``*.xlsx`` tables each successful script
               produced.
     describe  Resolve each table's join keys + kept columns from the registry
@@ -598,8 +598,8 @@ def describe_output(
     """
     spec = script_outputs.get(file.name) or global_outputs.get(file.name)
     # Convention: a registry spec with empty keep_cols deliberately drops an
-    # intermediate from bundling (e.g. otp_monthly_tides' panel, which
-    # otp_by_route consumes but which must not become a bundle of its own).
+    # intermediate from bundling (e.g. the panel otp_monthly_panel writes,
+    # which otp_by_route consumes but must not become a bundle of its own).
     if spec is not None and not spec["keep_cols"]:
         logging.info(
             "Output '%s' is registry-marked ignore (empty keep_cols) — skipping.", file.name

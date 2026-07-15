@@ -1,12 +1,12 @@
 """Route-level running-time features from TIDES, windowed for ridership modeling.
 
-This is the *modeling-feature* counterpart to ``trip_runtime_tides.py``. Where
+This is the *modeling-feature* counterpart to ``runtime_by_trip.py``. Where
 that script diagnoses individual scheduled trips (per-trip stats, variation
 flags, day-of-week anomalies), this one rolls observed running time up to one
 value per route so it can join the route-level modeling table on the secured
 box (see ``scripts/modeling/prep_features_private.py``).
 
-It runs in two stages, mirroring the OTP pipeline (``otp_monthly_tides.py`` ->
+It runs in two stages, mirroring the OTP pipeline (``otp_monthly_panel.py`` ->
 ``otp_by_route.py``) but packaged in a single file because no monthly-runtime
 panel exists elsewhere to consume:
 
@@ -137,7 +137,7 @@ class Config:
 
 # =============================================================================
 # LOADING & RUNTIME DERIVATION
-#   (mechanics mirror trip_runtime_tides.py; kept self-contained on purpose)
+#   (mechanics mirror runtime_by_trip.py; kept self-contained on purpose)
 # =============================================================================
 
 
@@ -478,7 +478,7 @@ def write_run_log(output_dir: Path, summary_lines: List[str]) -> bool:
     Returns:
         ``True`` if the log was written successfully, ``False`` otherwise.
     """
-    log_path = output_dir / "route_runtime_tides_runlog.txt"
+    log_path = output_dir / "runtime_by_route_runlog.txt"
 
     source_file = resolve_source_file()
     if source_file is None:

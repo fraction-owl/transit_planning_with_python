@@ -1,10 +1,10 @@
 """Route-level on-time performance (OTP), windowed for ridership modeling.
 
-This is the windowed-rollup stage that turns ``otp_monthly_tides.py``'s monthly
+This is the windowed-rollup stage that turns ``otp_monthly_panel.py``'s monthly
 OTP panel into one OTP value per route, so it can join the route-level modeling
 table on the secured box (see ``scripts/modeling/prep_features_private.py``).
 
-It deliberately does NOT re-score OTP from raw TIDES events. ``otp_monthly_tides``
+It deliberately does NOT re-score OTP from raw TIDES events. ``otp_monthly_panel``
 already owns the OTP definition (the early/late window, timepoint-only filter,
 ``Scheduled``-only rule, and departure-with-arrival fallback) and writes
 ``otp_monthly_processed.csv`` -- a tidy panel with one row per
@@ -24,7 +24,7 @@ possible ways:
                     equally, so a single heavy month cannot dominate).
 
 Inputs:
-    - ``otp_monthly_processed.csv`` from ``otp_monthly_tides.py`` (or any CSV
+    - ``otp_monthly_processed.csv`` from ``otp_monthly_panel.py`` (or any CSV
       with the columns listed above).
 
 Outputs:
@@ -58,7 +58,7 @@ CONFIG_END_MARKER: str = "# === END CONFIG ==="
 # =============================================================================
 # === BEGIN CONFIG ===
 
-# Path to the monthly OTP panel produced by otp_monthly_tides.py.
+# Path to the monthly OTP panel produced by otp_monthly_panel.py.
 OTP_PROCESSED_PATH: str = r"Path\To\Your\otp_monthly_processed.csv"
 OUTPUT_DIR: str = r"Path\To\Your\Output_Folder"
 
@@ -148,7 +148,7 @@ def load_otp_panel(path: Path, level: str = LEVEL) -> pd.DataFrame:
     """
     if not path.exists():
         raise FileNotFoundError(
-            f"OTP panel not found: {path}. Run otp_monthly_tides.py first to produce "
+            f"OTP panel not found: {path}. Run otp_monthly_panel.py first to produce "
             "otp_monthly_processed.csv, or point --otp-processed at the panel."
         )
 
@@ -426,7 +426,7 @@ def run(cfg: Config) -> pd.DataFrame:
 def build_arg_parser() -> argparse.ArgumentParser:
     """Create the command-line argument parser."""
     p = argparse.ArgumentParser(
-        description="Windowed route-level OTP rollup from otp_monthly_tides' panel."
+        description="Windowed route-level OTP rollup from otp_monthly_panel's output."
     )
     p.add_argument(
         "--otp-processed",

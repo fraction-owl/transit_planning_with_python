@@ -1,18 +1,22 @@
-"""Flag stops with notably poor AVL data coverage and/or OTP across multiple routes.
+"""Stop-level OTP and AVL data coverage from TIDES, with cross-route flags.
 
-Route-level OTP and coverage rollups (see ``otp_monthly_tides.py``) average over
-every stop a route serves, so a single problem stop hides inside the route mean
-and a stop-specific defect is easy to misread as a route problem. This script
-inverts the view: it works stop by stop, from TIDES ``stop_visits`` (stop-level
-arrival/departure events) joined to ``trips_performed`` (trip-level attributes),
-and asks whether a stop looks bad on *several* of the routes serving it at once.
-A stop that underperforms its routes' own baselines on multiple independent
-routes is unlikely to be the routes' fault -- it points at the stop itself: a
-mis-placed AVL geofence, a stop moved in the field but not in the AVL
-configuration, a construction detour, or chronic congestion at that location.
-Whether the cause is operational or a data defect, the stop deserves a look, and
-the per-stop diagnostics here separate the two failure modes as far as the data
-allows.
+This script computes on-time performance and AVL data coverage per stop (and
+per stop/route) from TIDES ``stop_visits`` (stop-level arrival/departure
+events) joined to ``trips_performed`` (trip-level attributes). By default only
+timepoint visits are scored (``TIMEPOINTS_ONLY``), so "per stop" means per
+timepoint stop -- the same scoring rule as ``otp_monthly_panel.py``.
+
+The flagging layered on top exists because route-level rollups (see
+``otp_monthly_panel.py``) average over every stop a route serves, so a single
+problem stop hides inside the route mean and a stop-specific defect is easy to
+misread as a route problem. This script inverts the view: it asks whether a
+stop looks bad on *several* of the routes serving it at once. A stop that
+underperforms its routes' own baselines on multiple independent routes is
+unlikely to be the routes' fault -- it points at the stop itself: a mis-placed
+AVL geofence, a stop moved in the field but not in the AVL configuration, a
+construction detour, or chronic congestion at that location. Whether the cause
+is operational or a data defect, the stop deserves a look, and the per-stop
+diagnostics here separate the two failure modes as far as the data allows.
 
 Everything is derived from the TIDES tables alone -- no GTFS feed is required
 (see "Limitations" for what that costs).
@@ -46,13 +50,13 @@ of no longer being able to distinguish a stop problem from a route problem).
 
 Outputs
 -------
-  1) ``stop_flags.csv`` - one row per stop: flags, flag reasons, pooled
-     coverage/OTP, worst gaps versus route baselines, per-cause visit
+  1) ``otp_by_stop.csv`` - one row per stop: pooled coverage/OTP, flags and
+     flag reasons, worst gaps versus route baselines, per-cause visit
      diagnostics (skipped, missing-actual, missing-schedule), sorted with
      flagged stops first.
-  2) ``stop_route_detail.csv`` - the per-(stop, route) evidence behind each
-     flag: expected/observed trips, coverage and OTP with route baselines and
-     gaps, and the per-route verdicts.
+  2) ``otp_by_stop_route_detail.csv`` - the per-(stop, route) table behind
+     each flag: expected/observed trips, coverage and OTP with route baselines
+     and gaps, and the per-route verdicts.
   3) A run-log sidecar capturing the verbatim CONFIGURATION block.
 
 Reading the diagnostics
@@ -148,8 +152,8 @@ MIN_SCORED_VISITS: int = 20
 LOG_LEVEL: int = logging.INFO
 
 # Filenames.
-STOP_FLAGS_FILENAME: str = "stop_flags.csv"
-STOP_ROUTE_DETAIL_FILENAME: str = "stop_route_detail.csv"
+OTP_BY_STOP_FILENAME: str = "otp_by_stop.csv"
+OTP_BY_STOP_ROUTE_DETAIL_FILENAME: str = "otp_by_stop_route_detail.csv"
 
 # When True, a failed run-log write aborts the script so an output is never left
 # without a matching configuration record.
@@ -229,7 +233,7 @@ def filter_in_service(trips_performed: pd.DataFrame) -> pd.DataFrame:
 
     Canceled trips never served any stop and non-revenue trips carry no
     passengers, so neither belongs in the expected-service denominator or the
-    OTP pool. This is the same filter ``otp_monthly_tides.py`` applies before
+    OTP pool. This is the same filter ``otp_monthly_panel.py`` applies before
     its join, so the two scripts see the same trip pool.
 
     Args:
@@ -463,7 +467,7 @@ def build_expected_trips(
 
     Because ``trips_performed`` lists every scheduled in-service trip -- even
     ones whose AVL never reported -- this denominator counts whole-trip AVL
-    gaps against the stop, exactly like ``otp_monthly_tides.py`` does per route.
+    gaps against the stop, exactly like ``otp_monthly_panel.py`` does per route.
 
     Args:
         membership: Output of :func:`infer_pattern_stop_membership`.
@@ -788,9 +792,9 @@ def export_tables(summary: pd.DataFrame, detail: pd.DataFrame, out_dir: Path) ->
         Paths of the files written.
     """
     ensure_dir(out_dir)
-    summary_path = out_dir / STOP_FLAGS_FILENAME
+    summary_path = out_dir / OTP_BY_STOP_FILENAME
     summary.to_csv(summary_path, index=False)
-    detail_path = out_dir / STOP_ROUTE_DETAIL_FILENAME
+    detail_path = out_dir / OTP_BY_STOP_ROUTE_DETAIL_FILENAME
     detail.to_csv(detail_path, index=False)
     return [summary_path, detail_path]
 
@@ -842,7 +846,7 @@ def write_run_log(output_dir: Path, summary_lines: List[str]) -> bool:
     Returns:
         ``True`` if the log was written successfully, ``False`` otherwise.
     """
-    log_path = output_dir / "tides_stop_otp_flagger_runlog.txt"
+    log_path = output_dir / "otp_by_stop_runlog.txt"
 
     source_file = resolve_source_file()
     if source_file is None:
@@ -944,7 +948,7 @@ def run(cfg: Config) -> pd.DataFrame:
             worst["flag_reason"],
             worst["pct_trips_observed"],
             worst["pct_on_time"],
-            STOP_ROUTE_DETAIL_FILENAME,
+            OTP_BY_STOP_ROUTE_DETAIL_FILENAME,
         )
 
     paths = export_tables(summary, detail, cfg.output_dir)
