@@ -240,8 +240,13 @@ def _is_placeholder_path(p: Path) -> bool:
     return any(marker in s for marker in _PLACEHOLDER_MARKERS)
 
 
-def main() -> None:
-    """Run the ETL pipeline and produce both Excel and text outputs."""
+def main() -> int:
+    """Run the ETL pipeline and produce both Excel and text outputs.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -261,7 +266,7 @@ def main() -> None:
             "before running. Exiting without processing.",
             ", ".join(unset),
         )
-        return
+        return 2
 
     OUTPUT_FOLDER.mkdir(parents=True, exist_ok=True)
 
@@ -298,7 +303,8 @@ def main() -> None:
 
     logging.info("flag_stop_upgrades.py completed successfully.")
     logging.info("Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

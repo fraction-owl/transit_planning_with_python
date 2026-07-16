@@ -1303,8 +1303,13 @@ def _run_by_route(gtfs_folder: str, route_short_names: Sequence[str]) -> pd.Data
 # =============================================================================
 # MAIN
 # =============================================================================
-def main() -> None:
-    """Run the end-to-end pipeline according to OUTPUT_MODE."""
+def main() -> int:
+    """Run the end-to-end pipeline according to OUTPUT_MODE.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -1315,7 +1320,7 @@ def main() -> None:
             "GTFS_FOLDER is still set to a placeholder value. "
             "Please update it in the CONFIGURATION section before running."
         )
-        return
+        return 2
 
     arcpy.env.overwriteOutput = OVERWRITE_OUTPUTS
 
@@ -1368,7 +1373,8 @@ def main() -> None:
         _ = _run_by_route(GTFS_FOLDER, route_list)
 
     logging.info("Processing completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

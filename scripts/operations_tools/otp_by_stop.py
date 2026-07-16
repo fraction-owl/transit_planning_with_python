@@ -88,10 +88,11 @@ from __future__ import annotations
 
 import argparse
 import logging
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import List, Sequence
+from typing import List, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -979,10 +980,39 @@ def run(cfg: Config) -> pd.DataFrame:
 # =============================================================================
 
 
+def notebook_safe_argv(argv: Optional[Sequence[str]]) -> Optional[List[str]]:
+    """Return the argv to parse, shielding notebook kernels from stray flags.
+
+    When a script's ``main()`` runs with no explicit ``argv`` inside a
+    Jupyter/IPython kernel, ``sys.argv`` holds kernel plumbing (for example
+    ``-f /path/kernel.json``) rather than flags meant for the script, and
+    strict ``argparse.parse_args`` would reject it and abort.  This helper
+    detects the notebook case and substitutes an empty argument list so the
+    CONFIGURATION constants stay in charge, while shell runs keep strict
+    parsing (a typo in a flag fails loudly instead of being silently ignored).
+
+    Canonical implementation: ``utils/cli_helpers.py``.
+
+    Args:
+        argv: Explicit argument list passed to ``main()``, or ``None`` to
+            fall back to ``sys.argv``.
+
+    Returns:
+        ``list(argv)`` when *argv* was provided; ``[]`` when running inside a
+        notebook kernel; otherwise ``None`` so argparse reads ``sys.argv[1:]``.
+    """
+    if argv is not None:
+        return list(argv)
+    if "ipykernel" in sys.modules:
+        return []
+    return None
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     """Create the command-line argument parser."""
     p = argparse.ArgumentParser(
-        description="Flag stops with poor AVL coverage and/or OTP across multiple routes."
+        description="Flag stops with poor AVL coverage and/or OTP across multiple routes.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--stop-visits", default=STOP_VISITS_PATH, help="Path to stop_visits CSV.")
     p.add_argument(
@@ -992,22 +1022,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return p
 
 
-def main(argv: Sequence[str] | None = None) -> None:
-    """Entry point. Validates placeholder paths before doing any work."""
+def main(argv: Sequence[str] | None = None) -> int:
+    """Entry point. Validates placeholder paths before doing any work.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
     parser = build_arg_parser()
-    args, _unknown = parser.parse_known_args(argv)
+    args = parser.parse_args(notebook_safe_argv(argv))
 
     if args.stop_visits == STOP_VISITS_PATH or args.trips_performed == TRIPS_PERFORMED_PATH:
         logging.warning(
             "STOP_VISITS_PATH/TRIPS_PERFORMED_PATH are still placeholders. Update the "
             "CONFIGURATION section or pass --stop-visits/--trips-performed before running."
         )
-        return
+        return 2
 
     cfg = Config(
         stop_visits_path=Path(args.stop_visits).expanduser(),
@@ -1029,14 +1064,15 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     if not cfg.stop_visits_path.exists():
         logging.warning("stop_visits not found: %s", cfg.stop_visits_path)
-        return
+        return 1
     if not cfg.trips_performed_path.exists():
         logging.warning("trips_performed not found: %s", cfg.trips_performed_path)
-        return
+        return 1
 
     run(cfg)
     logging.info("Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

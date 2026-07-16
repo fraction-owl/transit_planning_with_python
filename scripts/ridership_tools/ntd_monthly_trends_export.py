@@ -47,7 +47,6 @@ from __future__ import annotations
 import calendar
 import logging
 import re
-import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Final
@@ -1158,8 +1157,13 @@ def write_run_log(output_dir: Path) -> bool:
 # =============================================================================
 
 
-def main() -> None:
-    """Run the end-to-end subset workflow."""
+def main() -> int:
+    """Run the end-to-end subset workflow.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -1173,7 +1177,7 @@ def main() -> None:
             "File paths are still set to their defaults. Update DATA_ROOT and "
             "OUTPUT_ROOT in the CONFIGURATION section before running."
         )
-        return
+        return 2
 
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 
@@ -1184,10 +1188,10 @@ def main() -> None:
         logging.error(
             "START_MONTH / END_MONTH must be blank or 'Mon-YYYY' (e.g. 'Jan-2024'): %s", exc
         )
-        sys.exit(1)
+        return 1
     if start_bound is not None and end_bound is not None and start_bound > end_bound:
         logging.error("START_MONTH (%s) is after END_MONTH (%s).", START_MONTH, END_MONTH)
-        sys.exit(1)
+        return 1
 
     logging.info("Discovering workbooks under %s", DATA_ROOT)
     workbooks = discover_workbooks(DATA_ROOT)
@@ -1205,7 +1209,7 @@ def main() -> None:
     end_dt = end_bound if end_bound is not None else max(available_months, default=None)
     if start_dt is None or end_dt is None:
         logging.warning("No workbooks available to define a date range; nothing to export.")
-        return
+        return 1
 
     expected_months = month_range(start_dt, end_dt)
 
@@ -1267,11 +1271,12 @@ def main() -> None:
             "Run log could not be written. Set REQUIRE_RUN_LOG = False to "
             "suppress this error when a sidecar file is genuinely impossible."
         )
-        sys.exit(1)
+        return 1
 
     logging.info("Done. Outputs written to: %s", OUTPUT_ROOT)
     logging.info("Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -19,8 +19,20 @@ Participation is welcome from anyone, whether you’re new to Python, an experie
 ## 🧱 Code Structure
 
 - Scripts **must be modular**, with a clearly defined `main()` function.
+  - `main()` returns an `int` process exit code, and the module guard is
+    `if __name__ == "__main__": raise SystemExit(main())`. Convention: `0` = success, `1` = runtime
+    failure, `2` = configuration error (e.g. placeholder paths still unset). Returning the code —
+    rather than calling `sys.exit()` inside `main()` — keeps `main()` traceback-free when called
+    from a notebook cell, while shell callers, cron jobs, and Makefiles still see failures.
 - Include a clear **configuration section at the top** of each script.
-  - Prefer inline variable configuration over `argparse`.
+  - Inline variables are the **primary** interface: notebook users edit constants and never see a flag.
+  - New scripts should *additionally* mirror those constants with `argparse` flags whose defaults
+    **are** the constants, via a `build_arg_parser()` that sets
+    `formatter_class=argparse.ArgumentDefaultsHelpFormatter` (so `--help` shows every default).
+    Parse strictly with `parser.parse_args(notebook_safe_argv(argv))`, copying `notebook_safe_argv`
+    from `utils/cli_helpers.py` — it keeps a notebook kernel's injected argv from aborting the
+    script while letting shell typos fail loudly. See `scripts/operations_tools/otp_by_route.py`
+    for the reference shape.
 - Use intuitive success messages (`logging`) at the end of script execution.
 - Scripts that write an output file **must** also write a `_runlog.txt` sidecar next to that file. The sidecar captures the CONFIGURATION block verbatim (bounded by `# === BEGIN CONFIG ===` / `# === END CONFIG ===` markers) plus a timestamp and source-script path. This creates a drift-proof record that lets anyone reconstruct exactly what settings produced a given output. See `scripts/ridership_tools/data_request_by_stop_processor.py` for the reference implementation (`extract_config_block` / `write_run_log`).
 - Do **not import** functions from the shared `utils/` directory at runtime.

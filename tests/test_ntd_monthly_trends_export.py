@@ -415,7 +415,7 @@ def test_main_integration(fixture_df: pd.DataFrame, tmp_path: Path) -> None:
         patch.object(mod, "OUTPUT_ROOT", tmp_path),
         patch.object(mod, "read_month_workbook", side_effect=mock_read_month_workbook),
     ):
-        mod.main()
+        assert mod.main() == 0
 
     # Only configured routes get output directories
     assert (tmp_path / "route_101").exists()

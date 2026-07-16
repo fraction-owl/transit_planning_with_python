@@ -76,6 +76,7 @@ from typing import (
     List,
     Literal,
     Mapping,
+    Optional,
     Sequence,
 )
 
@@ -1658,12 +1659,16 @@ def run(
     intermediate_combined_csv: str | None = None,
     intermediate_merged_shp: str | None = None,
     supplemental_jobs_csv: str | Path | None = None,
-) -> None:
+) -> int:
     """Run the full three-stage pipeline.
 
     Unset args fall back to the CONFIGURATION block at the top of this file, so
     ``m.INPUT_CSV_DIR = ...; m.run()`` works after a plain import. Pass an empty
     string for an intermediate path to skip writing that artifact.
+
+    Returns:
+        Process exit code: 0 on success, 2 if required CONFIGURATION values
+        are still placeholders. Pipeline failures raise ``SystemExit(1)``.
     """
     input_csv_dir = INPUT_CSV_DIR if input_csv_dir is None else input_csv_dir
     input_shp_dir = INPUT_SHP_DIR if input_shp_dir is None else input_shp_dir
@@ -1702,7 +1707,7 @@ def run(
         intermediate_merged_shp,
     ):
         logging.info("No processing performed. Update the configuration paths and re-run.")
-        return
+        return 2
 
     try:
         # -------- Stage 1: CSV merge --------
@@ -1764,6 +1769,35 @@ def run(
     except Exception:  # noqa: BLE001
         logging.exception("Pipeline failed")
         sys.exit(1)
+    return 0
+
+
+def notebook_safe_argv(argv: Optional[Sequence[str]]) -> Optional[List[str]]:
+    """Return the argv to parse, shielding notebook kernels from stray flags.
+
+    When a script's ``main()`` runs with no explicit ``argv`` inside a
+    Jupyter/IPython kernel, ``sys.argv`` holds kernel plumbing (for example
+    ``-f /path/kernel.json``) rather than flags meant for the script, and
+    strict ``argparse.parse_args`` would reject it and abort.  This helper
+    detects the notebook case and substitutes an empty argument list so the
+    CONFIGURATION constants stay in charge, while shell runs keep strict
+    parsing (a typo in a flag fails loudly instead of being silently ignored).
+
+    Canonical implementation: ``utils/cli_helpers.py``.
+
+    Args:
+        argv: Explicit argument list passed to ``main()``, or ``None`` to
+            fall back to ``sys.argv``.
+
+    Returns:
+        ``list(argv)`` when *argv* was provided; ``[]`` when running inside a
+        notebook kernel; otherwise ``None`` so argparse reads ``sys.argv[1:]``.
+    """
+    if argv is not None:
+        return list(argv)
+    if "ipykernel" in sys.modules:
+        return []
+    return None
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -1774,7 +1808,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "block-level layer. Defaults come from the CONFIGURATION block at the "
             "top of this file; the CSV topic signatures and join keys stay in the "
             "config block."
-        )
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
         "--input-csv-dir", default=INPUT_CSV_DIR, help="Root folder of Census CSV downloads."
@@ -1792,7 +1827,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         nargs="*",
         default=FIPS_TO_FILTER,
         metavar="FIPS",
-        help="5-digit county FIPS codes to keep (default: config; empty = all).",
+        help="5-digit county FIPS codes to keep (empty = all).",
     )
     parser.add_argument(
         "--output",
@@ -1825,15 +1860,24 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv: Sequence[str] | None = None) -> None:
-    """Command-line entry point. Defaults fall back to the CONFIGURATION block."""
-    args = parse_args(argv)
+def main(argv: Sequence[str] | None = None) -> int:
+    """Command-line entry point. Defaults fall back to the CONFIGURATION block.
+
+    Parsing is strict (an unknown flag aborts); inside a Jupyter/IPython kernel
+    ``notebook_safe_argv`` swaps the kernel's injected argv for an empty list
+    so the CONFIGURATION block stays in charge.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
+    args = parse_args(notebook_safe_argv(argv))
     logging.basicConfig(
         level=getattr(logging, str(args.log_level).upper(), LOG_LEVEL),
         format="%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-    run(
+    return run(
         input_csv_dir=args.input_csv_dir,
         input_shp_dir=args.input_shp_dir,
         final_joined_features=args.output,
@@ -1845,20 +1889,5 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
 
 
-def _in_ipython() -> bool:
-    """Return True when running inside an IPython/Jupyter kernel."""
-    return "ipykernel" in sys.modules or "IPython" in sys.modules
-
-
 if __name__ == "__main__":
-    # In a notebook (pasted cell or %run), use the CONFIGURATION block instead
-    # of argparse, which would otherwise try to parse the kernel's own argv.
-    if _in_ipython():
-        logging.basicConfig(
-            level=LOG_LEVEL,
-            format="%(asctime)s | %(levelname)s | %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        )
-        run()
-    else:
-        main()
+    raise SystemExit(main())

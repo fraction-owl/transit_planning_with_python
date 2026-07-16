@@ -13,7 +13,8 @@ Checks performed (per-file):
     4.  raw_string_paths  – Raw-string literals (r"…") used for path/dir config variables.
     5.  dc_crs            – Washington DC CRS referenced when a CRS config variable is defined.
     6.  imperial_units    – Imperial units (feet/miles) referenced when metric distances appear.
-    7.  notebook_guard    – `if __name__ == "__main__": main()` guard present.
+    7.  notebook_guard    – `if __name__ == "__main__": raise SystemExit(main())`
+        guard (or legacy bare `main()`) present.
     8.  main_function     – Top-level `def main()` function present.
     9.  logging_present   – `import logging` and at least one `logging.` call present.
     10. success_message   – A success/completion message via `logging` present.
@@ -396,9 +397,15 @@ def check_imperial_units(src: str) -> list[Violation]:
 
 
 def check_notebook_guard(src: str) -> list[Violation]:
-    """Flag the absence of an `if __name__ == '__main__': main()` guard."""
+    """Flag the absence of an `if __name__ == '__main__':` guard calling main().
+
+    Accepted guard bodies: `raise SystemExit(main())` (preferred — propagates
+    main()'s integer return value as the process exit code), `sys.exit(main())`,
+    and the legacy bare `main()`.
+    """
     if not re.search(
-        r'if\s+__name__\s*==\s*["\']__main__["\']\s*:\s*\n[ \t]+main\s*\(',
+        r'if\s+__name__\s*==\s*["\']__main__["\']\s*:\s*\n'
+        r"[ \t]+(?:raise\s+SystemExit\s*\(\s*main|sys\.exit\s*\(\s*main|main)\s*\(",
         src,
     ):
         return [
@@ -406,8 +413,9 @@ def check_notebook_guard(src: str) -> list[Violation]:
                 check="notebook_guard",
                 line=None,
                 message=(
-                    'Missing `if __name__ == "__main__": main()` guard — '
-                    "required so the script runs from both a Jupyter notebook and the CLI"
+                    'Missing `if __name__ == "__main__": raise SystemExit(main())` guard — '
+                    "required so the script runs from both a Jupyter notebook and the CLI, "
+                    "and so shell callers see a non-zero exit code on failure"
                 ),
             )
         ]

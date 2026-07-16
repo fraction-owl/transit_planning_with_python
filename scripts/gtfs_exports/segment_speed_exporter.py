@@ -567,8 +567,13 @@ def export_excel(
 # =============================================================================
 
 
-def main() -> None:
-    """CLI entry-point – orchestrates GTFS load, processing, and Excel export."""
+def main() -> int:
+    """CLI entry-point – orchestrates GTFS load, processing, and Excel export.
+
+    Returns:
+        Process exit code: 0 on success, 2 if required CONFIGURATION values
+        are still placeholders.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -581,7 +586,7 @@ def main() -> None:
             "GTFS_FOLDER and/or OUTPUT_FOLDER are still set to their default placeholder values. "
             "Please update them in the CONFIGURATION section before running."
         )
-        return
+        return 2
 
     logging.info("GTFS folder:   %s", GTFS_FOLDER)
     logging.info("Output folder: %s", OUTPUT_FOLDER)
@@ -591,13 +596,14 @@ def main() -> None:
 
     if index_df.empty:
         logging.warning("No trips after filters – nothing to export.")
-        return
+        return 0
 
     bands = band_rows(index_df)
     export_excel(bands, pat_lut, speed_lut, header_lut, gtfs["routes"])
     logging.info("Finished – %d band rows written.", len(bands))
     logging.info("Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":  # pragma: no cover
-    main()
+    raise SystemExit(main())

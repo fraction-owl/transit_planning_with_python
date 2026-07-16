@@ -38,7 +38,7 @@ import argparse
 import logging
 import sys
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import List, Optional, Sequence
 
 import geopandas as gpd
 import pandas as pd
@@ -223,13 +223,42 @@ def run(
     logger.info("Script completed successfully.")
 
 
+def notebook_safe_argv(argv: Optional[Sequence[str]]) -> Optional[List[str]]:
+    """Return the argv to parse, shielding notebook kernels from stray flags.
+
+    When a script's ``main()`` runs with no explicit ``argv`` inside a
+    Jupyter/IPython kernel, ``sys.argv`` holds kernel plumbing (for example
+    ``-f /path/kernel.json``) rather than flags meant for the script, and
+    strict ``argparse.parse_args`` would reject it and abort.  This helper
+    detects the notebook case and substitutes an empty argument list so the
+    CONFIGURATION constants stay in charge, while shell runs keep strict
+    parsing (a typo in a flag fails loudly instead of being silently ignored).
+
+    Canonical implementation: ``utils/cli_helpers.py``.
+
+    Args:
+        argv: Explicit argument list passed to ``main()``, or ``None`` to
+            fall back to ``sys.argv``.
+
+    Returns:
+        ``list(argv)`` when *argv* was provided; ``[]`` when running inside a
+        notebook kernel; otherwise ``None`` so argparse reads ``sys.argv[1:]``.
+    """
+    if argv is not None:
+        return list(argv)
+    if "ipykernel" in sys.modules:
+        return []
+    return None
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse command-line arguments, defaulting to the CONFIG block values."""
     parser = argparse.ArgumentParser(
         description=(
             "Join Capital Bikeshare ridership totals onto station geometries. "
             "Defaults come from the CONFIG block at the top of this file."
-        )
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
         "--ridership-input", default=RIDERSHIP_INPUT, help="Per-station ridership CSV."
@@ -248,30 +277,31 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--station-id-field", default=STATION_ID_FIELD, help="Join column on both sides."
     )
-    return parser.parse_args(argv)
+    return parser.parse_args(notebook_safe_argv(argv))
 
 
-def main(argv: Sequence[str] | None = None) -> None:
-    """Command-line entry point. Defaults fall back to the CONFIG block."""
+def main(argv: Sequence[str] | None = None) -> int:
+    """Command-line entry point. Defaults fall back to the CONFIG block.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure.
+    """
     args = parse_args(argv)
-    run(
-        ridership_input=args.ridership_input,
-        geojson_input=args.geojson_input,
-        shapefile_input=args.shapefile_input,
-        output_dir=args.output_dir,
-        station_id_field=args.station_id_field,
-    )
-
-
-def _in_ipython() -> bool:
-    """Return True when running inside an IPython/Jupyter kernel."""
-    return "ipykernel" in sys.modules or "IPython" in sys.modules
+    try:
+        run(
+            ridership_input=args.ridership_input,
+            geojson_input=args.geojson_input,
+            shapefile_input=args.shapefile_input,
+            output_dir=args.output_dir,
+            station_id_field=args.station_id_field,
+        )
+    except (OSError, KeyError, ValueError) as exc:
+        logger.error("%s", exc)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    # In a notebook (pasted cell or %run), use the CONFIG block instead of
-    # argparse, which would otherwise try to parse the kernel's own argv.
-    if _in_ipython():
-        run()
-    else:
-        main()
+    # Strict parsing; in a notebook, notebook_safe_argv() keeps the kernel's
+    # injected argv away from argparse so the CONFIG block stays in charge.
+    raise SystemExit(main())

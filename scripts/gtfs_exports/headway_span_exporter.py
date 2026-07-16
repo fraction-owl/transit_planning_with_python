@@ -47,7 +47,7 @@ import argparse
 import logging
 import sys
 from pathlib import Path
-from typing import Final, Optional, Sequence
+from typing import Final, List, Optional, Sequence
 
 import pandas as pd
 
@@ -291,13 +291,42 @@ def run(
     return result
 
 
+def notebook_safe_argv(argv: Optional[Sequence[str]]) -> Optional[List[str]]:
+    """Return the argv to parse, shielding notebook kernels from stray flags.
+
+    When a script's ``main()`` runs with no explicit ``argv`` inside a
+    Jupyter/IPython kernel, ``sys.argv`` holds kernel plumbing (for example
+    ``-f /path/kernel.json``) rather than flags meant for the script, and
+    strict ``argparse.parse_args`` would reject it and abort.  This helper
+    detects the notebook case and substitutes an empty argument list so the
+    CONFIGURATION constants stay in charge, while shell runs keep strict
+    parsing (a typo in a flag fails loudly instead of being silently ignored).
+
+    Canonical implementation: ``utils/cli_helpers.py``.
+
+    Args:
+        argv: Explicit argument list passed to ``main()``, or ``None`` to
+            fall back to ``sys.argv``.
+
+    Returns:
+        ``list(argv)`` when *argv* was provided; ``[]`` when running inside a
+        notebook kernel; otherwise ``None`` so argparse reads ``sys.argv[1:]``.
+    """
+    if argv is not None:
+        return list(argv)
+    if "ipykernel" in sys.modules:
+        return []
+    return None
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse command-line arguments, defaulting to the config block values."""
     parser = argparse.ArgumentParser(
         description=(
             "Compute route-level headway and span of service from a GTFS feed. "
             "Defaults come from the configuration block at the top of this file."
-        )
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
         "--gtfs-folder", type=Path, default=GTFS_FOLDER, help="Path to the GTFS folder."
@@ -316,25 +345,30 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         nargs="*",
         default=FILTER_IN_ROUTE_SHORT_NAMES,
         metavar="ROUTE_SHORT_NAME",
-        help="Only keep these route_short_name values (default: all).",
+        help="Only keep these route_short_name values (empty = keep all).",
     )
     parser.add_argument(
         "--filter-out",
         nargs="*",
         default=FILTER_OUT_ROUTE_SHORT_NAMES,
         metavar="ROUTE_SHORT_NAME",
-        help="Drop these route_short_name values (default: none).",
+        help="Drop these route_short_name values (empty = drop none).",
     )
     parser.add_argument(
         "--log-level",
         default=logging.getLevelName(LOG_LEVEL),
         help="DEBUG / INFO / WARNING / ERROR.",
     )
-    return parser.parse_args(argv)
+    return parser.parse_args(notebook_safe_argv(argv))
 
 
-def main(argv: Sequence[str] | None = None) -> None:
-    """Command-line entry point. Defaults fall back to the config block."""
+def main(argv: Sequence[str] | None = None) -> int:
+    """Command-line entry point. Defaults fall back to the config block.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     args = parse_args(argv)
     logging.basicConfig(
         level=getattr(logging, str(args.log_level).upper(), LOG_LEVEL),
@@ -350,25 +384,22 @@ def main(argv: Sequence[str] | None = None) -> None:
             "GTFS_FOLDER and/or OUTPUT_DIR are still placeholders. Update the configuration "
             "block or pass --gtfs-folder/--output before running."
         )
-        return
-    run(
-        gtfs_folder=args.gtfs_folder,
-        output_path=args.output,
-        service_day=args.service_day,
-        filter_in_route_short_names=args.filter_in,
-        filter_out_route_short_names=args.filter_out,
-    )
-
-
-def _in_ipython() -> bool:
-    """Return True when running inside an IPython/Jupyter kernel."""
-    return "ipykernel" in sys.modules or "IPython" in sys.modules
+        return 2
+    try:
+        run(
+            gtfs_folder=args.gtfs_folder,
+            output_path=args.output,
+            service_day=args.service_day,
+            filter_in_route_short_names=args.filter_in,
+            filter_out_route_short_names=args.filter_out,
+        )
+    except (OSError, ValueError) as exc:
+        logging.error("%s", exc)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    # In a notebook (pasted cell or %run), use the config block instead of
-    # argparse, which would otherwise try to parse the kernel's own argv.
-    if _in_ipython():
-        run()
-    else:
-        main()
+    # Strict parsing; in a notebook, notebook_safe_argv() keeps the kernel's
+    # injected argv away from argparse so the config block stays in charge.
+    raise SystemExit(main())

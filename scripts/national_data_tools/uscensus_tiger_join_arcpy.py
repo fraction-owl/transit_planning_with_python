@@ -1339,8 +1339,13 @@ def run_pipeline() -> None:
         sys.exit(1)
 
 
-def main() -> None:
-    """Script entry point."""
+def main() -> int:
+    """Script entry point.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -1351,10 +1356,11 @@ def main() -> None:
             "INPUT_CSV_DIR and/or INPUT_SHP_DIR are still set to placeholder values. "
             "Please update them in the CONFIGURATION section before running."
         )
-        return
+        return 2
     run_pipeline()
     logging.info("Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

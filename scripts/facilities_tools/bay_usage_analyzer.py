@@ -538,8 +538,13 @@ def run_step2_conflict_detection() -> None:
 # ==================================================================================================
 
 
-def main() -> None:
-    """Entry point when executing this module as a script."""
+def main() -> int:
+    """Entry point when executing this module as a script.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -553,10 +558,11 @@ def main() -> None:
             "BLOCK_OUTPUT_FOLDER and/or CLUSTER_CONFLICT_OUTPUT_FOLDER are still set to "
             "placeholder values. Please update them in the CONFIGURATION section before running."
         )
-        return
+        return 2
     run_step2_conflict_detection()
     logging.info("Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

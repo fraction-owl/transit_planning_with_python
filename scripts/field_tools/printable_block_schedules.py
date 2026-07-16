@@ -502,7 +502,7 @@ def load_gtfs_data(
 # =============================================================================
 
 
-def main() -> None:
+def main() -> int:
     """Command-line entry point.
 
     Orchestrates:
@@ -515,6 +515,10 @@ def main() -> None:
 
     The function traps anticipated exceptions and logs them with useful
     context before exiting with a non-zero status.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
     """
     logging.basicConfig(
         level=LOG_LEVEL,
@@ -537,7 +541,7 @@ def main() -> None:
         using_defaults = True
     if using_defaults:
         logging.info("No processing performed. Update the placeholder paths above and re-run.")
-        return
+        return 2
 
     logging.info("========================================================")
     logging.info("GTFS Block Schedule Printable Generator")
@@ -563,24 +567,27 @@ def main() -> None:
         trips_df, stop_times_df = filter_data(trips_df, stop_times_df, routes_df)
         if trips_df.empty or stop_times_df.empty:
             logging.warning("No data remains after filtering – no files generated.")
-            return
+            return 1
 
         prepared = prepare_stop_times(trips_df, stop_times_df, stops_df)
         if prepared.empty:
             logging.warning("No data remains after preparation – no files generated.")
-            return
+            return 1
 
         export_blocks(prepared)
         logging.info("Script finished successfully.")
         logging.info("Script completed successfully.")
+        return 0
 
     except (OSError, ValueError) as err:
         logging.error("%s", err)
+        return 1
     except Exception as err:  # catch-all for unforeseen issues
         logging.exception("Unexpected error: %s", err)
+        return 1
     finally:
         logging.info("Exiting script.")
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

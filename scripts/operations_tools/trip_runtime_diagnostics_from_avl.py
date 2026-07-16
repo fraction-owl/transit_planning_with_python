@@ -1046,7 +1046,7 @@ def suggest_time_bands(
 # =============================================================================
 
 
-def main() -> None:  # pragma: no cover
+def main() -> int:  # pragma: no cover
     """Run the end-to-end analysis for every route.
 
     * If ``SPLIT_BY_DIRECTION`` is **True** (default), rows are subdivided
@@ -1054,6 +1054,10 @@ def main() -> None:  # pragma: no cover
       ``<OUTPUT_ROOT>/<route>/<direction-slug>/``.
     * If **False**, all rows for the route are written directly to
       ``<OUTPUT_ROOT>/<route>/``.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
     """
     logging.basicConfig(
         level=LOG_LEVEL,
@@ -1072,7 +1076,7 @@ def main() -> None:  # pragma: no cover
             "INPUT_ROOT_DIR and/or OUTPUT_ROOT_DIR are still set to placeholder values. "
             "Please update them in the CONFIGURATION section before running."
         )
-        return
+        return 2
 
     if not INPUT_ROOT_DIR.exists():
         logging.warning(
@@ -1081,7 +1085,7 @@ def main() -> None:  # pragma: no cover
             INPUT_ROOT_DIR,
         )
         logging.info("Completed (no data processed — update INPUT_ROOT_DIR to proceed).")
-        return
+        return 1
 
     logging.info("→ Crawling %s for CSVs …", INPUT_ROOT_DIR)
     route_files = _discover_route_csvs(INPUT_ROOT_DIR, whitelist)
@@ -1093,7 +1097,7 @@ def main() -> None:  # pragma: no cover
             INPUT_ROOT_DIR,
         )
         logging.info("Completed (no data processed — no CSV files found).")
-        return
+        return 1
 
     # ------------------------------------------------------------------ #
     # 1.  Process each route                                             #
@@ -1207,7 +1211,8 @@ def main() -> None:  # pragma: no cover
 
     logging.info("✓✓ All routes processed.")
     logging.info("Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

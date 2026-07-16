@@ -59,7 +59,7 @@ import logging
 import re
 import sys
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
@@ -116,12 +116,41 @@ LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
 # =============================================================================
 
 
+def notebook_safe_argv(argv: Optional[Sequence[str]]) -> Optional[List[str]]:
+    """Return the argv to parse, shielding notebook kernels from stray flags.
+
+    When a script's ``main()`` runs with no explicit ``argv`` inside a
+    Jupyter/IPython kernel, ``sys.argv`` holds kernel plumbing (for example
+    ``-f /path/kernel.json``) rather than flags meant for the script, and
+    strict ``argparse.parse_args`` would reject it and abort.  This helper
+    detects the notebook case and substitutes an empty argument list so the
+    CONFIGURATION constants stay in charge, while shell runs keep strict
+    parsing (a typo in a flag fails loudly instead of being silently ignored).
+
+    Canonical implementation: ``utils/cli_helpers.py``.
+
+    Args:
+        argv: Explicit argument list passed to ``main()``, or ``None`` to
+            fall back to ``sys.argv``.
+
+    Returns:
+        ``list(argv)`` when *argv* was provided; ``[]`` when running inside a
+        notebook kernel; otherwise ``None`` so argparse reads ``sys.argv[1:]``.
+    """
+    if argv is not None:
+        return list(argv)
+    if "ipykernel" in sys.modules:
+        return []
+    return None
+
+
 def build_argparser() -> argparse.ArgumentParser:
     """Create and configure the CLI argument parser."""
     p = argparse.ArgumentParser(
         description=(
             "Recalculate OTP percentages, apply optional filters, and output pivot+summary tables."
-        )
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("-i", "--input", default=CSV_PATH, help="Path to the input CSV.")
     p.add_argument(
@@ -888,15 +917,20 @@ def build_variation_index(df_monthly: pd.DataFrame) -> pd.DataFrame:
 # =============================================================================
 
 
-def main() -> None:
-    """Entry-point guarded by ``if __name__ == "__main__"``."""
+def main(argv: Sequence[str] | None = None) -> int:
+    """Entry-point guarded by ``if __name__ == "__main__"``.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
     parser = build_argparser()
-    args, _unknown = parser.parse_known_args()
+    args = parser.parse_args(notebook_safe_argv(argv))
 
     if (
         args.input == r"Path\To\Your\OTP by Timepoint Aggregated.csv"
@@ -906,7 +940,7 @@ def main() -> None:
             "CSV_PATH and/or OUTPUT_DIR are still set to placeholder values. "
             "Please update them in the CONFIGURATION section before running."
         )
-        return
+        return 2
 
     input_path = Path(args.input)
     if not input_path.exists():
@@ -916,7 +950,7 @@ def main() -> None:
             input_path,
         )
         logging.info("Completed (no data processed — update CSV_PATH to proceed).")
-        return
+        return 1
 
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -942,7 +976,8 @@ def main() -> None:
         ]
         missing = [c for c in required if c not in df_raw.columns]
         if missing:
-            sys.exit(f"ERROR: missing required columns: {missing}")
+            logging.error("Missing required columns: %s", missing)
+            return 1
 
     # Normalize / enrich --------------------------------------------------------
     df_raw["Short Route"] = df_raw["Route"].astype(str).apply(make_short_route)
@@ -965,12 +1000,14 @@ def main() -> None:
     df_monthly = filter_rdt(df_monthly, parse_rdt_arg(args.rdt))
 
     if df_monthly.empty:
-        sys.exit("ERROR: No rows remain after filtering; nothing to write.")
+        logging.error("No rows remain after filtering; nothing to write.")
+        return 1
 
     # Optional top-variation filter (monthly) ----------------------------------
     df_monthly = filter_top_variations(df_monthly, args.top_variations)
     if df_monthly.empty:
-        sys.exit("ERROR: No rows remain after top-variation filtering; nothing to write.")
+        logging.error("No rows remain after top-variation filtering; nothing to write.")
+        return 1
 
     # Long table output (monthly) ----------------------------------------------
     out_path = construct_output_path(input_path, outdir, args.output)
@@ -1032,7 +1069,8 @@ def main() -> None:
         )
 
     logging.info("Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

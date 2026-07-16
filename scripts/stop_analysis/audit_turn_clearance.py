@@ -561,8 +561,13 @@ def _export_flagged_pngs(
 # =============================================================================
 
 
-def main() -> None:  # noqa: D401
-    """Run the GTFS left‑turn clearance QA pipeline."""
+def main() -> int:  # noqa: D401
+    """Run the GTFS left‑turn clearance QA pipeline.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -573,7 +578,7 @@ def main() -> None:  # noqa: D401
             "GTFS_PATH and/or OUTPUT_FOLDER are still set to placeholder values. "
             "Please update them in the CONFIGURATION section before running."
         )
-        return
+        return 2
     # -------------------------------------------------------------
     # STEP 0 — Read & validate GTFS
     # -------------------------------------------------------------
@@ -655,11 +660,12 @@ def main() -> None:  # noqa: D401
     # -------------------------------------------------------------
     logging.info("Done. Outputs in: %s", out_dir)
     logging.info("Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
     try:
-        main()
+        raise SystemExit(main())
     except Exception as exc:  # noqa: BLE001
         logging.error("\nUNEXPECTED ERROR: %s", exc)
         sys.exit(1)

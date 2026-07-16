@@ -35,7 +35,6 @@ from __future__ import annotations
 import logging
 import math
 import re
-import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -876,7 +875,7 @@ def write_run_log(
 # =============================================================================
 
 
-def main() -> None:
+def main() -> int:
     """Run the end-to-end NTD performance workflow.
 
     Export policy
@@ -885,6 +884,10 @@ def main() -> None:
       → **CSV only** – lightweight and ready for BI/plotting ingestion.
     * All other deliverables (route-level, service-type, monthly workbooks, etc.)
       → **XLSX only** – analyst-friendly, no redundant CSV versions.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
     """
     logging.basicConfig(
         level=LOG_LEVEL,
@@ -899,7 +902,7 @@ def main() -> None:
             "File paths are still set to their defaults. Update DATA_ROOT and "
             "OUTPUT_DIR in the CONFIGURATION section before running."
         )
-        return
+        return 2
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -1025,10 +1028,11 @@ def main() -> None:
             "Run log could not be written. Set REQUIRE_RUN_LOG = False to "
             "suppress this error when a sidecar file is genuinely impossible."
         )
-        sys.exit(1)
+        return 1
 
     logging.info("All processing complete. Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

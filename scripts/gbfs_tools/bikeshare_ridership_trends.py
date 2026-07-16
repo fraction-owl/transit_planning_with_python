@@ -62,6 +62,7 @@ import sys
 import zipfile
 from collections import Counter
 from pathlib import Path
+from typing import List, Optional, Sequence
 
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
@@ -601,11 +602,40 @@ def run() -> dict[str, object]:
     )
 
 
+def notebook_safe_argv(argv: Optional[Sequence[str]]) -> Optional[List[str]]:
+    """Return the argv to parse, shielding notebook kernels from stray flags.
+
+    When a script's ``main()`` runs with no explicit ``argv`` inside a
+    Jupyter/IPython kernel, ``sys.argv`` holds kernel plumbing (for example
+    ``-f /path/kernel.json``) rather than flags meant for the script, and
+    strict ``argparse.parse_args`` would reject it and abort.  This helper
+    detects the notebook case and substitutes an empty argument list so the
+    CONFIGURATION constants stay in charge, while shell runs keep strict
+    parsing (a typo in a flag fails loudly instead of being silently ignored).
+
+    Canonical implementation: ``utils/cli_helpers.py``.
+
+    Args:
+        argv: Explicit argument list passed to ``main()``, or ``None`` to
+            fall back to ``sys.argv``.
+
+    Returns:
+        ``list(argv)`` when *argv* was provided; ``[]`` when running inside a
+        notebook kernel; otherwise ``None`` so argparse reads ``sys.argv[1:]``.
+    """
+    if argv is not None:
+        return list(argv)
+    if "ipykernel" in sys.modules:
+        return []
+    return None
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse command-line arguments, defaulting to the CONFIG block values."""
     parser = argparse.ArgumentParser(
         description="Summarize Capital Bikeshare extracts into ridership-over-time "
         "tables and charts. Defaults come from the CONFIG block.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
         "--input", default=INPUT, help="Directory or .zip of monthly trip extracts."
@@ -624,11 +654,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=logging.getLevelName(LOG_LEVEL),
         help="DEBUG / INFO / WARNING / ERROR.",
     )
-    return parser.parse_args(argv)
+    return parser.parse_args(notebook_safe_argv(argv))
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Command-line entry point. Returns a process exit code."""
+    """Command-line entry point.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure.
+    """
     args = parse_args(argv)
     logging.basicConfig(
         level=getattr(logging, str(args.log_level).upper(), logging.INFO),
@@ -642,20 +676,12 @@ def main(argv: list[str] | None = None) -> int:
         )
     except (ValueError, FileNotFoundError) as exc:
         logger.error("%s", exc)
-        return 2
+        return 1
     logger.info("Script completed successfully.")
     return 0
 
 
-def _in_ipython() -> bool:
-    """Return True when running inside an IPython/Jupyter kernel."""
-    return "ipykernel" in sys.modules or "IPython" in sys.modules
-
-
 if __name__ == "__main__":
-    # In a notebook (pasted cell or %run), use the CONFIG block instead of
-    # argparse, which would otherwise try to parse the kernel's own argv.
-    if _in_ipython():
-        run()
-    else:
-        raise SystemExit(main())
+    # Strict parsing; in a notebook, notebook_safe_argv() keeps the kernel's
+    # injected argv away from argparse so the CONFIG block stays in charge.
+    raise SystemExit(main())

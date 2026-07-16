@@ -485,8 +485,13 @@ def build_district_route_list(matrix: pd.DataFrame) -> pd.DataFrame:
 # =============================================================================
 
 
-def main() -> None:
-    """Main execution function to run the GTFS-district spatial analysis workflow."""
+def main() -> int:
+    """Main execution function to run the GTFS-district spatial analysis workflow.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     if (
         GTFS_DIR == r"Path\To\Your\GTFS_data"
         or DISTRICTS_FC == r"Path\To\Your\Districts.shp"
@@ -496,7 +501,7 @@ def main() -> None:
             "GTFS_DIR, DISTRICTS_FC, and/or OUTPUT_DIR are still set to placeholder values. "
             "Please update them in the CONFIGURATION section before running."
         )
-        return
+        return 2
     configure_logging(LOG_DIR)
     arcpy.env.overwriteOutput = True
 
@@ -534,7 +539,8 @@ def main() -> None:
         district_df.to_excel(writer, sheet_name="districts_with_routes", index=False)
     logging.info("Done. Excel written to: %s", OUTPUT_EXCEL)
     logging.info("Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

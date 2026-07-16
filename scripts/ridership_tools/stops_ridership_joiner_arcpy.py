@@ -1186,11 +1186,15 @@ def write_run_log(output_folder: str) -> bool:
 # =============================================================================
 
 
-def main() -> None:
+def main() -> int:
     """Main entry point for the script.
 
     Either processes all routes at once (creating a single shapefile) or splits
     by route (creating multiple shapefiles), depending on SPLIT_BY_ROUTE.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
     """
     logging.basicConfig(
         level=LOG_LEVEL,
@@ -1205,7 +1209,7 @@ def main() -> None:
             "File paths are still set to their defaults. Update BUS_STOPS_INPUT and "
             "EXCEL_FILE in the CONFIGURATION section before running."
         )
-        return
+        return 2
 
     # >>>>> NEW BRANCHING LOGIC <<<<<
     if not SPLIT_BY_ROUTE:
@@ -1313,10 +1317,11 @@ def main() -> None:
             "Run log could not be written. Set REQUIRE_RUN_LOG = False to "
             "suppress this error when a sidecar file is genuinely impossible."
         )
-        sys.exit(1)
+        return 1
 
     logging.info("Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

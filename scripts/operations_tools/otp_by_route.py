@@ -40,10 +40,11 @@ from __future__ import annotations
 
 import argparse
 import logging
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import List, Sequence
+from typing import List, Optional, Sequence
 
 import pandas as pd
 
@@ -423,10 +424,39 @@ def run(cfg: Config) -> pd.DataFrame:
 # =============================================================================
 
 
+def notebook_safe_argv(argv: Optional[Sequence[str]]) -> Optional[List[str]]:
+    """Return the argv to parse, shielding notebook kernels from stray flags.
+
+    When a script's ``main()`` runs with no explicit ``argv`` inside a
+    Jupyter/IPython kernel, ``sys.argv`` holds kernel plumbing (for example
+    ``-f /path/kernel.json``) rather than flags meant for the script, and
+    strict ``argparse.parse_args`` would reject it and abort.  This helper
+    detects the notebook case and substitutes an empty argument list so the
+    CONFIGURATION constants stay in charge, while shell runs keep strict
+    parsing (a typo in a flag fails loudly instead of being silently ignored).
+
+    Canonical implementation: ``utils/cli_helpers.py``.
+
+    Args:
+        argv: Explicit argument list passed to ``main()``, or ``None`` to
+            fall back to ``sys.argv``.
+
+    Returns:
+        ``list(argv)`` when *argv* was provided; ``[]`` when running inside a
+        notebook kernel; otherwise ``None`` so argparse reads ``sys.argv[1:]``.
+    """
+    if argv is not None:
+        return list(argv)
+    if "ipykernel" in sys.modules:
+        return []
+    return None
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     """Create the command-line argument parser."""
     p = argparse.ArgumentParser(
-        description="Windowed route-level OTP rollup from otp_monthly_panel's output."
+        description="Windowed route-level OTP rollup from otp_monthly_panel's output.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument(
         "--otp-processed",
@@ -434,7 +464,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Path to otp_monthly_processed.csv.",
     )
     p.add_argument("--output-dir", default=OUTPUT_DIR, help="Directory for outputs.")
-    p.add_argument("--level", default=LEVEL, help="Panel level to roll up (default: route).")
+    p.add_argument("--level", default=LEVEL, help="Panel level to roll up.")
     p.add_argument(
         "--window-months",
         type=int,
@@ -450,7 +480,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--end-month",
         default=END_MONTH,
-        help="Right edge of the window as YYYY-MM (default: latest month present).",
+        help="Right edge of the window as YYYY-MM; empty anchors at the latest month present.",
     )
     p.add_argument(
         "--min-eval-per-month",
@@ -461,22 +491,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return p
 
 
-def main(argv: Sequence[str] | None = None) -> None:
-    """Entry point. Validates placeholder paths before doing any work."""
+def main(argv: Sequence[str] | None = None) -> int:
+    """Entry point. Validates placeholder paths before doing any work.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
     parser = build_arg_parser()
-    args, _unknown = parser.parse_known_args(argv)
+    args = parser.parse_args(notebook_safe_argv(argv))
 
     if args.otp_processed == OTP_PROCESSED_PATH:
         logging.warning(
             "OTP_PROCESSED_PATH is still a placeholder. Update the CONFIGURATION section "
             "or pass --otp-processed before running."
         )
-        return
+        return 2
 
     cfg = Config(
         otp_processed_path=Path(args.otp_processed).expanduser(),
@@ -494,9 +529,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         run(cfg)
     except (FileNotFoundError, ValueError) as exc:
         logging.error("%s", exc)
-        return
+        return 1
     logging.info("Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
