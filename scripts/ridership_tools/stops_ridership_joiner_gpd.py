@@ -1067,8 +1067,13 @@ def write_run_log(output_folder: Path) -> bool:
 # =============================================================================
 
 
-def main() -> None:
-    """Main entry point."""
+def main() -> int:
+    """Main entry point.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -1082,7 +1087,7 @@ def main() -> None:
             "File paths are still set to their defaults. Update BUS_STOPS_INPUT and "
             "EXCEL_FILE in the CONFIGURATION section before running."
         )
-        return
+        return 2
 
     if not BUS_STOPS_INPUT.exists():
         raise FileNotFoundError(f"BUS_STOPS_INPUT not found: {BUS_STOPS_INPUT}")
@@ -1110,10 +1115,11 @@ def main() -> None:
             "Run log could not be written. Set REQUIRE_RUN_LOG = False to "
             "suppress this error when a sidecar file is genuinely impossible."
         )
-        sys.exit(1)
+        return 1
 
     logging.info("Done. Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
