@@ -1,6 +1,4 @@
-import sys
 from pathlib import Path
-from unittest.mock import patch
 
 import pandas as pd
 import pytest
@@ -35,9 +33,9 @@ def test_tides_data_processing(tides_input_csv: Path, tmp_path: Path) -> None:
     """Test that the script correctly processes TIDES-style data."""
     output_dir = tmp_path / "output"
 
-    # Arguments for the script
+    # Arguments for the script (passed explicitly; strict parsing would
+    # otherwise see pytest's own argv).
     argv = [
-        "otp_by_timepoint_from_avl.py",
         "--input",
         str(tides_input_csv),
         "--outdir",
@@ -48,9 +46,7 @@ def test_tides_data_processing(tides_input_csv: Path, tmp_path: Path) -> None:
         "2025-03",
     ]
 
-    with patch.object(sys, "argv", argv):
-        # This should not raise SystemExit now
-        otp_by_timepoint_from_avl.main()
+    assert otp_by_timepoint_from_avl.main(argv) == 0
 
     # Verification
     assert output_dir.exists()
