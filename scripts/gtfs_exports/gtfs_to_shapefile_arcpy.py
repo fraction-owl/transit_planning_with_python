@@ -10,6 +10,10 @@ By default, lines are exported as one feature per (route_id, direction_id),
 representing a selected "pattern" (shape_id). If MERGE_DIRECTIONS is True,
 all directions are merged into a single feature per route_id.
 
+If SPLIT_BY_ROUTE is True, the script additionally writes one shapefile per
+route into a "gtfs_lines_by_route" subfolder, alongside the combined
+gtfs_lines.shp.
+
 Pattern selection options:
 
 * "longest"     – choose the shape_id with the greatest geodesic length
@@ -21,11 +25,12 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 import tempfile
 import zipfile
 from pathlib import Path
-from typing import Dict, List, Literal, Optional, Set
+from typing import Dict, List, Literal, Optional, Sequence, Set, Tuple
 
 import arcpy
 import pandas as pd
@@ -56,6 +61,15 @@ ROUTE_FILTER_OUT: Optional[List[str]] = None
 # If False, keep one feature per (route_id, direction_id).
 MERGE_DIRECTIONS: bool = False
 
+# If True, additionally write one shapefile per route_id into the
+# PER_ROUTE_SUBDIR subfolder alongside the combined gtfs_lines.shp.
+# Off by default: a shapefile is 4+ files, so large feeds produce many files.
+SPLIT_BY_ROUTE: bool = False
+
+# Subdirectory (inside OUTPUT_FOLDER) that receives the per-route shapefiles
+# when SPLIT_BY_ROUTE is enabled.
+PER_ROUTE_SUBDIR: str = "gtfs_lines_by_route"
+
 # WGS 84 (GTFS lat/lon CRS).
 WGS84_WKID: int = 4326
 
@@ -80,6 +94,50 @@ def _ensure_output_folder(folder: str | Path) -> Path:
     out.mkdir(parents=True, exist_ok=True)
     if not out.is_dir():
         raise ValueError(f"OUTPUT_FOLDER is not a directory: {out}")
+    return out
+
+
+def _sanitize_filename_component(value: str, max_len: int = 40) -> str:
+    """Make a string safe to use as (part of) a shapefile base name.
+
+    Collapses every character outside [A-Za-z0-9_] to an underscore, trims
+    leading/trailing underscores, and truncates to max_len characters. GTFS
+    route identifiers may contain slashes, spaces, or unicode, none of which
+    are safe in file names or ArcGIS feature class names.
+    """
+    cleaned = re.sub(r"[^A-Za-z0-9_]+", "_", value).strip("_")
+    return cleaned[:max_len].rstrip("_") or "unnamed"
+
+
+def _build_export_basenames(
+    items: Sequence[Tuple[str, Optional[str]]],
+    prefix: str,
+) -> Dict[str, str]:
+    """Map each key to a unique, filesystem-safe shapefile base name.
+
+    Args:
+        items: (key, label) pairs. The label (e.g. route_short_name) is
+            preferred for the visible name; it falls back to the key itself
+            (e.g. route_id) when the label is missing or blank.
+        prefix: Prepended to every name, e.g. "route" → "route_30".
+
+    Returns:
+        Mapping of key → base name (without extension). Names are
+        deduplicated case-insensitively so they remain unique on
+        case-insensitive filesystems such as Windows.
+    """
+    used: Set[str] = set()
+    out: Dict[str, str] = {}
+    for key, label in items:
+        raw = label if label is not None and label.strip() else key
+        base = f"{prefix}_{_sanitize_filename_component(raw)}"
+        candidate = base
+        suffix = 2
+        while candidate.lower() in used:
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+        used.add(candidate.lower())
+        out[key] = candidate
     return out
 
 
@@ -662,31 +720,17 @@ def _export_stops_shapefile(stops_df: pd.DataFrame, out_folder: Path) -> None:
     logging.info("Wrote %s (%d features).", fc_path, rows_written)
 
 
-def _export_lines_shapefile(
-    routes: List[Dict[str, object]],
+def _write_lines_featureclass(
+    records: List[Dict[str, object]],
     out_folder: Path,
+    out_name: str,
     pattern_mode: PatternMode,
-    merge_directions: bool,
 ) -> None:
-    """Export selected route patterns to gtfs_lines.shp (WGS84 polylines)."""
-    if not routes:
-        logging.warning("No route patterns to export – skipping gtfs_lines.shp.")
-        return
-
-    if merge_directions:
-        logging.info("Merging all directions to one feature per route_id.")
-        routes = _merge_route_directions(routes)
-        if not routes:
-            logging.warning(
-                "No routes remain after merging directions – skipping gtfs_lines.shp.",
-            )
-            return
-
+    """Write route pattern records to <out_folder>/<out_name>.shp (WGS84 polylines)."""
     arcpy.env.overwriteOutput = True
     sr = _wgs84_sr()
 
     out_folder_str = str(out_folder)
-    out_name = "gtfs_lines"
 
     existing_fc = os.path.join(out_folder_str, out_name + ".shp")
     if arcpy.Exists(existing_fc):
@@ -736,7 +780,7 @@ def _export_lines_shapefile(
     missing_required = required - set(added_fields)
     if missing_required:
         raise RuntimeError(
-            "Missing required fields on gtfs_lines: " + ", ".join(sorted(missing_required)),
+            f"Missing required fields on {out_name}: " + ", ".join(sorted(missing_required)),
         )
 
     include_shape_id = "shape_id" in added_fields
@@ -748,7 +792,7 @@ def _export_lines_shapefile(
 
     rows_written = 0
     with arcpy.da.InsertCursor(fc_path, fields) as cursor:
-        for rec in routes:
+        for rec in records:
             geom = rec.get("geometry")
             if not isinstance(geom, arcpy.Polyline) or geom.length == 0:
                 continue
@@ -772,6 +816,58 @@ def _export_lines_shapefile(
             rows_written += 1
 
     logging.info("Wrote %s (%d features).", fc_path, rows_written)
+
+
+def _export_lines_shapefile(
+    routes: List[Dict[str, object]],
+    out_folder: Path,
+    pattern_mode: PatternMode,
+) -> None:
+    """Export selected route patterns to gtfs_lines.shp (WGS84 polylines)."""
+    if not routes:
+        logging.warning("No route patterns to export – skipping gtfs_lines.shp.")
+        return
+
+    _write_lines_featureclass(routes, out_folder, "gtfs_lines", pattern_mode)
+
+
+def _export_route_shapefiles(
+    routes: List[Dict[str, object]],
+    out_folder: Path,
+    pattern_mode: PatternMode,
+) -> None:
+    """Export one shapefile per route_id into the PER_ROUTE_SUBDIR subfolder.
+
+    File names derive from route_short_name when available (falling back to
+    route_id), sanitized for the filesystem and deduplicated
+    case-insensitively.
+    """
+    if not routes:
+        logging.warning("No route patterns to export – skipping per-route shapefiles.")
+        return
+
+    by_route: Dict[str, List[Dict[str, object]]] = {}
+    labels: Dict[str, Optional[str]] = {}
+    for rec in routes:
+        route_id = str(rec.get("route_id"))
+        by_route.setdefault(route_id, []).append(rec)
+        short = rec.get("route_short")
+        if route_id not in labels:
+            if isinstance(short, str) and short.strip() and short.lower() != "nan":
+                labels[route_id] = short
+            else:
+                labels[route_id] = None
+
+    subdir = _ensure_output_folder(out_folder / PER_ROUTE_SUBDIR)
+    names = _build_export_basenames(
+        [(rid, labels[rid]) for rid in sorted(by_route)],
+        prefix="route",
+    )
+
+    for route_id in sorted(by_route):
+        _write_lines_featureclass(by_route[route_id], subdir, names[route_id], pattern_mode)
+
+    logging.info("Wrote %d per-route shapefile(s) to %s.", len(by_route), subdir)
 
 
 # ============================================================================
@@ -844,12 +940,15 @@ def main() -> None:  # noqa: D401
                 route_filter_out=route_filter_out_set,
             )
 
-            _export_lines_shapefile(
-                routes,
-                out_dir,
-                PATTERN_MODE,
-                MERGE_DIRECTIONS,
-            )
+            if MERGE_DIRECTIONS and routes:
+                logging.info("Merging all directions to one feature per route_id.")
+                routes = _merge_route_directions(routes)
+
+            _export_lines_shapefile(routes, out_dir, PATTERN_MODE)
+
+            if SPLIT_BY_ROUTE:
+                logging.info("STEP 3  Exporting one shapefile per route …")
+                _export_route_shapefiles(routes, out_dir, PATTERN_MODE)
 
     logging.info("All done.")
     logging.info("Script completed successfully.")
