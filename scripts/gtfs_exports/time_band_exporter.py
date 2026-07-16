@@ -13,6 +13,11 @@ Outputs
 -------
 - One Excel workbook per ``(route_id, service_id)``
 - One sheet per ``direction_id`` within that workbook
+
+Typical usage
+-------------
+Update the paths in the CONFIGURATION section and run from a shell, ArcGIS
+Pro's Python window, or a Jupyter notebook.
 """
 
 from __future__ import annotations

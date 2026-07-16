@@ -5,7 +5,9 @@ This script reads stop-level ridership and amenity information from one or
 duplicate STOP_IDs, then computes boolean "FLAG_*" columns to highlight where
 usage warrants an upgrade but the amenity is missing.
 
-It outputs a multi-sheet Excel workbook and a plain-text log file:
+Outputs
+-------
+Both files are written to ``OUTPUT_FOLDER``:
 
     stops_needing_improvement.xlsx:
         Raw Data – Unmodified import.
@@ -19,6 +21,11 @@ It outputs a multi-sheet Excel workbook and a plain-text log file:
 
 Typical use-cases include batch reviews of bus-stop needs based on ArcGIS
 outputs, planning reports, or independently maintained amenity inventories.
+
+Typical usage
+-------------
+Update the paths in the CONFIGURATION section and run from a shell or a
+Jupyter notebook.
 """
 
 from __future__ import annotations

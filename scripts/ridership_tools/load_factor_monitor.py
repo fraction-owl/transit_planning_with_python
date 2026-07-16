@@ -13,6 +13,24 @@ Typical use cases
 - Operational load monitoring.
 - Compliance tracking against agency load-factor standards.
 - Automated route-level reporting.
+
+Outputs
+-------
+- ``<input stem>_processed.csv`` -- combined trip-level table with load factors
+  and violation flags (machine-readable).
+- ``<input stem>_processed.xlsx`` (``OUTPUT_FILE``) -- the same table as a
+  single-sheet workbook for quick inspection.
+- ``<ROUTE_NAME>.xlsx`` -- one workbook per route, written next to
+  ``OUTPUT_FILE``, with one sheet per direction.
+- ``<output stem>_violations_log.txt`` (``VIOLATION_LOG_FILE``) -- plain-text
+  violation log, written when ``WRITE_VIOLATION_LOG`` is True.
+- ``<output stem>_runlog.txt`` -- sidecar run log capturing the verbatim
+  CONFIGURATION block.
+
+Typical usage
+-------------
+Update the paths in the CONFIGURATION section and run from a shell, ArcGIS
+Pro's Python window, or a Jupyter notebook.
 """
 
 from __future__ import annotations

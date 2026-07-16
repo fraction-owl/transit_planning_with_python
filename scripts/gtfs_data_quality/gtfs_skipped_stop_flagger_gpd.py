@@ -19,6 +19,23 @@ At a high level, the script:
 Results are written to a CSV in OUTPUT_DIR for manual review. Configuration
 options (GTFS paths, base routes, and tuning thresholds) are defined in the
 Configuration section below.
+
+Outputs
+-------
+All files are written under ``OUTPUT_DIR``:
+
+- ``skipped_stop_segments.csv``: one row per detected skipped-stop segment.
+- ``stop_suspicion_scores.csv``: aggregated per-stop suspicion scores (one row
+  per missing route + candidate stop).
+- ``intra_route_skipped_stops.csv``: intra-route trip-level skipped-stop
+  findings.
+- ``segment_plots/``: PNG maps of flagged segments plus per-route overview
+  plots.
+
+Typical usage
+-------------
+Update the paths in the Configuration section and run from a shell or a
+Jupyter notebook.
 """
 
 from __future__ import annotations

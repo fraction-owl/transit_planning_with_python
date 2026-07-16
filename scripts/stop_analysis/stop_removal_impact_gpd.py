@@ -19,6 +19,21 @@ Key Features:
 
 This script is intended for transportation planners and GIS analysts assessing
 the accessibility impacts of stop consolidation, relocation, or removal.
+
+Outputs:
+    * ``deleted_stops_distances.csv``: per-removed-stop linear and network walking
+      distances (miles) to the nearest retained stop, with sanity flags.
+    * ``deleted_stops.shp``: point shapefile of the removed stops.
+    * ``deleted_to_nearest_paths.shp``: shortest-path polylines from each removed
+      stop to its nearest retained stop (when a network path exists).
+    * ``lost_coverage.shp``: sidewalk-buffer coverage lost by the removals
+      (written only when non-empty).
+    * ``maps/<stop_id>.png``: one QA map per removed stop, when ``EXPORT_MAPS``
+      is enabled.
+
+Typical usage:
+    Update the paths in the CONFIGURATION section and run from a shell or a
+    Jupyter notebook.
 """
 
 from __future__ import annotations

@@ -21,12 +21,24 @@ trip_count
 Weekday service is the default because the ridership model uses weekday
 NTD data.  Saturday and Sunday can be selected via ``SERVICE_DAY``.
 
+Outputs
+-------
+- ``headway_span_by_route.csv`` (``OUTPUT_FILENAME``) in ``OUTPUT_DIR``: one
+  row per ``route_id`` with ``avg_headway_min``, ``span_hrs``, and
+  ``trip_count``.
+
 Notes:
 -----
 Only ``calendar.txt`` is consulted for service-day classification.
 ``calendar_dates.txt`` exceptions (added / removed dates) are not
 applied here; if your feed relies heavily on calendar_dates.txt, filter
 ``FILTER_IN_SERVICE_IDS`` manually instead.
+
+Typical usage
+-------------
+Update the paths in the CONFIGURATION section (or pass ``--gtfs-folder`` /
+``--output`` / ``--service-day`` / ``--filter-in`` / ``--filter-out``) and
+run from a shell or a Jupyter notebook.
 """
 
 from __future__ import annotations

@@ -17,6 +17,11 @@ Inputs:
 Outputs:
     - `gbfs_stations.shp`: Shapefile of static station points
     - `gbfs_stations.geojson`: GeoJSON of static station points
+
+Typical usage:
+    Update the paths in the CONFIGURATION section (or pass the matching CLI
+    flags, e.g. ``--source``, ``--output-dir``, ``--format``) and run from a
+    shell or a Jupyter notebook.
 """
 
 import argparse

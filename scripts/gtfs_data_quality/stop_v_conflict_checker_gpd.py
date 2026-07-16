@@ -7,10 +7,23 @@ This script performs a simple overlap check and does not use any buffers
 or proximity analysis. It includes an optional pandas-based deduplication
 step (by key fields or XY tolerance) before the spatial analysis.
 
-Outputs a report (CSV, GeoPackage, Shapefile, and/or XLSX) containing only
-the stops that were flagged for one or more conflicts.
-
 All configuration is set in the 'Configuration' section below.
+
+Outputs
+-------
+Each export is toggled in the Configuration section and contains only the
+stops flagged for one or more conflicts:
+
+- ``stop_conflicts.csv`` / ``stop_conflicts.xlsx`` (``OUTPUT_BASENAME`` in
+  ``OUTPUT_DIR``): flagged stops with conflict attributes.
+- ``stops_conflicts`` layer (``OUTPUT_LAYER_NAME``) in ``stop_conflicts.gpkg``
+  (``OUTPUT_GPKG``).
+- ``stop_conflicts.shp``: optional shapefile copy of the flagged stops.
+
+Typical usage
+-------------
+Update the paths in the Configuration section and run from a shell or a
+Jupyter notebook.
 """
 
 from __future__ import annotations

@@ -12,6 +12,10 @@ Outputs:
 The long-spacing check examines whether stops from other routes fall within a
 specified buffer distance of unusually long segments and may merit further
 review as possible missed service opportunities.
+
+Typical usage:
+Update the paths in the CONFIGURATION section and run from ArcGIS Pro's Python
+window or a shell whose environment provides ``arcpy`` (an ArcGIS Pro install).
 """
 
 from __future__ import annotations

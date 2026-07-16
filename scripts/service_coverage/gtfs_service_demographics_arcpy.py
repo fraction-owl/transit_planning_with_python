@@ -22,6 +22,10 @@ Outputs:
   - Clipped polygons with area fields and synthetic metrics:
     loinc_hh, total_hh, minor_pop, total_pop, loinc_jobs, all_jobs (+ extras).
   - Final FC/shapefile; optional per-route CSV.
+
+Typical usage:
+  Update the paths in the CONFIGURATION section and run from a shell, ArcGIS
+  Pro's Python window, or a Jupyter notebook (requires ArcGIS Pro's `arcpy`).
 """
 
 from __future__ import annotations

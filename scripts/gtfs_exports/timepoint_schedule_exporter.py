@@ -4,11 +4,13 @@ This script processes GTFS files (e.g., trips.txt, stop_times.txt) to export
 Excel schedule sheets by route, direction, and service type. Output mimics
 print-style public schedules.
 
-Typical usage is within ArcGIS Pro or a Jupyter notebook. Configuration is
-manual: edit constants near the top before execution.
-
 Outputs:
     - One Excel file per route × service type with schedule sheets by direction
+
+Typical usage:
+    Configuration is manual: edit the constants in the CONFIGURATION section
+    near the top before execution, then run within ArcGIS Pro or a Jupyter
+    notebook.
 """
 
 from __future__ import annotations

@@ -47,6 +47,11 @@ Outputs:
 
 ArcGIS Pro Python stack only (numpy / scipy / pandas / matplotlib); no statsmodels,
 scikit-learn, or pyarrow. Runs in a notebook via %run or as a script.
+
+Typical usage:
+    Transfer in the Part A bundle folder, update the paths in the CONFIGURATION section,
+    and run on the secured box from a shell, ArcGIS Pro's Python window, or a Jupyter
+    notebook (via ``%run``).
 """
 
 from __future__ import annotations

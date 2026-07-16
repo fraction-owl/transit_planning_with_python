@@ -17,6 +17,19 @@ The behaviour is controlled entirely by the *CONFIGURATION* constants below;
 no command‑line flags are required.  Adjust paths, time‑window parameters, or
 filters (e.g. selected `service_id`s, maximum trips per block, or specific
 `route_short_name`s) to match the target feed.
+
+Outputs
+-------
+- One Excel workbook per vehicle block (`block_<block_id>.xlsx`) in
+  `OUTPUT_FOLDER`: one row per minute with timestamp, trip start time, route,
+  direction, trip, stop metadata, status, and interlined route.
+- When `AGGREGATE_BY_ROUTE_DIR` is True, one workbook per *Route × Direction*
+  (`route_<route>_dir_<direction>.xlsx`) is written instead.
+
+Typical usage
+-------------
+Update the paths in the CONFIGURATION section and run from a shell, ArcGIS
+Pro's Python window, or a Jupyter notebook.
 """
 
 from __future__ import annotations

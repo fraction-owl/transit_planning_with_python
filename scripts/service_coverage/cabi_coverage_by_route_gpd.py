@@ -37,6 +37,12 @@ Outputs
   (when available), ``cabi_stations_served``, ``cabi_weekday_riders_served``,
   ``cabi_saturday_riders_served``, and ``cabi_sunday_riders_served``.
 
+Typical usage
+-------------
+Update the paths in the CONFIGURATION section (or pass the matching CLI flags,
+e.g. ``--gtfs-dir``, ``--stations-path``, ``--ridership-csv``, ``--output-dir``)
+and run from a shell or a Jupyter notebook.
+
 Assumptions
 -----------
 - The projected CRS uses meters or feet; the buffer distance is given in feet

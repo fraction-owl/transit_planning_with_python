@@ -15,6 +15,10 @@ served by dir 0 trips for route X, the other only served by dir 1 trips for rout
 Outputs:
 - CSV of close stop pairs (with distance + safe flags)
 - CSV of per-stop summary (count of close neighbors)
+
+Typical usage:
+    Update the paths in the CONFIGURATION section and run from a shell or a
+    Jupyter notebook.
 """
 
 from __future__ import annotations

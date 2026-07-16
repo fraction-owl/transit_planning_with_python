@@ -16,6 +16,11 @@ choropleths, and so on).
 Both inputs and outputs use EPSG:4326 (WGS 84), inherited from the source
 geometries. The join key defaults to ``station_id``.
 
+Outputs:
+    - ``<stem>_ridership.geojson`` / ``<stem>_ridership.shp`` in ``OUTPUT_DIR``
+      (e.g. ``gbfs_stations_ridership.geojson``): one enriched copy of each
+      geometry input, carrying departures, arrivals, and total trip columns.
+
 Typical usage (edit the CONFIG block, then run):
 
     python gbfs_ridership_join.py

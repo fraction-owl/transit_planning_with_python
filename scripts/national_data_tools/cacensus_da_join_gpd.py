@@ -31,6 +31,17 @@ Set ``INTERMEDIATE_COMBINED_CSV_NAME`` to an empty string or None, or leave
 ``INTERMEDIATE_DA_SHP`` as None, to skip writing those intermediate
 artifacts.
 
+Outputs
+-------
+All paths below are written into ``OUTPUT_DIR``:
+
+- ``da_joined.gpkg`` (``FINAL_JOINED_FEATURES_NAME``): final DA geometry joined
+  to the pivoted attribute table (Stage 3).
+- ``da_attributes.csv`` (``INTERMEDIATE_COMBINED_CSV_NAME``): optional Stage 1
+  wide-format DA attribute table; set the name to ""/None to skip.
+- ``INTERMEDIATE_DA_SHP``: optional Stage 2 filtered DA geometry; skipped by
+  default (None).
+
 Notes:
     The Census Profile is long-format (one row per DA × characteristic),
     unlike US Census wide-format tables.  Stage 1 pivots so each DAUID
@@ -50,6 +61,11 @@ Helpful links
 -------------
     Census Profile 2021:  https://www12.statcan.gc.ca/census-recensement/2021/dp-pd/prof/
     DA boundary file:     https://www12.statcan.gc.ca/census-recensement/2021/geo/sip-pis/boundary-limites/
+
+Typical usage
+-------------
+Update ``INPUT_CSV_DIR``, ``INPUT_SHP_DIR``, and ``OUTPUT_DIR`` in the
+CONFIGURATION section and run from a shell or a Jupyter notebook.
 """
 
 from __future__ import annotations

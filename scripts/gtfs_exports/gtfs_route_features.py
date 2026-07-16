@@ -69,6 +69,11 @@ Outputs:
     OUTPUT_DIR / OUTPUT_CSV_NAME : the route-keyed feature table.
     A run-log sidecar capturing the verbatim config block, feed SHA-256, and the
     analysis date that was actually selected.
+
+Typical usage:
+    Update the paths in the CONFIGURATION block (or pass ``--gtfs-dir`` /
+    ``--output-dir`` / ``--analysis-weekday``) and run from a shell or a
+    Jupyter notebook.
 """
 
 from __future__ import annotations

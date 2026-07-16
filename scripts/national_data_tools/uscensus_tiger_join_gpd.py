@@ -24,6 +24,18 @@ Set INTERMEDIATE_COMBINED_CSV_NAME or INTERMEDIATE_MERGED_SHP_NAME to an
 empty string or None to skip writing those intermediate artifacts; the
 pipeline will still run in memory.
 
+Outputs
+-------
+All paths below default into ``OUTPUT_DIR``:
+
+- ``va_md_dc_blocks_plus_data.shp`` (``FINAL_JOINED_FEATURES_NAME``): final
+  block geometry with the joined attributes (Stage 3).
+- ``joined_blocks.csv`` (``INTERMEDIATE_COMBINED_CSV_NAME``): optional Stage 1
+  tract-level attribute table; set the name to ""/None to skip.
+- ``va_md_dc_blocks_fips_merge.shp`` (``INTERMEDIATE_MERGED_SHP_NAME``):
+  optional Stage 2 merged, FIPS-filtered block geometry; set the name to
+  ""/None to skip.
+
 Notes:
 -----
 * All TIGER input layers must share the same CRS.
@@ -36,6 +48,12 @@ Helpful links
     Demographic data: https://data.census.gov/table
     Jobs data:        https://lehd.ces.census.gov/data/
     Geographic data:  https://www.census.gov/cgi-bin/geo/shapefiles/index.php
+
+Typical usage
+-------------
+Update the paths in the CONFIGURATION section (or pass the matching CLI flags:
+``--input-csv-dir``, ``--input-shp-dir``, ``--output``, ``--fips``, ...) and
+run from a shell or a Jupyter notebook.
 """
 
 from __future__ import annotations

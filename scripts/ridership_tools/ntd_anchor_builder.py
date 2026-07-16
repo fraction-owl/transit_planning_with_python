@@ -41,6 +41,20 @@ Measure conventions (kept consistent with ntd_monthly_summary.py):
     - hours       = MTH_REV_HOURS (already monthly), summed then averaged per day.
     - revenue_miles = REV_MILES * DAYS, i.e. the monthly revenue-mile total,
       summed then averaged per day.
+
+Outputs
+-------
+- ``ntd_anchor.csv`` (``OUTPUT_DIR / OUTPUT_FILENAME``) -- the anchor table at
+  the configured grain; point the regression's ANCHOR_PATH at it.
+- ``ntd_anchor_builder_runlog.txt`` -- run-log sidecar in OUTPUT_DIR capturing
+  the verbatim CONFIGURATION block.
+
+Typical usage
+-------------
+Update the paths in the CONFIGURATION section (or pass ``--data-root`` /
+``--output-dir`` / ``--output-filename`` / ``--grain`` / ``--start-month`` /
+``--end-month``) and run from a shell, ArcGIS Pro's Python window, or a
+Jupyter notebook.
 """
 
 from __future__ import annotations

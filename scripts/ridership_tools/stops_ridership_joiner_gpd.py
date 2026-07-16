@@ -9,6 +9,10 @@ Outputs:
 - CSV summaries (per-stop and optional per-polygon aggregation)
 - Optional polygon layer with aggregated ridership
 - Optional per-route boardings/alightings maps from GTFS shapes (see DRAW_PLOTS)
+
+Typical usage:
+    Update the paths in the CONFIGURATION section and run from a shell or a
+    Jupyter notebook with the open-source geospatial stack (geopandas) installed.
 """
 
 from __future__ import annotations

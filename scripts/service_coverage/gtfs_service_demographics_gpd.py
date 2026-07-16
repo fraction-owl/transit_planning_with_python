@@ -43,6 +43,10 @@ Outputs:
     - Optional ``express_origin_candidates.csv`` advisory when express routes are
       set: stops ranked by nearby jobs, flagging the job-poor ones as likely
       express origins for review (it never changes any buffer).
+
+Typical usage:
+    Update the paths in the CONFIGURATION section (or pass the matching CLI
+    flags) and run from a shell or a Jupyter notebook.
 """
 
 import argparse

@@ -38,6 +38,17 @@ the output identifiers and records are stable across runs.
 Column names are configured via COLUMN_MAP in the CONFIGURATION section.
 Defaults are pre-set for CLEVER "Stop Visit Events" exports; update COLUMN_MAP
 values to adapt to other AVL sources.
+
+Outputs
+-------
+- `stop_visits.csv` (`OUTPUT_FILENAME`, written to `OUTPUT_DIR`) - one TIDES
+  `stop_visits` record per source stop visit event, with columns in the exact
+  order of the TIDES template (`TIDES_COLS`).
+
+Typical usage
+-------------
+Update the paths in the CONFIGURATION section and run from a shell, ArcGIS
+Pro's Python window, or a Jupyter notebook.
 """
 
 from __future__ import annotations

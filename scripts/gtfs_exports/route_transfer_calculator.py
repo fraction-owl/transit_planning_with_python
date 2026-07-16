@@ -40,6 +40,10 @@ Outputs:
 Defaults come from the CONFIGURATION block; ``--gtfs-dirs`` / ``--output-dir`` /
 ``--day`` / ``--log-level`` override them, so the script can run standalone or
 under the prep_features_public.py orchestrator.
+
+Typical usage:
+    Update the paths in the CONFIGURATION block (or pass the CLI flags above)
+    and run from a shell or a Jupyter notebook.
 """
 
 from __future__ import annotations

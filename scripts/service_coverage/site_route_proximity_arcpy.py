@@ -22,6 +22,11 @@ Outputs
 - Optional PNGs per site in PLOT_DIR.
 - QA CSV (shared/identical stop issues).
 
+Typical usage
+-------------
+Update the paths in the CONFIGURATION section and run from a shell, ArcGIS
+Pro's Python window, or a Jupyter notebook using ArcGIS Pro's bundled Python.
+
 Requires
 --------
 ArcGIS Pro (arcpy) and pandas (bundled with Pro).

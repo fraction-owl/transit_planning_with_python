@@ -53,6 +53,11 @@ Also outputs:
 - gtfs_route_diff.log
 
 No arcpy / geopandas. pandas + numpy only.
+
+Typical usage:
+Update the paths in the CONFIG block (or pass ``--before``, ``--after`` and ``--out``,
+plus the threshold flags) and run from a shell or a Jupyter notebook — unknown
+arguments are ignored, so ``main()`` also runs cleanly inside a notebook kernel.
 """
 
 from __future__ import annotations

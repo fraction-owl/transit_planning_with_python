@@ -18,6 +18,11 @@ routes that serve it (via stop_times -> trips -> routes). This is informational
 only and never affects the modified/unchanged classification.
 
 No arcpy / geopandas. pandas + numpy + scipy only.
+
+Typical usage:
+Update the paths in the Config block (or pass ``--before``, ``--after``, ``--out`` and
+``--threshold-feet``) and run from a shell or a Jupyter notebook — unknown arguments
+are ignored, so ``main()`` also runs cleanly inside a notebook kernel.
 """
 
 from __future__ import annotations

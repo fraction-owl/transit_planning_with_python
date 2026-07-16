@@ -5,6 +5,12 @@ The script reads the five core GTFS tables—``trips``, ``stop_times``, ``stops`
 *route short name*.  For every vehicle ``block_id`` that survives filtering it
 produces a nicely-formatted ``.xlsx`` file ready for field auditing.
 
+Outputs
+-------
+- ``block_<block_id>_schedule_printable.xlsx`` (one per surviving block, written
+  to ``BASE_OUTPUT_PATH``): the block's stop-by-stop schedule with placeholder
+  columns for handwritten field notes.
+
 Typical usage
 -------------
 Run from the command line, an ArcGIS Pro Python toolbox, or a notebook.

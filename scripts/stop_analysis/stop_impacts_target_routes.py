@@ -13,6 +13,10 @@ Day-of-Week codes to identify if stops are eliminated only on specific days.
 Outputs:
     Writes `stop_route_calendar_impacts.csv` containing stop-level summaries and
     per-service-id classifications.
+
+Typical usage:
+    Update the paths in the CONFIGURATION section and run from a shell or a
+    Jupyter notebook.
 """
 
 from __future__ import annotations

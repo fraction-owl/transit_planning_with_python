@@ -14,6 +14,18 @@ It follows these steps:
    to link GTFS stops to districts.
 6. Maps routes to districts if any stop on the route is spatially joined to that district.
 7. Outputs the final route-district matrix as an Excel file.
+
+Outputs
+-------
+- ``OUTPUT_EXCEL_NAME`` (default ``Excel_File.xlsx``) — Excel workbook with a
+  ``route_district_matrix`` sheet (one row per route, one column per district) and a
+  ``districts_with_routes`` sheet (one row per district listing the routes serving it).
+- ``gtfs_route_district_matrix.log`` in ``LOG_DIR`` — run log mirroring console output.
+
+Typical usage
+-------------
+Update the paths in the CONFIGURATION section and run from a shell, ArcGIS Pro's Python
+window, or a Jupyter notebook (requires ArcGIS Pro's ``arcpy``).
 """
 
 from __future__ import annotations

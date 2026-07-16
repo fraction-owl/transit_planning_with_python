@@ -9,6 +9,21 @@ Intended Use
 This tool is designed to support transit planning by quantifying access to key destinations.
 Results can inform decisions about route coverage, service prioritization, and equity evaluation.
 
+Outputs
+-------
+- ``<route_id>_feature_summary.csv`` — one CSV per route counting the features of each
+  layer that fall inside the route's buffer, with the matched feature names.
+- ``all_routes_feature_summary.csv`` — combined matrix of feature counts per layer for
+  every analyzed route.
+- ``<route_id>_buffer_plot.png`` — optional per-route map of the buffer and features
+  (only when ``MAKE_PLOTS`` is True or ``--plots`` is passed).
+
+Typical usage
+-------------
+Update the paths in the CONFIGURATION section (or pass the matching CLI flags,
+e.g. ``--gtfs-dir``, ``--shp-input-dir``, ``--output-dir``) and run from a shell
+or a Jupyter notebook.
+
 Assumptions
 -----------
 - GTFS and GIS layers are projected in a CRS using feet or meters.

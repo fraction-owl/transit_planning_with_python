@@ -9,6 +9,23 @@ feature selection -- including which weather variables matter for ridership --
 live in separate downstream steps, so this frame stays reusable across consumers.
 
 Source: https://www.ncei.noaa.gov/cdo-web/search
+
+Outputs
+-------
+- The cleaned daily frame at ``OUTPUT_PATH`` (``.parquet`` or ``.csv``): parsed
+  dates plus calendar columns, zero-filled ``WT*`` event flags, and numeric
+  measurement columns.
+- A CSV of monthly aggregates at ``MONTHLY_OUTPUT_PATH`` (``avg_temp_f``,
+  ``max_daily_precip_in``, ``days_with_precip``, ``total_snow_in``,
+  ``max_daily_snow_in``), written only when that path is set.
+- ``<output stem>_processing_log.txt`` (or ``LOG_PATH``): a .txt processing log
+  written next to the output when ``WRITE_LOG`` is on (the default).
+
+Typical usage
+-------------
+Set ``INPUT_PATH`` and ``OUTPUT_PATH`` in the config block (or pass ``--input``
+/ ``--output``; ``--long-names`` and ``--log`` are also available) and run from
+a shell or a Jupyter notebook. Paths left unset are prompted for interactively.
 """
 
 from __future__ import annotations

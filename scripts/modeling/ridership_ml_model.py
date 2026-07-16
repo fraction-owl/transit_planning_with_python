@@ -53,6 +53,11 @@ Outputs:
     - Optional diagnostic plots (predicted-vs-actual, residuals, importance bar
       chart, and partial-dependence curves for the top predictors).
     - A run log capturing the verbatim configuration block.
+
+Typical usage:
+    Update the paths in the CONFIGURATION section and run from a shell or a
+    Jupyter notebook in an environment with ``scikit-learn`` installed (a bare
+    ArcGIS Pro environment will not do).
 """
 
 from __future__ import annotations
