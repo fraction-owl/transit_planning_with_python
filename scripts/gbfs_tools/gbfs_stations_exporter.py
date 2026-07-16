@@ -29,7 +29,7 @@ import json
 import logging
 import sys
 from pathlib import Path
-from typing import Any, Literal, Optional, Sequence
+from typing import Any, List, Literal, Optional, Sequence
 from urllib.parse import urlparse
 
 import geopandas as gpd
@@ -362,13 +362,42 @@ def gbfs_stations_to_files(
 # ===========================================================================
 
 
+def notebook_safe_argv(argv: Optional[Sequence[str]]) -> Optional[List[str]]:
+    """Return the argv to parse, shielding notebook kernels from stray flags.
+
+    When a script's ``main()`` runs with no explicit ``argv`` inside a
+    Jupyter/IPython kernel, ``sys.argv`` holds kernel plumbing (for example
+    ``-f /path/kernel.json``) rather than flags meant for the script, and
+    strict ``argparse.parse_args`` would reject it and abort.  This helper
+    detects the notebook case and substitutes an empty argument list so the
+    CONFIGURATION constants stay in charge, while shell runs keep strict
+    parsing (a typo in a flag fails loudly instead of being silently ignored).
+
+    Canonical implementation: ``utils/cli_helpers.py``.
+
+    Args:
+        argv: Explicit argument list passed to ``main()``, or ``None`` to
+            fall back to ``sys.argv``.
+
+    Returns:
+        ``list(argv)`` when *argv* was provided; ``[]`` when running inside a
+        notebook kernel; otherwise ``None`` so argparse reads ``sys.argv[1:]``.
+    """
+    if argv is not None:
+        return list(argv)
+    if "ipykernel" in sys.modules:
+        return []
+    return None
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse command-line arguments, defaulting to the CONFIGURATION block."""
     parser = argparse.ArgumentParser(
         description=(
             "Export GBFS static station information to Shapefile and/or GeoJSON. "
             "Defaults come from the CONFIGURATION section at the top of this file."
-        )
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
         "--source",
@@ -393,11 +422,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=logging.getLevelName(LOG_LEVEL),
         help="DEBUG / INFO / WARNING / ERROR.",
     )
-    return parser.parse_args(argv)
+    return parser.parse_args(notebook_safe_argv(argv))
 
 
-def main(argv: Sequence[str] | None = None) -> None:
-    """Command-line entry point. Defaults fall back to the CONFIGURATION block."""
+def main(argv: Sequence[str] | None = None) -> int:
+    """Command-line entry point. Defaults fall back to the CONFIGURATION block.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     args = parse_args(argv)
     logging.basicConfig(
         level=getattr(logging, str(args.log_level).upper(), LOG_LEVEL),
@@ -412,20 +446,17 @@ def main(argv: Sequence[str] | None = None) -> None:
             "placeholder values. Update them in the CONFIGURATION section or pass "
             "--source/--output-dir before running."
         )
-        return
-    gbfs_stations_to_files(gbfs_source=args.source, output_dir=args.output_dir, kind=args.kind)
+        return 2
+    try:
+        gbfs_stations_to_files(gbfs_source=args.source, output_dir=args.output_dir, kind=args.kind)
+    except (OSError, ValueError) as exc:
+        logging.error("%s", exc)
+        return 1
     logging.info("Script completed successfully.")
-
-
-def _in_ipython() -> bool:
-    """Return True when running inside an IPython/Jupyter kernel."""
-    return "ipykernel" in sys.modules or "IPython" in sys.modules
+    return 0
 
 
 if __name__ == "__main__":
-    # In a notebook (pasted cell or %run), use the CONFIGURATION block instead
-    # of argparse, which would otherwise try to parse the kernel's own argv.
-    if _in_ipython():
-        main([])
-    else:
-        main()
+    # Strict parsing; in a notebook, notebook_safe_argv() keeps the kernel's
+    # injected argv away from argparse so the CONFIGURATION block stays in charge.
+    raise SystemExit(main())
