@@ -30,6 +30,17 @@ configuration, the output identifiers and records are stable across runs.
 Column names are configured via COLUMN_MAP in the CONFIGURATION section.
 Defaults are pre-set for CLEVER "Event Runtime Analysis" exports; update
 COLUMN_MAP values to adapt to other AVL sources.
+
+Outputs
+-------
+- `trips_performed.csv` (`OUTPUT_FILENAME`, written to `OUTPUT_DIR`) - one TIDES
+  `trips_performed` record per retained AVL trip row, with columns in the
+  schema-defined order (`TIDES_COLS`).
+
+Typical usage
+-------------
+Update the paths in the CONFIGURATION section and run from a shell, ArcGIS
+Pro's Python window, or a Jupyter notebook.
 """
 
 from __future__ import annotations

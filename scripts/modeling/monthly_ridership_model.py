@@ -40,6 +40,11 @@ Outputs:
       predicted-vs-actual).
     - A run log capturing the verbatim configuration block plus the verified
       provenance (filename + SHA-256) of every bundle that fed the model.
+
+Typical usage:
+    Transfer in the Part A bundle folder, update the paths in the CONFIGURATION
+    section, and run on the secured box (where the NTD anchor lives) from a
+    shell, ArcGIS Pro's Python window, or a Jupyter notebook.
 """
 
 from __future__ import annotations

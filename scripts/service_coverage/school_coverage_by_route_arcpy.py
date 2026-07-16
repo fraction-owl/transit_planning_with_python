@@ -32,6 +32,11 @@ Outputs
   the grade-band breakout ``enrollment_1_8_served``, ``enrollment_9_12_served``,
   ``enrollment_postsec_served``.
 
+Typical usage
+-------------
+Update the paths in the CONFIGURATION section and run from a shell, ArcGIS
+Pro's Python window, or a Jupyter notebook using ArcGIS Pro's bundled Python.
+
 Assumptions
 -----------
 - The analysis spatial reference is projected; the buffer distance is given in

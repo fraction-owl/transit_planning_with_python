@@ -11,6 +11,11 @@ Inputs:
 Outputs:
     - `gtfs_stops.shp`: Shapefile of transit stop points
     - `gtfs_lines.shp`: Shapefile of transit route line geometries
+
+Typical usage:
+    Update the default paths in the CONFIGURATION section and run from a
+    shell or a Jupyter notebook, or import and call `gtfs_to_shapefiles()`
+    with explicit paths.
 """
 
 import logging

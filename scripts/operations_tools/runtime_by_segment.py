@@ -30,6 +30,19 @@ same ``block_id`` is the scheduled recovery. It is attached to every segment of
 the trip so planners can see, per corridor leg, how much downstream slack is
 available to absorb overruns.
 
+Outputs
+-------
+All files land in ``OUTPUT_DIR`` (``--output-dir``):
+
+- ``segment_runtime_long.csv`` - the long table: one row per
+  (route, direction, segment, service_date, trip) with actual, scheduled, and
+  difference minutes.
+- ``segment_runtime_summary.csv`` - one row per (route, direction, segment)
+  with the summary columns described above (median/mean/percentile actuals,
+  modal schedule, difference, and downstream recovery).
+- ``pivots/segment_runtime_<route>_dir<direction>.csv`` - one human-readable
+  pivot per (route, direction) with segments as rows in stop order.
+
 Typical usage
 -------------
 Update the CONFIGURATION paths (or pass the matching CLI flags) and run from a

@@ -29,6 +29,26 @@ Important notes
   avoid mixing incompatible patterns.
 - If the export cannot support a reliable YYYY-MM (no usable YYYY-MM field, no parseable dates,
   and no way to infer year for Month values), the script fails loudly rather than guessing.
+
+Outputs
+-------
+All files land in the output folder (``OUTPUT_DIR`` / ``--outdir``):
+
+- ``<input stem>_processed.csv`` - the long monthly table (one row per route/direction/variation/
+  stop/month with recomputed OTP percentages); ``--output`` overrides the path.
+- ``variation_index.csv`` - one row per (route, direction, variation) with its total counts,
+  row count, and first/last observed month.
+- Per variation, files named ``<route>_<direction>_<variation>_n<N>_*``: ``*_pct.csv`` and
+  ``*_cnt.csv`` (monthly pivots of % On Time and Total Counts by stop order), ``*_summary.csv``
+  (the stop-level summary with Timepoint ID/Description context), ``*_timepoints.csv``
+  (timepoint lookup; disable with ``--no-timepoint-lookups``), and ``*_otp_line.png``
+  (line plot; disable with ``--no-line-plots``).
+
+Typical usage
+-------------
+Update the paths in the CONFIGURATION section (or pass ``-i/--input`` and ``-d/--outdir``, plus
+optional filter flags such as ``-r/--routes`` and ``--start-month``/``--end-month``) and run from
+a shell, ArcGIS Pro's Python window, or a Jupyter notebook.
 """
 
 from __future__ import annotations

@@ -65,6 +65,11 @@ Outputs:
       ``produced_by`` provenance of the script(s) that fed it).
     - A run log capturing the verbatim configuration block plus, per script, its
       exit code, duration, and collected output files.
+
+Typical usage:
+    Update the paths in the CONFIGURATION section (or pass the matching CLI flags,
+    e.g. ``--scripts-dir`` / ``--input-dir`` / ``--output-dir``) and run on the
+    secured box from a shell or a Jupyter notebook.
 """
 
 from __future__ import annotations

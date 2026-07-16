@@ -26,6 +26,23 @@ be dropped downstream.
 
 Note: this is a single national series. It broadcasts identically across every
 route and system -- it is a time effect, not a cross-sectional one.
+
+Outputs
+-------
+- The monthly frame at ``OUTPUT_PATH`` (``.parquet`` or ``.csv``): one row per
+  calendar month with ``MONTH_START``/``YEAR``/``MONTH``/``N_WEEKS`` plus one
+  column per price series.
+- ``<output stem>_processing_log.txt`` (or ``LOG_PATH``): a .txt processing log
+  written next to the output when ``WRITE_LOG`` is on (the default).
+- ``<output stem>_weekly<ext>``: the cleaned weekly frame, written only when
+  ``WRITE_WEEKLY`` / ``--weekly`` is on.
+
+Typical usage
+-------------
+Set ``INPUT_PATH`` and ``OUTPUT_PATH`` in the config block (or pass ``--input``
+/ ``--output``; ``--long-names``, ``--log``, and ``--weekly`` are also
+available) and run from a shell or a Jupyter notebook. Paths left unset are
+prompted for interactively.
 """
 
 from __future__ import annotations

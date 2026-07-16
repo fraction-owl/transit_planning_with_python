@@ -12,6 +12,10 @@ Inputs:
 
 Outputs:
     - Excel file with a matrix of route_short_name vs. district (y/n).
+
+Typical usage:
+    Update the paths in the CONFIGURATION section and run from a shell or a
+    Jupyter notebook.
 """
 
 from __future__ import annotations

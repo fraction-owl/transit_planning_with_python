@@ -12,6 +12,10 @@ Inputs:
 
 Outputs:
     - CSV listing potential stop name typos and similarity scores
+
+Typical usage:
+    Update the paths in the CONFIGURATION section and run from a shell or a
+    Jupyter notebook.
 """
 
 import logging

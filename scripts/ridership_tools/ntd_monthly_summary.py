@@ -10,6 +10,24 @@ Features:
     - Aggregates results by route and service type.
     - Supports user-defined time windows (e.g., fiscal years).
     - Exports Excel and CSV files, plus optional plots.
+
+Outputs:
+    All files land in OUTPUT_DIR.
+
+    - DetailedAllPeriods_for_plotting.csv: master tidy CSV covering every period.
+    - MonthlySheets.xlsx: convenience workbook with one sheet per month.
+    - RouteLevelSummary_<Combined|Weekday|Saturday|Sunday>.xlsx: route-level
+      summaries (the Weekday one adds holiday-free columns when applicable).
+    - plots/<metric>/<metric>_route_<route>.png: per-route time-series plots.
+    - NegativeTrendFlags.txt: routes flagged by the 12-month trend check.
+    - One subfolder per TIME_WINDOWS entry holding detailed_<label>_for_plotting.csv,
+      RouteLevelSummary_<subset>.xlsx files, and AggByServiceType_<label>.xlsx.
+    - ntd_monthly_summary_runlog.txt: run-log sidecar capturing the verbatim
+      CONFIGURATION block.
+
+Typical usage:
+    Update the paths in the CONFIGURATION section and run from a shell, ArcGIS
+    Pro's Python window, or a Jupyter notebook.
 """
 
 from __future__ import annotations

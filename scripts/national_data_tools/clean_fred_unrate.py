@@ -15,6 +15,20 @@ The script is generic over a single FRED series export and over the multi-series
 UNRATE. The value column(s) are detected as everything that is not the date axis.
 
 Source (UNRATE): https://fred.stlouisfed.org/series/UNRATE
+
+Outputs
+-------
+- The cleaned frame at ``OUTPUT_PATH`` (``.parquet`` or ``.csv``): the parsed,
+  sorted date axis, derived ``YEAR``/``MONTH``/``QUARTER`` calendar columns,
+  and the numeric value series.
+- ``<output stem>_processing_log.txt`` (or ``LOG_PATH``): a .txt processing log
+  written next to the output when ``WRITE_LOG`` is on (the default).
+
+Typical usage
+-------------
+Set ``INPUT_PATH`` and ``OUTPUT_PATH`` in the config block (or pass ``--input``
+/ ``--output``; ``--long-names`` and ``--log`` are also available) and run from
+a shell or a Jupyter notebook. Paths left unset are prompted for interactively.
 """
 
 from __future__ import annotations

@@ -30,6 +30,12 @@ Outputs
   the grade-band breakout ``enrollment_1_8_served``, ``enrollment_9_12_served``,
   ``enrollment_postsec_served``.
 
+Typical usage
+-------------
+Update the paths in the CONFIGURATION section (or pass the matching CLI flags,
+e.g. ``--gtfs-dir``, ``--schools-path``, ``--output-dir``) and run from a shell
+or a Jupyter notebook.
+
 Assumptions
 -----------
 - The projected CRS uses meters or feet; the buffer distance is given in feet and

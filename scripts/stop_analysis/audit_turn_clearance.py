@@ -28,6 +28,18 @@ Workflow:
     8. Optionally export:
         - A shapefile of flagged stops.
         - PNG figures showing a zoomed-in context map with stop, turn, route, and roads.
+
+Outputs:
+    - ``left_turn_spacing.txt`` (``LOG_FILENAME``): tab-delimited log of flagged
+      stop-to-turn spacing violations.
+    - ``left_turn_flags.shp`` (``FLAGGED_SHP_NAME``): shapefile of flagged stops,
+      written when ``EXPORT_FLAGGED_SHP`` is enabled.
+    - ``left_turn_figures/*.png`` (``PNG_SUBDIR``): one zoomed-in context map per
+      flagged stop, written when ``EXPORT_FLAGGED_PNGS`` is enabled.
+
+Typical usage:
+    Update the paths in the CONFIGURATION section and run from a shell or a
+    Jupyter notebook.
 """
 
 from __future__ import annotations

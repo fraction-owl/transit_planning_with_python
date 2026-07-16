@@ -15,6 +15,11 @@ Pattern selection options:
 * "longest"     – choose the shape_id with the greatest geodesic length
 * "most_stops"  – choose the shape_id that serves the most distinct stops
 * "most_common" – choose the shape_id used by the most trips
+
+Typical usage
+-------------
+Update the paths in the CONFIGURATION section and run from ArcGIS Pro's
+Python window or an ArcGIS Pro Python (arcpy) environment.
 """
 
 from __future__ import annotations

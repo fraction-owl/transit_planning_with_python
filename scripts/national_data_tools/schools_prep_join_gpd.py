@@ -29,6 +29,12 @@ Inputs (placed in the input directory, read straight from their distribution for
     - ELSI_csv_export_*.csv                  ELSI export (public and/or private)
     - effy<year>.csv / effy<year>.xlsx       IPEDS 12-month enrollment (colleges)
 
+Outputs:
+    Written into the output directory, named per school type via the templates:
+    - va_md_dc_<school_type>_schools_enrollment.gpkg    point layer (``schools``) with
+      total enrollment plus the grade/level breakout joined to each EDGE point
+    - va_md_dc_<school_type>_schools_enrollment.csv     attribute-only companion table
+
 Sources:
     - CCD school membership (fiscal files):
       https://nces.ed.gov/ccd/files.asp#Fiscal:2,LevelId:7,SchoolYearId:39,Page:1
@@ -44,6 +50,11 @@ Notes:
       file is present.
     - Keep the geocode and enrollment years on the same vintage, or the join will
       silently drop schools that opened or closed between the two collections.
+
+Typical usage:
+    Set ``INPUT_DIR`` and ``OUTPUT_DIR`` in the config block (or pass ``--input-dir`` /
+    ``--output-dir``; ``--school-type``, ``--enrollment-source``, ``--states``, and
+    ``--crs`` are also available) and run from a shell or a Jupyter notebook.
 """
 
 from __future__ import annotations

@@ -16,7 +16,8 @@ It logs warnings when:
 
 Optionally prompts users for manual fixes (enter corrected MTH_BOARD and/or DAYS).
 
-Outputs per route (folder: OUTPUT_ROOT/route_<ROUTE>/):
+Outputs:
+    Per route (folder: OUTPUT_ROOT/route_<ROUTE>/):
     - monthly_long.csv (month x service_period rows)
     - monthly_wide.csv (one row per month; totals + averages columns)
     - outage_flags.csv
@@ -27,6 +28,18 @@ Outputs per route (folder: OUTPUT_ROOT/route_<ROUTE>/):
       period: raw YoY points, a rolling-mean YoY line, and an optional
       systemwide rolling line + comparison band; when enabled). The weekday
       series can optionally be computed on holiday-free days (see HOLIDAYS).
+
+    Combined (folder: OUTPUT_ROOT/_combined/):
+    - all_routes_monthly_long.csv / all_routes_monthly_wide.csv /
+      all_routes_outage_flags.csv / all_routes_yoy_percent_change.csv:
+      the per-route tables stacked across all configured routes.
+
+    Plus ntd_route_trends_runlog.txt in OUTPUT_ROOT: a run-log sidecar
+    capturing the verbatim CONFIGURATION block.
+
+Typical usage:
+    Update the paths in the CONFIGURATION section and run from a shell, ArcGIS
+    Pro's Python window, or a Jupyter notebook.
 """
 
 from __future__ import annotations

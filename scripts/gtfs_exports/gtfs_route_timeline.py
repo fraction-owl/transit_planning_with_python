@@ -29,6 +29,10 @@ Also outputs:
 - route_timeline_runlog.txt (configuration sidecar)
 
 No arcpy / geopandas. pandas + numpy + matplotlib only.
+
+Typical usage:
+    Update ``GTFS_FEEDS``, ``CHANGE_DATES``, and ``OUTPUT_DIR`` in the
+    CONFIGURATION section and run from a shell or a Jupyter notebook.
 """
 
 from __future__ import annotations

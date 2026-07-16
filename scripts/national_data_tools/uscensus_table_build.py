@@ -9,9 +9,18 @@ statistics.
 Supports input as CSV, GZ, or ZIP files (containing '-Data.csv'), and can filter
 by county FIPS codes. Output may be saved as a flat CSV.
 
+Outputs:
+    - joined_blocks.csv (OUTPUT_CSV_NAME, written into OUTPUT_DIR): the joined
+      block + tract attribute table, one row per block. Set OUTPUT_DIR to None
+      to skip writing and use build_joined_table in memory instead.
+
 Helpful links:
     https://data.census.gov/table
     https://lehd.ces.census.gov/data/
+
+Typical usage:
+    Update ROOT_DATA_DIR and OUTPUT_DIR in the CONFIGURATION section and run
+    from a shell or a Jupyter notebook.
 """
 
 from __future__ import annotations

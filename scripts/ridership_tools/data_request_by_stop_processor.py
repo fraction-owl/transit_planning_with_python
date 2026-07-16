@@ -37,6 +37,21 @@ full resolved STOP_IDS list actually used for that run.
 The script is designed for analysts and data scientists who need a quick and
 repeatable tool for ad-hoc stop ridership data requests, and it is suitable
 for use in environments like ArcGIS Pro or Jupyter Notebooks.
+
+Outputs
+-------
+- ``<input stem>_processed.xlsx`` (stem + ``OUTPUT_FILE_SUFFIX`` +
+  ``OUTPUT_FILE_EXTENSION``, written to ``OUTPUT_DIR`` or next to the input) --
+  a workbook with ``Summary``, ``Original``, and ``All Time Periods`` sheets,
+  one sheet per entry in ``TIME_PERIODS``, plus optional ``Stops Clean`` (GTFS
+  enrichment) and ``Route Analysis`` sheets.
+- ``<output stem>_runlog.txt`` -- sidecar run log capturing the verbatim
+  CONFIGURATION block (and the STOP_IDS_FILE hash/IDs when that option is used).
+
+Typical usage
+-------------
+Update the paths in the CONFIGURATION section and run from a shell, ArcGIS
+Pro's Python window, or a Jupyter notebook.
 """
 
 from __future__ import annotations
