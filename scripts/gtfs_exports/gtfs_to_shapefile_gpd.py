@@ -442,8 +442,13 @@ def gtfs_to_shapefiles(
 # ===========================================================================
 
 
-def main() -> None:
-    """Run GTFS to Shapefile conversion using the configured default paths."""
+def main() -> int:
+    """Run GTFS to Shapefile conversion using the configured default paths.
+
+    Returns:
+        Process exit code: 0 on success, 2 if required CONFIGURATION values
+        are still placeholders.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -456,10 +461,11 @@ def main() -> None:
             "DEFAULT_GTFS_DIR and/or DEFAULT_OUTPUT_DIR are still set to their default "
             "placeholder values. Please update them in the CONFIGURATION section before running."
         )
-        return
+        return 2
     gtfs_to_shapefiles()
     logging.info("Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

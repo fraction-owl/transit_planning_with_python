@@ -784,8 +784,13 @@ def _export_lines_shapefile(
 # ============================================================================
 
 
-def main() -> None:  # noqa: D401
-    """Run the GTFS-to-shapefile pipeline with pattern selection."""
+def main() -> int:  # noqa: D401
+    """Run the GTFS-to-shapefile pipeline with pattern selection.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -796,7 +801,7 @@ def main() -> None:  # noqa: D401
             "GTFS_PATH and/or OUTPUT_FOLDER are still set to their default placeholder values. "
             "Please update them in the CONFIGURATION section before running."
         )
-        return
+        return 2
 
     arcpy.env.overwriteOutput = True
 
@@ -810,7 +815,7 @@ def main() -> None:  # noqa: D401
         _validate_tables(dfs, EXPORT_KIND, PATTERN_MODE)
     except ValueError as err:
         logging.error("ERROR – invalid GTFS feed:\n%s", err)
-        sys.exit(1)
+        return 1
 
     if EXPORT_KIND in ("stops", "both"):
         logging.info("STEP 1  Processing stops …")
@@ -829,6 +834,7 @@ def main() -> None:  # noqa: D401
             logging.error(
                 "shapes.txt and trips.txt are required for lines export; skipping gtfs_lines.shp.",
             )
+            return 1
         else:
             shape_geoms = _build_shape_geometries(shapes_df)
 
@@ -858,11 +864,12 @@ def main() -> None:  # noqa: D401
 
     logging.info("All done.")
     logging.info("Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
     try:
-        main()
+        raise SystemExit(main())
     except arcpy.ExecuteError:
         logging.error("ArcPy ExecuteError:\n%s", arcpy.GetMessages())
         raise

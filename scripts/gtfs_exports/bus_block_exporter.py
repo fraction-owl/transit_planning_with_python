@@ -854,8 +854,13 @@ def _aggregate_by_route_dir(
 # ==============================================================================
 
 
-def run() -> None:
-    """End‑to‑end pipeline: load GTFS, build per‑block schedules, write XLSX."""
+def run() -> int:
+    """End‑to‑end pipeline: load GTFS, build per‑block schedules, write XLSX.
+
+    Returns:
+        Process exit code: 0 on success, 2 if required CONFIGURATION values
+        are still placeholders.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -869,7 +874,7 @@ def run() -> None:
             "GTFS_FOLDER_PATH and/or OUTPUT_FOLDER are still set to their default placeholder "
             "values. Please update them in the CONFIGURATION section before running."
         )
-        return
+        return 2
 
     gtfs_path = Path(GTFS_FOLDER_PATH)
     out_path = Path(OUTPUT_FOLDER)
@@ -932,12 +937,18 @@ def run() -> None:
             logging.info("Wrote %s", fname)
 
     logging.info("Script completed successfully.")
+    return 0
 
 
-def main() -> None:
-    """Master entry point."""
-    run()
+def main() -> int:
+    """Master entry point.
+
+    Returns:
+        Process exit code: 0 on success, 2 if required CONFIGURATION values
+        are still placeholders.
+    """
+    return run()
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

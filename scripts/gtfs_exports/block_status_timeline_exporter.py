@@ -967,8 +967,13 @@ def load_gtfs_data(
 # ==================================================================================================
 
 
-def main() -> None:
-    """Master entry point."""
+def main() -> int:
+    """Master entry point.
+
+    Returns:
+        Process exit code: 0 on success, 2 if required CONFIGURATION values
+        are still placeholders.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -982,10 +987,11 @@ def main() -> None:
             "GTFS_FOLDER_PATH and/or BLOCK_OUTPUT_FOLDER are still set to their default "
             "placeholder values. Please update them in the CONFIGURATION section before running."
         )
-        return
+        return 2
     run_step1_gtfs_to_blocks()
     logging.info("Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

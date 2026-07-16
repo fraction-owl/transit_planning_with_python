@@ -995,8 +995,13 @@ def load_gtfs_data(
 # =============================================================================
 
 
-def main() -> None:
-    """Main script function for generating GTFS pattern exports."""
+def main() -> int:
+    """Main script function for generating GTFS pattern exports.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -1009,7 +1014,7 @@ def main() -> None:
             "INPUT_DIR and/or OUTPUT_DIR are still set to their default placeholder values. "
             "Please update them in the CONFIGURATION section before running."
         )
-        return
+        return 2
 
     if not os.path.exists(OUTPUT_DIR):
         try:
@@ -1017,7 +1022,7 @@ def main() -> None:
             logging.info("Created output directory: %s", OUTPUT_DIR)
         except OSError as exc:
             logging.error("Could not create output directory %s: %s", OUTPUT_DIR, exc)
-            return
+            return 1
 
     # Load calendar.txt (optional)
     calendar_df = None
@@ -1068,7 +1073,7 @@ def main() -> None:
 
     except (OSError, ValueError) as exc:
         logging.error("Failed to load essential GTFS files: %s", exc)
-        return
+        return 1
 
     stops_df = gtfs_data.get("stops")
     trips_df = gtfs_data.get("trips")
@@ -1077,7 +1082,7 @@ def main() -> None:
 
     if stops_df is None or trips_df is None or stop_times_df is None or routes_df is None:
         logging.error("One or more essential GTFS DataFrames could not be loaded. Exiting.")
-        return
+        return 1
 
     if any(df.empty for df in [stops_df, trips_df, stop_times_df, routes_df]):
         empty_files = [
@@ -1093,7 +1098,7 @@ def main() -> None:
             "files. Exiting.",
             ", ".join(empty_files),
         )
-        return
+        return 1
 
     # --- Type Conversions due to dtype=str from load_gtfs_data ---
     if "stop_sequence" in stop_times_df.columns:
@@ -1104,7 +1109,7 @@ def main() -> None:
         logging.error(
             "'stop_sequence' column is missing from stop_times.txt. This is critical. Exiting."
         )
-        return
+        return 1
 
     if "timepoint" in stop_times_df.columns:
         stop_times_df["timepoint"] = pd.to_numeric(stop_times_df["timepoint"], errors="coerce")
@@ -1118,17 +1123,17 @@ def main() -> None:
     filtered_trips = filter_trips(trips_df, routes_df, cal_ids=FILTER_IN_CALENDAR_IDS)
     if filtered_trips.empty:
         logging.info("No trips after filtering. This may be expected based on filters. Exiting.")
-        return
+        return 0
 
     patterns_dict = generate_unique_patterns(filtered_trips, stop_times_df, stops_df)
     if not patterns_dict:
         logging.warning("No patterns found. Exiting.")
-        return
+        return 1
 
     pattern_records = assign_pattern_ids(patterns_dict)
     if not pattern_records:
         logging.warning("No pattern records after assigning IDs. Exiting.")
-        return
+        return 1
 
     compute_earliest_start_times(pattern_records, stop_times_df)
     export_patterns_to_excel(
@@ -1137,7 +1142,8 @@ def main() -> None:
 
     logging.info("Processing complete.")
     logging.info("Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
