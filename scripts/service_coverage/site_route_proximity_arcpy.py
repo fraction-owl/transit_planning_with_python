@@ -36,7 +36,6 @@ from __future__ import annotations
 
 import logging
 import os
-import sys
 import zipfile
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -1016,8 +1015,13 @@ def _points_driven_sites(
 # =============================================================================
 
 
-def main() -> None:
-    """Run the GTFS proximity analysis."""
+def main() -> int:
+    """Run the GTFS proximity analysis.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -1028,7 +1032,7 @@ def main() -> None:
             "GTFS_FOLDER is still set to a placeholder value. "
             "Please update it in the CONFIGURATION section before running."
         )
-        return
+        return 2
 
     arcpy.env.overwriteOutput = True
     try:
@@ -1069,7 +1073,7 @@ def main() -> None:
         st_trips_routes = _apply_route_filters(st_trips_routes)
         if st_trips_routes.empty:
             logging.info("Route filters removed every route – nothing to analyze.")
-            return
+            return 0
 
         # Create projected stops FC
         stops_fc = _make_stops_fc_from_gtfs(gtfs["stops"], sr_proj)
@@ -1084,7 +1088,7 @@ def main() -> None:
 
         if not rows:
             logging.info("No results.")
-            return
+            return 0
 
         # ---------- QA: shared stops across facilities ----------
         if LOG_SHARED_STOPS:
@@ -1152,15 +1156,16 @@ def main() -> None:
         pd.DataFrame(rows).to_csv(out_csv, index=False, encoding="utf-8-sig")
         logging.info("Results written -> %s", out_csv)
         logging.info("Script completed successfully.")
+        return 0
 
     except Exception as exc:  # pylint: disable=broad-except
-        # In notebooks, re-raise to avoid IPython's nested 'inspect' failure with sys.exit
+        # In notebooks, re-raise so the traceback surfaces in the cell output.
         if _in_ipython():
             logging.error("%s", exc)
             raise
         logging.error("%s", exc)
-        sys.exit(1)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

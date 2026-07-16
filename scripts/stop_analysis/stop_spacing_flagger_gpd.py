@@ -542,8 +542,13 @@ def _build_stop_layers(
 # =============================================================================
 
 
-def main() -> None:  # noqa: D401
-    """Run the entire GTFS-to-GIS pipeline with both spacing QA checks."""
+def main() -> int:  # noqa: D401
+    """Run the entire GTFS-to-GIS pipeline with both spacing QA checks.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -557,7 +562,7 @@ def main() -> None:  # noqa: D401
             "GTFS_PATH and/or OUTPUT_FOLDER are still set to placeholder values. "
             "Please update them in the CONFIGURATION section before running."
         )
-        return
+        return 2
     # -----------------------------------------------------------------
     # STEP 0  Read GTFS tables and validate
     # -----------------------------------------------------------------
@@ -569,7 +574,7 @@ def main() -> None:  # noqa: D401
         _validate_columns(dfs)
     except ValueError as err:
         logging.error("\nERROR – invalid GTFS feed:\n%s", err)
-        sys.exit(1)
+        return 1
 
     # -----------------------------------------------------------------
     # 0·1  Route / trip filtering
@@ -627,11 +632,12 @@ def main() -> None:  # noqa: D401
 
     logging.info("\nAll done! Outputs in: %s", out_dir)
     logging.info("Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
     try:
-        main()
+        raise SystemExit(main())
     except Exception as exc:  # noqa: BLE001
         logging.error("\nUNEXPECTED ERROR: %s", exc)
         sys.exit(1)

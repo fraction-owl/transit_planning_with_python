@@ -791,8 +791,13 @@ def export_stop_maps(
 # =============================================================================
 
 
-def main() -> None:
-    """Analyze sidewalk-access impacts using a virtual-connector network."""
+def main() -> int:
+    """Analyze sidewalk-access impacts using a virtual-connector network.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -808,7 +813,7 @@ def main() -> None:
             "SIDEWALK_SHP and/or GTFS_DIR and/or OUTPUT_DIR are still set to placeholder values. "
             "Please update them in the CONFIGURATION section before running."
         )
-        return
+        return 2
     logging.info("Reading centerlines …")
     centerlines = load_centerlines(SIDEWALK_SHP, TARGET_CRS)
 
@@ -974,7 +979,8 @@ def main() -> None:
 
     logging.info("Done ✔")
     logging.info("Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

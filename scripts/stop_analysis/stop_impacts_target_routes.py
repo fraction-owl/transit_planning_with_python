@@ -466,8 +466,13 @@ def write_single_output(df: pd.DataFrame, output_dir: Path, filename: str) -> No
 # =============================================================================
 
 
-def main() -> None:
-    """Main execution function."""
+def main() -> int:
+    """Main execution function.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -478,7 +483,7 @@ def main() -> None:
             "GTFS_DIR and/or OUTPUT_DIR are still set to placeholder values. "
             "Please update them in the CONFIGURATION section before running."
         )
-        return
+        return 2
 
     logging.info("Loading GTFS tables from: %s", GTFS_DIR)
     t = load_gtfs_tables(GTFS_DIR)
@@ -596,7 +601,8 @@ def main() -> None:
 
     logging.info("Done ✔")
     logging.info("Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

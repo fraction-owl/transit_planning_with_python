@@ -364,7 +364,7 @@ def load_gtfs_data(
 # =============================================================================
 
 
-def main() -> None:
+def main() -> int:
     """Run the full route-to-district matrix generation workflow.
 
     Steps:
@@ -375,6 +375,10 @@ def main() -> None:
         5. Buffer the stops and intersect with districts.
         6. Build route-vs-district matrix.
         7. Write result to Excel.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
     """
     logging.basicConfig(
         level=LOG_LEVEL,
@@ -391,7 +395,7 @@ def main() -> None:
             "GTFS_DIR, DISTRICTS_SHP, and/or OUTPUT_DIR are still set to placeholder values. "
             "Please update them in the CONFIGURATION section before running."
         )
-        return
+        return 2
 
     # ------------------------------------------------------------------ 2 — GTFS
     try:
@@ -402,7 +406,7 @@ def main() -> None:
         )
     except (OSError, ValueError) as exc:
         logging.error("Failed to load GTFS data: %s", exc)
-        raise
+        return 1
 
     # ------------------------------------------------------------------ 3 — DISTRICTS
     districts_gdf = gpd.read_file(DISTRICTS_SHP)
@@ -432,7 +436,8 @@ def main() -> None:
     write_dataframe_to_excel(df_matrix, OUTPUT_EXCEL)
     logging.info("Done! Excel written to: %s", OUTPUT_EXCEL)
     logging.info("Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import logging
 import os
-import sys
 
 import geopandas as gpd
 import pandas as pd
@@ -187,11 +186,15 @@ def _nearby_routes(
 # =============================================================================
 
 
-def main() -> None:
+def main() -> int:
     """Runs the main analysis based on global CONFIGURATION variables.
 
     Performs either a location-based proximity search or a stop-code lookup
     and exports the results to a CSV.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
     """
     logging.basicConfig(
         level=LOG_LEVEL,
@@ -203,7 +206,7 @@ def main() -> None:
             "GTFS_FOLDER and/or OUTPUT_FOLDER are still set to placeholder values. "
             "Please update them in the CONFIGURATION section before running."
         )
-        return
+        return 2
 
     try:
         _check_gtfs(GTFS_FOLDER)
@@ -218,7 +221,7 @@ def main() -> None:
 
         if st_trips_routes.empty:
             logging.info("Route filters removed every route – nothing to analyse.")
-            return
+            return 0
 
         if INPUT_MODE == "location":
             gdf_loc = _load_locations(
@@ -239,11 +242,11 @@ def main() -> None:
         elif INPUT_MODE == "stop_code":
             if "stop_code" not in gtfs["stops"].columns:
                 logging.warning("stops.txt lacks 'stop_code' – cannot run stop_code mode.")
-                return
+                return 1
             stop_ids = gtfs["stops"][gtfs["stops"].stop_code.isin(STOP_CODE_FILTER)].stop_id
             if stop_ids.empty:
                 logging.info("No stops matched STOP_CODE_FILTER.")
-                return
+                return 0
 
             df = (
                 gtfs["stop_times"][gtfs["stop_times"].stop_id.isin(stop_ids)]
@@ -264,18 +267,19 @@ def main() -> None:
 
         if not rows:
             logging.info("No results.")
-            return
+            return 0
 
         out_csv = os.path.join(OUTPUT_FOLDER, OUTPUT_FILE_NAME)
         os.makedirs(OUTPUT_FOLDER, exist_ok=True)
         pd.DataFrame(rows).to_csv(out_csv, index=False, encoding="utf-8-sig")
         logging.info("✔  Results written → %s", out_csv)
         logging.info("Script completed successfully.")
+        return 0
 
     except Exception as exc:  # pylint: disable=broad-except
         logging.error("✖  %s", exc)
-        sys.exit(1)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

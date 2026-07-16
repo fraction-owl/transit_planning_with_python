@@ -494,7 +494,7 @@ def flag_suspicious_data(summary: pd.DataFrame) -> None:
 # =============================================================================
 
 
-def main() -> None:
+def main() -> int:
     """Primary entry point for GTFS direction classification.
 
     1. Reads GTFS files (routes, trips, stop_times, shapes, stops).
@@ -505,6 +505,10 @@ def main() -> None:
     6. Exports summarized results and per-route files to Excel, if enabled.
     7. Exports JPEG maps of dominant shapes, if enabled.
     8. Flags suspicious data where shape_direction and direction_id seem inconsistent.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
     """
     logging.basicConfig(
         level=LOG_LEVEL,
@@ -519,7 +523,7 @@ def main() -> None:
             "GTFS_FOLDER and/or OUTPUT_FOLDER are still set to placeholder values. "
             "Please update them in the CONFIGURATION section before running."
         )
-        return
+        return 2
     os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
     # Step 1: Read GTFS
@@ -570,7 +574,8 @@ def main() -> None:
 
     logging.info("Script execution completed.")
     logging.info("Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
