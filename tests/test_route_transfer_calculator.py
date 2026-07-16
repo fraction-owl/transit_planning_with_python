@@ -234,7 +234,9 @@ def test_parse_args_overrides() -> None:
     assert args.day == "all"
 
 
-def test_parse_args_ignores_unknown_orchestrator_tokens() -> None:
-    # The orchestrator's DEFAULT_CMD_TEMPLATE passes --input-dir; it must not crash.
-    args = rtc.parse_args(["--input-dir", "somewhere", "--gtfs-dirs", "feed_a"])
-    assert args.gtfs_dirs == ["feed_a"]
+def test_parse_args_rejects_unknown_tokens() -> None:
+    # Strict parsing: a stray flag (e.g. a mismatched orchestrator cmd template)
+    # fails loudly with argparse's exit code 2 instead of being silently ignored.
+    with pytest.raises(SystemExit) as excinfo:
+        rtc.parse_args(["--input-dir", "somewhere", "--gtfs-dirs", "feed_a"])
+    assert excinfo.value.code == 2
