@@ -201,6 +201,21 @@ def test_run_guard_rejects_is_express_predictor_when_excluding(monkeypatch, tmp_
         rpm.run()
 
 
+def test_main_maps_outcomes_to_exit_codes(monkeypatch, tmp_path) -> None:
+    """main() translates run()'s outcome: placeholders -> 2, a raised failure -> 1."""
+    # The shipped CONFIGURATION still holds '# <<< EDIT ME' placeholders, so
+    # run() returns None and main() reports the placeholder exit code.
+    assert rpm.main() == 2
+
+    # With real paths but a singular configuration, run() raises ValueError,
+    # which main() logs and converts to a failure exit code.
+    for attr in ("ANCHOR_PATH", "BUNDLE_DIR", "MANIFEST_PATH", "OUTPUT_DIR"):
+        monkeypatch.setattr(rpm, attr, tmp_path / attr.lower())
+    monkeypatch.setattr(rpm, "EXCLUDE_EXPRESS_FROM_FIT", True)
+    monkeypatch.setattr(rpm, "PREDICTORS", ("weekday_avg_revenue_hours", "is_express"))
+    assert rpm.main() == 1
+
+
 def test_build_express_bench_ranks_by_productivity() -> None:
     """The bench reports boardings per revenue hour and sorts most- to least-productive."""
     express = pd.DataFrame(

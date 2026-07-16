@@ -73,7 +73,6 @@ from __future__ import annotations
 import io
 import logging
 import re
-import sys
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -835,8 +834,13 @@ def _check_placeholders() -> bool:
     return found
 
 
-def main() -> None:
-    """Run the full three-stage Canadian Census DA pipeline."""
+def main() -> int:
+    """Run the full three-stage Canadian Census DA pipeline.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -845,7 +849,7 @@ def main() -> None:
 
     if _check_placeholders():
         logging.info("No processing performed. Update the configuration paths and re-run.")
-        return
+        return 2
 
     try:
         # -------- Stage 1: discover CSVs, pivot, derive indicators --------
@@ -855,7 +859,7 @@ def main() -> None:
         sources = discover_census_profile_csvs(INPUT_CSV_DIR)
         if not sources:
             logging.error("No Census Profile CSVs found — aborting.")
-            sys.exit(1)
+            return 1
 
         attrs_df = build_da_table(sources, cduid_filter=CDUIDS_TO_FILTER or None)
         logging.info("Stage 1 produced attribute table with shape %s", attrs_df.shape)
@@ -880,8 +884,9 @@ def main() -> None:
         logging.info("Pipeline completed successfully.")
     except Exception:  # noqa: BLE001
         logging.exception("Pipeline failed")
-        sys.exit(1)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -474,8 +474,13 @@ def convert_to_tides(df: pd.DataFrame) -> pd.DataFrame:
 # =============================================================================
 
 
-def main() -> None:
-    """Run the AVL -> TIDES trips_performed conversion pipeline."""
+def main() -> int:
+    """Run the AVL -> TIDES trips_performed conversion pipeline.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -489,7 +494,7 @@ def main() -> None:
             "INPUT_CSV and/or OUTPUT_DIR are still set to placeholder values. "
             "Please update them in the CONFIGURATION section before running."
         )
-        return
+        return 2
 
     if not INPUT_CSV.exists():
         logging.warning(
@@ -498,7 +503,7 @@ def main() -> None:
             INPUT_CSV,
         )
         logging.info("Completed (no data processed — update INPUT_CSV to proceed).")
-        return
+        return 1
 
     df = pd.read_csv(INPUT_CSV, low_memory=False)
     logging.info("Read %d rows, %d columns", len(df), df.shape[1])
@@ -509,7 +514,8 @@ def main() -> None:
     out.to_csv(OUTPUT_CSV, index=False)
     logging.info("Wrote %d rows -> %s", len(out), OUTPUT_CSV)
     logging.info("Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

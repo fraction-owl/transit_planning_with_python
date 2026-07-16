@@ -52,7 +52,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Final, NamedTuple
@@ -1187,8 +1186,13 @@ def write_run_log(
 # =============================================================================
 
 
-def main() -> None:
-    """Assemble the modeling table, fit the OLS model, and export results."""
+def main() -> int:
+    """Assemble the modeling table, fit the OLS model, and export results.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -1204,7 +1208,7 @@ def main() -> None:
             "File paths are still set to their defaults. Update ANCHOR_PATH, OUTPUT_DIR, "
             "BUNDLE_DIR, and MANIFEST_PATH in the CONFIGURATION section before running."
         )
-        return
+        return 2
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -1215,7 +1219,7 @@ def main() -> None:
     )
     if DEPENDENT_VAR not in table.columns:
         logging.error("Dependent variable '%s' not found in the assembled table.", DEPENDENT_VAR)
-        sys.exit(1)
+        return 1
 
     if "month" in CATEGORICAL_PREDICTORS:
         if "period" in table.columns:
@@ -1269,10 +1273,11 @@ def main() -> None:
             "Run log could not be written. Set REQUIRE_RUN_LOG = False to "
             "suppress this error when a sidecar file is genuinely impossible."
         )
-        sys.exit(1)
+        return 1
 
     logging.info("All processing complete. Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
