@@ -136,6 +136,36 @@ Jupyter Notebook is a powerful tool for running Python scripts in an interactive
 
 ---
 
+### 🐚 Option C: Running from the Shell (Command Line)
+
+Every script is also a normal command-line program — nothing about the notebook workflow is required. This suits users who prefer a terminal, or who want to automate a script in a batch file, Makefile, or scheduled task.
+
+1. **Run a script directly**
+   - Edit the CONFIGURATION section as usual, then run it with Python:
+     ```bash
+     python scripts/gtfs_exports/stop_pattern_exporter.py
+     ```
+   - ArcGIS Pro users can run the `*_arcpy` variants with Pro's bundled interpreter instead:
+     ```bat
+     "C:\Program Files\ArcGIS\Pro\bin\Python\Scripts\propy.bat" scripts\gtfs_exports\gtfs_to_shapefile_arcpy.py
+     ```
+
+2. **Override the configuration with flags (no file editing needed)**
+   - Many scripts mirror their CONFIGURATION constants as command-line flags, so you can point at new inputs per run without touching the file. See what a script accepts (and each flag's current default) with:
+     ```bash
+     python scripts/operations_tools/otp_by_route.py --help
+     ```
+     ```bash
+     python scripts/operations_tools/otp_by_route.py --otp-processed data/otp_monthly_processed.csv --output-dir out --window-months 12
+     ```
+   - Flags are parsed strictly: a mistyped flag stops the script with an error instead of being silently ignored.
+
+3. **Exit codes for automation**
+   - Scripts return `0` on success, `1` on a runtime failure, and `2` when required CONFIGURATION values are still placeholders (or flags are invalid) — so shell scripts, cron jobs, and CI pipelines can detect failures reliably (`&&`, `set -e`, `if errorlevel`, etc.).
+   - Every output file still gets its `_runlog.txt` sidecar recording the exact settings used, which serves as the audit trail for automated runs.
+
+---
+
 ## 💡 Notes for Beginners
 
 If you encounter any issues while installing Python or libraries, or if JupyterLab doesn't open as expected, here are some common troubleshooting steps:
