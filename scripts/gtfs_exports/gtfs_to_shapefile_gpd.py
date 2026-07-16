@@ -7,10 +7,13 @@ Supports configurable default input/output paths and selective export.
 Inputs:
     - GTFS directory with `stops.txt` (required) and `shapes.txt` (optional)
     - Optional export type: "stops", "lines", or "both"
+    - Optional per-route split (uses `trips.txt`/`routes.txt` when present)
 
 Outputs:
     - `gtfs_stops.shp`: Shapefile of transit stop points
     - `gtfs_lines.shp`: Shapefile of transit route line geometries
+    - `gtfs_lines_by_route/`: One shapefile per route (only when the
+      per-route split is enabled)
 
 Typical usage:
     Update the default paths in the CONFIGURATION section and run from a
@@ -20,6 +23,7 @@ Typical usage:
 
 import logging
 import os
+import re
 import zipfile
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -45,6 +49,15 @@ DEFAULT_OUTPUT_DIR: Optional[Path] = Path(r"/path/to/your/default_output_folder"
 # Set to None if you always want to provide paths as arguments
 # DEFAULT_GTFS_DIR = None
 # DEFAULT_OUTPUT_DIR = None
+
+# If True, additionally write one shapefile per route (grouped through the
+# shape_id → route_id mapping in trips.txt) into PER_ROUTE_SUBDIR alongside
+# the combined gtfs_lines.shp. Off by default to keep output folders small.
+SPLIT_BY_ROUTE: bool = False
+
+# Subdirectory (inside the output directory) that receives the per-route
+# shapefiles when SPLIT_BY_ROUTE is enabled.
+PER_ROUTE_SUBDIR: str = "gtfs_lines_by_route"
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
 
@@ -344,6 +357,187 @@ def export_gdf(gdf: gpd.GeoDataFrame, out_path: Path) -> None:
         raise IOError(f"Could not write shapefile {out_path}: {e}") from e
 
 
+def sanitize_filename_component(value: str, max_len: int = 40) -> str:
+    """Make a string safe to use as (part of) a shapefile base name.
+
+    Collapses every character outside ``[A-Za-z0-9_]`` to an underscore,
+    trims leading/trailing underscores, and truncates to *max_len*
+    characters. GTFS route identifiers may contain slashes, spaces, or
+    unicode, none of which are safe in file names (or, for ArcGIS,
+    in feature class names).
+
+    Args:
+        value: Raw string (e.g. a route_short_name or route_id).
+        max_len: Maximum length of the returned string.
+
+    Returns:
+        A non-empty, filesystem-safe string ("unnamed" if nothing survives).
+    """
+    cleaned = re.sub(r"[^A-Za-z0-9_]+", "_", value).strip("_")
+    return cleaned[:max_len].rstrip("_") or "unnamed"
+
+
+def build_export_basenames(
+    items: Sequence[tuple[str, Optional[str]]],
+    prefix: str,
+) -> dict[str, str]:
+    """Map each key to a unique, filesystem-safe shapefile base name.
+
+    Args:
+        items: ``(key, label)`` pairs. The label (e.g. route_short_name) is
+            preferred for the visible name; it falls back to the key itself
+            (e.g. route_id) when the label is missing or blank.
+        prefix: Prepended to every name, e.g. ``"route"`` → ``route_30``.
+
+    Returns:
+        Mapping of key → base name (without extension). Names are
+        deduplicated case-insensitively so they remain unique on
+        case-insensitive filesystems such as Windows.
+    """
+    used: set[str] = set()
+    out: dict[str, str] = {}
+    for key, label in items:
+        raw = label if label is not None and label.strip() else key
+        base = f"{prefix}_{sanitize_filename_component(raw)}"
+        candidate = base
+        suffix = 2
+        while candidate.lower() in used:
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+        used.add(candidate.lower())
+        out[key] = candidate
+    return out
+
+
+def map_shapes_to_routes(gtfs_dir: Path) -> Optional[pd.DataFrame]:
+    """Build a shape_id → route mapping from `trips.txt` (and `routes.txt`).
+
+    Args:
+        gtfs_dir: Path to the directory containing the GTFS files.
+
+    Returns:
+        DataFrame with columns ``shape_id``, ``route_id``, and
+        ``route_short`` (one row per distinct shape/route pair), or ``None``
+        when `trips.txt` is missing, unreadable, or lacks the needed columns.
+    """
+    if not (gtfs_dir / "trips.txt").exists():
+        logging.warning("Warning: trips.txt not found; cannot map shapes to routes.")
+        return None
+
+    try:
+        trips = load_gtfs_data(str(gtfs_dir), files=["trips.txt"])["trips"]
+    except (OSError, ValueError) as e:
+        logging.warning("Warning: Could not read trips.txt (%s); cannot map shapes to routes.", e)
+        return None
+
+    if not {"route_id", "shape_id"}.issubset(trips.columns):
+        logging.warning("Warning: trips.txt lacks route_id/shape_id; cannot map shapes to routes.")
+        return None
+
+    pairs = trips[["route_id", "shape_id"]].dropna().drop_duplicates()
+    pairs = pairs[(pairs["shape_id"].str.strip() != "") & (pairs["route_id"].str.strip() != "")]
+    if pairs.empty:
+        logging.warning("Warning: trips.txt contains no usable shape/route pairs.")
+        return None
+
+    short_lookup: dict[str, str] = {}
+    if (gtfs_dir / "routes.txt").exists():
+        try:
+            routes = load_gtfs_data(str(gtfs_dir), files=["routes.txt"])["routes"]
+            if {"route_id", "route_short_name"}.issubset(routes.columns):
+                lookup_df = routes[["route_id", "route_short_name"]].dropna()
+                short_lookup = dict(zip(lookup_df["route_id"], lookup_df["route_short_name"]))
+        except (OSError, ValueError) as e:
+            logging.warning("Warning: Could not read routes.txt (%s); using route_id for names.", e)
+
+    pairs = pairs.copy()
+    pairs["route_short"] = pairs["route_id"].map(short_lookup)
+    return pairs.reset_index(drop=True)
+
+
+def export_lines_per_route(
+    lines_gdf: gpd.GeoDataFrame,
+    gtfs_dir: Path,
+    output_dir: Path,
+) -> None:
+    """Write one shapefile per route into the PER_ROUTE_SUBDIR subfolder.
+
+    Route membership comes from the shape_id → route_id mapping in
+    `trips.txt`; a shape serving several routes appears in each of their
+    files. File names derive from route_short_name when available (falling
+    back to route_id), sanitized and deduplicated case-insensitively.
+
+    Shapes not referenced by any trip are written to
+    ``unassigned_shapes.shp`` so the split output never silently drops
+    geometry. When `trips.txt` is unavailable the function degrades to one
+    shapefile per shape_id.
+
+    Args:
+        lines_gdf: LineString GeoDataFrame as returned by :func:`read_shapes`.
+        gtfs_dir: Path to the directory containing the GTFS files.
+        output_dir: Base output directory (the subfolder is created inside).
+
+    Raises:
+        IOError: If a shapefile cannot be written.
+    """
+    if lines_gdf.empty:
+        logging.info("Info: Skipping per-route export: no line data.")
+        return
+
+    out_dir = output_dir / PER_ROUTE_SUBDIR
+    mapping = map_shapes_to_routes(gtfs_dir)
+
+    if mapping is None or mapping.empty:
+        logging.warning(
+            "Warning: No shape-to-route mapping available; "
+            "exporting one shapefile per shape_id instead."
+        )
+        shape_ids = sorted(lines_gdf["shape_id"].astype(str).unique())
+        names = build_export_basenames([(sid, None) for sid in shape_ids], prefix="shape")
+        for shape_id, group in lines_gdf.groupby("shape_id"):
+            export_gdf(group, out_dir / f"{names[str(shape_id)]}.shp")
+        logging.info("Per-shape export complete: %d shapefile(s) in %s", len(names), out_dir)
+        return
+
+    merged = lines_gdf.merge(mapping, on="shape_id", how="left")
+
+    unassigned = merged[merged["route_id"].isna()]
+    if not unassigned.empty:
+        logging.warning(
+            "Warning: %d shape(s) are not referenced by any trip; "
+            "writing them to unassigned_shapes.shp.",
+            unassigned["shape_id"].nunique(),
+        )
+        export_gdf(unassigned[["shape_id", "geometry"]], out_dir / "unassigned_shapes.shp")
+
+    assigned = merged.dropna(subset=["route_id"])
+    if assigned.empty:
+        logging.warning("Warning: No shapes could be matched to routes; nothing to split.")
+        return
+
+    route_labels = (
+        assigned[["route_id", "route_short"]]
+        .drop_duplicates(subset="route_id")
+        .sort_values("route_id")
+    )
+    names = build_export_basenames(
+        [
+            (row.route_id, row.route_short if isinstance(row.route_short, str) else None)
+            for row in route_labels.itertuples(index=False)
+        ],
+        prefix="route",
+    )
+
+    for route_id, group in assigned.groupby("route_id"):
+        out_gdf = group.rename(columns={"route_short": "rshort"})[
+            ["route_id", "rshort", "shape_id", "geometry"]
+        ].copy()
+        out_gdf["rshort"] = out_gdf["rshort"].fillna("")
+        export_gdf(out_gdf, out_dir / f"{names[str(route_id)]}.shp")
+
+    logging.info("Per-route export complete: %d route shapefile(s) in %s", len(names), out_dir)
+
+
 # --- Main Orchestration Function (Core Logic) ---
 
 
@@ -351,6 +545,7 @@ def gtfs_to_shapefiles(
     gtfs_dir: Optional[Path] = None,
     output_dir: Optional[Path] = None,
     kind: ExportKind = "both",
+    split_by_route: Optional[bool] = None,
 ) -> None:
     """Converts GTFS stops and/or shapes files to ESRI Shapefiles.
 
@@ -365,6 +560,10 @@ def gtfs_to_shapefiles(
                     DEFAULT_OUTPUT_DIR from module configuration.
         kind: Specifies elements to export ("stops", "lines", "both").
               Defaults to "both".
+        split_by_route: If True, additionally write one shapefile per route
+                        into the PER_ROUTE_SUBDIR subfolder (applies when
+                        lines are exported). If None, uses SPLIT_BY_ROUTE
+                        from module configuration.
 
     Raises:
         ValueError: If required path arguments are None and defaults are also None.
@@ -376,6 +575,7 @@ def gtfs_to_shapefiles(
     # Resolve paths using defaults if arguments are None
     resolved_gtfs_dir = gtfs_dir if gtfs_dir is not None else DEFAULT_GTFS_DIR
     resolved_output_dir = output_dir if output_dir is not None else DEFAULT_OUTPUT_DIR
+    resolved_split = split_by_route if split_by_route is not None else SPLIT_BY_ROUTE
 
     # Validate that paths are set either via args or defaults
     if resolved_gtfs_dir is None:
@@ -388,6 +588,7 @@ def gtfs_to_shapefiles(
     logging.info("Input GTFS Directory: %s", resolved_gtfs_dir)
     logging.info("Output Directory: %s", resolved_output_dir)
     logging.info("Export Type: %s", kind)
+    logging.info("Split lines by route: %s", resolved_split)
     logging.info("-" * 50)
 
     if not resolved_gtfs_dir.is_dir():
@@ -421,6 +622,9 @@ def gtfs_to_shapefiles(
         try:
             lines_gdf = read_shapes(resolved_gtfs_dir)
             export_gdf(lines_gdf, resolved_output_dir / "gtfs_lines.shp")
+            if resolved_split:
+                logging.info("\nProcessing per-route split...")
+                export_lines_per_route(lines_gdf, resolved_gtfs_dir, resolved_output_dir)
         except (ValueError, IOError) as e:
             logging.error("ERROR processing shapes: %s", e)
             # raise # Uncomment to stop execution on error

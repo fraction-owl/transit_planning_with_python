@@ -4,15 +4,21 @@ import zipfile
 from pathlib import Path
 
 import geopandas as gpd
+import pandas as pd
 import pytest
 from shapely.geometry import LineString, Point
 
 from scripts.gtfs_exports.gtfs_to_shapefile_gpd import (
     GTFS_CRS,
+    PER_ROUTE_SUBDIR,
+    build_export_basenames,
     export_gdf,
+    export_lines_per_route,
     gtfs_to_shapefiles,
+    map_shapes_to_routes,
     read_shapes,
     read_stops,
+    sanitize_filename_component,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -251,6 +257,179 @@ def test_gtfs_to_shapefiles_creates_output_dir(dc_gtfs_dir: Path, tmp_path: Path
     assert not out.exists()
     gtfs_to_shapefiles(dc_gtfs_dir, out, kind="stops")
     assert out.is_dir()
+
+
+# ---------------------------------------------------------------------------
+# sanitize_filename_component / build_export_basenames
+# ---------------------------------------------------------------------------
+
+
+def test_sanitize_replaces_unsafe_characters() -> None:
+    assert sanitize_filename_component("10/A B:C") == "10_A_B_C"
+
+
+def test_sanitize_empty_falls_back_to_unnamed() -> None:
+    assert sanitize_filename_component("///") == "unnamed"
+
+
+def test_sanitize_truncates_to_max_len() -> None:
+    assert sanitize_filename_component("x" * 100, max_len=10) == "x" * 10
+
+
+def test_build_export_basenames_prefers_label_over_key() -> None:
+    names = build_export_basenames([("route_1", "10")], prefix="route")
+    assert names == {"route_1": "route_10"}
+
+
+def test_build_export_basenames_falls_back_to_key() -> None:
+    names = build_export_basenames([("route_1", None), ("route_2", "  ")], prefix="route")
+    assert names == {"route_1": "route_route_1", "route_2": "route_route_2"}
+
+
+def test_build_export_basenames_dedupes_case_insensitively() -> None:
+    """Case-only collisions get numeric suffixes (safe on Windows filesystems)."""
+    names = build_export_basenames([("a", "X1"), ("b", "x1"), ("c", "X1")], prefix="route")
+    assert names["a"] == "route_X1"
+    assert names["b"] == "route_x1_2"
+    assert names["c"] == "route_X1_3"
+
+
+def test_build_export_basenames_dedupes_after_sanitizing() -> None:
+    """Distinct labels that sanitize to the same string still get unique names."""
+    names = build_export_basenames([("a", "10/A"), ("b", "10 A")], prefix="route")
+    assert len(set(names.values())) == 2
+
+
+# ---------------------------------------------------------------------------
+# map_shapes_to_routes
+# ---------------------------------------------------------------------------
+
+
+def test_map_shapes_to_routes_dc(dc_gtfs_dir: Path) -> None:
+    """DC fixture maps each of the 5 shapes to its route with a short name."""
+    mapping = map_shapes_to_routes(dc_gtfs_dir)
+    assert mapping is not None
+    assert set(mapping.columns) == {"shape_id", "route_id", "route_short"}
+    assert len(mapping) == 5
+    row = mapping[mapping["route_id"] == "DC_R10"].iloc[0]
+    assert row["shape_id"] == "DC_R10_shp"
+    assert row["route_short"] == "10"
+
+
+def test_map_shapes_to_routes_missing_trips_returns_none(tmp_path: Path) -> None:
+    gtfs = tmp_path / "gtfs"
+    gtfs.mkdir()
+    assert map_shapes_to_routes(gtfs) is None
+
+
+def test_map_shapes_to_routes_without_routes_txt(tmp_path: Path) -> None:
+    """Mapping still works without routes.txt; route_short is empty."""
+    gtfs = tmp_path / "gtfs"
+    gtfs.mkdir()
+    (gtfs / "trips.txt").write_text(
+        "route_id,service_id,trip_id,shape_id\nR1,wk,T1,S1\n", encoding="utf-8"
+    )
+    mapping = map_shapes_to_routes(gtfs)
+    assert mapping is not None
+    assert mapping.iloc[0]["route_id"] == "R1"
+    assert pd.isna(mapping.iloc[0]["route_short"])
+
+
+# ---------------------------------------------------------------------------
+# export_lines_per_route
+# ---------------------------------------------------------------------------
+
+
+def _write_two_shape_gtfs(gtfs: Path) -> None:
+    """Write a minimal shapes.txt with two 2-point shapes (S1, S2)."""
+    gtfs.mkdir(parents=True, exist_ok=True)
+    (gtfs / "shapes.txt").write_text(
+        "shape_id,shape_pt_lat,shape_pt_lon,shape_pt_sequence\n"
+        "S1,38.90,-77.03,1\nS1,38.91,-77.02,2\n"
+        "S2,38.92,-77.01,1\nS2,38.93,-77.00,2\n",
+        encoding="utf-8",
+    )
+
+
+def test_export_lines_per_route_dc(dc_gtfs_dir: Path, tmp_path: Path) -> None:
+    """DC fixture yields one shapefile per route, named after route_short_name."""
+    lines_gdf = read_shapes(dc_gtfs_dir)
+    out = tmp_path / "out"
+    export_lines_per_route(lines_gdf, dc_gtfs_dir, out)
+    subdir = out / PER_ROUTE_SUBDIR
+    for short in ("10", "20", "30", "40", "50H"):
+        assert (subdir / f"route_{short}.shp").exists()
+    assert len(list(subdir.glob("*.shp"))) == 5
+
+
+def test_export_lines_per_route_file_contents(dc_gtfs_dir: Path, tmp_path: Path) -> None:
+    """Each per-route shapefile carries route_id, rshort, and shape_id fields."""
+    lines_gdf = read_shapes(dc_gtfs_dir)
+    out = tmp_path / "out"
+    export_lines_per_route(lines_gdf, dc_gtfs_dir, out)
+    gdf = gpd.read_file(out / PER_ROUTE_SUBDIR / "route_10.shp")
+    assert len(gdf) == 1
+    assert gdf.iloc[0]["route_id"] == "DC_R10"
+    assert gdf.iloc[0]["rshort"] == "10"
+    assert gdf.iloc[0]["shape_id"] == "DC_R10_shp"
+    assert isinstance(gdf.iloc[0].geometry, LineString)
+
+
+def test_export_lines_per_route_fallback_per_shape(tmp_path: Path) -> None:
+    """Without trips.txt, the split degrades to one shapefile per shape_id."""
+    gtfs = tmp_path / "gtfs"
+    _write_two_shape_gtfs(gtfs)
+    lines_gdf = read_shapes(gtfs)
+    out = tmp_path / "out"
+    export_lines_per_route(lines_gdf, gtfs, out)
+    subdir = out / PER_ROUTE_SUBDIR
+    assert (subdir / "shape_S1.shp").exists()
+    assert (subdir / "shape_S2.shp").exists()
+
+
+def test_export_lines_per_route_unassigned_shapes(tmp_path: Path) -> None:
+    """Shapes not referenced by any trip land in unassigned_shapes.shp."""
+    gtfs = tmp_path / "gtfs"
+    _write_two_shape_gtfs(gtfs)
+    (gtfs / "trips.txt").write_text(
+        "route_id,service_id,trip_id,shape_id\nR1,wk,T1,S1\n", encoding="utf-8"
+    )
+    lines_gdf = read_shapes(gtfs)
+    out = tmp_path / "out"
+    export_lines_per_route(lines_gdf, gtfs, out)
+    subdir = out / PER_ROUTE_SUBDIR
+    assert (subdir / "route_R1.shp").exists()
+    assert (subdir / "unassigned_shapes.shp").exists()
+    unassigned = gpd.read_file(subdir / "unassigned_shapes.shp")
+    assert list(unassigned["shape_id"]) == ["S2"]
+
+
+def test_export_lines_per_route_empty_gdf_writes_nothing(tmp_path: Path) -> None:
+    empty = gpd.GeoDataFrame(columns=["shape_id", "geometry"], geometry=[], crs=GTFS_CRS)
+    out = tmp_path / "out"
+    export_lines_per_route(empty, tmp_path, out)
+    assert not (out / PER_ROUTE_SUBDIR).exists()
+
+
+# ---------------------------------------------------------------------------
+# gtfs_to_shapefiles — per-route split option
+# ---------------------------------------------------------------------------
+
+
+def test_gtfs_to_shapefiles_split_by_route(dc_gtfs_dir: Path, tmp_path: Path) -> None:
+    """split_by_route=True writes the combined file plus the per-route folder."""
+    out = tmp_path / "out"
+    gtfs_to_shapefiles(dc_gtfs_dir, out, kind="both", split_by_route=True)
+    assert (out / "gtfs_lines.shp").exists()
+    assert len(list((out / PER_ROUTE_SUBDIR).glob("*.shp"))) == 5
+
+
+def test_gtfs_to_shapefiles_split_off_by_default(dc_gtfs_dir: Path, tmp_path: Path) -> None:
+    """Default behavior is unchanged: no per-route subfolder appears."""
+    out = tmp_path / "out"
+    gtfs_to_shapefiles(dc_gtfs_dir, out, kind="both")
+    assert (out / "gtfs_lines.shp").exists()
+    assert not (out / PER_ROUTE_SUBDIR).exists()
 
 
 # ---------------------------------------------------------------------------
