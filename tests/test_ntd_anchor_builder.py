@@ -463,15 +463,18 @@ def test_main_writes_wide_anchor_with_all_service_days(tmp_path: Path) -> None:
     data_root.mkdir()
     _write_workbook(data_root / "JULY 2024 NTD.xlsx", _one_month_rows())
 
-    mod.main(
-        [
-            "--data-root",
-            str(data_root),
-            "--output-dir",
-            str(out_dir),
-            "--grain",
-            "cross_section",
-        ]
+    assert (
+        mod.main(
+            [
+                "--data-root",
+                str(data_root),
+                "--output-dir",
+                str(out_dir),
+                "--grain",
+                "cross_section",
+            ]
+        )
+        == 0
     )
 
     path = out_dir / "ntd_anchor.csv"
@@ -495,7 +498,7 @@ def test_main_aborts_when_no_workbooks_in_range(tmp_path: Path) -> None:
     out_dir = tmp_path / "out"
     data_root.mkdir()
 
-    with pytest.raises(SystemExit) as exc:
+    assert (
         mod.main(
             [
                 "--data-root",
@@ -506,7 +509,8 @@ def test_main_aborts_when_no_workbooks_in_range(tmp_path: Path) -> None:
                 "cross_section",
             ]
         )
-    assert exc.value.code == 1
+        == 1
+    )
     assert not (out_dir / "ntd_anchor.csv").exists()
 
 

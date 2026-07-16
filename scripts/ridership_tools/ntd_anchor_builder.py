@@ -66,7 +66,7 @@ import re
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Final, Sequence
+from typing import Any, Final, List, Optional, Sequence
 
 import pandas as pd
 
@@ -673,6 +673,34 @@ def write_run_log(output_dir: Path, summary_lines: list[str]) -> bool:
 # =============================================================================
 
 
+def notebook_safe_argv(argv: Optional[Sequence[str]]) -> Optional[List[str]]:
+    """Return the argv to parse, shielding notebook kernels from stray flags.
+
+    When a script's ``main()`` runs with no explicit ``argv`` inside a
+    Jupyter/IPython kernel, ``sys.argv`` holds kernel plumbing (for example
+    ``-f /path/kernel.json``) rather than flags meant for the script, and
+    strict ``argparse.parse_args`` would reject it and abort.  This helper
+    detects the notebook case and substitutes an empty argument list so the
+    CONFIGURATION constants stay in charge, while shell runs keep strict
+    parsing (a typo in a flag fails loudly instead of being silently ignored).
+
+    Canonical implementation: ``utils/cli_helpers.py``.
+
+    Args:
+        argv: Explicit argument list passed to ``main()``, or ``None`` to
+            fall back to ``sys.argv``.
+
+    Returns:
+        ``list(argv)`` when *argv* was provided; ``[]`` when running inside a
+        notebook kernel; otherwise ``None`` so argparse reads ``sys.argv[1:]``.
+    """
+    if argv is not None:
+        return list(argv)
+    if "ipykernel" in sys.modules:
+        return []
+    return None
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     """Create the command-line argument parser.
 
@@ -682,7 +710,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     flags are supplied.
     """
     p = argparse.ArgumentParser(
-        description="Build the NTD regression anchor from monthly ridership workbooks."
+        description="Build the NTD regression anchor from monthly ridership workbooks.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--data-root", default=str(DATA_ROOT), help="Folder of monthly NTD workbooks.")
     p.add_argument("--output-dir", default=str(OUTPUT_DIR), help="Where the anchor CSV is written.")
@@ -704,8 +733,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return p
 
 
-def main(argv: Sequence[str] | None = None) -> None:
-    """Read the monthly workbooks, build the anchor, and export it."""
+def main(argv: Sequence[str] | None = None) -> int:
+    """Read the monthly workbooks, build the anchor, and export it.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -713,7 +747,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
 
     parser = build_arg_parser()
-    args, _unknown = parser.parse_known_args(argv)
+    args = parser.parse_args(notebook_safe_argv(argv))
 
     data_root = Path(args.data_root)
     output_dir = Path(args.output_dir)
@@ -724,7 +758,7 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     if grain not in {"cross_section", "panel"}:
         logging.error("--grain must be 'cross_section' or 'panel', got '%s'.", grain)
-        sys.exit(1)
+        return 1
 
     if (
         str(data_root) == r"Path\To\Your\NTD_Folder"
@@ -734,7 +768,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             "File paths are still set to their defaults. Update DATA_ROOT and OUTPUT_DIR "
             "in the CONFIGURATION section, or pass --data-root/--output-dir, before running."
         )
-        return
+        return 2
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -752,10 +786,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         logging.error(
             "--start-month / --end-month must be blank or 'Mon-YYYY' (e.g. 'Jul-2024'): %s", exc
         )
-        sys.exit(1)
+        return 1
     if start_dt is not None and end_dt is not None and start_dt > end_dt:
         logging.error("--start-month (%s) is after --end-month (%s).", start_month, end_month)
-        sys.exit(1)
+        return 1
 
     periods = periods_in_range(workbooks, start_dt, end_dt)
     # Report the window actually applied, naming the dynamic ends explicitly so a
@@ -767,7 +801,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         logging.error(
             "No in-range workbooks were found under %s; the anchor cannot be built.", data_root
         )
-        sys.exit(1)
+        return 1
 
     logging.info("=== STEP 1: READ WORKBOOKS (%s..%s) ===", start_label, end_label)
     raw = load_raw(workbooks, periods)
@@ -795,10 +829,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             "Run log could not be written. Set REQUIRE_RUN_LOG = False to suppress this "
             "error when a sidecar file is genuinely impossible."
         )
-        sys.exit(1)
+        return 1
 
     logging.info("All processing complete. Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

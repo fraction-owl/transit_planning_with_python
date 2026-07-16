@@ -56,8 +56,9 @@ No arcpy / geopandas. pandas + numpy only.
 
 Typical usage:
 Update the paths in the CONFIG block (or pass ``--before``, ``--after`` and ``--out``,
-plus the threshold flags) and run from a shell or a Jupyter notebook — unknown
-arguments are ignored, so ``main()`` also runs cleanly inside a notebook kernel.
+plus the threshold flags) and run from a shell or a Jupyter notebook — arguments are
+parsed strictly, with ``notebook_safe_argv`` shielding notebook kernels from their
+injected argv so ``main()`` also runs cleanly inside a notebook.
 """
 
 from __future__ import annotations
@@ -67,10 +68,11 @@ import datetime as dt
 import json
 import logging
 import os
+import sys
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import numpy as np
 import pandas as pd
@@ -1718,9 +1720,40 @@ def run_compare(
 # =============================================================================
 
 
-def parse_args(argv: Optional[Sequence[str]] = None) -> tuple[argparse.Namespace, list[str]]:
-    """Parse CLI args and return ``(args, unknown_args)``."""
-    parser = argparse.ArgumentParser(description="Compare GTFS routes between two feeds.")
+def notebook_safe_argv(argv: Optional[Sequence[str]]) -> Optional[List[str]]:
+    """Return the argv to parse, shielding notebook kernels from stray flags.
+
+    When a script's ``main()`` runs with no explicit ``argv`` inside a
+    Jupyter/IPython kernel, ``sys.argv`` holds kernel plumbing (for example
+    ``-f /path/kernel.json``) rather than flags meant for the script, and
+    strict ``argparse.parse_args`` would reject it and abort.  This helper
+    detects the notebook case and substitutes an empty argument list so the
+    CONFIGURATION constants stay in charge, while shell runs keep strict
+    parsing (a typo in a flag fails loudly instead of being silently ignored).
+
+    Canonical implementation: ``utils/cli_helpers.py``.
+
+    Args:
+        argv: Explicit argument list passed to ``main()``, or ``None`` to
+            fall back to ``sys.argv``.
+
+    Returns:
+        ``list(argv)`` when *argv* was provided; ``[]`` when running inside a
+        notebook kernel; otherwise ``None`` so argparse reads ``sys.argv[1:]``.
+    """
+    if argv is not None:
+        return list(argv)
+    if "ipykernel" in sys.modules:
+        return []
+    return None
+
+
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    """Parse CLI args strictly (notebook argv is shielded via ``notebook_safe_argv``)."""
+    parser = argparse.ArgumentParser(
+        description="Compare GTFS routes between two feeds.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     parser.add_argument(
         "--before", type=Path, default=BEFORE_GTFS_DIR, help="Old/before GTFS folder"
     )
@@ -1740,17 +1773,22 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> tuple[argparse.Namespace
     )
     parser.add_argument("--split-merge-min-coverage", type=float, default=SPLIT_MERGE_MIN_COVERAGE)
     parser.add_argument("--split-merge-min-share", type=float, default=SPLIT_MERGE_MIN_SHARE)
-    args, unknown = parser.parse_known_args(list(argv) if argv is not None else None)
-    return args, unknown
+    return parser.parse_args(notebook_safe_argv(argv))
 
 
-def main(argv: Optional[Sequence[str]] = None) -> None:
-    """CLI entry point (notebook-safe)."""
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """CLI entry point (notebook-safe).
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+    args = parse_args(argv)
     if (
         _PLACEHOLDER in str(BEFORE_GTFS_DIR)
         or _PLACEHOLDER in str(AFTER_GTFS_DIR)
@@ -1760,9 +1798,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             "BEFORE_GTFS_DIR / AFTER_GTFS_DIR / OUTPUT_DIR are still placeholders. Update the "
             "CONFIG block or pass --before/--after/--out before running."
         )
-        return
+        return 2
 
-    args, _unknown = parse_args(argv)
     knobs = {
         "rekey_jaccard": args.rekey_jaccard,
         "align_minor_jaccard": args.align_minor_jaccard,
@@ -1782,7 +1819,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         knobs=knobs,
     )
     logging.info("Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
