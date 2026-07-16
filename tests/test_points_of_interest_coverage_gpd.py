@@ -298,7 +298,7 @@ def test_main_blocks_unedited_placeholder_config(monkeypatch: pytest.MonkeyPatch
     """With CONFIG untouched and no flags, main() warns and does not run."""
     calls: list[dict] = []
     monkeypatch.setattr(poi_mod, "run", lambda **kw: calls.append(kw))
-    poi_mod.main([])
+    assert poi_mod.main([]) == 2
     assert calls == []
 
 
@@ -308,7 +308,7 @@ def test_main_runs_after_config_edit(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     monkeypatch.setattr(poi_mod, "run", lambda **kw: calls.append(kw))
     monkeypatch.setattr(poi_mod, "GTFS_DIR", tmp_path / "gtfs")
     monkeypatch.setattr(poi_mod, "SHP_INPUT_DIR", tmp_path / "shp")
-    poi_mod.main([])
+    assert poi_mod.main([]) == 0
     assert len(calls) == 1
 
 

@@ -219,7 +219,7 @@ def test_main_blocks_unedited_placeholder_config(monkeypatch: pytest.MonkeyPatch
     """With CONFIG untouched and no flags, main() warns and does not run."""
     calls: list[dict] = []
     monkeypatch.setattr(cabi_mod, "run", lambda **kw: calls.append(kw))
-    cabi_mod.main([])
+    assert cabi_mod.main([]) == 2
     assert calls == []
 
 
@@ -230,7 +230,7 @@ def test_main_runs_after_config_edit(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     monkeypatch.setattr(cabi_mod, "GTFS_DIR", tmp_path / "gtfs")
     monkeypatch.setattr(cabi_mod, "STATIONS_PATH", tmp_path / "stations.geojson")
     monkeypatch.setattr(cabi_mod, "RIDERSHIP_CSV", tmp_path / "ridership.csv")
-    cabi_mod.main([])
+    assert cabi_mod.main([]) == 0
     assert len(calls) == 1
 
 
@@ -238,15 +238,18 @@ def test_main_runs_with_cli_flags_only(monkeypatch: pytest.MonkeyPatch, tmp_path
     """Flags alone (CONFIG untouched) must also reach run()."""
     calls: list[dict] = []
     monkeypatch.setattr(cabi_mod, "run", lambda **kw: calls.append(kw))
-    cabi_mod.main(
-        [
-            "--gtfs-dir",
-            str(tmp_path / "gtfs"),
-            "--stations-path",
-            str(tmp_path / "stations.geojson"),
-            "--ridership-csv",
-            str(tmp_path / "ridership.csv"),
-        ]
+    assert (
+        cabi_mod.main(
+            [
+                "--gtfs-dir",
+                str(tmp_path / "gtfs"),
+                "--stations-path",
+                str(tmp_path / "stations.geojson"),
+                "--ridership-csv",
+                str(tmp_path / "ridership.csv"),
+            ]
+        )
+        == 0
     )
     assert len(calls) == 1
 

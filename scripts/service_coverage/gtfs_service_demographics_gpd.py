@@ -56,7 +56,7 @@ import sys
 import zipfile
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, Final, Optional, Tuple
+from typing import Any, Final, List, Optional, Tuple
 
 import geopandas as gpd
 import matplotlib.pyplot as plt
@@ -2198,6 +2198,34 @@ def run(
         raise
 
 
+def notebook_safe_argv(argv: Optional[Sequence[str]]) -> Optional[List[str]]:
+    """Return the argv to parse, shielding notebook kernels from stray flags.
+
+    When a script's ``main()`` runs with no explicit ``argv`` inside a
+    Jupyter/IPython kernel, ``sys.argv`` holds kernel plumbing (for example
+    ``-f /path/kernel.json``) rather than flags meant for the script, and
+    strict ``argparse.parse_args`` would reject it and abort.  This helper
+    detects the notebook case and substitutes an empty argument list so the
+    CONFIGURATION constants stay in charge, while shell runs keep strict
+    parsing (a typo in a flag fails loudly instead of being silently ignored).
+
+    Canonical implementation: ``utils/cli_helpers.py``.
+
+    Args:
+        argv: Explicit argument list passed to ``main()``, or ``None`` to
+            fall back to ``sys.argv``.
+
+    Returns:
+        ``list(argv)`` when *argv* was provided; ``[]`` when running inside a
+        notebook kernel; otherwise ``None`` so argparse reads ``sys.argv[1:]``.
+    """
+    if argv is not None:
+        return list(argv)
+    if "ipykernel" in sys.modules:
+        return []
+    return None
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse command-line arguments, defaulting to the CONFIGURATION block.
 
@@ -2208,7 +2236,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "Estimate demographics within a GTFS-derived service area. Defaults come "
             "from the CONFIGURATION block at the top of this file; SYNTHETIC_FIELDS "
             "stays in the config block."
-        )
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
         "--analysis-mode",
@@ -2237,35 +2266,35 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         nargs="*",
         default=SERVICE_IDS_TO_INCLUDE,
         metavar="SERVICE_ID",
-        help="Calendar service_id values to keep (default: all).",
+        help="Calendar service_id values to keep (empty = auto-select weekday service).",
     )
     parser.add_argument(
         "--routes-include",
         nargs="*",
         default=ROUTES_TO_INCLUDE,
         metavar="ROUTE_ID",
-        help="Only these routes (default: all).",
+        help="Only these routes (empty = all).",
     )
     parser.add_argument(
         "--routes-exclude",
         nargs="*",
         default=ROUTES_TO_EXCLUDE,
         metavar="ROUTE_ID",
-        help="Drop these routes (default: none).",
+        help="Drop these routes.",
     )
     parser.add_argument(
         "--stops-include",
         nargs="*",
         default=STOP_IDS_TO_INCLUDE,
         metavar="STOP_ID",
-        help="Only these stops (default: all).",
+        help="Only these stops (empty = all).",
     )
     parser.add_argument(
         "--stops-exclude",
         nargs="*",
         default=STOP_IDS_TO_EXCLUDE,
         metavar="STOP_ID",
-        help="Drop these stops (default: none).",
+        help="Drop these stops.",
     )
     parser.add_argument(
         "--buffer-distance",
@@ -2326,7 +2355,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         nargs="*",
         default=FIPS_FILTER,
         metavar="FIPS",
-        help="Demographics FIPS codes to keep (default: all).",
+        help="Demographics FIPS codes to keep (empty = all).",
     )
     parser.add_argument(
         "--crs-epsg",
@@ -2339,7 +2368,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         nargs="*",
         default=EXPRESS_ROUTE_IDS,
         metavar="ROUTE_ID",
-        help="route_id values to label 'express' in route mode (default: none).",
+        help="route_id values to label 'express' in route mode.",
     )
     parser.add_argument(
         "--express-routes-file",
@@ -2353,7 +2382,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=EXPRESS_UNIDIRECTIONAL_ROUTE_IDS,
         metavar="ROUTE_ID",
         help="route_id values for unidirectional (commuter) express routes, which get "
-        "directional accounting in route mode (default: none).",
+        "directional accounting in route mode.",
     )
     parser.add_argument(
         "--express-unidirectional-routes-file",
@@ -2365,8 +2394,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         nargs="*",
         default=EXPRESS_BIDIRECTIONAL_ROUTE_IDS,
         metavar="ROUTE_ID",
-        help="route_id values for bidirectional express routes (symmetric accounting; "
-        "default: none).",
+        help="route_id values for bidirectional express routes (symmetric accounting).",
     )
     parser.add_argument(
         "--express-bidirectional-routes-file",
@@ -2400,11 +2428,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=logging.getLevelName(LOG_LEVEL),
         help="DEBUG / INFO / WARNING / ERROR.",
     )
-    return parser.parse_args(argv)
+    return parser.parse_args(notebook_safe_argv(argv))
 
 
-def main(argv: Sequence[str] | None = None) -> None:
-    """Command-line entry point. Defaults fall back to the CONFIGURATION block."""
+def main(argv: Sequence[str] | None = None) -> int:
+    """Command-line entry point. Defaults fall back to the CONFIGURATION block.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     args = parse_args(argv)
     logging.basicConfig(
         level=getattr(logging, str(args.log_level).upper(), LOG_LEVEL),
@@ -2421,7 +2454,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             "their default placeholder values. Update the CONFIGURATION section (or pass "
             "--gtfs-path/--demographics-shp/--output-dir) before running."
         )
-        return
+        return 2
     try:
         run(
             analysis_mode=args.analysis_mode,
@@ -2459,23 +2492,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     except Exception:
         # run() already logged the traceback; exit non-zero so the orchestrator
         # records a real failure instead of "produced no tables".
-        sys.exit(1)
-
-
-def _in_ipython() -> bool:
-    """Return True when running inside an IPython/Jupyter kernel."""
-    return "ipykernel" in sys.modules or "IPython" in sys.modules
+        return 1
+    return 0
 
 
 if __name__ == "__main__":  # pragma: no cover
-    # In a notebook (pasted cell or %run), use the CONFIGURATION block instead
-    # of argparse, which would otherwise try to parse the kernel's own argv.
-    if _in_ipython():
-        logging.basicConfig(
-            level=LOG_LEVEL,
-            format="%(asctime)s | %(levelname)s | %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        )
-        run()
-    else:
-        main()
+    # Strict parsing; in a notebook, notebook_safe_argv() keeps the kernel's
+    # injected argv away from argparse so the CONFIG block stays in charge.
+    raise SystemExit(main())
