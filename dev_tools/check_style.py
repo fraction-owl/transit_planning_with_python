@@ -13,11 +13,14 @@ Checks performed (per-file):
     4.  raw_string_paths  – Raw-string literals (r"…") used for path/dir config variables.
     5.  dc_crs            – Washington DC CRS referenced when a CRS config variable is defined.
     6.  imperial_units    – Imperial units (feet/miles) referenced when metric distances appear.
-    7.  notebook_guard    – `if __name__ == "__main__": main()` guard present.
+    7.  notebook_guard    – `if __name__ == "__main__": raise SystemExit(main())`
+        guard (or legacy bare `main()`) present.
     8.  main_function     – Top-level `def main()` function present.
     9.  logging_present   – `import logging` and at least one `logging.` call present.
     10. success_message   – A success/completion message via `logging` present.
     11. no_dataclasses    – No use of `dataclasses` (import or decorator).
+    12. docstring_sections – Module docstring uses the canonical section names
+        (`Inputs` / `Outputs` / `Typical usage`) from CONTRIBUTING.md.
 
 Exit status:
     0 – all enabled checks passed for all files
@@ -74,6 +77,7 @@ CHECKS_ENABLED: dict[str, bool] = {
     "logging_present": True,
     "success_message": True,
     "no_dataclasses": True,
+    "docstring_sections": True,
 }
 
 # === END CONFIG ===
@@ -125,6 +129,36 @@ _OUTPUT_WRITE_PAT: re.Pattern[str] = re.compile(
     r'|open\s*\([^)]+,\s*["\']w',
     re.IGNORECASE,
 )
+
+# Non-canonical module-docstring section names and their canonical replacements
+# (see the module-docstring template in CONTRIBUTING.md).
+_DOCSTRING_SECTION_VARIANTS: dict[str, str] = {
+    "Output": "Outputs",
+    "What it produces": "Outputs",
+    "WHAT IT PRODUCES": "Outputs",
+    "Primary outputs include": "Outputs",
+    "Input": "Inputs",
+    "Typical use": "Typical usage",
+    "Usage": "Typical usage",
+    "RUNNING IT": "Typical usage",
+}
+
+
+def _docstring_has_section(doc: str, name: str) -> bool:
+    """Return True if *doc* has a section header *name* (colon or underlined form).
+
+    Matches the exact header name, optionally followed by a parenthetical
+    (e.g. ``Outputs (CSV):``), then either a colon (Google style) or an
+    underline of dashes on the next line. Longer headers that merely start
+    with *name* (e.g. ``Output structure``) do not match.
+    """
+    head = rf"^{re.escape(name)}[ \t]*(?:\([^)\n]*\))?[ \t]*"
+    pat = re.compile(
+        rf"{head}:"  # Google style: `Outputs:` / `Outputs (CSV):`
+        rf"|{head}\n[ \t]*-{{3,}}[ \t]*$",  # underlined style
+        re.MULTILINE,
+    )
+    return bool(pat.search(doc))
 
 
 def _read_source(path: Path) -> str | None:
@@ -363,9 +397,15 @@ def check_imperial_units(src: str) -> list[Violation]:
 
 
 def check_notebook_guard(src: str) -> list[Violation]:
-    """Flag the absence of an `if __name__ == '__main__': main()` guard."""
+    """Flag the absence of an `if __name__ == '__main__':` guard calling main().
+
+    Accepted guard bodies: `raise SystemExit(main())` (preferred — propagates
+    main()'s integer return value as the process exit code), `sys.exit(main())`,
+    and the legacy bare `main()`.
+    """
     if not re.search(
-        r'if\s+__name__\s*==\s*["\']__main__["\']\s*:\s*\n[ \t]+main\s*\(',
+        r'if\s+__name__\s*==\s*["\']__main__["\']\s*:\s*\n'
+        r"[ \t]+(?:raise\s+SystemExit\s*\(\s*main|sys\.exit\s*\(\s*main|main)\s*\(",
         src,
     ):
         return [
@@ -373,8 +413,9 @@ def check_notebook_guard(src: str) -> list[Violation]:
                 check="notebook_guard",
                 line=None,
                 message=(
-                    'Missing `if __name__ == "__main__": main()` guard — '
-                    "required so the script runs from both a Jupyter notebook and the CLI"
+                    'Missing `if __name__ == "__main__": raise SystemExit(main())` guard — '
+                    "required so the script runs from both a Jupyter notebook and the CLI, "
+                    "and so shell callers see a non-zero exit code on failure"
                 ),
             )
         ]
@@ -523,6 +564,66 @@ def check_no_dataclasses(src: str, path: Path) -> list[Violation]:
     return found
 
 
+def check_docstring_sections(src: str, path: Path) -> list[Violation]:
+    """Flag module docstrings with variant section names or missing required sections."""
+    try:
+        tree = ast.parse(src, filename=str(path))
+    except SyntaxError:
+        return []
+
+    doc = ast.get_docstring(tree)
+    if doc is None:
+        return [
+            Violation(
+                check="docstring_sections",
+                line=1,
+                message=(
+                    "No module docstring — add one following the module-docstring "
+                    "template in CONTRIBUTING.md"
+                ),
+            )
+        ]
+
+    found: list[Violation] = []
+    for variant, canonical in _DOCSTRING_SECTION_VARIANTS.items():
+        if _docstring_has_section(doc, variant):
+            found.append(
+                Violation(
+                    check="docstring_sections",
+                    line=None,
+                    message=(
+                        f"Module docstring section `{variant}` should be named "
+                        f"`{canonical}` — use the canonical section names from "
+                        "CONTRIBUTING.md"
+                    ),
+                )
+            )
+
+    if _OUTPUT_WRITE_PAT.search(src) and not _docstring_has_section(doc, "Outputs"):
+        found.append(
+            Violation(
+                check="docstring_sections",
+                line=None,
+                message=(
+                    "Script writes output file(s) but its module docstring has no "
+                    "`Outputs` section — list the files it writes per CONTRIBUTING.md"
+                ),
+            )
+        )
+    if not _docstring_has_section(doc, "Typical usage"):
+        found.append(
+            Violation(
+                check="docstring_sections",
+                line=None,
+                message=(
+                    "Module docstring has no `Typical usage` section — say how to "
+                    "run the script per CONTRIBUTING.md"
+                ),
+            )
+        )
+    return found
+
+
 # =============================================================================
 # ORCHESTRATION
 # =============================================================================
@@ -562,6 +663,8 @@ def audit_file(path: Path) -> FileResult:
         violations.extend(check_success_message(src))
     if enabled.get("no_dataclasses", True):
         violations.extend(check_no_dataclasses(src, path))
+    if enabled.get("docstring_sections", True):
+        violations.extend(check_docstring_sections(src, path))
 
     return FileResult(path=path, violations=violations)
 

@@ -1232,8 +1232,13 @@ def _compute_route_transfer_tables(
 # =============================================================================
 
 
-def main() -> None:
-    """Run the GTFS feature-coverage analysis using ArcPy geometries."""
+def main() -> int:
+    """Run the GTFS feature-coverage analysis using ArcPy geometries.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -1248,7 +1253,7 @@ def main() -> None:
             "GTFS_DIR, SHP_INPUT_DIR, and/or OUTPUT_DIR are still set to placeholder values. "
             "Please update them in the CONFIGURATION section before running."
         )
-        return
+        return 2
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     gdb_path = OUTPUT_DIR / GDB_NAME
@@ -1269,7 +1274,7 @@ def main() -> None:
 
     if not layers:
         _add_message("No valid layers loaded – nothing to analyze", "ERROR")
-        return
+        return 1
 
     if not target_sr or target_sr.name == "Unknown":
         _add_message(
@@ -1277,7 +1282,7 @@ def main() -> None:
             "Please ensure at least one layer has a defined projected CRS.",
             "ERROR",
         )
-        return
+        return 1
 
     layers = _maybe_replace_facility_layers_with_parcel_buffers(
         layers=layers,
@@ -1302,7 +1307,7 @@ def main() -> None:
 
     if not arcpy.Exists(route_buffers_fc):
         _add_message("Route buffers feature class not created – nothing to do", "ERROR")
-        return
+        return 1
 
     _add_message("Counting features per route", "INFO")
     summary_df = _count_features(
@@ -1315,7 +1320,7 @@ def main() -> None:
 
     if summary_df.empty:
         _add_message("No summary produced – check logs for errors/warnings.", "ERROR")
-        return
+        return 1
 
     summary_path = OUTPUT_DIR / "all_routes_feature_summary.csv"
     summary_df.to_csv(summary_path)
@@ -1345,7 +1350,8 @@ def main() -> None:
 
     _add_message("Done.", "INFO")
     logging.info("Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

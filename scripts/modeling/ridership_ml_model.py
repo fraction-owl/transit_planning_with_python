@@ -53,12 +53,16 @@ Outputs:
     - Optional diagnostic plots (predicted-vs-actual, residuals, importance bar
       chart, and partial-dependence curves for the top predictors).
     - A run log capturing the verbatim configuration block.
+
+Typical usage:
+    Update the paths in the CONFIGURATION section and run from a shell or a
+    Jupyter notebook in an environment with ``scikit-learn`` installed (a bare
+    ArcGIS Pro environment will not do).
 """
 
 from __future__ import annotations
 
 import logging
-import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Final, NamedTuple
@@ -1081,8 +1085,13 @@ def write_run_log(output_dir: Path) -> bool:
 # =============================================================================
 
 
-def main() -> None:
-    """Assemble the modeling table, compare ML models, and export results."""
+def main() -> int:
+    """Assemble the modeling table, compare ML models, and export results.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -1095,7 +1104,7 @@ def main() -> None:
             "OUTPUT_DIR, and the FEATURE_TABLES paths in the CONFIGURATION section "
             "before running."
         )
-        return
+        return 2
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -1104,7 +1113,7 @@ def main() -> None:
     table = assemble_model_table(ANCHOR_PATH, ANCHOR_SHEET, FEATURE_TABLES)
     if DEPENDENT_VAR not in table.columns:
         logging.error("Dependent variable '%s' not found in the assembled table.", DEPENDENT_VAR)
-        sys.exit(1)
+        return 1
 
     if "month" in CATEGORICAL_PREDICTORS:
         if "period" in table.columns:
@@ -1174,10 +1183,11 @@ def main() -> None:
             "Run log could not be written. Set REQUIRE_RUN_LOG = False to "
             "suppress this error when a sidecar file is genuinely impossible."
         )
-        sys.exit(1)
+        return 1
 
     logging.info("All processing complete. Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -4,11 +4,13 @@ This script processes GTFS files (e.g., trips.txt, stop_times.txt) to export
 Excel schedule sheets by route, direction, and service type. Output mimics
 print-style public schedules.
 
-Typical usage is within ArcGIS Pro or a Jupyter notebook. Configuration is
-manual: edit constants near the top before execution.
-
 Outputs:
     - One Excel file per route × service type with schedule sheets by direction
+
+Typical usage:
+    Configuration is manual: edit the constants in the CONFIGURATION section
+    near the top before execution, then run within ArcGIS Pro or a Jupyter
+    notebook.
 """
 
 from __future__ import annotations
@@ -971,8 +973,13 @@ def load_gtfs_data(
 # =============================================================================
 
 
-def main() -> None:
-    """Coordinate the end-to-end GTFS → Excel workflow."""
+def main() -> int:
+    """Coordinate the end-to-end GTFS → Excel workflow.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -986,7 +993,7 @@ def main() -> None:
             "GTFS_FOLDER_PATH and/or BASE_OUTPUT_PATH are still set to their default placeholder "
             "values. Please update them in the CONFIGURATION section before running."
         )
-        return
+        return 2
 
     if not os.path.exists(BASE_OUTPUT_PATH):
         os.makedirs(BASE_OUTPUT_PATH)
@@ -1004,40 +1011,40 @@ def main() -> None:
     except OSError as error:
         logging.error("GTFS data loading error (OS): %s", error)
         if _in_ipython():
-            return
+            return 1
         raise
     except ValueError as error:
         logging.error("GTFS data loading error (Value): %s", error)
         if _in_ipython():
-            return
+            return 1
         raise
     except RuntimeError as error:
         logging.error("GTFS data loading error (Runtime): %s", error)
         if _in_ipython():
-            return
+            return 1
         raise
     except Exception as error:
         logging.error("An unexpected error occurred while loading GTFS files: %s", error)
         if _in_ipython():
-            return
+            return 1
         raise
 
     # Ensure required tables are present
     if "calendar" not in data:
         logging.error("Error: 'calendar.txt' not found in loaded GTFS data. Exiting.")
         if _in_ipython():
-            return
+            return 1
         raise RuntimeError("'calendar.txt' missing from loaded GTFS data.")
 
     calendar_df_filtered = filter_calendar_df(data["calendar"])
     if calendar_df_filtered is None:
         logging.info("Exiting due to no service IDs to process.")
-        return
+        return 0
 
     if "stop_times" not in data:
         logging.error("Error: 'stop_times.txt' not found in loaded GTFS data. Exiting.")
         if _in_ipython():
-            return
+            return 1
         raise RuntimeError("'stop_times.txt' missing from loaded GTFS data.")
     timepoints_df = prepare_timepoints(data["stop_times"])
 
@@ -1052,7 +1059,7 @@ def main() -> None:
         if key not in data:
             logging.error("Error: '%s.txt' not found in loaded GTFS data. Exiting.", key)
             if _in_ipython():
-                return
+                return 1
             raise RuntimeError(f"'{key}.txt' missing from loaded GTFS data.")
 
     ctx = {
@@ -1072,9 +1079,10 @@ def main() -> None:
     except Exception as e:
         logging.error("An error occurred during schedule processing: %s", e, exc_info=True)
         if _in_ipython():
-            return
+            return 1
         raise
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

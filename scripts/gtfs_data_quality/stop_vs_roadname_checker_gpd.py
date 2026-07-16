@@ -12,6 +12,10 @@ Inputs:
 
 Outputs:
     - CSV listing potential stop name typos and similarity scores
+
+Typical usage:
+    Update the paths in the CONFIGURATION section and run from a shell or a
+    Jupyter notebook.
 """
 
 import logging
@@ -563,8 +567,13 @@ def load_gtfs_data(
 # =============================================================================
 
 
-def main() -> None:
-    """Entry point for the GTFS stop-vs-road typo-checker script."""
+def main() -> int:
+    """Entry point for the GTFS stop-vs-road typo-checker script.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     # ------------------------------------------------------------------
     # 1. Configure logging *inside* main so importing this module is silent
     # ------------------------------------------------------------------
@@ -578,7 +587,7 @@ def main() -> None:
             "GTFS_FOLDER and/or OUTPUT_DIR are still set to placeholder values. "
             "Please update them in the CONFIGURATION section before running."
         )
-        return
+        return 2
     logging.info("Starting processing …")
 
     # ------------------------------------------------------------------
@@ -653,7 +662,8 @@ def main() -> None:
         typos_df.to_csv(out_path, index=False)
         logging.info("Potential typos saved to %s", out_path)
     logging.info("Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

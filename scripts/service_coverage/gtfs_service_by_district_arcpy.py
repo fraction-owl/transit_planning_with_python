@@ -14,6 +14,18 @@ It follows these steps:
    to link GTFS stops to districts.
 6. Maps routes to districts if any stop on the route is spatially joined to that district.
 7. Outputs the final route-district matrix as an Excel file.
+
+Outputs
+-------
+- ``OUTPUT_EXCEL_NAME`` (default ``Excel_File.xlsx``) — Excel workbook with a
+  ``route_district_matrix`` sheet (one row per route, one column per district) and a
+  ``districts_with_routes`` sheet (one row per district listing the routes serving it).
+- ``gtfs_route_district_matrix.log`` in ``LOG_DIR`` — run log mirroring console output.
+
+Typical usage
+-------------
+Update the paths in the CONFIGURATION section and run from a shell, ArcGIS Pro's Python
+window, or a Jupyter notebook (requires ArcGIS Pro's ``arcpy``).
 """
 
 from __future__ import annotations
@@ -473,8 +485,13 @@ def build_district_route_list(matrix: pd.DataFrame) -> pd.DataFrame:
 # =============================================================================
 
 
-def main() -> None:
-    """Main execution function to run the GTFS-district spatial analysis workflow."""
+def main() -> int:
+    """Main execution function to run the GTFS-district spatial analysis workflow.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     if (
         GTFS_DIR == r"Path\To\Your\GTFS_data"
         or DISTRICTS_FC == r"Path\To\Your\Districts.shp"
@@ -484,7 +501,7 @@ def main() -> None:
             "GTFS_DIR, DISTRICTS_FC, and/or OUTPUT_DIR are still set to placeholder values. "
             "Please update them in the CONFIGURATION section before running."
         )
-        return
+        return 2
     configure_logging(LOG_DIR)
     arcpy.env.overwriteOutput = True
 
@@ -522,7 +539,8 @@ def main() -> None:
         district_df.to_excel(writer, sheet_name="districts_with_routes", index=False)
     logging.info("Done. Excel written to: %s", OUTPUT_EXCEL)
     logging.info("Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

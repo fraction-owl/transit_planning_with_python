@@ -4,11 +4,27 @@ Designed for ArcGIS Pro workflows, this script merges stop-level ridership data 
 an Excel file with stop locations (from a shapefile or GTFS stops.txt), and optionally
 joins to a polygon layer (e.g., Census Blocks) for geographic aggregation.
 
-Outputs include shapefiles of stops with ridership attributes, CSV summaries, and,
-if a polygon layer is provided, shapefiles and CSVs with aggregated ridership by area.
-Optionally renders per-route boardings/alightings maps from GTFS shapes (see DRAW_PLOTS).
+Outputs:
+    Shapefiles land in OUTPUT_FOLDER/shapefiles/; CSVs and the run log stay at the
+    OUTPUT_FOLDER root.
 
-Typical use:
+    - bus_stops_generated.shp: stops feature class built from GTFS stops.txt
+      (when BUS_STOPS_INPUT is a GTFS feed rather than a shapefile).
+    - BusStops_JoinedPolygon.shp: stops spatially joined to the polygon layer
+      (when POLYGON_LAYER is set).
+    - bus_stops_with_polygon.csv: stop attributes (plus polygon fields) exported
+      from the joined feature class.
+    - BusStops_Matched_JoinedPolygon.shp: matched stops carrying ridership fields
+      (single-run mode), or one BusStops_<route>.shp per route when SPLIT_BY_ROUTE.
+    - agg_ridership_per_stop.csv: network-wide ridership per stop (single-run mode).
+    - agg_ridership_by_polygon.csv and polygon_with_ridership.shp: ridership
+      aggregated to the polygon layer (when POLYGON_LAYER is set).
+    - plots/route_<route>_<measure>.png: per-route boardings/alightings maps drawn
+      from GTFS shapes (when DRAW_PLOTS is True).
+    - stops_ridership_joiner_arcpy_runlog.txt: run-log sidecar capturing the
+      verbatim CONFIGURATION block.
+
+Typical usage:
     Configure paths and options at the top of the script, then run inside ArcGIS Pro
     or as a standalone Python script with access to the ArcPy environment.
 """
@@ -1170,11 +1186,15 @@ def write_run_log(output_folder: str) -> bool:
 # =============================================================================
 
 
-def main() -> None:
+def main() -> int:
     """Main entry point for the script.
 
     Either processes all routes at once (creating a single shapefile) or splits
     by route (creating multiple shapefiles), depending on SPLIT_BY_ROUTE.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
     """
     logging.basicConfig(
         level=LOG_LEVEL,
@@ -1189,7 +1209,7 @@ def main() -> None:
             "File paths are still set to their defaults. Update BUS_STOPS_INPUT and "
             "EXCEL_FILE in the CONFIGURATION section before running."
         )
-        return
+        return 2
 
     # >>>>> NEW BRANCHING LOGIC <<<<<
     if not SPLIT_BY_ROUTE:
@@ -1297,10 +1317,11 @@ def main() -> None:
             "Run log could not be written. Set REQUIRE_RUN_LOG = False to "
             "suppress this error when a sidecar file is genuinely impossible."
         )
-        sys.exit(1)
+        return 1
 
     logging.info("Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

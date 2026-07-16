@@ -31,11 +31,17 @@ Inputs
   ``cabi_weekday_riders_served`` matches the non-holiday-weekday posture of
   the GTFS-side feature scripts.
 
-Output
-------
+Outputs
+-------
 - ``cabi_coverage_by_route.csv`` — columns ``route_id``, ``route_short_name``
   (when available), ``cabi_stations_served``, ``cabi_weekday_riders_served``,
   ``cabi_saturday_riders_served``, and ``cabi_sunday_riders_served``.
+
+Typical usage
+-------------
+Update the paths in the CONFIGURATION section (or pass the matching CLI flags,
+e.g. ``--gtfs-dir``, ``--stations-path``, ``--ridership-csv``, ``--output-dir``)
+and run from a shell or a Jupyter notebook.
 
 Assumptions
 -----------
@@ -55,7 +61,7 @@ import logging
 import math
 import sys
 from pathlib import Path
-from typing import List, Mapping, Sequence
+from typing import List, Mapping, Optional, Sequence
 
 import geopandas as gpd
 import pandas as pd
@@ -575,13 +581,42 @@ def run(
     return summary
 
 
+def notebook_safe_argv(argv: Optional[Sequence[str]]) -> Optional[List[str]]:
+    """Return the argv to parse, shielding notebook kernels from stray flags.
+
+    When a script's ``main()`` runs with no explicit ``argv`` inside a
+    Jupyter/IPython kernel, ``sys.argv`` holds kernel plumbing (for example
+    ``-f /path/kernel.json``) rather than flags meant for the script, and
+    strict ``argparse.parse_args`` would reject it and abort.  This helper
+    detects the notebook case and substitutes an empty argument list so the
+    CONFIGURATION constants stay in charge, while shell runs keep strict
+    parsing (a typo in a flag fails loudly instead of being silently ignored).
+
+    Canonical implementation: ``utils/cli_helpers.py``.
+
+    Args:
+        argv: Explicit argument list passed to ``main()``, or ``None`` to
+            fall back to ``sys.argv``.
+
+    Returns:
+        ``list(argv)`` when *argv* was provided; ``[]`` when running inside a
+        notebook kernel; otherwise ``None`` so argparse reads ``sys.argv[1:]``.
+    """
+    if argv is not None:
+        return list(argv)
+    if "ipykernel" in sys.modules:
+        return []
+    return None
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse command-line arguments, defaulting to the CONFIGURATION block."""
     parser = argparse.ArgumentParser(
         description=(
             "Roll bikeshare station counts and day-type ridership up to GTFS routes. "
             "Defaults come from the CONFIGURATION block at the top of this file."
-        )
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
         "--gtfs-dir", type=Path, default=GTFS_DIR, help="Folder containing GTFS .txt files."
@@ -616,7 +651,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         nargs="*",
         default=ROUTE_FILTER,
         metavar="ROUTE_ID",
-        help="Only analyze these route_id values (default: all).",
+        help="Only analyze these route_id values (empty = all).",
     )
     parser.add_argument(
         "--station-id-field",
@@ -634,7 +669,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=logging.getLevelName(LOG_LEVEL),
         help="DEBUG / INFO / WARNING / ERROR.",
     )
-    return parser.parse_args(argv)
+    return parser.parse_args(notebook_safe_argv(argv))
 
 
 # Literal placeholder input paths shipped in the CONFIGURATION block, frozen
@@ -648,8 +683,13 @@ _PLACEHOLDER_STATIONS_PATH = Path(r"data/gbfs")
 _PLACEHOLDER_RIDERSHIP_CSV = Path(r"data/station_daytype_ridership.csv")
 
 
-def main(argv: Sequence[str] | None = None) -> None:
-    """Command-line entry point. Defaults fall back to the CONFIGURATION block."""
+def main(argv: Sequence[str] | None = None) -> int:
+    """Command-line entry point. Defaults fall back to the CONFIGURATION block.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     args = parse_args(argv)
     logging.basicConfig(
         level=getattr(logging, str(args.log_level).upper(), LOG_LEVEL),
@@ -684,7 +724,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             " and ".join(name for name, _ in unset),
             " / ".join(flag for _, flag in unset),
         )
-        return
+        return 2
     run(
         gtfs_dir=args.gtfs_dir,
         stations_path=args.stations_path,
@@ -697,22 +737,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         station_id_field=args.station_id_field,
         output_csv_name=args.output_name,
     )
-
-
-def _in_ipython() -> bool:
-    """Return True when running inside an IPython/Jupyter kernel."""
-    return "ipykernel" in sys.modules or "IPython" in sys.modules
+    return 0
 
 
 if __name__ == "__main__":
-    # In a notebook (pasted cell or %run), use the CONFIGURATION block instead
-    # of argparse, which would otherwise try to parse the kernel's own argv.
-    if _in_ipython():
-        logging.basicConfig(
-            level=LOG_LEVEL,
-            format="%(asctime)s | %(levelname)s | %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        )
-        run()
-    else:
-        main()
+    # Strict parsing; in a notebook, notebook_safe_argv() keeps the kernel's
+    # injected argv away from argparse so the CONFIG block stays in charge.
+    raise SystemExit(main())

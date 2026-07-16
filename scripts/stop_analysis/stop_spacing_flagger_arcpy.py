@@ -4,7 +4,7 @@ This module converts a General Transit Feed Specification (GTFS) package
 (directory or .zip) into projected ESRI Shapefiles suitable for spatial analysis
 and provides quality assurance (QA) checks on stop spacing.
 
-Primary outputs include:
+Outputs:
 * Shapefiles for served stops, route polylines, and stop-to-stop segments
 * Logs flagging consecutive served stops that are spaced too closely
 * CSVs identifying potential “missed” stops located between long stop-to-stop gaps
@@ -12,6 +12,10 @@ Primary outputs include:
 The long-spacing check examines whether stops from other routes fall within a
 specified buffer distance of unusually long segments and may merit further
 review as possible missed service opportunities.
+
+Typical usage:
+Update the paths in the CONFIGURATION section and run from ArcGIS Pro's Python
+window or a shell whose environment provides ``arcpy`` (an ArcGIS Pro install).
 """
 
 from __future__ import annotations
@@ -984,8 +988,13 @@ def _flag_long_spacing_csv(
 # =============================================================================
 
 
-def main() -> None:  # noqa: D401
-    """Run the entire GTFS-to-GIS pipeline with both spacing QA checks."""
+def main() -> int:  # noqa: D401
+    """Run the entire GTFS-to-GIS pipeline with both spacing QA checks.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -996,7 +1005,7 @@ def main() -> None:  # noqa: D401
             "GTFS_PATH and/or OUTPUT_FOLDER are still set to placeholder values. "
             "Please update them in the CONFIGURATION section before running."
         )
-        return
+        return 2
     arcpy.env.overwriteOutput = True
 
     out_dir = _ensure_output_folder(OUTPUT_FOLDER)
@@ -1007,7 +1016,7 @@ def main() -> None:  # noqa: D401
         _validate_columns(dfs)
     except ValueError as err:
         logging.error("ERROR – invalid GTFS feed:\n%s", err)
-        sys.exit(1)
+        return 1
 
     logging.info("STEP 0·1  Filtering routes and trips …")
     routes_df, trips_df = _filter_routes(
@@ -1077,11 +1086,12 @@ def main() -> None:  # noqa: D401
 
     logging.info("All done! Outputs in: %s", out_dir)
     logging.info("Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
     try:
-        main()
+        raise SystemExit(main())
     except Exception:  # noqa: BLE001
         logging.exception("UNEXPECTED ERROR")
         sys.exit(1)

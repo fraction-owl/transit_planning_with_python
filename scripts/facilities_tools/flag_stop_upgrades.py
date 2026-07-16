@@ -5,7 +5,9 @@ This script reads stop-level ridership and amenity information from one or
 duplicate STOP_IDs, then computes boolean "FLAG_*" columns to highlight where
 usage warrants an upgrade but the amenity is missing.
 
-It outputs a multi-sheet Excel workbook and a plain-text log file:
+Outputs
+-------
+Both files are written to ``OUTPUT_FOLDER``:
 
     stops_needing_improvement.xlsx:
         Raw Data – Unmodified import.
@@ -19,6 +21,11 @@ It outputs a multi-sheet Excel workbook and a plain-text log file:
 
 Typical use-cases include batch reviews of bus-stop needs based on ArcGIS
 outputs, planning reports, or independently maintained amenity inventories.
+
+Typical usage
+-------------
+Update the paths in the CONFIGURATION section and run from a shell or a
+Jupyter notebook.
 """
 
 from __future__ import annotations
@@ -233,8 +240,13 @@ def _is_placeholder_path(p: Path) -> bool:
     return any(marker in s for marker in _PLACEHOLDER_MARKERS)
 
 
-def main() -> None:
-    """Run the ETL pipeline and produce both Excel and text outputs."""
+def main() -> int:
+    """Run the ETL pipeline and produce both Excel and text outputs.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -254,7 +266,7 @@ def main() -> None:
             "before running. Exiting without processing.",
             ", ".join(unset),
         )
-        return
+        return 2
 
     OUTPUT_FOLDER.mkdir(parents=True, exist_ok=True)
 
@@ -291,7 +303,8 @@ def main() -> None:
 
     logging.info("flag_stop_upgrades.py completed successfully.")
     logging.info("Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

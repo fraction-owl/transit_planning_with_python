@@ -17,6 +17,19 @@ The behaviour is controlled entirely by the *CONFIGURATION* constants below;
 no command‑line flags are required.  Adjust paths, time‑window parameters, or
 filters (e.g. selected `service_id`s, maximum trips per block, or specific
 `route_short_name`s) to match the target feed.
+
+Outputs
+-------
+- One Excel workbook per vehicle block (`block_<block_id>.xlsx`) in
+  `OUTPUT_FOLDER`: one row per minute with timestamp, trip start time, route,
+  direction, trip, stop metadata, status, and interlined route.
+- When `AGGREGATE_BY_ROUTE_DIR` is True, one workbook per *Route × Direction*
+  (`route_<route>_dir_<direction>.xlsx`) is written instead.
+
+Typical usage
+-------------
+Update the paths in the CONFIGURATION section and run from a shell, ArcGIS
+Pro's Python window, or a Jupyter notebook.
 """
 
 from __future__ import annotations
@@ -841,8 +854,13 @@ def _aggregate_by_route_dir(
 # ==============================================================================
 
 
-def run() -> None:
-    """End‑to‑end pipeline: load GTFS, build per‑block schedules, write XLSX."""
+def run() -> int:
+    """End‑to‑end pipeline: load GTFS, build per‑block schedules, write XLSX.
+
+    Returns:
+        Process exit code: 0 on success, 2 if required CONFIGURATION values
+        are still placeholders.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -856,7 +874,7 @@ def run() -> None:
             "GTFS_FOLDER_PATH and/or OUTPUT_FOLDER are still set to their default placeholder "
             "values. Please update them in the CONFIGURATION section before running."
         )
-        return
+        return 2
 
     gtfs_path = Path(GTFS_FOLDER_PATH)
     out_path = Path(OUTPUT_FOLDER)
@@ -919,12 +937,18 @@ def run() -> None:
             logging.info("Wrote %s", fname)
 
     logging.info("Script completed successfully.")
+    return 0
 
 
-def main() -> None:
-    """Master entry point."""
-    run()
+def main() -> int:
+    """Master entry point.
+
+    Returns:
+        Process exit code: 0 on success, 2 if required CONFIGURATION values
+        are still placeholders.
+    """
+    return run()
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

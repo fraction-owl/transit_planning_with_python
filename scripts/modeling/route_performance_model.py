@@ -47,6 +47,11 @@ Outputs:
 
 ArcGIS Pro Python stack only (numpy / scipy / pandas / matplotlib); no statsmodels,
 scikit-learn, or pyarrow. Runs in a notebook via %run or as a script.
+
+Typical usage:
+    Transfer in the Part A bundle folder, update the paths in the CONFIGURATION section,
+    and run on the secured box from a shell, ArcGIS Pro's Python window, or a Jupyter
+    notebook (via ``%run``).
 """
 
 from __future__ import annotations
@@ -1311,5 +1316,24 @@ def run() -> Optional[OLSResult]:
     return result
 
 
+def main() -> int:
+    """Run the model as a script and translate the outcome into an exit code.
+
+    Thin shell wrapper around :func:`run` — notebook users should keep calling
+    ``run()`` directly to get the fitted :class:`OLSResult` back.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
+    try:
+        result = run()
+    except (OSError, KeyError, ValueError) as exc:
+        logging.error("%s", exc)
+        return 1
+    # run() returns None only when the '# <<< EDIT ME' placeholder guard fired.
+    return 2 if result is None else 0
+
+
 if __name__ == "__main__":
-    run()
+    raise SystemExit(main())

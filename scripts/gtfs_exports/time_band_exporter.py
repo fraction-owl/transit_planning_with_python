@@ -9,10 +9,15 @@ row with:
 - **Segment columns** – runtime (minutes) from the previous time-point
   (first cell is ``MISSING_TIME``)
 
-Output structure
-----------------
+Outputs
+-------
 - One Excel workbook per ``(route_id, service_id)``
 - One sheet per ``direction_id`` within that workbook
+
+Typical usage
+-------------
+Update the paths in the CONFIGURATION section and run from a shell, ArcGIS
+Pro's Python window, or a Jupyter notebook.
 """
 
 from __future__ import annotations
@@ -359,8 +364,13 @@ def export_excel(
 # ==================================================================================================
 
 
-def main() -> None:
-    """Entry-point when the module is executed as a script."""
+def main() -> int:
+    """Entry-point when the module is executed as a script.
+
+    Returns:
+        Process exit code: 0 on success, 2 if required CONFIGURATION values
+        are still placeholders.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -373,7 +383,7 @@ def main() -> None:
             "GTFS_FOLDER and/or OUTPUT_FOLDER are still set to their default placeholder values. "
             "Please update them in the CONFIGURATION section before running."
         )
-        return
+        return 2
 
     logging.info("GTFS folder   : %s", GTFS_FOLDER)
     logging.info("Output folder : %s", OUTPUT_FOLDER)
@@ -383,14 +393,15 @@ def main() -> None:
 
     if idx.empty:
         logging.warning("Nothing to export – check filters or timepoints.")
-        return
+        return 0
 
     bands = make_bands(idx)
     export_excel(bands, stop_dict, seg_dict, header_names, gtfs["routes"])
 
     logging.info("Finished – %d band rows.", len(bands))
     logging.info("Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -9,9 +9,18 @@ statistics.
 Supports input as CSV, GZ, or ZIP files (containing '-Data.csv'), and can filter
 by county FIPS codes. Output may be saved as a flat CSV.
 
+Outputs:
+    - joined_blocks.csv (OUTPUT_CSV_NAME, written into OUTPUT_DIR): the joined
+      block + tract attribute table, one row per block. Set OUTPUT_DIR to None
+      to skip writing and use build_joined_table in memory instead.
+
 Helpful links:
     https://data.census.gov/table
     https://lehd.ces.census.gov/data/
+
+Typical usage:
+    Update ROOT_DATA_DIR and OUTPUT_DIR in the CONFIGURATION section and run
+    from a shell or a Jupyter notebook.
 """
 
 from __future__ import annotations
@@ -19,7 +28,6 @@ from __future__ import annotations
 import io
 import logging
 import re
-import sys
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -731,8 +739,13 @@ __all__ = ["build_joined_table"]
 # =============================================================================
 
 
-def main() -> None:
-    """Orchestrate discovery, join, and optional CSV export."""
+def main() -> int:
+    """Orchestrate discovery, join, and optional CSV export.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -748,7 +761,7 @@ def main() -> None:
         defaults_found = True
     if defaults_found:
         logging.info("No processing performed. Update the configuration paths and re-run.")
-        return
+        return 2
 
     try:
         logging.info("Discovering Census datasets under %s …", ROOT_DATA_DIR)
@@ -777,8 +790,9 @@ def main() -> None:
         logging.info("Script completed successfully.")
     except Exception:  # noqa: BLE001
         logging.exception("Processing failed")
-        sys.exit(1)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

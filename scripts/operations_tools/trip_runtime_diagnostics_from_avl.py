@@ -8,13 +8,30 @@ Designed to support schedule tuning, the script suggests time-of-day bands using
 Fisher–Jenks segmentation and provides visual diagnostics for start time, runtime,
 and deviation patterns.
 
-Outputs per route include:
-- CSV: Trips with deviations and OTP compliance flags
-- XLSX: Summarized runtime and OTP statistics
-- XLSX: Suggested time bands for runtime adjustment
-- PNG: Diagnostic plots (e.g., runtime boxplots, schedule vs. 85th percentile)
-
 Assumes route-wise CSVs of trip observations with key timestamp columns.
+
+Outputs
+-------
+Written per route (and per direction when ``SPLIT_BY_DIRECTION`` is True) under
+``OUTPUT_ROOT_DIR/<route>/[<direction>/]``, where ``<day>`` is the service-day
+tag (e.g. ``WEEKDAY``):
+
+- ``events_retained_<day>.csv`` - trips kept for analysis, with deviations and
+  OTP compliance flags.
+- ``events_excluded_<day>.csv`` - outlier trips trimmed from the analysis
+  (only when ``WRITE_EXCLUSIONS`` is True).
+- ``trip_summary_<day>.xlsx`` - summarized runtime and OTP statistics per trip.
+- ``time_bands_<day>.xlsx`` - suggested time-of-day bands for runtime
+  adjustment.
+- ``low_sample_start_times_<day>.csv`` - start times with unusually low sample
+  counts, for data-quality review.
+- ``plots/*.png`` - diagnostic plots (start/finish/runtime deviation boxplots
+  and a scheduled vs. 85th-percentile runtime bar chart).
+
+Typical usage
+-------------
+Update the paths in the CONFIGURATION section and run from a shell, ArcGIS
+Pro's Python window, or a Jupyter notebook.
 """
 
 from __future__ import annotations
@@ -1029,7 +1046,7 @@ def suggest_time_bands(
 # =============================================================================
 
 
-def main() -> None:  # pragma: no cover
+def main() -> int:  # pragma: no cover
     """Run the end-to-end analysis for every route.
 
     * If ``SPLIT_BY_DIRECTION`` is **True** (default), rows are subdivided
@@ -1037,6 +1054,10 @@ def main() -> None:  # pragma: no cover
       ``<OUTPUT_ROOT>/<route>/<direction-slug>/``.
     * If **False**, all rows for the route are written directly to
       ``<OUTPUT_ROOT>/<route>/``.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
     """
     logging.basicConfig(
         level=LOG_LEVEL,
@@ -1055,7 +1076,7 @@ def main() -> None:  # pragma: no cover
             "INPUT_ROOT_DIR and/or OUTPUT_ROOT_DIR are still set to placeholder values. "
             "Please update them in the CONFIGURATION section before running."
         )
-        return
+        return 2
 
     if not INPUT_ROOT_DIR.exists():
         logging.warning(
@@ -1064,7 +1085,7 @@ def main() -> None:  # pragma: no cover
             INPUT_ROOT_DIR,
         )
         logging.info("Completed (no data processed — update INPUT_ROOT_DIR to proceed).")
-        return
+        return 1
 
     logging.info("→ Crawling %s for CSVs …", INPUT_ROOT_DIR)
     route_files = _discover_route_csvs(INPUT_ROOT_DIR, whitelist)
@@ -1076,7 +1097,7 @@ def main() -> None:  # pragma: no cover
             INPUT_ROOT_DIR,
         )
         logging.info("Completed (no data processed — no CSV files found).")
-        return
+        return 1
 
     # ------------------------------------------------------------------ #
     # 1.  Process each route                                             #
@@ -1190,7 +1211,8 @@ def main() -> None:  # pragma: no cover
 
     logging.info("✓✓ All routes processed.")
     logging.info("Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

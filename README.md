@@ -11,11 +11,11 @@ Turn NTD-format monthly summaries into route-level trend reports, process riders
 *Folder:* `ridership_tools/`
 
 ### Demand Modeling *(advanced)*
-For analysts comfortable assembling their own modeling tables. The core is a two-step ridership regression that keeps proprietary NTD data on one machine: `prep_features_public.py` loads, validates, and bundles the *non-NTD* feature tables — the service supplied (scheduled hours/miles), exogenous context (gas, unemployment, weather), and demographic and points-of-interest coverage — anywhere, writing a manifest with a per-bundle SHA-256, and `monthly_ridership_model.py` then runs only where the NTD anchor lives, verifying and joining each bundle before fitting a hand-rolled OLS — coefficients, robust standard errors, VIFs, AIC/BIC, and the usual diagnostics — entirely on the ArcGIS Pro `numpy`/`scipy` stack, so it needs no machine-learning package. A route-level anchor fits a cross-sectional model; a route×period anchor fits a panel that surfaces monthly and exogenous effects. A machine-learning counterpart (`ridership_ml_model.py`) ingests the *same* modeling table but swaps OLS for random-forest and gradient-boosting ensembles, comparing both against the linear baseline on cross-validated, out-of-sample accuracy and adding permutation importance and partial-dependence plots for interpretability. It captures the nonlinearities and interactions OLS can't — at the cost of a `scikit-learn` dependency (not bundled with ArcGIS Pro). For a more turnkey, opinionated route read, a two-step *cross-sectional route* pipeline pairs `gtfs_route_features.py` (in `gtfs_exports/`), which reads a GTFS feed and emits one row per route of supply and competition features, with `route_performance_model.py`, which joins those to route demographics and the NTD boardings anchor to fit a single cross-sectional OLS — reporting each route's fitted *potential* and its productivity-adjusted over/under residual, so planners can see which routes carry more or fewer riders than their fundamentals predict. Express routes can be held out of the fit and benchmarked descriptively instead (their park-and-ride catchment isn't what the buffer-based features measure), and an optional supply-free companion fit surfaces demand drivers that the dominant service term would otherwise mask. On the secured box, a parallel orchestrator (`prep_features_private.py`) assembles the proprietary side — the NTD ridership anchor plus the TIDES-derived on-time performance (`otp_by_route.py`) and running time (`route_runtime_tides.py`), each rolled up to the route over a configurable trailing window (e.g. 12 or 36 months, naive or month-normalized) — into the same bundle-plus-manifest those models already ingest.
+For analysts comfortable assembling their own modeling tables. The core is a two-step ridership regression that keeps proprietary NTD data on one machine: `prep_features_public.py` loads, validates, and bundles the *non-NTD* feature tables — the service supplied (scheduled hours/miles), exogenous context (gas, unemployment, weather), and demographic and points-of-interest coverage — anywhere, writing a manifest with a per-bundle SHA-256, and `monthly_ridership_model.py` then runs only where the NTD anchor lives, verifying and joining each bundle before fitting a hand-rolled OLS — coefficients, robust standard errors, VIFs, AIC/BIC, and the usual diagnostics — entirely on the ArcGIS Pro `numpy`/`scipy` stack, so it needs no machine-learning package. A route-level anchor fits a cross-sectional model; a route×period anchor fits a panel that surfaces monthly and exogenous effects. A machine-learning counterpart (`ridership_ml_model.py`) ingests the *same* modeling table but swaps OLS for random-forest and gradient-boosting ensembles, comparing both against the linear baseline on cross-validated, out-of-sample accuracy and adding permutation importance and partial-dependence plots for interpretability. It captures the nonlinearities and interactions OLS can't — at the cost of a `scikit-learn` dependency (not bundled with ArcGIS Pro). For a more turnkey, opinionated route read, a two-step *cross-sectional route* pipeline pairs `gtfs_route_features.py` (in `gtfs_exports/`), which reads a GTFS feed and emits one row per route of supply and competition features, with `route_performance_model.py`, which joins those to route demographics and the NTD boardings anchor to fit a single cross-sectional OLS — reporting each route's fitted *potential* and its productivity-adjusted over/under residual, so planners can see which routes carry more or fewer riders than their fundamentals predict. Express routes can be held out of the fit and benchmarked descriptively instead (their park-and-ride catchment isn't what the buffer-based features measure), and an optional supply-free companion fit surfaces demand drivers that the dominant service term would otherwise mask. On the secured box, a parallel orchestrator (`prep_features_private.py`) assembles the proprietary side — the NTD ridership anchor plus the TIDES-derived on-time performance (`otp_by_route.py`) and running time (`runtime_by_route.py`), each rolled up to the route over a configurable trailing window (e.g. 12 or 36 months, naive or month-normalized) — into the same bundle-plus-manifest those models already ingest.
 *Folder:* `modeling/`
 
 ### OTP & Runtime Diagnostics
-Stop guessing where buses are getting delayed. Pivot route-level OTP trends, diagnose runtime by trip event, and analyze segment-level runtimes. Roll on-time performance (`otp_by_route.py`) and running time (`route_runtime_tides.py`) up to the route over a trailing window for demand modeling. A stop-level counterpart (`tides_stop_otp_flagger.py`) inverts the route view and flags individual stops whose AVL data coverage or OTP falls well below the baselines of *multiple* routes serving them — a signature of stop-specific operational or data issues (mis-placed geofences, relocated stops, chronic congestion) that route rollups average away. Includes CleverWorks-to-TIDES converters for stop visits and trips performed.
+Stop guessing where buses are getting delayed. Pivot route-level OTP trends, diagnose runtime by trip event, and analyze segment-level runtimes. Roll on-time performance (`otp_by_route.py`) and running time (`runtime_by_route.py`) up to the route over a trailing window for demand modeling. A stop-level counterpart (`otp_by_stop.py`) inverts the route view — computing OTP and AVL data coverage per stop and natively flagging stops that fall well below the baselines of *multiple* routes serving them — a signature of stop-specific operational or data issues (mis-placed geofences, relocated stops, chronic congestion) that route rollups average away. Includes CleverWorks-to-TIDES converters for stop visits and trips performed.
 *Folder:* `operations_tools/`
 
 ### Service Coverage & Catchments *(arcpy + GeoPandas)*
@@ -133,6 +133,36 @@ Jupyter Notebook is a powerful tool for running Python scripts in an interactive
      output. There may also be additional configuration choices (e.g. choice of CRS, list of routes or stops to analyze)
    - You do not need to modify any code outside of the configuration section, which contains the core script logic.
    - Run the script, follow any printed instructions or error messages, and check the output for reasonableness and/or accuracy.
+
+---
+
+### 🐚 Option C: Running from the Shell (Command Line)
+
+Every script is also a normal command-line program — nothing about the notebook workflow is required. This suits users who prefer a terminal, or who want to automate a script in a batch file, Makefile, or scheduled task.
+
+1. **Run a script directly**
+   - Edit the CONFIGURATION section as usual, then run it with Python:
+     ```bash
+     python scripts/gtfs_exports/stop_pattern_exporter.py
+     ```
+   - ArcGIS Pro users can run the `*_arcpy` variants with Pro's bundled interpreter instead:
+     ```bat
+     "C:\Program Files\ArcGIS\Pro\bin\Python\Scripts\propy.bat" scripts\gtfs_exports\gtfs_to_shapefile_arcpy.py
+     ```
+
+2. **Override the configuration with flags (no file editing needed)**
+   - Many scripts mirror their CONFIGURATION constants as command-line flags, so you can point at new inputs per run without touching the file. See what a script accepts (and each flag's current default) with:
+     ```bash
+     python scripts/operations_tools/otp_by_route.py --help
+     ```
+     ```bash
+     python scripts/operations_tools/otp_by_route.py --otp-processed data/otp_monthly_processed.csv --output-dir out --window-months 12
+     ```
+   - Flags are parsed strictly: a mistyped flag stops the script with an error instead of being silently ignored.
+
+3. **Exit codes for automation**
+   - Scripts return `0` on success, `1` on a runtime failure, and `2` when required CONFIGURATION values are still placeholders (or flags are invalid) — so shell scripts, cron jobs, and CI pipelines can detect failures reliably (`&&`, `set -e`, `if errorlevel`, etc.).
+   - Every output file still gets its `_runlog.txt` sidecar recording the exact settings used, which serves as the audit trail for automated runs.
 
 ---
 

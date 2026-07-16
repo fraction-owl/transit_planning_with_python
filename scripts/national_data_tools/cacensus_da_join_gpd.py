@@ -31,6 +31,17 @@ Set ``INTERMEDIATE_COMBINED_CSV_NAME`` to an empty string or None, or leave
 ``INTERMEDIATE_DA_SHP`` as None, to skip writing those intermediate
 artifacts.
 
+Outputs
+-------
+All paths below are written into ``OUTPUT_DIR``:
+
+- ``da_joined.gpkg`` (``FINAL_JOINED_FEATURES_NAME``): final DA geometry joined
+  to the pivoted attribute table (Stage 3).
+- ``da_attributes.csv`` (``INTERMEDIATE_COMBINED_CSV_NAME``): optional Stage 1
+  wide-format DA attribute table; set the name to ""/None to skip.
+- ``INTERMEDIATE_DA_SHP``: optional Stage 2 filtered DA geometry; skipped by
+  default (None).
+
 Notes:
     The Census Profile is long-format (one row per DA × characteristic),
     unlike US Census wide-format tables.  Stage 1 pivots so each DAUID
@@ -50,6 +61,11 @@ Helpful links
 -------------
     Census Profile 2021:  https://www12.statcan.gc.ca/census-recensement/2021/dp-pd/prof/
     DA boundary file:     https://www12.statcan.gc.ca/census-recensement/2021/geo/sip-pis/boundary-limites/
+
+Typical usage
+-------------
+Update ``INPUT_CSV_DIR``, ``INPUT_SHP_DIR``, and ``OUTPUT_DIR`` in the
+CONFIGURATION section and run from a shell or a Jupyter notebook.
 """
 
 from __future__ import annotations
@@ -57,7 +73,6 @@ from __future__ import annotations
 import io
 import logging
 import re
-import sys
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -819,8 +834,13 @@ def _check_placeholders() -> bool:
     return found
 
 
-def main() -> None:
-    """Run the full three-stage Canadian Census DA pipeline."""
+def main() -> int:
+    """Run the full three-stage Canadian Census DA pipeline.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -829,7 +849,7 @@ def main() -> None:
 
     if _check_placeholders():
         logging.info("No processing performed. Update the configuration paths and re-run.")
-        return
+        return 2
 
     try:
         # -------- Stage 1: discover CSVs, pivot, derive indicators --------
@@ -839,7 +859,7 @@ def main() -> None:
         sources = discover_census_profile_csvs(INPUT_CSV_DIR)
         if not sources:
             logging.error("No Census Profile CSVs found — aborting.")
-            sys.exit(1)
+            return 1
 
         attrs_df = build_da_table(sources, cduid_filter=CDUIDS_TO_FILTER or None)
         logging.info("Stage 1 produced attribute table with shape %s", attrs_df.shape)
@@ -864,8 +884,9 @@ def main() -> None:
         logging.info("Pipeline completed successfully.")
     except Exception:  # noqa: BLE001
         logging.exception("Pipeline failed")
-        sys.exit(1)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

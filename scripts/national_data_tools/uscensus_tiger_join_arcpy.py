@@ -15,6 +15,15 @@ Stages:
     3) Join stage (ArcPy): join the attribute CSV from step 1 to the block polygons
        from step 2 using a normalized 15-digit block identifier, then write final output.
 
+Outputs
+-------
+- ``combined_blocks.csv`` (``INTERMEDIATE_COMBINED_CSV``): merged block + tract
+  attribute table from stage 1.
+- ``merged_blocks.shp`` (``INTERMEDIATE_MERGED_SHP``): merged, optionally
+  FIPS-filtered TIGER block geometry from stage 2 (shapefile or FileGDB feature class).
+- ``blocks_with_attrs.shp`` (``FINAL_JOINED_FEATURES``): final block geometry joined
+  to the attribute table from stage 3 (shapefile or FileGDB feature class).
+
 Notes:
 -----
 * ZIPped TIGER shapefiles are NOT read directly—unzip first.
@@ -28,6 +37,12 @@ Helpful links
     Demographic data: https://data.census.gov/table
     Jobs data:        https://lehd.ces.census.gov/data/
     Geographic data:  https://www.census.gov/cgi-bin/geo/shapefiles/index.php
+
+Typical usage
+-------------
+Update the paths in the CONFIGURATION section and run from ArcGIS Pro's Python
+window (or a shell/notebook using ArcGIS Pro's Python environment — the script
+requires ArcPy).
 """
 
 from __future__ import annotations
@@ -1324,8 +1339,13 @@ def run_pipeline() -> None:
         sys.exit(1)
 
 
-def main() -> None:
-    """Script entry point."""
+def main() -> int:
+    """Script entry point.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -1336,10 +1356,11 @@ def main() -> None:
             "INPUT_CSV_DIR and/or INPUT_SHP_DIR are still set to placeholder values. "
             "Please update them in the CONFIGURATION section before running."
         )
-        return
+        return 2
     run_pipeline()
     logging.info("Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

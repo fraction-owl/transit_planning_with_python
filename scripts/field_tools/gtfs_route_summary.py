@@ -634,8 +634,13 @@ def export_to_xlsx(data_frame: pd.DataFrame, output_file: str) -> None:
 # ==== MAIN ===================================================================
 
 
-def main() -> None:
-    """Entry point: load feed, build summary, write XLSX."""
+def main() -> int:
+    """Entry point: load feed, build summary, write XLSX.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
@@ -649,7 +654,7 @@ def main() -> None:
             "GTFS_FOLDER_PATH and/or BASE_OUTPUT_PATH are still set to their default "
             "placeholder values. Please update them in the CONFIGURATION section before running."
         )
-        return
+        return 2
 
     logging.info("==== GTFS Route Summary ====")
     logging.info("GTFS dir      : %s", GTFS_FOLDER_PATH)
@@ -695,18 +700,21 @@ def main() -> None:
 
         if summary.empty:
             logging.warning("Summary is empty; nothing to write.")
-            return
+            return 1
 
         export_to_xlsx(summary, os.path.join(BASE_OUTPUT_PATH, OUTPUT_FILENAME))
         logging.info("Script completed successfully.")
+        return 0
 
     except (OSError, ValueError) as exc:
         logging.error("Pipeline failed: %s", exc)
+        return 1
     except Exception:
         logging.exception("Unexpected error in pipeline")
+        return 1
     finally:
         logging.info("Exiting script.")
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

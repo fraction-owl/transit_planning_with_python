@@ -37,6 +37,21 @@ full resolved STOP_IDS list actually used for that run.
 The script is designed for analysts and data scientists who need a quick and
 repeatable tool for ad-hoc stop ridership data requests, and it is suitable
 for use in environments like ArcGIS Pro or Jupyter Notebooks.
+
+Outputs
+-------
+- ``<input stem>_processed.xlsx`` (stem + ``OUTPUT_FILE_SUFFIX`` +
+  ``OUTPUT_FILE_EXTENSION``, written to ``OUTPUT_DIR`` or next to the input) --
+  a workbook with ``Summary``, ``Original``, and ``All Time Periods`` sheets,
+  one sheet per entry in ``TIME_PERIODS``, plus optional ``Stops Clean`` (GTFS
+  enrichment) and ``Route Analysis`` sheets.
+- ``<output stem>_runlog.txt`` -- sidecar run log capturing the verbatim
+  CONFIGURATION block (and the STOP_IDS_FILE hash/IDs when that option is used).
+
+Typical usage
+-------------
+Update the paths in the CONFIGURATION section and run from a shell, ArcGIS
+Pro's Python window, or a Jupyter notebook.
 """
 
 from __future__ import annotations
@@ -1220,8 +1235,13 @@ def write_run_log(
 # =============================================================================
 
 
-def main() -> None:  # noqa: D401 – imperative mood is OK for main entry point
-    """Run the full read → filter → aggregate → (enrich) → write pipeline."""
+def main() -> int:  # noqa: D401 – imperative mood is OK for main entry point
+    """Run the full read → filter → aggregate → (enrich) → write pipeline.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -1237,14 +1257,14 @@ def main() -> None:  # noqa: D401 – imperative mood is OK for main entry point
             "File paths are still set to their defaults. Update INPUT_FILE_PATH and "
             "OUTPUT_DIR in the CONFIGURATION section before running."
         )
-        return
+        return 2
 
     if GTFS_JOIN_KEY not in {"stop_id", "stop_code"}:
         logging.error(
             "GTFS_JOIN_KEY must be 'stop_id' or 'stop_code'; got '%s'.",
             GTFS_JOIN_KEY,
         )
-        sys.exit(1)
+        return 1
 
     # Resolve the effective STOP_IDS filter: STOP_IDS_FILE (if set) takes
     # precedence over the inline STOP_IDS list.
@@ -1349,10 +1369,11 @@ def main() -> None:  # noqa: D401 – imperative mood is OK for main entry point
             "Run log could not be written. Set REQUIRE_RUN_LOG = False to "
             "suppress this error when a sidecar file is genuinely impossible."
         )
-        sys.exit(1)
+        return 1
 
     logging.info("Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

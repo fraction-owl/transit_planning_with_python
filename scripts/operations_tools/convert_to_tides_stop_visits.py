@@ -38,6 +38,17 @@ the output identifiers and records are stable across runs.
 Column names are configured via COLUMN_MAP in the CONFIGURATION section.
 Defaults are pre-set for CLEVER "Stop Visit Events" exports; update COLUMN_MAP
 values to adapt to other AVL sources.
+
+Outputs
+-------
+- `stop_visits.csv` (`OUTPUT_FILENAME`, written to `OUTPUT_DIR`) - one TIDES
+  `stop_visits` record per source stop visit event, with columns in the exact
+  order of the TIDES template (`TIDES_COLS`).
+
+Typical usage
+-------------
+Update the paths in the CONFIGURATION section and run from a shell, ArcGIS
+Pro's Python window, or a Jupyter notebook.
 """
 
 from __future__ import annotations
@@ -534,8 +545,13 @@ def convert_to_tides(df: pd.DataFrame) -> pd.DataFrame:
 # =============================================================================
 
 
-def main() -> None:
-    """Run the conversion pipeline."""
+def main() -> int:
+    """Run the conversion pipeline.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -549,7 +565,7 @@ def main() -> None:
             "INPUT_CSV and/or OUTPUT_DIR are still set to placeholder values. "
             "Please update them in the CONFIGURATION section before running."
         )
-        return
+        return 2
 
     if not INPUT_CSV.exists():
         logging.warning(
@@ -558,7 +574,7 @@ def main() -> None:
             INPUT_CSV,
         )
         logging.info("Completed (no data processed — update INPUT_CSV to proceed).")
-        return
+        return 1
 
     df = pd.read_csv(INPUT_CSV, low_memory=False)
     logging.info("Read %d rows, %d columns", len(df), df.shape[1])
@@ -569,7 +585,8 @@ def main() -> None:
     out.to_csv(OUTPUT_CSV, index=False)
     logging.info("Wrote %d rows -> %s", len(out), OUTPUT_CSV)
     logging.info("Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

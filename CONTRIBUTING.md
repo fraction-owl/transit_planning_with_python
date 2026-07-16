@@ -19,8 +19,20 @@ Participation is welcome from anyone, whether you’re new to Python, an experie
 ## 🧱 Code Structure
 
 - Scripts **must be modular**, with a clearly defined `main()` function.
+  - `main()` returns an `int` process exit code, and the module guard is
+    `if __name__ == "__main__": raise SystemExit(main())`. Convention: `0` = success, `1` = runtime
+    failure, `2` = configuration error (e.g. placeholder paths still unset). Returning the code —
+    rather than calling `sys.exit()` inside `main()` — keeps `main()` traceback-free when called
+    from a notebook cell, while shell callers, cron jobs, and Makefiles still see failures.
 - Include a clear **configuration section at the top** of each script.
-  - Prefer inline variable configuration over `argparse`.
+  - Inline variables are the **primary** interface: notebook users edit constants and never see a flag.
+  - New scripts should *additionally* mirror those constants with `argparse` flags whose defaults
+    **are** the constants, via a `build_arg_parser()` that sets
+    `formatter_class=argparse.ArgumentDefaultsHelpFormatter` (so `--help` shows every default).
+    Parse strictly with `parser.parse_args(notebook_safe_argv(argv))`, copying `notebook_safe_argv`
+    from `utils/cli_helpers.py` — it keeps a notebook kernel's injected argv from aborting the
+    script while letting shell typos fail loudly. See `scripts/operations_tools/otp_by_route.py`
+    for the reference shape.
 - Use intuitive success messages (`logging`) at the end of script execution.
 - Scripts that write an output file **must** also write a `_runlog.txt` sidecar next to that file. The sidecar captures the CONFIGURATION block verbatim (bounded by `# === BEGIN CONFIG ===` / `# === END CONFIG ===` markers) plus a timestamp and source-script path. This creates a drift-proof record that lets anyone reconstruct exactly what settings produced a given output. See `scripts/ridership_tools/data_request_by_stop_processor.py` for the reference implementation (`extract_config_block` / `write_run_log`).
 - Do **not import** functions from the shared `utils/` directory at runtime.
@@ -114,6 +126,53 @@ pre-commit install
 
 After this, `ruff check` and `ruff format` run automatically on every `git commit`. The hook reads its config
 from `pyproject.toml` and uses the same ruff version that CI does (pinned in `requirements-dev.txt`).
+
+### 📝 Module docstrings
+
+A script's module docstring doubles as its README — for many users it is the only documentation
+they will read. Ruff enforces that a docstring exists and that it starts with a one-line summary;
+the structure below is house convention, audited by `dev_tools/check_style.py`
+(`docstring_sections` check):
+
+```python
+"""One-sentence imperative summary of what the script does.
+
+One to three short paragraphs: what the script computes, the key method
+decisions, and where it sits relative to neighboring scripts (if relevant).
+
+Inputs
+------
+- The files or tables the script reads, and which script or source produces
+  each one.
+
+Outputs
+-------
+- The files the script writes (names plus one-line contents).
+- A run-log sidecar capturing the verbatim CONFIGURATION block.
+
+Typical usage
+-------------
+Update the paths in the CONFIGURATION section (or pass the matching CLI
+flags) and run from a shell, ArcGIS Pro's Python window, or a Jupyter
+notebook.
+"""
+```
+
+Guidelines:
+
+- **Use these exact section names** — `Inputs`, `Outputs`, `Typical usage`. The style audit flags
+  the variants that have crept in over time (`Output`, `Typical use`, `Usage`, `RUNNING IT`,
+  `WHAT IT PRODUCES`, `Primary outputs include`, …). Either header format is accepted: an
+  underlined header as shown above, or a Google-style `Outputs:` line with an indented body.
+- `Outputs` (for any script that writes files) and `Typical usage` are expected for every script
+  under `scripts/`; `Inputs` is strongly encouraged.
+- Optional sections, when they earn their keep: `Notes`, `Assumptions`, `Limitations`, `Method`,
+  `Workflow` (numbered processing steps), `Requires` (software prerequisites, e.g. ArcGIS Pro),
+  and `Helpful links` (where to download the input data).
+- **Length:** most script docstrings land between 15 and 45 lines. Helper modules in `utils/`
+  need only a couple of lines — their function docstrings carry the detail. If a module docstring
+  grows past ~50 lines, keep what an analyst needs to *run and trust* the tool (inputs, outputs,
+  method, limitations) and move extended design rationale elsewhere.
 
 ## 📁 File Organization
 

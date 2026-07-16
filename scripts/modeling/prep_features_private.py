@@ -32,7 +32,7 @@ Pipeline (identical shape to the public half):
               template, each into its own output subdir, capturing logs and
               applying a per-script timeout. Downstream scripts read an upstream
               script's output via ``{work}/out/<script_stem>/`` (e.g.
-              ``otp_by_route`` consumes ``otp_monthly_tides``'s panel).
+              ``otp_by_route`` consumes ``otp_monthly_panel``'s output).
     collect   Gather the ``*.csv`` / ``*.xlsx`` tables each successful script
               produced.
     describe  Resolve each table's join keys + kept columns from the registry
@@ -65,6 +65,11 @@ Outputs:
       ``produced_by`` provenance of the script(s) that fed it).
     - A run log capturing the verbatim configuration block plus, per script, its
       exit code, duration, and collected output files.
+
+Typical usage:
+    Update the paths in the CONFIGURATION section (or pass the matching CLI flags,
+    e.g. ``--scripts-dir`` / ``--input-dir`` / ``--output-dir``) and run on the
+    secured box from a shell or a Jupyter notebook.
 """
 
 from __future__ import annotations
@@ -83,7 +88,7 @@ from collections import OrderedDict
 from datetime import datetime
 from fnmatch import fnmatch
 from pathlib import Path
-from typing import Final, NamedTuple, Sequence
+from typing import Final, List, NamedTuple, Optional, Sequence
 
 import pandas as pd
 
@@ -598,8 +603,8 @@ def describe_output(
     """
     spec = script_outputs.get(file.name) or global_outputs.get(file.name)
     # Convention: a registry spec with empty keep_cols deliberately drops an
-    # intermediate from bundling (e.g. otp_monthly_tides' panel, which
-    # otp_by_route consumes but which must not become a bundle of its own).
+    # intermediate from bundling (e.g. the panel otp_monthly_panel writes,
+    # which otp_by_route consumes but must not become a bundle of its own).
     if spec is not None and not spec["keep_cols"]:
         logging.info(
             "Output '%s' is registry-marked ignore (empty keep_cols) — skipping.", file.name
@@ -1091,18 +1096,46 @@ def _source_path() -> Path:
     return Path(__file__) if "__file__" in globals() else SELF_PATH
 
 
-def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    """Parse command-line arguments, defaulting to the CONFIGURATION block.
+def notebook_safe_argv(argv: Optional[Sequence[str]]) -> Optional[List[str]]:
+    """Return the argv to parse, shielding notebook kernels from stray flags.
 
-    ``parse_known_args`` is used so a notebook kernel's injected argv does not
-    raise ``SystemExit: 2``.
+    When a script's ``main()`` runs with no explicit ``argv`` inside a
+    Jupyter/IPython kernel, ``sys.argv`` holds kernel plumbing (for example
+    ``-f /path/kernel.json``) rather than flags meant for the script, and
+    strict ``argparse.parse_args`` would reject it and abort.  This helper
+    detects the notebook case and substitutes an empty argument list so the
+    CONFIGURATION constants stay in charge, while shell runs keep strict
+    parsing (a typo in a flag fails loudly instead of being silently ignored).
+
+    Canonical implementation: ``utils/cli_helpers.py``.
+
+    Args:
+        argv: Explicit argument list passed to ``main()``, or ``None`` to
+            fall back to ``sys.argv``.
+
+    Returns:
+        ``list(argv)`` when *argv* was provided; ``[]`` when running inside a
+        notebook kernel; otherwise ``None`` so argparse reads ``sys.argv[1:]``.
+    """
+    if argv is not None:
+        return list(argv)
+    if "ipykernel" in sys.modules:
+        return []
+    return None
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    """Parse CLI args strictly, defaulting to the CONFIGURATION block.
+
+    Notebook kernels' injected argv is shielded via ``notebook_safe_argv``.
     """
     parser = argparse.ArgumentParser(
         description=(
             "Secured-box feature-prep orchestrator (PRIVATE). Runs the NTD / OTP / runtime "
             "feature scripts, collects their tables, and writes bundles + manifest for the "
             "ridership models. Defaults come from the CONFIGURATION block at the top of this file."
-        )
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--scripts-dir", default=str(SCRIPTS_DIR), help="Folder of *.py scripts.")
     parser.add_argument("--input-dir", default=str(INPUT_DIR), help="Input-data root.")
@@ -1134,12 +1167,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=logging.getLevelName(LOG_LEVEL),
         help="DEBUG / INFO / WARNING / ERROR.",
     )
-    args, _unknown = parser.parse_known_args(argv)
+    args = parser.parse_args(notebook_safe_argv(argv))
     return args
 
 
-def main(argv: Sequence[str] | None = None) -> None:
-    """Command-line entry point. Defaults fall back to the CONFIGURATION block."""
+def main(argv: Sequence[str] | None = None) -> int:
+    """Command-line entry point. Defaults fall back to the CONFIGURATION block.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     args = parse_args(argv)
     logging.basicConfig(
         level=getattr(logging, str(args.log_level).upper(), LOG_LEVEL),
@@ -1153,7 +1191,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             "SCRIPTS_DIR / INPUT_DIR / OUTPUT_DIR are still placeholders. Update the "
             "CONFIGURATION block or pass --scripts-dir/--input-dir/--output-dir before running."
         )
-        return
+        return 2
 
     try:
         orchestrate(
@@ -1169,19 +1207,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
     except ValueError as exc:  # hygiene failure
         logging.error("Hygiene check failed: %s", exc)
-        sys.exit(1)
+        return 1
     except RuntimeError as exc:
         logging.error("%s", exc)
-        sys.exit(1)
-
-
-def _in_ipython() -> bool:
-    """Return True when running inside an IPython/Jupyter kernel."""
-    return "ipykernel" in sys.modules or "IPython" in sys.modules
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    # In a notebook (pasted cell or %run), argparse would choke on the kernel's
-    # own argv; parse_known_args already guards that, and main() with no argv is
-    # safe in both contexts.
-    main()
+    raise SystemExit(main())

@@ -19,6 +19,21 @@ Key Features:
 
 This script is intended for transportation planners and GIS analysts assessing
 the accessibility impacts of stop consolidation, relocation, or removal.
+
+Outputs:
+    * ``deleted_stops_distances.csv``: per-removed-stop linear and network walking
+      distances (miles) to the nearest retained stop, with sanity flags.
+    * ``deleted_stops.shp``: point shapefile of the removed stops.
+    * ``deleted_to_nearest_paths.shp``: shortest-path polylines from each removed
+      stop to its nearest retained stop (when a network path exists).
+    * ``lost_coverage.shp``: sidewalk-buffer coverage lost by the removals
+      (written only when non-empty).
+    * ``maps/<stop_id>.png``: one QA map per removed stop, when ``EXPORT_MAPS``
+      is enabled.
+
+Typical usage:
+    Update the paths in the CONFIGURATION section and run from a shell or a
+    Jupyter notebook.
 """
 
 from __future__ import annotations
@@ -776,8 +791,13 @@ def export_stop_maps(
 # =============================================================================
 
 
-def main() -> None:
-    """Analyze sidewalk-access impacts using a virtual-connector network."""
+def main() -> int:
+    """Analyze sidewalk-access impacts using a virtual-connector network.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -793,7 +813,7 @@ def main() -> None:
             "SIDEWALK_SHP and/or GTFS_DIR and/or OUTPUT_DIR are still set to placeholder values. "
             "Please update them in the CONFIGURATION section before running."
         )
-        return
+        return 2
     logging.info("Reading centerlines …")
     centerlines = load_centerlines(SIDEWALK_SHP, TARGET_CRS)
 
@@ -959,7 +979,8 @@ def main() -> None:
 
     logging.info("Done ✔")
     logging.info("Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

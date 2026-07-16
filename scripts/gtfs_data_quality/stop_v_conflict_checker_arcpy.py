@@ -7,10 +7,22 @@ This script performs a simple overlap check and does not use any buffers
 or proximity analysis. It includes an optional pandas-based deduplication
 step (by key fields or XY tolerance) before the ArcPy analysis.
 
-Outputs a report (CSV, GDB Feature Class, or Shapefile) containing only
-the stops that were flagged for one or more conflicts.
-
 All configuration is set in the 'Configuration' section below.
+
+Outputs
+-------
+Each export is toggled in the Configuration section and contains only the
+stops flagged for one or more conflicts:
+
+- ``stop_conflicts.csv`` / ``stop_conflicts.xlsx`` (``OUTPUT_BASENAME`` in
+  ``OUTPUT_DIR``): flagged stops with conflict attributes.
+- ``stops_conflicts`` feature class (``OUTPUT_FC_NAME``) in ``OUTPUT_GDB``.
+- ``stop_conflicts.shp``: optional shapefile copy of the flagged stops.
+
+Typical usage
+-------------
+Update the paths in the Configuration section and run from ArcGIS Pro's
+Python window or any ArcPy-enabled shell or notebook (requires ``arcpy``).
 """
 
 from __future__ import annotations
@@ -328,8 +340,13 @@ def _export_conflicts(
 # =============================================================================
 
 
-def main() -> None:
-    """Run minimal stop conflict checker (overlap-only; pandas dedupe retained)."""
+def main() -> int:
+    """Run minimal stop conflict checker (overlap-only; pandas dedupe retained).
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -343,7 +360,7 @@ def main() -> None:
             "OUTPUT_DIR and/or GTFS_DIR are still set to placeholder values. "
             "Please update them in the CONFIGURATION section before running."
         )
-        return
+        return 2
     arcpy.env.overwriteOutput = OVERWRITE_OUTPUT
     _validate_config()
 
@@ -440,7 +457,8 @@ def main() -> None:
         "and " + xlsx_path if xlsx_path else "",
     )
     logging.info("Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

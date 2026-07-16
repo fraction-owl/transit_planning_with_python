@@ -19,13 +19,29 @@ At a high level, the script:
 Results are written to a CSV in OUTPUT_DIR for manual review. Configuration
 options (GTFS paths, base routes, and tuning thresholds) are defined in the
 Configuration section below.
+
+Outputs
+-------
+All files are written under ``OUTPUT_DIR``:
+
+- ``skipped_stop_segments.csv``: one row per detected skipped-stop segment.
+- ``stop_suspicion_scores.csv``: aggregated per-stop suspicion scores (one row
+  per missing route + candidate stop).
+- ``intra_route_skipped_stops.csv``: intra-route trip-level skipped-stop
+  findings.
+- ``segment_plots/``: PNG maps of flagged segments plus per-route overview
+  plots.
+
+Typical usage
+-------------
+Update the paths in the Configuration section and run from a shell or a
+Jupyter notebook.
 """
 
 from __future__ import annotations
 
 import itertools
 import logging
-import sys
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -1943,8 +1959,13 @@ def run_plotting(ctx: GTFSContext, mismatches_df: pd.DataFrame) -> None:
             )
 
 
-def main() -> None:
-    """Entry point for running the segment stop comparison QA check."""
+def main() -> int:
+    """Entry point for running the segment stop comparison QA check.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -1955,24 +1976,24 @@ def main() -> None:
             "GTFS_DIR is still set to a placeholder value. "
             "Please update it in the CONFIGURATION section before running."
         )
-        return
+        return 2
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     try:
         ctx = prepare_gtfs_context()
     except (FileNotFoundError, ValueError) as exc:
         logging.error("Error during GTFS preparation: %s", exc)
-        sys.exit(1)
+        return 1
 
     if not ctx.route_sequences:
         # Nothing to compare; bail out.
-        sys.exit(0)
+        return 0
 
     try:
         mismatches_df = run_segment_comparison(ctx)
     except (FileNotFoundError, ValueError) as exc:
         logging.error("Error during segment comparison: %s", exc)
-        sys.exit(1)
+        return 1
 
     # Always write the segment-level CSV, even if it's empty.
     output_path = OUTPUT_DIR / OUTPUT_FILENAME
@@ -1998,7 +2019,8 @@ def main() -> None:
     # Always run plotting; it already knows how to handle the empty case.
     run_plotting(ctx, mismatches_df)
     logging.info("Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

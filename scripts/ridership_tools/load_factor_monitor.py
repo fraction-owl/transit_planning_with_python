@@ -13,6 +13,24 @@ Typical use cases
 - Operational load monitoring.
 - Compliance tracking against agency load-factor standards.
 - Automated route-level reporting.
+
+Outputs
+-------
+- ``<input stem>_processed.csv`` -- combined trip-level table with load factors
+  and violation flags (machine-readable).
+- ``<input stem>_processed.xlsx`` (``OUTPUT_FILE``) -- the same table as a
+  single-sheet workbook for quick inspection.
+- ``<ROUTE_NAME>.xlsx`` -- one workbook per route, written next to
+  ``OUTPUT_FILE``, with one sheet per direction.
+- ``<output stem>_violations_log.txt`` (``VIOLATION_LOG_FILE``) -- plain-text
+  violation log, written when ``WRITE_VIOLATION_LOG`` is True.
+- ``<output stem>_runlog.txt`` -- sidecar run log capturing the verbatim
+  CONFIGURATION block.
+
+Typical usage
+-------------
+Update the paths in the CONFIGURATION section and run from a shell, ArcGIS
+Pro's Python window, or a Jupyter notebook.
 """
 
 from __future__ import annotations
@@ -20,7 +38,6 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import os
-import sys
 from pathlib import Path
 from typing import Final
 
@@ -520,8 +537,13 @@ def write_run_log(output_file: str) -> bool:
 # =============================================================================
 
 
-def main() -> None:
-    """Run the full ETL pipeline and create all exports."""
+def main() -> int:
+    """Run the full ETL pipeline and create all exports.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -534,7 +556,7 @@ def main() -> None:
             "File path is still set to its default. Update INPUT_FILE in the "
             "CONFIGURATION section before running."
         )
-        return
+        return 2
 
     # Load data
     data_frame = load_data(INPUT_FILE)
@@ -581,10 +603,11 @@ def main() -> None:
             "Run log could not be written. Set REQUIRE_RUN_LOG = False to "
             "suppress this error when a sidecar file is genuinely impossible."
         )
-        sys.exit(1)
+        return 1
 
     logging.info("Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -29,6 +29,10 @@ Also outputs:
 - route_timeline_runlog.txt (configuration sidecar)
 
 No arcpy / geopandas. pandas + numpy + matplotlib only.
+
+Typical usage:
+    Update ``GTFS_FEEDS``, ``CHANGE_DATES``, and ``OUTPUT_DIR`` in the
+    CONFIGURATION section and run from a shell or a Jupyter notebook.
 """
 
 from __future__ import annotations
@@ -1055,8 +1059,13 @@ def run_timeline(
 # =============================================================================
 
 
-def main() -> None:
-    """CLI entry point."""
+def main() -> int:
+    """CLI entry point.
+
+    Returns:
+        Process exit code: 0 on success, 2 if required CONFIGURATION values
+        are still placeholders.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -1067,11 +1076,12 @@ def main() -> None:
             "GTFS_FEEDS / OUTPUT_DIR are still placeholders. Update the CONFIG "
             "block before running."
         )
-        return
+        return 2
 
     run_timeline()
     logging.info("Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -25,12 +25,17 @@ Inputs
   GeoPackages, shapefiles, and GeoJSON files are supported (GeoJSON is
   converted in-memory via ``arcpy.conversion.JSONToFeatures``).
 
-Output
-------
+Outputs
+-------
 - ``school_coverage_by_route.csv`` — columns ``route_id``, ``route_short_name``
   (when available), ``schools_served``, ``enrollment_served`` (grand total), and
   the grade-band breakout ``enrollment_1_8_served``, ``enrollment_9_12_served``,
   ``enrollment_postsec_served``.
+
+Typical usage
+-------------
+Update the paths in the CONFIGURATION section and run from a shell, ArcGIS
+Pro's Python window, or a Jupyter notebook using ArcGIS Pro's bundled Python.
 
 Assumptions
 -----------
@@ -642,8 +647,13 @@ def _attach_route_short_name(summary: pd.DataFrame, routes_df: pd.DataFrame) -> 
 # =============================================================================
 
 
-def main() -> None:
-    """Build the route-level school coverage rollup and write it to CSV."""
+def main() -> int:
+    """Build the route-level school coverage rollup and write it to CSV.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -658,7 +668,7 @@ def main() -> None:
             "GTFS_DIR, SCHOOLS_PATH, and/or OUTPUT_DIR are still set to their default "
             "placeholder paths. Update the CONFIGURATION section before running."
         )
-        return
+        return 2
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     target_sr = arcpy.SpatialReference(PROJECTED_CRS_WKID)
@@ -676,7 +686,7 @@ def main() -> None:
     )
     if not route_buffers:
         logging.error("No route catchments produced – nothing to do")
-        return
+        return 1
 
     logging.info("Loading school points from %s", SCHOOLS_PATH)
     schools = load_schools_points(SCHOOLS_PATH, target_sr)
@@ -695,7 +705,8 @@ def main() -> None:
         int(summary["enrollment_served"].sum()),
     )
     logging.info("Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

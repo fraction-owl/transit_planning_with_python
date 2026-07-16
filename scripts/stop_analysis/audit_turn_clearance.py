@@ -28,6 +28,18 @@ Workflow:
     8. Optionally export:
         - A shapefile of flagged stops.
         - PNG figures showing a zoomed-in context map with stop, turn, route, and roads.
+
+Outputs:
+    - ``left_turn_spacing.txt`` (``LOG_FILENAME``): tab-delimited log of flagged
+      stop-to-turn spacing violations.
+    - ``left_turn_flags.shp`` (``FLAGGED_SHP_NAME``): shapefile of flagged stops,
+      written when ``EXPORT_FLAGGED_SHP`` is enabled.
+    - ``left_turn_figures/*.png`` (``PNG_SUBDIR``): one zoomed-in context map per
+      flagged stop, written when ``EXPORT_FLAGGED_PNGS`` is enabled.
+
+Typical usage:
+    Update the paths in the CONFIGURATION section and run from a shell or a
+    Jupyter notebook.
 """
 
 from __future__ import annotations
@@ -549,8 +561,13 @@ def _export_flagged_pngs(
 # =============================================================================
 
 
-def main() -> None:  # noqa: D401
-    """Run the GTFS left‑turn clearance QA pipeline."""
+def main() -> int:  # noqa: D401
+    """Run the GTFS left‑turn clearance QA pipeline.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -561,7 +578,7 @@ def main() -> None:  # noqa: D401
             "GTFS_PATH and/or OUTPUT_FOLDER are still set to placeholder values. "
             "Please update them in the CONFIGURATION section before running."
         )
-        return
+        return 2
     # -------------------------------------------------------------
     # STEP 0 — Read & validate GTFS
     # -------------------------------------------------------------
@@ -643,11 +660,12 @@ def main() -> None:  # noqa: D401
     # -------------------------------------------------------------
     logging.info("Done. Outputs in: %s", out_dir)
     logging.info("Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
     try:
-        main()
+        raise SystemExit(main())
     except Exception as exc:  # noqa: BLE001
         logging.error("\nUNEXPECTED ERROR: %s", exc)
         sys.exit(1)

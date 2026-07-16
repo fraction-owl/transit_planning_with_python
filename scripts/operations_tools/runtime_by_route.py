@@ -1,12 +1,12 @@
 """Route-level running-time features from TIDES, windowed for ridership modeling.
 
-This is the *modeling-feature* counterpart to ``trip_runtime_tides.py``. Where
+This is the *modeling-feature* counterpart to ``runtime_by_trip.py``. Where
 that script diagnoses individual scheduled trips (per-trip stats, variation
 flags, day-of-week anomalies), this one rolls observed running time up to one
 value per route so it can join the route-level modeling table on the secured
 box (see ``scripts/modeling/prep_features_private.py``).
 
-It runs in two stages, mirroring the OTP pipeline (``otp_monthly_tides.py`` ->
+It runs in two stages, mirroring the OTP pipeline (``otp_monthly_panel.py`` ->
 ``otp_by_route.py``) but packaged in a single file because no monthly-runtime
 panel exists elsewhere to consume:
 
@@ -49,10 +49,11 @@ from __future__ import annotations
 
 import argparse
 import logging
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Sequence
+from typing import Dict, List, Optional, Sequence
 
 import pandas as pd
 
@@ -137,7 +138,7 @@ class Config:
 
 # =============================================================================
 # LOADING & RUNTIME DERIVATION
-#   (mechanics mirror trip_runtime_tides.py; kept self-contained on purpose)
+#   (mechanics mirror runtime_by_trip.py; kept self-contained on purpose)
 # =============================================================================
 
 
@@ -478,7 +479,7 @@ def write_run_log(output_dir: Path, summary_lines: List[str]) -> bool:
     Returns:
         ``True`` if the log was written successfully, ``False`` otherwise.
     """
-    log_path = output_dir / "route_runtime_tides_runlog.txt"
+    log_path = output_dir / "runtime_by_route_runlog.txt"
 
     source_file = resolve_source_file()
     if source_file is None:
@@ -591,10 +592,39 @@ def run(cfg: Config) -> Dict[str, pd.DataFrame]:
 # =============================================================================
 
 
+def notebook_safe_argv(argv: Optional[Sequence[str]]) -> Optional[List[str]]:
+    """Return the argv to parse, shielding notebook kernels from stray flags.
+
+    When a script's ``main()`` runs with no explicit ``argv`` inside a
+    Jupyter/IPython kernel, ``sys.argv`` holds kernel plumbing (for example
+    ``-f /path/kernel.json``) rather than flags meant for the script, and
+    strict ``argparse.parse_args`` would reject it and abort.  This helper
+    detects the notebook case and substitutes an empty argument list so the
+    CONFIGURATION constants stay in charge, while shell runs keep strict
+    parsing (a typo in a flag fails loudly instead of being silently ignored).
+
+    Canonical implementation: ``utils/cli_helpers.py``.
+
+    Args:
+        argv: Explicit argument list passed to ``main()``, or ``None`` to
+            fall back to ``sys.argv``.
+
+    Returns:
+        ``list(argv)`` when *argv* was provided; ``[]`` when running inside a
+        notebook kernel; otherwise ``None`` so argparse reads ``sys.argv[1:]``.
+    """
+    if argv is not None:
+        return list(argv)
+    if "ipykernel" in sys.modules:
+        return []
+    return None
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     """Create the command-line argument parser."""
     p = argparse.ArgumentParser(
-        description="Route-level windowed running-time features from TIDES stop_visits."
+        description="Route-level windowed running-time features from TIDES stop_visits.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--stop-visits", default=STOP_VISITS_PATH, help="Path to stop_visits CSV.")
     p.add_argument(
@@ -622,7 +652,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--end-month",
         default=END_MONTH,
-        help="Right edge of the window as YYYY-MM (default: latest month present).",
+        help="Right edge of the window as YYYY-MM (empty = latest month present).",
     )
     p.add_argument(
         "--min-obs-per-month",
@@ -633,22 +663,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return p
 
 
-def main(argv: Sequence[str] | None = None) -> None:
-    """Entry point. Validates placeholder paths before doing any work."""
+def main(argv: Sequence[str] | None = None) -> int:
+    """Entry point. Validates placeholder paths before doing any work.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
     parser = build_arg_parser()
-    args, _unknown = parser.parse_known_args(argv)
+    args = parser.parse_args(notebook_safe_argv(argv))
 
     if args.stop_visits == STOP_VISITS_PATH or args.trips_performed == TRIPS_PERFORMED_PATH:
         logging.warning(
             "STOP_VISITS_PATH/TRIPS_PERFORMED_PATH are still placeholders. Update the "
             "CONFIGURATION section or pass --stop-visits/--trips-performed before running."
         )
-        return
+        return 2
 
     cfg = Config(
         stop_visits_path=Path(args.stop_visits).expanduser(),
@@ -665,14 +700,15 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     if not cfg.stop_visits_path.exists():
         logging.warning("stop_visits not found: %s", cfg.stop_visits_path)
-        return
+        return 1
     if not cfg.trips_performed_path.exists():
         logging.warning("trips_performed not found: %s", cfg.trips_performed_path)
-        return
+        return 1
 
     run(cfg)
     logging.info("Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

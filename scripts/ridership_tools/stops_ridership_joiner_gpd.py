@@ -1,4 +1,4 @@
-"""Join ridership data to bus stop point features (GeoPandas port; no dataclass).
+"""Join ridership data to bus stop point features (GeoPandas port).
 
 This script merges stop-level ridership data from an Excel file with stop locations
 (from a shapefile/GeoPackage/GeoJSON/etc. or GTFS stops.txt), and optionally performs
@@ -9,6 +9,10 @@ Outputs:
 - CSV summaries (per-stop and optional per-polygon aggregation)
 - Optional polygon layer with aggregated ridership
 - Optional per-route boardings/alightings maps from GTFS shapes (see DRAW_PLOTS)
+
+Typical usage:
+    Update the paths in the CONFIGURATION section and run from a shell or a
+    Jupyter notebook with the open-source geospatial stack (geopandas) installed.
 """
 
 from __future__ import annotations
@@ -1063,8 +1067,13 @@ def write_run_log(output_folder: Path) -> bool:
 # =============================================================================
 
 
-def main() -> None:
-    """Main entry point."""
+def main() -> int:
+    """Main entry point.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -1078,7 +1087,7 @@ def main() -> None:
             "File paths are still set to their defaults. Update BUS_STOPS_INPUT and "
             "EXCEL_FILE in the CONFIGURATION section before running."
         )
-        return
+        return 2
 
     if not BUS_STOPS_INPUT.exists():
         raise FileNotFoundError(f"BUS_STOPS_INPUT not found: {BUS_STOPS_INPUT}")
@@ -1106,10 +1115,11 @@ def main() -> None:
             "Run log could not be written. Set REQUIRE_RUN_LOG = False to "
             "suppress this error when a sidecar file is genuinely impossible."
         )
-        sys.exit(1)
+        return 1
 
     logging.info("Done. Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

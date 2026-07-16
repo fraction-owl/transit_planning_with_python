@@ -9,6 +9,23 @@ feature selection -- including which weather variables matter for ridership --
 live in separate downstream steps, so this frame stays reusable across consumers.
 
 Source: https://www.ncei.noaa.gov/cdo-web/search
+
+Outputs
+-------
+- The cleaned daily frame at ``OUTPUT_PATH`` (``.parquet`` or ``.csv``): parsed
+  dates plus calendar columns, zero-filled ``WT*`` event flags, and numeric
+  measurement columns.
+- A CSV of monthly aggregates at ``MONTHLY_OUTPUT_PATH`` (``avg_temp_f``,
+  ``max_daily_precip_in``, ``days_with_precip``, ``total_snow_in``,
+  ``max_daily_snow_in``), written only when that path is set.
+- ``<output stem>_processing_log.txt`` (or ``LOG_PATH``): a .txt processing log
+  written next to the output when ``WRITE_LOG`` is on (the default).
+
+Typical usage
+-------------
+Set ``INPUT_PATH`` and ``OUTPUT_PATH`` in the config block (or pass ``--input``
+/ ``--output``; ``--long-names`` and ``--log`` are also available) and run from
+a shell or a Jupyter notebook. Paths left unset are prompted for interactively.
 """
 
 from __future__ import annotations
@@ -17,7 +34,7 @@ import argparse
 import logging
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, List, Optional, Sequence
 
 import pandas as pd
 
@@ -99,13 +116,32 @@ def _prompt_path(label: str, *, must_exist: bool) -> Path:
         return path
 
 
-def _in_ipython_kernel() -> bool:
-    """Return True inside a Jupyter/IPython kernel.
+def notebook_safe_argv(argv: Optional[Sequence[str]]) -> Optional[List[str]]:
+    """Return the argv to parse, shielding notebook kernels from stray flags.
 
-    There ``sys.argv`` holds the kernel launcher args (e.g. ``-f
-    ...kernel.json``) rather than user CLI args.
+    When a script's ``main()`` runs with no explicit ``argv`` inside a
+    Jupyter/IPython kernel, ``sys.argv`` holds kernel plumbing (for example
+    ``-f /path/kernel.json``) rather than flags meant for the script, and
+    strict ``argparse.parse_args`` would reject it and abort.  This helper
+    detects the notebook case and substitutes an empty argument list so the
+    CONFIGURATION constants stay in charge, while shell runs keep strict
+    parsing (a typo in a flag fails loudly instead of being silently ignored).
+
+    Canonical implementation: ``utils/cli_helpers.py``.
+
+    Args:
+        argv: Explicit argument list passed to ``main()``, or ``None`` to
+            fall back to ``sys.argv``.
+
+    Returns:
+        ``list(argv)`` when *argv* was provided; ``[]`` when running inside a
+        notebook kernel; otherwise ``None`` so argparse reads ``sys.argv[1:]``.
     """
-    return "ipykernel" in sys.modules or Path(sys.argv[0]).name == "ipykernel_launcher.py"
+    if argv is not None:
+        return list(argv)
+    if "ipykernel" in sys.modules:
+        return []
+    return None
 
 
 def _ensure_logging(level: int = logging.INFO) -> None:
@@ -318,23 +354,24 @@ def run(
     return clean
 
 
-def main(argv: list[str] | None = None) -> None:
+def main(argv: Sequence[str] | None = None) -> int:
     """Entry point for both notebook and CLI.
 
     Path resolution is the same everywhere: explicit value -> config block ->
-    interactive prompt. In a Jupyter/IPython kernel the launcher injects its own
-    argv (``-f kernel.json``), which argparse would reject, so we skip parsing
-    and let ``run()`` resolve from the config block or prompt. On the command
-    line, ``--input`` / ``--output`` override the config; omit them (with config
-    left as None) to be prompted.
+    interactive prompt. Parsing is strict (an unknown flag aborts); inside a
+    Jupyter/IPython kernel ``notebook_safe_argv`` swaps the kernel's injected
+    argv for an empty list so the config block stays in charge. On the command
+    line, ``--input`` / ``--output`` override the config; omit them (with
+    config left as None) to be prompted.
+
+    Returns:
+        Process exit code: 0 on success (failures raise and exit non-zero).
     """
     _ensure_logging()
-    if argv is None and _in_ipython_kernel():
-        logger.info("kernel detected; resolving paths from config block or prompt")
-        run()
-        return
-
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(
+        description=__doc__.splitlines()[0],
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     parser.add_argument("--input", type=Path, default=INPUT_PATH, help="input CSV path")
     parser.add_argument(
         "--output", type=Path, default=OUTPUT_PATH, help="output path (.parquet/.csv)"
@@ -351,9 +388,10 @@ def main(argv: list[str] | None = None) -> None:
         default=WRITE_LOG,
         help="write a .txt processing log next to the output",
     )
-    args = parser.parse_args(argv)
+    args = parser.parse_args(notebook_safe_argv(argv))
     run(args.input, args.output, use_long_names=args.long_names, write_log=args.log)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

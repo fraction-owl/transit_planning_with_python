@@ -40,6 +40,10 @@ Outputs:
 Defaults come from the CONFIGURATION block; ``--gtfs-dirs`` / ``--output-dir`` /
 ``--day`` / ``--log-level`` override them, so the script can run standalone or
 under the prep_features_public.py orchestrator.
+
+Typical usage:
+    Update the paths in the CONFIGURATION block (or pass the CLI flags above)
+    and run from a shell or a Jupyter notebook.
 """
 
 from __future__ import annotations
@@ -47,8 +51,9 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import sys
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import List, Optional, Sequence
 
 import geopandas as gpd
 import numpy as np
@@ -664,17 +669,45 @@ def build_output_tables(
 # =============================================================================
 
 
-def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    """Parse command-line arguments, defaulting to the configuration block.
+def notebook_safe_argv(argv: Optional[Sequence[str]]) -> Optional[List[str]]:
+    """Return the argv to parse, shielding notebook kernels from stray flags.
 
-    ``parse_known_args`` is used so a notebook kernel's injected argv (or the
-    orchestrator's extra ``--input-dir`` token) does not raise ``SystemExit: 2``.
+    When a script's ``main()`` runs with no explicit ``argv`` inside a
+    Jupyter/IPython kernel, ``sys.argv`` holds kernel plumbing (for example
+    ``-f /path/kernel.json``) rather than flags meant for the script, and
+    strict ``argparse.parse_args`` would reject it and abort.  This helper
+    detects the notebook case and substitutes an empty argument list so the
+    CONFIGURATION constants stay in charge, while shell runs keep strict
+    parsing (a typo in a flag fails loudly instead of being silently ignored).
+
+    Canonical implementation: ``utils/cli_helpers.py``.
+
+    Args:
+        argv: Explicit argument list passed to ``main()``, or ``None`` to
+            fall back to ``sys.argv``.
+
+    Returns:
+        ``list(argv)`` when *argv* was provided; ``[]`` when running inside a
+        notebook kernel; otherwise ``None`` so argparse reads ``sys.argv[1:]``.
+    """
+    if argv is not None:
+        return list(argv)
+    if "ipykernel" in sys.modules:
+        return []
+    return None
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    """Parse CLI args strictly, defaulting to the configuration block.
+
+    Notebook kernels' injected argv is shielded via ``notebook_safe_argv``.
     """
     parser = argparse.ArgumentParser(
         description=(
             "Compute the routes each target route can transfer to across one or more "
             "GTFS feeds. Defaults come from the CONFIGURATION block at the top of this file."
-        )
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
         "--gtfs-dirs",
@@ -692,7 +725,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--day",
         default=DAY_OF_WEEK if DAY_OF_WEEK is not None else "all",
         help=(
-            "Service-day filter: 'weekday' (any Mon-Fri service; default), a single "
+            "Service-day filter: 'weekday' (any Mon-Fri service), a single "
             "day name (monday..sunday), or 'all' to keep every trip."
         ),
     )
@@ -701,12 +734,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=logging.getLevelName(LOG_LEVEL),
         help="DEBUG / INFO / WARNING / ERROR.",
     )
-    args, _unknown = parser.parse_known_args(argv)
+    args = parser.parse_args(notebook_safe_argv(argv))
     return args
 
 
-def main(argv: Sequence[str] | None = None) -> None:
-    """Run the route transfer calculation and write the output CSV(s)."""
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run the route transfer calculation and write the output CSV(s).
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     args = parse_args(argv)
     logging.basicConfig(
         level=getattr(logging, str(args.log_level).upper(), LOG_LEVEL),
@@ -721,7 +759,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             "GTFS feed folder(s) and/or the output folder are still set to placeholder "
             "values. Update the CONFIGURATION section or pass --gtfs-dirs/--output-dir."
         )
-        return
+        return 2
 
     day_token = str(args.day).strip().lower()
     day_filter: Optional[str] = None if day_token in ("", "all", "none") else day_token
@@ -734,13 +772,13 @@ def main(argv: Sequence[str] | None = None) -> None:
             loaded.append(_read_feed(folder, label))
         except (FileNotFoundError, ValueError, pd.errors.ParserError) as exc:
             logging.error("Failed to load feed '%s': %s", label, exc)
-            return
+            return 1
 
     routes = _build_route_table([feed["routes"] for feed in loaded])
     n_targets = int(routes["is_target"].sum())
     if n_targets == 0:
         logging.warning("No routes matched the target criteria. Nothing to do.")
-        return
+        return 1
     logging.info("Identified %d target route(s) across %d feed(s).", n_targets, len(loaded))
 
     stops = pd.concat([feed["stops"] for feed in loaded], ignore_index=True)
@@ -787,7 +825,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         logging.info("Wrote %d transfer pair(s) -> %s", len(detail), detail_path)
 
     logging.info("Done.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

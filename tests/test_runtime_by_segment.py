@@ -1,4 +1,4 @@
-"""Tests for segment_runtime_tides using the repo TIDES fixtures."""
+"""Tests for runtime_by_segment using the repo TIDES fixtures."""
 
 import sys
 from pathlib import Path
@@ -9,7 +9,7 @@ import pytest
 script_dir = Path("scripts/operations_tools").resolve()
 sys.path.append(str(script_dir))
 
-import segment_runtime_tides as target  # noqa: E402
+import runtime_by_segment as target  # noqa: E402
 
 STOP_VISITS = Path("tests/fixtures/stop_visits.csv")
 TRIPS_PERFORMED = Path("tests/fixtures/trips_performed.csv")
@@ -80,7 +80,7 @@ def test_compute_block_recovery() -> None:
 
 
 def test_summarize_segments_columns(joined: pd.DataFrame) -> None:
-    """Summary exposes median/scheduled/diff/recovery per segment."""
+    """Summary exposes median/avg/percentiles/scheduled/diff/recovery per segment."""
     seg = target.build_segments(joined, timepoints_only=True)
     tp = target.load_trips_performed(TRIPS_PERFORMED)
     rec = target.compute_block_recovery(tp)
@@ -91,12 +91,65 @@ def test_summarize_segments_columns(joined: pd.DataFrame) -> None:
         "segment",
         "n_obs",
         "actual_median_min",
+        "actual_avg_min",
+        "actual_p01_min",
+        "actual_p05_min",
+        "actual_p85_min",
+        "actual_p95_min",
+        "actual_p99_min",
         "scheduled_min",
         "diff_min",
         "recovery_after_min",
     ):
         assert col in summary.columns
     assert (summary["n_obs"] >= 1).all()
+    # Percentiles are ordered: p01 <= p05 <= median <= p85 <= p95 <= p99.
+    stats = summary.dropna(subset=["actual_p01_min", "actual_p99_min"])
+    assert (stats["actual_p01_min"] <= stats["actual_p05_min"]).all()
+    assert (stats["actual_p05_min"] <= stats["actual_median_min"]).all()
+    assert (stats["actual_median_min"] <= stats["actual_p85_min"]).all()
+    assert (stats["actual_p85_min"] <= stats["actual_p95_min"]).all()
+    assert (stats["actual_p95_min"] <= stats["actual_p99_min"]).all()
+
+
+def test_summarize_segments_percentile_values() -> None:
+    """Percentile columns match pandas quantile arithmetic on a known series."""
+    runtimes = [10.0, 12.0, 14.0, 16.0, 30.0]
+    seg = pd.DataFrame(
+        {
+            "route_id": ["R1"] * 5,
+            "direction_id": ["0"] * 5,
+            "segment": ["A -> B"] * 5,
+            "seq": [1] * 5,
+            "trip_id_performed": [f"T{i}" for i in range(5)],
+            "actual_runtime_min": runtimes,
+            "scheduled_runtime_min": [12.0] * 5,
+        }
+    )
+    rec = pd.DataFrame({"trip_id_performed": [], "recovery_after_min": []})
+    summary = target.summarize_segments(seg, rec, min_obs=1, percentiles=(85,))
+    row = summary.iloc[0]
+    s = pd.Series(runtimes)
+    assert row["actual_avg_min"] == pytest.approx(s.mean(), abs=0.01)
+    assert row["actual_median_min"] == pytest.approx(s.median(), abs=0.01)
+    assert row["actual_p85_min"] == pytest.approx(s.quantile(0.85), abs=0.01)
+
+
+def test_parse_percentiles() -> None:
+    """CLI percentile strings parse to floats and reject out-of-range values."""
+    assert target.parse_percentiles("1,5,85,95,99") == (1.0, 5.0, 85.0, 95.0, 99.0)
+    assert target.parse_percentiles(" 99.5 ") == (99.5,)
+    with pytest.raises(ValueError):
+        target.parse_percentiles("0")
+    with pytest.raises(ValueError):
+        target.parse_percentiles("100")
+
+
+def test_percentile_column_labels() -> None:
+    """Column names zero-pad single digits and encode decimals with underscores."""
+    assert target.percentile_column(1) == "actual_p01_min"
+    assert target.percentile_column(85) == "actual_p85_min"
+    assert target.percentile_column(99.5) == "actual_p99_5_min"
 
 
 def test_run_writes_long_summary_and_pivots(tmp_path: Path) -> None:

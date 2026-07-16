@@ -167,7 +167,7 @@ def test_full_processing_integration() -> None:
         mock_read.return_value = fixture_df.copy()
 
         # 3. Run the main function
-        target.main()
+        assert target.main() == 0
 
         # 4. Assertions
         mock_read.assert_called_once()
@@ -300,7 +300,7 @@ def test_main_passes_route_analysis_when_enabled() -> None:
         patch("data_request_by_stop_processor.EXPORT_ROUTE_LEVEL_ANALYSIS", True),
     ):
         mock_read.return_value = fixture_df.copy()
-        target.main()
+        assert target.main() == 0
 
         _, kwargs = mock_write.call_args
         route_analysis = kwargs["route_analysis"]
@@ -334,7 +334,7 @@ def test_main_scopes_route_analysis_to_routes_serving_filtered_stops() -> None:
         patch("data_request_by_stop_processor.EXPORT_ROUTE_LEVEL_ANALYSIS", True),
     ):
         mock_read.return_value = fixture_df.copy()
-        target.main()
+        assert target.main() == 0
         _, kwargs = mock_write.call_args
         route_analysis = kwargs["route_analysis"]
 
@@ -634,7 +634,7 @@ def test_main_filters_using_stop_ids_file() -> None:
         patch("data_request_by_stop_processor.EXPORT_ROUTE_LEVEL_ANALYSIS", False),
     ):
         mock_read.return_value = fixture_df.copy()
-        target.main()
+        assert target.main() == 0
 
         args, _ = mock_write.call_args
         filtered_data = args[1]
@@ -664,7 +664,7 @@ def test_main_passes_stop_ids_file_snapshot_info_to_run_log() -> None:
         patch("data_request_by_stop_processor.EXPORT_ROUTE_LEVEL_ANALYSIS", False),
     ):
         mock_read.return_value = fixture_df.copy()
-        target.main()
+        assert target.main() == 0
 
         _, kwargs = mock_log.call_args
 
@@ -763,7 +763,7 @@ def test_main_omits_route_analysis_when_disabled() -> None:
         patch("data_request_by_stop_processor.EXPORT_ROUTE_LEVEL_ANALYSIS", False),
     ):
         mock_read.return_value = fixture_df.copy()
-        target.main()
+        assert target.main() == 0
         _, kwargs = mock_write.call_args
 
     assert kwargs["route_analysis"] is None

@@ -82,13 +82,13 @@ transit_planning_with_python/
 │   │   ├── convert_to_tides_stop_visits.py
 │   │   ├── convert_to_tides_trips_performed.py
 │   │   ├── otp_by_route.py
-│   │   ├── otp_by_timepoint.py
-│   │   ├── otp_monthly_tides.py
-│   │   ├── route_runtime_tides.py
-│   │   ├── segment_runtime_tides.py
-│   │   ├── tides_stop_otp_flagger.py
-│   │   ├── trip_runtime_diagnostics.py
-│   │   └── trip_runtime_tides.py
+│   │   ├── otp_by_stop.py
+│   │   ├── otp_by_timepoint_from_avl.py
+│   │   ├── otp_monthly_panel.py
+│   │   ├── runtime_by_route.py
+│   │   ├── runtime_by_segment.py
+│   │   ├── runtime_by_trip.py
+│   │   └── trip_runtime_diagnostics_from_avl.py
 │   ├── ridership_tools/
 │   │   ├── data_request_by_stop_processor.py
 │   │   ├── load_factor_monitor.py
@@ -217,8 +217,9 @@ transit_planning_with_python/
 │   ├── test_ntd_monthly_summary.py
 │   ├── test_ntd_monthly_trends_export.py
 │   ├── test_otp_by_route.py
-│   ├── test_otp_by_timepoint.py
-│   ├── test_otp_monthly_tides.py
+│   ├── test_otp_by_stop.py
+│   ├── test_otp_by_timepoint_from_avl.py
+│   ├── test_otp_monthly_panel.py
 │   ├── test_pipeline_contracts.py
 │   ├── test_points_of_interest_coverage_gpd.py
 │   ├── test_prep_features_private_orchestrator.py
@@ -228,11 +229,12 @@ transit_planning_with_python/
 │   ├── test_ridership_ml_model.py
 │   ├── test_route_direction_classifier.py
 │   ├── test_route_performance_model.py
-│   ├── test_route_runtime_tides.py
 │   ├── test_route_transfer_calculator.py
+│   ├── test_runtime_by_route.py
+│   ├── test_runtime_by_segment.py
+│   ├── test_runtime_by_trip.py
 │   ├── test_school_coverage_by_route_gpd.py
 │   ├── test_schools_prep_join_gpd.py
-│   ├── test_segment_runtime_tides.py
 │   ├── test_segment_speed_exporter.py
 │   ├── test_shapefile_helpers.py
 │   ├── test_site_route_proximity_gpd.py
@@ -244,15 +246,14 @@ transit_planning_with_python/
 │   ├── test_stop_v_conflict_checker_gpd.py
 │   ├── test_stop_vs_roadname_checker_gpd.py
 │   ├── test_stops_ridership_joiner_gpd.py
-│   ├── test_tides_stop_otp_flagger.py
 │   ├── test_time_band_exporter.py
 │   ├── test_timepoint_schedule_exporter.py
-│   ├── test_trip_runtime_diagnostics.py
-│   ├── test_trip_runtime_tides.py
+│   ├── test_trip_runtime_diagnostics_from_avl.py
 │   ├── test_uscensus_table_build.py
 │   ├── test_uscensus_tiger_join_gpd.py
 │   └── test_validate_gtfs_files_exist.py
 ├── utils/
+│   ├── cli_helpers.py
 │   ├── gtfs_helpers.py
 │   ├── network_helpers.py
 │   ├── run_log.py

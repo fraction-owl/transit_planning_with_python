@@ -5,7 +5,7 @@ Two layers:
     governance inversion vs the public half, the ignore-intermediate convention,
     join-key grouping, and the hygiene guard);
   * one end-to-end run drives the REAL private scripts (ntd_anchor_builder,
-    otp_monthly_tides -> otp_by_route, route_runtime_tides) through the actual
+    otp_monthly_panel -> otp_by_route, runtime_by_route) through the actual
     jobs.private.json registry and the repo TIDES fixtures, catching registry /
     CLI drift.
 """

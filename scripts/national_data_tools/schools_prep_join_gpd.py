@@ -29,6 +29,12 @@ Inputs (placed in the input directory, read straight from their distribution for
     - ELSI_csv_export_*.csv                  ELSI export (public and/or private)
     - effy<year>.csv / effy<year>.xlsx       IPEDS 12-month enrollment (colleges)
 
+Outputs:
+    Written into the output directory, named per school type via the templates:
+    - va_md_dc_<school_type>_schools_enrollment.gpkg    point layer (``schools``) with
+      total enrollment plus the grade/level breakout joined to each EDGE point
+    - va_md_dc_<school_type>_schools_enrollment.csv     attribute-only companion table
+
 Sources:
     - CCD school membership (fiscal files):
       https://nces.ed.gov/ccd/files.asp#Fiscal:2,LevelId:7,SchoolYearId:39,Page:1
@@ -44,6 +50,11 @@ Notes:
       file is present.
     - Keep the geocode and enrollment years on the same vintage, or the join will
       silently drop schools that opened or closed between the two collections.
+
+Typical usage:
+    Set ``INPUT_DIR`` and ``OUTPUT_DIR`` in the config block (or pass ``--input-dir`` /
+    ``--output-dir``; ``--school-type``, ``--enrollment-source``, ``--states``, and
+    ``--crs`` are also available) and run from a shell or a Jupyter notebook.
 """
 
 from __future__ import annotations
@@ -58,6 +69,7 @@ import zipfile
 from dataclasses import dataclass, field
 from itertools import islice
 from pathlib import Path
+from typing import List, Optional, Sequence
 
 import geopandas as gpd
 import pandas as pd
@@ -165,13 +177,32 @@ IPEDS_TOTAL_COL = "EFYTOTLT"
 IPEDS_LEVEL_MAP = {"1": "enroll_total", "2": "g_undergrad", "4": "g_graduate"}
 
 
-def _in_ipython_kernel() -> bool:
-    """Return True inside a Jupyter/IPython kernel.
+def notebook_safe_argv(argv: Optional[Sequence[str]]) -> Optional[List[str]]:
+    """Return the argv to parse, shielding notebook kernels from stray flags.
 
-    There ``sys.argv`` holds the kernel launcher args (e.g. ``-f
-    ...kernel.json``) rather than user CLI args.
+    When a script's ``main()`` runs with no explicit ``argv`` inside a
+    Jupyter/IPython kernel, ``sys.argv`` holds kernel plumbing (for example
+    ``-f /path/kernel.json``) rather than flags meant for the script, and
+    strict ``argparse.parse_args`` would reject it and abort.  This helper
+    detects the notebook case and substitutes an empty argument list so the
+    CONFIGURATION constants stay in charge, while shell runs keep strict
+    parsing (a typo in a flag fails loudly instead of being silently ignored).
+
+    Canonical implementation: ``utils/cli_helpers.py``.
+
+    Args:
+        argv: Explicit argument list passed to ``main()``, or ``None`` to
+            fall back to ``sys.argv``.
+
+    Returns:
+        ``list(argv)`` when *argv* was provided; ``[]`` when running inside a
+        notebook kernel; otherwise ``None`` so argparse reads ``sys.argv[1:]``.
     """
-    return "ipykernel" in sys.modules or Path(sys.argv[0]).name == "ipykernel_launcher.py"
+    if argv is not None:
+        return list(argv)
+    if "ipykernel" in sys.modules:
+        return []
+    return None
 
 
 def _ensure_logging(level: int = logging.INFO) -> None:
@@ -686,23 +717,24 @@ def run(
     return out
 
 
-def main(argv: list[str] | None = None) -> None:
+def main(argv: Sequence[str] | None = None) -> int:
     """Entry point for both notebook and CLI.
 
     Path resolution is the same everywhere: explicit value -> config block ->
-    interactive prompt. In a Jupyter/IPython kernel the launcher injects its own
-    argv (``-f kernel.json``), which argparse would reject, so we skip parsing
-    and let ``run()`` resolve from the config block or prompt. On the command
+    interactive prompt. Parsing is strict (an unknown flag aborts); inside a
+    Jupyter/IPython kernel ``notebook_safe_argv`` swaps the kernel's injected
+    argv for an empty list so the config block stays in charge. On the command
     line, flags override the config; omit them (with config left as None) to be
     prompted. ``--school-type both`` processes public then private.
+
+    Returns:
+        Process exit code: 0 on success (failures raise and exit non-zero).
     """
     _ensure_logging()
-    if argv is None and _in_ipython_kernel():
-        logger.info("kernel detected; resolving paths from config block or prompt")
-        run(school_type=DEFAULT_SCHOOL_TYPE, enrollment_source=DEFAULT_ENROLLMENT_SOURCE)
-        return
-
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(
+        description=__doc__.splitlines()[0],
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     parser.add_argument(
         "--input-dir", type=Path, default=INPUT_DIR, help="folder holding the distribution files"
     )
@@ -713,29 +745,28 @@ def main(argv: list[str] | None = None) -> None:
         "--school-type",
         choices=[*SCHOOL_TYPES, "both", "all"],
         default=DEFAULT_SCHOOL_TYPE,
-        help="school type to process; 'both' = public+private, 'all' adds postsec "
-        "(default: %(default)s)",
+        help="school type to process; 'both' = public+private, 'all' adds postsec",
     )
     parser.add_argument(
         "--enrollment-source",
         choices=["auto", "ccd", "elsi", "ipeds"],
         default=DEFAULT_ENROLLMENT_SOURCE,
-        help="enrollment source; auto picks the first the type declares (default: %(default)s)",
+        help="enrollment source; auto picks the first the type declares",
     )
     parser.add_argument(
         "--states",
         nargs="+",
         metavar="ABBR",
         default=sorted(STATE_ABBRS),
-        help="postal abbreviations to keep (default: VA MD DC)",
+        help="postal abbreviations to keep",
     )
     parser.add_argument(
         "--crs",
         type=int,
         default=OUTPUT_CRS,
-        help="EPSG code to reproject school points into (default: %(default)s)",
+        help="EPSG code to reproject school points into",
     )
-    args = parser.parse_args(argv)
+    args = parser.parse_args(notebook_safe_argv(argv))
 
     if args.school_type == "all":
         types = list(SCHOOL_TYPES)
@@ -752,7 +783,8 @@ def main(argv: list[str] | None = None) -> None:
             states={s.upper() for s in args.states},
             output_crs=args.crs,
         )
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

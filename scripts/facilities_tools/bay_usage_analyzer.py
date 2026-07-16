@@ -8,8 +8,16 @@ calculates capacity constraints from the user-defined ``CLUSTER_DEFINITIONS``,
 and writes a detailed Excel workbook for each cluster showing every event and
 highlighting any conflicts.
 
-Typical use is from a Jupyter Notebook or ArcGIS Pro “Python” pane, but
-the module can also be invoked directly from the command line.
+Outputs
+-------
+- ``<Cluster_Name>_Conflicts.xlsx`` (one workbook per cluster, written to
+  ``CLUSTER_CONFLICT_OUTPUT_FOLDER``): an “AllStops” sheet of every event plus
+  one sheet per stop and overflow bay, with conflict rows shown in bold.
+
+Typical usage
+-------------
+Update the paths in the CONFIGURATION section and run from a Jupyter
+notebook, ArcGIS Pro’s “Python” pane, or directly from the command line.
 """
 
 from __future__ import annotations
@@ -530,8 +538,13 @@ def run_step2_conflict_detection() -> None:
 # ==================================================================================================
 
 
-def main() -> None:
-    """Entry point when executing this module as a script."""
+def main() -> int:
+    """Entry point when executing this module as a script.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -545,10 +558,11 @@ def main() -> None:
             "BLOCK_OUTPUT_FOLDER and/or CLUSTER_CONFLICT_OUTPUT_FOLDER are still set to "
             "placeholder values. Please update them in the CONFIGURATION section before running."
         )
-        return
+        return 2
     run_step2_conflict_detection()
     logging.info("Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
