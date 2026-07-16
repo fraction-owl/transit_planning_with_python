@@ -27,7 +27,7 @@ Logical stop key:
     USE_STOP_CODE is True, stops are deduplicated by stop_code; an improvement
     counts as present on a logical stop if ANY underlying platform has it.
 
-Typical use:
+Typical usage:
     Quarterly board reports, capital planning prioritization, equity reporting
     on amenity coverage on priority vs. coverage routes.
 """

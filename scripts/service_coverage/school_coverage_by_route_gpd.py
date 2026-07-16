@@ -23,8 +23,8 @@ Inputs
   (``va_md_dc_<type>_schools_enrollment.gpkg``); pass a single file or a folder
   to combine public + private + postsec into one rollup.
 
-Output
-------
+Outputs
+-------
 - ``school_coverage_by_route.csv`` — columns ``route_id``, ``route_short_name``
   (when available), ``schools_served``, ``enrollment_served`` (grand total), and
   the grade-band breakout ``enrollment_1_8_served``, ``enrollment_9_12_served``,

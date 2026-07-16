@@ -6,8 +6,8 @@ stop spacings, and block lengths to serve as fixture data for downstream
 scripts in this repository (e.g., schedule exporters, stop-spacing flaggers,
 skipped-stop flaggers, GTFS-to-shapefile converters).
 
-What it produces
-----------------
+Outputs
+-------
 For each region, a complete GTFS package containing:
     agency.txt, stops.txt, routes.txt, trips.txt, stop_times.txt,
     calendar.txt, calendar_dates.txt, shapes.txt, feed_info.txt

@@ -1,10 +1,29 @@
 """Generates minute-by-minute transit block status timelines from GTFS data.
 
-Processes GTFS files to determine operational statuses (e.g., DWELL, LAYOVER, TRAVELING)
-of transit blocks at one-minute intervals, producing Excel reports for further analysis.
+Processes GTFS files to determine each vehicle block's operational status (e.g.
+DWELL, LAYOVER, LOADING, TRAVELING BETWEEN STOPS, LONG BREAK, INACTIVE) at
+one-minute intervals across the service day, producing one spreadsheet per
+block for further analysis (bay conflict checks, layover planning, cluster
+staffing). Named stop clusters (``CLUSTER_DEFINITIONS``) group related stops --
+for example the bays of a transit center -- so statuses reflect time spent
+anywhere in the cluster.
 
-Typically used interactively within a Jupyter notebook or ArcGIS Pro environment,
-though direct execution via the command line is also supported.
+Inputs
+------
+- A GTFS folder containing trips.txt, stop_times.txt, routes.txt, stops.txt,
+  and calendar.txt. The service day to analyze is selected via
+  ``CALENDAR_SERVICE_IDS``; optional route and stop filters narrow the run.
+
+Outputs
+-------
+- One Excel workbook per vehicle block (``block_<block_id>_<route(s)>.xlsx``)
+  in ``BLOCK_OUTPUT_FOLDER``: one row per minute with timestamp, route,
+  direction, trip, stop, arrival/departure times, and status.
+
+Typical usage
+-------------
+Update the paths in the CONFIGURATION section and run from a shell, ArcGIS
+Pro's Python window, or a Jupyter notebook.
 """
 
 from __future__ import annotations

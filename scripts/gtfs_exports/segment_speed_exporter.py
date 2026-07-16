@@ -5,13 +5,12 @@ trips by stop pattern and schedule, aggregates them into time-of-day bands, and
 writes one workbook per (route × service ID).  Each workbook contains one sheet
 per travel direction with per-segment speeds.
 
-Typical use-cases
------------------
-* Rapid batch analysis of GTFS feeds in Jupyter Notebooks or ArcGIS Pro.
-* Producing reviewer-friendly Excel outputs for operations or service planning.
-
-Before running, **edit the paths and optional filters** in the *CONFIGURATION*
-section.
+Typical usage
+-------------
+Edit the paths and optional filters in the *CONFIGURATION* section, then run
+from a Jupyter notebook, ArcGIS Pro's Python window, or a shell. Suited to
+rapid batch analysis of GTFS feeds and to producing reviewer-friendly Excel
+outputs for operations or service planning.
 """
 
 from __future__ import annotations

@@ -7,7 +7,7 @@ Supports two input modes:
 Applies optional route filters and returns closest routes and directions per input.
 Outputs results to a CSV file with customizable location metadata.
 
-Typical use:
+Typical usage:
     - Evaluate transit accessibility near proposed schools, facilities, or sites.
     - Summarize GTFS route presence at selected stop codes.
 

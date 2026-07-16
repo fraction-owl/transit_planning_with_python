@@ -4,7 +4,7 @@ Determines whether GTFS shapes are cardinal (NB, SB, EB, WB) or looped (CW, CCW,
 flags suspicious direction inconsistencies, and optionally exports Excel summaries and
 JPEG maps of dominant route shapes.
 
-Typical use: ArcGIS Pro workflows or Jupyter notebooks with GTFS datasets.
+Typical usage: ArcGIS Pro workflows or Jupyter notebooks with GTFS datasets.
 
 Inputs:
     - GTFS files: routes.txt, trips.txt, stop_times.txt, shapes.txt, stops.txt

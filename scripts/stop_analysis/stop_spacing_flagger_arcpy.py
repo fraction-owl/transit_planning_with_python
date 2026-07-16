@@ -4,7 +4,7 @@ This module converts a General Transit Feed Specification (GTFS) package
 (directory or .zip) into projected ESRI Shapefiles suitable for spatial analysis
 and provides quality assurance (QA) checks on stop spacing.
 
-Primary outputs include:
+Outputs:
 * Shapefiles for served stops, route polylines, and stop-to-stop segments
 * Logs flagging consecutive served stops that are spaced too closely
 * CSVs identifying potential “missed” stops located between long stop-to-stop gaps

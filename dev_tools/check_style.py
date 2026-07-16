@@ -18,6 +18,8 @@ Checks performed (per-file):
     9.  logging_present   – `import logging` and at least one `logging.` call present.
     10. success_message   – A success/completion message via `logging` present.
     11. no_dataclasses    – No use of `dataclasses` (import or decorator).
+    12. docstring_sections – Module docstring uses the canonical section names
+        (`Inputs` / `Outputs` / `Typical usage`) from CONTRIBUTING.md.
 
 Exit status:
     0 – all enabled checks passed for all files
@@ -74,6 +76,7 @@ CHECKS_ENABLED: dict[str, bool] = {
     "logging_present": True,
     "success_message": True,
     "no_dataclasses": True,
+    "docstring_sections": True,
 }
 
 # === END CONFIG ===
@@ -125,6 +128,36 @@ _OUTPUT_WRITE_PAT: re.Pattern[str] = re.compile(
     r'|open\s*\([^)]+,\s*["\']w',
     re.IGNORECASE,
 )
+
+# Non-canonical module-docstring section names and their canonical replacements
+# (see the module-docstring template in CONTRIBUTING.md).
+_DOCSTRING_SECTION_VARIANTS: dict[str, str] = {
+    "Output": "Outputs",
+    "What it produces": "Outputs",
+    "WHAT IT PRODUCES": "Outputs",
+    "Primary outputs include": "Outputs",
+    "Input": "Inputs",
+    "Typical use": "Typical usage",
+    "Usage": "Typical usage",
+    "RUNNING IT": "Typical usage",
+}
+
+
+def _docstring_has_section(doc: str, name: str) -> bool:
+    """Return True if *doc* has a section header *name* (colon or underlined form).
+
+    Matches the exact header name, optionally followed by a parenthetical
+    (e.g. ``Outputs (CSV):``), then either a colon (Google style) or an
+    underline of dashes on the next line. Longer headers that merely start
+    with *name* (e.g. ``Output structure``) do not match.
+    """
+    head = rf"^{re.escape(name)}[ \t]*(?:\([^)\n]*\))?[ \t]*"
+    pat = re.compile(
+        rf"{head}:"  # Google style: `Outputs:` / `Outputs (CSV):`
+        rf"|{head}\n[ \t]*-{{3,}}[ \t]*$",  # underlined style
+        re.MULTILINE,
+    )
+    return bool(pat.search(doc))
 
 
 def _read_source(path: Path) -> str | None:
@@ -523,6 +556,66 @@ def check_no_dataclasses(src: str, path: Path) -> list[Violation]:
     return found
 
 
+def check_docstring_sections(src: str, path: Path) -> list[Violation]:
+    """Flag module docstrings with variant section names or missing required sections."""
+    try:
+        tree = ast.parse(src, filename=str(path))
+    except SyntaxError:
+        return []
+
+    doc = ast.get_docstring(tree)
+    if doc is None:
+        return [
+            Violation(
+                check="docstring_sections",
+                line=1,
+                message=(
+                    "No module docstring — add one following the module-docstring "
+                    "template in CONTRIBUTING.md"
+                ),
+            )
+        ]
+
+    found: list[Violation] = []
+    for variant, canonical in _DOCSTRING_SECTION_VARIANTS.items():
+        if _docstring_has_section(doc, variant):
+            found.append(
+                Violation(
+                    check="docstring_sections",
+                    line=None,
+                    message=(
+                        f"Module docstring section `{variant}` should be named "
+                        f"`{canonical}` — use the canonical section names from "
+                        "CONTRIBUTING.md"
+                    ),
+                )
+            )
+
+    if _OUTPUT_WRITE_PAT.search(src) and not _docstring_has_section(doc, "Outputs"):
+        found.append(
+            Violation(
+                check="docstring_sections",
+                line=None,
+                message=(
+                    "Script writes output file(s) but its module docstring has no "
+                    "`Outputs` section — list the files it writes per CONTRIBUTING.md"
+                ),
+            )
+        )
+    if not _docstring_has_section(doc, "Typical usage"):
+        found.append(
+            Violation(
+                check="docstring_sections",
+                line=None,
+                message=(
+                    "Module docstring has no `Typical usage` section — say how to "
+                    "run the script per CONTRIBUTING.md"
+                ),
+            )
+        )
+    return found
+
+
 # =============================================================================
 # ORCHESTRATION
 # =============================================================================
@@ -562,6 +655,8 @@ def audit_file(path: Path) -> FileResult:
         violations.extend(check_success_message(src))
     if enabled.get("no_dataclasses", True):
         violations.extend(check_no_dataclasses(src, path))
+    if enabled.get("docstring_sections", True):
+        violations.extend(check_docstring_sections(src, path))
 
     return FileResult(path=path, violations=violations)
 

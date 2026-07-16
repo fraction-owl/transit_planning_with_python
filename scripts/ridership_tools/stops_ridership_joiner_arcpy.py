@@ -8,7 +8,7 @@ Outputs include shapefiles of stops with ridership attributes, CSV summaries, an
 if a polygon layer is provided, shapefiles and CSVs with aggregated ridership by area.
 Optionally renders per-route boardings/alightings maps from GTFS shapes (see DRAW_PLOTS).
 
-Typical use:
+Typical usage:
     Configure paths and options at the top of the script, then run inside ArcGIS Pro
     or as a standalone Python script with access to the ArcPy environment.
 """

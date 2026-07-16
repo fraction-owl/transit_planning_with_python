@@ -8,7 +8,7 @@ Outputs:
     - CSV of potential stop name typos and similarity scores.
     - File geodatabase with intermediate feature classes for inspection.
 
-Typical use:
+Typical usage:
     Run in ArcGIS Pro's Python environment or any ArcPy-enabled session
     after configuring input paths and parameters at the top of the script.
 """
