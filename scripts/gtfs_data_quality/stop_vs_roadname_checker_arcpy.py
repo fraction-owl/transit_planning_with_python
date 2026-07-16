@@ -428,8 +428,13 @@ def detect_typos(
 # =============================================================================
 
 
-def main() -> None:
-    """Main script execution function."""
+def main() -> int:
+    """Main script execution function.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -440,7 +445,7 @@ def main() -> None:
             "GTFS_FOLDER and/or OUTPUT_DIR are still set to placeholder values. "
             "Please update them in the CONFIGURATION section before running."
         )
-        return
+        return 2
     # workspace
     WORK_GDB = create_work_gdb(OUTPUT_DIR)
 
@@ -494,11 +499,12 @@ def main() -> None:
 
     logging.info("All done. Workspace retained at %s for inspection.", WORK_GDB)
     logging.info("Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
     try:
-        main()
+        raise SystemExit(main())
     except Exception:
         logging.exception("Processing failed")
         sys.exit(1)

@@ -340,8 +340,13 @@ def _export_conflicts(
 # =============================================================================
 
 
-def main() -> None:
-    """Run minimal stop conflict checker (overlap-only; pandas dedupe retained)."""
+def main() -> int:
+    """Run minimal stop conflict checker (overlap-only; pandas dedupe retained).
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -355,7 +360,7 @@ def main() -> None:
             "OUTPUT_DIR and/or GTFS_DIR are still set to placeholder values. "
             "Please update them in the CONFIGURATION section before running."
         )
-        return
+        return 2
     arcpy.env.overwriteOutput = OVERWRITE_OUTPUT
     _validate_config()
 
@@ -452,7 +457,8 @@ def main() -> None:
         "and " + xlsx_path if xlsx_path else "",
     )
     logging.info("Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

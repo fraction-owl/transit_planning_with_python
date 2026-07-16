@@ -584,8 +584,12 @@ def write_summary_txt(
 # =============================================================================
 
 
-def main() -> None:
-    """Run the coverage summary pipeline."""
+def main() -> int:
+    """Run the coverage summary pipeline.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure.
+    """
     logging.basicConfig(level=LOG_LEVEL, format="%(levelname)s | %(message)s")
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -693,7 +697,8 @@ def main() -> None:
     logging.info("Wrote summary: %s", txt_path)
     logging.info("Wrote detail:  %s", csv_path)
     logging.info("Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

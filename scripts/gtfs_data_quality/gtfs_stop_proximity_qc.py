@@ -417,8 +417,13 @@ def summarize_by_stop(pairs: pd.DataFrame) -> pd.DataFrame:
 # =============================================================================
 
 
-def main() -> None:
-    """Run the stop proximity QC."""
+def main() -> int:
+    """Run the stop proximity QC.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -429,7 +434,7 @@ def main() -> None:
             "GTFS_DIR and/or OUT_DIR are still set to placeholder values. "
             "Please update them in the CONFIGURATION section before running."
         )
-        return
+        return 2
 
     validate_gtfs_files_exist(str(GTFS_DIR))
 
@@ -468,7 +473,8 @@ def main() -> None:
     logging.info("Wrote: %s", pairs_path)
     logging.info("Wrote: %s", summary_path)
     logging.info("Script completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
