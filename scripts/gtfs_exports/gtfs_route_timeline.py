@@ -315,7 +315,7 @@ def parse_date(value: object) -> Optional[dt.date]:
 def natural_key(text: str) -> tuple[object, ...]:
     """Sort key that orders embedded numbers numerically ("2" before "10")."""
     parts = re.split(r"(\d+)", str(text))
-    return tuple(int(p) if p.isdigit() else p.lower() for p in parts if p != "")
+    return tuple((0, int(p)) if p.isdigit() else (1, p.lower()) for p in parts if p != "")
 
 
 # =============================================================================
