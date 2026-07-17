@@ -8,10 +8,18 @@ Outputs:
 * Shapefiles for served stops, route polylines, and stop-to-stop segments
 * Logs flagging consecutive served stops that are spaced too closely
 * CSVs identifying potential “missed” stops located between long stop-to-stop gaps
+* Optional what-if QA for proposed stop relocations: a CSV of recomputed
+  along-route spacing around each relocated stop with a compliance verdict,
+  plus a PNG map per relocated stop (``proposed_maps/<stop_id>.png``)
 
 The long-spacing check examines whether stops from other routes fall within a
 specified buffer distance of unusually long segments and may merit further
 review as possible missed service opportunities.
+
+The proposed-relocation check accepts new coordinates for existing stops —
+either as an in-line list or a .txt/.csv file — and reports whether the
+spacing to each adjacent served stop, measured along the route polyline,
+would comply with the short/long spacing thresholds after the move.
 
 Typical usage:
 Update the paths in the CONFIGURATION section and run from ArcGIS Pro's Python
@@ -28,9 +36,10 @@ import tempfile
 import zipfile
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, NamedTuple, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, NamedTuple, Sequence, Set, Tuple
 
 import arcpy
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
@@ -64,6 +73,18 @@ LONG_SPACING_FT: float = 1_500.0
 NEAR_BUFFER_FT: float = 99.0
 LONG_SPACING_LOG_FILE: str = "long_spacing_segments.txt"  # currently unused (CSV + summary)
 LONG_SPACING_CSV_FILE: str = "long_spacing_segments.csv"
+
+# Proposed stop relocations (optional what-if QA)
+# Provide new coordinates for existing stops either as an in-line list of
+# (stop identifier, new_lat, new_lon) tuples or as the path to a .txt/.csv
+# file with a header row, e.g. ``stop_id,new_lat,new_lon`` (comma- or
+# tab-separated). Identifiers are matched against stop_id first, then
+# stop_code (when stops.txt has one). Leave as None (or empty) to skip.
+PROPOSED_STOPS: list[tuple[str, float, float]] | str | None = None
+# PROPOSED_STOPS = [("1001", 38.8895, -77.0353)]
+# PROPOSED_STOPS = r"Path\To\Your\proposed_stops.txt"
+PROPOSED_SPACING_CSV_FILE: str = "proposed_spacing_compliance.csv"
+PROPOSED_MAPS: bool = True  # write a PNG map per relocated stop
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
 
@@ -984,6 +1005,462 @@ def _flag_long_spacing_csv(
 
 
 # =============================================================================
+# PROPOSED STOP RELOCATIONS (WHAT-IF QA)
+# =============================================================================
+
+
+def _load_proposed_stops(
+    source: Sequence[Tuple[str, float, float]] | str | Path | None,
+) -> List[Tuple[str, float, float]]:
+    """Normalize ``PROPOSED_STOPS`` into a list of (identifier, lat, lon).
+
+    Args:
+        source: Either an in-line sequence of ``(identifier, new_lat, new_lon)``
+            tuples, a path to a delimited text file (comma- or tab-separated)
+            with a header row naming an identifier column (``stop_id``,
+            ``stop_code``, or ``stop``) plus latitude/longitude columns
+            (``new_lat``/``new_lon``, ``stop_lat``/``stop_lon``, or
+            ``lat``/``lon``), or None.
+
+    Returns:
+        List of ``(identifier, lat, lon)`` tuples. Empty when *source* is
+        None or empty.
+
+    Raises:
+        ValueError: If the file lacks the required columns, an entry does not
+            have exactly three fields, coordinates are not numeric, or a
+            coordinate is outside the valid WGS84 range.
+    """
+    if source is None or (not isinstance(source, (str, Path)) and len(source) == 0):
+        return []
+
+    if isinstance(source, (str, Path)):
+        df = pd.read_csv(source, sep=None, engine="python", dtype=str, skipinitialspace=True)
+        cols = {str(c).strip().lower(): c for c in df.columns}
+        id_col = next((cols[k] for k in ("stop_id", "stop_code", "stop") if k in cols), None)
+        lat_col = next((cols[k] for k in ("new_lat", "stop_lat", "lat") if k in cols), None)
+        lon_col = next((cols[k] for k in ("new_lon", "stop_lon", "lon") if k in cols), None)
+        if id_col is None or lat_col is None or lon_col is None:
+            raise ValueError(
+                f"Proposed-stops file {source!s} must have a header row with an "
+                "identifier column (stop_id, stop_code, or stop) and coordinate "
+                "columns (new_lat/new_lon, stop_lat/stop_lon, or lat/lon)."
+            )
+        raw_rows: Iterable[Tuple[Any, Any, Any]] = zip(df[id_col], df[lat_col], df[lon_col])
+    else:
+        raw_rows = source  # type: ignore[assignment]
+
+    out: List[Tuple[str, float, float]] = []
+    for entry in raw_rows:
+        try:
+            ident, lat_raw, lon_raw = entry
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Proposed-stop entry {entry!r} must have exactly three fields: "
+                "(identifier, new_lat, new_lon)."
+            ) from exc
+        try:
+            lat, lon = float(lat_raw), float(lon_raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Proposed-stop entry for {ident!r} has non-numeric coordinates: "
+                f"({lat_raw!r}, {lon_raw!r})."
+            ) from exc
+        if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+            raise ValueError(
+                f"Proposed-stop entry for {ident!r} has out-of-range WGS84 "
+                f"coordinates: ({lat}, {lon})."
+            )
+        out.append((str(ident).strip(), lat, lon))
+    return out
+
+
+def _resolve_proposed_stops(
+    proposals: Sequence[Tuple[str, float, float]],
+    stops_master: pd.DataFrame,
+) -> Dict[str, Tuple[float, float]]:
+    """Map proposal identifiers to canonical ``stop_id`` values.
+
+    Identifiers are matched against ``stop_id`` first, then ``stop_code``
+    (when that column exists in *stops_master*). Unmatched identifiers are
+    logged and dropped; a repeated identifier overrides the earlier entry.
+
+    Args:
+        proposals: Output of :func:`_load_proposed_stops`.
+        stops_master: The raw ``stops.txt`` DataFrame.
+
+    Returns:
+        Mapping ``stop_id → (new_lat, new_lon)``.
+    """
+    stop_ids: Set[str] = set(stops_master["stop_id"].astype(str))
+    code_to_id: Dict[str, str] = {}
+    if "stop_code" in stops_master.columns:
+        codes = stops_master.loc[stops_master["stop_code"].notna(), ["stop_code", "stop_id"]]
+        for code, sid in zip(codes["stop_code"].astype(str), codes["stop_id"].astype(str)):
+            code_to_id.setdefault(code, sid)
+
+    resolved: Dict[str, Tuple[float, float]] = {}
+    for ident, lat, lon in proposals:
+        sid = ident if ident in stop_ids else code_to_id.get(ident)
+        if sid is None:
+            logging.warning(
+                "Proposed stop %r not found in stops.txt (checked stop_id and stop_code); "
+                "skipping.",
+                ident,
+            )
+            continue
+        if sid in resolved:
+            logging.warning("Proposed stop %s appears more than once; keeping the last entry.", sid)
+        resolved[sid] = (lat, lon)
+    return resolved
+
+
+def _apply_proposed_stop_geoms(
+    stop_geoms: Dict[str, arcpy.PointGeometry],
+    moves: Dict[str, Tuple[float, float]],
+    projected_sr: arcpy.SpatialReference,
+) -> Dict[str, arcpy.PointGeometry]:
+    """Return a copy of *stop_geoms* with relocated stops re-projected.
+
+    Args:
+        stop_geoms: Mapping stop_id → PointGeometry (projected).
+        moves: Mapping ``stop_id → (new_lat, new_lon)`` in WGS84.
+        projected_sr: Target projected spatial reference.
+
+    Returns:
+        New mapping; stops absent from *moves* keep their geometry.
+    """
+    out = dict(stop_geoms)
+    if not moves:
+        return out
+
+    wgs84 = arcpy.SpatialReference(4326)
+    for sid, (lat, lon) in moves.items():
+        pt = arcpy.Point(lon, lat)
+        out[sid] = arcpy.PointGeometry(pt, wgs84).projectAs(projected_sr)
+    return out
+
+
+def _evaluate_proposed_spacing(
+    routes: List[Dict[str, Any]],
+    stops_df: pd.DataFrame,
+    route_index: Dict[Tuple[str, int], np.ndarray],
+    stop_geoms: Dict[str, arcpy.PointGeometry],
+    proposed_geoms: Dict[str, arcpy.PointGeometry],
+    moved_ids: Set[str],
+    sr: arcpy.SpatialReference,
+    min_spacing_ft: float,
+    long_spacing_ft: float,
+) -> pd.DataFrame:
+    """Recompute along-route spacing around relocated stops.
+
+    For every (route_id, direction_id) polyline that serves a relocated stop,
+    each consecutive served-stop pair touching a relocated stop is measured
+    along the polyline under both the original and the proposed coordinates.
+
+    Args:
+        routes: Route records built by :func:`_build_routes_from_shapes`.
+        stops_df: Served stops (filtered set) with route/direction lists.
+        route_index: Output of :func:`_build_route_stop_index` for *stops_df*.
+        stop_geoms: Original stop geometries.
+        proposed_geoms: Output of :func:`_apply_proposed_stop_geoms`.
+        moved_ids: ``stop_id`` values that were relocated.
+        sr: Projected spatial reference (for the feet factor).
+        min_spacing_ft: Spacing below this is flagged ``too short``.
+        long_spacing_ft: Spacing above this is flagged ``too long``.
+
+    Returns:
+        One row per affected consecutive pair with columns: route_id,
+        route_short, direction_id, moved_stop_id, begin/end stop id + name,
+        spacing_ft_before, spacing_ft_after, verdict, compliant.
+    """
+    columns = [
+        "route_id",
+        "route_short",
+        "direction_id",
+        "moved_stop_id",
+        "begin_stop_id",
+        "begin_stop_name",
+        "end_stop_id",
+        "end_stop_name",
+        "spacing_ft_before",
+        "spacing_ft_after",
+        "verdict",
+        "compliant",
+    ]
+    ft_factor = _feet_factor(sr)
+    records: List[Dict[str, Any]] = []
+
+    for rec in routes:
+        line: arcpy.Polyline = rec["geometry"]
+        if _is_empty_polyline(line):
+            continue
+
+        rid = rec["route_id"]
+        drn = int(rec["direction_id"])
+
+        after = _ordered_route_stops(rec, stops_df, route_index, proposed_geoms, line)
+        if len(after) < 2:
+            continue
+        moved_here = {s.stop_id for s in after} & moved_ids
+        if not moved_here:
+            continue
+
+        before = _ordered_route_stops(rec, stops_df, route_index, stop_geoms, line)
+        before_pos: Dict[str, float] = {s.stop_id: s.measure for s in before}
+
+        for i in range(len(after) - 1):
+            s0, s1 = after[i], after[i + 1]
+            pair_moved = [sid for sid in (s0.stop_id, s1.stop_id) if sid in moved_here]
+            if not pair_moved:
+                continue
+
+            spacing_after = (s1.measure - s0.measure) * ft_factor
+            b0 = before_pos.get(s0.stop_id)
+            b1 = before_pos.get(s1.stop_id)
+            if b0 is not None and b1 is not None:
+                spacing_before = abs(b1 - b0) * ft_factor
+            else:
+                spacing_before = float("nan")
+
+            if spacing_after < min_spacing_ft:
+                verdict = "too short"
+            elif spacing_after > long_spacing_ft:
+                verdict = "too long"
+            else:
+                verdict = "OK"
+
+            records.append(
+                {
+                    "route_id": rid,
+                    "route_short": rec.get("route_short"),
+                    "direction_id": drn,
+                    "moved_stop_id": ",".join(pair_moved),
+                    "begin_stop_id": s0.stop_id,
+                    "begin_stop_name": s0.stop_name,
+                    "end_stop_id": s1.stop_id,
+                    "end_stop_name": s1.stop_name,
+                    "spacing_ft_before": round(spacing_before, 1),
+                    "spacing_ft_after": round(spacing_after, 1),
+                    "verdict": verdict,
+                    "compliant": verdict == "OK",
+                }
+            )
+
+    return pd.DataFrame.from_records(records, columns=columns)
+
+
+def _plot_route_polyline(ax: Any, line: arcpy.Polyline) -> None:
+    """Draw every part of an arcpy Polyline on a matplotlib axis."""
+    for part in line:
+        xs = [pt.X for pt in part if pt]
+        ys = [pt.Y for pt in part if pt]
+        if xs:
+            ax.plot(xs, ys, color="0.6", linewidth=1.0, zorder=1)
+
+
+def _plot_proposed_stops(
+    routes: List[Dict[str, Any]],
+    stops_df: pd.DataFrame,
+    route_index: Dict[Tuple[str, int], np.ndarray],
+    stop_geoms: Dict[str, arcpy.PointGeometry],
+    proposed_geoms: Dict[str, arcpy.PointGeometry],
+    moves: Dict[str, Tuple[float, float]],
+    report: pd.DataFrame,
+    out_dir: Path,
+) -> None:
+    """Write one PNG map per relocated stop to ``<out_dir>/proposed_maps``.
+
+    Each map shows the serving route polylines, nearby served stops, the
+    original (red) and proposed (green) stop positions joined by a dashed
+    arrow, and the recomputed spacing to each adjacent stop annotated at the
+    segment midpoint (green when compliant, red otherwise).
+    """
+    map_dir = out_dir / "proposed_maps"
+    map_dir.mkdir(parents=True, exist_ok=True)
+
+    name_by_id: Dict[str, str] = dict(
+        zip(stops_df["stop_id"].astype(str), stops_df["stop_name"].astype(str))
+    )
+
+    def _xy(geom: arcpy.PointGeometry | None) -> Tuple[float, float] | None:
+        if geom is None or geom.firstPoint is None:
+            return None
+        return (geom.firstPoint.X, geom.firstPoint.Y)
+
+    for sid in moves:
+        old_xy = _xy(stop_geoms.get(sid))
+        new_xy = _xy(proposed_geoms.get(sid))
+        if old_xy is None or new_xy is None:
+            continue
+
+        stop_rows = stops_df.loc[stops_df["stop_id"].astype(str) == sid]
+        if stop_rows.empty:
+            continue
+        row = stop_rows.iloc[0]
+        serving = [
+            rec
+            for rec in routes
+            if not _is_empty_polyline(rec["geometry"])
+            and str(rec["route_id"]) in [str(x) for x in row.route_id]
+            and int(rec["direction_id"]) in [int(x) for x in row.direction_id]
+        ]
+
+        rows = report[
+            report["moved_stop_id"].astype(str).str.split(",").apply(lambda xs, s=sid: s in xs)
+        ]
+
+        fig, ax = plt.subplots(figsize=(5, 5), dpi=200)
+
+        for rec in serving:
+            _plot_route_polyline(ax, rec["geometry"])
+            idxs = route_index.get((str(rec["route_id"]), int(rec["direction_id"])))
+            if idxs is None:
+                continue
+            for nsid in stops_df.iloc[idxs]["stop_id"].astype(str):
+                n_xy = _xy(proposed_geoms.get(nsid))
+                if n_xy is not None:
+                    ax.plot([n_xy[0]], [n_xy[1]], "o", color="0.4", markersize=3, zorder=2)
+
+        ax.plot([old_xy[0]], [old_xy[1]], "o", color="red", markersize=7, zorder=4)
+        ax.plot([new_xy[0]], [new_xy[1]], "o", color="green", markersize=7, zorder=4)
+        ax.annotate(
+            "",
+            xy=new_xy,
+            xytext=old_xy,
+            arrowprops={"arrowstyle": "->", "linestyle": "--", "color": "black"},
+            zorder=3,
+        )
+
+        focus_xs: List[float] = [old_xy[0], new_xy[0]]
+        focus_ys: List[float] = [old_xy[1], new_xy[1]]
+        for rec_row in rows.itertuples(index=False):
+            p0 = _xy(proposed_geoms.get(str(rec_row.begin_stop_id)))
+            p1 = _xy(proposed_geoms.get(str(rec_row.end_stop_id)))
+            if p0 is None or p1 is None:
+                continue
+            focus_xs.extend([p0[0], p1[0]])
+            focus_ys.extend([p0[1], p1[1]])
+            ax.annotate(
+                f"{rec_row.spacing_ft_after:,.0f} ft ({rec_row.verdict})",
+                xy=((p0[0] + p1[0]) / 2.0, (p0[1] + p1[1]) / 2.0),
+                xytext=(3, 3),
+                textcoords="offset points",
+                fontsize=7,
+                color="green" if rec_row.compliant else "red",
+                zorder=5,
+            )
+
+        n_bad = int((~rows["compliant"]).sum()) if not rows.empty else 0
+        status = "all spacing OK" if n_bad == 0 else f"{n_bad} non-compliant segment(s)"
+        ax.set_title(
+            f"Proposed move: {name_by_id.get(sid, '')} ({sid}) — {status}",
+            fontsize=8,
+        )
+        # Zoom to the relocation and its adjacent segments; without this the
+        # view spans the whole route and the move is unreadable.
+        span = max(max(focus_xs) - min(focus_xs), max(focus_ys) - min(focus_ys))
+        pad = max(0.25 * span, 200.0)
+        ax.set_xlim(min(focus_xs) - pad, max(focus_xs) + pad)
+        ax.set_ylim(min(focus_ys) - pad, max(focus_ys) + pad)
+        ax.set_aspect("equal")
+        ax.set_axis_off()
+
+        fig.tight_layout()
+        fig.savefig(map_dir / f"{sid}.png", dpi=200, bbox_inches="tight", pad_inches=0.05)
+        plt.close(fig)
+        logging.info("Wrote proposed-stop map → proposed_maps/%s.png", sid)
+
+
+def _run_proposed_stops_qa(
+    proposed_source: Sequence[Tuple[str, float, float]] | str | None,
+    stops_master: pd.DataFrame,
+    routes: List[Dict[str, Any]],
+    stops_df: pd.DataFrame,
+    route_index: Dict[Tuple[str, int], np.ndarray],
+    stop_geoms: Dict[str, arcpy.PointGeometry],
+    sr: arcpy.SpatialReference,
+    min_spacing_ft: float,
+    long_spacing_ft: float,
+    csv_path: Path,
+    export_maps: bool,
+) -> None:
+    """Load, evaluate, and report proposed stop relocations (no-op when unset).
+
+    Args:
+        proposed_source: The ``PROPOSED_STOPS`` configuration value.
+        stops_master: Raw ``stops.txt`` DataFrame (for stop_id/stop_code lookup).
+        routes: Route records built by :func:`_build_routes_from_shapes`.
+        stops_df: Served stops (filtered set) with route/direction lists.
+        route_index: Output of :func:`_build_route_stop_index` for *stops_df*.
+        stop_geoms: Original projected stop geometries.
+        sr: Projected spatial reference.
+        min_spacing_ft: Short-spacing threshold.
+        long_spacing_ft: Long-spacing threshold.
+        csv_path: Destination for the compliance CSV.
+        export_maps: If True, also write a PNG map per relocated stop.
+    """
+    proposals = _load_proposed_stops(proposed_source)
+    if not proposals:
+        return
+
+    moves = _resolve_proposed_stops(proposals, stops_master)
+    if not moves:
+        logging.warning("No proposed stops could be matched; skipping what-if QA.")
+        return
+
+    served_ids = set(stops_df["stop_id"].astype(str))
+    for sid in moves:
+        if sid not in served_ids:
+            logging.warning(
+                "Proposed stop %s is not served by any selected route/direction; "
+                "its relocation cannot be evaluated here.",
+                sid,
+            )
+
+    proposed_geoms = _apply_proposed_stop_geoms(stop_geoms, moves, sr)
+    report = _evaluate_proposed_spacing(
+        routes,
+        stops_df,
+        route_index,
+        stop_geoms,
+        proposed_geoms,
+        set(moves),
+        sr,
+        min_spacing_ft,
+        long_spacing_ft,
+    )
+
+    if report.empty:
+        logging.warning(
+            "Proposed stops matched no served route/direction in the selected set; "
+            "no compliance rows to report."
+        )
+        return
+
+    report.to_csv(csv_path, index=False)
+    n_bad = int((~report["compliant"]).sum())
+    logging.info(
+        "Wrote proposed-spacing CSV → %s (%d segment(s), %d non-compliant).",
+        csv_path.name,
+        len(report),
+        n_bad,
+    )
+
+    if export_maps:
+        _plot_proposed_stops(
+            routes,
+            stops_df,
+            route_index,
+            stop_geoms,
+            proposed_geoms,
+            moves,
+            report,
+            csv_path.parent,
+        )
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 
@@ -1083,6 +1560,22 @@ def main() -> int:  # noqa: D401
         NEAR_BUFFER_FT,
         out_dir / LONG_SPACING_CSV_FILE,
     )
+
+    if PROPOSED_STOPS:
+        logging.info("STEP 8  Evaluating proposed stop relocations …")
+        _run_proposed_stops_qa(
+            PROPOSED_STOPS,
+            dfs["stops"],
+            routes,
+            sel_stops_df,
+            sel_route_index,
+            stop_geoms,
+            sr,
+            MIN_SPACING_FT,
+            LONG_SPACING_FT,
+            out_dir / PROPOSED_SPACING_CSV_FILE,
+            export_maps=PROPOSED_MAPS,
+        )
 
     logging.info("All done! Outputs in: %s", out_dir)
     logging.info("Script completed successfully.")
