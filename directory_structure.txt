@@ -43,6 +43,7 @@ transit_planning_with_python/
 │   ├── gtfs_data_quality/
 │   │   ├── gtfs_skipped_stop_flagger_gpd.py
 │   │   ├── gtfs_stop_proximity_qc.py
+│   │   ├── route_direction_classifier.py
 │   │   ├── stop_v_conflict_checker_arcpy.py
 │   │   ├── stop_v_conflict_checker_gpd.py
 │   │   ├── stop_vs_roadname_checker_arcpy.py
@@ -100,6 +101,7 @@ transit_planning_with_python/
 │   │   ├── stops_ridership_joiner_arcpy.py
 │   │   └── stops_ridership_joiner_gpd.py
 │   ├── service_coverage/
+│   │   ├── cabi_coverage_by_route_gpd.py
 │   │   ├── gtfs_service_by_district_arcpy.py
 │   │   ├── gtfs_service_by_district_gpd.py
 │   │   ├── gtfs_service_demographics_arcpy.py
@@ -111,10 +113,9 @@ transit_planning_with_python/
 │   │   ├── site_route_proximity_arcpy.py
 │   │   └── site_route_proximity_gpd.py
 │   └── stop_analysis/
-│       ├── audit_turn_clearance.py
+│       ├── gtfs_linear_diff_gpd.py
 │       ├── gtfs_route_diff.py
 │       ├── gtfs_stop_diff.py
-│       ├── route_direction_classifier.py
 │       ├── stop_impacts_target_routes.py
 │       ├── stop_removal_impact_gpd.py
 │       ├── stop_spacing_flagger_arcpy.py
@@ -124,9 +125,16 @@ transit_planning_with_python/
 │   │   ├── gtfs_basic/
 │   │   │   ├── agency.txt
 │   │   │   ├── calendar.txt
+│   │   │   ├── calendar_dates.txt
+│   │   │   ├── fare_attributes.txt
+│   │   │   ├── fare_rules.txt
+│   │   │   ├── feed_info.txt
+│   │   │   ├── frequencies.txt
 │   │   │   ├── routes.txt
+│   │   │   ├── shapes.txt
 │   │   │   ├── stop_times.txt
 │   │   │   ├── stops.txt
+│   │   │   ├── transfers.txt
 │   │   │   └── trips.txt
 │   │   ├── points_of_interest/
 │   │   │   ├── Bus_Stations.zip
@@ -182,11 +190,11 @@ transit_planning_with_python/
 │   │   ├── tl_2025_51_tabblock20_sample.zip
 │   │   ├── trips_performed.csv
 │   │   └── va_wac_S000_JT00_2023.csv.gz
-│   ├── test_audit_turn_clearance.py
 │   ├── test_bay_usage_analyzer.py
 │   ├── test_bikeshare_ridership_trends.py
 │   ├── test_block_status_timeline_exporter.py
 │   ├── test_bus_block_exporter.py
+│   ├── test_cabi_coverage_by_route_gpd.py
 │   ├── test_cacensus_da_join_gpd.py
 │   ├── test_clean_eia_gas_prices.py
 │   ├── test_clean_fred_unrate.py
@@ -194,9 +202,11 @@ transit_planning_with_python/
 │   ├── test_convert_to_tides_stop_visits.py
 │   ├── test_convert_to_tides_trips_performed.py
 │   ├── test_data_request_by_stop_processor.py
+│   ├── test_distance_helpers.py
 │   ├── test_flag_stop_upgrades.py
 │   ├── test_gbfs_ridership_join.py
 │   ├── test_gbfs_stations_exporter.py
+│   ├── test_gtfs_linear_diff_gpd.py
 │   ├── test_gtfs_route_diff.py
 │   ├── test_gtfs_route_features.py
 │   ├── test_gtfs_route_summary.py
@@ -247,6 +257,7 @@ transit_planning_with_python/
 │   ├── test_stop_vs_roadname_checker_gpd.py
 │   ├── test_stops_ridership_joiner_gpd.py
 │   ├── test_time_band_exporter.py
+│   ├── test_time_helpers.py
 │   ├── test_timepoint_schedule_exporter.py
 │   ├── test_trip_runtime_diagnostics_from_avl.py
 │   ├── test_uscensus_table_build.py
@@ -254,10 +265,12 @@ transit_planning_with_python/
 │   └── test_validate_gtfs_files_exist.py
 ├── utils/
 │   ├── cli_helpers.py
+│   ├── distance_helpers.py
 │   ├── gtfs_helpers.py
 │   ├── network_helpers.py
 │   ├── run_log.py
-│   └── shapefile_helpers.py
+│   ├── shapefile_helpers.py
+│   └── time_helpers.py
 ├── .gitignore
 ├── CONTRIBUTING.md
 ├── LICENSE
