@@ -1,0 +1,17 @@
+route_id,service_id,trip_id,direction_id
+R1,WKD,W1,0
+R1,WKD,W2,0
+R1,WKD,W3,0
+R1,WKD,W4,0
+R1,WKD,W5,0
+R1,WKD,W6,0
+R1,SAT,S1,0
+R1,SAT,S2,0
+R1,SAT,S3,0
+R1,SAT,S4,0
+R1,SUN,U1,0
+R1,SUN,U2,0
+R1,SUN,U3,0
+R1,HOL,H1,0
+R1,HOL,H2,0
+R1,HOL,H3,0

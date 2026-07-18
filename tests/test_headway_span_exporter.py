@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import math
 from pathlib import Path
 
@@ -235,3 +236,78 @@ def test_run_route_filters_can_exclude_everything(tmp_path: Path) -> None:
             service_day="weekday",
             filter_out_route_short_names=["101"],
         )
+
+
+# ---------------------------------------------------------------------------
+# Date-based service resolution (calendar fixtures)
+# ---------------------------------------------------------------------------
+
+FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def test_run_split_weekday_uses_modal_pattern_and_warns(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.WARNING):
+        result = target.run(
+            gtfs_folder=FIXTURES / "gtfs_split_weekday",
+            output_path=tmp_path / "out.csv",
+            service_day="weekday",
+        )
+    row = result.iloc[0]
+    # Tue-Thu is the modal weekday; Monday's 4 and Friday's 3 trips must not
+    # be summed on top of it (the old column-based union would report 13).
+    assert row["trip_count"] == 6
+    assert "varies by day of week" in caplog.text
+
+
+def test_run_split_weekday_single_day_selection(tmp_path: Path) -> None:
+    result = target.run(
+        gtfs_folder=FIXTURES / "gtfs_split_weekday",
+        output_path=tmp_path / "out.csv",
+        service_day="friday",
+    )
+    assert result.iloc[0]["trip_count"] == 3
+
+
+def test_run_holiday_negation_keeps_holiday_service_out_of_weekday(tmp_path: Path) -> None:
+    result = target.run(
+        gtfs_folder=FIXTURES / "gtfs_holiday_negation",
+        output_path=tmp_path / "out.csv",
+        service_day="weekday",
+    )
+    # HOL claims Mon/Wed/Fri columns but only runs on holidays; a normal
+    # weekday must count WKD's 6 trips alone.
+    assert result.iloc[0]["trip_count"] == 6
+
+
+def test_run_service_date_override_selects_holiday_schedule(tmp_path: Path) -> None:
+    result = target.run(
+        gtfs_folder=FIXTURES / "gtfs_split_weekday",
+        output_path=tmp_path / "out.csv",
+        service_day="weekday",
+        service_date="20260907",  # Labor Day: Sunday schedule replaces MON
+    )
+    assert result.iloc[0]["trip_count"] == 2
+
+
+def test_run_falls_back_when_calendar_lacks_dates(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    gtfs_dir = tmp_path / "gtfs"
+    gtfs_dir.mkdir()
+    _write_gtfs(gtfs_dir)  # calendar.txt has no start_date/end_date columns
+    with caplog.at_level(logging.WARNING):
+        result = target.run(
+            gtfs_folder=gtfs_dir,
+            output_path=tmp_path / "out.csv",
+            service_day="weekday",
+        )
+    assert "falling back" in caplog.text
+    assert result.iloc[0]["trip_count"] == 3
+
+
+def test_resolve_service_ids_rejects_malformed_service_date() -> None:
+    calendar = _calendar_df()
+    with pytest.raises(ValueError, match="SERVICE_DATE"):
+        target.resolve_service_ids(calendar, None, "weekday", "2026-09-07")
