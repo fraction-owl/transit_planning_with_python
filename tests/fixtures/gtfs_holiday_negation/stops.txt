@@ -1,0 +1,3 @@
+stop_id,stop_name,stop_lat,stop_lon
+STOP_A,Harbor & 1st,41.30,-72.92
+STOP_B,Harbor & 9th,41.32,-72.90

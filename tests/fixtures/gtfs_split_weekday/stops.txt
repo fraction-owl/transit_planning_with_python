@@ -1,0 +1,3 @@
+stop_id,stop_name,stop_lat,stop_lon
+STOP_A,First & Main,30.10,-97.60
+STOP_B,Second & Oak,30.12,-97.58
