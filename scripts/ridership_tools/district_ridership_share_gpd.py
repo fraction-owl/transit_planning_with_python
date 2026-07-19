@@ -1,7 +1,7 @@
 """Allocate stop-level ridership to districts and report each district's share.
 
 This script joins stop-level ridership (a Ridecheck-style Excel export) to GTFS
-stop locations, determines which district contains each stop via an ArcPy
+stop locations, determines which district contains each stop via a GeoPandas
 point-in-polygon spatial join, and writes an Excel workbook of total and
 percent ridership by district. A reconciliation sheet accounts for every
 unallocated unit — ridership at stops outside all districts, STOP_IDs with no
@@ -15,8 +15,8 @@ counted fully in each ("full" — a boundary-as-inside convention that can push
 summed percentages above 100). Boardings, alightings, and their sum all carry
 through with separate percentage columns; boardings is the conventional
 "ridership" figure, while boardings + alightings is stop *activity* and
-double-counts riders. A GeoPandas twin, ``district_ridership_share_gpd.py``,
-runs without an ArcGIS license.
+double-counts riders. This is the open-source twin of
+``district_ridership_share_arcpy.py``; it needs no ArcGIS license.
 
 Inputs
 ------
@@ -25,7 +25,8 @@ Inputs
 - Stop-level ridership Excel; column defaults match the Ridecheck
   RIDERSHIP_BY_ROUTE_AND_STOP_(ALL_TIME_PERIODS) export, the same file
   consumed by ``data_request_by_stop_processor.py``.
-- District polygon layer (e.g. a shapefile) with a district identifier field.
+- District polygon layer (any format geopandas reads: shapefile, GeoPackage,
+  GeoJSON, ...) with a district identifier field.
 
 Outputs
 -------
@@ -36,14 +37,14 @@ Outputs
 - ``district_ridership_share_runlog.txt`` — run-log sidecar capturing the
   verbatim CONFIGURATION block, the effective settings, and SHA-256
   fingerprints of the inputs.
-- ``district_ridership_share_arcpy.log`` in ``LOG_DIR`` mirroring console
+- ``district_ridership_share_gpd.log`` in ``LOG_DIR`` mirroring console
   output.
 
 Typical usage
 -------------
 Update the paths in the CONFIGURATION section (or pass the matching CLI
-flags) and run from a shell, ArcGIS Pro's Python window, or a Jupyter
-notebook (requires ArcGIS Pro's ``arcpy``).
+flags) and run from a shell or a Jupyter notebook (requires geopandas; see
+``requirements.txt``).
 """
 
 from __future__ import annotations
@@ -53,13 +54,12 @@ import hashlib
 import logging
 import os
 import sys
-import uuid
 import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any, List, Optional, Sequence
 
-import arcpy
+import geopandas as gpd
 import pandas as pd
 
 # Path to this script's own source. Undefined in a Jupyter kernel (no __file__),
@@ -120,23 +120,16 @@ TIME_PERIODS: list[str] = []  # e.g. ["AM PEAK", "PM PEAK"]; empty keeps all
 BOUNDARY_ALLOCATION: str = "split"
 
 # District polygons and the field carrying the district identifier/name.
+# Any format geopandas can read works (shapefile, GeoPackage, GeoJSON, ...).
 DISTRICTS_FC = r"Path\To\Your\Districts.shp"
 DISTRICT_FIELD = "DISTRICT"
 
 # SPATIAL ---------------------------------------------------------------------
-# Stops are projected into the district layer's own spatial reference before
-# the containment join, so no target EPSG is configured and the districts
-# layer itself is never reprojected. If the WGS84-to-district-datum shift
-# matters at your stop locations, name an explicit geographic transformation
-# (e.g. "WGS_1984_(ITRF00)_To_NAD_1983"); None applies no datum
-# transformation.
-GEO_TRANSFORMATION: Optional[str] = None
-
-# WORKSPACE -------------------------------------------------------------------
-# Working directory for the intermediate file geodatabase. A local (non-
-# network) path keeps the geoprocessing steps fast.
-WORK_DIR = os.path.abspath(r"temp\district_ridership_share_work")
-WORK_GDB_NAME = "work.gdb"
+# Stops are projected into the district layer's own CRS before the containment
+# join, so no target EPSG is configured and the districts layer itself is
+# never reprojected. pyproj picks an appropriate datum transformation
+# automatically (unlike the arcpy twin, which exposes a GEO_TRANSFORMATION
+# knob because ArcPy applies none by default).
 
 # OUTPUTS ---------------------------------------------------------------------
 OUTPUT_DIR = r"Path\To\Your\Output_Folder"
@@ -182,7 +175,7 @@ METRICS: tuple[str, ...] = ("boardings", "alightings", "total")
 def configure_logging(log_dir: str) -> None:
     """Configure root logging to write to console plus a file in *log_dir*."""
     os.makedirs(log_dir, exist_ok=True)
-    log_path = os.path.join(log_dir, "district_ridership_share_arcpy.log")
+    log_path = os.path.join(log_dir, "district_ridership_share_gpd.log")
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -196,49 +189,9 @@ def configure_logging(log_dir: str) -> None:
     logging.info("Logging to: %s", log_path)
 
 
-def log_arcpy_messages(level: int = logging.INFO) -> None:
-    """Log any messages generated by the last ArcPy operation."""
-    msg = arcpy.GetMessages()
-    if msg:
-        logging.log(level, "ArcPy messages:\n%s", msg)
-
-
 # =============================================================================
 # UTILITIES
 # =============================================================================
-
-
-def safe_name(prefix: str, workspace: str) -> str:
-    """Generate a unique and valid name for an ArcGIS feature class or table.
-
-    Args:
-        prefix: The base prefix for the name (e.g., 'stops_wgs84').
-        workspace: The workspace (GDB) where the name will be used.
-
-    Returns:
-        A validated, unique name string.
-    """
-    suffix = uuid.uuid4().hex[:8]
-    return arcpy.ValidateTableName(f"{prefix}_{suffix}", workspace)
-
-
-def ensure_work_gdb(work_dir: str, gdb_name: str) -> str:
-    """Create a file geodatabase (GDB) if it doesn't already exist.
-
-    Args:
-        work_dir: The directory where the GDB should reside.
-        gdb_name: The name of the GDB file (e.g., 'work.gdb').
-
-    Returns:
-        The full path to the geodatabase.
-    """
-    os.makedirs(work_dir, exist_ok=True)
-    gdb = os.path.join(work_dir, gdb_name)
-    if not arcpy.Exists(gdb):
-        logging.info("Creating work GDB: %s", gdb)
-        arcpy.management.CreateFileGDB(work_dir, gdb_name)
-        log_arcpy_messages()
-    return gdb
 
 
 def sha256_of_file(path: str) -> Optional[str]:
@@ -388,158 +341,73 @@ def filter_stops(stops: pd.DataFrame, join_key: str = GTFS_JOIN_KEY) -> pd.DataF
 # =============================================================================
 
 
-def stops_to_points(stops_df: pd.DataFrame, out_gdb: str) -> str:
-    """Build a WGS84 point feature class from the stops DataFrame.
+def load_districts(districts_fc: str, district_field: str) -> gpd.GeoDataFrame:
+    """Load the district polygon layer and validate its CRS and field.
 
-    Uses CreateFeatureclass + an insert cursor rather than XYTableToPoint from
-    a CSV, so the join key is written as TEXT verbatim — CSV type inference can
-    coerce numeric-looking IDs and drop leading zeros, which would silently
-    break the ridership join.
+    Args:
+        districts_fc: District polygon layer path (any geopandas-readable
+            format).
+        district_field: Field expected to carry the district identifier/name.
+
+    Returns:
+        The district GeoDataFrame, untouched (never reprojected).
+
+    Raises:
+        OSError: The path does not exist.
+        ValueError: The layer cannot be read, has no CRS (containment in an
+            unknown CRS is meaningless), or lacks *district_field* (the
+            message lists available fields).
+    """
+    if not os.path.exists(districts_fc):
+        raise OSError(f"District layer not found: {districts_fc}")
+    try:
+        districts = gpd.read_file(districts_fc)
+    except Exception as exc:  # pyogrio/fiona raise driver-specific errors
+        raise ValueError(f"Could not read district layer '{districts_fc}': {exc}") from exc
+
+    if districts.crs is None:
+        raise ValueError(
+            f"District layer '{districts_fc}' has no CRS (missing/unknown .prj). "
+            "Define its projection before running."
+        )
+    if district_field not in districts.columns:
+        raise ValueError(
+            f"DISTRICT_FIELD '{district_field}' not found in '{districts_fc}'. "
+            f"Available fields: {', '.join(sorted(str(c) for c in districts.columns))}"
+        )
+    logging.info("Loaded %d district polygon(s) in CRS '%s'.", len(districts), districts.crs)
+    return districts
+
+
+def stops_to_gdf(stops_df: pd.DataFrame) -> gpd.GeoDataFrame:
+    """Build a WGS84 point GeoDataFrame from the filtered stops DataFrame.
 
     Args:
         stops_df: DataFrame with stop_key, stop_lon, stop_lat.
-        out_gdb: Geodatabase for the output feature class.
 
     Returns:
-        Full path to the created point feature class.
+        GeoDataFrame of stop points in EPSG:4326 carrying stop_key.
     """
-    name = safe_name("stops_wgs84", out_gdb)
-    out_fc = os.path.join(out_gdb, name)
-    logging.info("Creating stops point feature class (%d points).", len(stops_df))
-
-    arcpy.management.CreateFeatureclass(
-        out_path=out_gdb,
-        out_name=name,
-        geometry_type="POINT",
-        spatial_reference=arcpy.SpatialReference(4326),
-    )
-    log_arcpy_messages()
-    arcpy.management.AddField(out_fc, "stop_key", "TEXT", field_length=64)
-    log_arcpy_messages()
-
-    with arcpy.da.InsertCursor(out_fc, ["SHAPE@XY", "stop_key"]) as cur:
-        for code, lon, lat in stops_df[["stop_key", "stop_lon", "stop_lat"]].itertuples(
-            index=False
-        ):
-            cur.insertRow(((float(lon), float(lat)), str(code)))
-
-    return out_fc
+    geometry = gpd.points_from_xy(stops_df["stop_lon"], stops_df["stop_lat"])
+    return gpd.GeoDataFrame(stops_df[["stop_key"]].copy(), geometry=geometry, crs="EPSG:4326")
 
 
-def validate_district_field(districts_fc: str, district_field: str) -> None:
-    """Check that *district_field* exists on the district layer before joining.
+def join_stops_to_districts(
+    stops_gdf: gpd.GeoDataFrame,
+    districts: gpd.GeoDataFrame,
+    district_field: str,
+) -> dict[str, set[str]]:
+    """Spatially join stops to districts and map stop_key to its district(s).
+
+    The stops are projected into the district layer's own CRS, then joined
+    with predicate="intersects" so a stop exactly on a shared boundary yields
+    one row per touching district — the precondition for boundary allocation.
+    No search radius: this is containment, unlike the buffered proximity join
+    used by ``gtfs_service_by_district_gpd.py``.
 
     Args:
-        districts_fc: District polygon layer.
-        district_field: Field expected to carry the district identifier/name.
-
-    Raises:
-        ValueError: The field is absent (the message lists available fields).
-    """
-    try:
-        available = {f.name for f in arcpy.ListFields(districts_fc)}
-    except OSError as exc:
-        raise ValueError(
-            f"Could not read fields from district layer '{districts_fc}': {exc}"
-        ) from exc
-    if district_field not in available:
-        raise ValueError(
-            f"DISTRICT_FIELD '{district_field}' not found in '{districts_fc}'. "
-            f"Available fields: {', '.join(sorted(available))}"
-        )
-
-
-def project_stops_to_district_sr(
-    stops_fc: str,
-    districts_fc: str,
-    out_gdb: str,
-    transformation: Optional[str] = GEO_TRANSFORMATION,
-) -> str:
-    """Project the stops into the district layer's own spatial reference.
-
-    Containment is evaluated in the district layer's native spatial reference
-    (read via arcpy.Describe), so the polygons are never reprojected — only
-    the points move. When *transformation* is named it is applied; otherwise
-    no datum transformation is used.
-
-    Args:
-        stops_fc: WGS84 stops point feature class.
-        districts_fc: District polygon layer whose SR is the target.
-        out_gdb: The output geodatabase.
-        transformation: Optional geographic (datum) transformation name.
-
-    Returns:
-        The full path to the projected stops feature class.
-
-    Raises:
-        ValueError: The district layer's spatial reference cannot be read or
-            is unknown (containment in an unknown SR is meaningless).
-    """
-    try:
-        desc = arcpy.Describe(districts_fc)
-        target_sr = desc.spatialReference
-    except OSError as exc:
-        raise ValueError(f"Could not describe district layer '{districts_fc}': {exc}") from exc
-    if target_sr is None or getattr(target_sr, "name", "Unknown") in ("", "Unknown"):
-        raise ValueError(
-            f"District layer '{districts_fc}' has no usable spatial reference "
-            "(missing/unknown .prj). Define its projection before running."
-        )
-
-    out_fc = os.path.join(out_gdb, safe_name("stops_proj", out_gdb))
-    logging.info(
-        "Projecting stops into district SR '%s'%s",
-        target_sr.name,
-        f" (transformation: {transformation})" if transformation else "",
-    )
-    if transformation:
-        arcpy.management.Project(stops_fc, out_fc, target_sr, transformation)
-    else:
-        arcpy.management.Project(stops_fc, out_fc, target_sr)
-    log_arcpy_messages()
-    return out_fc
-
-
-def containment_join_stops_to_districts(
-    stops_fc: str,
-    districts_fc: str,
-    out_gdb: str,
-) -> str:
-    """Spatially join stops to districts by point-in-polygon containment.
-
-    Uses INTERSECT with JOIN_ONE_TO_MANY / KEEP_COMMON so a stop coincident
-    with a shared district boundary produces one output row per district —
-    the precondition for boundary allocation. No search radius: this is
-    containment, unlike the proximity join used by
-    ``gtfs_service_by_district_arcpy.py``.
-
-    Args:
-        stops_fc: Projected stops point feature class (carries stop_key).
-        districts_fc: District polygon layer.
-        out_gdb: The output geodatabase.
-
-    Returns:
-        The full path to the spatially joined output feature class.
-    """
-    out_fc = os.path.join(out_gdb, safe_name("stops_districts_contains", out_gdb))
-    logging.info("SpatialJoin INTERSECT (containment, one-to-many)")
-    arcpy.analysis.SpatialJoin(
-        target_features=stops_fc,
-        join_features=districts_fc,
-        out_feature_class=out_fc,
-        join_operation="JOIN_ONE_TO_MANY",
-        join_type="KEEP_COMMON",
-        match_option="INTERSECT",
-    )
-    log_arcpy_messages()
-    return out_fc
-
-
-def extract_stop_districts(fc: str, district_field: str) -> dict[str, set[str]]:
-    """Read the spatial join result into a stop_key -> set-of-districts mapping.
-
-    Args:
-        fc: The spatially joined feature class.
+        stops_gdf: WGS84 stop points carrying stop_key.
+        districts: District polygons (their CRS is the join CRS).
         district_field: The name of the district ID field.
 
     Returns:
@@ -550,11 +418,20 @@ def extract_stop_districts(fc: str, district_field: str) -> dict[str, set[str]]:
             guard: an unpopulated DISTRICT_FIELD or a projection mismatch
             would otherwise flow through as an empty report).
     """
+    stops_proj = stops_gdf.to_crs(districts.crs)
+    logging.info("Projected stops into district CRS '%s'.", districts.crs)
+
+    joined = gpd.sjoin(
+        stops_proj,
+        districts[[district_field, "geometry"]],
+        how="inner",
+        predicate="intersects",
+    )
+
     stop_to_districts: dict[str, set[str]] = {}
-    with arcpy.da.SearchCursor(fc, ["stop_key", district_field]) as cur:
-        for stop_key, dist in cur:
-            if stop_key and dist is not None and str(dist).strip():
-                stop_to_districts.setdefault(str(stop_key), set()).add(str(dist))
+    for stop_key, dist in zip(joined["stop_key"], joined[district_field]):
+        if stop_key and dist is not None and str(dist).strip():
+            stop_to_districts.setdefault(str(stop_key), set()).add(str(dist))
     if not stop_to_districts:
         raise ValueError(
             "Containment join produced zero stop-district pairs. Check that "
@@ -1020,8 +897,9 @@ def input_fingerprints(gtfs_input: str, excel_file: str, districts_fc: str) -> L
     """Return SHA-256 fingerprint lines for the primary inputs, for provenance.
 
     A folder GTFS input fingerprints its stops.txt; a zip or stops.txt input
-    fingerprints the file itself. The districts layer fingerprints the .shp
-    and .dbf sidecars (geometry + attributes).
+    fingerprints the file itself. A shapefile district layer fingerprints the
+    .shp and .dbf sidecars (geometry + attributes); other formats fingerprint
+    the file itself.
 
     Args:
         gtfs_input: The GTFS feed path actually used for this run.
@@ -1037,9 +915,9 @@ def input_fingerprints(gtfs_input: str, excel_file: str, districts_fc: str) -> L
     else:
         targets.append(("GTFS input", gtfs_input))
     targets.append(("Ridership Excel", excel_file))
-    targets.append(("Districts .shp", districts_fc))
+    targets.append(("Districts layer", districts_fc))
     dbf = os.path.splitext(districts_fc)[0] + ".dbf"
-    if os.path.isfile(dbf):
+    if districts_fc.lower().endswith(".shp") and os.path.isfile(dbf):
         targets.append(("Districts .dbf", dbf))
 
     lines: list[str] = []
@@ -1147,23 +1025,15 @@ def run_analysis(args: argparse.Namespace) -> None:
         RuntimeError: The run log could not be written and REQUIRE_RUN_LOG
             is True.
     """
-    work_gdb = ensure_work_gdb(args.work_dir, WORK_GDB_NAME)
-    arcpy.env.workspace = work_gdb
-    logging.info("Workspace: %s", work_gdb)
-
     stops_df = filter_stops(load_gtfs_stops(args.gtfs_input), args.gtfs_join_key)
     stop_ridership = load_stop_ridership(
         args.excel_file, args.routes, args.routes_exclude, args.time_periods
     )
 
-    validate_district_field(args.districts_fc, args.district_field)
-    stops_wgs84 = stops_to_points(stops_df, work_gdb)
-    stops_proj = project_stops_to_district_sr(
-        stops_wgs84, args.districts_fc, work_gdb, args.geo_transformation
-    )
-    sj_fc = containment_join_stops_to_districts(stops_proj, args.districts_fc, work_gdb)
+    districts = load_districts(args.districts_fc, args.district_field)
+    stops_gdf = stops_to_gdf(stops_df)
+    stop_to_districts = join_stops_to_districts(stops_gdf, districts, args.district_field)
 
-    stop_to_districts = extract_stop_districts(sj_fc, args.district_field)
     geocoded_stops = set(stops_df["stop_key"].astype(str))
     district_df, alloc_df, diagnostics = allocate_ridership_to_districts(
         stop_to_districts,
@@ -1196,7 +1066,6 @@ def run_analysis(args: argparse.Namespace) -> None:
         f"Routes kept:         {list(args.routes) if args.routes else 'all'}",
         f"Routes dropped:      {list(args.routes_exclude) if args.routes_exclude else 'none'}",
         f"Time periods:        {list(args.time_periods) if args.time_periods else 'all'}",
-        f"Geo transformation:  {args.geo_transformation or 'none'}",
     ]
     log_ok = write_run_log(
         args.output_dir,
@@ -1263,7 +1132,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--districts-fc",
         default=DISTRICTS_FC,
-        help="District polygon layer (shapefile or feature class).",
+        help="District polygon layer (any geopandas-readable format).",
     )
     p.add_argument(
         "--district-field",
@@ -1299,16 +1168,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         nargs="*",
         default=TIME_PERIODS,
         help="TIME_PERIOD values to keep (empty sums all periods).",
-    )
-    p.add_argument(
-        "--geo-transformation",
-        default=GEO_TRANSFORMATION,
-        help="Optional geographic (datum) transformation for the stops projection.",
-    )
-    p.add_argument(
-        "--work-dir",
-        default=WORK_DIR,
-        help="Working directory for the intermediate file geodatabase.",
     )
     p.add_argument(
         "--output-dir",
@@ -1357,11 +1216,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
 
     configure_logging(args.log_dir)
-    arcpy.env.overwriteOutput = True
 
     try:
         run_analysis(args)
-    except (OSError, ValueError, RuntimeError, arcpy.ExecuteError) as exc:
+    except (OSError, ValueError, RuntimeError) as exc:
         logging.error("%s", exc)
         return 1
 
