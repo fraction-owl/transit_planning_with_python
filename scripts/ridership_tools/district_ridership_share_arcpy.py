@@ -15,7 +15,9 @@ counted fully in each ("full" — a boundary-as-inside convention that can push
 summed percentages above 100). Boardings, alightings, and their sum all carry
 through with separate percentage columns; boardings is the conventional
 "ridership" figure, while boardings + alightings is stop *activity* and
-double-counts riders. A GeoPandas twin, ``district_ridership_share_gpd.py``,
+double-counts riders. Percent columns default to shares of the allocated
+total; PCT_BASE can widen the denominator to include out-of-district or
+unmatched ridership. A GeoPandas twin, ``district_ridership_share_gpd.py``,
 runs without an ArcGIS license.
 
 Inputs
@@ -118,6 +120,18 @@ TIME_PERIODS: list[str] = []  # e.g. ["AM PEAK", "PM PEAK"]; empty keeps all
 #           total and percentages above 100; the reconciliation sheet reports
 #           the double-counted amount.
 BOUNDARY_ALLOCATION: str = "split"
+
+# PERCENT BASE ----------------------------------------------------------------
+# Denominator for the pct_* share columns, named by reconciliation category:
+# "allocated"   — ridership allocated to districts, counting each stop once.
+#                 District shares sum to 100 under "split" (default).
+# "geocoded"    — also counts ridership at geocoded stops outside every
+#                 district, so shares sum below 100 by exactly the outside
+#                 share.
+# "grand_total" — the full ridership file: additionally counts STOP_IDs with
+#                 no GTFS match (join failures, not geography — use with
+#                 care).
+PCT_BASE: str = "allocated"
 
 # District polygons and the field carrying the district identifier/name.
 DISTRICTS_FC = r"Path\To\Your\Districts.shp"
@@ -741,6 +755,7 @@ def allocate_ridership_to_districts(
     geocoded_stops: set[str],
     metrics: Sequence[str] = METRICS,
     boundary_allocation: str = BOUNDARY_ALLOCATION,
+    pct_base: str = PCT_BASE,
     join_key: str = GTFS_JOIN_KEY,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, dict[str, float]]]:
     """Allocate each stop's ridership to the district(s) it falls in.
@@ -751,11 +766,12 @@ def allocate_ridership_to_districts(
     divides its ridership evenly among the touching districts (district
     totals reconcile exactly), while "full" counts the full value in every
     touching district (district totals then double-count such stops and
-    percentages can sum above 100). Percentages are of the allocated total
-    per metric, which counts each stop ONCE regardless of mode; the
-    diagnostics expose ridership that landed in no district, never matched
-    GTFS, or was double-counted across boundaries, so every discrepancy is
-    auditable.
+    percentages can sum above 100). Percentages default to shares of the
+    allocated total per metric, counting each stop ONCE regardless of mode;
+    *pct_base* can widen the denominator to include out-of-district or
+    unmatched ridership. The diagnostics expose ridership that landed in no
+    district, never matched GTFS, or was double-counted across boundaries,
+    so every discrepancy is auditable.
 
     Args:
         stop_to_districts: Mapping stop_key -> set of district IDs.
@@ -764,6 +780,9 @@ def allocate_ridership_to_districts(
             used to separate "outside all districts" from "not in GTFS".
         metrics: Metric keys to allocate and report.
         boundary_allocation: "split" or "full" (see above).
+        pct_base: Denominator for the pct_* columns — "allocated" (default),
+            "geocoded" (adds ridership outside every district), or
+            "grand_total" (also adds ridership unmatched to GTFS).
         join_key: The GTFS join key in use, echoed in the mismatch error.
 
     Returns:
@@ -772,12 +791,17 @@ def allocate_ridership_to_districts(
         -> {metric: total}.
 
     Raises:
-        ValueError: *boundary_allocation* invalid, or nothing allocated
-            (likely a join-key/STOP_ID mismatch — check GTFS_JOIN_KEY).
+        ValueError: *boundary_allocation* or *pct_base* invalid, or nothing
+            allocated (likely a join-key/STOP_ID mismatch — check
+            GTFS_JOIN_KEY).
     """
     if boundary_allocation not in ("full", "split"):
         raise ValueError(
             f"BOUNDARY_ALLOCATION must be 'full' or 'split', got {boundary_allocation!r}."
+        )
+    if pct_base not in ("allocated", "geocoded", "grand_total"):
+        raise ValueError(
+            f"PCT_BASE must be 'allocated', 'geocoded', or 'grand_total', got {pct_base!r}."
         )
     district_totals: dict[str, dict[str, float]] = {}
     alloc_rows: list[dict[str, Any]] = []
@@ -817,12 +841,20 @@ def allocate_ridership_to_districts(
             f"{sorted(stop_ridership)[:5]}; GTFS sample: {sorted(geocoded_stops)[:5]}"
         )
 
+    pct_denoms = {
+        m: (
+            matched[m]
+            + (no_district[m] if pct_base in ("geocoded", "grand_total") else 0.0)
+            + (unmatched_gtfs[m] if pct_base == "grand_total" else 0.0)
+        )
+        for m in metrics
+    }
     district_rows: list[dict[str, Any]] = []
     for d in sorted(district_totals):
         r: dict[str, Any] = {"district": d}
         for m in metrics:
             r[m] = district_totals[d][m]
-            r[f"pct_{m}"] = (district_totals[d][m] / matched[m] * 100.0) if matched[m] else 0.0
+            r[f"pct_{m}"] = district_totals[d][m] / pct_denoms[m] * 100.0 if pct_denoms[m] else 0.0
         district_rows.append(r)
 
     district_df = pd.DataFrame(district_rows)
@@ -1170,6 +1202,7 @@ def run_analysis(args: argparse.Namespace) -> None:
         stop_ridership,
         geocoded_stops,
         boundary_allocation=args.boundary_allocation,
+        pct_base=args.pct_base,
         join_key=args.gtfs_join_key,
     )
 
@@ -1193,6 +1226,7 @@ def run_analysis(args: argparse.Namespace) -> None:
         f"District field:      {args.district_field}",
         f"GTFS join key:       {args.gtfs_join_key}",
         f"Boundary allocation: {args.boundary_allocation}",
+        f"Percent base:        {args.pct_base}",
         f"Routes kept:         {list(args.routes) if args.routes else 'all'}",
         f"Routes dropped:      {list(args.routes_exclude) if args.routes_exclude else 'none'}",
         f"Time periods:        {list(args.time_periods) if args.time_periods else 'all'}",
@@ -1281,6 +1315,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=BOUNDARY_ALLOCATION,
         choices=("split", "full"),
         help="Boundary-coincident stops: split evenly, or count fully in each district.",
+    )
+    p.add_argument(
+        "--pct-base",
+        default=PCT_BASE,
+        choices=("allocated", "geocoded", "grand_total"),
+        help="Percent-column denominator: allocated ridership only, plus outside-district "
+        "ridership, or the full ridership file.",
     )
     p.add_argument(
         "--routes",

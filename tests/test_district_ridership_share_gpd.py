@@ -315,6 +315,36 @@ def test_allocate_geocoded_stop_outside_all_districts_is_diagnosed() -> None:
     assert diag["no_district"]["boardings"] == 3.0
 
 
+def test_allocate_pct_base_geocoded_counts_outside_ridership() -> None:
+    mapping, ridership, geocoded = _alloc_fixtures()
+    ridership["1006"] = {"boardings": 3.0, "alightings": 1.0, "total": 4.0}  # outside
+    district_df, _, _ = target.allocate_ridership_to_districts(
+        mapping, ridership, geocoded, pct_base="geocoded"
+    )
+    by_district = district_df.set_index("district")
+    # Denominator widens from 47 to 50; the 6% outside share is left unclaimed.
+    assert by_district.loc["District A", "pct_boardings"] == 38.0  # 19 / 50
+    assert by_district["pct_boardings"].sum() == pytest.approx(94.0)
+
+
+def test_allocate_pct_base_grand_total_counts_unmatched_too() -> None:
+    mapping, ridership, geocoded = _alloc_fixtures()
+    ridership["1006"] = {"boardings": 3.0, "alightings": 1.0, "total": 4.0}  # outside
+    district_df, _, _ = target.allocate_ridership_to_districts(
+        mapping, ridership, geocoded, pct_base="grand_total"
+    )
+    by_district = district_df.set_index("district")
+    # Denominator = 47 allocated + 3 outside + 7 unmatched = 57.
+    assert by_district.loc["District A", "pct_boardings"] == pytest.approx(33.3)
+    assert by_district.loc["District B", "pct_boardings"] == pytest.approx(49.1)
+
+
+def test_allocate_invalid_pct_base_raises() -> None:
+    mapping, ridership, geocoded = _alloc_fixtures()
+    with pytest.raises(ValueError, match="PCT_BASE"):
+        target.allocate_ridership_to_districts(mapping, ridership, geocoded, pct_base="nope")
+
+
 def test_allocate_invalid_mode_raises() -> None:
     mapping, ridership, geocoded = _alloc_fixtures()
     with pytest.raises(ValueError, match="BOUNDARY_ALLOCATION"):
