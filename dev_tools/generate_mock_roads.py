@@ -10,8 +10,8 @@ makes two fixture requirements structural rather than coincidental:
        ``stop_vs_roadname_checker_{gpd,arcpy}.py``.
     2. The centerlines form a clean network (segments split at every
        intersection, shared nodes coincide exactly, every road is a connected
-       polyline), so the network/turn-clearance tools have well-formed input —
-       see ``audit_turn_clearance.py`` and ``stop_removal_impact_gpd.py``.
+       polyline), so the network tools have well-formed input —
+       see ``stop_removal_impact_gpd.py``.
 
 Topology
 --------

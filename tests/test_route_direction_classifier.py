@@ -4,8 +4,8 @@ import pandas as pd
 import pytest
 from shapely.geometry import LineString
 
-import scripts.stop_analysis.route_direction_classifier as mod
-from scripts.stop_analysis.route_direction_classifier import (
+import scripts.gtfs_data_quality.route_direction_classifier as mod
+from scripts.gtfs_data_quality.route_direction_classifier import (
     classify_direction,
     create_lines_from_shapes,
     determine_dominant_shapes,

@@ -23,9 +23,9 @@ pre-commit                   # Local git hooks (ruff)
 ty==0.0.56                   # Type checks; error-level rules block CI
 
 # Data Processing
-# polars moved to requirements.txt: it is now a runtime dependency
-# (scripts/gbfs_tools/bikeshare_ridership_trends_polars.py) as well as a
-# dev fixture-builder dependency, and CI/dev installs both files.
+# Required only by the dev fixture builders (dev_tools/build_cacensus_fixtures.py);
+# no runtime script uses polars.
+polars==0.20.31              # Columnar DataFrame engine for large fixture extracts
 
 # ------------- Typing stubs (temporary) -------------------------------------
 pandas-stubs==2.2.*
