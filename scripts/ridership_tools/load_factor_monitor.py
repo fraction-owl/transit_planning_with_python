@@ -16,12 +16,14 @@ Typical use cases
 
 Outputs
 -------
+All outputs are written to ``OUTPUT_DIR`` (created if it does not exist):
+
 - ``<input stem>_processed.csv`` -- combined trip-level table with load factors
   and violation flags (machine-readable).
 - ``<input stem>_processed.xlsx`` (``OUTPUT_FILE``) -- the same table as a
   single-sheet workbook for quick inspection.
-- ``<ROUTE_NAME>.xlsx`` -- one workbook per route, written next to
-  ``OUTPUT_FILE``, with one sheet per direction.
+- ``<ROUTE_NAME>.xlsx`` -- one workbook per route, with one sheet per
+  direction.
 - ``<output stem>_violations_log.txt`` (``VIOLATION_LOG_FILE``) -- plain-text
   violation log, written when ``WRITE_VIOLATION_LOG`` is True.
 - ``<output stem>_runlog.txt`` -- sidecar run log capturing the verbatim
@@ -59,7 +61,12 @@ CONFIG_END_MARKER: str = "# === END CONFIG ==="
 # === BEGIN CONFIG ===
 
 INPUT_FILE: Final[str] = r"File\Path\To\Your\STATISTICS_BY_ROUTE_AND_TRIP.XLSX"
-OUTPUT_FILE: Final[str] = INPUT_FILE.replace(".XLSX", "_processed.xlsx")
+
+# Folder where all outputs (CSV, Excel workbooks, logs) are written.
+# It is created if it does not already exist.
+OUTPUT_DIR: Final[str] = r"Path\To\Your\Output_Folder"
+
+OUTPUT_FILE: Final[str] = os.path.join(OUTPUT_DIR, Path(INPUT_FILE).stem + "_processed.xlsx")
 BUS_CAPACITY: Final[int] = 39
 
 # Routes that get the *higher* (1.25) load factor limit
@@ -273,7 +280,8 @@ def process_data(
 def create_route_workbooks(data_frame: pd.DataFrame) -> None:
     """Generate one Excel workbook per route, with sheets per direction.
 
-    Workbooks are written to the directory containing :pydata:`OUTPUT_FILE`.
+    Workbooks are written to the directory containing :pydata:`OUTPUT_FILE`,
+    which is :pydata:`OUTPUT_DIR` in a normal run.
 
     Parameters:
     ----------
@@ -551,12 +559,15 @@ def main() -> int:
     )
 
     _DEFAULT_INPUT = r"File\Path\To\Your\STATISTICS_BY_ROUTE_AND_TRIP.XLSX"
-    if INPUT_FILE == _DEFAULT_INPUT:
+    _DEFAULT_OUTPUT_DIR = r"Path\To\Your\Output_Folder"
+    if INPUT_FILE == _DEFAULT_INPUT or OUTPUT_DIR == _DEFAULT_OUTPUT_DIR:
         logging.warning(
-            "File path is still set to its default. Update INPUT_FILE in the "
-            "CONFIGURATION section before running."
+            "File paths are still set to their defaults. Update INPUT_FILE and "
+            "OUTPUT_DIR in the CONFIGURATION section before running."
         )
         return 2
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     # Load data
     data_frame = load_data(INPUT_FILE)
@@ -573,7 +584,7 @@ def main() -> int:
     # -------------------------------------------------------------------------
     # 1) EXPORT COMBINED CSV (good for programmatic consumption)
     # -------------------------------------------------------------------------
-    combined_csv_path = INPUT_FILE.replace(".XLSX", "_processed.csv")
+    combined_csv_path = os.path.join(OUTPUT_DIR, Path(INPUT_FILE).stem + "_processed.csv")
     export_to_csv(processed_data, combined_csv_path)
 
     # -------------------------------------------------------------------------
