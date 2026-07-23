@@ -107,6 +107,96 @@ def test_holiday_week_is_transient(tmp_path: Path, caplog) -> None:
     assert "transient" in caplog.text.lower()
 
 
+def _trip_content_files(
+    service_id: str, n_trips: int, route: str = "R1", modified: int = 0
+) -> dict[str, str]:
+    # Trip i departs at 06:00 + i*20min with 3 stops 5min apart; the first
+    # `modified` trips get an extra stop so their fingerprints differ.
+    trips = ["route_id,service_id,trip_id"]
+    stop_times = ["trip_id,arrival_time,departure_time,stop_id,stop_sequence"]
+    for i in range(n_trips):
+        trip_id = f"{service_id}_t{i}"
+        trips.append(f"{route},{service_id},{trip_id}")
+        n_stops = 3 + (1 if i < modified else 0)
+        for s in range(n_stops):
+            minutes = 360 + i * 20 + s * 5
+            hh, mm = divmod(minutes, 60)
+            stamp = f"{hh:02d}:{mm:02d}:00"
+            stop_times.append(f"{trip_id},{stamp},{stamp},S{s},{s + 1}")
+    return {
+        "trips.txt": "\n".join(trips) + "\n",
+        "stop_times.txt": "\n".join(stop_times) + "\n",
+    }
+
+
+def test_republished_signup_with_renamed_ids_is_not_a_change(tmp_path: Path, caplog) -> None:
+    # Same weekly structure, renamed service_ids, byte-identical trip content:
+    # a re-exported signup, not a service change.
+    feeds = tmp_path / "archive"
+    _write_feed(
+        feeds,
+        "export_may",
+        calendar_rows=[("1", "1111100", "20250106", "20250613")],
+        extra_files=_trip_content_files("1", n_trips=10),
+    )
+    _write_feed(
+        feeds,
+        "export_june",
+        calendar_rows=[("A", "1111100", "20250616", "20251226")],
+        extra_files=_trip_content_files("A", n_trips=10),
+    )
+    with caplog.at_level(logging.INFO):
+        changes, _ = target.run(feeds_dir=feeds, output_dir=tmp_path / "out")
+    assert changes.empty
+    assert "republished signup" in caplog.text
+
+
+def test_amended_signup_is_reported_as_amendment(tmp_path: Path) -> None:
+    # 2 of 50 trips gain a stop across the boundary: multiset Jaccard is
+    # 48/52 ≈ 0.92 — inside the amendment band, not a new signup.
+    feeds = tmp_path / "archive"
+    _write_feed(
+        feeds,
+        "export_may",
+        calendar_rows=[("1", "1111100", "20250106", "20250613")],
+        extra_files=_trip_content_files("1", n_trips=50),
+    )
+    _write_feed(
+        feeds,
+        "export_june",
+        calendar_rows=[("A", "1111100", "20250616", "20251226")],
+        extra_files=_trip_content_files("A", n_trips=50, modified=2),
+    )
+    changes, _ = target.run(feeds_dir=feeds, output_dir=tmp_path / "out")
+    assert list(changes["change_date"]) == ["2025-06-16"]
+    row = changes.iloc[0]
+    assert row["change_type"] == "Schedule amendment"
+    assert "minor amendments" in row["notes"]
+
+
+def test_new_signup_with_same_structure_is_reported(tmp_path: Path) -> None:
+    # Same weekly structure but half the trips are new: a genuine signup
+    # change, with the low content match noted.
+    feeds = tmp_path / "archive"
+    _write_feed(
+        feeds,
+        "export_may",
+        calendar_rows=[("1", "1111100", "20250106", "20250613")],
+        extra_files=_trip_content_files("1", n_trips=10),
+    )
+    _write_feed(
+        feeds,
+        "export_june",
+        calendar_rows=[("A", "1111100", "20250616", "20251226")],
+        extra_files=_trip_content_files("A", n_trips=20),
+    )
+    changes, _ = target.run(feeds_dir=feeds, output_dir=tmp_path / "out")
+    assert list(changes["change_date"]) == ["2025-06-16"]
+    row = changes.iloc[0]
+    assert row["change_type"] == "New service period"
+    assert "genuine new signup" in row["notes"]
+
+
 def test_holiday_fortnight_revert_is_not_a_change(tmp_path: Path, caplog) -> None:
     # Christmas 2025 and New Year's Day 2026 are both Thursdays, so the two
     # modified weeks form a two-week "stable" pattern; it must be collapsed

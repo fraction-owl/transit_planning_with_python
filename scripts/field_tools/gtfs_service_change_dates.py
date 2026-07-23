@@ -15,10 +15,14 @@ variations (holidays, special events) are logged as transient rather than
 reported as service changes, and a longer excursion that fully returns to
 the prior pattern within ``REVERTING_CHANGE_MAX_WEEKS`` (a holiday
 fortnight, a winter break) is reported as temporary rather than as a
-change and a change back. A pick that changes only trip times never
-touches calendar structure, so it is visible only when the archive contains
-a new feed for it — the feed-succession boundary is then reported, with a
-log note about the ambiguity. The script also cross-checks the feeds
+change and a change back. When one feed supersedes another with the same
+weekly structure, calendars alone cannot tell a republished signup from a
+genuinely new one, so (when ``trips.txt`` and ``stop_times.txt`` are
+present) the script fingerprints trip-level content on both sides of the
+boundary: near-identical content is treated as a republication, a small
+difference as a schedule amendment, and a large one as a real signup
+change — each with the match percentage in the notes and the log. The
+script also cross-checks the feeds
 against each other — agency names, timezones, declared ``feed_info`` ranges
 vs. real active dates, coverage gaps, and overlapping snapshots that
 disagree — and logs an actionable warning for every inconsistency it finds.
@@ -30,7 +34,9 @@ Inputs
   also itself be a single unzipped feed, or a single ``.zip``.
 - Each feed needs ``calendar.txt`` and/or ``calendar_dates.txt``;
   ``agency.txt`` and ``feed_info.txt``, when present, feed the same-system
-  and declared-date-range checks.
+  and declared-date-range checks, and ``trips.txt`` / ``stop_times.txt`` /
+  ``routes.txt`` enable the trip-content comparison at ambiguous feed
+  boundaries.
 
 Outputs
 -------
@@ -120,6 +126,26 @@ REVERTING_CHANGE_MAX_WEEKS: int = 4
 # 7 keeps an ordinary weekend (or a short holiday shutdown) between
 # snapshots from being called a gap.
 COVERAGE_GAP_DAYS: int = 7
+
+# Trip-content comparison at ambiguous feed boundaries. When a successor
+# feed keeps the same weekly day-of-week structure and only the service_ids
+# differ (renamed or reassigned), calendars alone cannot say whether a new
+# signup began or the same signup was re-exported. When enabled — and the
+# feeds carry trips.txt and stop_times.txt — every trip on each side of the
+# boundary is fingerprinted (day role, route, first departure, last
+# arrival, stop count; deliberately free of trip/stop ids, which churn
+# between exports) and the two multisets are compared (Jaccard):
+#   similarity >= SAME_SIGNUP_MIN_SIMILARITY  -> republished signup; NOT a
+#       change (tiny mid-signup edits, e.g. one stop on one trip, land
+#       here by design — loosen the threshold if you want them surfaced)
+#   similarity >= AMENDMENT_MIN_SIMILARITY    -> "Schedule amendment" row
+#   below that                                -> a genuine signup change
+# Set COMPARE_TRIP_CONTENT to False to skip the comparison (faster on huge
+# feeds); ambiguous boundaries are then reported as new service periods
+# with a caveat, as before.
+COMPARE_TRIP_CONTENT: bool = True
+SAME_SIGNUP_MIN_SIMILARITY: float = 0.98
+AMENDMENT_MIN_SIMILARITY: float = 0.90
 
 # When True, a failed run-log write aborts the script so outputs are never
 # left untraced. Set False only for genuinely read-only output locations.
@@ -1052,6 +1078,125 @@ def analyze_feed_changes(
     return events, regimes
 
 
+# ---- TRIP-CONTENT FINGERPRINTS ----------------------------------------------
+
+
+def _hms_to_seconds(time_str: Any) -> Optional[int]:
+    """Convert a GTFS ``HH:MM:SS`` time to seconds; ``None`` when missing/invalid."""
+    if time_str is None or (isinstance(time_str, float) and pd.isna(time_str)):
+        return None
+    try:
+        hours, minutes, seconds = str(time_str).strip().split(":")
+        return int(hours) * 3600 + int(minutes) * 60 + int(seconds)
+    except (ValueError, AttributeError):
+        return None
+
+
+def _load_trip_content(feed_path: Path) -> Optional[dict[str, Counter]]:
+    """Fingerprint every trip in the feed, grouped by service_id.
+
+    Each trip contributes ``(route, first departure, last arrival, stop
+    count)`` — deliberately free of trip and stop ids, which churn between
+    exports. Routes are keyed by ``route_short_name`` when available (ids
+    can churn too), else ``route_id``.
+
+    Args:
+        feed_path: Path to a feed folder or ``.zip``.
+
+    Returns:
+        Mapping of service_id → multiset of trip fingerprints, or ``None``
+        when ``trips.txt`` / ``stop_times.txt`` are absent or unusable.
+    """
+    trips = _load_optional(feed_path, "trips.txt")
+    stop_times = _load_optional(feed_path, "stop_times.txt")
+    if trips is None or stop_times is None:
+        return None
+    if not {"trip_id", "service_id", "route_id"} <= set(trips.columns) or not {
+        "trip_id",
+        "stop_sequence",
+    } <= set(stop_times.columns):
+        logging.info(
+            "'%s': trips.txt/stop_times.txt lack required columns — "
+            "skipping trip-content comparison.",
+            feed_path,
+        )
+        return None
+
+    routes = _load_optional(feed_path, "routes.txt")
+    route_names: dict[str, str] = {}
+    if routes is not None and {"route_id", "route_short_name"} <= set(routes.columns):
+        for route_id, name in zip(routes["route_id"], routes["route_short_name"]):
+            text = "" if (isinstance(name, float) and pd.isna(name)) else str(name).strip()
+            if text:
+                route_names[str(route_id).strip()] = text
+
+    ordered = stop_times.copy()
+    ordered["_seq"] = pd.to_numeric(ordered["stop_sequence"], errors="coerce")
+    ordered = ordered.sort_values(["trip_id", "_seq"])
+    grouped = ordered.groupby("trip_id")
+    empty = pd.Series(dtype=object)
+    first_dep = grouped["departure_time"].first() if "departure_time" in ordered.columns else empty
+    last_arr = grouped["arrival_time"].last() if "arrival_time" in ordered.columns else empty
+    n_stops = grouped.size()
+
+    content: dict[str, Counter] = {}
+    for _, row in trips.iterrows():
+        trip_id = row["trip_id"]
+        sid = str(row["service_id"]).strip()
+        route_id = str(row["route_id"]).strip()
+        signature = (
+            route_names.get(route_id, route_id),
+            _hms_to_seconds(first_dep.get(trip_id)),
+            _hms_to_seconds(last_arr.get(trip_id)),
+            int(n_stops.get(trip_id, 0)),
+        )
+        content.setdefault(sid, Counter())[signature] += 1
+    return content
+
+
+def _trip_content_cached(
+    feed: FeedSummary,
+    cache: dict[str, Optional[dict[str, Counter]]],
+) -> Optional[dict[str, Counter]]:
+    """Load and memoize a feed's trip fingerprints (stop_times.txt is large)."""
+    if feed.label not in cache:
+        logging.info(
+            "Comparing trip-level content — loading trips/stop_times from feed '%s'.",
+            feed.label,
+        )
+        cache[feed.label] = _load_trip_content(feed.path)
+    return cache[feed.label]
+
+
+def _regime_trip_signatures(
+    pattern: frozenset[tuple[str, int]],
+    content: Mapping[str, Counter],
+) -> Counter:
+    """Combine trip fingerprints for the services in *pattern*, tagged by day role.
+
+    The day role is the id-free set of weekdays a service operates, so a
+    weekday service compares to the successor's weekday service no matter
+    what either export names it.
+    """
+    day_roles: dict[str, set[int]] = {}
+    for sid, dow in pattern:
+        day_roles.setdefault(sid, set()).add(dow)
+    combined: Counter = Counter()
+    for sid, dows in day_roles.items():
+        role = tuple(sorted(dows))
+        for signature, count in content.get(sid, Counter()).items():
+            combined[(role, *signature)] += count
+    return combined
+
+
+def _signature_similarity(a: Counter, b: Counter) -> float:
+    """Multiset Jaccard similarity between two trip-fingerprint sets (0.0–1.0)."""
+    union = sum((a | b).values())
+    if union == 0:
+        return 1.0
+    return sum((a & b).values()) / union
+
+
 # ---- CROSS-FEED RECONCILIATION ----------------------------------------------
 
 
@@ -1072,16 +1217,20 @@ def _boundary_event(
     next_feed: FeedSummary,
     next_regimes: Sequence[Regime],
     coverage_gap_days: int = COVERAGE_GAP_DAYS,
+    content_cache: Optional[dict[str, Optional[dict[str, Counter]]]] = None,
+    same_signup_min_similarity: float = SAME_SIGNUP_MIN_SIMILARITY,
+    amendment_min_similarity: float = AMENDMENT_MIN_SIMILARITY,
 ) -> Optional[ServiceChange]:
     """Derive the service change (if any) implied by one feed superseding another.
 
     In a feed archive each markup is often published as a brand-new feed, so
     the succession itself — not any within-feed calendar row — marks the
     change date. Republished snapshots (same weekly pattern on both sides of
-    the boundary) produce no event; a boundary where only the service_ids
-    differ is reported with an explicit ambiguity note, because renamed ids
-    and a genuinely new pick with identical structure are indistinguishable
-    from calendars alone.
+    the boundary) produce no event. When only the service_ids differ across
+    the boundary, calendars alone cannot tell a republished signup from a
+    genuinely new one, so trip-level content is compared when available
+    (see the ``COMPARE_TRIP_CONTENT`` configuration notes); without it, the
+    boundary is reported with an explicit ambiguity note.
 
     Args:
         prev_feed: The earlier feed (by first active date).
@@ -1089,6 +1238,12 @@ def _boundary_event(
         next_feed: The later feed.
         next_regimes: Its stable regimes.
         coverage_gap_days: Max uncovered days still treated as contiguous.
+        content_cache: Memo of per-feed trip fingerprints, or ``None`` to
+            skip the trip-content comparison entirely.
+        same_signup_min_similarity: At or above this trip-content
+            similarity, the boundary is a republication, not a change.
+        amendment_min_similarity: At or above this (but below the
+            republication threshold), the boundary is a schedule amendment.
 
     Returns:
         A :class:`ServiceChange` dated at *next_feed*'s first active date,
@@ -1155,34 +1310,88 @@ def _boundary_event(
         )
         return None
     if _weekly_signature(prev_ref.pattern) == _weekly_signature(next_ref.pattern):
-        if prev_ids == next_ids:
-            logging.warning(
-                "Feed '%s' takes over from '%s' on %s with the same service_ids reassigned "
-                "to a different day-of-week pattern — probably a new pick re-using ids; "
-                "review the feeds if %s is not a known change date.",
+        ids_detail = (
+            "the same service_ids reassigned to a different day-of-week pattern"
+            if prev_ids == next_ids
+            else "different service_ids"
+        )
+        similarity: Optional[float] = None
+        if content_cache is not None:
+            prev_content = _trip_content_cached(prev_feed, content_cache)
+            next_content = _trip_content_cached(next_feed, content_cache)
+            if prev_content is not None and next_content is not None:
+                similarity = _signature_similarity(
+                    _regime_trip_signatures(prev_ref.pattern, prev_content),
+                    _regime_trip_signatures(next_ref.pattern, next_content),
+                )
+        if similarity is not None and similarity >= same_signup_min_similarity:
+            logging.info(
+                "Feed '%s' takes over from '%s' on %s with %s, and %s of trip-level "
+                "content is identical — a republished signup, not a service change.",
                 next_feed.label,
                 prev_feed.label,
                 next_feed.first_active,
-                next_feed.first_active,
+                ids_detail,
+                f"{similarity:.0%}",
             )
-            note = (
-                "same service_ids reassigned across days of the week — date marks where "
-                "the newer feed takes over"
-            )
-        else:
-            logging.warning(
-                "Feed '%s' takes over from '%s' on %s with an identical day-of-week "
-                "structure but different service_ids — probably a new pick (or renamed "
-                "ids); review the feeds if %s is not a known change date.",
+            return None
+        if similarity is not None and similarity >= amendment_min_similarity:
+            logging.info(
+                "Feed '%s' takes over from '%s' on %s with %s and %s of trip-level "
+                "content unchanged — reporting a schedule amendment, not a new signup.",
                 next_feed.label,
                 prev_feed.label,
                 next_feed.first_active,
+                ids_detail,
+                f"{similarity:.0%}",
+            )
+            return ServiceChange(
                 next_feed.first_active,
+                evidence,
+                "Schedule amendment",
+                added,
+                removed,
+                note=f"{similarity:.0%} of trip content unchanged — likely the same signup "
+                "with minor amendments (e.g. stop or trip edits)",
             )
-            note = (
-                "weekly day-of-week structure is unchanged — date marks where the newer "
-                "feed takes over"
+        if similarity is not None:
+            logging.info(
+                "Feed '%s' takes over from '%s' on %s with %s; only %s of trip-level "
+                "content carries over — a genuine signup change despite the unchanged "
+                "weekly structure.",
+                next_feed.label,
+                prev_feed.label,
+                next_feed.first_active,
+                ids_detail,
+                f"{similarity:.0%}",
             )
+            return ServiceChange(
+                next_feed.first_active,
+                evidence,
+                "New service period",
+                added,
+                removed,
+                note=f"weekly structure unchanged but only {similarity:.0%} of trip content "
+                "carries over — a genuine new signup",
+            )
+        logging.warning(
+            "Feed '%s' takes over from '%s' on %s with an identical day-of-week structure "
+            "but %s — probably a new pick, but a republished signup looks the same from "
+            "calendars alone (no trips/stop_times available to compare); review the feeds "
+            "if %s is not a known change date.",
+            next_feed.label,
+            prev_feed.label,
+            next_feed.first_active,
+            ids_detail,
+            next_feed.first_active,
+        )
+        note = (
+            "same service_ids reassigned across days of the week — date marks where "
+            "the newer feed takes over"
+            if prev_ids == next_ids
+            else "weekly day-of-week structure is unchanged — date marks where the newer "
+            "feed takes over"
+        )
         return ServiceChange(
             next_feed.first_active,
             evidence,
@@ -1280,6 +1489,7 @@ def merge_service_changes(
     min_stable_weeks: int = MIN_STABLE_WEEKS,
     coverage_gap_days: int = COVERAGE_GAP_DAYS,
     revert_max_weeks: int = REVERTING_CHANGE_MAX_WEEKS,
+    compare_trip_content: bool = COMPARE_TRIP_CONTENT,
 ) -> list[MergedChange]:
     """Detect changes in every usable feed and reconcile them across the archive.
 
@@ -1290,6 +1500,8 @@ def merge_service_changes(
             a seamless hand-off.
         revert_max_weeks: Longest fully-reverting excursion to collapse as
             temporary (see :func:`analyze_feed_changes`).
+        compare_trip_content: Compare trip-level content at ambiguous feed
+            boundaries (see :func:`_boundary_event`).
 
     Returns:
         Chronological list of merged, dispute-flagged change events.
@@ -1306,6 +1518,9 @@ def merge_service_changes(
         )
         events.extend(feed_events)
         regimes_by_feed[summary.label] = regimes
+    content_cache: Optional[dict[str, Optional[dict[str, Counter]]]] = (
+        {} if compare_trip_content else None
+    )
     for prev_feed, next_feed in zip(ordered, ordered[1:]):
         boundary = _boundary_event(
             prev_feed,
@@ -1313,6 +1528,7 @@ def merge_service_changes(
             next_feed,
             regimes_by_feed[next_feed.label],
             coverage_gap_days,
+            content_cache=content_cache,
         )
         if boundary is not None:
             events.append(boundary)
