@@ -280,7 +280,8 @@ def process_data(
 def create_route_workbooks(data_frame: pd.DataFrame) -> None:
     """Generate one Excel workbook per route, with sheets per direction.
 
-    Workbooks are written to :pydata:`OUTPUT_DIR`.
+    Workbooks are written to the directory containing :pydata:`OUTPUT_FILE`,
+    which is :pydata:`OUTPUT_DIR` in a normal run.
 
     Parameters:
     ----------
@@ -288,7 +289,7 @@ def create_route_workbooks(data_frame: pd.DataFrame) -> None:
         The processed DataFrame returned by :func:`process_data`.
     """
     # Determine the directory in which to save per-route files
-    output_dir = OUTPUT_DIR
+    output_dir = os.path.dirname(OUTPUT_FILE) or "."
     os.makedirs(output_dir, exist_ok=True)
 
     # Group by each ROUTE_NAME
