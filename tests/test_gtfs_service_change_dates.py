@@ -5,6 +5,7 @@ import shutil
 import zipfile
 from pathlib import Path
 
+import pandas as pd
 import pytest
 from openpyxl import load_workbook
 
@@ -151,7 +152,7 @@ def test_overlapping_feeds_disagree(tmp_path: Path, caplog) -> None:
         changes, _ = target.run(feeds_dir=feeds, output_dir=tmp_path / "out")
 
     assert list(changes["change_date"]) == ["2025-06-16"]
-    assert "archive_flat" in changes.iloc[0]["notes"]
+    assert changes.iloc[0]["disputed_by"] == "archive_flat"
     assert "disagree" in caplog.text.lower()
 
 
@@ -251,6 +252,31 @@ def test_feed_info_disagreement_warns(tmp_path: Path, caplog) -> None:
     assert row["declared_end"] == "2025-12-31"
     assert "feed_info declares service through" in row["issues"]
     assert "feed_info declares service through" in caplog.text
+
+
+def test_csv_outputs_are_machine_readable(tmp_path: Path) -> None:
+    feeds = tmp_path / "archive"
+    calendar_rows = [("WKD0", "1111100", "20250106", "20250613")] + [
+        (f"W_{letter}", "1111100", "20250616", "20251226") for letter in "ABCDEFG"
+    ]
+    _write_feed(feeds, "many_services", calendar_rows=calendar_rows)
+    out = tmp_path / "out"
+    changes, feeds_df = target.run(feeds_dir=feeds, output_dir=out)
+
+    # The CSV carries the full, untruncated service_id list.
+    csv_changes = pd.read_csv(out / "service_changes.csv")
+    assert list(csv_changes["change_date"]) == ["2025-06-16"]
+    assert csv_changes.iloc[0]["services_added"] == "W_A; W_B; W_C; W_D; W_E; W_F; W_G"
+    assert csv_changes.iloc[0]["services_removed"] == "WKD0"
+    assert list(csv_changes.columns) == list(changes.columns)
+
+    # The printable XLSX shortens the same list for display.
+    workbook = load_workbook(out / "service_change_quick_reference.xlsx")
+    assert "+1 more" in str(workbook["Service Changes"]["D4"].value)
+
+    csv_feeds = pd.read_csv(out / "service_change_feeds.csv")
+    assert list(csv_feeds["feed"]) == list(feeds_df["feed"])
+    assert csv_feeds.iloc[0]["service_ids"] == 8
 
 
 def test_empty_folder_raises(tmp_path: Path) -> None:

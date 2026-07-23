@@ -35,6 +35,9 @@ Outputs
   per service change date — day of week, services added/removed, source
   feeds, caveats) and sheet *Feeds* (one row per discovered feed — agency,
   version, declared vs. real active date range, data issues).
+- ``service_changes.csv`` / ``service_change_feeds.csv``: the same two
+  tables as machine-readable CSVs — full ``;``-separated service_id lists
+  with no display truncation — for joining into other analyses.
 - ``gtfs_service_change_dates_runlog.txt``: sidecar capturing the verbatim
   CONFIGURATION block, run timestamp, and a run summary.
 
@@ -74,6 +77,12 @@ from openpyxl.utils import get_column_letter
 FEEDS_DIR: Path = Path(r"Path\To\Your\GTFS_Feeds_Folder")  # ←–– change me
 OUTPUT_DIR: Path = Path(r"Path\To\Your\Output_Folder")  # ←–– change me
 OUTPUT_FILENAME: str = r"service_change_quick_reference.xlsx"
+
+# Alongside the printable XLSX, the same two tables are written as
+# machine-readable CSVs: full service_id lists with no display truncation,
+# and disputes in their own column — ready to join into other analyses.
+CHANGES_CSV_FILENAME: str = r"service_changes.csv"
+FEEDS_CSV_FILENAME: str = r"service_change_feeds.csv"
 
 # Optional cutoffs for the printable reference. Leave both as None to list
 # every service change detected in the archive.
@@ -1291,28 +1300,37 @@ def apply_cutoffs(
 # ---- OUTPUT TABLES AND EXPORT -----------------------------------------------
 
 
-def _join_ids(ids: Iterable[str], limit: int = 6) -> str:
-    """Join service_ids for display, truncating long lists."""
+def _join_ids(ids: Iterable[str], limit: Optional[int] = None) -> str:
+    """Join service_ids with ``'; '``, optionally truncating long lists for display."""
     ordered = sorted(ids)
-    if len(ordered) > limit:
-        return ", ".join(ordered[:limit]) + f", +{len(ordered) - limit} more"
-    return ", ".join(ordered)
+    if limit is not None and len(ordered) > limit:
+        return "; ".join(ordered[:limit]) + f"; +{len(ordered) - limit} more"
+    return "; ".join(ordered)
+
+
+def _display_id_list(joined: str, limit: int = 6) -> str:
+    """Shorten a ``'; '``-joined service_id list for a printable cell."""
+    ids = [part for part in joined.split("; ") if part]
+    return _join_ids(ids, limit=limit)
 
 
 def build_changes_table(changes: Sequence[MergedChange]) -> pd.DataFrame:
     """Build the one-row-per-change-date table for the quick reference.
 
+    The table is machine-truthful: service_id and feed lists are complete
+    and ``'; '``-joined (the XLSX export shortens long lists at display
+    time only), and feeds that dispute a change sit in their own
+    ``disputed_by`` column rather than inside free-text notes.
+
     Args:
         changes: Output of :func:`merge_service_changes` (post-cutoff).
 
     Returns:
-        DataFrame with display-ready string columns, oldest change first.
+        DataFrame of string columns, oldest change first — written verbatim
+        to the changes CSV.
     """
     rows: list[dict[str, Any]] = []
     for change in sorted(changes, key=lambda c: c.date):
-        notes = list(change.notes)
-        if change.disputed_by:
-            notes.append("not shown by: " + ", ".join(change.disputed_by))
         rows.append(
             {
                 "change_date": change.date.isoformat(),
@@ -1320,8 +1338,9 @@ def build_changes_table(changes: Sequence[MergedChange]) -> pd.DataFrame:
                 "change_type": change.kind,
                 "services_added": _join_ids(change.added),
                 "services_removed": _join_ids(change.removed),
-                "source_feeds": ", ".join(change.feeds),
-                "notes": "; ".join(notes),
+                "source_feeds": "; ".join(change.feeds),
+                "disputed_by": "; ".join(change.disputed_by),
+                "notes": "; ".join(change.notes),
             }
         )
     columns = [
@@ -1331,6 +1350,7 @@ def build_changes_table(changes: Sequence[MergedChange]) -> pd.DataFrame:
         "services_added",
         "services_removed",
         "source_feeds",
+        "disputed_by",
         "notes",
     ]
     return pd.DataFrame(rows, columns=columns)
@@ -1392,8 +1412,9 @@ _CHANGE_COLUMN_WIDTHS: dict[str, int] = {
     "change_type": 18,
     "services_added": 26,
     "services_removed": 26,
-    "source_feeds": 28,
-    "notes": 46,
+    "source_feeds": 26,
+    "disputed_by": 22,
+    "notes": 42,
 }
 
 _FEED_COLUMN_WIDTHS: dict[str, int] = {
@@ -1462,15 +1483,21 @@ def export_quick_reference_xlsx(
         cell.fill = header_fill
         cell.alignment = center
 
-    wrap_cols = {"services_added", "services_removed", "source_feeds", "notes"}
+    wrap_cols = {"services_added", "services_removed", "source_feeds", "disputed_by", "notes"}
     center_cols = {"change_date", "day_of_week"}
+    truncate_cols = {"services_added", "services_removed"}
     if changes_df.empty:
         changes_ws.append(["(no service changes detected in the analyzed window)"])
         changes_ws.merge_cells(start_row=4, start_column=1, end_row=4, end_column=n_cols)
         changes_ws.cell(row=4, column=1).font = Font(italic=True)
     else:
         for row in changes_df.itertuples(index=False):
-            changes_ws.append(list(row))
+            changes_ws.append(
+                [
+                    _display_id_list(str(value)) if name in truncate_cols else value
+                    for name, value in zip(changes_df.columns, row)
+                ]
+            )
         for row_idx in range(4, changes_ws.max_row + 1):
             for col_idx, name in enumerate(changes_df.columns, start=1):
                 cell = changes_ws.cell(row=row_idx, column=col_idx)
@@ -1578,12 +1605,13 @@ def run(
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Scan the archive, reconcile service changes, and write the quick reference.
 
-    Unset args fall back to the config block at the top of this file, so
-    ``m.FEEDS_DIR = ...; m.run()`` works after a plain import.
+    Writes the printable XLSX, its machine-readable CSV twins, and the
+    run-log sidecar. Unset args fall back to the config block at the top of
+    this file, so ``m.FEEDS_DIR = ...; m.run()`` works after a plain import.
 
     Args:
         feeds_dir: Folder of GTFS feeds (zips and/or subfolders).
-        output_dir: Folder for the XLSX and its run-log sidecar.
+        output_dir: Folder for the XLSX, CSVs, and run-log sidecar.
         max_changes: Keep only the most recent N changes (``None`` = config).
         max_years: Keep only the last X years of changes (``None`` = config).
 
@@ -1623,8 +1651,8 @@ def run(
                 change.date,
                 _DAY_NAMES[change.date.weekday()],
                 change.kind,
-                _join_ids(change.added) or "-",
-                _join_ids(change.removed) or "-",
+                _join_ids(change.added, limit=6) or "-",
+                _join_ids(change.removed, limit=6) or "-",
                 ", ".join(change.feeds),
             )
     else:
@@ -1653,12 +1681,20 @@ def run(
         subtitle=subtitle,
     )
 
+    changes_csv_path = output_dir / CHANGES_CSV_FILENAME
+    feeds_csv_path = output_dir / FEEDS_CSV_FILENAME
+    changes_df.to_csv(changes_csv_path, index=False)
+    feeds_df.to_csv(feeds_csv_path, index=False)
+    logging.info("Wrote machine-readable CSVs → %s, %s", changes_csv_path, feeds_csv_path)
+
     summary_lines = [
         f"Feeds folder:     {feeds_dir}",
         f"Feeds discovered: {len(summaries)} ({len(usable)} usable)",
         f"Service changes:  {len(changes_df)}",
         f"Cutoffs:          max_changes={max_changes}, max_years={max_years}",
         f"Quick reference:  {out_path}",
+        f"Changes CSV:      {changes_csv_path}",
+        f"Feeds CSV:        {feeds_csv_path}",
     ]
     if not write_run_log(output_dir, summary_lines) and REQUIRE_RUN_LOG:
         raise OSError(
@@ -1683,8 +1719,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Scan a folder of GTFS feeds (zipped or unzipped), reconcile the dates the "
-            "service actually changed, and export a printable XLSX quick reference. "
-            "Defaults come from the configuration block at the top of this file."
+            "service actually changed, and export a printable XLSX quick reference plus "
+            "machine-readable CSVs. Defaults come from the configuration block at the "
+            "top of this file."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
