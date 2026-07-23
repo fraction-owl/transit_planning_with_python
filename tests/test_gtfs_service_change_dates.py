@@ -107,6 +107,67 @@ def test_holiday_week_is_transient(tmp_path: Path, caplog) -> None:
     assert "transient" in caplog.text.lower()
 
 
+def test_holiday_fortnight_revert_is_not_a_change(tmp_path: Path, caplog) -> None:
+    # Christmas 2025 and New Year's Day 2026 are both Thursdays, so the two
+    # modified weeks form a two-week "stable" pattern; it must be collapsed
+    # as a temporary excursion, not reported as a change plus a change back.
+    feeds = tmp_path / "archive"
+    _write_feed(
+        feeds,
+        "winter",
+        calendar_rows=[("WKD", "1111100", "20250106", "20260227")],
+        calendar_dates_rows=[("WKD", "20251225", "2"), ("WKD", "20260101", "2")],
+    )
+    with caplog.at_level(logging.INFO):
+        changes, _ = target.run(feeds_dir=feeds, output_dir=tmp_path / "out")
+    assert changes.empty
+    assert "temporary" in caplog.text.lower()
+
+
+def test_run_log_survives_pasted_cell_without_file(tmp_path: Path, monkeypatch) -> None:
+    # Pasted into a notebook / ArcGIS Pro Python window, __file__ is undefined;
+    # the run must still finish and write a run log with a placeholder.
+    feeds = tmp_path / "archive"
+    _write_feed(feeds, "single", calendar_rows=[("WKD", "1111100", "20250106", "20251226")])
+    monkeypatch.delattr(target, "__file__")
+    out = tmp_path / "out"
+    target.run(feeds_dir=feeds, output_dir=out)
+    runlog = out / "gtfs_service_change_dates_runlog.txt"
+    assert runlog.exists()
+    assert "configuration block unavailable" in runlog.read_text(encoding="utf-8")
+
+
+def test_boundary_with_reused_service_ids(tmp_path: Path, caplog) -> None:
+    # The successor feed re-uses the same service_ids with swapped weekday
+    # roles — common when agencies number services 1..N per pick.
+    feeds = tmp_path / "archive"
+    _write_feed(
+        feeds,
+        "pick1",
+        calendar_rows=[
+            ("1", "1111100", "20250106", "20250613"),
+            ("2", "0000010", "20250111", "20250614"),
+        ],
+    )
+    _write_feed(
+        feeds,
+        "pick2",
+        calendar_rows=[
+            ("2", "1111100", "20250616", "20251226"),
+            ("1", "0000010", "20250621", "20251227"),
+        ],
+    )
+    with caplog.at_level(logging.WARNING):
+        changes, _ = target.run(feeds_dir=feeds, output_dir=tmp_path / "out")
+    assert list(changes["change_date"]) == ["2025-06-16"]
+    row = changes.iloc[0]
+    assert row["change_type"] == "New service period"
+    assert row["services_added"] == ""
+    assert row["services_removed"] == ""
+    assert "reassigned" in row["notes"]
+    assert "reassigned" in caplog.text
+
+
 def test_cross_feed_succession_between_zips(tmp_path: Path) -> None:
     feeds = tmp_path / "archive"
     _write_feed(

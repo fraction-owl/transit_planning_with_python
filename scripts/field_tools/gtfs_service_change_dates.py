@@ -12,7 +12,10 @@ Detection is calendar-based. Each week of each feed is fingerprinted by
 which service_ids run on which days of the week; a change is reported only
 when a new fingerprint persists for ``MIN_STABLE_WEEKS``, so one-week
 variations (holidays, special events) are logged as transient rather than
-reported as service changes. A pick that changes only trip times never
+reported as service changes, and a longer excursion that fully returns to
+the prior pattern within ``REVERTING_CHANGE_MAX_WEEKS`` (a holiday
+fortnight, a winter break) is reported as temporary rather than as a
+change and a change back. A pick that changes only trip times never
 touches calendar structure, so it is visible only when the archive contains
 a new feed for it — the feed-succession boundary is then reported, with a
 log note about the ambiguity. The script also cross-checks the feeds
@@ -100,6 +103,16 @@ MAX_YEARS: Optional[float] = None
 # schedule) show up as changes; lower it to 1 to list every weekly
 # variation, holidays included.
 MIN_STABLE_WEEKS: int = 2
+
+# A pattern interruption that lasts at least MIN_STABLE_WEEKS but returns
+# exactly to the prior weekly pattern within this many weeks is reported as
+# temporary rather than as a pair of service changes. This catches holiday
+# fortnights: Christmas and New Year's Day fall on the same weekday in
+# back-to-back weeks, so the two modified weeks form a two-week "stable"
+# pattern that is not a markup. Raise it if longer seasonal blips (e.g. a
+# one-month shutdown) should also be collapsed; set it to 0 to disable the
+# collapse and report every reverting excursion as two changes.
+REVERTING_CHANGE_MAX_WEEKS: int = 4
 
 # When consecutive feeds leave more than this many days uncovered between
 # one feed's last active date and the next feed's first, the boundary is
@@ -869,8 +882,9 @@ def stable_regimes(
     """Compress weekly fingerprints into runs and keep the lasting ones.
 
     Runs shorter than *min_stable_weeks* — holiday weeks, special events,
-    and the partial weeks at a feed's edges — are logged as transient and
-    dropped, so they never masquerade as service changes.
+    and the partial weeks at a feed's edges — are logged as transient (one
+    aggregate line per feed) and dropped, so they never masquerade as
+    service changes.
 
     Args:
         weekly_patterns: Output of :func:`weekly_service_patterns`.
@@ -889,17 +903,23 @@ def stable_regimes(
         else:
             runs.append(Regime(week, week, 1, pattern))
     stable: list[Regime] = []
+    transient: list[Regime] = []
     for run in runs:
         if run.weeks >= min_stable_weeks:
             stable.append(run)
         else:
-            logging.info(
-                "Feed '%s': transient weekly variation for %d week(s) starting %s (likely a "
-                "holiday or special service) — not counted as a service change.",
-                feed_label,
-                run.weeks,
-                run.start_week,
-            )
+            transient.append(run)
+    if transient:
+        shown = ", ".join(str(run.start_week) for run in transient[:10])
+        extra = f", +{len(transient) - 10} more" if len(transient) > 10 else ""
+        logging.info(
+            "Feed '%s': %d transient weekly variation(s) (likely holidays or special "
+            "service) in the week(s) of %s%s — not counted as service changes.",
+            feed_label,
+            len(transient),
+            shown,
+            extra,
+        )
     return stable
 
 
@@ -954,13 +974,20 @@ def analyze_feed_changes(
     active_dates: Mapping[str, set[dt.date]],
     min_stable_weeks: int = MIN_STABLE_WEEKS,
     feed_label: str = "feed",
+    revert_max_weeks: int = REVERTING_CHANGE_MAX_WEEKS,
 ) -> tuple[list[ServiceChange], list[Regime]]:
     """Detect the lasting service changes within one feed.
+
+    A stable excursion that returns exactly to the prior pattern within
+    *revert_max_weeks* — e.g. Christmas and New Year's Day landing on the
+    same weekday in back-to-back weeks — is logged as temporary rather than
+    reported as a change and a change back.
 
     Args:
         active_dates: Output of :func:`expand_service_active_dates`.
         min_stable_weeks: Weeks a new pattern must persist to count.
         feed_label: Feed name used in events and log messages.
+        revert_max_weeks: Longest fully-reverting excursion to collapse.
 
     Returns:
         Tuple of (chronological change events, the feed's stable regimes —
@@ -980,15 +1007,26 @@ def analyze_feed_changes(
             )
         return events, regimes
     prev = regimes[0]
-    for new in regimes[1:]:
+    resumed: list[dt.date] = []
+    for index in range(1, len(regimes)):
+        new = regimes[index]
         if new.pattern == prev.pattern:
+            resumed.append(new.start_week)
+            prev = new
+            continue
+        if (
+            new.weeks <= revert_max_weeks
+            and index + 1 < len(regimes)
+            and regimes[index + 1].pattern == prev.pattern
+        ):
             logging.info(
-                "Feed '%s': the weekly pattern resumes unchanged after a transient variation "
-                "before %s — not counted as a service change.",
+                "Feed '%s': the weekly pattern departs for %d week(s) starting %s and then "
+                "returns to the prior pattern (e.g. a holiday season) — reported as "
+                "temporary, not as a service change.",
                 feed_label,
+                new.weeks,
                 new.start_week,
             )
-            prev = new
             continue
         date = _change_date_between(services_by_date, prev, new)
         prev_ids = {sid for sid, _ in prev.pattern}
@@ -1004,6 +1042,13 @@ def analyze_feed_changes(
         note = "" if (added or removed) else "same service_ids on a new day-of-week pattern"
         events.append(ServiceChange(date, (feed_label,), kind, added, removed, note))
         prev = new
+    if resumed:
+        logging.info(
+            "Feed '%s': the weekly pattern resumed unchanged after transient variation(s) "
+            "before %s — not counted as service changes.",
+            feed_label,
+            ", ".join(str(day) for day in resumed),
+        )
     return events, regimes
 
 
@@ -1110,23 +1155,41 @@ def _boundary_event(
         )
         return None
     if _weekly_signature(prev_ref.pattern) == _weekly_signature(next_ref.pattern):
-        logging.warning(
-            "Feed '%s' takes over from '%s' on %s with an identical day-of-week structure "
-            "but different service_ids — probably a new pick (or renamed ids); review the "
-            "feeds if %s is not a known change date.",
-            next_feed.label,
-            prev_feed.label,
-            next_feed.first_active,
-            next_feed.first_active,
-        )
+        if prev_ids == next_ids:
+            logging.warning(
+                "Feed '%s' takes over from '%s' on %s with the same service_ids reassigned "
+                "to a different day-of-week pattern — probably a new pick re-using ids; "
+                "review the feeds if %s is not a known change date.",
+                next_feed.label,
+                prev_feed.label,
+                next_feed.first_active,
+                next_feed.first_active,
+            )
+            note = (
+                "same service_ids reassigned across days of the week — date marks where "
+                "the newer feed takes over"
+            )
+        else:
+            logging.warning(
+                "Feed '%s' takes over from '%s' on %s with an identical day-of-week "
+                "structure but different service_ids — probably a new pick (or renamed "
+                "ids); review the feeds if %s is not a known change date.",
+                next_feed.label,
+                prev_feed.label,
+                next_feed.first_active,
+                next_feed.first_active,
+            )
+            note = (
+                "weekly day-of-week structure is unchanged — date marks where the newer "
+                "feed takes over"
+            )
         return ServiceChange(
             next_feed.first_active,
             evidence,
             "New service period",
             added,
             removed,
-            note="weekly day-of-week structure is unchanged — date marks where the newer "
-            "feed takes over",
+            note=note,
         )
     return ServiceChange(
         next_feed.first_active,
@@ -1216,6 +1279,7 @@ def merge_service_changes(
     summaries: Sequence[FeedSummary],
     min_stable_weeks: int = MIN_STABLE_WEEKS,
     coverage_gap_days: int = COVERAGE_GAP_DAYS,
+    revert_max_weeks: int = REVERTING_CHANGE_MAX_WEEKS,
 ) -> list[MergedChange]:
     """Detect changes in every usable feed and reconcile them across the archive.
 
@@ -1224,6 +1288,8 @@ def merge_service_changes(
         min_stable_weeks: Weeks a new pattern must persist to count.
         coverage_gap_days: Max uncovered days between feeds still treated as
             a seamless hand-off.
+        revert_max_weeks: Longest fully-reverting excursion to collapse as
+            temporary (see :func:`analyze_feed_changes`).
 
     Returns:
         Chronological list of merged, dispute-flagged change events.
@@ -1235,7 +1301,9 @@ def merge_service_changes(
     events: list[ServiceChange] = []
     regimes_by_feed: dict[str, list[Regime]] = {}
     for summary in ordered:
-        feed_events, regimes = analyze_feed_changes(summary.active, min_stable_weeks, summary.label)
+        feed_events, regimes = analyze_feed_changes(
+            summary.active, min_stable_weeks, summary.label, revert_max_weeks
+        )
         events.extend(feed_events)
         regimes_by_feed[summary.label] = regimes
     for prev_feed, next_feed in zip(ordered, ordered[1:]):
@@ -1554,15 +1622,33 @@ def export_quick_reference_xlsx(
 def write_run_log(output_dir: Path, summary_lines: List[str]) -> bool:
     """Write the verbatim config block plus a run summary into *output_dir*.
 
+    When the code was pasted into a notebook or ArcGIS Pro Python window
+    cell, ``__file__`` does not exist and there is no source on disk to
+    slice the CONFIGURATION block out of; the run log is still written,
+    with a placeholder explaining why the block is absent.
+
     Returns:
         ``True`` if the log was written successfully, ``False`` otherwise.
     """
     log_path = output_dir / "gtfs_service_change_dates_runlog.txt"
-    try:
-        config_text = extract_config_block(Path(__file__))
-    except (OSError, ValueError) as exc:
-        logging.error("Could not extract config block for run log: %s", exc)
-        return False
+    source_file = globals().get("__file__")
+    if source_file is None:
+        config_text = (
+            "(configuration block unavailable — the script ran without a source file on "
+            "disk, e.g. pasted into a notebook or ArcGIS Pro Python window cell)"
+        )
+        source_display = "(no source file — code was pasted into an interactive session)"
+        logging.info(
+            "No __file__ in this session (pasted-cell run) — writing the run log without "
+            "the verbatim configuration block."
+        )
+    else:
+        source_display = str(Path(source_file).resolve())
+        try:
+            config_text = extract_config_block(Path(source_file))
+        except (OSError, ValueError) as exc:
+            logging.error("Could not extract config block for run log: %s", exc)
+            return False
 
     lines: List[str] = [
         "=" * 72,
@@ -1570,7 +1656,7 @@ def write_run_log(output_dir: Path, summary_lines: List[str]) -> bool:
         "=" * 72,
         f"Run timestamp:    {datetime.now().isoformat(timespec='seconds')}",
         f"Output directory: {output_dir}",
-        f"Source script:    {Path(__file__).resolve()}",
+        f"Source script:    {source_display}",
         "",
         "-" * 72,
         "RUN SUMMARY",
