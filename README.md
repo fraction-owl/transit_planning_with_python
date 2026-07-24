@@ -19,7 +19,7 @@ Stop guessing where buses are getting delayed. Pivot route-level OTP trends, dia
 *Folder:* `operations_tools/`
 
 ### Service Coverage & Catchments *(arcpy + GeoPandas)*
-Generate GTFS-to-Census catchment areas and calculate service coverage by district — built for **Title VI** equity/demographic analysis and service planning. Site-to-route proximity tools support site planning collaboration with developers, elected officials, and partner agencies.
+Generate GTFS-to-Census catchment areas and calculate service coverage by district — built for **Title VI** equity/demographic analysis and service planning. Site-to-route proximity tools support site planning collaboration with developers, elected officials, and partner agencies. A private-shuttle tool (`private_shuttle_coverage_by_route_gpd.py`) turns the hand-maintained operator spreadsheets agencies actually have — partial addresses, partial coordinates, free-text notes — into a clean registry, a geocoding worklist, a `Private_Shuttle_Stops` point layer for the strategic-site coverage counts, and an optional per-route rollup of shuttle sites (splitting transit *feeders* from potential *competitors*) that plugs into the demand-modeling bundles, so agencies can see where employer/university/residential shuttles run and test whether they move ridership.
 *Folders:* `service_coverage/`, `national_data_tools/`
 
 ### GTFS Data Quality & Validation *(arcpy + GeoPandas)*

@@ -21,6 +21,13 @@
     "inference finds no join key and skips it. Only the route_id-keyed summary ships, and only",
     "transfer_route_count (the transfer_routes column is a comma-separated string, not a",
     "predictor). The script defaults to weekday (non-holiday) service via its --day filter.",
+    "NOTE: private_shuttle_coverage_by_route_gpd.py cleans the agency's private-shuttle operator",
+    "registry ({input}/shuttles/private_shuttles.csv) and rolls shuttle presence up per route so",
+    "the models can test whether private shuttles move ridership. Its other outputs are handled",
+    "correctly without being described: private_shuttles_clean.csv and",
+    "private_shuttles_needs_geocoding.csv carry no candidate join key, so inference skips them,",
+    "and Private_Shuttle_Stops.zip is not a csv/xlsx so it is never collected (drop that zip",
+    "under {input}/shapefiles to also include shuttles in the POI coverage counts).",
     "NOTE: the CaBi chain is three stages. bikeshare_ridership_trends.py reads the monthly trip",
     "extracts under {input}/cabi and writes station_daytype_ridership.csv (weekday/Saturday/",
     "Sunday average ridership per station; observed federal holidays count as Sunday-equivalent,",
@@ -87,6 +94,15 @@
       ]
     },
     {
+      "script": "private_shuttle_coverage_by_route_gpd.py",
+      "cmd": ["{python}", "{script}", "--shuttles-csv", "{input}/shuttles/private_shuttles.csv",
+              "--gtfs-dir", "{input}/gtfs", "--output-dir", "{output}"],
+      "outputs": [
+        {"file": "private_shuttle_coverage_by_route.csv", "join_keys": ["route_id"],
+         "keep_cols": ["shuttle_sites_served", "shuttle_feeder_sites_served"]}
+      ]
+    },
+    {
       "script": "gbfs_stations_exporter.py",
       "cmd": ["{python}", "{script}", "--source", "{input}/gbfs/gbfs.json",
               "--output-dir", "{output}"]
@@ -139,6 +155,8 @@
     {"file": "cabi_coverage_by_route.csv", "join_keys": ["route_id"],
      "keep_cols": ["cabi_stations_served", "cabi_weekday_riders_served",
                    "cabi_saturday_riders_served", "cabi_sunday_riders_served"]},
+    {"file": "private_shuttle_coverage_by_route.csv", "join_keys": ["route_id"],
+     "keep_cols": ["shuttle_sites_served", "shuttle_feeder_sites_served"]},
     {"file": "headway_span_by_route.csv", "join_keys": ["route_id"],
      "keep_cols": ["avg_headway_min", "span_hrs"]},
     {"file": "route_transfers_summary.csv", "join_keys": ["route_id"],
