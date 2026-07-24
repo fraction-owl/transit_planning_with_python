@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import geopandas as gpd
 import pandas as pd
 import pytest
 
@@ -18,6 +19,7 @@ from scripts.service_coverage.private_shuttle_coverage_by_route_gpd import (
     REASON_MISSING_COORDS,
     categorize_notes,
     clean_registry,
+    filter_active_sites,
     load_registry_csv,
     run,
 )
@@ -81,6 +83,8 @@ def test_load_registry_matches_headers_case_insensitively(tmp_path: Path) -> Non
         "notes",
         "lon_raw",
         "lat_raw",
+        "start_date_raw",
+        "end_date_raw",
     ]
     assert out.loc[0, "company"] == "Acme"
     assert out.loc[0, "lon_raw"] == "-77.18"
@@ -159,6 +163,45 @@ def test_clean_registry_fixture_categories() -> None:
     assert counts[CATEGORY_UNSPECIFIED] == 3
 
 
+def test_clean_registry_normalizes_mixed_date_formats() -> None:
+    """Service dates in mixed formats normalize to ISO; junk becomes unknown."""
+    clean, needs = _cleaned_fixture()
+    by_company = clean.set_index("company")
+    assert by_company.loc["Building Co", "start_date"] == "2018-05-01"
+    assert by_company.loc["Riverside Apartments", "start_date"] == "2021-06-15"  # 6/15/2021
+    assert by_company.loc["University Annex", "start_date"] == "2015-09-01"  # 9/1/2015
+    assert by_company.loc["Grand Hotel", "end_date"] == "2024-12-31"  # 12/31/2024
+    assert by_company.loc["Consulting Unlimited", "end_date"] == "2020-03-31"
+    assert by_company.loc["Retail Pavilion", "start_date"] == ""  # "TBD" is unparseable
+    assert by_company.loc["Building Co", "end_date"] == ""  # blank = still running
+    # The worklist keeps its dates too (Hospital Center awaits geocoding only).
+    assert needs.set_index("company").loc["Hospital Center", "start_date"] == "2021-09-07"
+
+
+# ---------------------------------------------------------------------------
+# filter_active_sites
+# ---------------------------------------------------------------------------
+
+
+def test_filter_active_sites_date_window_and_unknowns() -> None:
+    """Ended shuttles drop out; unknown dates never exclude; bounds are inclusive."""
+    clean, _ = _cleaned_fixture()
+    active = set(filter_active_sites(clean, "2026-01-01")["company"])
+    assert "Consulting Unlimited" not in active  # ended 2020-03-31
+    assert "Grand Hotel" not in active  # ended 2024-12-31
+    assert "Riverside Apartments" in active  # blank end = still running
+    assert "Retail Pavilion" in active  # unknown ("TBD") start = assumed active
+    # On its final day of service a shuttle still counts.
+    assert "Grand Hotel" in set(filter_active_sites(clean, "2024-12-31")["company"])
+
+
+def test_filter_active_sites_rejects_bad_date() -> None:
+    """An unparseable as-of date fails with an actionable error."""
+    clean, _ = _cleaned_fixture()
+    with pytest.raises(ValueError, match="as-of"):
+        filter_active_sites(clean, "not-a-date")
+
+
 # ---------------------------------------------------------------------------
 # run (prep-only mode)
 # ---------------------------------------------------------------------------
@@ -190,6 +233,11 @@ def test_run_poi_layer_matches_coverage_tool_layer_spec(tmp_path: Path) -> None:
     layer = layers["Private_Shuttle_Stops.shp"]
     assert len(layer) == 8
     assert "Building Co" in set(layer["NAME"])
+
+    # The layer also carries the service dates (as ISO strings) for mapping use.
+    full = gpd.read_file(f"zip://{tmp_path / 'Private_Shuttle_Stops.zip'}")
+    assert {"START_DATE", "END_DATE"} <= set(full.columns)
+    assert full.set_index("NAME").loc["Building Co", "START_DATE"] == "2018-05-01"
 
 
 def test_run_can_skip_poi_layer(tmp_path: Path) -> None:
@@ -229,6 +277,28 @@ def test_run_with_gtfs_writes_route_keyed_coverage(tmp_path: Path) -> None:
     assert by_route.loc["R2", "shuttle_sites_served"] == 0
     assert by_route.loc["R2", "shuttle_feeder_sites_served"] == 0
     assert result.coverage is not None
+
+
+def test_run_as_of_counts_only_active_shuttles(tmp_path: Path) -> None:
+    """With --as-of, ended shuttles drop out of the rollup but stay in the registry."""
+    gtfs_dir = tmp_path / "gtfs"
+    gtfs_dir.mkdir()
+    _write_gtfs_files(gtfs_dir)
+    out_dir = tmp_path / "out"
+
+    result = run(
+        shuttles_csv=FIXTURE_CSV, gtfs_dir=gtfs_dir, output_dir=out_dir, active_as_of="2026-01-01"
+    )
+
+    # Of R1's three sites, Consulting Unlimited (ended 2020) and Grand Hotel
+    # (ended 2024) are gone; only Riverside Apartments (a feeder) remains.
+    assert result.coverage is not None
+    by_route = result.coverage.set_index("route_id")
+    assert by_route.loc["R1", "shuttle_sites_served"] == 1
+    assert by_route.loc["R1", "shuttle_feeder_sites_served"] == 1
+    # The clean registry and POI layer still keep every site.
+    assert len(result.clean) == 8
+    assert (out_dir / "Private_Shuttle_Stops.zip").exists()
 
 
 def test_run_with_gtfs_and_empty_clean_registry(tmp_path: Path) -> None:
@@ -271,6 +341,21 @@ def test_main_runs_after_config_edit(monkeypatch: pytest.MonkeyPatch, tmp_path: 
 def test_main_reports_missing_input_as_error(tmp_path: Path) -> None:
     """A nonexistent registry path exits 1 with an error, not a traceback."""
     assert shuttle_mod.main(["--shuttles-csv", str(tmp_path / "nope.csv")]) == 1
+
+
+def test_main_rejects_bad_as_of_even_in_prep_only_mode(tmp_path: Path) -> None:
+    """A typo'd --as-of fails fast (exit 1) before any output is written."""
+    out_dir = tmp_path / "out"
+    argv = [
+        "--shuttles-csv",
+        str(FIXTURE_CSV),
+        "--output-dir",
+        str(out_dir),
+        "--as-of",
+        "not-a-date",
+    ]
+    assert shuttle_mod.main(argv) == 1
+    assert not (out_dir / "private_shuttles_clean.csv").exists()
 
 
 def test_gpd_gtfs_dir_flag_reaches_run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

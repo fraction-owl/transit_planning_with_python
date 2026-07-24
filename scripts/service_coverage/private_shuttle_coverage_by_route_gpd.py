@@ -12,7 +12,10 @@ shuttles run and the modeling pipeline can test whether they move ridership:
    column derived from the notes: ``transit_feeder`` (the shuttle connects to
    rail/metro/transit, i.e. likely *complements* fixed-route service),
    ``shuttle`` (a shuttle with no stated transit connection, i.e. a potential
-   *competitor*), or ``unspecified``.
+   *competitor*), or ``unspecified``. Service ``start_date`` / ``end_date``
+   columns are carried through and normalized to ISO dates (blank = unknown /
+   still operating), so dated openings and closures survive cleaning — the
+   raw material for panel (route × month) modeling later.
 2. **Geocoding worklist** (``private_shuttles_needs_geocoding.csv``) — rows
    whose coordinates are missing or invalid (out of range, or the 0,0
    "null island" geocoder artifact). No geocoding is attempted here — the
@@ -31,7 +34,11 @@ the transit-feeder subset (``shuttle_feeder_sites_served``). That table is the
 modeling hook: registered in ``scripts/modeling/orchestrator_jobs_public.json``,
 it joins the ridership anchor by ``route_id`` so the OLS / ML models
 (``monthly_ridership_model.py``, ``ridership_ml_model.py``) can estimate
-whether private-shuttle presence helps explain route-level ridership.
+whether private-shuttle presence helps explain route-level ridership. Set
+``ACTIVE_AS_OF`` (or ``--as-of``) to count only the shuttles active on a given
+date — match it to the ridership anchor's period so a shuttle that shut down
+years ago doesn't inflate today's counts. A site with an unknown start or end
+date is treated as active.
 
 Typical usage
 -------------
@@ -86,8 +93,9 @@ GTFS_DIR: Path | None = None  # GTFS folder; None → skip the route rollup
 OUTPUT_DIR = Path(r"output")  # where all outputs are written
 
 # Registry column names, matched case-insensitively against the CSV header.
-# X/Y are WGS84 longitude/latitude; both may be absent (all rows then land on
-# the geocoding worklist).
+# X/Y are WGS84 longitude/latitude; the coordinate and date columns may be
+# absent entirely (rows without coordinates land on the geocoding worklist;
+# absent dates mean every site is treated as currently operating).
 COMPANY_COL = "Company"
 ADDRESS_COL = "Address"
 CITY_COL = "City"
@@ -96,6 +104,10 @@ ZIP_COL = "Zip"
 X_COL = "X"
 Y_COL = "Y"
 NOTES_COL = "Notes"
+# Service dates: when the shuttle began / ceased operating. Any format pandas
+# can parse is accepted per-value; blank = unknown (start) / still running (end).
+START_DATE_COL = "Start Date"
+END_DATE_COL = "End Date"
 
 # Case-insensitive regex applied to the notes column. A match marks the site a
 # ``transit_feeder`` (its shuttle connects to the regional transit network);
@@ -121,6 +133,10 @@ RUN_LOG_NAME = "private_shuttles_runlog.txt"
 ROUTE_FILTER: list[str] = []  # only these route_id values; empty = all
 USE_SHAPE_BUFFER = False  # False → buffer stops (simple catchment); True → route geometry
 BUFFER_DIST_FT = 1320.0  # ¼ mile in feet
+# Count only shuttles active on this date (e.g. "2026-06-01" — match it to the
+# ridership anchor's period). None counts every site regardless of its dates;
+# sites with an unknown start or end date are always treated as active.
+ACTIVE_AS_OF: str | None = None
 
 # Projected CRS used for buffering and the spatial join.
 # EPSG:3857 (Web Mercator) works globally; its latitude-dependent scale
@@ -179,12 +195,15 @@ def load_registry_csv(
     x_col: str = X_COL,
     y_col: str = Y_COL,
     notes_col: str = NOTES_COL,
+    start_date_col: str = START_DATE_COL,
+    end_date_col: str = END_DATE_COL,
 ) -> pd.DataFrame:
     """Read the operator registry CSV into canonically named string columns.
 
     Every configured column is matched case-insensitively against the file's
     header. Missing optional columns (everything except the company column)
-    are created empty, so a registry that was never geocoded still loads.
+    are created empty, so a registry that was never geocoded or dated still
+    loads.
 
     Args:
         shuttles_csv: Path to the registry CSV.
@@ -196,10 +215,13 @@ def load_registry_csv(
         x_col: WGS84 longitude header.
         y_col: WGS84 latitude header.
         notes_col: Free-text notes header.
+        start_date_col: Service start-date header (blank value = unknown).
+        end_date_col: Service end-date header (blank value = still running).
 
     Returns:
         DataFrame with string columns ``company``, ``address``, ``city``,
-        ``state``, ``zip``, ``notes``, ``lon_raw``, ``lat_raw``.
+        ``state``, ``zip``, ``notes``, ``lon_raw``, ``lat_raw``,
+        ``start_date_raw``, ``end_date_raw``.
 
     Raises:
         FileNotFoundError: If ``shuttles_csv`` does not exist.
@@ -231,11 +253,16 @@ def load_registry_csv(
         "notes": _resolve(notes_col),
         "lon_raw": _resolve(x_col),
         "lat_raw": _resolve(y_col),
+        "start_date_raw": _resolve(start_date_col),
+        "end_date_raw": _resolve(end_date_col),
     }
+    # Coordinate and date columns are genuinely optional in the wild, so their
+    # absence is not worth a warning; the other text columns are expected.
+    quiet_when_absent = {"lon_raw", "lat_raw", "start_date_raw", "end_date_raw"}
     out = pd.DataFrame(index=raw.index)
     for target, source in wanted.items():
         out[target] = raw[source] if source is not None else ""
-        if source is None and target not in {"lon_raw", "lat_raw"}:
+        if source is None and target not in quiet_when_absent:
             logging.warning(
                 "Column '%s' not found in %s; '%s' left empty.", target, shuttles_csv.name, target
             )
@@ -262,6 +289,34 @@ def categorize_notes(notes: pd.Series, feeder_pattern: str = FEEDER_NOTES_PATTER
     return categories
 
 
+def _normalize_dates(raw: pd.Series, label: str) -> pd.Series:
+    """Parse a raw service-date column into ISO ``YYYY-MM-DD`` strings.
+
+    Registries collect dates in whatever format each editor typed, so each
+    value is parsed individually (``2021-06-15``, ``6/15/2021``, ``June 2021``
+    all work). Blank stays blank (unknown / still running); a non-blank value
+    that cannot be parsed (e.g. ``TBD``) is blanked with a warning so it is
+    treated as unknown rather than silently mis-dated.
+
+    Args:
+        raw: The trimmed raw date strings.
+        label: Column name used in the warning message.
+
+    Returns:
+        Series of ISO date strings, ``""`` where the date is unknown.
+    """
+    parsed = pd.to_datetime(raw.replace("", pd.NA), errors="coerce", format="mixed")
+    unparseable = parsed.isna() & (raw != "")
+    if unparseable.any():
+        logging.warning(
+            "%d unparseable %s value(s) treated as unknown: %s",
+            int(unparseable.sum()),
+            label,
+            sorted(raw[unparseable].unique()),
+        )
+    return parsed.dt.strftime("%Y-%m-%d").fillna("")
+
+
 def clean_registry(
     registry: pd.DataFrame,
     feeder_pattern: str = FEEDER_NOTES_PATTERN,
@@ -274,7 +329,8 @@ def clean_registry(
         3. Drop exact duplicate rows.
         4. Parse coordinates and validate them: both present, longitude within
            ±180, latitude within ±90, and not the (0, 0) geocoder artifact.
-        5. Categorize the notes (see :func:`categorize_notes`).
+        5. Normalize the service dates to ISO (see :func:`_normalize_dates`).
+        6. Categorize the notes (see :func:`categorize_notes`).
 
     Args:
         registry: Output of :func:`load_registry_csv`.
@@ -282,12 +338,13 @@ def clean_registry(
 
     Returns:
         ``(clean, needs_geocoding)``. ``clean`` carries the text columns plus
-        numeric ``lon`` / ``lat`` and ``category``; ``needs_geocoding`` carries
-        the text columns, ``category``, and a ``reason`` column
-        (``missing_coordinates`` or ``invalid_coordinates``).
+        numeric ``lon`` / ``lat``, ISO ``start_date`` / ``end_date``, and
+        ``category``; ``needs_geocoding`` carries the text columns, the dates,
+        ``category``, and a ``reason`` column (``missing_coordinates`` or
+        ``invalid_coordinates``).
     """
     df = registry.copy()
-    for col in (*_TEXT_COLUMNS, "lon_raw", "lat_raw"):
+    for col in (*_TEXT_COLUMNS, "lon_raw", "lat_raw", "start_date_raw", "end_date_raw"):
         df[col] = df[col].astype(str).str.strip()
     df["state"] = df["state"].str.upper()
 
@@ -309,13 +366,18 @@ def clean_registry(
     invalid = out_of_range | null_island
     usable = ~missing & ~invalid
 
-    df = df.assign(category=categorize_notes(df["notes"], feeder_pattern))
+    df = df.assign(
+        start_date=_normalize_dates(df["start_date_raw"], "start date"),
+        end_date=_normalize_dates(df["end_date_raw"], "end date"),
+        category=categorize_notes(df["notes"], feeder_pattern),
+    )
 
-    clean = df.loc[usable, [*_TEXT_COLUMNS, "category"]].copy()
+    kept_cols = [*_TEXT_COLUMNS, "start_date", "end_date", "category"]
+    clean = df.loc[usable, kept_cols].copy()
     clean.insert(_TEXT_COLUMNS.index("notes"), "lon", lon[usable])
     clean.insert(_TEXT_COLUMNS.index("notes") + 1, "lat", lat[usable])
 
-    needs = df.loc[~usable, [*_TEXT_COLUMNS, "category"]].copy()
+    needs = df.loc[~usable, kept_cols].copy()
     reason = pd.Series(REASON_INVALID_COORDS, index=needs.index)
     reason[missing.loc[needs.index]] = REASON_MISSING_COORDS
     needs["reason"] = reason
@@ -339,16 +401,26 @@ def clean_registry(
 def build_poi_layer(clean: pd.DataFrame, id_column: str = POI_ID_COLUMN) -> gpd.GeoDataFrame:
     """Build the WGS84 point layer for the strategic-site coverage tool.
 
+    Besides the id column the layer carries the service dates as ISO strings
+    (``START_DATE`` / ``END_DATE``, blank = unknown) for mapping use; the
+    coverage tool itself reads only the id column.
+
     Args:
-        clean: The clean registry rows (must carry ``company``/``lon``/``lat``).
+        clean: The clean registry rows (must carry ``company``/``lon``/``lat``
+            and the normalized ``start_date``/``end_date``).
         id_column: Attribute column name expected by the coverage tool's
             LAYER_SPECS (``NAME`` for Private_Shuttle_Stops.shp).
 
     Returns:
-        GeoDataFrame with columns ``[id_column, "geometry"]`` in EPSG:4326.
+        GeoDataFrame with columns ``[id_column, "START_DATE", "END_DATE",
+        "geometry"]`` in EPSG:4326.
     """
     return gpd.GeoDataFrame(
-        {id_column: clean["company"].to_numpy()},
+        {
+            id_column: clean["company"].to_numpy(),
+            "START_DATE": clean["start_date"].to_numpy(),
+            "END_DATE": clean["end_date"].to_numpy(),
+        },
         geometry=gpd.points_from_xy(clean["lon"], clean["lat"]),
         crs="EPSG:4326",
     )
@@ -564,6 +636,51 @@ def _web_mercator_ground_scale(crs: object, latitudes: pd.Series) -> float:
 # =============================================================================
 
 
+def _parse_as_of(value: str) -> pd.Timestamp:
+    """Parse the as-of date, failing with an actionable message.
+
+    Raises:
+        ValueError: If *value* cannot be parsed as a date.
+    """
+    try:
+        return pd.Timestamp(value)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(
+            f"ACTIVE_AS_OF / --as-of value {value!r} is not a parseable date (use e.g. 2026-06-01)."
+        ) from exc
+
+
+def filter_active_sites(clean: pd.DataFrame, active_as_of: str) -> pd.DataFrame:
+    """Return only the clean rows whose shuttle was active on *active_as_of*.
+
+    A site counts as active when its start date is unknown or on/before the
+    as-of date AND its end date is unknown or on/after it — i.e. missing dates
+    never exclude a site, they only fail to.
+
+    Args:
+        clean: The clean registry rows carrying ISO ``start_date``/``end_date``.
+        active_as_of: The as-of date (any format ``pd.Timestamp`` accepts).
+
+    Returns:
+        The active subset of *clean*.
+
+    Raises:
+        ValueError: If *active_as_of* cannot be parsed as a date.
+    """
+    as_of = _parse_as_of(active_as_of)
+
+    start = pd.to_datetime(clean["start_date"].replace("", pd.NA), errors="coerce")
+    end = pd.to_datetime(clean["end_date"].replace("", pd.NA), errors="coerce")
+    active = (start.isna() | (start <= as_of)) & (end.isna() | (end >= as_of))
+    logging.info(
+        "As-of filter %s: %d of %d shuttle site(s) active.",
+        as_of.date(),
+        int(active.sum()),
+        len(clean),
+    )
+    return clean[active]
+
+
 def summarize_shuttles_by_route(
     route_buffers: gpd.GeoDataFrame,
     shuttles_gdf: gpd.GeoDataFrame,
@@ -729,6 +846,7 @@ def run(
     projected_crs: str | None = None,
     feeder_pattern: str | None = None,
     write_poi_layer: bool | None = None,
+    active_as_of: str | None = None,
     require_run_log: bool | None = None,
 ) -> PrepResult:
     """Clean the registry, export the POI layer, and (optionally) roll up by route.
@@ -736,13 +854,16 @@ def run(
     Unset args fall back to the CONFIGURATION block, so ``m.SHUTTLES_CSV = ...;
     m.run()`` works after a plain import. The route rollup only runs when a
     GTFS folder is configured (``GTFS_DIR`` or ``--gtfs-dir``); without one the
-    script is a pure registry-prep step.
+    script is a pure registry-prep step. When *active_as_of* (or
+    ``ACTIVE_AS_OF``) is set, the rollup counts only shuttles active on that
+    date; the clean registry, worklist, and POI layer always keep every site.
 
     Returns:
         A :class:`PrepResult` with the clean registry, the geocoding worklist,
         and the route coverage table (None in prep-only mode).
 
     Raises:
+        ValueError: If *active_as_of* is not a parseable date.
         RuntimeError: If the run-log sidecar cannot be written while
             ``REQUIRE_RUN_LOG`` is enabled.
     """
@@ -755,7 +876,13 @@ def run(
     projected_crs = PROJECTED_CRS if projected_crs is None else projected_crs
     feeder_pattern = FEEDER_NOTES_PATTERN if feeder_pattern is None else feeder_pattern
     write_poi_layer_flag = WRITE_POI_LAYER if write_poi_layer is None else write_poi_layer
+    active_as_of = ACTIVE_AS_OF if active_as_of is None else active_as_of
     require_run_log = REQUIRE_RUN_LOG if require_run_log is None else require_run_log
+
+    # Validate eagerly so a typo'd as-of date fails before any output is
+    # written — even in prep-only mode, where the filter itself never runs.
+    if active_as_of is not None:
+        _parse_as_of(active_as_of)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     summary_lines: list[str] = []
@@ -808,9 +935,10 @@ def run(
         if route_buffers.empty:
             logging.error("No route catchments produced – coverage rollup skipped")
         else:
+            sites = clean if active_as_of is None else filter_active_sites(clean, active_as_of)
             shuttles_gdf = gpd.GeoDataFrame(
-                clean[["company", "category"]].copy(),
-                geometry=gpd.points_from_xy(clean["lon"], clean["lat"]),
+                sites[["company", "category"]].copy(),
+                geometry=gpd.points_from_xy(sites["lon"], sites["lat"]),
                 crs="EPSG:4326",
             ).to_crs(projected_crs)
             coverage = summarize_shuttles_by_route(route_buffers, shuttles_gdf)
@@ -912,6 +1040,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Case-insensitive regex marking a note as a transit-feeder shuttle.",
     )
     parser.add_argument(
+        "--as-of",
+        dest="active_as_of",
+        default=ACTIVE_AS_OF,
+        metavar="DATE",
+        help="Count only shuttles active on this date in the route rollup "
+        "(e.g. 2026-06-01); omit to count every site.",
+    )
+    parser.add_argument(
         "--no-poi-layer",
         dest="write_poi_layer",
         action="store_false",
@@ -971,6 +1107,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             projected_crs=args.projected_crs,
             feeder_pattern=args.feeder_pattern,
             write_poi_layer=args.write_poi_layer,
+            active_as_of=args.active_as_of,
         )
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
         logging.error("%s", exc)
