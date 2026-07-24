@@ -64,6 +64,10 @@ OUTPUT_DIR = Path(r"output")  # where CSVs and PNGs are written
 # ``dev_tools/generate_mock_points_of_interest.py``: id columns reuse the source
 # data's own field names where one exists (DESCRIPTIO / SCHOOL_NAM / NAME) and
 # fall back to NAME for layers without an established schema.
+# Private_Shuttle_Stops.shp can be produced from an agency's shuttle-operator
+# registry CSV by ``private_shuttle_coverage_by_route_gpd.py`` (same folder),
+# which emits a matching Private_Shuttle_Stops.zip — drop it anywhere under
+# SHP_INPUT_DIR and this script picks it up.
 LAYER_SPECS: list[tuple[str, str]] = [
     ("Hospitals.shp", "DESCRIPTIO"),
     ("Urgent_Care_Facilities.shp", "DESCRIPTIO"),

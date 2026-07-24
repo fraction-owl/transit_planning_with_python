@@ -35,12 +35,14 @@ transit_planning_with_python/
 │   │   └── stop_improvement_coverage_summary.py
 │   ├── field_tools/
 │   │   ├── gtfs_route_summary.py
+│   │   ├── gtfs_service_change_dates.py
 │   │   └── printable_block_schedules.py
 │   ├── gbfs_tools/
 │   │   ├── bikeshare_ridership_trends.py
 │   │   ├── gbfs_ridership_join.py
 │   │   └── gbfs_stations_exporter.py
 │   ├── gtfs_data_quality/
+│   │   ├── gtfs_calendar_inspector.py
 │   │   ├── gtfs_skipped_stop_flagger_gpd.py
 │   │   ├── gtfs_stop_proximity_qc.py
 │   │   ├── route_direction_classifier.py
@@ -92,6 +94,8 @@ transit_planning_with_python/
 │   │   └── trip_runtime_diagnostics_from_avl.py
 │   ├── ridership_tools/
 │   │   ├── data_request_by_stop_processor.py
+│   │   ├── district_ridership_share_arcpy.py
+│   │   ├── district_ridership_share_gpd.py
 │   │   ├── load_factor_monitor.py
 │   │   ├── max_load_from_tides.py
 │   │   ├── ntd_anchor_builder.py
@@ -108,6 +112,7 @@ transit_planning_with_python/
 │   │   ├── gtfs_service_demographics_gpd.py
 │   │   ├── points_of_interest_coverage_arcpy.py
 │   │   ├── points_of_interest_coverage_gpd.py
+│   │   ├── private_shuttle_coverage_by_route_gpd.py
 │   │   ├── school_coverage_by_route_arcpy.py
 │   │   ├── school_coverage_by_route_gpd.py
 │   │   ├── site_route_proximity_arcpy.py
@@ -135,6 +140,22 @@ transit_planning_with_python/
 │   │   │   ├── stop_times.txt
 │   │   │   ├── stops.txt
 │   │   │   ├── transfers.txt
+│   │   │   └── trips.txt
+│   │   ├── gtfs_holiday_negation/
+│   │   │   ├── agency.txt
+│   │   │   ├── calendar.txt
+│   │   │   ├── calendar_dates.txt
+│   │   │   ├── routes.txt
+│   │   │   ├── stop_times.txt
+│   │   │   ├── stops.txt
+│   │   │   └── trips.txt
+│   │   ├── gtfs_split_weekday/
+│   │   │   ├── agency.txt
+│   │   │   ├── calendar.txt
+│   │   │   ├── calendar_dates.txt
+│   │   │   ├── routes.txt
+│   │   │   ├── stop_times.txt
+│   │   │   ├── stops.txt
 │   │   │   └── trips.txt
 │   │   ├── points_of_interest/
 │   │   │   ├── Bus_Stations.zip
@@ -178,6 +199,7 @@ transit_planning_with_python/
 │   │   ├── ntd_monthly_multi_month.csv
 │   │   ├── output_road_shps_dc.zip
 │   │   ├── output_road_shps_ottawa.zip
+│   │   ├── private_shuttles_sample.csv
 │   │   ├── ridership_by_route_and_stop.csv
 │   │   ├── sample_block_geoids.csv
 │   │   ├── statistics_by_route_and_trip.csv
@@ -196,6 +218,7 @@ transit_planning_with_python/
 │   ├── test_bus_block_exporter.py
 │   ├── test_cabi_coverage_by_route_gpd.py
 │   ├── test_cacensus_da_join_gpd.py
+│   ├── test_calendar_helpers.py
 │   ├── test_clean_eia_gas_prices.py
 │   ├── test_clean_fred_unrate.py
 │   ├── test_clean_noaa_weather.py
@@ -203,15 +226,18 @@ transit_planning_with_python/
 │   ├── test_convert_to_tides_trips_performed.py
 │   ├── test_data_request_by_stop_processor.py
 │   ├── test_distance_helpers.py
+│   ├── test_district_ridership_share_gpd.py
 │   ├── test_flag_stop_upgrades.py
 │   ├── test_gbfs_ridership_join.py
 │   ├── test_gbfs_stations_exporter.py
+│   ├── test_gtfs_calendar_inspector.py
 │   ├── test_gtfs_linear_diff_gpd.py
 │   ├── test_gtfs_route_diff.py
 │   ├── test_gtfs_route_features.py
 │   ├── test_gtfs_route_summary.py
 │   ├── test_gtfs_route_timeline.py
 │   ├── test_gtfs_service_by_district_gpd.py
+│   ├── test_gtfs_service_change_dates.py
 │   ├── test_gtfs_service_demographics_gpd.py
 │   ├── test_gtfs_skipped_stop_flagger_gpd.py
 │   ├── test_gtfs_stop_diff.py
@@ -235,6 +261,7 @@ transit_planning_with_python/
 │   ├── test_prep_features_private_orchestrator.py
 │   ├── test_prep_features_public_orchestrator.py
 │   ├── test_printable_block_schedules.py
+│   ├── test_private_shuttle_coverage_by_route_gpd.py
 │   ├── test_ridership_from_tides.py
 │   ├── test_ridership_ml_model.py
 │   ├── test_route_direction_classifier.py
@@ -264,6 +291,7 @@ transit_planning_with_python/
 │   ├── test_uscensus_tiger_join_gpd.py
 │   └── test_validate_gtfs_files_exist.py
 ├── utils/
+│   ├── calendar_helpers.py
 │   ├── cli_helpers.py
 │   ├── distance_helpers.py
 │   ├── gtfs_helpers.py
