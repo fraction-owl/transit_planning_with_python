@@ -107,6 +107,60 @@ def test_load_registry_without_coordinate_columns(tmp_path: Path) -> None:
     assert list(needs["reason"]) == [REASON_MISSING_COORDS]
 
 
+def test_load_registry_from_excel_workbook(tmp_path: Path) -> None:
+    """An Excel registry loads like a CSV; whole-number cells keep text form."""
+    frame = pd.DataFrame(
+        {
+            "Company": ["Acme"],
+            "Address": ["1 Main St"],
+            "City": ["Springfield"],
+            "State": ["VA"],
+            "Zip": [22150],
+            "X": [-77.18],
+            "Y": [38.77],
+            "Notes": ["Shuttle"],
+        }
+    )
+    path = tmp_path / "registry.xlsx"
+    frame.to_excel(path, index=False)
+    out = load_registry_csv(path)
+    assert out.loc[0, "company"] == "Acme"
+    assert out.loc[0, "zip"] == "22150"  # Excel's float 22150.0 collapses back to text
+    clean, needs = clean_registry(out)
+    assert len(clean) == 1
+    assert needs.empty
+
+
+def test_load_registry_excel_sheet_by_name(tmp_path: Path) -> None:
+    """REGISTRY_SHEET / --sheet selects a named sheet in a multi-sheet workbook."""
+    path = tmp_path / "registry.xlsx"
+    with pd.ExcelWriter(path) as writer:
+        pd.DataFrame({"unrelated": [1]}).to_excel(writer, sheet_name="Cover", index=False)
+        pd.DataFrame({"Company": ["Acme"], "Address": ["1 Main St"]}).to_excel(
+            writer, sheet_name="Registry", index=False
+        )
+    out = load_registry_csv(path, sheet="Registry")
+    assert list(out["company"]) == ["Acme"]
+
+
+def test_load_registry_excel_misnamed_as_csv(tmp_path: Path) -> None:
+    """A workbook saved under a .csv name is detected by content, not extension."""
+    real = tmp_path / "registry.xlsx"
+    pd.DataFrame({"Company": ["Acme"], "Address": ["1 Main St"]}).to_excel(real, index=False)
+    disguised = tmp_path / "registry.csv"
+    disguised.write_bytes(real.read_bytes())
+    out = load_registry_csv(disguised)
+    assert list(out["company"]) == ["Acme"]
+
+
+def test_load_registry_cp1252_csv(tmp_path: Path) -> None:
+    """A Windows-encoded CSV falls back to cp1252 instead of a codec error."""
+    path = tmp_path / "registry.csv"
+    path.write_bytes("Company,Address\nCafé Motors,1 Main St\n".encode("cp1252"))
+    out = load_registry_csv(path)
+    assert out.loc[0, "company"] == "Café Motors"
+
+
 # ---------------------------------------------------------------------------
 # categorize_notes
 # ---------------------------------------------------------------------------

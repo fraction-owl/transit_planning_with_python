@@ -52,9 +52,11 @@ instead of exiting, so a new user can copy, paste, and hit run.
 
 Assumptions
 -----------
-- The registry CSV carries the operator name, street address fields, WGS84
+- The registry carries the operator name, street address fields, WGS84
   coordinates (X = longitude, Y = latitude), and a free-text notes column;
-  column names are configurable and matched case-insensitively.
+  column names are configurable and matched case-insensitively. The file may
+  be a CSV (UTF-8, falling back to Windows cp1252) or an Excel workbook
+  (.xls/.xlsx; ``REGISTRY_SHEET`` / ``--sheet`` picks the sheet).
 - The buffer distance is given in feet and converted to meters when the
   projected CRS is metric.
 """
@@ -91,9 +93,16 @@ SELF_PATH: Final[Path] = (
 # === BEGIN CONFIG ===
 
 # Top-level paths
-SHUTTLES_CSV = Path(r"data/private_shuttles.csv")  # the operator registry CSV
+# The registry may be a CSV or an Excel workbook (.xls/.xlsx) — Excel files
+# are read with the engines requirements.txt / ArcGIS Pro already bundle
+# (xlrd for legacy .xls, openpyxl for .xlsx).
+SHUTTLES_CSV = Path(r"data/private_shuttles.csv")  # the operator registry file
 GTFS_DIR: Path | None = None  # GTFS folder; None → skip the route rollup
 OUTPUT_DIR = Path(r"output")  # where all outputs are written
+
+# Excel registries only: which sheet to read — a 0-based index or a sheet
+# name. Ignored for CSV registries.
+REGISTRY_SHEET: int | str = 0
 
 # Registry column names, matched case-insensitively against the CSV header.
 # X/Y are WGS84 longitude/latitude; the coordinate and date columns may be
@@ -187,6 +196,85 @@ class PrepResult(NamedTuple):
 # REGISTRY CLEANING
 # =============================================================================
 
+# Excel workbook suffixes accepted for the registry. Legacy .xls is read with
+# xlrd, the .xlsx family with openpyxl — both ship with ArcGIS Pro and with
+# this repo's requirements.txt.
+_EXCEL_SUFFIXES: tuple[str, ...] = (".xls", ".xlsx", ".xlsm", ".xltx", ".xltm")
+
+
+def _cell_to_text(value: object) -> str:
+    """Render one spreadsheet cell as registry text.
+
+    Whole-number floats collapse to their integer form because Excel stores
+    every number as a float — otherwise ZIP codes arrive as ``"22030.0"``.
+    Missing cells become ``""``; datetime cells become their ``str()`` form,
+    which the per-value date parsing accepts.
+    """
+    if pd.isna(value):
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
+def _read_registry_table(shuttles_csv: Path, sheet: int | str = 0) -> pd.DataFrame:
+    """Read the registry file into a raw string DataFrame, from CSV or Excel.
+
+    The format is decided by file *content* first — Excel's two container
+    signatures (the OLE2 header of legacy ``.xls``, the zip header of
+    ``.xlsx``) — and by extension second, so a workbook that was renamed to
+    ``.csv`` is still read as Excel instead of failing with a cryptic
+    ``utf-8 codec`` error. CSVs are read as UTF-8 with a fallback to cp1252,
+    the usual Windows-export encoding.
+
+    Args:
+        shuttles_csv: Registry file path (.csv, .xls, or .xlsx family).
+        sheet: Excel sheet to read — 0-based index or sheet name. Ignored
+            for CSVs.
+
+    Returns:
+        DataFrame of raw strings (missing cells as NaN, like ``read_csv``).
+
+    Raises:
+        ValueError: If the required Excel engine is not installed.
+    """
+    with open(shuttles_csv, "rb") as fh:
+        head = fh.read(8)
+    suffix = shuttles_csv.suffix.lower()
+
+    excel_engine: str | None = None
+    if head.startswith(b"\xd0\xcf\x11\xe0"):  # OLE2 compound document = .xls
+        excel_engine = "xlrd"
+    elif head.startswith(b"PK\x03\x04"):  # zip container = .xlsx family
+        excel_engine = "openpyxl"
+    elif suffix in _EXCEL_SUFFIXES:  # Excel name, unrecognized content
+        excel_engine = "xlrd" if suffix == ".xls" else "openpyxl"
+
+    if excel_engine is not None:
+        logging.info(
+            "Reading %s as an Excel workbook (engine=%s, sheet=%r).",
+            shuttles_csv.name,
+            excel_engine,
+            sheet,
+        )
+        try:
+            raw = pd.read_excel(shuttles_csv, sheet_name=sheet, engine=excel_engine, dtype=object)
+        except ImportError as exc:
+            raise ValueError(
+                f"Reading {shuttles_csv.name} needs the '{excel_engine}' package. It ships "
+                "with ArcGIS Pro and this repo's requirements.txt; otherwise pip install it."
+            ) from exc
+        return raw.apply(lambda column: column.map(_cell_to_text))
+
+    try:
+        return pd.read_csv(shuttles_csv, dtype=str)
+    except UnicodeDecodeError:
+        logging.info(
+            "%s is not UTF-8 text; retrying with the Windows cp1252 encoding.",
+            shuttles_csv.name,
+        )
+        return pd.read_csv(shuttles_csv, dtype=str, encoding="cp1252")
+
 
 def load_registry_csv(
     shuttles_csv: Path,
@@ -200,16 +288,17 @@ def load_registry_csv(
     notes_col: str = NOTES_COL,
     start_date_col: str = START_DATE_COL,
     end_date_col: str = END_DATE_COL,
+    sheet: int | str = REGISTRY_SHEET,
 ) -> pd.DataFrame:
-    """Read the operator registry CSV into canonically named string columns.
+    """Read the operator registry (CSV or Excel) into canonically named string columns.
 
     Every configured column is matched case-insensitively against the file's
     header. Missing optional columns (everything except the company column)
     are created empty, so a registry that was never geocoded or dated still
-    loads.
+    loads. See :func:`_read_registry_table` for the format handling.
 
     Args:
-        shuttles_csv: Path to the registry CSV.
+        shuttles_csv: Path to the registry file (.csv, .xls, or .xlsx family).
         company_col: Header holding the operator/site name (required).
         address_col: Street address header.
         city_col: City header.
@@ -220,6 +309,7 @@ def load_registry_csv(
         notes_col: Free-text notes header.
         start_date_col: Service start-date header (blank value = unknown).
         end_date_col: Service end-date header (blank value = still running).
+        sheet: Excel registries only — sheet name or 0-based index to read.
 
     Returns:
         DataFrame with string columns ``company``, ``address``, ``city``,
@@ -233,7 +323,7 @@ def load_registry_csv(
     if not shuttles_csv.exists():
         raise FileNotFoundError(f"Shuttle registry not found: {shuttles_csv}")
 
-    raw = pd.read_csv(shuttles_csv, dtype=str)
+    raw = _read_registry_table(shuttles_csv, sheet)
     header = {str(col).strip().lower(): col for col in raw.columns}
 
     def _resolve(name: str) -> str | None:
@@ -851,6 +941,7 @@ def run(
     write_poi_layer: bool | None = None,
     active_as_of: str | None = None,
     require_run_log: bool | None = None,
+    registry_sheet: int | str | None = None,
 ) -> PrepResult:
     """Clean the registry, export the POI layer, and (optionally) roll up by route.
 
@@ -881,6 +972,7 @@ def run(
     write_poi_layer_flag = WRITE_POI_LAYER if write_poi_layer is None else write_poi_layer
     active_as_of = ACTIVE_AS_OF if active_as_of is None else active_as_of
     require_run_log = REQUIRE_RUN_LOG if require_run_log is None else require_run_log
+    registry_sheet = REGISTRY_SHEET if registry_sheet is None else registry_sheet
 
     # Validate eagerly so a typo'd as-of date fails before any output is
     # written — even in prep-only mode, where the filter itself never runs.
@@ -891,7 +983,7 @@ def run(
     summary_lines: list[str] = []
 
     logging.info("Loading shuttle registry from %s", shuttles_csv)
-    registry = load_registry_csv(shuttles_csv)
+    registry = load_registry_csv(shuttles_csv, sheet=registry_sheet)
     clean, needs = clean_registry(registry, feeder_pattern)
 
     clean_path = output_dir / CLEAN_CSV_NAME
@@ -1067,6 +1159,11 @@ def prompt_for_path(
         return path
 
 
+def _sheet_arg(value: str) -> int | str:
+    """Parse --sheet as a 0-based index when numeric, else as a sheet name."""
+    return int(value) if value.isdigit() else value
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse command-line arguments, defaulting to the CONFIGURATION block."""
     parser = argparse.ArgumentParser(
@@ -1081,7 +1178,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--shuttles-csv",
         type=Path,
         default=SHUTTLES_CSV,
-        help="The operator registry CSV (company / address / X / Y / notes).",
+        help="The operator registry (company / address / X / Y / notes) — a CSV "
+        "or an Excel workbook (.xls/.xlsx).",
+    )
+    parser.add_argument(
+        "--sheet",
+        dest="registry_sheet",
+        type=_sheet_arg,
+        default=REGISTRY_SHEET,
+        metavar="NAME_OR_INDEX",
+        help="Excel registries only: sheet name or 0-based index to read.",
     )
     parser.add_argument(
         "--gtfs-dir",
@@ -1172,7 +1278,7 @@ def _guided_path_setup(args: argparse.Namespace) -> bool:
     )
     try:
         args.shuttles_csv = prompt_for_path(
-            "Path to the private-shuttle registry CSV (the operator spreadsheet): "
+            "Path to the private-shuttle registry (a CSV or Excel operator spreadsheet): "
         )
         if args.gtfs_dir is None:
             args.gtfs_dir = prompt_for_path(
@@ -1226,6 +1332,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             feeder_pattern=args.feeder_pattern,
             write_poi_layer=args.write_poi_layer,
             active_as_of=args.active_as_of,
+            registry_sheet=args.registry_sheet,
         )
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
         logging.error("%s", exc)
