@@ -42,6 +42,10 @@ GDB_NAME = "transit_coverage.gdb"
 
 # List of `(filename, id_column)` describing each layer to test
 # (filenames are relative to SHP_INPUT_DIR; search is recursive and case-insensitive)
+# Private_Shuttle_Stops.shp can be produced from an agency's shuttle-operator
+# registry CSV by ``private_shuttle_coverage_by_route_arcpy.py`` (same folder) —
+# copy the shapefile it writes anywhere under SHP_INPUT_DIR and this script
+# picks it up.
 LAYER_SPECS: List[Tuple[str, str]] = [
     ("school_facilities.shp", "SCHOOL_NAM"),
     ("metro_stations.shp", "NAME"),
@@ -51,6 +55,7 @@ LAYER_SPECS: List[Tuple[str, str]] = [
     ("hospitals.shp", "DESCRIPTIO"),
     ("park_and_rides.shp", "FACILITY_N"),
     ("gov_and_community_centers.shp", "DESCRIPTIO"),
+    ("Private_Shuttle_Stops.shp", "NAME"),
 ]
 
 # Optional filter: only analyze these route_id values using shape-based buffers.
