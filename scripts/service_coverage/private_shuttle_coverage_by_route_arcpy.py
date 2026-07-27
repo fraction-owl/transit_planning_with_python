@@ -51,7 +51,11 @@ Update the paths in the CONFIGURATION section (or pass the matching CLI flags,
 e.g. ``--shuttles-csv``, ``--gtfs-dir``, ``--output-dir``) and run from a
 shell, ArcGIS Pro's Python window, or a Jupyter notebook using ArcGIS Pro's
 bundled Python. Without ``--gtfs-dir`` the script runs in prep-only mode
-(clean registry + worklist + POI layer, no route rollup).
+(clean registry + worklist + POI layer, no route rollup). Running the script
+completely unedited also works: in an interactive session (terminal or
+notebook) it prompts for the registry CSV, the output folder, and the
+optional GTFS folder instead of exiting, so a new user can copy, paste, and
+hit run.
 
 Assumptions
 -----------
@@ -1071,6 +1075,78 @@ def notebook_safe_argv(argv: Optional[Sequence[str]]) -> Optional[List[str]]:
     return None
 
 
+def stdin_is_interactive() -> bool:
+    """Return True when ``input()`` can reach a live user.
+
+    True inside a Jupyter/IPython kernel (ipykernel routes ``input()`` to a
+    notebook prompt widget) or when stdin is a real terminal. False under
+    captured or redirected stdin — CI runners, orchestrator pipelines, cron —
+    where an ``input()`` call would hang or crash rather than guide anyone.
+    Scripts use this to decide between prompting for missing configuration
+    (guided setup) and failing fast with an exit code.
+
+    Canonical implementation: ``utils/cli_helpers.py``.
+
+    Returns:
+        True when prompting a user is possible, False otherwise.
+    """
+    if "ipykernel" in sys.modules:
+        return True
+    try:
+        return sys.stdin is not None and sys.stdin.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+def prompt_for_path(
+    prompt: str,
+    *,
+    must_exist: bool = True,
+    default: Optional[Path] = None,
+    allow_skip: bool = False,
+) -> Optional[Path]:
+    """Ask for one path on stdin, re-asking until the answer is usable.
+
+    Surrounding quotes are stripped so values pasted from Windows Explorer's
+    "Copy as path" (which wraps the path in double quotes) work as-is. Blank
+    input returns *default* when one is set, returns None when *allow_skip*
+    is True, and otherwise re-asks. Only call this after
+    :func:`stdin_is_interactive` has confirmed a user is present.
+
+    Canonical implementation: ``utils/cli_helpers.py``.
+
+    Args:
+        prompt: Text shown to the user; include any default/skip hint.
+        must_exist: Re-ask until the entered path exists on disk (applies to
+            typed answers only, never to *default*).
+        default: Returned on blank input.
+        allow_skip: Blank input returns None instead of re-asking (ignored
+            when *default* is set).
+
+    Returns:
+        The entered path, or *default* / None per the blank-input rules.
+
+    Raises:
+        KeyboardInterrupt: The user cancelled with Ctrl+C.
+        EOFError: Stdin closed mid-prompt. Callers should catch both and
+            treat them as "user aborted the guided setup".
+    """
+    while True:
+        raw = input(prompt).strip().strip('"').strip("'")
+        if not raw:
+            if default is not None:
+                return default
+            if allow_skip:
+                return None
+            logging.warning("A path is required here — enter one, or press Ctrl+C to abort.")
+            continue
+        path = Path(raw)
+        if must_exist and not path.exists():
+            logging.warning("Path not found: %s — check it and try again.", path)
+            continue
+        return path
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse command-line arguments, defaulting to the CONFIGURATION block."""
     parser = argparse.ArgumentParser(
@@ -1147,13 +1223,75 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(notebook_safe_argv(argv))
 
 
-# Literal placeholder input path shipped in the CONFIGURATION block, frozen
+# Literal placeholder input paths shipped in the CONFIGURATION block, frozen
 # here (do not edit) so main() can tell an unedited config from a real one. An
 # input equal to its placeholder in BOTH the CONFIG constant and the CLI arg
 # was customized nowhere. Comparing args against the live CONFIG constants
 # instead would always match whenever a flag is omitted (argparse defaults to
 # those constants), wrongly blocking the edit-CONFIG-then-run workflow.
 _PLACEHOLDER_SHUTTLES_CSV = Path(r"Path\To\Your\private_shuttles.csv")
+_PLACEHOLDER_OUTPUT_DIR = Path(r"Path\To\Your\Output_Folder")
+
+
+def _shuttles_csv_is_placeholder(args: argparse.Namespace) -> bool:
+    """Return True when the registry CSV was customized nowhere."""
+    return (
+        Path(args.shuttles_csv) == _PLACEHOLDER_SHUTTLES_CSV
+        and Path(SHUTTLES_CSV) == _PLACEHOLDER_SHUTTLES_CSV
+    )
+
+
+def _output_dir_is_placeholder(args: argparse.Namespace) -> bool:
+    """Return True when the output folder was customized nowhere."""
+    return (
+        Path(args.output_dir) == _PLACEHOLDER_OUTPUT_DIR
+        and Path(OUTPUT_DIR) == _PLACEHOLDER_OUTPUT_DIR
+    )
+
+
+def _guided_path_setup(args: argparse.Namespace) -> bool:
+    """Interactively collect the paths a brand-new user has not configured yet.
+
+    Runs only when :func:`main` detects an unedited configuration in an
+    interactive session, so someone who copies the script and hits run is
+    walked through the required inputs instead of being handed an exit-code
+    warning. Only the values still at their placeholders are asked for.
+    Answers apply to this run only; the CONFIGURATION block and CLI flags
+    remain the ways to set them permanently.
+
+    Args:
+        args: Parsed CLI namespace, updated in place.
+
+    Returns:
+        True when every required path was collected; False when the user
+        aborted (Ctrl+C, or stdin closed mid-prompt).
+    """
+    logging.info(
+        "Required paths have not been configured — starting guided setup. "
+        "Answers apply to this run only; set them permanently in the "
+        "CONFIGURATION block or via CLI flags. Press Ctrl+C to abort."
+    )
+    try:
+        if _shuttles_csv_is_placeholder(args):
+            args.shuttles_csv = prompt_for_path(
+                "Path to the private-shuttle registry CSV (the operator spreadsheet): "
+            )
+        if _output_dir_is_placeholder(args):
+            args.output_dir = prompt_for_path(
+                "Output folder (press Enter for 'output' in the current directory): ",
+                must_exist=False,
+                default=Path("output"),
+            )
+        if args.gtfs_dir is None:
+            args.gtfs_dir = prompt_for_path(
+                "GTFS folder for the route rollup (press Enter to skip it): ",
+                allow_skip=True,
+            )
+    except (EOFError, KeyboardInterrupt):
+        logging.warning("Guided setup aborted — nothing was run.")
+        return False
+    logging.info("Outputs will be written to '%s'.", args.output_dir)
+    return True
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1161,7 +1299,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     Returns:
         Process exit code: 0 on success, 1 on failure, 2 if required
-        CONFIGURATION values are still placeholders.
+        CONFIGURATION values are still placeholders and the run is
+        non-interactive (an interactive run prompts for them instead — see
+        :func:`_guided_path_setup`) or the user aborted the prompts.
     """
     args = parse_args(argv)
     logging.basicConfig(
@@ -1169,15 +1309,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         format="%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-    if (
-        Path(args.shuttles_csv) == _PLACEHOLDER_SHUTTLES_CSV
-        and Path(SHUTTLES_CSV) == _PLACEHOLDER_SHUTTLES_CSV
-    ):
-        logging.warning(
-            "SHUTTLES_CSV still points at the placeholder path from the CONFIGURATION "
-            "block. Update the CONFIGURATION section or pass --shuttles-csv before running."
-        )
-        return 2
+    if _shuttles_csv_is_placeholder(args) or _output_dir_is_placeholder(args):
+        if not stdin_is_interactive():
+            logging.warning(
+                "SHUTTLES_CSV and/or OUTPUT_DIR still point at the placeholder paths "
+                "from the CONFIGURATION block. Update the CONFIGURATION section, pass "
+                "--shuttles-csv / --output-dir, or run interactively (terminal or "
+                "notebook) to be prompted for the paths."
+            )
+            return 2
+        if not _guided_path_setup(args):
+            return 2
     try:
         run(
             shuttles_csv=args.shuttles_csv,

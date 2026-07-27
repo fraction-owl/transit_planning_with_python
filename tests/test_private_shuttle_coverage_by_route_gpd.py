@@ -322,9 +322,55 @@ def test_run_with_gtfs_and_empty_clean_registry(tmp_path: Path) -> None:
 
 
 def test_main_blocks_unedited_placeholder_config(monkeypatch: pytest.MonkeyPatch) -> None:
-    """With CONFIG untouched and no flags, main() warns and does not run."""
+    """With CONFIG untouched and no flags, a non-interactive main() warns, not runs."""
     calls: list[dict] = []
     monkeypatch.setattr(shuttle_mod, "run", lambda **kw: calls.append(kw))
+    monkeypatch.setattr(shuttle_mod, "stdin_is_interactive", lambda: False)
+    assert shuttle_mod.main([]) == 2
+    assert calls == []
+
+
+def test_main_placeholder_config_prompts_interactively(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Guided setup collects the registry path (with retry) and reaches run().
+
+    The first answer is a nonexistent path (re-asked), the second is the
+    fixture wrapped in quotes (Windows "Copy as path" style), and the third
+    skips the GTFS rollup.
+    """
+    calls: list[dict] = []
+    monkeypatch.setattr(shuttle_mod, "run", lambda **kw: calls.append(kw))
+    monkeypatch.setattr(shuttle_mod, "stdin_is_interactive", lambda: True)
+    answers = iter([str(tmp_path / "missing.csv"), f'"{FIXTURE_CSV}"', ""])
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+    assert shuttle_mod.main([]) == 0
+    assert len(calls) == 1
+    assert calls[0]["shuttles_csv"] == FIXTURE_CSV
+    assert calls[0]["gtfs_dir"] is None
+
+
+def test_main_guided_setup_runs_end_to_end(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A fully unedited copy-paste-and-run session produces the prep outputs."""
+    monkeypatch.setattr(shuttle_mod, "stdin_is_interactive", lambda: True)
+    answers = iter([str(FIXTURE_CSV.resolve()), ""])
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+    monkeypatch.chdir(tmp_path)
+    assert shuttle_mod.main([]) == 0
+    assert (tmp_path / "output" / "private_shuttles_clean.csv").exists()
+    assert not (tmp_path / "output" / "private_shuttle_coverage_by_route.csv").exists()
+
+
+def test_main_guided_setup_abort_exits_cleanly(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ctrl+C during guided setup exits 2 without running anything."""
+    calls: list[dict] = []
+    monkeypatch.setattr(shuttle_mod, "run", lambda **kw: calls.append(kw))
+    monkeypatch.setattr(shuttle_mod, "stdin_is_interactive", lambda: True)
+
+    def _interrupt(prompt: str = "") -> str:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("builtins.input", _interrupt)
     assert shuttle_mod.main([]) == 2
     assert calls == []
 
