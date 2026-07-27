@@ -21,7 +21,10 @@ modeling pipeline can test whether they move ridership:
 2. **Geocoding worklist** (``private_shuttles_needs_geocoding.csv``) — rows
    whose coordinates are missing or invalid (out of range, or the 0,0
    "null island" geocoder artifact). No geocoding is attempted here — the
-   script is offline by design; fill these in and re-run.
+   script is offline by design. Geocode these however suits your shop —
+   ArcGIS Pro's Geocode Addresses tool with a locator, a service such as the
+   free US Census batch geocoder (geocoding.geo.census.gov), or by hand —
+   then paste the X/Y values into the registry and re-run.
 3. **POI layer** (``Private_Shuttle_Stops.shp``) — the clean rows as a point
    shapefile whose name and id column (``NAME``) match the
    ``("Private_Shuttle_Stops.shp", "NAME")`` entry listed in
@@ -43,7 +46,10 @@ whether private-shuttle presence helps explain route-level ridership. Set
 ``ACTIVE_AS_OF`` (or ``--as-of``) to count only the shuttles active on a given
 date — match it to the ridership anchor's period so a shuttle that shut down
 years ago doesn't inflate today's counts. A site with an unknown start or end
-date is treated as active.
+date is treated as active. A companion ``private_shuttle_routes_by_site.csv``
+flips the view — one row per shuttle site listing the route_ids (and short
+names) whose catchments reach it — for planner-facing QA and mapping rather
+than modeling.
 
 Typical usage
 -------------
@@ -146,6 +152,7 @@ POI_ID_COLUMN = "NAME"
 CLEAN_CSV_NAME = "private_shuttles_clean.csv"
 NEEDS_GEOCODING_CSV_NAME = "private_shuttles_needs_geocoding.csv"
 COVERAGE_CSV_NAME = "private_shuttle_coverage_by_route.csv"
+ROUTES_BY_SITE_CSV_NAME = "private_shuttle_routes_by_site.csv"
 RUN_LOG_NAME = "private_shuttles_runlog.txt"
 
 # Route rollup options (only used when a GTFS folder is supplied).
@@ -186,17 +193,20 @@ _TEXT_COLUMNS: tuple[str, ...] = ("company", "address", "city", "state", "zip", 
 
 
 class PrepResult(NamedTuple):
-    """The three tables a run produces.
+    """The tables a run produces.
 
     Attributes:
         clean: Deduplicated registry rows with usable coordinates.
         needs_geocoding: Rows lacking usable coordinates (the manual worklist).
         coverage: Route-level rollup, or None when no GTFS folder was supplied.
+        routes_by_site: Per-site inverse view (routes whose catchment reaches
+            each shuttle site), or None when no GTFS folder was supplied.
     """
 
     clean: pd.DataFrame
     needs_geocoding: pd.DataFrame
     coverage: pd.DataFrame | None
+    routes_by_site: pd.DataFrame | None
 
 
 # =============================================================================
@@ -908,6 +918,67 @@ def _attach_route_short_name(summary: pd.DataFrame, routes_df: pd.DataFrame) -> 
     return merged[cols]
 
 
+def summarize_routes_by_site(
+    route_buffers: List[Dict[str, object]],
+    shuttles: pd.DataFrame,
+    sites: pd.DataFrame,
+    routes_df: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """List, per shuttle site, the routes whose catchment reaches it.
+
+    The inverse of :func:`summarize_shuttles_by_route`, for planner-facing QA
+    and mapping: one row per site with the number of routes nearby and their
+    ids (plus short names when routes.txt carries them). Sites outside every
+    catchment report zero.
+
+    Args:
+        route_buffers: One buffered catchment per route_id (from
+            :func:`_prepare_route_buffers`).
+        shuttles: The shuttle points (from :func:`_shuttle_points_in_sr`), in
+            the same spatial reference as *route_buffers*, row-aligned with
+            *sites*.
+        sites: The matching registry rows (``company``/``category``/``lon``/
+            ``lat``), same order as *shuttles*.
+        routes_df: GTFS routes table, used to attach ``route_short_names``.
+
+    Returns:
+        DataFrame with one row per site and columns ``company``,
+        ``category``, ``lon``, ``lat``, ``routes_nearby``, ``route_ids``
+        (``"; "``-joined), and ``route_short_names`` when available.
+    """
+    out = sites.reset_index(drop=True)[["company", "category", "lon", "lat"]].copy()
+    id_lists: List[List[str]] = [[] for _ in range(len(out))]
+    xs = shuttles["x"].to_numpy(dtype=float) if not shuttles.empty else None
+    ys = shuttles["y"].to_numpy(dtype=float) if not shuttles.empty else None
+
+    seen: set = set()
+    for buffer_rec in route_buffers:
+        route_id = str(buffer_rec["route_id"])
+        if route_id in seen or shuttles.empty:
+            continue
+        seen.add(route_id)
+
+        geom = buffer_rec["geometry"]
+        extent = geom.extent
+        near = (xs >= extent.XMin) & (xs <= extent.XMax) & (ys >= extent.YMin) & (ys <= extent.YMax)
+        for position in shuttles.index[near]:
+            if not geom.disjoint(shuttles.loc[position, "geometry"]):
+                id_lists[position].append(route_id)
+
+    for ids in id_lists:
+        ids.sort()
+    out["routes_nearby"] = [len(ids) for ids in id_lists]
+    out["route_ids"] = ["; ".join(ids) for ids in id_lists]
+    if routes_df is not None and "route_short_name" in routes_df.columns:
+        name_of = dict(
+            zip(routes_df["route_id"].astype(str), routes_df["route_short_name"].astype(str))
+        )
+        out["route_short_names"] = [
+            "; ".join(name_of.get(route_id, "") for route_id in ids) for ids in id_lists
+        ]
+    return out
+
+
 # =============================================================================
 # RUN LOG
 # =============================================================================
@@ -956,12 +1027,60 @@ def extract_config_block(source_file: Path) -> str:
     return "\n".join(lines[begin_idx + 1 : end_idx])
 
 
+# Configuration names captured by the run-log fallback snapshot when this
+# script's own source cannot be read (e.g. the code was pasted into a
+# notebook cell, so no .py exists at SELF_PATH).
+_CONFIG_SNAPSHOT_NAMES: tuple[str, ...] = (
+    "SHUTTLES_CSV",
+    "REGISTRY_SHEET",
+    "GTFS_DIR",
+    "OUTPUT_DIR",
+    "COMPANY_COL",
+    "ADDRESS_COL",
+    "CITY_COL",
+    "STATE_COL",
+    "ZIP_COL",
+    "X_COL",
+    "Y_COL",
+    "NOTES_COL",
+    "START_DATE_COL",
+    "END_DATE_COL",
+    "FEEDER_NOTES_PATTERN",
+    "WRITE_POI_LAYER",
+    "POI_LAYER_FILENAME",
+    "POI_ID_COLUMN",
+    "CLEAN_CSV_NAME",
+    "NEEDS_GEOCODING_CSV_NAME",
+    "COVERAGE_CSV_NAME",
+    "ROUTES_BY_SITE_CSV_NAME",
+    "RUN_LOG_NAME",
+    "ROUTE_FILTER",
+    "USE_SHAPE_BUFFER",
+    "BUFFER_DIST_FT",
+    "ACTIVE_AS_OF",
+    "PROJECTED_CRS_WKID",
+    "LOG_LEVEL",
+    "REQUIRE_RUN_LOG",
+)
+
+
+def _live_config_snapshot() -> str:
+    """Render the current CONFIG values for the run log's fallback path."""
+    return "\n".join(f"{name} = {globals().get(name)!r}" for name in _CONFIG_SNAPSHOT_NAMES)
+
+
 def write_run_log(
     output_dir: Path,
     summary_lines: Sequence[str],
     source_path: Path = SELF_PATH,
 ) -> bool:
-    """Write the run-log sidecar: run summary plus the CONFIG block verbatim.
+    """Write the run-log sidecar: run summary plus the configuration.
+
+    The configuration is captured verbatim from this script's source when the
+    file is readable; when it is not (the code was pasted into a notebook
+    cell, so ``__file__`` points nowhere), a snapshot of the live CONFIG
+    values is recorded instead — the run log never fails just because the
+    source is unavailable.
 
     Args:
         output_dir: Folder the outputs were written to.
@@ -969,14 +1088,20 @@ def write_run_log(
         source_path: Path to this script's source (for config extraction).
 
     Returns:
-        True when the log was written, False on any extraction/write failure.
+        True when the log was written, False when the write itself failed.
     """
     log_path = output_dir / RUN_LOG_NAME
     try:
         config_text: str = extract_config_block(source_path)
+        config_header = "CONFIGURATION (verbatim from source)"
     except (OSError, ValueError) as exc:
-        logging.error("Could not extract config block for run log: %s", exc)
-        return False
+        logging.warning(
+            "Could not read the script source for the run log (%s); recording the "
+            "live configuration values instead.",
+            exc,
+        )
+        config_text = _live_config_snapshot()
+        config_header = "CONFIGURATION (live values; source file unavailable)"
 
     lines: list[str] = [
         "=" * 72,
@@ -992,7 +1117,7 @@ def write_run_log(
         *summary_lines,
         "",
         "-" * 72,
-        "CONFIGURATION (verbatim from source)",
+        config_header,
         "-" * 72,
         config_text,
         "=" * 72,
@@ -1028,8 +1153,8 @@ def run(
     """Clean the registry, export the POI layer, and (optionally) roll up by route.
 
     Unset args fall back to the CONFIGURATION block, so ``m.SHUTTLES_CSV = ...;
-    m.run()`` works after a plain import. The route rollup only runs when a
-    GTFS folder is configured (``GTFS_DIR`` or ``--gtfs-dir``); without one the
+    m.run()`` works after a plain import. The route rollup only runs when a GTFS
+    folder is configured (``GTFS_DIR`` or ``--gtfs-dir``); without one the
     script is a pure registry-prep step. When *active_as_of* (or
     ``ACTIVE_AS_OF``) is set, the rollup counts only shuttles active on that
     date; the clean registry, worklist, and POI layer always keep every site.
@@ -1095,6 +1220,7 @@ def run(
         logging.warning("No clean rows with coordinates; POI layer not written.")
 
     coverage: pd.DataFrame | None = None
+    routes_by_site: pd.DataFrame | None = None
     if gtfs_dir is None:
         logging.info("No GTFS folder configured; skipping the route coverage rollup.")
     else:
@@ -1129,6 +1255,19 @@ def run(
                 int(coverage["shuttle_feeder_sites_served"].sum()),
             )
 
+            routes_by_site = summarize_routes_by_site(
+                route_buffers, shuttle_points, sites, tables["routes"]
+            )
+            routes_by_site_path = output_dir / ROUTES_BY_SITE_CSV_NAME
+            routes_by_site.to_csv(routes_by_site_path, index=False)
+            summary_lines.append(f"  {ROUTES_BY_SITE_CSV_NAME}  rows={len(routes_by_site)}")
+            logging.info(
+                "Wrote %s (%d site(s), %d with at least one route nearby)",
+                routes_by_site_path,
+                len(routes_by_site),
+                int((routes_by_site["routes_nearby"] > 0).sum()),
+            )
+
     if not write_run_log(output_dir, summary_lines) and require_run_log:
         raise RuntimeError(
             "Run log could not be written. Set REQUIRE_RUN_LOG = False to suppress this "
@@ -1136,7 +1275,9 @@ def run(
         )
 
     logging.info("Script completed successfully.")
-    return PrepResult(clean=clean, needs_geocoding=needs, coverage=coverage)
+    return PrepResult(
+        clean=clean, needs_geocoding=needs, coverage=coverage, routes_by_site=routes_by_site
+    )
 
 
 def notebook_safe_argv(argv: Optional[Sequence[str]]) -> Optional[List[str]]:

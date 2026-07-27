@@ -429,6 +429,56 @@ def test_main_guided_setup_abort_exits_cleanly(monkeypatch: pytest.MonkeyPatch) 
     assert calls == []
 
 
+# ---------------------------------------------------------------------------
+# routes-by-site inverse view
+# ---------------------------------------------------------------------------
+
+
+def test_run_writes_routes_by_site_inverse_view(tmp_path: Path) -> None:
+    """The per-site companion CSV lists the routes whose catchment reaches each site."""
+    gtfs = tmp_path / "gtfs"
+    gtfs.mkdir()
+    _write_gtfs_files(gtfs)
+    result = run(
+        shuttles_csv=FIXTURE_CSV, gtfs_dir=gtfs, output_dir=tmp_path, write_poi_layer=False
+    )
+    assert (tmp_path / "private_shuttle_routes_by_site.csv").exists()
+    assert result.routes_by_site is not None
+    by_company = result.routes_by_site.set_index("company")
+    # R1's stops sit exactly on these three fixture sites.
+    assert by_company.loc["Grand Hotel", "routes_nearby"] == 1
+    assert by_company.loc["Grand Hotel", "route_ids"] == "R1"
+    assert by_company.loc["Grand Hotel", "route_short_names"] == "101"
+    assert by_company.loc["Riverside Apartments", "route_ids"] == "R1"
+    # Building Co is in Fairfax, far from every stop of the tiny feed.
+    assert by_company.loc["Building Co", "routes_nearby"] == 0
+    assert by_company.loc["Building Co", "route_ids"] == ""
+
+
+def test_run_prep_only_has_no_routes_by_site(tmp_path: Path) -> None:
+    """Without GTFS the inverse view is skipped along with the rollup."""
+    result = run(shuttles_csv=FIXTURE_CSV, output_dir=tmp_path, write_poi_layer=False)
+    assert result.routes_by_site is None
+    assert not (tmp_path / "private_shuttle_routes_by_site.csv").exists()
+
+
+# ---------------------------------------------------------------------------
+# run log fallback
+# ---------------------------------------------------------------------------
+
+
+def test_run_log_falls_back_to_live_config_when_source_missing(tmp_path: Path) -> None:
+    """An unreadable source (notebook paste) yields a live-config run log, not a failure."""
+    ok = shuttle_mod.write_run_log(
+        tmp_path, ["  something.csv  rows=1"], source_path=tmp_path / "not_a_real_file.py"
+    )
+    assert ok
+    text = (tmp_path / "private_shuttles_runlog.txt").read_text(encoding="utf-8")
+    assert "live values; source file unavailable" in text
+    assert "SHUTTLES_CSV" in text
+    assert "FEEDER_NOTES_PATTERN" in text
+
+
 def test_main_runs_after_config_edit(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """The documented edit-CONFIG-then-run workflow must reach run()."""
     calls: list[dict] = []
