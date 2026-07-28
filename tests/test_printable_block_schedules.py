@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import math
 import os
 from pathlib import Path
@@ -14,6 +15,7 @@ from scripts.field_tools.printable_block_schedules import (
     filter_data,
     format_hhmm,
     load_gtfs_data,
+    main,
     prepare_stop_times,
     time_to_seconds,
 )
@@ -229,6 +231,18 @@ def test_filter_data_stop_times_restricted_to_filtered_trips() -> None:
     assert set(fst["trip_id"].unique()) == {"T3"}
 
 
+def test_filter_data_params_override_config() -> None:
+    """Explicit filter params take effect without touching the config globals."""
+    ft, _ = filter_data(
+        _make_trips(),
+        _make_stop_times(),
+        _make_routes(),
+        filter_route_short_names=["10"],
+        filter_service_ids=[],
+    )
+    assert set(ft["block_id"].unique()) == {"B1"}
+
+
 # ---------------------------------------------------------------------------
 # prepare_stop_times
 # ---------------------------------------------------------------------------
@@ -380,3 +394,60 @@ def test_export_blocks_output_includes_placeholder_columns(tmp_path: Path) -> No
     result = pd.read_excel(tmp_path / "block_B1_schedule_printable.xlsx")
     for col in ("Actual Time", "Boardings", "Alightings", "Comments"):
         assert col in result.columns
+
+
+def test_export_blocks_output_path_param_overrides_config(tmp_path: Path) -> None:
+    """An explicit base_output_path wins without touching the config global."""
+    export_blocks(_make_block_df(), base_output_path=str(tmp_path))
+    assert len(list(tmp_path.glob("*.xlsx"))) == 2
+
+
+# ---------------------------------------------------------------------------
+# main / CLI
+# ---------------------------------------------------------------------------
+
+
+def test_main_placeholder_paths_return_2() -> None:
+    assert main([]) == 2
+
+
+def test_main_runs_end_to_end(tmp_path: Path) -> None:
+    rc = main(["--gtfs-dir", str(GTFS_BASIC), "--output-dir", str(tmp_path)])
+    assert rc == 0
+    files = {f.name for f in tmp_path.glob("block_*_schedule_printable.xlsx")}
+    # gtfs_basic has blocks B1-B6
+    assert files == {f"block_B{i}_schedule_printable.xlsx" for i in range(1, 7)}
+
+
+def test_main_writes_run_log_with_effective_config(tmp_path: Path) -> None:
+    rc = main(["--gtfs-dir", str(GTFS_BASIC), "--output-dir", str(tmp_path)])
+    assert rc == 0
+    runlog = tmp_path / "printable_block_schedules_runlog.txt"
+    assert runlog.is_file()
+    text = runlog.read_text(encoding="utf-8")
+    assert "CONFIGURATION (verbatim)" in text
+    assert "Effective configuration" in text
+    assert "[CLI]" in text
+
+
+def test_main_route_filter_flag_limits_blocks(tmp_path: Path) -> None:
+    # Blocks B4-B6 belong exclusively to route R3 in the gtfs_basic fixture.
+    rc = main(["--gtfs-dir", str(GTFS_BASIC), "--output-dir", str(tmp_path), "--routes", "R3"])
+    assert rc == 0
+    files = {f.name for f in tmp_path.glob("*.xlsx")}
+    assert files == {f"block_B{i}_schedule_printable.xlsx" for i in (4, 5, 6)}
+
+
+def test_main_route_filter_no_match_returns_1(tmp_path: Path) -> None:
+    rc = main(["--gtfs-dir", str(GTFS_BASIC), "--output-dir", str(tmp_path), "--routes", "ZZZ"])
+    assert rc == 1
+    assert not list(tmp_path.glob("*.xlsx"))
+
+
+def test_main_effective_config_echo_present(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.INFO):
+        rc = main(["--gtfs-dir", str(GTFS_BASIC), "--output-dir", str(tmp_path)])
+    assert rc == 0
+    assert "Effective configuration" in caplog.text

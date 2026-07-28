@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from scripts.field_tools.gtfs_route_summary import (
     classify_services,
     hms_to_seconds,
     load_optional_lookup,
+    main,
     trip_distances_meters,
     trip_durations_seconds,
 )
@@ -388,6 +390,42 @@ def test_build_summary_extras_joined(gtfs_basic: dict[str, pd.DataFrame]) -> Non
     assert summary[summary["route_short_name"] == "R3"].iloc[0]["service_type"] == ""
 
 
+def test_build_summary_excluded_param_overrides_config(
+    gtfs_basic: dict[str, pd.DataFrame],
+) -> None:
+    summary = build_summary(
+        routes_df=gtfs_basic["routes"],
+        trips_df=gtfs_basic["trips"],
+        stop_times_df=gtfs_basic["stop_times"],
+        calendar_df=gtfs_basic["calendar"],
+        calendar_dates_df=None,
+        shapes_df=None,
+        distance_unit="meters",
+        extras={},
+        excluded_route_short_names=["R1"],
+    )
+    assert "R1" not in summary["route_short_name"].to_numpy()
+    assert len(summary) == 2
+
+
+def test_build_summary_output_units_param_metric(
+    gtfs_basic: dict[str, pd.DataFrame],
+) -> None:
+    summary = build_summary(
+        routes_df=gtfs_basic["routes"],
+        trips_df=gtfs_basic["trips"],
+        stop_times_df=gtfs_basic["stop_times"],
+        calendar_df=gtfs_basic["calendar"],
+        calendar_dates_df=None,
+        shapes_df=None,
+        distance_unit="meters",
+        extras={},
+        output_units="metric",
+    )
+    assert "avg_distance_km" in summary.columns
+    assert "avg_speed_kmh" in summary.columns
+
+
 def test_build_summary_export_to_xlsx(gtfs_basic: dict[str, pd.DataFrame], tmp_path: Path) -> None:
     from scripts.field_tools.gtfs_route_summary import export_to_xlsx
 
@@ -405,3 +443,65 @@ def test_build_summary_export_to_xlsx(gtfs_basic: dict[str, pd.DataFrame], tmp_p
     export_to_xlsx(summary, out)
     assert os.path.isfile(out)
     assert os.path.getsize(out) > 0
+
+
+# ---------------------------------------------------------------------------
+# main / CLI
+# ---------------------------------------------------------------------------
+
+
+def test_main_placeholder_paths_return_2() -> None:
+    assert main([]) == 2
+
+
+def test_main_runs_end_to_end(tmp_path: Path) -> None:
+    rc = main(["--gtfs-dir", str(FIXTURE_DIR), "--output-dir", str(tmp_path)])
+    assert rc == 0
+    out = tmp_path / "routes_summary.xlsx"
+    assert out.is_file()
+    assert out.stat().st_size > 0
+
+
+def test_main_writes_run_log_with_effective_config(tmp_path: Path) -> None:
+    rc = main(["--gtfs-dir", str(FIXTURE_DIR), "--output-dir", str(tmp_path)])
+    assert rc == 0
+    runlog = tmp_path / "gtfs_route_summary_runlog.txt"
+    assert runlog.is_file()
+    text = runlog.read_text(encoding="utf-8")
+    assert "CONFIGURATION (verbatim)" in text
+    assert "Effective configuration" in text
+    # The CLI-overridden path is recorded with its origin marker.
+    assert str(FIXTURE_DIR) in text
+    assert "[CLI]" in text
+
+
+def test_main_metric_output_units_flag(tmp_path: Path) -> None:
+    rc = main(
+        [
+            "--gtfs-dir",
+            str(FIXTURE_DIR),
+            "--output-dir",
+            str(tmp_path),
+            "--output-units",
+            "metric",
+        ]
+    )
+    assert rc == 0
+    df = pd.read_excel(tmp_path / "routes_summary.xlsx")
+    assert "avg_distance_km" in df.columns
+    assert "avg_speed_kmh" in df.columns
+
+
+def test_main_effective_config_echo_marks_origins(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The startup echo lists each flag with a CLI-vs-config origin marker."""
+    with caplog.at_level(logging.INFO):
+        rc = main(["--gtfs-dir", str(FIXTURE_DIR), "--output-dir", str(tmp_path)])
+    assert rc == 0
+    assert "Effective configuration" in caplog.text
+    echo_lines = [r.getMessage() for r in caplog.records if r.getMessage().strip().startswith("--")]
+    gtfs_line = next(m for m in echo_lines if m.strip().startswith("--gtfs-dir"))
+    assert "[CLI]" in gtfs_line
+    unit_line = next(m for m in echo_lines if m.strip().startswith("--distance-unit"))
+    assert "[config]" in unit_line

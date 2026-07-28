@@ -10,6 +10,7 @@ file as the source.
 
 from __future__ import annotations
 
+import argparse
 import logging
 import sys
 from pathlib import Path
@@ -42,6 +43,29 @@ def notebook_safe_argv(argv: Optional[Sequence[str]]) -> Optional[List[str]]:
     if "ipykernel" in sys.modules:
         return []
     return None
+
+
+def log_effective_config(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Log the resolved settings this run will actually use, at INFO.
+
+    Prints one line per flag-exposed setting with its origin — ``config`` when
+    the value is the CONFIGURATION-block default, ``CLI`` when a command-line
+    flag changed it — so a stale config edit or a forgotten flag is visible in
+    the console (and in notebook output) before any work starts. A flag passed
+    with a value equal to its default is indistinguishable from the default and
+    is labelled ``config``; the effective value is identical either way.
+
+    Canonical implementation: ``utils/cli_helpers.py``.
+
+    Args:
+        parser: The parser that produced *args*; supplies the defaults.
+        args: The parsed namespace holding the resolved values.
+    """
+    logging.info("Effective configuration (CONFIGURATION block + CLI overrides):")
+    for name in sorted(vars(args)):
+        value = getattr(args, name)
+        origin = "CLI" if value != parser.get_default(name) else "config"
+        logging.info("  --%-20s %-40s [%s]", name.replace("_", "-"), value, origin)
 
 
 def stdin_is_interactive() -> bool:

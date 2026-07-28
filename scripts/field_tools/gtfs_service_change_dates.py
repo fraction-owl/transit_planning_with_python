@@ -474,6 +474,29 @@ def notebook_safe_argv(argv: Optional[Sequence[str]]) -> Optional[List[str]]:
     return None
 
 
+def log_effective_config(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Log the resolved settings this run will actually use, at INFO.
+
+    Prints one line per flag-exposed setting with its origin — ``config`` when
+    the value is the CONFIGURATION-block default, ``CLI`` when a command-line
+    flag changed it — so a stale config edit or a forgotten flag is visible in
+    the console (and in notebook output) before any work starts. A flag passed
+    with a value equal to its default is indistinguishable from the default and
+    is labelled ``config``; the effective value is identical either way.
+
+    Canonical implementation: ``utils/cli_helpers.py``.
+
+    Args:
+        parser: The parser that produced *args*; supplies the defaults.
+        args: The parsed namespace holding the resolved values.
+    """
+    logging.info("Effective configuration (CONFIGURATION block + CLI overrides):")
+    for name in sorted(vars(args)):
+        value = getattr(args, name)
+        origin = "CLI" if value != parser.get_default(name) else "config"
+        logging.info("  --%-20s %-40s [%s]", name.replace("_", "-"), value, origin)
+
+
 # ---- SCRIPT-SPECIFIC TYPES --------------------------------------------------
 
 
@@ -1764,7 +1787,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         Process exit code: 0 on success, 1 on failure, 2 if required
         CONFIGURATION values are still placeholders.
     """
-    args = build_arg_parser().parse_args(notebook_safe_argv(argv))
+    parser = build_arg_parser()
+    args = parser.parse_args(notebook_safe_argv(argv))
     logging.basicConfig(
         level=getattr(logging, str(args.log_level).upper(), LOG_LEVEL),
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -1777,6 +1801,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "block or pass --feeds-dir/--output-dir before running."
         )
         return 2
+    log_effective_config(parser, args)
     try:
         run(
             feeds_dir=args.feeds_dir,

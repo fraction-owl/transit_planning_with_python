@@ -10,10 +10,17 @@ Outputs
 - ``block_<block_id>_schedule_printable.xlsx`` (one per surviving block, written
   to ``BASE_OUTPUT_PATH``): the block's stop-by-stop schedule with placeholder
   columns for handwritten field notes.
+- ``printable_block_schedules_runlog.txt``: run-log sidecar capturing the
+  verbatim CONFIGURATION block, the effective (CLI-resolved) settings, and a
+  run summary.
 
 Typical usage
 -------------
-Run from the command line, an ArcGIS Pro Python toolbox, or a notebook.
+Update the paths in the CONFIGURATION section (or pass ``--gtfs-dir`` /
+``--output-dir``) and run from the command line, an ArcGIS Pro Python
+toolbox, or a notebook. The effective configuration — config-block values
+plus any CLI overrides — is echoed at INFO at startup so unintended
+settings are visible before any work starts.
 
 Key Features
 ------------
@@ -25,12 +32,16 @@ Key Features
 
 from __future__ import annotations
 
+import argparse
 import logging
 import math
 import os
+import sys
 import zipfile
 from collections.abc import Mapping, Sequence
-from typing import Any, Optional, Union
+from datetime import datetime
+from pathlib import Path
+from typing import Any, List, Optional, Union
 
 import pandas as pd
 from openpyxl.styles import Alignment
@@ -39,6 +50,7 @@ from openpyxl.utils import get_column_letter
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+# === BEGIN CONFIG ===
 
 _DEFAULT_GTFS_FOLDER_PATH = r"Path\To\Your\Input\Folder"
 _DEFAULT_BASE_OUTPUT_PATH = r"Path\To\Your\Output\Folder"
@@ -65,7 +77,13 @@ MISSING_VALUE = "_____"
 # Maximum column width for neat Excel formatting:
 MAX_COLUMN_WIDTH = 35
 
+# When True, a failed run-log write aborts the script so outputs are never
+# left untraced. Set False only for genuinely read-only output locations.
+REQUIRE_RUN_LOG: bool = True
+
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
+
+# === END CONFIG ===
 
 # =============================================================================
 # FUNCTIONS
@@ -174,7 +192,11 @@ def export_to_excel(data_frame: pd.DataFrame, output_file: str) -> None:
 
 
 def filter_data(
-    trips_df: pd.DataFrame, stop_times_df: pd.DataFrame, routes_df: pd.DataFrame
+    trips_df: pd.DataFrame,
+    stop_times_df: pd.DataFrame,
+    routes_df: pd.DataFrame,
+    filter_route_short_names: Optional[Sequence[str]] = None,
+    filter_service_ids: Optional[Sequence[str]] = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Apply route and service filters, propagating them to stop times.
 
@@ -182,6 +204,12 @@ def filter_data(
         trips_df: Parsed **trips.txt** table.
         stop_times_df: Parsed **stop_times.txt** table.
         routes_df: Parsed **routes.txt** table (for ``route_short_name``).
+        filter_route_short_names: Route short names whose blocks to keep;
+            ``None`` falls back to the ``FILTER_ROUTE_SHORT_NAMES`` config
+            constant, and an empty sequence keeps every route.
+        filter_service_ids: Service IDs to keep; ``None`` falls back to the
+            ``FILTER_SERVICE_IDS`` config constant, and an empty sequence
+            keeps every service.
 
     Returns:
         ``(filtered_trips, filtered_stop_times)``.
@@ -190,18 +218,22 @@ def filter_data(
         KeyError: If required columns are missing.
 
     Warning:
-        If the global constants ``FILTER_ROUTE_SHORT_NAMES`` or
-        ``FILTER_SERVICE_IDS`` remove every trip, the function returns
-        two **empty** DataFrames.
+        If the filters remove every trip, the function returns two
+        **empty** DataFrames.
     """
+    if filter_route_short_names is None:
+        filter_route_short_names = FILTER_ROUTE_SHORT_NAMES
+    if filter_service_ids is None:
+        filter_service_ids = FILTER_SERVICE_IDS
+
     # Merge route_short_name into trips
     routes_subset = routes_df[["route_id", "route_short_name"]]
     trips_df = trips_df.merge(routes_subset, on="route_id", how="left")
 
     # Apply Route Filtering
-    if FILTER_ROUTE_SHORT_NAMES:
+    if filter_route_short_names:
         blocks_for_selected_routes = (
-            trips_df[trips_df["route_short_name"].isin(FILTER_ROUTE_SHORT_NAMES)]["block_id"]
+            trips_df[trips_df["route_short_name"].isin(filter_route_short_names)]["block_id"]
             .dropna()
             .unique()
         )
@@ -212,8 +244,8 @@ def filter_data(
         trips_df = trips_df[trips_df["block_id"].isin(blocks_for_selected_routes)]
 
     # Apply Service ID Filtering
-    if FILTER_SERVICE_IDS:
-        trips_df = trips_df[trips_df["service_id"].isin(FILTER_SERVICE_IDS)]
+    if filter_service_ids:
+        trips_df = trips_df[trips_df["service_id"].isin(filter_service_ids)]
 
     # Filter stop_times to only include relevant trips
     stop_times_df = stop_times_df[stop_times_df["trip_id"].isin(trips_df["trip_id"])]
@@ -273,7 +305,7 @@ def prepare_stop_times(
     return stop_times_df
 
 
-def export_blocks(stop_times_df: pd.DataFrame) -> None:
+def export_blocks(stop_times_df: pd.DataFrame, base_output_path: Optional[str] = None) -> None:
     """Generate one Excel schedule per vehicle block.
 
     Args:
@@ -281,11 +313,15 @@ def export_blocks(stop_times_df: pd.DataFrame) -> None:
             :pyfunc:`prepare_stop_times`).  Must include the columns
             produced earlier (``block_id``, ``scheduled_time_hhmm``,
             etc.).
+        base_output_path: Folder to write the per-block XLSX files into;
+            ``None`` falls back to the ``BASE_OUTPUT_PATH`` config constant.
 
     Side Effects:
-        Writes ``block_<id>_schedule_printable.xlsx`` to
-        ``BASE_OUTPUT_PATH``; creates the folder tree if needed.
+        Writes ``block_<id>_schedule_printable.xlsx`` to the output folder;
+        creates the folder tree if needed.
     """
+    if base_output_path is None:
+        base_output_path = BASE_OUTPUT_PATH
     all_blocks = stop_times_df["block_id"].unique()
     logging.info("Found %d blocks to export.\n", len(all_blocks))
 
@@ -364,7 +400,7 @@ def export_blocks(stop_times_df: pd.DataFrame) -> None:
         final_df = final_df.sort_values(by=["Trip Start Time", "Trip ID", "Stop Sequence"])
 
         filename = f"block_{block_id}_schedule_printable.xlsx"
-        output_path = os.path.join(BASE_OUTPUT_PATH, filename)
+        output_path = os.path.join(base_output_path, filename)
         export_to_excel(final_df, output_path)
 
 
@@ -497,12 +533,198 @@ def load_gtfs_data(
             archive.close()
 
 
+# ---- REUSABLE HELPERS (copied from utils/run_log.py) -----------------------
+
+
+def extract_config_block(source_file: Path) -> str:
+    r"""Return the text between the CONFIG markers in *source_file*.
+
+    Reads ``source_file`` as UTF-8 text and slices out the lines strictly
+    *between* the first occurrence of ``# === BEGIN CONFIG ===`` and the first
+    subsequent occurrence of ``# === END CONFIG ===``.  The marker lines
+    themselves are excluded; whitespace and inline comments inside the block
+    are preserved verbatim.
+
+    Args:
+        source_file: Path to the Python source file to scan (typically
+            ``Path(__file__)`` from the calling script).
+
+    Returns:
+        The verbatim text of the configuration block, joined with ``\n``.
+
+    Raises:
+        ValueError: If either marker is missing or they appear out of order.
+        OSError: If ``source_file`` cannot be read.
+    """
+    _BEGIN = "# === BEGIN CONFIG ==="
+    _END = "# === END CONFIG ==="
+
+    lines: list[str] = source_file.read_text(encoding="utf-8").splitlines()
+
+    begin_idx: int | None = None
+    end_idx: int | None = None
+    for i, line in enumerate(lines):
+        stripped: str = line.strip()
+        if begin_idx is None and stripped == _BEGIN:
+            begin_idx = i
+        elif begin_idx is not None and stripped == _END:
+            end_idx = i
+            break
+
+    if begin_idx is None or end_idx is None:
+        raise ValueError(
+            f"Config markers not found in '{source_file}'. Expected '{_BEGIN}' and '{_END}'."
+        )
+
+    return "\n".join(lines[begin_idx + 1 : end_idx])
+
+
+# ---- RUN LOG ----------------------------------------------------------------
+
+
+def write_run_log(output_dir: Path, summary_lines: List[str]) -> bool:
+    """Write the verbatim config block plus a run summary into *output_dir*.
+
+    Returns:
+        ``True`` if the log was written successfully, ``False`` otherwise.
+    """
+    log_path = output_dir / "printable_block_schedules_runlog.txt"
+    try:
+        config_text = extract_config_block(Path(__file__))
+    except (OSError, ValueError) as exc:
+        logging.error("Could not extract config block for run log: %s", exc)
+        return False
+
+    lines: List[str] = [
+        "=" * 72,
+        "PRINTABLE BLOCK SCHEDULES RUN LOG",
+        "=" * 72,
+        f"Run timestamp:    {datetime.now().isoformat(timespec='seconds')}",
+        f"Output directory: {output_dir}",
+        f"Source script:    {Path(__file__).resolve()}",
+        "",
+        "-" * 72,
+        "RUN SUMMARY",
+        "-" * 72,
+        *summary_lines,
+        "",
+        "-" * 72,
+        "CONFIGURATION (verbatim)",
+        "-" * 72,
+        "# === BEGIN CONFIG ===",
+        config_text,
+        "# === END CONFIG ===",
+        "",
+    ]
+    try:
+        log_path.write_text("\n".join(lines), encoding="utf-8")
+    except OSError as exc:
+        logging.error("Could not write run log '%s': %s", log_path, exc)
+        return False
+    logging.info("Run log written → %s", log_path)
+    return True
+
+
+# ---- REUSABLE HELPERS (copied from utils/cli_helpers.py) -------------------
+
+
+def notebook_safe_argv(argv: Optional[Sequence[str]]) -> Optional[List[str]]:
+    """Return the argv to parse, shielding notebook kernels from stray flags.
+
+    When a script's ``main()`` runs with no explicit ``argv`` inside a
+    Jupyter/IPython kernel, ``sys.argv`` holds kernel plumbing (for example
+    ``-f /path/kernel.json``) rather than flags meant for the script, and
+    strict ``argparse.parse_args`` would reject it and abort.  This helper
+    detects the notebook case and substitutes an empty argument list so the
+    CONFIGURATION constants stay in charge, while shell runs keep strict
+    parsing (a typo in a flag fails loudly instead of being silently ignored).
+
+    Canonical implementation: ``utils/cli_helpers.py``.
+
+    Args:
+        argv: Explicit argument list passed to ``main()``, or ``None`` to
+            fall back to ``sys.argv``.
+
+    Returns:
+        ``list(argv)`` when *argv* was provided; ``[]`` when running inside a
+        notebook kernel; otherwise ``None`` so argparse reads ``sys.argv[1:]``.
+    """
+    if argv is not None:
+        return list(argv)
+    if "ipykernel" in sys.modules:
+        return []
+    return None
+
+
+def log_effective_config(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Log the resolved settings this run will actually use, at INFO.
+
+    Prints one line per flag-exposed setting with its origin — ``config`` when
+    the value is the CONFIGURATION-block default, ``CLI`` when a command-line
+    flag changed it — so a stale config edit or a forgotten flag is visible in
+    the console (and in notebook output) before any work starts. A flag passed
+    with a value equal to its default is indistinguishable from the default and
+    is labelled ``config``; the effective value is identical either way.
+
+    Canonical implementation: ``utils/cli_helpers.py``.
+
+    Args:
+        parser: The parser that produced *args*; supplies the defaults.
+        args: The parsed namespace holding the resolved values.
+    """
+    logging.info("Effective configuration (CONFIGURATION block + CLI overrides):")
+    for name in sorted(vars(args)):
+        value = getattr(args, name)
+        origin = "CLI" if value != parser.get_default(name) else "config"
+        logging.info("  --%-20s %-40s [%s]", name.replace("_", "-"), value, origin)
+
+
 # =============================================================================
 # MAIN
 # =============================================================================
 
 
-def main() -> int:
+def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI parser; every flag defaults to its CONFIGURATION constant."""
+    parser = argparse.ArgumentParser(
+        description=(
+            "Generate one printable XLSX schedule per vehicle block in a GTFS feed, "
+            "with placeholder columns for handwritten field notes. Defaults come "
+            "from the configuration block at the top of this file."
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--gtfs-dir",
+        default=GTFS_FOLDER_PATH,
+        help="Folder (or .zip) containing the GTFS feed.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=BASE_OUTPUT_PATH,
+        help="Folder for the per-block XLSX files.",
+    )
+    parser.add_argument(
+        "--routes",
+        nargs="*",
+        default=FILTER_ROUTE_SHORT_NAMES,
+        help="Route short names whose blocks to keep (default: all routes).",
+    )
+    parser.add_argument(
+        "--service-ids",
+        nargs="*",
+        default=FILTER_SERVICE_IDS,
+        help="Service IDs to keep (default: all services).",
+    )
+    parser.add_argument(
+        "--log-level",
+        default=logging.getLevelName(LOG_LEVEL),
+        help="DEBUG / INFO / WARNING / ERROR.",
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
     """Command-line entry point.
 
     Orchestrates:
@@ -514,28 +736,33 @@ def main() -> int:
     * Per-block Excel export (:pyfunc:`export_blocks`).
 
     The function traps anticipated exceptions and logs them with useful
-    context before exiting with a non-zero status.
+    context before exiting with a non-zero status. Defaults fall back to the
+    config block at the top of this file.
 
     Returns:
         Process exit code: 0 on success, 1 on failure, 2 if required
         CONFIGURATION values are still placeholders.
     """
+    parser = build_arg_parser()
+    args = parser.parse_args(notebook_safe_argv(argv))
     logging.basicConfig(
-        level=LOG_LEVEL,
+        level=getattr(logging, str(args.log_level).upper(), LOG_LEVEL),
         format="%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
     using_defaults = False
-    if GTFS_FOLDER_PATH == _DEFAULT_GTFS_FOLDER_PATH:
+    if args.gtfs_dir == _DEFAULT_GTFS_FOLDER_PATH:
         logging.warning(
-            "GTFS_FOLDER_PATH is still the default placeholder – update it before running: %s",
+            "GTFS_FOLDER_PATH is still the default placeholder – update it in the "
+            "CONFIGURATION section or pass --gtfs-dir before running: %s",
             _DEFAULT_GTFS_FOLDER_PATH,
         )
         using_defaults = True
-    if BASE_OUTPUT_PATH == _DEFAULT_BASE_OUTPUT_PATH:
+    if args.output_dir == _DEFAULT_BASE_OUTPUT_PATH:
         logging.warning(
-            "BASE_OUTPUT_PATH is still the default placeholder – update it before running: %s",
+            "BASE_OUTPUT_PATH is still the default placeholder – update it in the "
+            "CONFIGURATION section or pass --output-dir before running: %s",
             _DEFAULT_BASE_OUTPUT_PATH,
         )
         using_defaults = True
@@ -545,16 +772,11 @@ def main() -> int:
 
     logging.info("========================================================")
     logging.info("GTFS Block Schedule Printable Generator")
-    logging.info("Input GTFS Folder: %s", GTFS_FOLDER_PATH)
-    logging.info("Output Folder:     %s", BASE_OUTPUT_PATH)
-    if FILTER_ROUTE_SHORT_NAMES:
-        logging.info("Filtering for Routes: %s", FILTER_ROUTE_SHORT_NAMES)
-    if FILTER_SERVICE_IDS:
-        logging.info("Filtering for Service IDs: %s", FILTER_SERVICE_IDS)
+    log_effective_config(parser, args)
 
     try:
         gtfs_data = load_gtfs_data(
-            gtfs_path=GTFS_FOLDER_PATH,
+            gtfs_path=args.gtfs_dir,
             files=REQUIRED_GTFS_FILES,
             dtype=str,
         )
@@ -564,7 +786,13 @@ def main() -> int:
         stops_df = gtfs_data["stops"]
         routes_df = gtfs_data["routes"]
 
-        trips_df, stop_times_df = filter_data(trips_df, stop_times_df, routes_df)
+        trips_df, stop_times_df = filter_data(
+            trips_df,
+            stop_times_df,
+            routes_df,
+            filter_route_short_names=args.routes,
+            filter_service_ids=args.service_ids,
+        )
         if trips_df.empty or stop_times_df.empty:
             logging.warning("No data remains after filtering – no files generated.")
             return 1
@@ -574,7 +802,28 @@ def main() -> int:
             logging.warning("No data remains after preparation – no files generated.")
             return 1
 
-        export_blocks(prepared)
+        export_blocks(prepared, base_output_path=args.output_dir)
+
+        effective_lines = [
+            f"  --{name.replace('_', '-'):<20} {getattr(args, name)!s:<40} "
+            f"[{'CLI' if getattr(args, name) != parser.get_default(name) else 'config'}]"
+            for name in sorted(vars(args))
+        ]
+        summary_lines = [
+            f"GTFS feed:       {args.gtfs_dir}",
+            f"Blocks exported: {prepared['block_id'].nunique()}",
+            f"Output folder:   {args.output_dir}",
+            "",
+            "Effective configuration (CONFIGURATION block + CLI overrides):",
+            *effective_lines,
+        ]
+        if not write_run_log(Path(args.output_dir), summary_lines) and REQUIRE_RUN_LOG:
+            logging.error(
+                "Run log could not be written to '%s' and REQUIRE_RUN_LOG is True.",
+                args.output_dir,
+            )
+            return 1
+
         logging.info("Script finished successfully.")
         logging.info("Script completed successfully.")
         return 0
@@ -589,5 +838,7 @@ def main() -> int:
         logging.info("Exiting script.")
 
 
+# Strict parsing; in a notebook, notebook_safe_argv() keeps the kernel's
+# injected argv away from argparse so the config block stays in charge.
 if __name__ == "__main__":
     raise SystemExit(main())

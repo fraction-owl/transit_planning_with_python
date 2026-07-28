@@ -1,9 +1,20 @@
 """Export a one-row-per-route GTFS desk reference spreadsheet for transit planners.
 
+Outputs
+-------
+- ``routes_summary.xlsx`` (written to the output folder): the formatted,
+  print-ready wall chart — one row per route.
+- ``gtfs_route_summary_runlog.txt``: run-log sidecar capturing the verbatim
+  CONFIGURATION block, the effective (CLI-resolved) settings, and a run
+  summary.
+
 Typical usage
 -------------
-Adjust the paths and options in the CONFIGURATION section below, then run
-the script in ArcGIS Pro, a standalone Python environment, or a notebook.
+Adjust the paths and options in the CONFIGURATION section below (or pass
+``--gtfs-dir`` / ``--output-dir``), then run the script in ArcGIS Pro, a
+standalone Python environment, or a notebook. The effective configuration —
+config-block values plus any CLI overrides — is echoed at INFO at startup so
+unintended settings are visible before any work starts.
 
 Key Features
 ------------
@@ -19,12 +30,15 @@ Key Features
 
 from __future__ import annotations
 
+import argparse
 import logging
 import os
+import sys
 import zipfile
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta
-from typing import Any, Optional, Union
+from pathlib import Path
+from typing import Any, List, Optional, Union
 
 import pandas as pd
 from openpyxl import Workbook
@@ -32,21 +46,22 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 # ==== CONFIGURATION ==========================================================
+# === BEGIN CONFIG ===
 
 _DEFAULT_GTFS_FOLDER_PATH = r"Path\To\Your\GTFS_Folder"
 _DEFAULT_BASE_OUTPUT_PATH = r"Path\To\Your\Output_Folder"
 
 GTFS_FOLDER_PATH = _DEFAULT_GTFS_FOLDER_PATH  # <<< EDIT HERE
 BASE_OUTPUT_PATH = _DEFAULT_BASE_OUTPUT_PATH  # <<< EDIT HERE
-OUTPUT_FILENAME = "routes_summary.xlsx"
+OUTPUT_FILENAME = r"routes_summary.xlsx"
 DISTANCE_UNIT = "meters"  # meters | kilometers | feet | miles
 OUTPUT_UNITS = "imperial"  # imperial (mi/mph) or metric (km/kmh)
 EXCLUDED_ROUTE_SHORT_NAMES = ["9999A", "9999B", "9999C"]
 
-SERVICE_TYPES_PATH = ""
-CORRIDORS_PATH = ""
-LAST_CHANGED_PATH = ""
-RIDERSHIP_PATH = ""
+SERVICE_TYPES_PATH = r""
+CORRIDORS_PATH = r""
+LAST_CHANGED_PATH = r""
+RIDERSHIP_PATH = r""
 
 REQUIRED_GTFS_FILES = ["routes.txt", "trips.txt", "stop_times.txt", "calendar.txt"]
 
@@ -81,6 +96,14 @@ REQUIRED_GTFS_FILES = ["routes.txt", "trips.txt", "stop_times.txt", "calendar.tx
 # runs most weekends is getting only "Weekday".
 HOLIDAY_MAX_DAYS_PER_YEAR: float = 25
 WEEKDAY_DOW_SHARE: float = 0.80
+
+# When True, a failed run-log write aborts the script so outputs are never
+# left untraced. Set False only for genuinely read-only output locations.
+REQUIRE_RUN_LOG: bool = True
+
+LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
+
+# === END CONFIG ===
 
 # ==== FUNCTIONS ==============================================================
 
@@ -209,6 +232,106 @@ def load_gtfs_data(
     finally:
         if archive is not None:
             archive.close()
+
+
+# ---- REUSABLE HELPERS (copied from utils/run_log.py) -----------------------
+
+
+def extract_config_block(source_file: Path) -> str:
+    r"""Return the text between the CONFIG markers in *source_file*.
+
+    Reads ``source_file`` as UTF-8 text and slices out the lines strictly
+    *between* the first occurrence of ``# === BEGIN CONFIG ===`` and the first
+    subsequent occurrence of ``# === END CONFIG ===``.  The marker lines
+    themselves are excluded; whitespace and inline comments inside the block
+    are preserved verbatim.
+
+    Args:
+        source_file: Path to the Python source file to scan (typically
+            ``Path(__file__)`` from the calling script).
+
+    Returns:
+        The verbatim text of the configuration block, joined with ``\n``.
+
+    Raises:
+        ValueError: If either marker is missing or they appear out of order.
+        OSError: If ``source_file`` cannot be read.
+    """
+    _BEGIN = "# === BEGIN CONFIG ==="
+    _END = "# === END CONFIG ==="
+
+    lines: list[str] = source_file.read_text(encoding="utf-8").splitlines()
+
+    begin_idx: int | None = None
+    end_idx: int | None = None
+    for i, line in enumerate(lines):
+        stripped: str = line.strip()
+        if begin_idx is None and stripped == _BEGIN:
+            begin_idx = i
+        elif begin_idx is not None and stripped == _END:
+            end_idx = i
+            break
+
+    if begin_idx is None or end_idx is None:
+        raise ValueError(
+            f"Config markers not found in '{source_file}'. Expected '{_BEGIN}' and '{_END}'."
+        )
+
+    return "\n".join(lines[begin_idx + 1 : end_idx])
+
+
+# ---- REUSABLE HELPERS (copied from utils/cli_helpers.py) -------------------
+
+
+def notebook_safe_argv(argv: Optional[Sequence[str]]) -> Optional[List[str]]:
+    """Return the argv to parse, shielding notebook kernels from stray flags.
+
+    When a script's ``main()`` runs with no explicit ``argv`` inside a
+    Jupyter/IPython kernel, ``sys.argv`` holds kernel plumbing (for example
+    ``-f /path/kernel.json``) rather than flags meant for the script, and
+    strict ``argparse.parse_args`` would reject it and abort.  This helper
+    detects the notebook case and substitutes an empty argument list so the
+    CONFIGURATION constants stay in charge, while shell runs keep strict
+    parsing (a typo in a flag fails loudly instead of being silently ignored).
+
+    Canonical implementation: ``utils/cli_helpers.py``.
+
+    Args:
+        argv: Explicit argument list passed to ``main()``, or ``None`` to
+            fall back to ``sys.argv``.
+
+    Returns:
+        ``list(argv)`` when *argv* was provided; ``[]`` when running inside a
+        notebook kernel; otherwise ``None`` so argparse reads ``sys.argv[1:]``.
+    """
+    if argv is not None:
+        return list(argv)
+    if "ipykernel" in sys.modules:
+        return []
+    return None
+
+
+def log_effective_config(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Log the resolved settings this run will actually use, at INFO.
+
+    Prints one line per flag-exposed setting with its origin — ``config`` when
+    the value is the CONFIGURATION-block default, ``CLI`` when a command-line
+    flag changed it — so a stale config edit or a forgotten flag is visible in
+    the console (and in notebook output) before any work starts. A flag passed
+    with a value equal to its default is indistinguishable from the default and
+    is labelled ``config``; the effective value is identical either way.
+
+    Canonical implementation: ``utils/cli_helpers.py``.
+
+    Args:
+        parser: The parser that produced *args*; supplies the defaults.
+        args: The parsed namespace holding the resolved values.
+    """
+    logging.info("Effective configuration (CONFIGURATION block + CLI overrides):")
+    for name in sorted(vars(args)):
+        value = getattr(args, name)
+        origin = "CLI" if value != parser.get_default(name) else "config"
+        logging.info("  --%-20s %-40s [%s]", name.replace("_", "-"), value, origin)
 
 
 # ---- SCRIPT FUNCTIONS -------------------------------------------------------
@@ -433,6 +556,8 @@ def build_summary(
     extras: Mapping[str, Mapping[str, str]],
     holiday_max_days_per_year: float = HOLIDAY_MAX_DAYS_PER_YEAR,
     weekday_dow_share: float = WEEKDAY_DOW_SHARE,
+    output_units: Optional[str] = None,
+    excluded_route_short_names: Optional[Sequence[str]] = None,
 ) -> pd.DataFrame:
     """Assemble the per-route summary DataFrame.
 
@@ -447,6 +572,10 @@ def build_summary(
         extras: Optional lookup dicts keyed by category then ``route_id``.
         holiday_max_days_per_year: Forwarded to :func:`classify_services`.
         weekday_dow_share: Forwarded to :func:`classify_services`.
+        output_units: ``"imperial"`` (mi/mph) or ``"metric"`` (km/kmh);
+            ``None`` falls back to the ``OUTPUT_UNITS`` config constant.
+        excluded_route_short_names: Routes to drop from the summary; ``None``
+            falls back to the ``EXCLUDED_ROUTE_SHORT_NAMES`` config constant.
 
     Returns:
         One-row-per-route :class:`pandas.DataFrame` ready for export.
@@ -464,8 +593,12 @@ def build_summary(
     t["_dist_m"] = t["trip_id"].map(dist_m)
     t["_dur_s"] = t["trip_id"].map(dur_s)
 
-    excluded = {str(x) for x in (EXCLUDED_ROUTE_SHORT_NAMES or [])}
-    imperial = str(OUTPUT_UNITS).lower() == "imperial"
+    if excluded_route_short_names is None:
+        excluded_route_short_names = EXCLUDED_ROUTE_SHORT_NAMES
+    if output_units is None:
+        output_units = OUTPUT_UNITS
+    excluded = {str(x) for x in (excluded_route_short_names or [])}
+    imperial = str(output_units).lower() == "imperial"
     dist_col = "avg_distance_mi" if imperial else "avg_distance_km"
     speed_col = "avg_speed_mph" if imperial else "avg_speed_kmh"
 
@@ -631,60 +764,170 @@ def export_to_xlsx(data_frame: pd.DataFrame, output_file: str) -> None:
     logging.info("Wrote %s (%s rows)", output_file, len(data_frame))
 
 
+def write_run_log(output_dir: Path, summary_lines: List[str]) -> bool:
+    """Write the verbatim config block plus a run summary into *output_dir*.
+
+    Returns:
+        ``True`` if the log was written successfully, ``False`` otherwise.
+    """
+    log_path = output_dir / "gtfs_route_summary_runlog.txt"
+    try:
+        config_text = extract_config_block(Path(__file__))
+    except (OSError, ValueError) as exc:
+        logging.error("Could not extract config block for run log: %s", exc)
+        return False
+
+    lines: List[str] = [
+        "=" * 72,
+        "GTFS ROUTE SUMMARY RUN LOG",
+        "=" * 72,
+        f"Run timestamp:    {datetime.now().isoformat(timespec='seconds')}",
+        f"Output directory: {output_dir}",
+        f"Source script:    {Path(__file__).resolve()}",
+        "",
+        "-" * 72,
+        "RUN SUMMARY",
+        "-" * 72,
+        *summary_lines,
+        "",
+        "-" * 72,
+        "CONFIGURATION (verbatim)",
+        "-" * 72,
+        "# === BEGIN CONFIG ===",
+        config_text,
+        "# === END CONFIG ===",
+        "",
+    ]
+    try:
+        log_path.write_text("\n".join(lines), encoding="utf-8")
+    except OSError as exc:
+        logging.error("Could not write run log '%s': %s", log_path, exc)
+        return False
+    logging.info("Run log written → %s", log_path)
+    return True
+
+
 # ==== MAIN ===================================================================
 
 
-def main() -> int:
+def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI parser; every flag defaults to its CONFIGURATION constant."""
+    parser = argparse.ArgumentParser(
+        description=(
+            "Read a GTFS feed and export a one-row-per-route desk reference XLSX: "
+            "service days, variants, directions, average distance, duration, and "
+            "speed, plus optional route-level lookups. Defaults come from the "
+            "configuration block at the top of this file."
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--gtfs-dir",
+        default=GTFS_FOLDER_PATH,
+        help="Folder (or .zip) containing the GTFS feed.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=BASE_OUTPUT_PATH,
+        help="Folder for the XLSX wall chart.",
+    )
+    parser.add_argument(
+        "--distance-unit",
+        choices=("meters", "kilometers", "feet", "miles"),
+        default=DISTANCE_UNIT,
+        help="Unit of shape_dist_traveled in the feed.",
+    )
+    parser.add_argument(
+        "--output-units",
+        choices=("imperial", "metric"),
+        default=OUTPUT_UNITS,
+        help="Report distances/speeds in mi/mph (imperial) or km/kmh (metric).",
+    )
+    parser.add_argument(
+        "--service-types",
+        default=SERVICE_TYPES_PATH,
+        help="Optional route_id -> service_type lookup CSV/TSV.",
+    )
+    parser.add_argument(
+        "--corridors",
+        default=CORRIDORS_PATH,
+        help="Optional route_id -> corridor lookup CSV/TSV.",
+    )
+    parser.add_argument(
+        "--last-changed",
+        default=LAST_CHANGED_PATH,
+        help="Optional route_id -> last_changed lookup CSV/TSV.",
+    )
+    parser.add_argument(
+        "--ridership",
+        default=RIDERSHIP_PATH,
+        help="Optional route_id -> ridership lookup CSV/TSV.",
+    )
+    parser.add_argument(
+        "--log-level",
+        default=logging.getLevelName(LOG_LEVEL),
+        help="DEBUG / INFO / WARNING / ERROR.",
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
     """Entry point: load feed, build summary, write XLSX.
+
+    Defaults fall back to the config block at the top of this file.
 
     Returns:
         Process exit code: 0 on success, 1 on failure, 2 if required
         CONFIGURATION values are still placeholders.
     """
+    parser = build_arg_parser()
+    args = parser.parse_args(notebook_safe_argv(argv))
     logging.basicConfig(
-        level=logging.INFO,
+        level=getattr(logging, str(args.log_level).upper(), LOG_LEVEL),
         format="%(asctime)s %(levelname)s %(message)s",
     )
 
-    if (
-        GTFS_FOLDER_PATH == _DEFAULT_GTFS_FOLDER_PATH
-        or BASE_OUTPUT_PATH == _DEFAULT_BASE_OUTPUT_PATH
-    ):
+    if args.gtfs_dir == _DEFAULT_GTFS_FOLDER_PATH or args.output_dir == _DEFAULT_BASE_OUTPUT_PATH:
         logging.warning(
             "GTFS_FOLDER_PATH and/or BASE_OUTPUT_PATH are still set to their default "
-            "placeholder values. Please update them in the CONFIGURATION section before running."
+            "placeholder values. Update them in the CONFIGURATION section or pass "
+            "--gtfs-dir/--output-dir before running."
         )
         return 2
 
     logging.info("==== GTFS Route Summary ====")
-    logging.info("GTFS dir      : %s", GTFS_FOLDER_PATH)
-    logging.info("Output        : %s", os.path.join(BASE_OUTPUT_PATH, OUTPUT_FILENAME))
-    logging.info("Distance unit : %s", DISTANCE_UNIT)
-    logging.info("Holiday max/y : %s", HOLIDAY_MAX_DAYS_PER_YEAR)
-    logging.info("Weekday share : %s", WEEKDAY_DOW_SHARE)
+    log_effective_config(parser, args)
+    logging.info(
+        "Config-only settings: OUTPUT_FILENAME=%s, EXCLUDED_ROUTE_SHORT_NAMES=%s, "
+        "HOLIDAY_MAX_DAYS_PER_YEAR=%s, WEEKDAY_DOW_SHARE=%s",
+        OUTPUT_FILENAME,
+        EXCLUDED_ROUTE_SHORT_NAMES,
+        HOLIDAY_MAX_DAYS_PER_YEAR,
+        WEEKDAY_DOW_SHARE,
+    )
 
     try:
-        core = load_gtfs_data(GTFS_FOLDER_PATH, files=REQUIRED_GTFS_FILES)
+        core = load_gtfs_data(args.gtfs_dir, files=REQUIRED_GTFS_FILES)
 
         calendar_dates_df: Optional[pd.DataFrame] = None
         try:
-            cd = load_gtfs_data(GTFS_FOLDER_PATH, files=("calendar_dates.txt",))
+            cd = load_gtfs_data(args.gtfs_dir, files=("calendar_dates.txt",))
             calendar_dates_df = cd.get("calendar_dates")
         except OSError as exc:
             logging.warning("calendar_dates.txt unavailable: %s", exc)
 
         shapes_df: Optional[pd.DataFrame] = None
         try:
-            sh = load_gtfs_data(GTFS_FOLDER_PATH, files=("shapes.txt",))
+            sh = load_gtfs_data(args.gtfs_dir, files=("shapes.txt",))
             shapes_df = sh.get("shapes")
         except OSError as exc:
             logging.warning("shapes.txt unavailable: %s", exc)
 
         extras: dict[str, dict[str, str]] = {
-            "service_types": load_optional_lookup(SERVICE_TYPES_PATH, "service_type"),
-            "corridors": load_optional_lookup(CORRIDORS_PATH, "corridor"),
-            "last_changed": load_optional_lookup(LAST_CHANGED_PATH, "last_changed"),
-            "ridership": load_optional_lookup(RIDERSHIP_PATH, "ridership"),
+            "service_types": load_optional_lookup(args.service_types, "service_type"),
+            "corridors": load_optional_lookup(args.corridors, "corridor"),
+            "last_changed": load_optional_lookup(args.last_changed, "last_changed"),
+            "ridership": load_optional_lookup(args.ridership, "ridership"),
         }
 
         summary = build_summary(
@@ -694,15 +937,38 @@ def main() -> int:
             calendar_df=core["calendar"],
             calendar_dates_df=calendar_dates_df,
             shapes_df=shapes_df,
-            distance_unit=DISTANCE_UNIT,
+            distance_unit=args.distance_unit,
             extras=extras,
+            output_units=args.output_units,
         )
 
         if summary.empty:
             logging.warning("Summary is empty; nothing to write.")
             return 1
 
-        export_to_xlsx(summary, os.path.join(BASE_OUTPUT_PATH, OUTPUT_FILENAME))
+        out_path = os.path.join(args.output_dir, OUTPUT_FILENAME)
+        export_to_xlsx(summary, out_path)
+
+        effective_lines = [
+            f"  --{name.replace('_', '-'):<20} {getattr(args, name)!s:<40} "
+            f"[{'CLI' if getattr(args, name) != parser.get_default(name) else 'config'}]"
+            for name in sorted(vars(args))
+        ]
+        summary_lines = [
+            f"GTFS feed:         {args.gtfs_dir}",
+            f"Routes summarized: {len(summary)}",
+            f"Output XLSX:       {out_path}",
+            "",
+            "Effective configuration (CONFIGURATION block + CLI overrides):",
+            *effective_lines,
+        ]
+        if not write_run_log(Path(args.output_dir), summary_lines) and REQUIRE_RUN_LOG:
+            logging.error(
+                "Run log could not be written to '%s' and REQUIRE_RUN_LOG is True.",
+                args.output_dir,
+            )
+            return 1
+
         logging.info("Script completed successfully.")
         return 0
 
@@ -716,5 +982,7 @@ def main() -> int:
         logging.info("Exiting script.")
 
 
+# Strict parsing; in a notebook, notebook_safe_argv() keeps the kernel's
+# injected argv away from argparse so the config block stays in charge.
 if __name__ == "__main__":
     raise SystemExit(main())
