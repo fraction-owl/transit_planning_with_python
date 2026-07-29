@@ -45,6 +45,7 @@ transit_planning_with_python/
 │   │   ├── gtfs_calendar_inspector.py
 │   │   ├── gtfs_skipped_stop_flagger_gpd.py
 │   │   ├── gtfs_stop_proximity_qc.py
+│   │   ├── gtfs_timepoint_interval_flagger.py
 │   │   ├── route_direction_classifier.py
 │   │   ├── stop_v_conflict_checker_arcpy.py
 │   │   ├── stop_v_conflict_checker_gpd.py
@@ -243,6 +244,7 @@ transit_planning_with_python/
 │   ├── test_gtfs_skipped_stop_flagger_gpd.py
 │   ├── test_gtfs_stop_diff.py
 │   ├── test_gtfs_stop_proximity_qc.py
+│   ├── test_gtfs_timepoint_interval_flagger.py
 │   ├── test_gtfs_to_shapefile_gpd.py
 │   ├── test_headway_span_exporter.py
 │   ├── test_load_factor_monitor.py
