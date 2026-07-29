@@ -3,10 +3,9 @@
 This script reviews every trip in a GTFS feed — for all schedules
 (service_ids) by default — and measures the scheduled running time between
 each pair of consecutive timepoints. Any interval longer than
-MAX_INTERVAL_MINUTES (default 10; 8 is a common stricter standard) is
-flagged for review. Long gaps between timepoints make mid-route on-time
-performance hard to monitor and often signal that a timepoint is missing
-from the schedule data.
+MAX_INTERVAL_MINUTES (default 10) is flagged for review. Long gaps
+between timepoints make mid-route on-time performance hard to monitor and
+often signal that a timepoint is missing from the schedule data.
 
 Timepoints are the stop_times.txt rows with ``timepoint == 1``. When the
 feed carries no ``timepoint`` column (or marks no rows), every stop with a
@@ -57,8 +56,9 @@ GTFS_PATH: str = r"Path\To\Your\GTFS_Folder"  # folder of .txt files or a .zip
 OUTPUT_DIR: str = r"Path\To\Your\Output_Folder"
 
 # Maximum scheduled minutes allowed between consecutive timepoints on a trip.
-# Intervals STRICTLY greater than this are flagged. 10 is a common planning
-# standard; set 8.0 for a stricter review.
+# Intervals STRICTLY greater than this are flagged. Timepoints are commonly
+# spaced every 5-10 scheduled minutes of running time, so anything over 10
+# merits review; lower this to tighten the review.
 MAX_INTERVAL_MINUTES: float = 10.0
 
 # Schedules (service_ids from calendar.txt / trips.txt) to review.
@@ -875,8 +875,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--max-interval-minutes",
         type=float,
         default=MAX_INTERVAL_MINUTES,
-        help="Flag intervals STRICTLY greater than this many scheduled minutes "
-        "(8 and 10 are common standards).",
+        help="Flag intervals STRICTLY greater than this many scheduled minutes.",
     )
     parser.add_argument(
         "--service-ids",
