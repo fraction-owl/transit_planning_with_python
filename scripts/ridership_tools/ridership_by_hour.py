@@ -25,6 +25,10 @@ Outputs:
     - ``ridership_by_hour_route.csv``: day type × route × hour average boardings
       (and alightings when available), with observation counts.
     - ``ridership_by_hour_system.csv``: day type × hour system totals.
+    - ``ridership_by_trip_<day>.csv`` per day type (``EXPORT_TRIP_TABLE``):
+      average daily boardings by ``trip_id`` (and ``stop_id`` in tides mode) —
+      the exact ``RIDERSHIP_CSV`` input ``service_cut_impact_gpd.py`` expects;
+      pass the file matching that script's ``SERVICE_DAY``.
     - ``charts/``: one bar chart PNG per route per day type, plus a system chart
       per day type (``EXPORT_CHARTS``).
     - A run-log sidecar capturing the verbatim CONFIGURATION block.
@@ -34,9 +38,10 @@ Notes:
     actual event hour — so expect small shifts between them for long trips.
     Holiday service is not separated: dates are classed weekday/saturday/sunday
     by calendar day alone in ``tides`` mode, and the xlsx export's own day-type
-    split is trusted as-is. Mapping these tables to GTFS ``trip_id`` (to feed
-    ``service_cut_impact_gpd.py``) needs an agency trip-number crosswalk and is
-    future work.
+    split is trusted as-is. The trip tables are only as good as their ids: the
+    xlsx export's trip-number column must hold GTFS ``trip_id`` values, and
+    TIDES trips should carry ``trip_id_scheduled``; otherwise blank the
+    ``trip_id`` mapping / expect unmatched ids downstream.
 
 Typical usage:
     Update the paths in the CONFIGURATION section (or pass the matching CLI
@@ -87,10 +92,13 @@ XLSX_INPUTS: Mapping[str, str] = {
 # Sheet to read; None reads the first sheet in each workbook.
 XLSX_SHEET: Optional[str] = None
 # Source column names. route, trip_start_time, and boardings are required;
-# set an optional entry to "" if the export lacks that column.
+# set an optional entry to "" if the export lacks that column. trip_id must
+# hold GTFS trip_id values for the engine-ready trip table to be meaningful —
+# set it to "" if your export's trip numbers do not match GTFS.
 XLSX_COLUMN_MAP: Mapping[str, str] = {
     "route": "ROUTE_NUMBER",
     "route_name": "ROUTE_NAME",
+    "trip_id": "TRIP_NUMBER",
     "trip_start_time": "TRIP_START_TIME",
     "boardings": "PASSENGERS_ON",
     "alightings": "PASSENGERS_OFF",
@@ -124,6 +132,13 @@ ROUTES_TO_EXCLUDE: Sequence[str] = ()
 
 ROUTE_OUTPUT_FILENAME: str = r"ridership_by_hour_route.csv"
 SYSTEM_OUTPUT_FILENAME: str = r"ridership_by_hour_system.csv"
+
+# Also write ridership_by_trip_<day>.csv per day type — average daily boardings
+# by trip_id (and stop_id in tides mode), in exactly the schema
+# service_cut_impact_gpd.py's RIDERSHIP_CSV input expects. Pass the file whose
+# day type matches that script's SERVICE_DAY.
+EXPORT_TRIP_TABLE: bool = True
+TRIP_TABLE_FILENAME_PREFIX: str = r"ridership_by_trip"
 
 # Bar charts: one PNG per route per day type plus a system chart per day type.
 EXPORT_CHARTS: bool = True
@@ -328,8 +343,8 @@ def load_route_trip_workbook(path: Path, day_type: str) -> pd.DataFrame:
 
     Returns:
         DataFrame with columns ``day_type``, ``route``, ``route_name``,
-        ``hour``, ``boardings``, ``alightings``, ``days_observed`` — one row
-        per scheduled trip.
+        ``trip_id`` (blank when unmapped), ``hour``, ``boardings``,
+        ``alightings``, ``days_observed`` — one row per scheduled trip.
 
     Raises:
         FileNotFoundError: If *path* does not exist.
@@ -359,6 +374,10 @@ def load_route_trip_workbook(path: Path, day_type: str) -> pd.DataFrame:
     name_col = colmap.get("route_name")
     out["route_name"] = (
         raw[name_col].astype(str).str.strip() if name_col and name_col in raw.columns else ""
+    )
+    trip_col = colmap.get("trip_id")
+    out["trip_id"] = (
+        raw[trip_col].astype(str).str.strip() if trip_col and trip_col in raw.columns else ""
     )
 
     start_min = raw[colmap["trip_start_time"]].map(parse_time_to_minutes)
@@ -395,7 +414,9 @@ def load_route_trip_workbook(path: Path, day_type: str) -> pd.DataFrame:
     return out
 
 
-def build_hourly_from_xlsx(inputs: Mapping[str, str]) -> pd.DataFrame:
+def build_hourly_from_xlsx(
+    inputs: Mapping[str, str],
+) -> "tuple[pd.DataFrame, dict[str, pd.DataFrame]]":
     """Build the route × day × hour table from Route-and-Trip workbooks.
 
     Each trip's period-average boardings are assigned wholly to the hour of the
@@ -405,9 +426,12 @@ def build_hourly_from_xlsx(inputs: Mapping[str, str]) -> pd.DataFrame:
         inputs: Mapping of day-type label to workbook path.
 
     Returns:
-        DataFrame with one row per (day_type, route, hour): summed average
-        ``boardings``/``alightings``, scheduled ``trips`` in that hour, and the
-        mean ``days_observed`` behind those averages.
+        Tuple of (hourly table, engine trip tables). The hourly table has one
+        row per (day_type, route, hour): summed average ``boardings``/
+        ``alightings``, scheduled ``trips`` in that hour, and the mean
+        ``days_observed`` behind those averages. The trip tables map day type
+        to a ``trip_id``/``stop_id``/``avg_daily_boardings`` frame ready for
+        ``service_cut_impact_gpd.py`` (empty when ``trip_id`` is unmapped).
 
     Raises:
         ValueError: If *inputs* is empty.
@@ -434,7 +458,23 @@ def build_hourly_from_xlsx(inputs: Mapping[str, str]) -> pd.DataFrame:
         .agg(lambda s: s.mode().iloc[0])
     )
     grouped["route_name"] = grouped["route"].map(names).fillna("")
-    return grouped
+
+    trip_tables: dict[str, pd.DataFrame] = {}
+    with_ids = trips_rows[trips_rows["trip_id"] != ""]
+    if not with_ids.empty:
+        for day_type, sub in with_ids.groupby("day_type"):
+            dup = int(sub["trip_id"].duplicated().sum())
+            if dup:
+                logging.warning(
+                    "%s workbook: %d duplicate trip_id value(s) — their boardings are summed.",
+                    day_type,
+                    dup,
+                )
+            table = sub.groupby("trip_id", as_index=False)["boardings"].sum()
+            table = table.rename(columns={"boardings": "avg_daily_boardings"})
+            table.insert(1, "stop_id", "")
+            trip_tables[str(day_type)] = table
+    return grouped, trip_tables
 
 
 # =============================================================================
@@ -490,7 +530,9 @@ def _event_service_hour(time_value: object, service_date: object, cutover_hour: 
     return float(hour)
 
 
-def build_hourly_from_tides(stop_visits_path: Path, trips_performed_path: Path) -> pd.DataFrame:
+def build_hourly_from_tides(
+    stop_visits_path: Path, trips_performed_path: Path
+) -> "tuple[pd.DataFrame, dict[str, pd.DataFrame]]":
     """Build the route × day × hour table from TIDES event files.
 
     Boardings are counted at the hour each stop visit occurred and averaged
@@ -502,9 +544,14 @@ def build_hourly_from_tides(stop_visits_path: Path, trips_performed_path: Path) 
         trips_performed_path: TIDES ``trips_performed`` CSV.
 
     Returns:
-        DataFrame with one row per (day_type, route, hour): average daily
-        ``boardings``/``alightings``, average daily distinct ``trips``, and the
-        number of service dates observed (``days_observed``).
+        Tuple of (hourly table, engine trip tables). The hourly table has one
+        row per (day_type, route, hour): average daily ``boardings``/
+        ``alightings``, average daily distinct ``trips``, and the number of
+        service dates observed (``days_observed``). The trip tables map day
+        type to a ``trip_id``/``stop_id``/``avg_daily_boardings`` frame ready
+        for ``service_cut_impact_gpd.py``, keyed on ``trip_id_scheduled``
+        (the GTFS trip_id) when trips_performed carries it, with per-stop
+        grain when stop_visits carries ``stop_id``.
 
     Raises:
         FileNotFoundError: If either file does not exist.
@@ -547,11 +594,10 @@ def build_hourly_from_tides(stop_visits_path: Path, trips_performed_path: Path) 
     visits["hour"] = visits["hour"].astype(int)
 
     routes = performed.drop_duplicates(subset=["service_date", "trip_id_performed"])
-    events = visits.merge(
-        routes[["service_date", "trip_id_performed", "route_id"]],
-        on=["service_date", "trip_id_performed"],
-        how="left",
-    )
+    route_cols = ["service_date", "trip_id_performed", "route_id"]
+    if "trip_id_scheduled" in routes.columns:
+        route_cols.append("trip_id_scheduled")
+    events = visits.merge(routes[route_cols], on=["service_date", "trip_id_performed"], how="left")
     unmatched = int(events["route_id"].isna().sum())
     if unmatched:
         logging.warning(
@@ -584,7 +630,24 @@ def build_hourly_from_tides(stop_visits_path: Path, trips_performed_path: Path) 
     totals["route_name"] = ""
     for day_type, count in n_dates.items():
         logging.info("TIDES: %s averaged over %d service date(s).", day_type, count)
-    return totals.drop(columns=["trip_visits"])
+
+    if "trip_id_scheduled" in events.columns:
+        sched = events["trip_id_scheduled"].fillna("").astype(str).str.strip()
+        events["trip_key"] = sched.where(sched != "", events["trip_id_performed"])
+    else:
+        events["trip_key"] = events["trip_id_performed"]
+    if "stop_id" in events.columns:
+        events["_stop"] = events["stop_id"].fillna("").astype(str).str.strip()
+    else:
+        events["_stop"] = ""
+    trip_tables: dict[str, pd.DataFrame] = {}
+    for day_type, sub in events.groupby("day_type"):
+        trip_dates = sub.groupby("trip_key")["service_date"].nunique()
+        table = sub.groupby(["trip_key", "_stop"], as_index=False)["boardings"].sum()
+        table["avg_daily_boardings"] = table["boardings"] / table["trip_key"].map(trip_dates)
+        table = table.rename(columns={"trip_key": "trip_id", "_stop": "stop_id"})
+        trip_tables[str(day_type)] = table[["trip_id", "stop_id", "avg_daily_boardings"]]
+    return totals.drop(columns=["trip_visits"]), trip_tables
 
 
 # =============================================================================
@@ -795,9 +858,9 @@ def run(
     """
     mode = input_mode.strip().lower()
     if mode == "route_trip_xlsx":
-        hourly = build_hourly_from_xlsx(xlsx_inputs)
+        hourly, trip_tables = build_hourly_from_xlsx(xlsx_inputs)
     elif mode == "tides":
-        hourly = build_hourly_from_tides(stop_visits_path, trips_performed_path)
+        hourly, trip_tables = build_hourly_from_tides(stop_visits_path, trips_performed_path)
     else:
         raise ValueError(f"INPUT_MODE must be 'route_trip_xlsx' or 'tides'; got {input_mode!r}.")
 
@@ -810,6 +873,30 @@ def run(
     logging.info("Wrote: %s (%d rows)", route_path, len(route_table))
     logging.info("Wrote: %s (%d rows)", system_path, len(system))
 
+    trip_files = 0
+    if EXPORT_TRIP_TABLE:
+        if trip_tables:
+            for day_type in sorted(trip_tables, key=_day_sort_key):
+                table = trip_tables[day_type].copy()
+                table["avg_daily_boardings"] = table["avg_daily_boardings"].round(2)
+                trip_path = (
+                    output_dir / f"{TRIP_TABLE_FILENAME_PREFIX}_{_sanitize_token(day_type)}.csv"
+                )
+                table.to_csv(trip_path, index=False)
+                trip_files += 1
+                logging.info(
+                    "Wrote: %s (%d rows) — feed to service_cut_impact_gpd.py via "
+                    "RIDERSHIP_CSV for a %s analysis.",
+                    trip_path,
+                    len(table),
+                    day_type,
+                )
+        else:
+            logging.warning(
+                "EXPORT_TRIP_TABLE is on but no trip ids are available — map "
+                "XLSX_COLUMN_MAP['trip_id'] (xlsx mode) to write engine-ready trip tables."
+            )
+
     charts_written = 0
     if export_charts_flag:
         charts_written = export_charts(route_table, system, output_dir / CHARTS_SUBDIR)
@@ -820,6 +907,7 @@ def run(
         f"Day types:         {day_types}",
         f"Routes:            {route_table['route'].nunique()}",
         f"Route rows:        {len(route_table)}",
+        f"Trip tables:       {trip_files}",
         f"Charts written:    {charts_written}",
     ]
     if not write_run_log(output_dir, summary_lines) and REQUIRE_RUN_LOG:
