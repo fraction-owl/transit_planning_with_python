@@ -27,7 +27,9 @@ Inputs:
 Outputs:
     - ``scenario_summary.csv``: one row per scenario — trips cut/truncated, stops
       eliminated/reduced, stop×time-bin service lost, revenue hours/miles cut, coverage
-      area lost, demographics lost, and riders affected.
+      area lost, demographics lost, and riders affected. In screening mode
+      (``SCENARIOS = "each_route"`` or ``--each-route``) this is the only table:
+      every route's elimination is evaluated and ranked by what is at stake.
     - ``<scenario>_stop_impacts.csv``: per impacted stop — baseline vs scenario trips,
       span, largest gap, time bins lost, nearest remaining stop, boardings lost.
     - ``<scenario>_stop_time_bins.csv``: long-format stop × time-bin trip counts,
@@ -88,8 +90,12 @@ CONFIG_END_MARKER: str = "# === END CONFIG ==="
 GTFS_DIR: str = r"Path\To\Your\GTFS_Folder"
 OUTPUT_DIR: str = r"Path\To\Your\Output_Folder"
 
-# Scenarios are evaluated independently against the same baseline feed. Every key
-# except "name" is optional, and any combination is unioned into one cut:
+# Scenarios are evaluated independently against the same baseline feed. Set the
+# whole variable to the string "each_route" instead of a list for SCREENING MODE:
+# one route-elimination scenario is generated per route serving the analysis day,
+# per-scenario detail files are skipped, and the summary becomes a route exposure
+# ranking (sorted by riders at stake, else revenue hours). For an explicit list,
+# every key except "name" is optional, and any combination is unioned into one cut:
 #   routes       - drop every trip on these routes (route_short_name or route_id).
 #   trip_ids     - drop these exact trips.txt trip_ids.
 #   trip_windows - drop trips by first departure, e.g. {"route": "101",
@@ -100,7 +106,7 @@ OUTPUT_DIR: str = r"Path\To\Your\Output_Folder"
 #   stops        - drop these stop_ids from every trip that visits them.
 #   route_stops  - {"route token": [stop_ids]}: drop the stops only from that
 #                  route's trips (truncation / short-turn).
-SCENARIOS: Sequence[Mapping[str, Any]] = (
+SCENARIOS: "Sequence[Mapping[str, Any]] | str" = (
     {
         "name": "cut_route_101",
         "description": "Eliminate route 101 entirely.",
@@ -807,7 +813,7 @@ class Config(NamedTuple):
 
     gtfs_dir: str
     output_dir: Path
-    scenarios: Sequence[Mapping[str, Any]] = SCENARIOS
+    scenarios: "Sequence[Mapping[str, Any]] | str" = SCENARIOS
     service_day: str = SERVICE_DAY
     service_date: str = SERVICE_DATE
     time_bin_minutes: int = TIME_BIN_MINUTES
@@ -1177,6 +1183,47 @@ def resolve_drop_mask(
         mask |= scoped
 
     return mask
+
+
+def build_screening_scenarios(events: pd.DataFrame) -> "list[dict[str, Any]]":
+    """Generate one route-elimination scenario per route serving the analysis day.
+
+    Screening mode's scenario generator: the whole-route cut is the upper bound
+    on what is at stake for each route, so evaluating every route's elimination
+    in one run turns the summary table into a route exposure ranking.
+
+    Args:
+        events: Baseline event table.
+
+    Returns:
+        One scenario dict per route, targeted by ``route_id`` (exact), named
+        after the route label with the route_id appended when labels collide.
+    """
+    label_by_id = (
+        events.drop_duplicates(subset=["route_id"])
+        .set_index("route_id")["route_label"]
+        .astype(str)
+        .to_dict()
+    )
+    ordered = sorted(label_by_id, key=lambda rid: (label_by_id[rid], rid))
+    base_names = {rid: f"cut_route_{_sanitize_name(label_by_id[rid])}" for rid in ordered}
+    counts: dict[str, int] = {}
+    for name in base_names.values():
+        counts[name] = counts.get(name, 0) + 1
+
+    scenarios: list[dict[str, Any]] = []
+    for rid in ordered:
+        name = base_names[rid]
+        if counts[name] > 1:
+            name = f"{name}_{_sanitize_name(rid)}"
+        scenarios.append(
+            {
+                "name": name,
+                "description": f"Screening: eliminate route {label_by_id[rid]} entirely.",
+                "routes": [rid],
+            }
+        )
+    return scenarios
 
 
 # =============================================================================
@@ -1942,6 +1989,7 @@ def run_scenario(
     feed: Mapping[str, Optional[pd.DataFrame]],
     events_all: Optional[pd.DataFrame],
     cfg: Config,
+    write_details: bool = True,
 ) -> dict[str, Any]:
     """Evaluate one scenario end-to-end and write its per-scenario outputs.
 
@@ -1960,6 +2008,9 @@ def run_scenario(
         events_all: All-days event table for the GTFS export, or ``None`` when
             the export is disabled.
         cfg: Resolved configuration.
+        write_details: When False (screening mode), compute the summary row but
+            skip every per-scenario file — impact/matrix CSVs, shapefiles, and
+            the scenario GTFS export.
 
     Returns:
         The scenario's summary row (one dict) for ``scenario_summary.csv``.
@@ -1982,7 +2033,8 @@ def run_scenario(
     scen_bins = bin_counts(surviving, cfg.time_bin_minutes)
 
     impacts = compute_stop_impacts(base_stats, scen_stats, base_bins, scen_bins, stops_gdf)
-    impacts = add_nearest_remaining(impacts, stops_gdf, cfg.crs_units)
+    if write_details:
+        impacts = add_nearest_remaining(impacts, stops_gdf, cfg.crs_units)
 
     eliminated_ids = set(impacts.loc[impacts["classification"] == "eliminated", "stop_id"])
     reduced_ids = set(impacts.loc[impacts["classification"] == "reduced", "stop_id"])
@@ -2016,30 +2068,34 @@ def run_scenario(
             impacts["stop_id"].map(est_lost_by_stop).fillna(0.0).round(1)
         )
 
-    impacted = impacts[impacts["classification"] != "unchanged"].copy()
-    impacts_path = cfg.output_dir / f"{token}_stop_impacts.csv"
-    impacted.to_csv(impacts_path, index=False)
-    logging.info("Wrote: %s (%d impacted stops)", impacts_path, len(impacted))
+    if write_details:
+        impacted = impacts[impacts["classification"] != "unchanged"].copy()
+        impacts_path = cfg.output_dir / f"{token}_stop_impacts.csv"
+        impacted.to_csv(impacts_path, index=False)
+        logging.info("Wrote: %s (%d impacted stops)", impacts_path, len(impacted))
 
-    matrix = base_bins.merge(
-        scen_bins, on=["stop_id", "bin_start_min"], how="outer", suffixes=("_baseline", "_scenario")
-    )
-    matrix[["trips_baseline", "trips_scenario"]] = (
-        matrix[["trips_baseline", "trips_scenario"]].fillna(0).astype(int)
-    )
-    matrix["trips_delta"] = matrix["trips_scenario"] - matrix["trips_baseline"]
-    matrix["bin_start"] = matrix["bin_start_min"].map(minutes_to_hhmm)
-    names = stops_gdf.set_index("stop_id")["stop_name"]
-    matrix["stop_name"] = matrix["stop_id"].map(names).fillna("")
-    matrix = matrix.sort_values(["stop_id", "bin_start_min"])
-    matrix_path = cfg.output_dir / f"{token}_stop_time_bins.csv"
-    matrix[
-        ["stop_id", "stop_name", "bin_start", "trips_baseline", "trips_scenario", "trips_delta"]
-    ].to_csv(matrix_path, index=False)
-    logging.info("Wrote: %s", matrix_path)
+        matrix = base_bins.merge(
+            scen_bins,
+            on=["stop_id", "bin_start_min"],
+            how="outer",
+            suffixes=("_baseline", "_scenario"),
+        )
+        matrix[["trips_baseline", "trips_scenario"]] = (
+            matrix[["trips_baseline", "trips_scenario"]].fillna(0).astype(int)
+        )
+        matrix["trips_delta"] = matrix["trips_scenario"] - matrix["trips_baseline"]
+        matrix["bin_start"] = matrix["bin_start_min"].map(minutes_to_hhmm)
+        names = stops_gdf.set_index("stop_id")["stop_name"]
+        matrix["stop_name"] = matrix["stop_id"].map(names).fillna("")
+        matrix = matrix.sort_values(["stop_id", "bin_start_min"])
+        matrix_path = cfg.output_dir / f"{token}_stop_time_bins.csv"
+        matrix[
+            ["stop_id", "stop_name", "bin_start", "trips_baseline", "trips_scenario", "trips_delta"]
+        ].to_csv(matrix_path, index=False)
+        logging.info("Wrote: %s", matrix_path)
 
     lost_sqmi = _area_to_sqmi(lost_geom.area, cfg.crs_units)
-    if not lost_geom.is_empty and lost_geom.area > 0:
+    if write_details and not lost_geom.is_empty and lost_geom.area > 0:
         lost_gdf = gpd.GeoDataFrame(
             {"scenario": [name]}, geometry=[lost_geom], crs=f"EPSG:{cfg.crs_epsg}"
         )
@@ -2047,7 +2103,7 @@ def run_scenario(
         lost_gdf.to_file(coverage_path)
         logging.info("Wrote: %s (%.2f sq mi lost)", coverage_path, lost_sqmi)
 
-    if cfg.export_map_layers:
+    if write_details and cfg.export_map_layers:
         if not remaining_geom.is_empty and remaining_geom.area > 0:
             remaining_gdf = gpd.GeoDataFrame(
                 {"scenario": [name]}, geometry=[remaining_geom], crs=f"EPSG:{cfg.crs_epsg}"
@@ -2058,7 +2114,7 @@ def run_scenario(
         if not shape_lines.empty:
             export_line_layers(events, drop_mask, trips, shape_lines, cfg.output_dir, token)
 
-    if cfg.export_scenario_gtfs and events_all is not None:
+    if write_details and cfg.export_scenario_gtfs and events_all is not None:
         drop_mask_all = resolve_drop_mask(scenario, events_all, routes)
         export_scenario_gtfs(cfg.gtfs_dir, feed, events_all, drop_mask_all, cfg.output_dir, token)
 
@@ -2222,14 +2278,31 @@ def run(cfg: Config) -> pd.DataFrame:
         routes,
     )
 
+    screening = isinstance(cfg.scenarios, str)
+    if screening:
+        if str(cfg.scenarios).strip().lower() != "each_route":
+            raise ValueError(
+                f"SCENARIOS must be a list of scenario dicts or the string "
+                f"'each_route'; got {cfg.scenarios!r}."
+            )
+        scenarios = build_screening_scenarios(events)
+        logging.info(
+            "Screening mode: evaluating the elimination of each of %d route(s). "
+            "Per-scenario detail files are skipped — rerun with an explicit "
+            "SCENARIOS entry for full outputs on a route of interest.",
+            len(scenarios),
+        )
+    else:
+        scenarios = list(cfg.scenarios)
+
     events_all: Optional[pd.DataFrame] = None
-    if cfg.export_scenario_gtfs:
+    if cfg.export_scenario_gtfs and not screening:
         # The exported feeds apply each cut across every service day, so the
         # scenario masks are re-resolved over an unfiltered event table.
         logging.info("Scenario GTFS export enabled — building the all-days event table.")
         events_all = build_events(stop_times, trips, routes, service_ids=None)
 
-    names = [str(s.get("name", "")).strip() for s in cfg.scenarios]
+    names = [str(s.get("name", "")).strip() for s in scenarios]
     if len(names) != len(set(names)):
         raise ValueError(f"Scenario names must be unique; got {names}.")
 
@@ -2249,10 +2322,24 @@ def run(cfg: Config) -> pd.DataFrame:
             feed,
             events_all,
             cfg,
+            write_details=not screening,
         )
-        for scenario in cfg.scenarios
+        for scenario in scenarios
     ]
     summary = pd.DataFrame(summary_rows)
+    if screening:
+        # Rank the exposure table: riders at stake when ridership is loaded,
+        # else the operational scale of the route.
+        rank_col = next(
+            (
+                col
+                for col in ("riders_on_cut_service", "stop_boardings_lost_est", "revenue_hours_cut")
+                if col in summary.columns and summary[col].notna().any()
+            ),
+            None,
+        )
+        if rank_col:
+            summary = summary.sort_values(rank_col, ascending=False, ignore_index=True)
     summary_path = cfg.output_dir / SUMMARY_FILENAME
     summary.to_csv(summary_path, index=False)
     logging.info("Wrote: %s (%d scenario(s))", summary_path, len(summary))
@@ -2351,6 +2438,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=EXPORT_SCENARIO_GTFS,
         help="Write each scenario's surviving network as a GTFS feed folder.",
     )
+    p.add_argument(
+        "--each-route",
+        action="store_true",
+        default=False,
+        help=(
+            "Screening mode: ignore SCENARIOS and evaluate the elimination of every "
+            "route serving the analysis day, writing only the ranked summary."
+        ),
+    )
     return p
 
 
@@ -2385,7 +2481,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     cfg = Config(
         gtfs_dir=args.gtfs_dir,
         output_dir=Path(args.output_dir).expanduser(),
-        scenarios=SCENARIOS,
+        scenarios="each_route" if args.each_route else SCENARIOS,
         service_day=args.service_day,
         service_date=args.service_date,
         time_bin_minutes=args.time_bin_minutes,
