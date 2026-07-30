@@ -123,6 +123,7 @@ transit_planning_with_python/
 │       ├── gtfs_linear_diff_gpd.py
 │       ├── gtfs_route_diff.py
 │       ├── gtfs_stop_diff.py
+│       ├── service_cut_impact_gpd.py
 │       ├── stop_impacts_target_routes.py
 │       ├── stop_removal_impact_gpd.py
 │       ├── stop_spacing_flagger_arcpy.py
