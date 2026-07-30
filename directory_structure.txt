@@ -102,6 +102,7 @@ transit_planning_with_python/
 │   │   ├── ntd_anchor_builder.py
 │   │   ├── ntd_monthly_summary.py
 │   │   ├── ntd_monthly_trends_export.py
+│   │   ├── ridership_by_hour.py
 │   │   ├── ridership_from_tides.py
 │   │   ├── stops_ridership_joiner_arcpy.py
 │   │   └── stops_ridership_joiner_gpd.py
@@ -123,6 +124,7 @@ transit_planning_with_python/
 │       ├── gtfs_linear_diff_gpd.py
 │       ├── gtfs_route_diff.py
 │       ├── gtfs_stop_diff.py
+│       ├── service_cut_impact_gpd.py
 │       ├── stop_impacts_target_routes.py
 │       ├── stop_removal_impact_gpd.py
 │       ├── stop_spacing_flagger_arcpy.py
