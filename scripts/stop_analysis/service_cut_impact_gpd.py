@@ -21,6 +21,8 @@ Inputs:
       fields to apportion over lost coverage.
     - Optional trip-level ridership CSV of average daily boardings by ``trip_id`` (and
       optionally ``stop_id``), from APC/ridecheck processing.
+    - Optional stop-level ridership CSV at route × stop grain (a vendor "stop usage"
+      export) for boardings-lost estimates when trip-level data is unavailable.
 
 Outputs:
     - ``scenario_summary.csv``: one row per scenario — trips cut/truncated, stops
@@ -35,6 +37,9 @@ Outputs:
       and ``_removed_lines.shp`` (route alignments still run / no longer run by
       any trip, from shapes.txt) and ``_remaining_coverage.shp`` (walk buffer of
       the surviving network).
+    - ``<scenario>_gtfs/`` per scenario (``EXPORT_SCENARIO_GTFS``): the surviving
+      network as a standalone GTFS feed (cuts applied across all service days),
+      so any other tool can run baseline-vs-scenario comparisons.
     - A run-log sidecar capturing the verbatim CONFIGURATION block.
 
 Limitations:
@@ -134,6 +139,12 @@ FILTER_TO_PLATFORM_STOPS: bool = True
 # truncations do not redraw alignments.
 EXPORT_MAP_LAYERS: bool = True
 
+# Also write each scenario's surviving network as a standalone GTFS feed folder
+# (<name>_gtfs/), so any other script in this repo can run baseline-vs-scenario
+# comparisons on ordinary feeds. Cuts are applied across ALL service days —
+# not just the analysis day — so the exported feed is the scenario network.
+EXPORT_SCENARIO_GTFS: bool = False
+
 # Optional demographics polygon layer; numeric DEMOGRAPHIC_FIELDS are apportioned
 # onto lost coverage by area weighting. Leave the path "" to skip.
 DEMOGRAPHICS_PATH: str = r""
@@ -146,6 +157,16 @@ RIDERSHIP_CSV: str = r""
 RIDERSHIP_TRIP_ID_COL: str = "trip_id"
 RIDERSHIP_STOP_ID_COL: str = "stop_id"
 RIDERSHIP_BOARDINGS_COL: str = "avg_daily_boardings"
+
+# Optional stop-level ridership CSV at route × stop grain (a vendor "stop usage"
+# export: one row per route/direction/stop with average daily boardings). Route
+# values match route_short_name or route_id. Enables boardings-lost estimates —
+# exact for stops/route-pairs losing all service, prorated by trip share for
+# partial cuts — without needing trip-level data. Leave the path "" to skip.
+STOP_RIDERSHIP_CSV: str = r""
+STOP_RIDERSHIP_ROUTE_COL: str = "ROUTE_NUMBER"
+STOP_RIDERSHIP_STOP_ID_COL: str = "STOP_ID"
+STOP_RIDERSHIP_BOARDINGS_COL: str = "XBOARDINGS"
 
 # Cross-scenario summary filename (per-scenario files are prefixed by scenario name).
 SUMMARY_FILENAME: str = r"scenario_summary.csv"
@@ -795,9 +816,11 @@ class Config(NamedTuple):
     crs_units: str = CRS_UNITS
     filter_platform_stops: bool = FILTER_TO_PLATFORM_STOPS
     export_map_layers: bool = EXPORT_MAP_LAYERS
+    export_scenario_gtfs: bool = EXPORT_SCENARIO_GTFS
     demographics_path: str = DEMOGRAPHICS_PATH
     demographic_fields: Sequence[str] = tuple(DEMOGRAPHIC_FIELDS)
     ridership_csv: str = RIDERSHIP_CSV
+    stop_ridership_csv: str = STOP_RIDERSHIP_CSV
 
 
 # =============================================================================
@@ -1504,6 +1527,225 @@ def ridership_impacts(
     )
 
 
+def load_stop_ridership(
+    path: str,
+    route_col: str,
+    stop_col: str,
+    boardings_col: str,
+    routes: pd.DataFrame,
+) -> Optional[pd.DataFrame]:
+    """Load the optional route × stop stop-usage CSV and resolve its route ids.
+
+    Args:
+        path: CSV path ("" disables stop-level ridership accounting).
+        route_col: Column holding the route (matched against route_short_name
+            or route_id, like scenario route tokens).
+        stop_col: Column holding GTFS ``stop_id``.
+        boardings_col: Numeric average-daily-boardings column.
+        routes: Parsed ``routes.txt`` (for route resolution).
+
+    Returns:
+        ``None`` when disabled, else a frame with ``route_id``, ``stop_id``,
+        ``boardings`` summed by pair. Rows whose route value matches nothing in
+        routes.txt are dropped with a warning.
+
+    Raises:
+        FileNotFoundError: If *path* is set but does not exist.
+        ValueError: If required columns are missing.
+    """
+    if not path.strip():
+        return None
+    csv_path = Path(path)
+    if not csv_path.exists():
+        raise FileNotFoundError(f"Stop ridership CSV not found: {csv_path}")
+    usage = pd.read_csv(csv_path, dtype=str)
+    for col in (route_col, stop_col, boardings_col):
+        if col not in usage.columns:
+            raise ValueError(f"Stop ridership CSV is missing required column {col!r}.")
+    usage = usage.rename(
+        columns={route_col: "route_token", stop_col: "stop_id", boardings_col: "boardings"}
+    )
+    usage["route_token"] = usage["route_token"].astype(str).str.strip()
+    usage["stop_id"] = usage["stop_id"].astype(str).str.strip()
+    usage["boardings"] = pd.to_numeric(usage["boardings"], errors="coerce")
+    bad = int(usage["boardings"].isna().sum())
+    if bad:
+        logging.warning("Stop ridership CSV: dropped %d row(s) with non-numeric boardings.", bad)
+        usage = usage[usage["boardings"].notna()]
+
+    r = routes.drop_duplicates(subset=["route_id"]).copy()
+    r["route_id"] = r["route_id"].astype(str).str.strip()
+    short = r.get("route_short_name", pd.Series(dtype=str)).fillna("").astype(str).str.strip()
+    token_to_id = dict(zip(r["route_id"], r["route_id"]))
+    token_to_id.update({s: rid for s, rid in zip(short, r["route_id"]) if s})
+    usage["route_id"] = usage["route_token"].map(token_to_id)
+    unmatched = usage.loc[usage["route_id"].isna(), "route_token"].unique()
+    if len(unmatched):
+        logging.warning(
+            "Stop ridership CSV: %d route value(s) match nothing in routes.txt "
+            "(e.g. %s) — their rows are ignored.",
+            len(unmatched),
+            ", ".join(sorted(unmatched)[:5]),
+        )
+        usage = usage[usage["route_id"].notna()]
+    out = usage.groupby(["route_id", "stop_id"], as_index=False)["boardings"].sum()
+    logging.info("Stop ridership loaded: %d route × stop pair(s).", len(out))
+    return out
+
+
+def stop_ridership_impacts(
+    events: pd.DataFrame,
+    drop_mask: pd.Series,
+    eliminated_stop_ids: set[str],
+    stop_usage: Optional[pd.DataFrame],
+) -> tuple[dict[str, float], pd.Series]:
+    """Estimate boardings lost from route × stop stop-usage averages.
+
+    For each (route, stop) pair, the pair's daily boardings are scaled by the
+    share of that pair's trips the scenario removes — exact when the pair loses
+    all service, a proportional estimate for partial cuts (which assumes riders
+    are spread evenly across the pair's trips).
+
+    Args:
+        events: Baseline event table.
+        drop_mask: Boolean drop mask over *events*.
+        eliminated_stop_ids: Stops whose service goes to zero.
+        stop_usage: Output of :func:`load_stop_ridership` (``None`` disables).
+
+    Returns:
+        Tuple of (summary dict with ``stop_boardings_lost_est`` and
+        ``stop_riders_at_eliminated_stops``, per-stop estimated-boardings-lost
+        Series indexed by stop_id).
+    """
+    empty = pd.Series(dtype=float)
+    if stop_usage is None:
+        return {}, empty
+
+    pair_base = events.groupby(["route_id", "stop_id"])["trip_id"].nunique().rename("trips_base")
+    pair_dropped = (
+        events[drop_mask]
+        .groupby(["route_id", "stop_id"])["trip_id"]
+        .nunique()
+        .rename("trips_dropped")
+    )
+    pairs = pd.concat([pair_base, pair_dropped], axis=1).fillna(0)
+    pairs["share_cut"] = pairs["trips_dropped"] / pairs["trips_base"]
+
+    joined = stop_usage.merge(
+        pairs.reset_index(), on=["route_id", "stop_id"], how="inner", validate="one_to_one"
+    )
+    matched_pairs = len(joined)
+    if matched_pairs < len(stop_usage):
+        logging.info(
+            "Stop ridership: %d of %d pair(s) matched service on the analysis day.",
+            matched_pairs,
+            len(stop_usage),
+        )
+    joined["boardings_lost"] = joined["boardings"] * joined["share_cut"]
+    per_stop = joined.groupby("stop_id")["boardings_lost"].sum()
+    per_stop = per_stop[per_stop > 0]
+
+    # Scope to pairs with analysis-day service so boardings attributed to routes
+    # that only run other day types (e.g. a holiday loop) don't inflate the total.
+    at_eliminated = float(
+        joined.loc[joined["stop_id"].isin(eliminated_stop_ids), "boardings"].sum()
+    )
+    return (
+        {
+            "stop_boardings_lost_est": round(float(joined["boardings_lost"].sum()), 1),
+            "stop_riders_at_eliminated_stops": round(at_eliminated, 1),
+        },
+        per_stop,
+    )
+
+
+def export_scenario_gtfs(
+    gtfs_dir: str,
+    feed: Mapping[str, Optional[pd.DataFrame]],
+    events_all: pd.DataFrame,
+    drop_mask_all: pd.Series,
+    output_dir: Path,
+    token: str,
+) -> None:
+    """Write the scenario's surviving network as a standalone GTFS feed folder.
+
+    The cut is applied across every service day (*events_all* spans the whole
+    feed, not just the analysis day): masked (trip, stop) pairs are removed from
+    ``stop_times``, trips left with no stop events are removed from ``trips``
+    (and ``frequencies``), routes left with no trips are removed from
+    ``routes``, and every other ``.txt`` in the source feed is copied through
+    verbatim — so the folder is a complete feed any GTFS tool can consume.
+
+    Args:
+        gtfs_dir: Source feed folder or .zip (for copy-through files).
+        feed: Loaded feed tables from :func:`load_feed`.
+        events_all: All-days event table from :func:`build_events` with no
+            service filter.
+        drop_mask_all: The scenario's drop mask resolved over *events_all*.
+        output_dir: Destination folder.
+        token: Sanitized scenario name; the feed lands in ``<token>_gtfs/``.
+    """
+    dest = output_dir / f"{token}_gtfs"
+    dest.mkdir(parents=True, exist_ok=True)
+
+    dropped = events_all[drop_mask_all]
+    surviving_trips = set(events_all.loc[~drop_mask_all, "trip_id"])
+    removed_trips = set(events_all["trip_id"]) - surviving_trips
+    dropped_pairs = set(zip(dropped["trip_id"], dropped["stop_id"]))
+
+    stop_times = feed["stop_times"]
+    trips = feed["trips"]
+    routes = feed["routes"]
+    assert isinstance(stop_times, pd.DataFrame)
+    assert isinstance(trips, pd.DataFrame)
+    assert isinstance(routes, pd.DataFrame)
+
+    st = stop_times.copy()
+    st["_trip"] = st["trip_id"].astype(str)
+    pair_key = pd.Series(
+        list(zip(st["_trip"], st["stop_id"].astype(str))), index=st.index, dtype=object
+    )
+    keep = ~st["_trip"].isin(removed_trips) & ~pair_key.isin(dropped_pairs)
+    st_out = st[keep].drop(columns="_trip")
+
+    kept_trip_ids = set(st_out["trip_id"].astype(str))
+    trips_out = trips[trips["trip_id"].astype(str).isin(kept_trip_ids)]
+    kept_route_ids = set(trips_out["route_id"].astype(str))
+    routes_out = routes[routes["route_id"].astype(str).isin(kept_route_ids)]
+    removed_routes = len(routes) - len(routes_out)
+
+    st_out.to_csv(dest / "stop_times.txt", index=False)
+    trips_out.to_csv(dest / "trips.txt", index=False)
+    routes_out.to_csv(dest / "routes.txt", index=False)
+    rewritten = {"stop_times.txt", "trips.txt", "routes.txt"}
+
+    freq = feed.get("frequencies")
+    if freq is not None and not freq.empty:
+        freq_out = freq[~freq["trip_id"].astype(str).isin(removed_trips)]
+        freq_out.to_csv(dest / "frequencies.txt", index=False)
+        rewritten.add("frequencies.txt")
+
+    src = Path(gtfs_dir)
+    if src.is_dir():
+        for txt in sorted(src.glob("*.txt")):
+            if txt.name not in rewritten:
+                (dest / txt.name).write_bytes(txt.read_bytes())
+    elif src.is_file() and src.suffix.lower() == ".zip":
+        with zipfile.ZipFile(src) as archive:
+            for member in archive.namelist():
+                base = os.path.basename(member)
+                if base.endswith(".txt") and base not in rewritten:
+                    (dest / base).write_bytes(archive.read(member))
+
+    logging.info(
+        "Wrote: %s (scenario GTFS — removed %d trip(s), %d route(s), %d stop event(s))",
+        dest,
+        len(removed_trips),
+        removed_routes,
+        len(stop_times) - len(st_out),
+    )
+
+
 def build_shape_lines(shapes: Optional[pd.DataFrame], crs_epsg: int) -> gpd.GeoDataFrame:
     """Assemble one projected LineString per shape from ``shapes.txt``.
 
@@ -1696,6 +1938,9 @@ def run_scenario(
     shape_miles: pd.Series,
     demographics: Optional[gpd.GeoDataFrame],
     ridership: Optional[tuple[pd.DataFrame, pd.DataFrame]],
+    stop_usage: Optional[pd.DataFrame],
+    feed: Mapping[str, Optional[pd.DataFrame]],
+    events_all: Optional[pd.DataFrame],
     cfg: Config,
 ) -> dict[str, Any]:
     """Evaluate one scenario end-to-end and write its per-scenario outputs.
@@ -1710,6 +1955,10 @@ def run_scenario(
         shape_miles: Shape lengths from :func:`shape_length_miles`.
         demographics: Projected demographics polygons or ``None``.
         ridership: Output of :func:`load_ridership` or ``None``.
+        stop_usage: Output of :func:`load_stop_ridership` or ``None``.
+        feed: Loaded feed tables (for the scenario GTFS export).
+        events_all: All-days event table for the GTFS export, or ``None`` when
+            the export is disabled.
         cfg: Resolved configuration.
 
     Returns:
@@ -1759,6 +2008,13 @@ def run_scenario(
         impacts["boardings_lost"] = (
             impacts["stop_id"].map(boardings_lost_by_stop).fillna(0.0).round(1)
         )
+    stop_riders, est_lost_by_stop = stop_ridership_impacts(
+        events, drop_mask, eliminated_ids, stop_usage
+    )
+    if not est_lost_by_stop.empty:
+        impacts["stop_boardings_lost_est"] = (
+            impacts["stop_id"].map(est_lost_by_stop).fillna(0.0).round(1)
+        )
 
     impacted = impacts[impacts["classification"] != "unchanged"].copy()
     impacts_path = cfg.output_dir / f"{token}_stop_impacts.csv"
@@ -1802,6 +2058,10 @@ def run_scenario(
         if not shape_lines.empty:
             export_line_layers(events, drop_mask, trips, shape_lines, cfg.output_dir, token)
 
+    if cfg.export_scenario_gtfs and events_all is not None:
+        drop_mask_all = resolve_drop_mask(scenario, events_all, routes)
+        export_scenario_gtfs(cfg.gtfs_dir, feed, events_all, drop_mask_all, cfg.output_dir, token)
+
     stop_bins_lost_total = int(impacts["time_bins_lost"].sum())
     routes_affected = _as_sorted_csv(dropped["route_label"].tolist()) if not dropped.empty else ""
 
@@ -1818,6 +2078,7 @@ def run_scenario(
         **ops,
         **demo_lost,
         **riders,
+        **stop_riders,
     }
     hours = summary.get("revenue_hours_cut") or 0
     if riders and hours:
@@ -1953,6 +2214,21 @@ def run(cfg: Config) -> pd.DataFrame:
             trip_sums[trip_sums["trip_id"].isin(day_trips)].reset_index(drop=True),
         )
 
+    stop_usage = load_stop_ridership(
+        cfg.stop_ridership_csv,
+        STOP_RIDERSHIP_ROUTE_COL,
+        STOP_RIDERSHIP_STOP_ID_COL,
+        STOP_RIDERSHIP_BOARDINGS_COL,
+        routes,
+    )
+
+    events_all: Optional[pd.DataFrame] = None
+    if cfg.export_scenario_gtfs:
+        # The exported feeds apply each cut across every service day, so the
+        # scenario masks are re-resolved over an unfiltered event table.
+        logging.info("Scenario GTFS export enabled — building the all-days event table.")
+        events_all = build_events(stop_times, trips, routes, service_ids=None)
+
     names = [str(s.get("name", "")).strip() for s in cfg.scenarios]
     if len(names) != len(set(names)):
         raise ValueError(f"Scenario names must be unique; got {names}.")
@@ -1969,6 +2245,9 @@ def run(cfg: Config) -> pd.DataFrame:
             shape_miles,
             demographics,
             ridership,
+            stop_usage,
+            feed,
+            events_all,
             cfg,
         )
         for scenario in cfg.scenarios
@@ -2061,6 +2340,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=EXPORT_MAP_LAYERS,
         help="Write remaining/removed line and remaining-coverage layers per scenario.",
     )
+    p.add_argument(
+        "--stop-ridership",
+        default=STOP_RIDERSHIP_CSV,
+        help="Optional route x stop stop-usage CSV ('' disables).",
+    )
+    p.add_argument(
+        "--scenario-gtfs",
+        action=argparse.BooleanOptionalAction,
+        default=EXPORT_SCENARIO_GTFS,
+        help="Write each scenario's surviving network as a GTFS feed folder.",
+    )
     return p
 
 
@@ -2105,7 +2395,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         demographics_path=args.demographics,
         demographic_fields=list(args.demographic_fields),
         ridership_csv=args.ridership,
+        stop_ridership_csv=args.stop_ridership,
         export_map_layers=bool(args.map_layers),
+        export_scenario_gtfs=bool(args.scenario_gtfs),
     )
 
     try:
