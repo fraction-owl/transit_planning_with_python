@@ -31,6 +31,10 @@ Outputs:
     - ``<scenario>_stop_time_bins.csv``: long-format stop × time-bin trip counts,
       baseline vs scenario.
     - ``<scenario>_lost_coverage.shp``: polygon of walk-buffer coverage lost.
+    - Map layers per scenario (``EXPORT_MAP_LAYERS``): ``_remaining_lines.shp``
+      and ``_removed_lines.shp`` (route alignments still run / no longer run by
+      any trip, from shapes.txt) and ``_remaining_coverage.shp`` (walk buffer of
+      the surviving network).
     - A run-log sidecar capturing the verbatim CONFIGURATION block.
 
 Limitations:
@@ -123,6 +127,12 @@ CRS_UNITS: str = "feet"
 
 # Keep only platform stops (location_type 0 or blank) in stop-level outputs.
 FILTER_TO_PLATFORM_STOPS: bool = True
+
+# Also export per-scenario mapping layers: remaining route lines, removed route
+# lines (shapes no surviving trip uses; needs shapes.txt), and the remaining
+# network's walk-buffer coverage. Line layers reflect whole-trip cuts —
+# truncations do not redraw alignments.
+EXPORT_MAP_LAYERS: bool = True
 
 # Optional demographics polygon layer; numeric DEMOGRAPHIC_FIELDS are apportioned
 # onto lost coverage by area weighting. Leave the path "" to skip.
@@ -784,6 +794,7 @@ class Config(NamedTuple):
     crs_epsg: int = CRS_EPSG_CODE
     crs_units: str = CRS_UNITS
     filter_platform_stops: bool = FILTER_TO_PLATFORM_STOPS
+    export_map_layers: bool = EXPORT_MAP_LAYERS
     demographics_path: str = DEMOGRAPHICS_PATH
     demographic_fields: Sequence[str] = tuple(DEMOGRAPHIC_FIELDS)
     ridership_csv: str = RIDERSHIP_CSV
@@ -1304,7 +1315,7 @@ def coverage_stats(
     stops_gdf: gpd.GeoDataFrame,
     buffer_miles: float,
     crs_units: str,
-) -> tuple[float, float, BaseGeometry]:
+) -> tuple[float, float, BaseGeometry, BaseGeometry]:
     """Compare walk-buffer coverage of served stops before and after the cut.
 
     Args:
@@ -1316,7 +1327,8 @@ def coverage_stats(
 
     Returns:
         Tuple of (baseline area sq mi, scenario area sq mi, lost-coverage
-        geometry in the projected CRS — possibly empty).
+        geometry, remaining-coverage geometry) — geometries in the projected
+        CRS, possibly empty.
     """
     radius = _miles_to_crs_units(buffer_miles, crs_units)
 
@@ -1333,6 +1345,7 @@ def coverage_stats(
         _area_to_sqmi(base_union.area, crs_units),
         _area_to_sqmi(scen_union.area, crs_units),
         lost,
+        scen_union,
     )
 
 
@@ -1491,19 +1504,20 @@ def ridership_impacts(
     )
 
 
-def shape_length_miles(shapes: Optional[pd.DataFrame], crs_epsg: int, crs_units: str) -> pd.Series:
-    """Measure each shape's length in miles in the projected CRS.
+def build_shape_lines(shapes: Optional[pd.DataFrame], crs_epsg: int) -> gpd.GeoDataFrame:
+    """Assemble one projected LineString per shape from ``shapes.txt``.
 
     Args:
         shapes: Parsed ``shapes.txt`` or ``None``.
         crs_epsg: EPSG code of the projected analysis CRS.
-        crs_units: Linear unit of that CRS.
 
     Returns:
-        Series of miles indexed by ``shape_id`` (empty when shapes are missing).
+        GeoDataFrame with ``shape_id`` and line geometry (empty when shapes are
+        missing or no shape has two usable points).
     """
+    empty = gpd.GeoDataFrame({"shape_id": []}, geometry=[], crs=f"EPSG:{crs_epsg}")
     if shapes is None or shapes.empty:
-        return pd.Series(dtype=float)
+        return empty
     pts = shapes.copy()
     pts["shape_pt_sequence"] = pd.to_numeric(pts["shape_pt_sequence"], errors="coerce")
     pts["shape_pt_lat"] = pd.to_numeric(pts["shape_pt_lat"], errors="coerce")
@@ -1519,10 +1533,88 @@ def shape_length_miles(shapes: Optional[pd.DataFrame], crs_epsg: int, crs_units:
         ids.append(str(shape_id))
         lines.append(LineString(zip(group["shape_pt_lon"], group["shape_pt_lat"])))
     if not lines:
+        return empty
+    gdf = gpd.GeoDataFrame({"shape_id": ids}, geometry=lines, crs="EPSG:4326")
+    return gdf.to_crs(epsg=crs_epsg)
+
+
+def shape_length_miles(shape_lines: gpd.GeoDataFrame, crs_units: str) -> pd.Series:
+    """Measure each shape line's length in miles.
+
+    Args:
+        shape_lines: Output of :func:`build_shape_lines`.
+        crs_units: Linear unit of the projected CRS.
+
+    Returns:
+        Series of miles indexed by ``shape_id`` (empty when no lines exist).
+    """
+    if shape_lines.empty:
         return pd.Series(dtype=float)
-    lengths = gpd.GeoSeries(lines, crs="EPSG:4326").to_crs(epsg=crs_epsg).length
-    miles = lengths.map(lambda v: convert_distance(v, input_unit=crs_units, output_unit="miles"))
-    return pd.Series(pd.to_numeric(miles, errors="coerce").to_numpy(), index=ids)
+    miles = shape_lines.geometry.length.map(
+        lambda v: convert_distance(v, input_unit=crs_units, output_unit="miles")
+    )
+    return pd.Series(
+        pd.to_numeric(miles, errors="coerce").to_numpy(), index=shape_lines["shape_id"].tolist()
+    )
+
+
+def export_line_layers(
+    events: pd.DataFrame,
+    drop_mask: pd.Series,
+    trips: pd.DataFrame,
+    shape_lines: gpd.GeoDataFrame,
+    output_dir: Path,
+    token: str,
+) -> None:
+    """Write the remaining- and removed-alignment line shapefiles for a scenario.
+
+    A shape is *removed* when baseline trips ran it but no surviving trip does,
+    and *remaining* otherwise. Truncations keep their (unchanged) shape in the
+    remaining layer. Each feature carries the routes using the shape and its
+    baseline/surviving trip counts.
+
+    Args:
+        events: Baseline event table.
+        drop_mask: Boolean drop mask over *events*.
+        trips: Parsed ``trips.txt`` (for the trip -> shape_id mapping).
+        shape_lines: Output of :func:`build_shape_lines` (non-empty).
+        output_dir: Destination folder.
+        token: Sanitized scenario name used as the filename prefix.
+    """
+    trip_info = events.drop_duplicates(subset=["trip_id"])[["trip_id", "route_label"]]
+    shape_map = trips.drop_duplicates(subset=["trip_id"])[["trip_id", "shape_id"]].copy()
+    if "shape_id" not in shape_map.columns:
+        return
+    shape_map["trip_id"] = shape_map["trip_id"].astype(str)
+    shape_map["shape_id"] = shape_map["shape_id"].fillna("").astype(str)
+    usage = trip_info.merge(shape_map, on="trip_id", how="left")
+    usage = usage[usage["shape_id"] != ""]
+    if usage.empty:
+        logging.warning("No baseline trip has a shape_id — line layers skipped.")
+        return
+
+    surviving_trips = set(events.loc[~drop_mask, "trip_id"])
+    usage["surviving"] = usage["trip_id"].isin(surviving_trips)
+    per_shape = usage.groupby("shape_id").agg(
+        routes=("route_label", lambda s: _as_sorted_csv(s.tolist())),
+        trips_base=("trip_id", "nunique"),
+        trips_left=("surviving", "sum"),
+    )
+    per_shape["trips_left"] = per_shape["trips_left"].astype(int)
+    layer = shape_lines.merge(per_shape, on="shape_id", how="inner")
+    missing_geom = len(per_shape) - len(layer)
+    if missing_geom:
+        logging.warning("%d used shape(s) have no drawable geometry in shapes.txt.", missing_geom)
+
+    for label, subset in (
+        ("remaining_lines", layer[layer["trips_left"] > 0]),
+        ("removed_lines", layer[layer["trips_left"] == 0]),
+    ):
+        if subset.empty:
+            continue
+        path = output_dir / f"{token}_{label}.shp"
+        subset.to_file(path)
+        logging.info("Wrote: %s (%d shape(s))", path, len(subset))
 
 
 def operational_savings(
@@ -1600,6 +1692,7 @@ def run_scenario(
     routes: pd.DataFrame,
     trips: pd.DataFrame,
     stops_gdf: gpd.GeoDataFrame,
+    shape_lines: gpd.GeoDataFrame,
     shape_miles: pd.Series,
     demographics: Optional[gpd.GeoDataFrame],
     ridership: Optional[tuple[pd.DataFrame, pd.DataFrame]],
@@ -1613,6 +1706,7 @@ def run_scenario(
         routes: Parsed ``routes.txt``.
         trips: Parsed ``trips.txt``.
         stops_gdf: Projected stops layer.
+        shape_lines: Projected shape lines from :func:`build_shape_lines`.
         shape_miles: Shape lengths from :func:`shape_length_miles`.
         demographics: Projected demographics polygons or ``None``.
         ridership: Output of :func:`load_ridership` or ``None``.
@@ -1646,7 +1740,7 @@ def run_scenario(
     cut_trip_ids = set(events["trip_id"]) - set(surviving["trip_id"])
 
     ops = operational_savings(events, drop_mask, trips, shape_miles)
-    base_sqmi, scen_sqmi, lost_geom = coverage_stats(
+    base_sqmi, scen_sqmi, lost_geom, remaining_geom = coverage_stats(
         set(base_stats.index),
         set(scen_stats.index),
         stops_gdf,
@@ -1696,6 +1790,17 @@ def run_scenario(
         coverage_path = cfg.output_dir / f"{token}_lost_coverage.shp"
         lost_gdf.to_file(coverage_path)
         logging.info("Wrote: %s (%.2f sq mi lost)", coverage_path, lost_sqmi)
+
+    if cfg.export_map_layers:
+        if not remaining_geom.is_empty and remaining_geom.area > 0:
+            remaining_gdf = gpd.GeoDataFrame(
+                {"scenario": [name]}, geometry=[remaining_geom], crs=f"EPSG:{cfg.crs_epsg}"
+            )
+            remaining_path = cfg.output_dir / f"{token}_remaining_coverage.shp"
+            remaining_gdf.to_file(remaining_path)
+            logging.info("Wrote: %s (%.2f sq mi remaining)", remaining_path, scen_sqmi)
+        if not shape_lines.empty:
+            export_line_layers(events, drop_mask, trips, shape_lines, cfg.output_dir, token)
 
     stop_bins_lost_total = int(impacts["time_bins_lost"].sum())
     routes_affected = _as_sorted_csv(dropped["route_label"].tolist()) if not dropped.empty else ""
@@ -1811,9 +1916,12 @@ def run(cfg: Config) -> pd.DataFrame:
     )
     events = build_events(stop_times, trips, routes, service_ids)
     stops_gdf = prepare_stops_gdf(stops, cfg.filter_platform_stops, cfg.crs_epsg)
-    shape_miles = shape_length_miles(feed["shapes"], cfg.crs_epsg, cfg.crs_units)
-    if shape_miles.empty:
-        logging.warning("No usable shapes.txt — revenue_miles_cut will be blank.")
+    shape_lines = build_shape_lines(feed["shapes"], cfg.crs_epsg)
+    shape_miles = shape_length_miles(shape_lines, cfg.crs_units)
+    if shape_lines.empty:
+        logging.warning(
+            "No usable shapes.txt — revenue_miles_cut will be blank and line layers skipped."
+        )
 
     demographics: Optional[gpd.GeoDataFrame] = None
     if cfg.demographics_path.strip():
@@ -1852,7 +1960,16 @@ def run(cfg: Config) -> pd.DataFrame:
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
     summary_rows = [
         run_scenario(
-            scenario, events, routes, trips, stops_gdf, shape_miles, demographics, ridership, cfg
+            scenario,
+            events,
+            routes,
+            trips,
+            stops_gdf,
+            shape_lines,
+            shape_miles,
+            demographics,
+            ridership,
+            cfg,
         )
         for scenario in cfg.scenarios
     ]
@@ -1938,6 +2055,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=RIDERSHIP_CSV,
         help="Optional trip-level ridership CSV ('' disables).",
     )
+    p.add_argument(
+        "--map-layers",
+        action=argparse.BooleanOptionalAction,
+        default=EXPORT_MAP_LAYERS,
+        help="Write remaining/removed line and remaining-coverage layers per scenario.",
+    )
     return p
 
 
@@ -1982,6 +2105,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         demographics_path=args.demographics,
         demographic_fields=list(args.demographic_fields),
         ridership_csv=args.ridership,
+        export_map_layers=bool(args.map_layers),
     )
 
     try:
