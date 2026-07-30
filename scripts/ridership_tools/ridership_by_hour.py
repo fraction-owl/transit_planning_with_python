@@ -9,10 +9,11 @@ hour of its start time. ``"tides"`` derives the same table from raw TIDES
 stop visit actually occurred and averaging across the service dates observed for
 each day type.
 
-Hours are expressed on the GTFS-style service-day clock: trips or events in the
-small hours (before ``LATE_NIGHT_CUTOVER_HOUR``) are treated as hour 24+ of the
-prior service day, so late-night service does not masquerade as early-morning
-ridership.
+Hours are expressed on the GTFS-style service-day clock, the industry convention
+for owl service: trips or events in the small hours (before
+``LATE_NIGHT_CUTOVER_HOUR``) are treated as hours 24-27 of the prior service
+day, so late-night service does not masquerade as early-morning ridership and
+the default service day runs 04:00-27:59.
 
 Inputs:
     - ``route_trip_xlsx`` mode: one workbook per day type (weekday/saturday/
@@ -112,8 +113,10 @@ TIDES_ALIGHTING_COLS: Sequence[str] = ("alighting_1", "alighting_2")
 
 # --- shared -------------------------------------------------------------------
 # Events/trips starting before this clock hour belong to the prior service day
-# and are shifted to hour 24+ (e.g. a 00:30 owl trip becomes hour 24).
-LATE_NIGHT_CUTOVER_HOUR: int = 3
+# and are shifted to hour 24+ (e.g. a 00:30 owl trip becomes hour 24, a 2:15
+# trip hour 26). The default 4 gives the industry-standard 04:00-27:59 service
+# day; set 3 if your agency's service day starts at 3am (hours run to 26).
+LATE_NIGHT_CUTOVER_HOUR: int = 4
 
 # Optional route filters (matched against the route column as strings).
 ROUTES_TO_INCLUDE: Sequence[str] = ()
@@ -456,7 +459,10 @@ def _event_service_hour(time_value: object, service_date: object, cutover_hour: 
     """Locate one stop-visit event on the service-day hour clock.
 
     Full timestamps are compared against the service date, so an event logged
-    at 00:30 on the calendar day after its service date lands at hour 24.
+    at 00:30 on the calendar day after its service date lands at hour 24. An
+    event timestamped in the small hours *of the service date itself* (a vendor
+    that stamps owl events with the operating day's date) gets the same
+    cutover shift, so hours below the cutover never appear either way.
     Time-only values fall back to the cutover rule.
 
     Args:
@@ -472,8 +478,8 @@ def _event_service_hour(time_value: object, service_date: object, cutover_hour: 
         day = pd.to_datetime(service_date, errors="coerce")
         if not pd.isna(day):
             offset_days = (stamp.date() - day.date()).days
-            if 0 <= offset_days <= 1:
-                return float(stamp.hour + 24 * offset_days)
+            if offset_days == 1:
+                return float(stamp.hour + 24)
         return float(_service_hour(stamp.hour, cutover_hour))
     minutes = parse_time_to_minutes(str(time_value))
     if minutes is None:
