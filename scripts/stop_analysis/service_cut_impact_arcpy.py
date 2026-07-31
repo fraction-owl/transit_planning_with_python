@@ -25,7 +25,10 @@ Inputs:
       shapefile, file geodatabase, ...) with numeric fields to apportion over
       lost coverage.
     - Optional trip-level ridership CSV of average daily boardings by ``trip_id`` (and
-      optionally ``stop_id``), from APC/ridecheck processing.
+      optionally ``stop_id``), from APC/ridecheck processing. Exports carrying no
+      GTFS trip_id match on route + start time (``RIDERSHIP_TRIP_MATCH_MODE``), and
+      one holding a row per trip per surveyed day is averaged over those days
+      rather than summed (``RIDERSHIP_DATE_COL``).
     - Optional stop-level ridership CSV at route × stop grain (a vendor "stop usage"
       export) for boardings-lost estimates when trip-level data is unavailable.
       Both ridership inputs may be .csv or .xlsx/.xls, and their stop ids may be
@@ -186,6 +189,15 @@ RIDERSHIP_TRIP_MATCH_MODE: str = "trip_id"
 RIDERSHIP_ROUTE_COL: str = "ROUTE_NUMBER"
 RIDERSHIP_START_TIME_COL: str = "TRIP_START_TIME"
 RIDERSHIP_START_TIME_TOLERANCE_MIN: int = 2
+
+# Set this when the ridership file holds one row per trip per OBSERVED DAY (an
+# APC/farebox export with a survey-date column) rather than one pre-averaged row
+# per trip. Boardings are then averaged across the distinct values of this
+# column instead of summed, which is what "average daily boardings" means — left
+# blank, a file spanning N survey days overstates every trip by roughly N times.
+# The average is taken over the days a trip actually appears, so a trip observed
+# on 18 of 30 days is averaged over those 18.
+RIDERSHIP_DATE_COL: str = ""
 
 # Optional stop-level ridership CSV at route × stop grain (a vendor "stop usage"
 # export: one row per route/direction/stop with average daily boardings). Route
@@ -894,6 +906,8 @@ class RidershipSpec(NamedTuple):
         route_col: Route column used by ``route_start_time`` mode.
         start_time_col: Trip start-time column used by that mode.
         tolerance_min: Minutes of slack allowed against the GTFS departure.
+        date_col: Optional survey-date column; when set, boardings are averaged
+            across its distinct values rather than summed.
     """
 
     trip_col: str = RIDERSHIP_TRIP_ID_COL
@@ -903,6 +917,7 @@ class RidershipSpec(NamedTuple):
     route_col: str = RIDERSHIP_ROUTE_COL
     start_time_col: str = RIDERSHIP_START_TIME_COL
     tolerance_min: int = RIDERSHIP_START_TIME_TOLERANCE_MIN
+    date_col: str = RIDERSHIP_DATE_COL
 
 
 class Baseline(NamedTuple):
@@ -2130,20 +2145,32 @@ def match_trips_by_route_and_time(
     assigned = [trip_id for trip_id in matched if trip_id]
     distinct = len(set(assigned))
     if distinct and len(assigned) > distinct:
-        # Rows sharing a trip have their boardings summed. That is right for
-        # the two directions of a loop, and badly wrong when the start times
-        # are not actually distinguishing trips.
-        busiest = pd.Series(assigned).value_counts()
-        logging.warning(
-            "Ridership: %d matched row(s) share only %d distinct trip(s), and boardings for "
-            "rows landing on the same trip are summed. Trip %s absorbed %d row(s) — if that "
-            "count is large, %r is not distinguishing trips.",
-            len(assigned),
-            distinct,
-            busiest.index[0],
-            int(busiest.iloc[0]),
-            spec.start_time_col,
-        )
+        if str(spec.date_col).strip():
+            # Expected: one row per trip per observed day, averaged downstream.
+            logging.info(
+                "Ridership: %d matched row(s) cover %d distinct trip(s) — normal for a "
+                "multi-day file, and boardings are averaged across %r.",
+                len(assigned),
+                distinct,
+                spec.date_col,
+            )
+        else:
+            # Rows sharing a trip have their boardings summed. That is right for
+            # the two directions of a loop, and badly wrong for a file holding
+            # one row per trip per observed day.
+            busiest = pd.Series(assigned).value_counts()
+            logging.warning(
+                "Ridership: %d matched row(s) share only %d distinct trip(s), and boardings "
+                "for rows landing on the same trip are SUMMED. Trip %s absorbed %d row(s). "
+                "If this file carries one row per trip per observed day, set RIDERSHIP_DATE_COL "
+                "to its survey-date column — otherwise every trip is overstated by roughly that "
+                "multiple. If it is a single day of data, %r is not distinguishing trips.",
+                len(assigned),
+                distinct,
+                busiest.index[0],
+                int(busiest.iloc[0]),
+                spec.start_time_col,
+            )
     return pd.Series(matched, index=frame.index, dtype=object)
 
 
@@ -2273,6 +2300,22 @@ def load_ridership(
                 f"Columns found: {', '.join(map(str, ridership.columns))}."
             )
 
+    date_col = str(spec.date_col).strip()
+    date_key = "_ridership_survey_date"
+    if date_col:
+        if date_col not in ridership.columns:
+            raise ValueError(
+                f"RIDERSHIP_DATE_COL is set to {date_col!r}, which the ridership file does "
+                f"not have. Columns found: {', '.join(map(str, ridership.columns))}."
+            )
+        ridership[date_key] = ridership[date_col].astype(str).str.strip()
+        logging.info(
+            "Ridership: %r holds %d distinct value(s); boardings are averaged across them "
+            "rather than summed.",
+            date_col,
+            ridership[date_key].nunique(),
+        )
+
     if mode == "trip_id":
         ridership = ridership.rename(columns={spec.trip_col: "trip_id"})
     else:
@@ -2317,8 +2360,20 @@ def load_ridership(
         )
         trip_grain = trip_grain[~trip_grain["trip_id"].isin(overlap)]
 
-    stop_sums = stop_grain.groupby(["trip_id", "stop_id"])["boardings"].sum().reset_index()
-    trip_sums = trip_grain.groupby("trip_id")["boardings"].sum().reset_index()
+    def collapse(frame: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
+        """Total boardings per key, averaged across survey days when dated.
+
+        Rows are summed within a single day first, so a trip legitimately
+        carrying several rows on one date (both directions of a loop) still
+        totals correctly before the mean across dates is taken.
+        """
+        if not date_col:
+            return frame.groupby(keys)["boardings"].sum().reset_index()
+        per_day = frame.groupby(keys + [date_key])["boardings"].sum().reset_index()
+        return per_day.groupby(keys)["boardings"].mean().reset_index()
+
+    stop_sums = collapse(stop_grain, ["trip_id", "stop_id"])
+    trip_sums = collapse(trip_grain, ["trip_id"])
     logging.info(
         "Ridership loaded: %d stop-grain pair(s), %d trip-grain trip(s).",
         len(stop_sums),
