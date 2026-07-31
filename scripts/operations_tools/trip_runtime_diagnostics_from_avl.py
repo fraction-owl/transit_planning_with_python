@@ -6,8 +6,8 @@ summary statistics, emphasizing on-time performance (OTP) and 85th-percentile ru
 
 Two data-quality screens run alongside the performance review: start times with
 unusually few observations, and back-to-back trips whose runtimes or
-actual/scheduled ratios diverge far more than neighbors on the same
-pattern/shape variant should.
+actual/scheduled ratios diverge far more than neighbors on the same stop
+pattern should.
 
 Designed to support schedule tuning, the script suggests time-of-day bands using
 Fisher–Jenks segmentation and provides visual diagnostics for start time, runtime,
@@ -30,10 +30,12 @@ tag (e.g. ``WEEKDAY``):
   adjustment.
 - ``low_sample_start_times_<day>.csv`` - start times with unusually low sample
   counts, for data-quality review.
-- ``back_to_back_runtime_flags_<day>.csv`` - consecutive trips on the same
-  pattern/shape variant whose runtimes or actual/scheduled ratios differ far
-  more than neighbors should, for data-quality review. Written only when
-  something is flagged.
+- ``back_to_back_runtime_flags_<day>.csv`` - consecutive trips on the same stop
+  pattern whose runtimes or actual/scheduled ratios differ far more than
+  neighbors should, for data-quality review. Written only when something is
+  flagged.
+- ``trip_runtime_diagnostics_runlog.txt`` - the verbatim CONFIGURATION block,
+  a timestamp, and this run's counts, written beside every set of outputs.
 - ``plots/*.png`` - diagnostic plots (start/finish/runtime deviation boxplots
   and a scheduled vs. 85th-percentile runtime bar chart).
 
@@ -50,6 +52,7 @@ import logging
 import re
 import warnings
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Final, Iterable, List, Sequence, TypeAlias
 
@@ -59,9 +62,16 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 
+# Sentinel markers used by extract_config_block / write_run_log to identify the
+# CONFIGURATION block that is copied verbatim into the run-log sidecar.
+CONFIG_BEGIN_MARKER: Final[str] = "# === BEGIN CONFIG ==="
+CONFIG_END_MARKER: Final[str] = "# === END CONFIG ==="
+
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+
+# === BEGIN CONFIG ===
 
 INPUT_ROOT_DIR: Final[Path] = Path(r"Path\To\Your\Data_Folder_with_observed_trips")
 OUTPUT_ROOT_DIR: Final[Path] = Path(r"Path\To\Your\Output_Folder")
@@ -113,9 +123,9 @@ TRIM_OUTLIERS: Final[bool] = True
 TRIM_FRAC: Final[float] = 0.01  # drop shortest & longest 1 %
 
 # Back-to-back trip checks. Each start-time token is compared with the next one
-# on the same pattern/shape variant. Neighboring trips on one variant should
-# behave alike, so a step change is normally a data or schedule problem rather
-# than real operating conditions.
+# on the same stop pattern. Neighboring trips on one pattern should behave
+# alike, so a step change is normally a data or schedule problem rather than
+# real operating conditions.
 #   * B2B_RUNTIME_RATIO    - flag when the longer median runtime divided by the
 #     shorter one reaches this (2.0 = one trip takes twice as long).
 #   * B2B_RUNTIME_DIFF_MIN - flag when the median runtimes differ by at least
@@ -133,22 +143,21 @@ TRIM_FRAC: Final[float] = 0.01  # drop shortest & longest 1 %
 B2B_RUNTIME_RATIO: Final[float] = 2.0
 B2B_RUNTIME_DIFF_MIN: Final[float] = 20.0
 B2B_SCHED_RATIO_DIFF: Final[float] = 0.50
-B2B_MAX_GAP_MIN: Final[float] = 120.0
+B2B_MAX_GAP_MIN: Final[float] = 90.0
 B2B_MIN_OBS: Final[int] = 3
 
-# Columns tried, in order, to identify a trip's pattern/shape variant. Pairing
-# trips across variants is meaningless - a short-turn legitimately runs far
-# shorter than a full-length trip - so when none of these columns is present the
-# check is skipped rather than run on mixed variants. Set B2B_REQUIRE_VARIANT to
-# False to compare anyway (older AVL exports often carry no pattern column).
-B2B_VARIANT_COLS: Final[tuple[str, ...]] = (
-    "pattern_id",
-    "shape_id",
-    "Pattern",
-    "PatternID",
-    "Variant",
-)
-B2B_REQUIRE_VARIANT: Final[bool] = True
+# Columns tried, in order, to identify a trip's stop pattern: ``pattern_id`` in
+# TIDES, ``Variation`` in the legacy AVL exports. Pairing trips across patterns
+# is meaningless - a short-turn legitimately runs far shorter than a full-length
+# trip - so when neither column is present the check is skipped rather than run
+# on mixed patterns. Set B2B_REQUIRE_PATTERN to False to compare anyway, which
+# pools branching variants and can flag correct service.
+B2B_PATTERN_COLS: Final[tuple[str, ...]] = ("pattern_id", "Variation")
+B2B_REQUIRE_PATTERN: Final[bool] = True
+
+# Abort when the run-log sidecar cannot be written, so an output is never left
+# without its record. Set False only for genuinely read-only destinations.
+REQUIRE_RUN_LOG: Final[bool] = True
 
 # ─── derived paths (initial stubs – reassigned per route in main()) ─── #
 OUTPUT_DIR: Path = OUTPUT_ROOT_DIR
@@ -164,6 +173,8 @@ ALLOWED_DIRECTIONS: List[str] = [
 ]
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
+
+# === END CONFIG ===
 
 # ---------------------------------------------------------------------
 # TYPE ALIASES
@@ -965,7 +976,7 @@ def log_low_sample_start_times(
 
 
 B2B_COLUMNS: Final[list[str]] = [
-    "variant_key",
+    "pattern_key",
     "from_trip_start_time",
     "from_n_obs",
     "from_runtime_median_min",
@@ -1007,15 +1018,15 @@ def flag_back_to_back_runtimes(
     sched_ratio_diff: float = B2B_SCHED_RATIO_DIFF,
     max_gap_min: float = B2B_MAX_GAP_MIN,
     min_obs: int = B2B_MIN_OBS,
-    require_variant: bool = B2B_REQUIRE_VARIANT,
+    require_pattern: bool = B2B_REQUIRE_PATTERN,
 ) -> pd.DataFrame:
-    """Compare each start-time token with the next one on the same variant.
+    """Compare each start-time token with the next one on the same pattern.
 
     Consecutive trips on one pattern should run alike, so a step change between
     neighbors is usually a data or schedule problem rather than real operating
-    conditions. Pairs are formed strictly *within* a pattern/shape variant: a
-    short-turn legitimately runs far shorter than a full-length trip, so
-    comparing across variants would flag normal service. A pair is flagged when
+    conditions. Pairs are formed strictly *within* a stop pattern: a short-turn
+    legitimately runs far shorter than a full-length trip, so comparing across
+    patterns would flag normal service. A pair is flagged when
     any enabled test trips - the median runtimes differ by ``runtime_ratio``, by
     ``runtime_diff_min`` minutes, or the two trips' actual/scheduled runtime
     ratios differ by ``sched_ratio_diff``.
@@ -1023,7 +1034,7 @@ def flag_back_to_back_runtimes(
     Args:
         summary: Output of :func:`write_summary_table` for one route/direction.
         df: The row-level trips behind *summary*, used to attach each start-time
-            token to its pattern/shape variant.
+            token to its stop pattern.
         runtime_ratio: Longer/shorter median runtime cutoff (0 disables).
         runtime_diff_min: Absolute median-runtime difference in minutes
             (0 disables).
@@ -1032,8 +1043,8 @@ def flag_back_to_back_runtimes(
         max_gap_min: Skip pairs whose scheduled starts are farther apart than
             this many minutes (0 compares every consecutive pair).
         min_obs: Minimum observations required on *both* trips.
-        require_variant: When True and no variant column is present, skip the
-            check rather than compare trips that may be different patterns.
+        require_pattern: When True and no pattern column is present, skip the
+            check rather than compare trips on different patterns.
 
     Returns:
         One row per consecutive pair with the gap, the deltas, whether the pair
@@ -1045,28 +1056,27 @@ def flag_back_to_back_runtimes(
     if summary.empty or not need <= set(summary.columns):
         return empty
 
-    variant_col = next((c for c in B2B_VARIANT_COLS if c in df.columns), None)
-    if variant_col is None:
-        if require_variant:
+    pattern_col = next((c for c in B2B_PATTERN_COLS if c in df.columns), None)
+    if pattern_col is None:
+        if require_pattern:
             logging.warning(
                 "   ⚠  Back-to-back check skipped: no pattern/shape column found "
-                "(looked for %s). Comparing trips across variants is meaningless, so set "
-                "B2B_REQUIRE_VARIANT = False to compare within the direction anyway.",
-                ", ".join(B2B_VARIANT_COLS),
+                "(looked for %s). Comparing trips across patterns is meaningless, so set "
+                "B2B_REQUIRE_PATTERN = False to compare within the direction anyway.",
+                ", ".join(B2B_PATTERN_COLS),
             )
             return empty
         logging.warning(
             "   ⚠  Back-to-back check running without a pattern/shape column; trips on "
-            "different variants may be compared and flagged even when both are correct."
+            "different patterns may be compared and flagged even when both are correct."
         )
-        variants = pd.Series("", index=summary.index, name="variant_key")
-        work = summary.assign(variant_key=variants)
+        work = summary.assign(pattern_key="")
     else:
         per_token = (
-            df.groupby(TIME_COL_NAME)[variant_col].agg(_representative_value).rename("variant_key")
+            df.groupby(TIME_COL_NAME)[pattern_col].agg(_representative_value).rename("pattern_key")
         )
         work = summary.merge(per_token, how="left", left_on="trip_start_time", right_index=True)
-        work["variant_key"] = work["variant_key"].fillna("").astype(str)
+        work["pattern_key"] = work["pattern_key"].fillna("").astype(str)
 
     work = work.assign(
         _t=_hhmm_series_to_minutes(work["trip_start_time"]),
@@ -1074,12 +1084,12 @@ def flag_back_to_back_runtimes(
             [np.inf, -np.inf], np.nan
         ),
     )
-    work = work.sort_values(["variant_key", "_t"], kind="mergesort").reset_index(drop=True)
+    work = work.sort_values(["pattern_key", "_t"], kind="mergesort").reset_index(drop=True)
 
-    nxt = work.groupby("variant_key", dropna=False, sort=False).shift(-1)
+    nxt = work.groupby("pattern_key", dropna=False, sort=False).shift(-1)
     pairs = pd.DataFrame(
         {
-            "variant_key": work["variant_key"],
+            "pattern_key": work["pattern_key"],
             "from_trip_start_time": work["trip_start_time"],
             "from_n_obs": work["n_events"],
             "from_runtime_median_min": work["runtime_median_min"],
@@ -1093,7 +1103,7 @@ def flag_back_to_back_runtimes(
             "gap_min": nxt["_t"] - work["_t"],
         }
     )
-    # The last token on each variant has no successor.
+    # The last token on each pattern has no successor.
     pairs = pairs.loc[nxt["trip_start_time"].notna()].reset_index(drop=True)
     if pairs.empty:
         return empty
@@ -1127,7 +1137,7 @@ def flag_back_to_back_runtimes(
         pairs["flag_runtime_ratio"] | pairs["flag_runtime_diff"] | pairs["flag_act_sched_ratio"]
     )
 
-    pairs = pairs.sort_values(["variant_key", "from_trip_start_time"]).reset_index(drop=True)
+    pairs = pairs.sort_values(["pattern_key", "from_trip_start_time"]).reset_index(drop=True)
     return pairs[B2B_COLUMNS].round(
         {
             "gap_min": 1,
@@ -1183,6 +1193,106 @@ def write_back_to_back_flags(pairs: pd.DataFrame) -> None:
         B2B_SCHED_RATIO_DIFF,
         fname.name,
     )
+
+
+def resolve_source_file() -> Path | None:
+    """Best-effort path to this script's source (``None`` in notebooks)."""
+    try:
+        return Path(__file__).resolve()
+    except NameError:
+        return None
+
+
+def extract_config_block(source_file: Path) -> str:
+    """Return the text between the CONFIG markers in *source_file*.
+
+    Canonical implementation: ``utils/run_log.py``.
+
+    Args:
+        source_file: Path to the Python source file to scan.
+
+    Returns:
+        The verbatim text of the configuration block, joined with newlines.
+
+    Raises:
+        ValueError: If either marker is missing or they appear out of order.
+        OSError: If ``source_file`` cannot be read.
+    """
+    lines: list[str] = source_file.read_text(encoding="utf-8").splitlines()
+
+    begin_idx: int | None = None
+    end_idx: int | None = None
+    for i, line in enumerate(lines):
+        stripped: str = line.strip()
+        if begin_idx is None and stripped == CONFIG_BEGIN_MARKER:
+            begin_idx = i
+        elif begin_idx is not None and stripped == CONFIG_END_MARKER:
+            end_idx = i
+            break
+
+    if begin_idx is None or end_idx is None:
+        raise ValueError(
+            f"Config markers not found in '{source_file}'. "
+            f"Expected '{CONFIG_BEGIN_MARKER}' and '{CONFIG_END_MARKER}'."
+        )
+
+    return "\n".join(lines[begin_idx + 1 : end_idx])
+
+
+def write_run_log(output_dir: Path, summary_lines: List[str]) -> bool:
+    """Write the verbatim config block plus a build summary into *output_dir*.
+
+    One sidecar is written per route/direction folder, beside that folder's
+    outputs, so every artifact set carries the settings that produced it.
+
+    Args:
+        output_dir: Directory holding this route/direction's outputs.
+        summary_lines: Human-readable facts about what the run produced.
+
+    Returns:
+        ``True`` if the log was written successfully, ``False`` otherwise.
+    """
+    log_path = output_dir / "trip_runtime_diagnostics_runlog.txt"
+
+    source_file = resolve_source_file()
+    if source_file is None:
+        config_text = "(config block unavailable: interactive session, no __file__ on disk)"
+        source_display = "<interactive>"
+    else:
+        try:
+            config_text = extract_config_block(source_file)
+        except (OSError, ValueError) as exc:
+            logging.error("Could not extract config block for run log: %s", exc)
+            return False
+        source_display = str(source_file)
+
+    lines: List[str] = [
+        "=" * 72,
+        "TRIP RUNTIME DIAGNOSTICS (AVL) RUN LOG",
+        "=" * 72,
+        f"Run timestamp:    {datetime.now().isoformat(timespec='seconds')}",
+        f"Output directory: {output_dir}",
+        f"Source script:    {source_display}",
+        "",
+        "-" * 72,
+        "BUILD SUMMARY",
+        "-" * 72,
+        *summary_lines,
+        "",
+        "-" * 72,
+        "CONFIGURATION (verbatim from source)",
+        "-" * 72,
+        config_text,
+        "=" * 72,
+    ]
+
+    try:
+        log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        logging.info("   ⤷ Run log saved to '%s'.", log_path.name)
+        return True
+    except OSError as exc:
+        logging.error("Error writing run log: %s", exc)
+        return False
 
 
 def _cum_sums(arr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -1487,7 +1597,8 @@ def main() -> int:  # pragma: no cover
             # ---- 2 d.  Core exports --------------------------------------
             write_row_level(dir_df)
             summary = write_summary_table(dir_df)
-            write_back_to_back_flags(flag_back_to_back_runtimes(summary, dir_df))
+            b2b_pairs = flag_back_to_back_runtimes(summary, dir_df)
+            write_back_to_back_flags(b2b_pairs)
             bands = suggest_time_bands(summary)
             bands.to_excel(
                 OUTPUT_DIR / f"time_bands_{_day_tag()}.xlsx",
@@ -1507,6 +1618,27 @@ def main() -> int:  # pragma: no cover
             ]
             for func in plot_funcs:
                 _safe_plot(func, dir_df)
+
+            # ---- 2 f.  Run-log sidecar -----------------------------------
+            n_b2b_flagged = int(b2b_pairs["back_to_back_flag"].sum()) if not b2b_pairs.empty else 0
+            n_b2b_compared = int(b2b_pairs["compared"].sum()) if not b2b_pairs.empty else 0
+            summary_lines = [
+                f"Route / direction:  {route} / {dir_val}",
+                f"Rows retained:      {len(dir_df)}",
+                f"Start-time tokens:  {len(summary)}",
+                f"Under OTP target:   "
+                f"{int(summary['under_target'].sum()) if not summary.empty else 0}",
+                f"Back-to-back pairs: {len(b2b_pairs)} "
+                f"({n_b2b_compared} compared, {n_b2b_flagged} flagged)",
+                f"Time bands:         {len(bands)}",
+            ]
+            if not write_run_log(OUTPUT_DIR, summary_lines) and REQUIRE_RUN_LOG:
+                logging.error(
+                    "Run log could not be written for %s. Set REQUIRE_RUN_LOG = False to "
+                    "continue anyway when a sidecar file is genuinely impossible.",
+                    OUTPUT_DIR,
+                )
+                return 1
 
             logging.info("      ✓ Direction '%s' done.", dir_val)
 

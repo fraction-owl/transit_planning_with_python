@@ -18,14 +18,14 @@ Three data-quality diagnostics are produced as well:
     trips running materially longer/shorter than Tue-Fri). Both are common
     artifacts of pooling weekdays that actually behave differently.
   * **Back-to-back trip anomalies** - consecutive trips on the same route,
-    direction, *and* pattern/shape variant should behave alike; a step change
+    direction, *and* stop pattern should behave alike; a step change
     between neighbors usually means bad data or a broken schedule rather than
     real operating conditions. Each trip is compared with the next one on its
-    variant and flagged when the median running times differ by a large ratio
+    pattern and flagged when the median running times differ by a large ratio
     (e.g. 2x) or a large number of minutes (e.g. 20), or when the two trips'
-    actual/scheduled runtime ratios diverge. Comparing across variants is
+    actual/scheduled runtime ratios diverge. Comparing across patterns is
     meaningless (a short-turn legitimately runs far shorter than a full-length
-    trip), so pairs are only formed within a variant. Pairs whose scheduled
+    trip), so pairs are only formed within a pattern. Pairs whose scheduled
     starts are far apart are skipped, since a genuine peak/midday runtime
     difference is not a data problem.
 
@@ -39,7 +39,7 @@ Outputs:
   * ``trip_runtime_outliers.csv``      - rows removed by trimming.
   * ``trip_runtime_stats.csv``         - per-trip summary statistics + flags.
   * ``trip_runtime_dow.csv``           - per-trip-per-DOW counts/means + flags.
-  * ``trip_runtime_back_to_back.csv``  - every consecutive same-variant trip
+  * ``trip_runtime_back_to_back.csv``  - every consecutive same-pattern trip
     pair, with the gap, the runtime deltas, and the flags below.
   * PNG charts per route: runtime boxplot by trip start, and mean runtime by
     day of week.
@@ -56,6 +56,7 @@ import argparse
 import logging
 import sys
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
@@ -66,9 +67,16 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
+# Sentinel markers used by extract_config_block / write_run_log to identify the
+# CONFIGURATION block that is copied verbatim into the run-log sidecar.
+CONFIG_BEGIN_MARKER: str = "# === BEGIN CONFIG ==="
+CONFIG_END_MARKER: str = "# === END CONFIG ==="
+
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+
+# === BEGIN CONFIG ===
 
 STOP_VISITS_PATH: str = r"Path\To\Your\stop_visits.csv"
 TRIPS_PERFORMED_PATH: str = r"Path\To\Your\trips_performed.csv"
@@ -96,8 +104,8 @@ DOW_LOW_COUNT_FRAC: float = 0.40
 DOW_RUNTIME_PCT: float = 0.10
 
 # Back-to-back trip checks. Each trip is compared with the *next* scheduled trip
-# on the same route, direction, and pattern/shape variant. Neighboring trips on
-# one variant should behave alike, so a step change is normally a data or
+# on the same route, direction, and stop pattern (``pattern_id``). Neighboring
+# trips on one pattern should behave alike, so a step change is normally a data or
 # schedule problem rather than real operating conditions.
 #   * B2B_RUNTIME_RATIO    - flag when the longer median runtime divided by the
 #     shorter one reaches this (2.0 = one trip takes twice as long).
@@ -116,19 +124,22 @@ DOW_RUNTIME_PCT: float = 0.10
 B2B_RUNTIME_RATIO: float = 2.0
 B2B_RUNTIME_DIFF_MIN: float = 20.0
 B2B_SCHED_RATIO_DIFF: float = 0.50
-B2B_MAX_GAP_MIN: float = 120.0
+B2B_MAX_GAP_MIN: float = 90.0
 B2B_MIN_OBS: int = 3
 
-# Columns tried, in order, to identify a trip's pattern/shape variant. Pairing
-# trips across variants is meaningless, so when none of these columns is present
-# the check is skipped rather than run on mixed variants - unless
-# B2B_REQUIRE_VARIANT is set to False, which compares within route/direction only.
-VARIANT_ID_COLS: Sequence[str] = ("pattern_id", "shape_id")
-B2B_REQUIRE_VARIANT: bool = True
+# Pairing trips across stop patterns is meaningless, so when no usable
+# ``pattern_id`` is available the check is skipped rather than run on mixed
+# patterns. Set B2B_REQUIRE_PATTERN to False to compare within route/direction
+# anyway, which pools branching variants and can flag correct service.
+B2B_REQUIRE_PATTERN: bool = True
 
 # Optional route filters (matched against route_id as a string). Empty = all.
 ROUTES_TO_INCLUDE: Sequence[str] = ()
 ROUTES_TO_EXCLUDE: Sequence[str] = ()
+
+# Abort when the run-log sidecar cannot be written, so an output is never left
+# without its record. Set False only for genuinely read-only destinations.
+REQUIRE_RUN_LOG: bool = True
 
 LOG_LEVEL: int = logging.INFO
 
@@ -141,6 +152,8 @@ DOW_ORDER: List[str] = [
     "Saturday",
     "Sunday",
 ]
+
+# === END CONFIG ===
 
 # =============================================================================
 # DATA STRUCTURES
@@ -165,7 +178,7 @@ class Config:
     b2b_sched_ratio_diff: float = B2B_SCHED_RATIO_DIFF
     b2b_max_gap_min: float = B2B_MAX_GAP_MIN
     b2b_min_obs: int = B2B_MIN_OBS
-    b2b_require_variant: bool = B2B_REQUIRE_VARIANT
+    b2b_require_pattern: bool = B2B_REQUIRE_PATTERN
     routes_to_include: Sequence[str] = ()
     routes_to_exclude: Sequence[str] = ()
 
@@ -219,9 +232,9 @@ def compute_trip_runtimes(stop_visits: pd.DataFrame) -> pd.DataFrame:
     Returns:
         DataFrame with one row per ``trip_id_performed`` and columns
         ``service_date``, ``start_time`` (first actual departure),
-        ``actual_runtime_min`` (NaN when fewer than two usable stops exist), and
+        ``actual_runtime_min`` (NaN when fewer than two usable stops exist),
         ``scheduled_runtime_min`` (NaN when the endpoints carry no schedule
-        times).
+        times), and ``pattern_id`` when the visits carry one.
     """
     work = stop_visits
     if "schedule_relationship" in work.columns:
@@ -230,6 +243,7 @@ def compute_trip_runtimes(stop_visits: pd.DataFrame) -> pd.DataFrame:
     work = work.sort_values(["trip_id_performed", "trip_stop_sequence"])
 
     has_sched = {"schedule_departure_time", "schedule_arrival_time"} <= set(work.columns)
+    has_pattern = "pattern_id" in work.columns
 
     rows: List[Dict[str, object]] = []
     for trip_id, g in work.groupby("trip_id_performed", sort=False):
@@ -249,15 +263,18 @@ def compute_trip_runtimes(stop_visits: pd.DataFrame) -> pd.DataFrame:
             if pd.notna(sched_start) and pd.notna(sched_end):
                 sched_runtime = (sched_end - sched_start).total_seconds() / 60.0
 
-        rows.append(
-            {
-                "trip_id_performed": trip_id,
-                "service_date": g["service_date"].iloc[0],
-                "start_time": start,
-                "actual_runtime_min": runtime,
-                "scheduled_runtime_min": sched_runtime,
-            }
-        )
+        row: Dict[str, object] = {
+            "trip_id_performed": trip_id,
+            "service_date": g["service_date"].iloc[0],
+            "start_time": start,
+            "actual_runtime_min": runtime,
+            "scheduled_runtime_min": sched_runtime,
+        }
+        if has_pattern:
+            # One pattern per performed trip; take the first non-null visit.
+            pattern = g["pattern_id"].dropna()
+            row["pattern_id"] = pattern.iloc[0] if not pattern.empty else pd.NA
+        rows.append(row)
 
     return pd.DataFrame(rows)
 
@@ -270,8 +287,12 @@ def join_trip_attributes(
     Canceled / non-in-service trips are dropped via the join. Adds:
     ``route_id``, ``direction_id``, ``trip_id_scheduled``, ``start_hhmm`` (the
     *scheduled* start label, stable across dates, used to order trips), ``dow``
-    (day name), and ``variant_key`` (the pattern/shape the trip ran, taken from
-    the first available :data:`VARIANT_ID_COLS` column; empty when none exists).
+    (day name), and ``pattern_key`` (the stop pattern the trip ran; empty when
+    neither table carries a usable ``pattern_id``).
+
+    ``pattern_id`` is preferred from ``stop_visits`` and only then from
+    ``trips_performed``: it is optional in TIDES, and the converters in this
+    folder synthesize it on stop visits while leaving it blank on trips.
 
     The start label is taken from the scheduled trip start rather than the
     observed departure, so the same recurring trip carries one consistent label
@@ -296,21 +317,25 @@ def join_trip_attributes(
             "route_type_agency",
             "schedule_trip_start",
             "schedule_trip_end",
-            *VARIANT_ID_COLS,
+            "pattern_id",
         )
         if c in trips.columns
     ]
     trips_small = trips[["trip_id_performed", *attr_cols]].drop_duplicates("trip_id_performed")
 
-    merged = trip_runtimes.merge(trips_small, on="trip_id_performed", how="inner")
+    merged = trip_runtimes.merge(
+        trips_small, on="trip_id_performed", how="inner", suffixes=("", "_trips")
+    )
     merged["dow"] = merged["service_date"].dt.day_name()
 
-    # Pattern/shape the trip ran; pairing trips across variants is meaningless.
-    variant_col = next((c for c in VARIANT_ID_COLS if c in merged.columns), None)
-    if variant_col is None:
-        merged["variant_key"] = ""
-    else:
-        merged["variant_key"] = merged[variant_col].astype(str).replace({"nan": "", "<NA>": ""})
+    # Stop pattern the trip ran; pairing trips across patterns is meaningless.
+    blank = pd.Series("", index=merged.index)
+    pattern = blank
+    for col in ("pattern_id", "pattern_id_trips"):
+        if col in merged.columns:
+            values = merged[col].astype("string").fillna("").str.strip()
+            pattern = pattern.where(pattern != "", values)
+    merged["pattern_key"] = pattern.fillna("")
 
     # Fall back to the booked trip span when the stop-level schedule was missing.
     if "scheduled_runtime_min" not in merged.columns:
@@ -420,7 +445,7 @@ def compute_trip_stats(
     Returns:
         DataFrame with one row per ``trip_key`` and statistics + boolean flags
         ``high_variation`` and ``data_gap``. Also carries the trip's
-        ``variant_key``, its median ``sched_runtime_median_min``, and
+        ``pattern_key``, its median ``sched_runtime_median_min``, and
         ``act_sched_ratio`` (median actual over median scheduled runtime), which
         :func:`compute_back_to_back_flags` compares between neighbors.
     """
@@ -436,16 +461,16 @@ def compute_trip_stats(
         "runtime_min_min": ("actual_runtime_min", "min"),
         "runtime_max_min": ("actual_runtime_min", "max"),
     }
-    if "variant_key" in df.columns:
-        aggs["variant_key"] = ("variant_key", _representative_label)
+    if "pattern_key" in df.columns:
+        aggs["pattern_key"] = ("pattern_key", _representative_label)
     if "scheduled_runtime_min" in df.columns:
         aggs["sched_runtime_median_min"] = ("scheduled_runtime_min", "median")
 
     grouped = df.groupby(["route_id", "direction_id", "trip_key"], dropna=False)
     stats = grouped.agg(**aggs).reset_index()
 
-    if "variant_key" not in stats.columns:
-        stats["variant_key"] = ""
+    if "pattern_key" not in stats.columns:
+        stats["pattern_key"] = ""
     if "sched_runtime_median_min" not in stats.columns:
         stats["sched_runtime_median_min"] = float("nan")
 
@@ -530,7 +555,7 @@ def compute_dow_anomalies(
 B2B_COLUMNS: List[str] = [
     "route_id",
     "direction_id",
-    "variant_key",
+    "pattern_key",
     "from_trip_key",
     "from_start_hhmm",
     "from_n_obs",
@@ -580,14 +605,14 @@ def compute_back_to_back_flags(
     sched_ratio_diff: float = B2B_SCHED_RATIO_DIFF,
     max_gap_min: float = B2B_MAX_GAP_MIN,
     min_obs: int = B2B_MIN_OBS,
-    require_variant: bool = B2B_REQUIRE_VARIANT,
+    require_pattern: bool = B2B_REQUIRE_PATTERN,
 ) -> pd.DataFrame:
-    """Compare each trip with the next one on its route/direction/variant.
+    """Compare each trip with the next one on its route/direction/pattern.
 
     Consecutive trips on the same pattern should run alike, so a step change
     between neighbors is usually a data or schedule problem. Pairs are formed
-    strictly *within* a pattern/shape variant: a short-turn legitimately runs far
-    shorter than a full-length trip, so comparing across variants would flag
+    strictly *within* a stop pattern: a short-turn legitimately runs far
+    shorter than a full-length trip, so comparing across patterns would flag
     normal service. A pair is flagged when any enabled test trips - the runtimes
     differ by ``runtime_ratio``, by ``runtime_diff_min`` minutes, or the two
     trips' actual/scheduled ratios differ by ``sched_ratio_diff``.
@@ -602,8 +627,8 @@ def compute_back_to_back_flags(
         max_gap_min: Skip pairs whose scheduled starts are farther apart than
             this many minutes (0 compares every consecutive pair).
         min_obs: Minimum retained observations required on *both* trips.
-        require_variant: When True and no variant column was available, skip the
-            check rather than compare trips that may be different patterns.
+        require_pattern: When True and no usable ``pattern_id`` was available,
+            skip the check rather than compare trips on different patterns.
 
     Returns:
         One row per consecutive pair with the gap, the deltas, whether the pair
@@ -615,29 +640,28 @@ def compute_back_to_back_flags(
         return empty
 
     work = stats.copy()
-    if "variant_key" not in work.columns:
-        work["variant_key"] = ""
-    work["variant_key"] = work["variant_key"].fillna("").astype(str)
+    if "pattern_key" not in work.columns:
+        work["pattern_key"] = ""
+    work["pattern_key"] = work["pattern_key"].fillna("").astype(str)
 
-    if not (work["variant_key"].str.strip() != "").any():
-        if require_variant:
+    if not (work["pattern_key"].str.strip() != "").any():
+        if require_pattern:
             logging.warning(
-                "Back-to-back check skipped: no pattern/shape column found (looked for %s). "
-                "Comparing trips across variants is meaningless, so set "
-                "B2B_REQUIRE_VARIANT = False to compare within route/direction anyway.",
-                ", ".join(VARIANT_ID_COLS),
+                "Back-to-back check skipped: neither stop_visits nor trips_performed has a "
+                "usable pattern_id. Comparing trips across stop patterns is meaningless, so "
+                "set B2B_REQUIRE_PATTERN = False to compare within route/direction anyway."
             )
             return empty
         logging.warning(
-            "Back-to-back check running without a pattern/shape column; trips on different "
-            "variants may be compared and flagged even when both are correct."
+            "Back-to-back check running without pattern_id; branching variants within a "
+            "direction are pooled, so correct trips may be compared and flagged."
         )
 
     if "act_sched_ratio" not in work.columns:
         work["act_sched_ratio"] = float("nan")
 
     work["_start_min"] = _hhmm_to_minutes(work["start_hhmm"])
-    group_cols = ["route_id", "direction_id", "variant_key"]
+    group_cols = ["route_id", "direction_id", "pattern_key"]
     work = work.sort_values([*group_cols, "_start_min"], kind="mergesort").reset_index(drop=True)
 
     nxt = work.groupby(group_cols, dropna=False, sort=False).shift(-1)
@@ -645,7 +669,7 @@ def compute_back_to_back_flags(
         {
             "route_id": work["route_id"],
             "direction_id": work["direction_id"],
-            "variant_key": work["variant_key"],
+            "pattern_key": work["pattern_key"],
             "from_trip_key": work["trip_key"],
             "from_start_hhmm": work["start_hhmm"],
             "from_n_obs": work["n_obs"],
@@ -659,7 +683,7 @@ def compute_back_to_back_flags(
             "gap_min": nxt["_start_min"] - work["_start_min"],
         }
     )
-    # The last trip on each variant has no successor.
+    # The last trip on each pattern has no successor.
     pairs = pairs.loc[nxt["trip_key"].notna()].reset_index(drop=True)
     if pairs.empty:
         return empty
@@ -694,7 +718,7 @@ def compute_back_to_back_flags(
     )
 
     pairs = pairs.sort_values(
-        ["route_id", "direction_id", "variant_key", "from_start_hhmm"]
+        ["route_id", "direction_id", "pattern_key", "from_start_hhmm"]
     ).reset_index(drop=True)
     return pairs[B2B_COLUMNS].round(
         {
@@ -851,6 +875,108 @@ def export_outputs(
 
 
 # =============================================================================
+# RUN LOG
+# =============================================================================
+
+
+def resolve_source_file() -> Optional[Path]:
+    """Best-effort path to this script's source (``None`` in notebooks)."""
+    try:
+        return Path(__file__).resolve()
+    except NameError:
+        return None
+
+
+def extract_config_block(source_file: Path) -> str:
+    """Return the text between the CONFIG markers in *source_file*.
+
+    Canonical implementation: ``utils/run_log.py``.
+
+    Args:
+        source_file: Path to the Python source file to scan.
+
+    Returns:
+        The verbatim text of the configuration block, joined with newlines.
+
+    Raises:
+        ValueError: If either marker is missing or they appear out of order.
+        OSError: If ``source_file`` cannot be read.
+    """
+    lines: list[str] = source_file.read_text(encoding="utf-8").splitlines()
+
+    begin_idx: int | None = None
+    end_idx: int | None = None
+    for i, line in enumerate(lines):
+        stripped: str = line.strip()
+        if begin_idx is None and stripped == CONFIG_BEGIN_MARKER:
+            begin_idx = i
+        elif begin_idx is not None and stripped == CONFIG_END_MARKER:
+            end_idx = i
+            break
+
+    if begin_idx is None or end_idx is None:
+        raise ValueError(
+            f"Config markers not found in '{source_file}'. "
+            f"Expected '{CONFIG_BEGIN_MARKER}' and '{CONFIG_END_MARKER}'."
+        )
+
+    return "\n".join(lines[begin_idx + 1 : end_idx])
+
+
+def write_run_log(output_dir: Path, summary_lines: List[str]) -> bool:
+    """Write the verbatim config block plus a build summary into *output_dir*.
+
+    Args:
+        output_dir: Directory holding this run's outputs.
+        summary_lines: Human-readable facts about what the run produced.
+
+    Returns:
+        ``True`` if the log was written successfully, ``False`` otherwise.
+    """
+    log_path = output_dir / "runtime_by_trip_runlog.txt"
+
+    source_file = resolve_source_file()
+    if source_file is None:
+        config_text = "(config block unavailable: interactive session, no __file__ on disk)"
+        source_display = "<interactive>"
+    else:
+        try:
+            config_text = extract_config_block(source_file)
+        except (OSError, ValueError) as exc:
+            logging.error("Could not extract config block for run log: %s", exc)
+            return False
+        source_display = str(source_file)
+
+    lines: List[str] = [
+        "=" * 72,
+        "TRIP RUNTIME DIAGNOSTICS RUN LOG",
+        "=" * 72,
+        f"Run timestamp:    {datetime.now().isoformat(timespec='seconds')}",
+        f"Output directory: {output_dir}",
+        f"Source script:    {source_display}",
+        "",
+        "-" * 72,
+        "BUILD SUMMARY",
+        "-" * 72,
+        *summary_lines,
+        "",
+        "-" * 72,
+        "CONFIGURATION (verbatim from source)",
+        "-" * 72,
+        config_text,
+        "=" * 72,
+    ]
+
+    try:
+        log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        logging.info("Run log saved to '%s'.", log_path)
+        return True
+    except OSError as exc:
+        logging.error("Error writing run log: %s", exc)
+        return False
+
+
+# =============================================================================
 # PIPELINE
 # =============================================================================
 
@@ -886,14 +1012,14 @@ def run(cfg: Config) -> Dict[str, pd.DataFrame]:
         cfg.b2b_sched_ratio_diff,
         cfg.b2b_max_gap_min,
         cfg.b2b_min_obs,
-        cfg.b2b_require_variant,
+        cfg.b2b_require_pattern,
     )
     stats = apply_back_to_back_flag(stats, back_to_back)
     if not back_to_back.empty:
         n_flagged = int(back_to_back["back_to_back_flag"].sum())
         n_skipped = int((~back_to_back["compared"].astype(bool)).sum())
         logging.info(
-            "Back-to-back check: %d of %d consecutive same-variant pairs flagged "
+            "Back-to-back check: %d of %d consecutive same-pattern pairs flagged "
             "(%d not compared - too few observations or a scheduled gap over %g min).",
             n_flagged,
             len(back_to_back),
@@ -908,6 +1034,23 @@ def run(cfg: Config) -> Dict[str, pd.DataFrame]:
     box_paths = plot_route_runtime_box(retained, cfg.output_dir)
     dow_paths = plot_dow_runtime(dow_table, cfg.output_dir)
     logging.info("Wrote %d runtime charts.", len(box_paths) + len(dow_paths))
+
+    n_b2b_flagged = int(back_to_back["back_to_back_flag"].sum()) if not back_to_back.empty else 0
+    n_b2b_compared = int(back_to_back["compared"].sum()) if not back_to_back.empty else 0
+    summary_lines = [
+        f"Trips summarized:   {len(stats)}",
+        f"Observations kept:  {len(retained)} (trimmed {len(outliers)})",
+        f"High variation:     {int(stats['high_variation'].sum()) if not stats.empty else 0}",
+        f"Data gaps:          {int(stats['data_gap'].sum()) if not stats.empty else 0}",
+        f"Back-to-back pairs: {len(back_to_back)} "
+        f"({n_b2b_compared} compared, {n_b2b_flagged} flagged)",
+        f"Charts written:     {len(box_paths) + len(dow_paths)}",
+    ]
+    if not write_run_log(cfg.output_dir, summary_lines) and REQUIRE_RUN_LOG:
+        raise RuntimeError(
+            "Run log could not be written. Set REQUIRE_RUN_LOG = False to suppress this "
+            "error when a sidecar file is genuinely impossible."
+        )
 
     return {
         "retained": retained,
@@ -1002,10 +1145,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Back-to-back: minimum observations required on both trips in a pair.",
     )
     p.add_argument(
-        "--b2b-allow-mixed-variants",
+        "--b2b-allow-mixed-patterns",
         action="store_true",
         help="Back-to-back: compare within route/direction even when no pattern/shape column "
-        "exists (off by default, since cross-variant pairs are meaningless).",
+        "exists (off by default, since cross-pattern pairs are meaningless).",
     )
     return p
 
@@ -1043,7 +1186,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         b2b_sched_ratio_diff=args.b2b_sched_ratio_diff,
         b2b_max_gap_min=args.b2b_max_gap_min,
         b2b_min_obs=args.b2b_min_obs,
-        b2b_require_variant=not args.b2b_allow_mixed_variants,
+        b2b_require_pattern=not args.b2b_allow_mixed_patterns,
         routes_to_include=ROUTES_TO_INCLUDE,
         routes_to_exclude=ROUTES_TO_EXCLUDE,
     )

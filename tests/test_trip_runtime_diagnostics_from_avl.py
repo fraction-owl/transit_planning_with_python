@@ -134,7 +134,7 @@ def _b2b_summary(**overrides: object) -> pd.DataFrame:
 
 
 def _b2b_rows(variants: list[str]) -> pd.DataFrame:
-    """Row-level frame carrying each start time's pattern variant."""
+    """Row-level frame carrying each start time's stop pattern."""
     return pd.DataFrame(
         {
             target.TIME_COL_NAME: ["06:00", "06:20", "06:40", "07:00"],
@@ -162,7 +162,7 @@ def test_back_to_back_flags_doubled_runtime() -> None:
     assert flagged["flag_act_sched_ratio"].all()
 
 
-def test_back_to_back_pairs_only_within_a_variant() -> None:
+def test_back_to_back_pairs_only_within_a_pattern() -> None:
     """A short-turn is never compared against a full-length trip."""
     summary = _b2b_summary(
         runtime_median_min=[60.0, 25.0, 61.0, 26.0],
@@ -172,16 +172,33 @@ def test_back_to_back_pairs_only_within_a_variant() -> None:
         summary, _b2b_rows(["FULL", "SHORT", "FULL", "SHORT"])
     )
     assert len(pairs) == 2
-    assert set(pairs["variant_key"]) == {"FULL", "SHORT"}
+    assert set(pairs["pattern_key"]) == {"FULL", "SHORT"}
     assert not pairs["back_to_back_flag"].any()
 
 
-def test_back_to_back_skipped_without_variant_column() -> None:
-    """Without a pattern/shape column the check refuses to guess."""
+def test_back_to_back_accepts_legacy_variation_column() -> None:
+    """Legacy AVL exports name the stop pattern 'Variation'."""
+    summary = _b2b_summary(
+        runtime_median_min=[60.0, 25.0, 61.0, 26.0],
+        scheduled_runtime_mode=[60.0, 25.0, 60.0, 25.0],
+    )
+    rows = pd.DataFrame(
+        {
+            target.TIME_COL_NAME: ["06:00", "06:20", "06:40", "07:00"],
+            "Variation": ["FULL", "SHORT", "FULL", "SHORT"],
+        }
+    )
+    pairs = target.flag_back_to_back_runtimes(summary, rows)
+    assert set(pairs["pattern_key"]) == {"FULL", "SHORT"}
+    assert not pairs["back_to_back_flag"].any()
+
+
+def test_back_to_back_skipped_without_pattern_column() -> None:
+    """Without a pattern column the check refuses to guess."""
     summary = _b2b_summary(runtime_median_min=[31.0, 32.0, 66.0, 33.0])
     rows = pd.DataFrame({target.TIME_COL_NAME: ["06:00", "06:20", "06:40", "07:00"]})
     assert target.flag_back_to_back_runtimes(summary, rows).empty
-    opted_in = target.flag_back_to_back_runtimes(summary, rows, require_variant=False)
+    opted_in = target.flag_back_to_back_runtimes(summary, rows, require_pattern=False)
     assert opted_in["back_to_back_flag"].any()
 
 
@@ -221,3 +238,20 @@ def test_write_back_to_back_flags(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     written = pd.read_csv(out)
     assert len(written) == 2
     assert written["back_to_back_flag"].all()
+
+
+def test_write_run_log_sidecar(tmp_path: Path) -> None:
+    """The sidecar records the run and the verbatim CONFIGURATION block."""
+    assert target.write_run_log(tmp_path, ["Rows retained:      42"])
+
+    log = tmp_path / "trip_runtime_diagnostics_runlog.txt"
+    assert log.exists()
+
+    text = log.read_text(encoding="utf-8")
+    assert "Run timestamp:" in text
+    assert "Rows retained:      42" in text
+    # Config constants are reproduced verbatim so a run can be reconstructed.
+    assert "B2B_RUNTIME_RATIO: Final[float] = 2.0" in text
+    assert f"B2B_MAX_GAP_MIN: Final[float] = {target.B2B_MAX_GAP_MIN}" in text
+    # The marker lines themselves are excluded from the captured block.
+    assert target.CONFIG_BEGIN_MARKER not in text
