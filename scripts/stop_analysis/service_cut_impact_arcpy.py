@@ -2332,6 +2332,17 @@ def load_ridership(
             len(ridership),
             rows_in,
         )
+        if rows_in and ridership.empty:
+            # Every downstream rider number would be zero, which reads as a
+            # finding rather than as the input failure it is.
+            raise ValueError(
+                f"Ridership CSV: none of the {rows_in} row(s) matched a trip on the analysis "
+                f"day, so no ridership could be attributed. The warnings above say which "
+                f"stage failed — commonly {spec.start_time_col!r} arrived as a date with no "
+                f"time of day (re-export it from Excel as text, HH:MM), "
+                f"{spec.route_col!r} holds values that are not route_short_name or route_id, "
+                f"or the file covers service days other than the analysis day."
+            )
     ridership = ridership.rename(columns={spec.boardings_col: "boardings"})
     ridership["trip_id"] = ridership["trip_id"].astype(str).str.strip()
     ridership["boardings"] = pd.to_numeric(ridership["boardings"], errors="coerce")

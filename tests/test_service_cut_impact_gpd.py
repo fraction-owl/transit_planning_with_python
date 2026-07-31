@@ -291,3 +291,111 @@ def test_blank_path_disables_ridership() -> None:
 def test_missing_file_is_reported(tmp_path) -> None:
     with pytest.raises(FileNotFoundError):
         load_ridership(str(tmp_path / "nope.csv"), RidershipSpec())
+
+
+# ---------------------------------------------------------------------------
+# load_ridership — Excel workbook cell shapes
+#
+# A vendor .xlsx stores routes as numbers and start times as date-formatted
+# serials near the Excel epoch, which spreadsheets display as "1/0/1900". These
+# tests feed load_ridership a real workbook holding every shape at once.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def vendor_xlsx(tmp_path: Path) -> str:
+    """One workbook, four TRIP_START_TIME shapes on numeric route 232."""
+    openpyxl = pytest.importorskip("openpyxl")
+    import datetime as dt
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["SURVEY_DATE", "ROUTE_NUMBER", "TRIP_START_TIME", "PASSENGERS_ON"])
+    # A date-formatted serial: displays as 1/0/1900 but still holds 07:23.
+    ws.append([None, 232, 0.30763888888, 4.2])
+    ws.cell(row=2, column=3).number_format = "m/d/yyyy"
+    # A day-zero datetime, as openpyxl hands back cached date cells.
+    ws.append([None, 232, dt.datetime(1899, 12, 31, 8, 23), 7.5])
+    # Literal text "1/0/1900": the time of day is genuinely gone.
+    ws.append([None, 232, "1/0/1900", 9.9])
+    # An AM/PM text time.
+    ws.append([None, 232, "9:23:00 AM", 1.1])
+    path = tmp_path / "vendor.xlsx"
+    wb.save(path)
+    return str(path)
+
+
+@pytest.fixture
+def route_232_events() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "trip_id": ["t1", "t2", "t3"],
+            "stop_id": ["s1", "s1", "s1"],
+            "dep_min": [443, 503, 563],  # 7:23, 8:23, 9:23
+            "route_id": ["r232", "r232", "r232"],
+        }
+    )
+
+
+@pytest.fixture
+def route_232() -> pd.DataFrame:
+    return pd.DataFrame({"route_id": ["r232"], "route_short_name": ["232"]})
+
+
+def test_vendor_workbook_shapes_match_and_lost_times_drop(
+    vendor_xlsx, route_232_events, route_232, vendor_spec
+) -> None:
+    _, trip_sums = load_ridership(
+        vendor_xlsx, vendor_spec, events=route_232_events, routes=route_232
+    )
+    # Serial, datetime, and AM/PM rows all match; numeric 232 resolves to the
+    # route despite Excel storing it as a float. The text "1/0/1900" row —
+    # whose time of day is unrecoverable — is dropped, not guessed at.
+    assert trip_sums.set_index("trip_id")["boardings"].to_dict() == {
+        "t1": 4.2,
+        "t2": 7.5,
+        "t3": 1.1,
+    }
+
+
+def test_a_file_where_nothing_matches_is_an_error_not_zero_riders(
+    tmp_path, route_232_events, route_232, vendor_spec
+) -> None:
+    # Every start time has lost its time of day, so no row can match. Reporting
+    # zero riders affected would look like a finding.
+    frame = pd.DataFrame(
+        {
+            "ROUTE_NUMBER": ["232", "232"],
+            "TRIP_START_TIME": ["1/0/1900", "1/0/1900"],
+            "PASSENGERS_ON": [4.2, 7.5],
+        }
+    )
+    path = _write(tmp_path, frame)
+    with pytest.raises(ValueError, match="none of the 2 row"):
+        load_ridership(path, vendor_spec, events=route_232_events, routes=route_232)
+
+
+def test_partial_matches_do_not_error(tmp_path, route_232_events, route_232, vendor_spec) -> None:
+    # Rows for other service days legitimately fail to match; only a total
+    # wipeout is treated as an input failure.
+    frame = pd.DataFrame(
+        {
+            "ROUTE_NUMBER": ["232", "232"],
+            "TRIP_START_TIME": ["7:23", "1/0/1900"],
+            "PASSENGERS_ON": [4.2, 7.5],
+        }
+    )
+    path = _write(tmp_path, frame)
+    _, trip_sums = load_ridership(path, vendor_spec, events=route_232_events, routes=route_232)
+    assert trip_sums.set_index("trip_id")["boardings"].to_dict() == {"t1": 4.2}
+
+
+def test_blank_survey_date_column_makes_date_averaging_a_no_op(
+    vendor_xlsx, route_232_events, route_232, vendor_spec
+) -> None:
+    # A pre-averaged export ships SURVEY_DATE empty; pointing RIDERSHIP_DATE_COL
+    # at it collapses to one date group and must not change any number.
+    dated = vendor_spec._replace(date_col="SURVEY_DATE")
+    _, plain = load_ridership(vendor_xlsx, vendor_spec, events=route_232_events, routes=route_232)
+    _, averaged = load_ridership(vendor_xlsx, dated, events=route_232_events, routes=route_232)
+    assert plain.equals(averaged)
