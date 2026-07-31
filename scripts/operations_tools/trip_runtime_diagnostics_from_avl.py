@@ -4,6 +4,11 @@ This module analyzes observed bus trips to evaluate how actual runtime and timin
 deviations compare to scheduled values. It generates both row-level flags and
 summary statistics, emphasizing on-time performance (OTP) and 85th-percentile runtime.
 
+Two data-quality screens run alongside the performance review: start times with
+unusually few observations, and back-to-back trips whose runtimes or
+actual/scheduled ratios diverge far more than neighbors on the same
+pattern/shape variant should.
+
 Designed to support schedule tuning, the script suggests time-of-day bands using
 Fisher–Jenks segmentation and provides visual diagnostics for start time, runtime,
 and deviation patterns.
@@ -25,6 +30,10 @@ tag (e.g. ``WEEKDAY``):
   adjustment.
 - ``low_sample_start_times_<day>.csv`` - start times with unusually low sample
   counts, for data-quality review.
+- ``back_to_back_runtime_flags_<day>.csv`` - consecutive trips on the same
+  pattern/shape variant whose runtimes or actual/scheduled ratios differ far
+  more than neighbors should, for data-quality review. Written only when
+  something is flagged.
 - ``plots/*.png`` - diagnostic plots (start/finish/runtime deviation boxplots
   and a scheduled vs. 85th-percentile runtime bar chart).
 
@@ -102,6 +111,44 @@ _DOW_CHOICES: Final[set[str | None]] = {None, "", "WEEKDAY", "SATURDAY", "SUNDAY
 # Outlier‑trimming settings (per‑trip)
 TRIM_OUTLIERS: Final[bool] = True
 TRIM_FRAC: Final[float] = 0.01  # drop shortest & longest 1 %
+
+# Back-to-back trip checks. Each start-time token is compared with the next one
+# on the same pattern/shape variant. Neighboring trips on one variant should
+# behave alike, so a step change is normally a data or schedule problem rather
+# than real operating conditions.
+#   * B2B_RUNTIME_RATIO    - flag when the longer median runtime divided by the
+#     shorter one reaches this (2.0 = one trip takes twice as long).
+#   * B2B_RUNTIME_DIFF_MIN - flag when the median runtimes differ by at least
+#     this many minutes.
+#   * B2B_SCHED_RATIO_DIFF - flag when the two trips' actual/scheduled runtime
+#     ratios differ by at least this much (0.50 = one trip runs 50% further over
+#     its scheduled time than its neighbor does).
+#   * B2B_MAX_GAP_MIN      - skip pairs whose scheduled starts are more than this
+#     many minutes apart (peak-only gaps, where a runtime change is legitimate).
+#     Set 0 to compare every consecutive pair regardless of the gap.
+#   * B2B_MIN_OBS          - both trips need at least this many observations
+#     before the pair is compared.
+# A pair is flagged when *any* enabled test trips. Set an individual threshold to
+# 0 to disable just that test.
+B2B_RUNTIME_RATIO: Final[float] = 2.0
+B2B_RUNTIME_DIFF_MIN: Final[float] = 20.0
+B2B_SCHED_RATIO_DIFF: Final[float] = 0.50
+B2B_MAX_GAP_MIN: Final[float] = 120.0
+B2B_MIN_OBS: Final[int] = 3
+
+# Columns tried, in order, to identify a trip's pattern/shape variant. Pairing
+# trips across variants is meaningless - a short-turn legitimately runs far
+# shorter than a full-length trip - so when none of these columns is present the
+# check is skipped rather than run on mixed variants. Set B2B_REQUIRE_VARIANT to
+# False to compare anyway (older AVL exports often carry no pattern column).
+B2B_VARIANT_COLS: Final[tuple[str, ...]] = (
+    "pattern_id",
+    "shape_id",
+    "Pattern",
+    "PatternID",
+    "Variant",
+)
+B2B_REQUIRE_VARIANT: Final[bool] = True
 
 # ─── derived paths (initial stubs – reassigned per route in main()) ─── #
 OUTPUT_DIR: Path = OUTPUT_ROOT_DIR
@@ -198,6 +245,11 @@ def normalize_directions_column(df: pd.DataFrame, allowed: List[str]) -> pd.Data
 # -----------------------------------------------------------------------------
 
 _route_token_re = re.compile(r"([0-9]{1,4})")
+_ROUTE_HDR_RE: Final[re.Pattern[str]] = re.compile(r"\s*route\w*\s*", flags=re.I)
+# Route-like headers that describe the service rather than identify the route.
+# TIDES carries route_type ("Local Bus Service") and route_type_agency ("LOCAL"),
+# neither of which holds a route number.
+_ROUTE_ATTR_RE: Final[re.Pattern[str]] = re.compile(r"\s*route_?type\w*\s*", flags=re.I)
 
 
 def _clean_route_id(raw: str | float | int) -> str:
@@ -207,6 +259,30 @@ def _clean_route_id(raw: str | float | int) -> str:
     if not m:
         raise ValueError(f"Cannot parse route from value {txt!r}")
     return m.group(1).lstrip("0") or "0"
+
+
+def _route_column_candidates(header: Iterable[str]) -> List[str]:
+    """Rank a file's route-like headers by how likely each identifies a route.
+
+    Human-readable ``Route`` first, then other non-ID route columns (such as
+    ``routeName``), then ID-style ones (``route_id``, ``RouteID``). Columns that
+    describe the service type are dropped outright: they match the same
+    ``route*`` pattern but never hold a route number.
+
+    Args:
+        header: Column names read from the file.
+
+    Returns:
+        Candidate column names, best first; empty when none look like a route.
+    """
+    route_like = [
+        c for c in header if _ROUTE_HDR_RE.fullmatch(c) and not _ROUTE_ATTR_RE.fullmatch(c)
+    ]
+    named = [c for c in route_like if c.strip().lower() == "route"]
+    rest = [c for c in route_like if c not in named]
+    non_id = [c for c in rest if not re.search(r"id\s*$", c, flags=re.I)]
+    id_like = [c for c in rest if c not in non_id]
+    return [*named, *non_id, *id_like]
 
 
 def _discover_route_csvs(
@@ -219,47 +295,52 @@ def _discover_route_csvs(
     (prefers a human-readable ``Route`` column over ID-like columns such as
     ``RouteID``). Mixed files get processed by each relevant route run.
 
-    The selected route column may be “Route”, “routeName”, “Route_ID”, etc.
+    The selected route column may be “Route”, “routeName”, “Route_ID”, etc. Each
+    candidate is tried in turn, so a file is only skipped once *no* route-like
+    column yields a usable ID - a column full of unparseable values falls through
+    to the next candidate instead of dropping the file.
+
     Honors *wanted* whitelist (1-to-4 digit IDs with leading zeros stripped).
     """
     buckets: dict[str, list[Path]] = defaultdict(list)
-    route_hdr_re = re.compile(r"\s*route\w*\s*", flags=re.I)
 
     for p in root.rglob("*.csv"):
         try:
-            # Read just the header to find a Route-like column.
+            # Read just the header to find the Route-like columns.
             header = pd.read_csv(p, sep=_detect_sep(p), nrows=0).columns.tolist()
-            route_like = [c for c in header if route_hdr_re.fullmatch(c)]
-            if not route_like:
-                raise KeyError("no route-like column")
-
-            # Prefer the human-readable 'Route' column when present.
-            if "Route" in route_like:
-                route_col = "Route"
-            else:
-                # Otherwise prefer a non-ID route-like column (e.g., routeName) over RouteID.
-                non_id = [c for c in route_like if not re.search(r"id\s*$", c, flags=re.I)]
-                route_col = non_id[0] if non_id else route_like[0]
-
-        except (OSError, ValueError, KeyError, UnicodeDecodeError) as e:
+        except (OSError, ValueError, UnicodeDecodeError) as e:
             logging.warning("!! %s: %s; skipped", p.name, e)
             continue
 
-        try:
-            routes = (
-                pd.read_csv(
-                    p,
-                    sep=_detect_sep(p),
-                    usecols=[route_col],
-                    dtype=str,
-                    low_memory=False,
-                )[route_col]
-                .dropna()
-                .unique()
-            )
-            ids = {_clean_route_id(r) for r in routes}
-        except (OSError, ValueError, KeyError, UnicodeDecodeError) as e:
-            logging.warning("!! %s: %s; skipped", p.name, e)
+        candidates = _route_column_candidates(header)
+        if not candidates:
+            logging.warning("!! %s: no route-like column; skipped", p.name)
+            continue
+
+        ids: set[str] = set()
+        last_error: str = ""
+        for route_col in candidates:
+            try:
+                routes = (
+                    pd.read_csv(
+                        p,
+                        sep=_detect_sep(p),
+                        usecols=[route_col],
+                        dtype=str,
+                        low_memory=False,
+                    )[route_col]
+                    .dropna()
+                    .unique()
+                )
+                ids = {_clean_route_id(r) for r in routes}
+            except (OSError, ValueError, KeyError, UnicodeDecodeError) as e:
+                last_error = f"{route_col}: {e}"
+                continue
+            if ids:
+                break
+
+        if not ids:
+            logging.warning("!! %s: %s; skipped", p.name, last_error or "no route IDs found")
             continue
 
         if wanted:
@@ -605,22 +686,22 @@ def write_summary_table(df: pd.DataFrame) -> pd.DataFrame:
         lambda s: _sched_mode_with_warning(s, trip_id=s.name)
     )
 
-    def _runtime_stats(series: pd.Series) -> pd.Series:
+    def _runtime_stats(series: pd.Series) -> dict[str, float]:
         data = _trim_pct(series) if TRIM_OUTLIERS else series
-        return pd.Series(
-            {
-                "runtime_mean_min": data.mean(),
-                "runtime_median_min": data.median(),
-                "runtime_p85_min": data.quantile(0.85),
-            }
-        )
+        return {
+            "runtime_mean_min": data.mean(),
+            "runtime_median_min": data.median(),
+            "runtime_p85_min": data.quantile(0.85),
+        }
 
-    _runtime_df = trip_grp["actual_runtime_min"].apply(_runtime_stats)
-    if isinstance(_runtime_df.index, pd.MultiIndex):
-        _runtime_df = _runtime_df.pivot_table(
-            index=_runtime_df.index.get_level_values(0),
-            aggfunc="first",
-        )
+    # Built one start-time at a time so the statistics land as columns on every
+    # pandas version, rather than depending on how groupby.apply reshapes a
+    # Series-returning function.
+    _runtime_df = pd.DataFrame.from_dict(
+        {token: _runtime_stats(vals) for token, vals in trip_grp["actual_runtime_min"]},
+        orient="index",
+    )
+    _runtime_df.index.name = summary.index.name
     summary = summary.join(_runtime_df)
 
     # New, clearer columns kept in parallel for one cycle
@@ -881,6 +962,227 @@ def log_low_sample_start_times(
         missing = flagged_dates - {str(d) for d in exclude_dates}
         if missing:
             logging.warning("      ↪ Consider adding these to EXCLUDE_DATES: %s", sorted(missing))
+
+
+B2B_COLUMNS: Final[list[str]] = [
+    "variant_key",
+    "from_trip_start_time",
+    "from_n_obs",
+    "from_runtime_median_min",
+    "from_scheduled_runtime_min",
+    "from_act_sched_ratio",
+    "to_trip_start_time",
+    "to_n_obs",
+    "to_runtime_median_min",
+    "to_scheduled_runtime_min",
+    "to_act_sched_ratio",
+    "gap_min",
+    "runtime_diff_min",
+    "runtime_ratio",
+    "act_sched_ratio_diff",
+    "compared",
+    "flag_runtime_ratio",
+    "flag_runtime_diff",
+    "flag_act_sched_ratio",
+    "back_to_back_flag",
+]
+
+
+def _representative_value(series: pd.Series) -> str:
+    """Return the most common value in *series*, breaking ties alphabetically."""
+    vals = series.dropna().astype(str)
+    vals = vals[vals.str.strip() != ""]
+    if vals.empty:
+        return ""
+    counts = vals.value_counts()
+    return sorted(counts[counts == counts.max()].index)[0]
+
+
+def flag_back_to_back_runtimes(
+    summary: pd.DataFrame,
+    df: pd.DataFrame,
+    *,
+    runtime_ratio: float = B2B_RUNTIME_RATIO,
+    runtime_diff_min: float = B2B_RUNTIME_DIFF_MIN,
+    sched_ratio_diff: float = B2B_SCHED_RATIO_DIFF,
+    max_gap_min: float = B2B_MAX_GAP_MIN,
+    min_obs: int = B2B_MIN_OBS,
+    require_variant: bool = B2B_REQUIRE_VARIANT,
+) -> pd.DataFrame:
+    """Compare each start-time token with the next one on the same variant.
+
+    Consecutive trips on one pattern should run alike, so a step change between
+    neighbors is usually a data or schedule problem rather than real operating
+    conditions. Pairs are formed strictly *within* a pattern/shape variant: a
+    short-turn legitimately runs far shorter than a full-length trip, so
+    comparing across variants would flag normal service. A pair is flagged when
+    any enabled test trips - the median runtimes differ by ``runtime_ratio``, by
+    ``runtime_diff_min`` minutes, or the two trips' actual/scheduled runtime
+    ratios differ by ``sched_ratio_diff``.
+
+    Args:
+        summary: Output of :func:`write_summary_table` for one route/direction.
+        df: The row-level trips behind *summary*, used to attach each start-time
+            token to its pattern/shape variant.
+        runtime_ratio: Longer/shorter median runtime cutoff (0 disables).
+        runtime_diff_min: Absolute median-runtime difference in minutes
+            (0 disables).
+        sched_ratio_diff: Absolute difference between the pair's
+            actual/scheduled runtime ratios (0 disables).
+        max_gap_min: Skip pairs whose scheduled starts are farther apart than
+            this many minutes (0 compares every consecutive pair).
+        min_obs: Minimum observations required on *both* trips.
+        require_variant: When True and no variant column is present, skip the
+            check rather than compare trips that may be different patterns.
+
+    Returns:
+        One row per consecutive pair with the gap, the deltas, whether the pair
+        was ``compared``, the individual test flags, and ``back_to_back_flag``.
+        Empty (with the full column set) when there is nothing to compare.
+    """
+    empty = pd.DataFrame({c: pd.Series(dtype="object") for c in B2B_COLUMNS})
+    need = {"trip_start_time", "runtime_median_min", "scheduled_runtime_mode", "n_events"}
+    if summary.empty or not need <= set(summary.columns):
+        return empty
+
+    variant_col = next((c for c in B2B_VARIANT_COLS if c in df.columns), None)
+    if variant_col is None:
+        if require_variant:
+            logging.warning(
+                "   ⚠  Back-to-back check skipped: no pattern/shape column found "
+                "(looked for %s). Comparing trips across variants is meaningless, so set "
+                "B2B_REQUIRE_VARIANT = False to compare within the direction anyway.",
+                ", ".join(B2B_VARIANT_COLS),
+            )
+            return empty
+        logging.warning(
+            "   ⚠  Back-to-back check running without a pattern/shape column; trips on "
+            "different variants may be compared and flagged even when both are correct."
+        )
+        variants = pd.Series("", index=summary.index, name="variant_key")
+        work = summary.assign(variant_key=variants)
+    else:
+        per_token = (
+            df.groupby(TIME_COL_NAME)[variant_col].agg(_representative_value).rename("variant_key")
+        )
+        work = summary.merge(per_token, how="left", left_on="trip_start_time", right_index=True)
+        work["variant_key"] = work["variant_key"].fillna("").astype(str)
+
+    work = work.assign(
+        _t=_hhmm_series_to_minutes(work["trip_start_time"]),
+        act_sched_ratio=(work["runtime_median_min"] / work["scheduled_runtime_mode"]).replace(
+            [np.inf, -np.inf], np.nan
+        ),
+    )
+    work = work.sort_values(["variant_key", "_t"], kind="mergesort").reset_index(drop=True)
+
+    nxt = work.groupby("variant_key", dropna=False, sort=False).shift(-1)
+    pairs = pd.DataFrame(
+        {
+            "variant_key": work["variant_key"],
+            "from_trip_start_time": work["trip_start_time"],
+            "from_n_obs": work["n_events"],
+            "from_runtime_median_min": work["runtime_median_min"],
+            "from_scheduled_runtime_min": work["scheduled_runtime_mode"],
+            "from_act_sched_ratio": work["act_sched_ratio"],
+            "to_trip_start_time": nxt["trip_start_time"],
+            "to_n_obs": nxt["n_events"],
+            "to_runtime_median_min": nxt["runtime_median_min"],
+            "to_scheduled_runtime_min": nxt["scheduled_runtime_mode"],
+            "to_act_sched_ratio": nxt["act_sched_ratio"],
+            "gap_min": nxt["_t"] - work["_t"],
+        }
+    )
+    # The last token on each variant has no successor.
+    pairs = pairs.loc[nxt["trip_start_time"].notna()].reset_index(drop=True)
+    if pairs.empty:
+        return empty
+
+    runtime_cols = ["from_runtime_median_min", "to_runtime_median_min"]
+    pairs["runtime_diff_min"] = pairs["to_runtime_median_min"] - pairs["from_runtime_median_min"]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        pairs["runtime_ratio"] = (
+            pairs[runtime_cols].max(axis=1) / pairs[runtime_cols].min(axis=1)
+        ).replace([np.inf, -np.inf], np.nan)
+    pairs["act_sched_ratio_diff"] = pairs["to_act_sched_ratio"] - pairs["from_act_sched_ratio"]
+
+    # Which pairs are worth judging at all.
+    compared = (pairs["from_n_obs"] >= min_obs) & (pairs["to_n_obs"] >= min_obs)
+    if max_gap_min and max_gap_min > 0:
+        compared &= pairs["gap_min"].le(max_gap_min)
+    pairs["compared"] = compared
+
+    # NaN never satisfies a comparison, so unmeasurable tests simply do not flag.
+    zeros = pd.Series(False, index=pairs.index)
+    pairs["flag_runtime_ratio"] = (
+        (pairs["runtime_ratio"] >= runtime_ratio) if runtime_ratio > 0 else zeros
+    ) & compared
+    pairs["flag_runtime_diff"] = (
+        (pairs["runtime_diff_min"].abs() >= runtime_diff_min) if runtime_diff_min > 0 else zeros
+    ) & compared
+    pairs["flag_act_sched_ratio"] = (
+        (pairs["act_sched_ratio_diff"].abs() >= sched_ratio_diff) if sched_ratio_diff > 0 else zeros
+    ) & compared
+    pairs["back_to_back_flag"] = (
+        pairs["flag_runtime_ratio"] | pairs["flag_runtime_diff"] | pairs["flag_act_sched_ratio"]
+    )
+
+    pairs = pairs.sort_values(["variant_key", "from_trip_start_time"]).reset_index(drop=True)
+    return pairs[B2B_COLUMNS].round(
+        {
+            "gap_min": 1,
+            "runtime_diff_min": 2,
+            "runtime_ratio": 3,
+            "act_sched_ratio_diff": 3,
+            "from_runtime_median_min": 2,
+            "to_runtime_median_min": 2,
+            "from_scheduled_runtime_min": 2,
+            "to_scheduled_runtime_min": 2,
+            "from_act_sched_ratio": 3,
+            "to_act_sched_ratio": 3,
+        }
+    )
+
+
+def write_back_to_back_flags(pairs: pd.DataFrame) -> None:
+    """Save the flagged back-to-back pairs, if any, as an exception list.
+
+    Nothing is written when no pair trips a threshold, matching the other
+    data-quality outputs (a missing file means nothing to review).
+
+    Args:
+        pairs: Output of :func:`flag_back_to_back_runtimes`.
+    """
+    if pairs.empty:
+        return
+
+    n_skipped = int((~pairs["compared"].astype(bool)).sum())
+    if n_skipped:
+        logging.info(
+            "   ⤷ %d of %d back-to-back pair(s) not compared (under %d observations "
+            "or a scheduled gap over %g min).",
+            n_skipped,
+            len(pairs),
+            B2B_MIN_OBS,
+            B2B_MAX_GAP_MIN,
+        )
+
+    flagged = pairs.loc[pairs["back_to_back_flag"].astype(bool)]
+    if flagged.empty:
+        return
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    fname = OUTPUT_DIR / f"back_to_back_runtime_flags_{_day_tag()}.csv"
+    flagged.to_csv(fname, index=False)
+    logging.warning(
+        "   ⚠  %d back-to-back trip pair(s) flagged (>=%gx or >=%g min apart, or "
+        "actual/scheduled ratios >=%g apart) ➜ %s",
+        len(flagged),
+        B2B_RUNTIME_RATIO,
+        B2B_RUNTIME_DIFF_MIN,
+        B2B_SCHED_RATIO_DIFF,
+        fname.name,
+    )
 
 
 def _cum_sums(arr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -1185,6 +1487,7 @@ def main() -> int:  # pragma: no cover
             # ---- 2 d.  Core exports --------------------------------------
             write_row_level(dir_df)
             summary = write_summary_table(dir_df)
+            write_back_to_back_flags(flag_back_to_back_runtimes(summary, dir_df))
             bands = suggest_time_bands(summary)
             bands.to_excel(
                 OUTPUT_DIR / f"time_bands_{_day_tag()}.xlsx",

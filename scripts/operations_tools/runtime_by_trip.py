@@ -7,7 +7,7 @@ ran. For every such trip it reports the mean, median, standard deviation, and
 coefficient of variation of the running time, and flags trips whose runtime is
 unusually variable.
 
-Two data-quality diagnostics are produced as well:
+Three data-quality diagnostics are produced as well:
 
   * **Apparent data gaps** - scheduled trips with far fewer observations than
     their peers (a sign of missing AVL/feed coverage), flagged relative to the
@@ -17,6 +17,17 @@ Two data-quality diagnostics are produced as well:
     running time departs noticeably from the trip's overall mean (e.g. Monday
     trips running materially longer/shorter than Tue-Fri). Both are common
     artifacts of pooling weekdays that actually behave differently.
+  * **Back-to-back trip anomalies** - consecutive trips on the same route,
+    direction, *and* pattern/shape variant should behave alike; a step change
+    between neighbors usually means bad data or a broken schedule rather than
+    real operating conditions. Each trip is compared with the next one on its
+    variant and flagged when the median running times differ by a large ratio
+    (e.g. 2x) or a large number of minutes (e.g. 20), or when the two trips'
+    actual/scheduled runtime ratios diverge. Comparing across variants is
+    meaningless (a short-turn legitimately runs far shorter than a full-length
+    trip), so pairs are only formed within a variant. Pairs whose scheduled
+    starts are far apart are skipped, since a genuine peak/midday runtime
+    difference is not a data problem.
 
 Outlier trimming is applied per trip before statistics are computed: the
 shortest and longest ``TRIM_FRAC`` of observations are dropped (default 1%; set
@@ -24,10 +35,12 @@ to 0.05 for 5%, etc.). The trimmed rows are written to their own CSV so nothing
 is silently discarded.
 
 Outputs:
-  * ``trip_runtime_observations.csv`` - retained per-trip-per-date runtimes.
-  * ``trip_runtime_outliers.csv``     - rows removed by trimming.
-  * ``trip_runtime_stats.csv``        - per-trip summary statistics + flags.
-  * ``trip_runtime_dow.csv``          - per-trip-per-DOW counts/means + flags.
+  * ``trip_runtime_observations.csv``  - retained per-trip-per-date runtimes.
+  * ``trip_runtime_outliers.csv``      - rows removed by trimming.
+  * ``trip_runtime_stats.csv``         - per-trip summary statistics + flags.
+  * ``trip_runtime_dow.csv``           - per-trip-per-DOW counts/means + flags.
+  * ``trip_runtime_back_to_back.csv``  - every consecutive same-variant trip
+    pair, with the gap, the runtime deltas, and the flags below.
   * PNG charts per route: runtime boxplot by trip start, and mean runtime by
     day of week.
 
@@ -82,6 +95,37 @@ GAP_FRAC: float = 0.30
 DOW_LOW_COUNT_FRAC: float = 0.40
 DOW_RUNTIME_PCT: float = 0.10
 
+# Back-to-back trip checks. Each trip is compared with the *next* scheduled trip
+# on the same route, direction, and pattern/shape variant. Neighboring trips on
+# one variant should behave alike, so a step change is normally a data or
+# schedule problem rather than real operating conditions.
+#   * B2B_RUNTIME_RATIO    - flag when the longer median runtime divided by the
+#     shorter one reaches this (2.0 = one trip takes twice as long).
+#   * B2B_RUNTIME_DIFF_MIN - flag when the median runtimes differ by at least
+#     this many minutes.
+#   * B2B_SCHED_RATIO_DIFF - flag when the two trips' actual/scheduled runtime
+#     ratios differ by at least this much (0.50 = one trip runs 50% further over
+#     its scheduled time than its neighbor does).
+#   * B2B_MAX_GAP_MIN      - skip pairs whose scheduled starts are more than this
+#     many minutes apart (peak-only gaps, where a runtime change is legitimate).
+#     Set 0 to compare every consecutive pair regardless of the gap.
+#   * B2B_MIN_OBS          - both trips need at least this many retained
+#     observations before the pair is compared.
+# A pair is flagged when *any* enabled test trips. Set an individual threshold to
+# 0 to disable just that test.
+B2B_RUNTIME_RATIO: float = 2.0
+B2B_RUNTIME_DIFF_MIN: float = 20.0
+B2B_SCHED_RATIO_DIFF: float = 0.50
+B2B_MAX_GAP_MIN: float = 120.0
+B2B_MIN_OBS: int = 3
+
+# Columns tried, in order, to identify a trip's pattern/shape variant. Pairing
+# trips across variants is meaningless, so when none of these columns is present
+# the check is skipped rather than run on mixed variants - unless
+# B2B_REQUIRE_VARIANT is set to False, which compares within route/direction only.
+VARIANT_ID_COLS: Sequence[str] = ("pattern_id", "shape_id")
+B2B_REQUIRE_VARIANT: bool = True
+
 # Optional route filters (matched against route_id as a string). Empty = all.
 ROUTES_TO_INCLUDE: Sequence[str] = ()
 ROUTES_TO_EXCLUDE: Sequence[str] = ()
@@ -116,6 +160,12 @@ class Config:
     gap_frac: float = GAP_FRAC
     dow_low_count_frac: float = DOW_LOW_COUNT_FRAC
     dow_runtime_pct: float = DOW_RUNTIME_PCT
+    b2b_runtime_ratio: float = B2B_RUNTIME_RATIO
+    b2b_runtime_diff_min: float = B2B_RUNTIME_DIFF_MIN
+    b2b_sched_ratio_diff: float = B2B_SCHED_RATIO_DIFF
+    b2b_max_gap_min: float = B2B_MAX_GAP_MIN
+    b2b_min_obs: int = B2B_MIN_OBS
+    b2b_require_variant: bool = B2B_REQUIRE_VARIANT
     routes_to_include: Sequence[str] = ()
     routes_to_exclude: Sequence[str] = ()
 
@@ -128,7 +178,12 @@ class Config:
 def load_stop_visits(path: Path) -> pd.DataFrame:
     """Read ``stop_visits`` and parse timestamps + numeric sequence."""
     df = pd.read_csv(path, dtype=str)
-    for col in ("actual_arrival_time", "actual_departure_time"):
+    for col in (
+        "actual_arrival_time",
+        "actual_departure_time",
+        "schedule_arrival_time",
+        "schedule_departure_time",
+    ):
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], errors="coerce")
     df["service_date"] = pd.to_datetime(df["service_date"], errors="coerce")
@@ -137,10 +192,11 @@ def load_stop_visits(path: Path) -> pd.DataFrame:
 
 
 def load_trips_performed(path: Path) -> pd.DataFrame:
-    """Read ``trips_performed`` and parse the scheduled start timestamp."""
+    """Read ``trips_performed`` and parse the scheduled start/end timestamps."""
     df = pd.read_csv(path, dtype=str)
-    if "schedule_trip_start" in df.columns:
-        df["schedule_trip_start"] = pd.to_datetime(df["schedule_trip_start"], errors="coerce")
+    for col in ("schedule_trip_start", "schedule_trip_end"):
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
     return df
 
 
@@ -152,13 +208,20 @@ def compute_trip_runtimes(stop_visits: pd.DataFrame) -> pd.DataFrame:
     excluded before picking the endpoints, so a trip's runtime spans its first
     to last *served* stop.
 
+    The scheduled running time is measured between those same two endpoints
+    (the schedule times on the first and last served stop) rather than over the
+    whole booked trip, so the actual/scheduled ratio is not skewed low whenever
+    AVL coverage stops short of the terminals.
+
     Args:
         stop_visits: Output of :func:`load_stop_visits`.
 
     Returns:
         DataFrame with one row per ``trip_id_performed`` and columns
-        ``service_date``, ``start_time`` (first actual departure), and
-        ``actual_runtime_min`` (NaN when fewer than two usable stops exist).
+        ``service_date``, ``start_time`` (first actual departure),
+        ``actual_runtime_min`` (NaN when fewer than two usable stops exist), and
+        ``scheduled_runtime_min`` (NaN when the endpoints carry no schedule
+        times).
     """
     work = stop_visits
     if "schedule_relationship" in work.columns:
@@ -166,21 +229,33 @@ def compute_trip_runtimes(stop_visits: pd.DataFrame) -> pd.DataFrame:
     work = work.dropna(subset=["actual_arrival_time", "actual_departure_time"], how="all")
     work = work.sort_values(["trip_id_performed", "trip_stop_sequence"])
 
+    has_sched = {"schedule_departure_time", "schedule_arrival_time"} <= set(work.columns)
+
     rows: List[Dict[str, object]] = []
     for trip_id, g in work.groupby("trip_id_performed", sort=False):
-        deps = g["actual_departure_time"].dropna()
-        arrs = g["actual_arrival_time"].dropna()
-        if deps.empty or arrs.empty:
+        # Row labels of the endpoints, so schedule times come from the same stops.
+        dep_idx = g["actual_departure_time"].first_valid_index()
+        arr_idx = g["actual_arrival_time"].last_valid_index()
+        if dep_idx is None or arr_idx is None:
             continue
-        start = deps.iloc[0]
-        end = arrs.iloc[-1]
+        start = g.loc[dep_idx, "actual_departure_time"]
+        end = g.loc[arr_idx, "actual_arrival_time"]
         runtime = (end - start).total_seconds() / 60.0
+
+        sched_runtime = float("nan")
+        if has_sched:
+            sched_start = g.loc[dep_idx, "schedule_departure_time"]
+            sched_end = g.loc[arr_idx, "schedule_arrival_time"]
+            if pd.notna(sched_start) and pd.notna(sched_end):
+                sched_runtime = (sched_end - sched_start).total_seconds() / 60.0
+
         rows.append(
             {
                 "trip_id_performed": trip_id,
                 "service_date": g["service_date"].iloc[0],
                 "start_time": start,
                 "actual_runtime_min": runtime,
+                "scheduled_runtime_min": sched_runtime,
             }
         )
 
@@ -194,12 +269,17 @@ def join_trip_attributes(
 
     Canceled / non-in-service trips are dropped via the join. Adds:
     ``route_id``, ``direction_id``, ``trip_id_scheduled``, ``start_hhmm`` (the
-    *scheduled* start label, stable across dates, used to order trips), and
-    ``dow`` (day name).
+    *scheduled* start label, stable across dates, used to order trips), ``dow``
+    (day name), and ``variant_key`` (the pattern/shape the trip ran, taken from
+    the first available :data:`VARIANT_ID_COLS` column; empty when none exists).
 
     The start label is taken from the scheduled trip start rather than the
     observed departure, so the same recurring trip carries one consistent label
     on every date it ran (the actual departure jitters by seconds day to day).
+
+    Any trip whose scheduled runtime could not be measured from the stop-level
+    schedule times falls back to the booked trip start/end on
+    ``trips_performed``.
     """
     trips = trips_performed.copy()
     if "schedule_relationship" in trips.columns:
@@ -215,6 +295,8 @@ def join_trip_attributes(
             "trip_id_scheduled",
             "route_type_agency",
             "schedule_trip_start",
+            "schedule_trip_end",
+            *VARIANT_ID_COLS,
         )
         if c in trips.columns
     ]
@@ -222,6 +304,22 @@ def join_trip_attributes(
 
     merged = trip_runtimes.merge(trips_small, on="trip_id_performed", how="inner")
     merged["dow"] = merged["service_date"].dt.day_name()
+
+    # Pattern/shape the trip ran; pairing trips across variants is meaningless.
+    variant_col = next((c for c in VARIANT_ID_COLS if c in merged.columns), None)
+    if variant_col is None:
+        merged["variant_key"] = ""
+    else:
+        merged["variant_key"] = merged[variant_col].astype(str).replace({"nan": "", "<NA>": ""})
+
+    # Fall back to the booked trip span when the stop-level schedule was missing.
+    if "scheduled_runtime_min" not in merged.columns:
+        merged["scheduled_runtime_min"] = float("nan")
+    if {"schedule_trip_start", "schedule_trip_end"} <= set(merged.columns):
+        booked = (
+            merged["schedule_trip_end"] - merged["schedule_trip_start"]
+        ).dt.total_seconds() / 60.0
+        merged["scheduled_runtime_min"] = merged["scheduled_runtime_min"].fillna(booked)
 
     # Prefer the scheduled start for the (stable) label; fall back to actual.
     if "schedule_trip_start" in merged.columns:
@@ -321,24 +419,41 @@ def compute_trip_stats(
 
     Returns:
         DataFrame with one row per ``trip_key`` and statistics + boolean flags
-        ``high_variation`` and ``data_gap``.
+        ``high_variation`` and ``data_gap``. Also carries the trip's
+        ``variant_key``, its median ``sched_runtime_median_min``, and
+        ``act_sched_ratio`` (median actual over median scheduled runtime), which
+        :func:`compute_back_to_back_flags` compares between neighbors.
     """
     if df.empty:
         return df.copy()
 
+    aggs = {
+        "start_hhmm": ("start_hhmm", _representative_label),
+        "n_obs": ("actual_runtime_min", "count"),
+        "runtime_mean_min": ("actual_runtime_min", "mean"),
+        "runtime_median_min": ("actual_runtime_min", "median"),
+        "runtime_std_min": ("actual_runtime_min", "std"),
+        "runtime_min_min": ("actual_runtime_min", "min"),
+        "runtime_max_min": ("actual_runtime_min", "max"),
+    }
+    if "variant_key" in df.columns:
+        aggs["variant_key"] = ("variant_key", _representative_label)
+    if "scheduled_runtime_min" in df.columns:
+        aggs["sched_runtime_median_min"] = ("scheduled_runtime_min", "median")
+
     grouped = df.groupby(["route_id", "direction_id", "trip_key"], dropna=False)
-    stats = grouped.agg(
-        start_hhmm=("start_hhmm", _representative_label),
-        n_obs=("actual_runtime_min", "count"),
-        runtime_mean_min=("actual_runtime_min", "mean"),
-        runtime_median_min=("actual_runtime_min", "median"),
-        runtime_std_min=("actual_runtime_min", "std"),
-        runtime_min_min=("actual_runtime_min", "min"),
-        runtime_max_min=("actual_runtime_min", "max"),
-    ).reset_index()
+    stats = grouped.agg(**aggs).reset_index()
+
+    if "variant_key" not in stats.columns:
+        stats["variant_key"] = ""
+    if "sched_runtime_median_min" not in stats.columns:
+        stats["sched_runtime_median_min"] = float("nan")
 
     with np.errstate(divide="ignore", invalid="ignore"):
         stats["cv"] = stats["runtime_std_min"] / stats["runtime_mean_min"]
+        stats["act_sched_ratio"] = (
+            stats["runtime_median_min"] / stats["sched_runtime_median_min"]
+        ).replace([np.inf, -np.inf], np.nan)
 
     stats["high_variation"] = (stats["cv"] > high_cv_threshold) & (stats["n_obs"] >= min_obs_for_cv)
 
@@ -352,7 +467,9 @@ def compute_trip_stats(
             "runtime_mean_min": 2,
             "runtime_median_min": 2,
             "runtime_std_min": 2,
+            "sched_runtime_median_min": 2,
             "cv": 3,
+            "act_sched_ratio": 3,
         }
     )
 
@@ -404,6 +521,217 @@ def compute_dow_anomalies(
     out["dow"] = pd.Categorical(out["dow"], categories=DOW_ORDER, ordered=True)
     out = out.sort_values(["route_id", "direction_id", "trip_key", "dow"]).reset_index(drop=True)
     return out.round({"dow_mean_min": 2, "trip_mean_min": 2, "pct_diff": 3})
+
+
+# =============================================================================
+# BACK-TO-BACK TRIP CHECKS
+# =============================================================================
+
+B2B_COLUMNS: List[str] = [
+    "route_id",
+    "direction_id",
+    "variant_key",
+    "from_trip_key",
+    "from_start_hhmm",
+    "from_n_obs",
+    "from_runtime_median_min",
+    "from_act_sched_ratio",
+    "to_trip_key",
+    "to_start_hhmm",
+    "to_n_obs",
+    "to_runtime_median_min",
+    "to_act_sched_ratio",
+    "gap_min",
+    "runtime_diff_min",
+    "runtime_ratio",
+    "act_sched_ratio_diff",
+    "compared",
+    "flag_runtime_ratio",
+    "flag_runtime_diff",
+    "flag_act_sched_ratio",
+    "back_to_back_flag",
+]
+
+
+def _hhmm_to_minutes(s: pd.Series) -> pd.Series:
+    """Convert an ``HH:MM`` label to minutes after midnight.
+
+    Hours beyond 23 (e.g. ``"24:05"`` for an after-midnight trip) parse fine, so
+    owl trips stay in schedule order. Anything unparseable becomes NaN.
+
+    Args:
+        s: Series of ``HH:MM`` strings.
+
+    Returns:
+        Float Series of minutes after midnight; invalid inputs are NaN.
+    """
+    parts = s.astype(str).str.split(":", n=1, expand=True)
+    if parts.shape[1] < 2:
+        return pd.Series(np.nan, index=s.index, dtype=float)
+    hours = pd.to_numeric(parts[0], errors="coerce")
+    minutes = pd.to_numeric(parts[1], errors="coerce")
+    return hours * 60 + minutes
+
+
+def compute_back_to_back_flags(
+    stats: pd.DataFrame,
+    runtime_ratio: float = B2B_RUNTIME_RATIO,
+    runtime_diff_min: float = B2B_RUNTIME_DIFF_MIN,
+    sched_ratio_diff: float = B2B_SCHED_RATIO_DIFF,
+    max_gap_min: float = B2B_MAX_GAP_MIN,
+    min_obs: int = B2B_MIN_OBS,
+    require_variant: bool = B2B_REQUIRE_VARIANT,
+) -> pd.DataFrame:
+    """Compare each trip with the next one on its route/direction/variant.
+
+    Consecutive trips on the same pattern should run alike, so a step change
+    between neighbors is usually a data or schedule problem. Pairs are formed
+    strictly *within* a pattern/shape variant: a short-turn legitimately runs far
+    shorter than a full-length trip, so comparing across variants would flag
+    normal service. A pair is flagged when any enabled test trips - the runtimes
+    differ by ``runtime_ratio``, by ``runtime_diff_min`` minutes, or the two
+    trips' actual/scheduled ratios differ by ``sched_ratio_diff``.
+
+    Args:
+        stats: Output of :func:`compute_trip_stats`.
+        runtime_ratio: Longer/shorter median runtime cutoff (0 disables).
+        runtime_diff_min: Absolute median-runtime difference in minutes
+            (0 disables).
+        sched_ratio_diff: Absolute difference between the pair's
+            actual/scheduled runtime ratios (0 disables).
+        max_gap_min: Skip pairs whose scheduled starts are farther apart than
+            this many minutes (0 compares every consecutive pair).
+        min_obs: Minimum retained observations required on *both* trips.
+        require_variant: When True and no variant column was available, skip the
+            check rather than compare trips that may be different patterns.
+
+    Returns:
+        One row per consecutive pair with the gap, the deltas, whether the pair
+        was ``compared``, the individual test flags, and ``back_to_back_flag``.
+        Empty (with the full column set) when there is nothing to compare.
+    """
+    empty = pd.DataFrame({c: pd.Series(dtype="object") for c in B2B_COLUMNS})
+    if stats.empty:
+        return empty
+
+    work = stats.copy()
+    if "variant_key" not in work.columns:
+        work["variant_key"] = ""
+    work["variant_key"] = work["variant_key"].fillna("").astype(str)
+
+    if not (work["variant_key"].str.strip() != "").any():
+        if require_variant:
+            logging.warning(
+                "Back-to-back check skipped: no pattern/shape column found (looked for %s). "
+                "Comparing trips across variants is meaningless, so set "
+                "B2B_REQUIRE_VARIANT = False to compare within route/direction anyway.",
+                ", ".join(VARIANT_ID_COLS),
+            )
+            return empty
+        logging.warning(
+            "Back-to-back check running without a pattern/shape column; trips on different "
+            "variants may be compared and flagged even when both are correct."
+        )
+
+    if "act_sched_ratio" not in work.columns:
+        work["act_sched_ratio"] = float("nan")
+
+    work["_start_min"] = _hhmm_to_minutes(work["start_hhmm"])
+    group_cols = ["route_id", "direction_id", "variant_key"]
+    work = work.sort_values([*group_cols, "_start_min"], kind="mergesort").reset_index(drop=True)
+
+    nxt = work.groupby(group_cols, dropna=False, sort=False).shift(-1)
+    pairs = pd.DataFrame(
+        {
+            "route_id": work["route_id"],
+            "direction_id": work["direction_id"],
+            "variant_key": work["variant_key"],
+            "from_trip_key": work["trip_key"],
+            "from_start_hhmm": work["start_hhmm"],
+            "from_n_obs": work["n_obs"],
+            "from_runtime_median_min": work["runtime_median_min"],
+            "from_act_sched_ratio": work["act_sched_ratio"],
+            "to_trip_key": nxt["trip_key"],
+            "to_start_hhmm": nxt["start_hhmm"],
+            "to_n_obs": nxt["n_obs"],
+            "to_runtime_median_min": nxt["runtime_median_min"],
+            "to_act_sched_ratio": nxt["act_sched_ratio"],
+            "gap_min": nxt["_start_min"] - work["_start_min"],
+        }
+    )
+    # The last trip on each variant has no successor.
+    pairs = pairs.loc[nxt["trip_key"].notna()].reset_index(drop=True)
+    if pairs.empty:
+        return empty
+
+    runtime_cols = ["from_runtime_median_min", "to_runtime_median_min"]
+    pairs["runtime_diff_min"] = pairs["to_runtime_median_min"] - pairs["from_runtime_median_min"]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        pairs["runtime_ratio"] = (
+            pairs[runtime_cols].max(axis=1) / pairs[runtime_cols].min(axis=1)
+        ).replace([np.inf, -np.inf], np.nan)
+    pairs["act_sched_ratio_diff"] = pairs["to_act_sched_ratio"] - pairs["from_act_sched_ratio"]
+
+    # Which pairs are worth judging at all.
+    compared = (pairs["from_n_obs"] >= min_obs) & (pairs["to_n_obs"] >= min_obs)
+    if max_gap_min and max_gap_min > 0:
+        compared &= pairs["gap_min"].le(max_gap_min)
+    pairs["compared"] = compared
+
+    # NaN never satisfies a comparison, so unmeasurable tests simply do not flag.
+    zeros = pd.Series(False, index=pairs.index)
+    pairs["flag_runtime_ratio"] = (
+        (pairs["runtime_ratio"] >= runtime_ratio) if runtime_ratio > 0 else zeros
+    ) & compared
+    pairs["flag_runtime_diff"] = (
+        (pairs["runtime_diff_min"].abs() >= runtime_diff_min) if runtime_diff_min > 0 else zeros
+    ) & compared
+    pairs["flag_act_sched_ratio"] = (
+        (pairs["act_sched_ratio_diff"].abs() >= sched_ratio_diff) if sched_ratio_diff > 0 else zeros
+    ) & compared
+    pairs["back_to_back_flag"] = (
+        pairs["flag_runtime_ratio"] | pairs["flag_runtime_diff"] | pairs["flag_act_sched_ratio"]
+    )
+
+    pairs = pairs.sort_values(
+        ["route_id", "direction_id", "variant_key", "from_start_hhmm"]
+    ).reset_index(drop=True)
+    return pairs[B2B_COLUMNS].round(
+        {
+            "gap_min": 1,
+            "runtime_diff_min": 2,
+            "runtime_ratio": 3,
+            "act_sched_ratio_diff": 3,
+            "from_runtime_median_min": 2,
+            "to_runtime_median_min": 2,
+            "from_act_sched_ratio": 3,
+            "to_act_sched_ratio": 3,
+        }
+    )
+
+
+def apply_back_to_back_flag(stats: pd.DataFrame, pairs: pd.DataFrame) -> pd.DataFrame:
+    """Mark every trip that takes part in a flagged back-to-back pair.
+
+    Args:
+        stats: Output of :func:`compute_trip_stats`.
+        pairs: Output of :func:`compute_back_to_back_flags`.
+
+    Returns:
+        Copy of *stats* with a boolean ``back_to_back_flag`` column.
+    """
+    out = stats.copy()
+    if out.empty:
+        out["back_to_back_flag"] = pd.Series(dtype=bool)
+        return out
+    if pairs.empty:
+        out["back_to_back_flag"] = False
+        return out
+
+    flagged = pairs.loc[pairs["back_to_back_flag"].astype(bool)]
+    keys = set(flagged["from_trip_key"]) | set(flagged["to_trip_key"])
+    out["back_to_back_flag"] = out["trip_key"].isin(keys)
+    return out
 
 
 # =============================================================================
@@ -492,9 +820,10 @@ def export_outputs(
     outliers: pd.DataFrame,
     stats: pd.DataFrame,
     dow_table: pd.DataFrame,
+    back_to_back: pd.DataFrame,
     out_dir: Path,
 ) -> List[Path]:
-    """Write the observation, outlier, stats, and DOW-anomaly CSVs."""
+    """Write the observation, outlier, stats, DOW-anomaly, and pair CSVs."""
     ensure_dir(out_dir)
     written: List[Path] = []
 
@@ -514,6 +843,10 @@ def export_outputs(
     dow_table.to_csv(dow_path, index=False)
     written.append(dow_path)
 
+    b2b_path = out_dir / "trip_runtime_back_to_back.csv"
+    back_to_back.to_csv(b2b_path, index=False)
+    written.append(b2b_path)
+
     return written
 
 
@@ -526,7 +859,8 @@ def run(cfg: Config) -> Dict[str, pd.DataFrame]:
     """Execute the full trip-runtime pipeline and write all artifacts.
 
     Returns:
-        Mapping with keys ``retained``, ``outliers``, ``stats``, ``dow``.
+        Mapping with keys ``retained``, ``outliers``, ``stats``, ``dow``,
+        ``back_to_back``.
     """
     stop_visits = load_stop_visits(cfg.stop_visits_path)
     trips = load_trips_performed(cfg.trips_performed_path)
@@ -545,7 +879,29 @@ def run(cfg: Config) -> Dict[str, pd.DataFrame]:
     stats = compute_trip_stats(retained, cfg.high_cv_threshold, cfg.min_obs_for_cv, cfg.gap_frac)
     dow_table = compute_dow_anomalies(retained, cfg.dow_low_count_frac, cfg.dow_runtime_pct)
 
-    paths = export_outputs(retained, outliers, stats, dow_table, cfg.output_dir)
+    back_to_back = compute_back_to_back_flags(
+        stats,
+        cfg.b2b_runtime_ratio,
+        cfg.b2b_runtime_diff_min,
+        cfg.b2b_sched_ratio_diff,
+        cfg.b2b_max_gap_min,
+        cfg.b2b_min_obs,
+        cfg.b2b_require_variant,
+    )
+    stats = apply_back_to_back_flag(stats, back_to_back)
+    if not back_to_back.empty:
+        n_flagged = int(back_to_back["back_to_back_flag"].sum())
+        n_skipped = int((~back_to_back["compared"].astype(bool)).sum())
+        logging.info(
+            "Back-to-back check: %d of %d consecutive same-variant pairs flagged "
+            "(%d not compared - too few observations or a scheduled gap over %g min).",
+            n_flagged,
+            len(back_to_back),
+            n_skipped,
+            cfg.b2b_max_gap_min,
+        )
+
+    paths = export_outputs(retained, outliers, stats, dow_table, back_to_back, cfg.output_dir)
     for p in paths:
         logging.info("Wrote: %s", p)
 
@@ -553,7 +909,13 @@ def run(cfg: Config) -> Dict[str, pd.DataFrame]:
     dow_paths = plot_dow_runtime(dow_table, cfg.output_dir)
     logging.info("Wrote %d runtime charts.", len(box_paths) + len(dow_paths))
 
-    return {"retained": retained, "outliers": outliers, "stats": stats, "dow": dow_table}
+    return {
+        "retained": retained,
+        "outliers": outliers,
+        "stats": stats,
+        "dow": dow_table,
+        "back_to_back": back_to_back,
+    }
 
 
 # =============================================================================
@@ -609,6 +971,42 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--high-cv", type=float, default=HIGH_CV_THRESHOLD, help="CV cutoff for high variation."
     )
+    p.add_argument(
+        "--b2b-runtime-ratio",
+        type=float,
+        default=B2B_RUNTIME_RATIO,
+        help="Back-to-back: longer/shorter median runtime cutoff (0 disables).",
+    )
+    p.add_argument(
+        "--b2b-runtime-diff-min",
+        type=float,
+        default=B2B_RUNTIME_DIFF_MIN,
+        help="Back-to-back: median runtime difference in minutes (0 disables).",
+    )
+    p.add_argument(
+        "--b2b-sched-ratio-diff",
+        type=float,
+        default=B2B_SCHED_RATIO_DIFF,
+        help="Back-to-back: difference between the pair's actual/scheduled ratios (0 disables).",
+    )
+    p.add_argument(
+        "--b2b-max-gap-min",
+        type=float,
+        default=B2B_MAX_GAP_MIN,
+        help="Back-to-back: skip pairs whose starts are farther apart than this (0 = no limit).",
+    )
+    p.add_argument(
+        "--b2b-min-obs",
+        type=int,
+        default=B2B_MIN_OBS,
+        help="Back-to-back: minimum observations required on both trips in a pair.",
+    )
+    p.add_argument(
+        "--b2b-allow-mixed-variants",
+        action="store_true",
+        help="Back-to-back: compare within route/direction even when no pattern/shape column "
+        "exists (off by default, since cross-variant pairs are meaningless).",
+    )
     return p
 
 
@@ -640,6 +1038,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         output_dir=Path(args.output_dir).expanduser(),
         trim_frac=args.trim_frac,
         high_cv_threshold=args.high_cv,
+        b2b_runtime_ratio=args.b2b_runtime_ratio,
+        b2b_runtime_diff_min=args.b2b_runtime_diff_min,
+        b2b_sched_ratio_diff=args.b2b_sched_ratio_diff,
+        b2b_max_gap_min=args.b2b_max_gap_min,
+        b2b_min_obs=args.b2b_min_obs,
+        b2b_require_variant=not args.b2b_allow_mixed_variants,
         routes_to_include=ROUTES_TO_INCLUDE,
         routes_to_exclude=ROUTES_TO_EXCLUDE,
     )
