@@ -1891,12 +1891,16 @@ def _resolve_stop_values(
     translated[blank] = ""
     unmapped = values[~blank & translated.isna()]
     if len(unmapped):
+        # Show both sides: a total miss is usually a formatting difference
+        # (leading zeros, a suffix, a prefix), which only reads as such when
+        # the feed's codes sit next to the file's values.
         logging.warning(
-            "%s: %d stop value(s) match no stop_code in stops.txt (e.g. %s) — those rows are "
-            "ignored.",
+            "%s: %d stop value(s) match no stop_code in stops.txt — those rows are ignored. "
+            "File values look like %s; the feed's stop_codes look like %s.",
             label,
             unmapped.nunique(),
             ", ".join(sorted(set(unmapped))[:5]),
+            ", ".join(sorted(lookup)[:5]),
         )
     return translated
 

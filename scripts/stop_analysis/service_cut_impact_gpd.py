@@ -23,6 +23,8 @@ Inputs:
       optionally ``stop_id``), from APC/ridecheck processing.
     - Optional stop-level ridership CSV at route × stop grain (a vendor "stop usage"
       export) for boardings-lost estimates when trip-level data is unavailable.
+      Both ridership inputs may be .csv or .xlsx/.xls, and their stop ids may be
+      GTFS stop_ids or stop_codes (``RIDERSHIP_STOP_MATCH_FIELD``).
 
 Outputs:
     - ``scenario_summary.csv``: one row per scenario — trips cut/truncated, stops
@@ -174,6 +176,13 @@ STOP_RIDERSHIP_ROUTE_COL: str = "ROUTE_NUMBER"
 STOP_RIDERSHIP_STOP_ID_COL: str = "STOP_ID"
 STOP_RIDERSHIP_BOARDINGS_COL: str = "XBOARDINGS"
 
+# Which stops.txt column the ridership files' stop ids refer to. Vendor exports
+# usually carry the public-facing stop number, which GTFS holds in stop_code
+# rather than in the internal stop_id key. Set this to "stop_code" and those
+# values are translated to stop_ids before any join; rows whose stop matches no
+# code are reported and ignored. Applies to both ridership inputs above.
+RIDERSHIP_STOP_MATCH_FIELD: str = "stop_id"
+
 # Cross-scenario summary filename (per-scenario files are prefixed by scenario name).
 SUMMARY_FILENAME: str = r"scenario_summary.csv"
 
@@ -189,6 +198,10 @@ REQUIRE_RUN_LOG: bool = True
 _SCENARIO_KEYS: frozenset[str] = frozenset(
     {"name", "description", "routes", "trip_ids", "trip_windows", "stops", "route_stops"}
 )
+
+# Excel workbook suffixes accepted for the optional ridership tables. Legacy
+# .xls is read with xlrd, the .xlsx family with openpyxl.
+_EXCEL_SUFFIXES: tuple[str, ...] = (".xls", ".xlsx", ".xlsm", ".xltx", ".xltm")
 
 
 # =============================================================================
@@ -827,6 +840,7 @@ class Config(NamedTuple):
     demographic_fields: Sequence[str] = tuple(DEMOGRAPHIC_FIELDS)
     ridership_csv: str = RIDERSHIP_CSV
     stop_ridership_csv: str = STOP_RIDERSHIP_CSV
+    ridership_stop_field: str = RIDERSHIP_STOP_MATCH_FIELD
 
 
 # =============================================================================
@@ -1453,8 +1467,187 @@ def apportion_demographics(
     return out
 
 
+def build_stop_id_lookup(stops: pd.DataFrame, match_field: str) -> Optional[dict[str, str]]:
+    """Map the ridership files' stop values onto GTFS ``stop_id``.
+
+    Vendor stop-usage exports normally carry the public-facing stop number,
+    which GTFS keeps in ``stop_code`` — joining it against ``stop_id`` matches
+    nothing. Resolving the values once at load time keeps every downstream
+    metric in ``stop_id`` space, the same way route tokens resolve to
+    ``route_id``.
+
+    Args:
+        stops: Parsed ``stops.txt`` (unfiltered, so codes on stops excluded
+            from the analysis still resolve).
+        match_field: ``"stop_id"`` (no translation needed) or ``"stop_code"``.
+
+    Returns:
+        Mapping of stop_code to stop_id, or ``None`` when the ridership files
+        already carry stop_ids.
+
+    Raises:
+        ValueError: If *match_field* is not one of the two supported columns,
+            or ``stop_code`` is requested but the feed has no usable codes.
+    """
+    field = str(match_field).strip().lower()
+    if field == "stop_id":
+        return None
+    if field != "stop_code":
+        raise ValueError(
+            f"RIDERSHIP_STOP_MATCH_FIELD must be 'stop_id' or 'stop_code'; got {match_field!r}."
+        )
+    if "stop_code" not in stops.columns:
+        raise ValueError(
+            "RIDERSHIP_STOP_MATCH_FIELD is 'stop_code', but stops.txt has no stop_code column. "
+            "Set it back to 'stop_id', or use a feed that publishes stop codes."
+        )
+
+    frame = stops[["stop_id", "stop_code"]].copy()
+    frame["stop_id"] = frame["stop_id"].astype(str).str.strip()
+    frame["stop_code"] = frame["stop_code"].fillna("").astype(str).str.strip()
+    frame = frame[frame["stop_code"] != ""]
+    if frame.empty:
+        raise ValueError(
+            "RIDERSHIP_STOP_MATCH_FIELD is 'stop_code', but every stop_code in stops.txt is "
+            "blank. Set it back to 'stop_id'."
+        )
+
+    shared = frame.loc[frame["stop_code"].duplicated(keep=False), "stop_code"]
+    if len(shared):
+        logging.warning(
+            "%d stop_code(s) are shared by more than one stop (e.g. %s); the lowest stop_id "
+            "wins, so ridership at the others is attributed to it.",
+            shared.nunique(),
+            ", ".join(sorted(set(shared))[:5]),
+        )
+    frame = frame.sort_values(["stop_code", "stop_id"]).drop_duplicates(
+        subset=["stop_code"], keep="first"
+    )
+    lookup = dict(zip(frame["stop_code"], frame["stop_id"]))
+    logging.info(
+        "Ridership stop ids will be matched on stop_code (%d code(s) mapped).", len(lookup)
+    )
+    return lookup
+
+
+def _resolve_stop_values(
+    values: pd.Series, lookup: Optional[Mapping[str, str]], label: str
+) -> pd.Series:
+    """Translate one ridership table's stop column into GTFS stop_ids.
+
+    Blank values are preserved — in the trip-level file they mean a whole-trip
+    total. Non-blank values matching no stop come back as NaN so the caller
+    drops those rows instead of silently rereading them as whole-trip totals.
+
+    Args:
+        values: The table's stop column, already stripped.
+        lookup: Output of :func:`build_stop_id_lookup` (``None`` = no change).
+        label: Human-readable table name, used in the warning.
+
+    Returns:
+        The translated column.
+    """
+    if lookup is None:
+        return values
+    blank = values == ""
+    translated = values.map(lookup)
+    translated[blank] = ""
+    unmapped = values[~blank & translated.isna()]
+    if len(unmapped):
+        # Show both sides: a total miss is usually a formatting difference
+        # (leading zeros, a suffix, a prefix), which only reads as such when
+        # the feed's codes sit next to the file's values.
+        logging.warning(
+            "%s: %d stop value(s) match no stop_code in stops.txt — those rows are ignored. "
+            "File values look like %s; the feed's stop_codes look like %s.",
+            label,
+            unmapped.nunique(),
+            ", ".join(sorted(set(unmapped))[:5]),
+            ", ".join(sorted(lookup)[:5]),
+        )
+    return translated
+
+
+def _cell_to_text(value: Any) -> str:
+    """Render one spreadsheet cell as table text.
+
+    Whole-number floats collapse to their integer form because Excel stores
+    every number as a float — otherwise a numeric ``trip_id`` arrives as
+    ``"4821.0"`` and joins against nothing. Missing cells become ``""``.
+    """
+    if pd.isna(value):
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
+def _read_optional_table(path: Path, label: str) -> pd.DataFrame:
+    """Read an optional ridership table as strings, whatever Windows produced.
+
+    The format is decided by file *content* first — Excel's two container
+    signatures (the OLE2 header of legacy ``.xls``, the zip header of
+    ``.xlsx``) — and by extension second, so a workbook saved with a ``.csv``
+    name is still read as Excel instead of failing with a cryptic ``utf-8
+    codec`` error. Text files are read as UTF-8 (tolerating the BOM Excel's
+    "CSV UTF-8" export writes, which would otherwise hide the first column
+    behind an invisible character) and then as cp1252, the usual Windows
+    export encoding.
+
+    Args:
+        path: File to read.
+        label: Human-readable name of the input, used in error messages.
+
+    Returns:
+        DataFrame of text values.
+
+    Raises:
+        ValueError: If the file is neither readable text nor a workbook the
+            installed Excel engines can open.
+    """
+    logging.info("%s: reading %s", label, path)
+    with open(path, "rb") as handle:
+        head = handle.read(8)
+    suffix = path.suffix.lower()
+
+    excel_engine: Optional[str] = None
+    if head.startswith(b"\xd0\xcf\x11\xe0"):  # OLE2 compound document = .xls
+        excel_engine = "xlrd"
+    elif head.startswith(b"PK\x03\x04"):  # zip container = .xlsx family
+        excel_engine = "openpyxl"
+    elif suffix in _EXCEL_SUFFIXES:  # Excel name, unrecognized content
+        excel_engine = "xlrd" if suffix == ".xls" else "openpyxl"
+
+    if excel_engine is not None:
+        logging.info("%s: reading %s as an Excel workbook.", label, path.name)
+        try:
+            frame = pd.read_excel(path, engine=excel_engine)
+        except ImportError as exc:
+            raise ValueError(
+                f"{label} {path} is an Excel workbook, but the {excel_engine} engine is not "
+                f"installed. Install it, or re-save the file as a CSV and re-run."
+            ) from exc
+        for column in frame.columns:
+            frame[column] = frame[column].map(_cell_to_text)
+        return frame
+
+    for encoding in ("utf-8-sig", "cp1252"):
+        try:
+            return pd.read_csv(path, dtype=str, encoding=encoding)
+        except UnicodeDecodeError:
+            continue
+    raise ValueError(
+        f"{label} {path} is not readable as UTF-8 or Windows-1252 text, and is not an Excel "
+        f"workbook. Re-save it from Excel as 'CSV UTF-8 (Comma delimited)' and re-run."
+    )
+
+
 def load_ridership(
-    path: str, trip_col: str, stop_col: str, boardings_col: str
+    path: str,
+    trip_col: str,
+    stop_col: str,
+    boardings_col: str,
+    stop_lookup: Optional[Mapping[str, str]] = None,
 ) -> Optional[tuple[pd.DataFrame, pd.DataFrame]]:
     """Load the optional trip-level ridership CSV and split it by grain.
 
@@ -1463,6 +1656,8 @@ def load_ridership(
         trip_col: Column holding GTFS ``trip_id``.
         stop_col: Column holding ``stop_id`` (optional column; blank rows are
             whole-trip totals).
+        stop_lookup: Output of :func:`build_stop_id_lookup` when the file's
+            stop values are stop_codes (``None`` = they are already stop_ids).
         boardings_col: Numeric average-daily-boardings column.
 
     Returns:
@@ -1480,10 +1675,13 @@ def load_ridership(
     csv_path = Path(path)
     if not csv_path.exists():
         raise FileNotFoundError(f"Ridership CSV not found: {csv_path}")
-    ridership = pd.read_csv(csv_path, dtype=str)
+    ridership = _read_optional_table(csv_path, "Ridership CSV")
     for col in (trip_col, boardings_col):
         if col not in ridership.columns:
-            raise ValueError(f"Ridership CSV is missing required column {col!r}.")
+            raise ValueError(
+                f"Ridership CSV is missing required column {col!r}. "
+                f"Columns found: {', '.join(map(str, ridership.columns))}."
+            )
     ridership = ridership.rename(columns={trip_col: "trip_id", boardings_col: "boardings"})
     ridership["trip_id"] = ridership["trip_id"].astype(str).str.strip()
     ridership["boardings"] = pd.to_numeric(ridership["boardings"], errors="coerce")
@@ -1497,6 +1695,9 @@ def load_ridership(
         ridership["stop_id"] = ridership["stop_id"].fillna("").astype(str).str.strip()
     else:
         ridership["stop_id"] = ""
+
+    ridership["stop_id"] = _resolve_stop_values(ridership["stop_id"], stop_lookup, "Ridership CSV")
+    ridership = ridership[ridership["stop_id"].notna()]
 
     stop_grain = ridership[ridership["stop_id"] != ""]
     trip_grain = ridership[ridership["stop_id"] == ""]
@@ -1580,16 +1781,20 @@ def load_stop_ridership(
     stop_col: str,
     boardings_col: str,
     routes: pd.DataFrame,
+    stop_lookup: Optional[Mapping[str, str]] = None,
 ) -> Optional[pd.DataFrame]:
-    """Load the optional route × stop stop-usage CSV and resolve its route ids.
+    """Load the optional route × stop stop-usage CSV and resolve its ids.
 
     Args:
         path: CSV path ("" disables stop-level ridership accounting).
         route_col: Column holding the route (matched against route_short_name
             or route_id, like scenario route tokens).
-        stop_col: Column holding GTFS ``stop_id``.
+        stop_col: Column holding the stop id — a GTFS ``stop_id``, or the
+            ``stop_code`` *stop_lookup* translates.
         boardings_col: Numeric average-daily-boardings column.
         routes: Parsed ``routes.txt`` (for route resolution).
+        stop_lookup: Output of :func:`build_stop_id_lookup` when the file's
+            stop values are stop_codes (``None`` = they are already stop_ids).
 
     Returns:
         ``None`` when disabled, else a frame with ``route_id``, ``stop_id``,
@@ -1605,10 +1810,13 @@ def load_stop_ridership(
     csv_path = Path(path)
     if not csv_path.exists():
         raise FileNotFoundError(f"Stop ridership CSV not found: {csv_path}")
-    usage = pd.read_csv(csv_path, dtype=str)
+    usage = _read_optional_table(csv_path, "Stop ridership CSV")
     for col in (route_col, stop_col, boardings_col):
         if col not in usage.columns:
-            raise ValueError(f"Stop ridership CSV is missing required column {col!r}.")
+            raise ValueError(
+                f"Stop ridership CSV is missing required column {col!r}. "
+                f"Columns found: {', '.join(map(str, usage.columns))}."
+            )
     usage = usage.rename(
         columns={route_col: "route_token", stop_col: "stop_id", boardings_col: "boardings"}
     )
@@ -1635,6 +1843,10 @@ def load_stop_ridership(
             ", ".join(sorted(unmatched)[:5]),
         )
         usage = usage[usage["route_id"].notna()]
+
+    usage["stop_id"] = _resolve_stop_values(usage["stop_id"], stop_lookup, "Stop ridership CSV")
+    usage = usage[usage["stop_id"].notna() & (usage["stop_id"] != "")]
+
     out = usage.groupby(["route_id", "stop_id"], as_index=False)["boardings"].sum()
     logging.info("Stop ridership loaded: %d route × stop pair(s).", len(out))
     return out
@@ -1687,6 +1899,19 @@ def stop_ridership_impacts(
             "Stop ridership: %d of %d pair(s) matched service on the analysis day.",
             matched_pairs,
             len(stop_usage),
+        )
+    if not matched_pairs and len(stop_usage):
+        # Either the stop ids or the route tokens are from another namespace;
+        # without this the boardings-lost estimates read 0 with no explanation.
+        logging.warning(
+            "Stop ridership: none of the %d route × stop pair(s) match service on the analysis "
+            "day, so the boardings-lost estimates will be 0. The route values already resolved "
+            "against routes.txt, so check the stop ids: %r should hold GTFS stop_ids (e.g. %s). "
+            "If it holds the public stop numbers instead, set RIDERSHIP_STOP_MATCH_FIELD = "
+            "'stop_code'.",
+            len(stop_usage),
+            STOP_RIDERSHIP_STOP_ID_COL,
+            ", ".join(sorted(set(events["stop_id"]))[:3]),
         )
     joined["boardings_lost"] = joined["boardings"] * joined["share_cut"]
     per_stop = joined.groupby("stop_id")["boardings_lost"].sum()
@@ -2249,21 +2474,39 @@ def run(cfg: Config) -> pd.DataFrame:
             ", ".join(cfg.demographic_fields),
         )
 
+    stop_lookup = build_stop_id_lookup(stops, cfg.ridership_stop_field)
+
     ridership = load_ridership(
-        cfg.ridership_csv, RIDERSHIP_TRIP_ID_COL, RIDERSHIP_STOP_ID_COL, RIDERSHIP_BOARDINGS_COL
+        cfg.ridership_csv,
+        RIDERSHIP_TRIP_ID_COL,
+        RIDERSHIP_STOP_ID_COL,
+        RIDERSHIP_BOARDINGS_COL,
+        stop_lookup,
     )
     if ridership is not None:
         # Keep every ridership metric on the same day as the service metrics: rows
         # for trips that do not operate on the analysis day are set aside.
         day_trips = set(events["trip_id"])
         stop_sums, trip_sums = ridership
-        off_day = len(set(stop_sums["trip_id"]) | set(trip_sums["trip_id"])) - len(
-            (set(stop_sums["trip_id"]) | set(trip_sums["trip_id"])) & day_trips
-        )
+        rider_trips = set(stop_sums["trip_id"]) | set(trip_sums["trip_id"])
+        matched = rider_trips & day_trips
+        off_day = len(rider_trips) - len(matched)
         if off_day:
             logging.info(
                 "Ridership: ignoring rows for %d trip(s) not operating on the analysis day.",
                 off_day,
+            )
+        if rider_trips and not matched:
+            # Vendor exports usually key on their own trip number; without this
+            # warning the join silently empties and every rider metric reads 0.
+            logging.warning(
+                "Ridership: none of the %d trip id(s) in the ridership table match any trip "
+                "operating on the analysis day, so every rider metric will be 0. Check that "
+                "%r holds GTFS trip_ids (e.g. %s) rather than vendor trip numbers (e.g. %s).",
+                len(rider_trips),
+                RIDERSHIP_TRIP_ID_COL,
+                ", ".join(sorted(day_trips)[:3]),
+                ", ".join(sorted(rider_trips)[:3]),
             )
         ridership = (
             stop_sums[stop_sums["trip_id"].isin(day_trips)].reset_index(drop=True),
@@ -2276,6 +2519,7 @@ def run(cfg: Config) -> pd.DataFrame:
         STOP_RIDERSHIP_STOP_ID_COL,
         STOP_RIDERSHIP_BOARDINGS_COL,
         routes,
+        stop_lookup,
     )
 
     screening = isinstance(cfg.scenarios, str)
@@ -2433,6 +2677,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Optional route x stop stop-usage CSV ('' disables).",
     )
     p.add_argument(
+        "--ridership-stop-field",
+        default=RIDERSHIP_STOP_MATCH_FIELD,
+        choices=("stop_id", "stop_code"),
+        help="stops.txt column the ridership files' stop ids refer to.",
+    )
+    p.add_argument(
         "--scenario-gtfs",
         action=argparse.BooleanOptionalAction,
         default=EXPORT_SCENARIO_GTFS,
@@ -2492,6 +2742,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         demographic_fields=list(args.demographic_fields),
         ridership_csv=args.ridership,
         stop_ridership_csv=args.stop_ridership,
+        ridership_stop_field=args.ridership_stop_field,
         export_map_layers=bool(args.map_layers),
         export_scenario_gtfs=bool(args.scenario_gtfs),
     )
@@ -2499,7 +2750,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         run(cfg)
     except (OSError, ValueError, RuntimeError) as exc:
-        logging.error("%s", exc)
+        # The exception type is part of the message: a bare decode or lookup
+        # error text alone leaves the user with nothing to act on.
+        logging.error("%s: %s", type(exc).__name__, exc)
         return 1
     logging.info("Script completed successfully.")
     return 0
