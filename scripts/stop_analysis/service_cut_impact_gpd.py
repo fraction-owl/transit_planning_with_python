@@ -166,6 +166,18 @@ RIDERSHIP_TRIP_ID_COL: str = "trip_id"
 RIDERSHIP_STOP_ID_COL: str = "stop_id"
 RIDERSHIP_BOARDINGS_COL: str = "avg_daily_boardings"
 
+# How those rows are matched to GTFS trips. "trip_id" joins on the column above.
+# "route_start_time" is the fallback for vendor exports whose trip number is a
+# per-route sequence rather than a GTFS id: each row is matched to the trip of
+# the same route whose first departure is nearest the start-time column, within
+# the tolerance below. Start times may be GTFS "HH:MM[:SS]" (25:30 included), an
+# Excel time cell, or "7:23:00 AM"; a 1:30 AM value also matches a GTFS 25:30
+# departure. Rows for other service days simply do not match the analysis day.
+RIDERSHIP_TRIP_MATCH_MODE: str = "trip_id"
+RIDERSHIP_ROUTE_COL: str = "ROUTE_NUMBER"
+RIDERSHIP_START_TIME_COL: str = "TRIP_START_TIME"
+RIDERSHIP_START_TIME_TOLERANCE_MIN: int = 2
+
 # Optional stop-level ridership CSV at route × stop grain (a vendor "stop usage"
 # export: one row per route/direction/stop with average daily boardings). Route
 # values match route_short_name or route_id. Enables boardings-lost estimates —
@@ -202,6 +214,11 @@ _SCENARIO_KEYS: frozenset[str] = frozenset(
 # Excel workbook suffixes accepted for the optional ridership tables. Legacy
 # .xls is read with xlrd, the .xlsx family with openpyxl.
 _EXCEL_SUFFIXES: tuple[str, ...] = (".xls", ".xlsx", ".xlsm", ".xltx", ".xltm")
+
+# Share of a ridership table's trips that must match the analysis day before
+# the join is treated as sound. Below this the rider metrics understate the cut
+# badly enough that reporting them without comment would mislead.
+_RIDERSHIP_MATCH_WARN_SHARE: float = 0.5
 
 
 # =============================================================================
@@ -821,6 +838,28 @@ def extract_config_block(source_file: Path) -> str:
 # =============================================================================
 
 
+class RidershipSpec(NamedTuple):
+    """Column names and join strategy for the trip-level ridership file.
+
+    Attributes:
+        trip_col: Column holding GTFS ``trip_id`` (``trip_id`` mode only).
+        stop_col: Optional stop column; blank rows are whole-trip totals.
+        boardings_col: Numeric average-daily-boardings column.
+        match_mode: ``"trip_id"`` or ``"route_start_time"``.
+        route_col: Route column used by ``route_start_time`` mode.
+        start_time_col: Trip start-time column used by that mode.
+        tolerance_min: Minutes of slack allowed against the GTFS departure.
+    """
+
+    trip_col: str = RIDERSHIP_TRIP_ID_COL
+    stop_col: str = RIDERSHIP_STOP_ID_COL
+    boardings_col: str = RIDERSHIP_BOARDINGS_COL
+    match_mode: str = RIDERSHIP_TRIP_MATCH_MODE
+    route_col: str = RIDERSHIP_ROUTE_COL
+    start_time_col: str = RIDERSHIP_START_TIME_COL
+    tolerance_min: int = RIDERSHIP_START_TIME_TOLERANCE_MIN
+
+
 class Config(NamedTuple):
     """Runtime configuration for a service-cut impact run."""
 
@@ -841,6 +880,7 @@ class Config(NamedTuple):
     ridership_csv: str = RIDERSHIP_CSV
     stop_ridership_csv: str = STOP_RIDERSHIP_CSV
     ridership_stop_field: str = RIDERSHIP_STOP_MATCH_FIELD
+    ridership_trip_mode: str = RIDERSHIP_TRIP_MATCH_MODE
 
 
 # =============================================================================
@@ -1568,6 +1608,208 @@ def _resolve_stop_values(
     return translated
 
 
+def _as_excel_serial(value: Any, text: str) -> Optional[int]:
+    """Read an Excel date serial as minutes past midnight, if it holds a time.
+
+    The time of day lives in the fractional part, so a whole number carries no
+    time at all — a column that arrives as whole numbers has lost its time to
+    a date-only cell format, and is reported as unreadable rather than being
+    silently taken for midnight.
+
+    Args:
+        value: The raw cell value.
+        text: Its stripped text form (the workbook reader stringifies cells).
+
+    Returns:
+        Minutes past midnight, or ``None`` when the value is not a serial or
+        carries no time of day.
+    """
+    if isinstance(value, bool):
+        return None
+    number: Optional[float] = None
+    if isinstance(value, (int, float)):
+        number = float(value)
+    else:
+        try:
+            number = float(text)
+        except ValueError:
+            return None
+    fraction = number % 1.0
+    if fraction == 0.0:
+        return None
+    return int(round(fraction * 1440)) % 1440
+
+
+def _parse_clock_value(value: Any) -> Optional[int]:
+    """Read a trip start time from whatever the export stored, as minutes.
+
+    Vendor exports write the same clock time four different ways, and an Excel
+    time-only cell is the worst of them: it is stored as a fraction of a day on
+    day zero, which spreadsheets display as ``1/0/1900`` and readers hand over
+    as a bare ``time``. All four are reduced to minutes past midnight here:
+
+    * a ``datetime``/``time`` value (Excel time cells, already parsed)
+    * a number — an Excel serial, whose fractional part is the time of day
+    * ``"HH:MM[:SS]"``, including the GTFS convention of 25:30 for after
+      midnight, which is preserved as >= 1440
+    * anything else pandas can parse, e.g. ``"7:23:00 AM"``
+
+    Exact midnight is rejected rather than returned. A column whose time of day
+    was lost to a date-only cell format arrives as all-midnight, and accepting
+    that would silently pile every row in the file onto whichever trip starts
+    nearest midnight; a genuine 00:00 departure is much rarer than that mistake
+    and is better handled by ``trip_id`` matching.
+
+    Args:
+        value: The raw cell value.
+
+    Returns:
+        Minutes past midnight, or ``None`` when the value is missing, is
+        uninterpretable as a time, or carries no time of day.
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+
+    minutes: Optional[int] = None
+    if isinstance(value, (dt.datetime, dt.time)):
+        minutes = value.hour * 60 + value.minute + round(value.second / 60)
+    elif pd.isna(value):
+        return None
+    else:
+        text = str(value).strip()
+        # GTFS-style first: it is the only form that can exceed 24 hours, and
+        # pandas would reject 25:30 rather than read it as the next morning.
+        minutes = parse_time_to_minutes(text)
+        if minutes is None:
+            minutes = _as_excel_serial(value, text)
+        if minutes is None:
+            try:
+                stamp = pd.to_datetime(text, errors="raise")
+            except (ValueError, TypeError, pd.errors.ParserError):
+                return None
+            if pd.isna(stamp):
+                return None
+            minutes = int(stamp.hour) * 60 + int(stamp.minute) + round(int(stamp.second) / 60)
+
+    return None if not minutes else minutes
+
+
+def match_trips_by_route_and_time(
+    frame: pd.DataFrame,
+    events: pd.DataFrame,
+    routes: pd.DataFrame,
+    spec: RidershipSpec,
+) -> pd.Series:
+    """Match ridership rows to GTFS trips on route plus first departure.
+
+    The fallback for exports that carry no GTFS ``trip_id``. Each row is
+    matched to the trip of the same route whose first departure is nearest the
+    row's start time, within ``spec.tolerance_min``. A row whose time is
+    before dawn is also tried a service day later (a 1:30 AM row matches a
+    GTFS 25:30 departure), and ties resolve to the lowest ``trip_id`` so a
+    rerun cannot shuffle the attribution.
+
+    Because *events* covers only the analysis day, rows for other service days
+    do not match — that is expected, and reported rather than hidden.
+
+    Args:
+        frame: The raw ridership rows.
+        events: Baseline event table for the analysis day.
+        routes: Parsed ``routes.txt`` (for route-token resolution).
+        spec: Column names and tolerance.
+
+    Returns:
+        A ``trip_id`` per row, aligned to ``frame.index``; ``""`` where no trip
+        matched.
+    """
+    r = routes.drop_duplicates(subset=["route_id"]).copy()
+    r["route_id"] = r["route_id"].astype(str).str.strip()
+    short = r.get("route_short_name", pd.Series(dtype=str)).fillna("").astype(str).str.strip()
+    token_to_id = dict(zip(r["route_id"], r["route_id"]))
+    token_to_id.update({s: rid for s, rid in zip(short, r["route_id"]) if s})
+
+    first_dep = events.groupby("trip_id")["dep_min"].min()
+    trip_route = events.drop_duplicates("trip_id").set_index("trip_id")["route_id"].astype(str)
+    by_route: dict[str, list[tuple[int, str]]] = {}
+    for trip_id, departure in first_dep.items():
+        by_route.setdefault(trip_route.get(trip_id, ""), []).append((int(departure), str(trip_id)))
+    for departures in by_route.values():
+        departures.sort()
+
+    matched: list[str] = []
+    unknown_routes: set[str] = set()
+    unparsed_times = 0
+    no_trip_in_window = 0
+    for token, raw_time in zip(frame[spec.route_col], frame[spec.start_time_col]):
+        route_id = token_to_id.get(str(token).strip())
+        if route_id is None:
+            unknown_routes.add(str(token).strip())
+            matched.append("")
+            continue
+        minutes = _parse_clock_value(raw_time)
+        if minutes is None:
+            unparsed_times += 1
+            matched.append("")
+            continue
+
+        best_trip = ""
+        best_delta: Optional[int] = None
+        for departure, trip_id in by_route.get(route_id, []):
+            for candidate in (minutes, minutes + 1440):
+                delta = abs(departure - candidate)
+                if delta > spec.tolerance_min:
+                    continue
+                if best_delta is None or delta < best_delta:
+                    best_trip, best_delta = trip_id, delta
+                elif delta == best_delta and trip_id < best_trip:
+                    best_trip = trip_id
+        if not best_trip:
+            no_trip_in_window += 1
+        matched.append(best_trip)
+
+    if unknown_routes:
+        logging.warning(
+            "Ridership CSV: %d route value(s) match nothing in routes.txt (e.g. %s) — their "
+            "rows are ignored.",
+            len(unknown_routes),
+            ", ".join(sorted(unknown_routes)[:5]),
+        )
+    if unparsed_times:
+        logging.warning(
+            "Ridership CSV: %d row(s) have an unreadable %r value — their rows are ignored. "
+            "An Excel time-only cell that reads as a date (1/0/1900) has lost its time of day; "
+            "re-export that column as text (HH:MM) if so.",
+            unparsed_times,
+            spec.start_time_col,
+        )
+    if no_trip_in_window:
+        logging.info(
+            "Ridership: %d row(s) have no trip on their route starting within %d minute(s) of "
+            "the listed time — expected for rows describing other service days.",
+            no_trip_in_window,
+            spec.tolerance_min,
+        )
+
+    assigned = [trip_id for trip_id in matched if trip_id]
+    distinct = len(set(assigned))
+    if distinct and len(assigned) > distinct:
+        # Rows sharing a trip have their boardings summed. That is right for
+        # the two directions of a loop, and badly wrong when the start times
+        # are not actually distinguishing trips.
+        busiest = pd.Series(assigned).value_counts()
+        logging.warning(
+            "Ridership: %d matched row(s) share only %d distinct trip(s), and boardings for "
+            "rows landing on the same trip are summed. Trip %s absorbed %d row(s) — if that "
+            "count is large, %r is not distinguishing trips.",
+            len(assigned),
+            distinct,
+            busiest.index[0],
+            int(busiest.iloc[0]),
+            spec.start_time_col,
+        )
+    return pd.Series(matched, index=frame.index, dtype=object)
+
+
 def _cell_to_text(value: Any) -> str:
     """Render one spreadsheet cell as table text.
 
@@ -1644,21 +1886,20 @@ def _read_optional_table(path: Path, label: str) -> pd.DataFrame:
 
 def load_ridership(
     path: str,
-    trip_col: str,
-    stop_col: str,
-    boardings_col: str,
+    spec: RidershipSpec,
     stop_lookup: Optional[Mapping[str, str]] = None,
+    events: Optional[pd.DataFrame] = None,
+    routes: Optional[pd.DataFrame] = None,
 ) -> Optional[tuple[pd.DataFrame, pd.DataFrame]]:
-    """Load the optional trip-level ridership CSV and split it by grain.
+    """Load the optional trip-level ridership file and split it by grain.
 
     Args:
-        path: CSV path ("" disables ridership accounting).
-        trip_col: Column holding GTFS ``trip_id``.
-        stop_col: Column holding ``stop_id`` (optional column; blank rows are
-            whole-trip totals).
+        path: File path ("" disables ridership accounting).
+        spec: Column names and the trip-matching strategy.
         stop_lookup: Output of :func:`build_stop_id_lookup` when the file's
             stop values are stop_codes (``None`` = they are already stop_ids).
-        boardings_col: Numeric average-daily-boardings column.
+        events: Baseline event table, required by ``route_start_time`` mode.
+        routes: Parsed ``routes.txt``, required by ``route_start_time`` mode.
 
     Returns:
         ``None`` when disabled, else a tuple of (stop-grain rows summed by
@@ -1668,7 +1909,8 @@ def load_ridership(
 
     Raises:
         FileNotFoundError: If *path* is set but does not exist.
-        ValueError: If required columns are missing.
+        ValueError: If required columns are missing, the match mode is not
+            recognised, or ``route_start_time`` is requested without a feed.
     """
     if not path.strip():
         return None
@@ -1676,13 +1918,41 @@ def load_ridership(
     if not csv_path.exists():
         raise FileNotFoundError(f"Ridership CSV not found: {csv_path}")
     ridership = _read_optional_table(csv_path, "Ridership CSV")
-    for col in (trip_col, boardings_col):
+
+    mode = str(spec.match_mode).strip().lower()
+    if mode == "trip_id":
+        required = (spec.trip_col, spec.boardings_col)
+    elif mode == "route_start_time":
+        required = (spec.route_col, spec.start_time_col, spec.boardings_col)
+    else:
+        raise ValueError(
+            f"RIDERSHIP_TRIP_MATCH_MODE must be 'trip_id' or 'route_start_time'; "
+            f"got {spec.match_mode!r}."
+        )
+    for col in required:
         if col not in ridership.columns:
             raise ValueError(
                 f"Ridership CSV is missing required column {col!r}. "
                 f"Columns found: {', '.join(map(str, ridership.columns))}."
             )
-    ridership = ridership.rename(columns={trip_col: "trip_id", boardings_col: "boardings"})
+
+    if mode == "trip_id":
+        ridership = ridership.rename(columns={spec.trip_col: "trip_id"})
+    else:
+        if events is None or routes is None:
+            raise ValueError(
+                "RIDERSHIP_TRIP_MATCH_MODE 'route_start_time' needs the GTFS feed; call "
+                "load_ridership with events and routes."
+            )
+        rows_in = len(ridership)
+        ridership["trip_id"] = match_trips_by_route_and_time(ridership, events, routes, spec)
+        ridership = ridership[ridership["trip_id"] != ""]
+        logging.info(
+            "Ridership: matched %d of %d row(s) to analysis-day trips on route + start time.",
+            len(ridership),
+            rows_in,
+        )
+    ridership = ridership.rename(columns={spec.boardings_col: "boardings"})
     ridership["trip_id"] = ridership["trip_id"].astype(str).str.strip()
     ridership["boardings"] = pd.to_numeric(ridership["boardings"], errors="coerce")
     bad = int(ridership["boardings"].isna().sum())
@@ -1690,8 +1960,8 @@ def load_ridership(
         logging.warning("Ridership CSV: dropped %d row(s) with non-numeric boardings.", bad)
         ridership = ridership[ridership["boardings"].notna()]
 
-    if stop_col in ridership.columns:
-        ridership = ridership.rename(columns={stop_col: "stop_id"})
+    if spec.stop_col in ridership.columns:
+        ridership = ridership.rename(columns={spec.stop_col: "stop_id"})
         ridership["stop_id"] = ridership["stop_id"].fillna("").astype(str).str.strip()
     else:
         ridership["stop_id"] = ""
@@ -2478,10 +2748,10 @@ def run(cfg: Config) -> pd.DataFrame:
 
     ridership = load_ridership(
         cfg.ridership_csv,
-        RIDERSHIP_TRIP_ID_COL,
-        RIDERSHIP_STOP_ID_COL,
-        RIDERSHIP_BOARDINGS_COL,
+        RidershipSpec(match_mode=cfg.ridership_trip_mode),
         stop_lookup,
+        events,
+        routes,
     )
     if ridership is not None:
         # Keep every ridership metric on the same day as the service metrics: rows
@@ -2496,13 +2766,17 @@ def run(cfg: Config) -> pd.DataFrame:
                 "Ridership: ignoring rows for %d trip(s) not operating on the analysis day.",
                 off_day,
             )
-        if rider_trips and not matched:
+        if rider_trips and len(matched) / len(rider_trips) < _RIDERSHIP_MATCH_WARN_SHARE:
             # Vendor exports usually key on their own trip number; without this
-            # warning the join silently empties and every rider metric reads 0.
+            # warning a mostly-empty join silently understates every rider
+            # metric, and an empty one reports 0 as though it were an answer.
             logging.warning(
-                "Ridership: none of the %d trip id(s) in the ridership table match any trip "
-                "operating on the analysis day, so every rider metric will be 0. Check that "
-                "%r holds GTFS trip_ids (e.g. %s) rather than vendor trip numbers (e.g. %s).",
+                "Ridership: only %d of %d trip id(s) in the ridership table match a trip "
+                "operating on the analysis day, so the rider metrics understate the cut. "
+                "Check that %r holds GTFS trip_ids (e.g. %s) rather than vendor trip numbers "
+                "(e.g. %s) — if it does not, set RIDERSHIP_TRIP_MATCH_MODE = "
+                "'route_start_time' to join on route plus start time instead.",
+                len(matched),
                 len(rider_trips),
                 RIDERSHIP_TRIP_ID_COL,
                 ", ".join(sorted(day_trips)[:3]),
@@ -2683,6 +2957,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="stops.txt column the ridership files' stop ids refer to.",
     )
     p.add_argument(
+        "--ridership-trip-match",
+        default=RIDERSHIP_TRIP_MATCH_MODE,
+        choices=("trip_id", "route_start_time"),
+        help="How trip-level ridership rows are matched to GTFS trips.",
+    )
+    p.add_argument(
         "--scenario-gtfs",
         action=argparse.BooleanOptionalAction,
         default=EXPORT_SCENARIO_GTFS,
@@ -2743,6 +3023,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ridership_csv=args.ridership,
         stop_ridership_csv=args.stop_ridership,
         ridership_stop_field=args.ridership_stop_field,
+        ridership_trip_mode=args.ridership_trip_match,
         export_map_layers=bool(args.map_layers),
         export_scenario_gtfs=bool(args.scenario_gtfs),
     )
