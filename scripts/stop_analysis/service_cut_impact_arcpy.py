@@ -212,6 +212,11 @@ _DISTANCE_CHUNK: int = 256
 # Longest string a shapefile text field can hold (dBASE limit).
 _SHP_TEXT_MAX: int = 254
 
+# Excel workbook suffixes accepted for the optional ridership tables. Legacy
+# .xls is read with xlrd, the .xlsx family with openpyxl — both ship with
+# ArcGIS Pro.
+_EXCEL_SUFFIXES: tuple[str, ...] = (".xls", ".xlsx", ".xlsm", ".xltx", ".xltm")
+
 
 # =============================================================================
 # CANONICAL HELPERS (copied verbatim from utils/ — see CONTRIBUTING.md)
@@ -1700,11 +1705,17 @@ def load_demographics(path: str, fields: Sequence[str], sr: Any) -> List[Dict[st
 
     Raises:
         FileNotFoundError: If *path* does not exist.
+        ValueError: If arcpy cannot read the layer's fields or rows — most often
+            a shapefile whose .dbf declares the wrong codepage.
     """
     if not arcpy.Exists(path):
         raise FileNotFoundError(f"Demographics layer not found: {path}")
 
-    available = {f.name.lower(): f.name for f in arcpy.ListFields(path)}
+    logging.info("Reading demographics layer: %s", path)
+    try:
+        available = {f.name.lower(): f.name for f in arcpy.ListFields(path)}
+    except (RuntimeError, UnicodeDecodeError, arcpy.ExecuteError) as exc:
+        raise ValueError(f"Could not list the fields of demographics layer {path}: {exc}") from exc
     resolved: List[Tuple[str, str]] = []
     for name in fields:
         actual = available.get(str(name).strip().lower())
@@ -1715,23 +1726,26 @@ def load_demographics(path: str, fields: Sequence[str], sr: Any) -> List[Dict[st
 
     cursor_fields = ["SHAPE@"] + [actual for _, actual in resolved]
     records: List[Dict[str, Any]] = []
-    with arcpy.da.SearchCursor(path, cursor_fields, spatial_reference=sr) as cursor:
-        for row in cursor:
-            geometry = row[0]
-            if geometry is None:
-                continue
-            values: Dict[str, float] = {}
-            for offset, (name, _) in enumerate(resolved, start=1):
-                number = pd.to_numeric(row[offset], errors="coerce")
-                values[name] = 0.0 if pd.isna(number) else float(number)
-            records.append(
-                {
-                    "geometry": geometry,
-                    "extent": geometry.extent,
-                    "area": float(geometry.area),
-                    "values": values,
-                }
-            )
+    try:
+        with arcpy.da.SearchCursor(path, cursor_fields, spatial_reference=sr) as cursor:
+            for row in cursor:
+                geometry = row[0]
+                if geometry is None:
+                    continue
+                values: Dict[str, float] = {}
+                for offset, (name, _) in enumerate(resolved, start=1):
+                    number = pd.to_numeric(row[offset], errors="coerce")
+                    values[name] = 0.0 if pd.isna(number) else float(number)
+                records.append(
+                    {
+                        "geometry": geometry,
+                        "extent": geometry.extent,
+                        "area": float(geometry.area),
+                        "values": values,
+                    }
+                )
+    except (RuntimeError, UnicodeDecodeError, arcpy.ExecuteError) as exc:
+        raise ValueError(f"Could not read demographics layer {path}: {exc}") from exc
     logging.info(
         "Demographics: %d polygon(s); fields: %s",
         len(records),
@@ -1780,6 +1794,80 @@ def apportion_demographics(
     return out
 
 
+def _cell_to_text(value: Any) -> str:
+    """Render one spreadsheet cell as table text.
+
+    Whole-number floats collapse to their integer form because Excel stores
+    every number as a float — otherwise a numeric ``trip_id`` arrives as
+    ``"4821.0"`` and joins against nothing. Missing cells become ``""``.
+    """
+    if pd.isna(value):
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
+def _read_optional_table(path: Path, label: str) -> pd.DataFrame:
+    """Read an optional ridership table as strings, whatever Windows produced.
+
+    The format is decided by file *content* first — Excel's two container
+    signatures (the OLE2 header of legacy ``.xls``, the zip header of
+    ``.xlsx``) — and by extension second, so a workbook saved with a ``.csv``
+    name is still read as Excel instead of failing with a cryptic ``utf-8
+    codec`` error. Text files are read as UTF-8 (tolerating the BOM Excel's
+    "CSV UTF-8" export writes, which would otherwise hide the first column
+    behind an invisible character) and then as cp1252, the usual Windows
+    export encoding.
+
+    Args:
+        path: File to read.
+        label: Human-readable name of the input, used in error messages.
+
+    Returns:
+        DataFrame of text values.
+
+    Raises:
+        ValueError: If the file is neither readable text nor a workbook the
+            bundled Excel engines can open.
+    """
+    logging.info("%s: reading %s", label, path)
+    with open(path, "rb") as handle:
+        head = handle.read(8)
+    suffix = path.suffix.lower()
+
+    excel_engine: Optional[str] = None
+    if head.startswith(b"\xd0\xcf\x11\xe0"):  # OLE2 compound document = .xls
+        excel_engine = "xlrd"
+    elif head.startswith(b"PK\x03\x04"):  # zip container = .xlsx family
+        excel_engine = "openpyxl"
+    elif suffix in _EXCEL_SUFFIXES:  # Excel name, unrecognized content
+        excel_engine = "xlrd" if suffix == ".xls" else "openpyxl"
+
+    if excel_engine is not None:
+        logging.info("%s: reading %s as an Excel workbook.", label, path.name)
+        try:
+            frame = pd.read_excel(path, engine=excel_engine)
+        except ImportError as exc:
+            raise ValueError(
+                f"{label} {path} is an Excel workbook, but the {excel_engine} engine is not "
+                f"available in this Python environment. Re-save it as a CSV and re-run."
+            ) from exc
+        for column in frame.columns:
+            frame[column] = frame[column].map(_cell_to_text)
+        return frame
+
+    for encoding in ("utf-8-sig", "cp1252"):
+        try:
+            return pd.read_csv(path, dtype=str, encoding=encoding)
+        except UnicodeDecodeError:
+            continue
+    raise ValueError(
+        f"{label} {path} is not readable as UTF-8 or Windows-1252 text, and is not an Excel "
+        f"workbook. Re-save it from Excel as 'CSV UTF-8 (Comma delimited)' and re-run."
+    )
+
+
 def load_ridership(
     path: str, trip_col: str, stop_col: str, boardings_col: str
 ) -> Optional[tuple[pd.DataFrame, pd.DataFrame]]:
@@ -1807,10 +1895,13 @@ def load_ridership(
     csv_path = Path(path)
     if not csv_path.exists():
         raise FileNotFoundError(f"Ridership CSV not found: {csv_path}")
-    ridership = pd.read_csv(csv_path, dtype=str)
+    ridership = _read_optional_table(csv_path, "Ridership CSV")
     for col in (trip_col, boardings_col):
         if col not in ridership.columns:
-            raise ValueError(f"Ridership CSV is missing required column {col!r}.")
+            raise ValueError(
+                f"Ridership CSV is missing required column {col!r}. "
+                f"Columns found: {', '.join(map(str, ridership.columns))}."
+            )
     ridership = ridership.rename(columns={trip_col: "trip_id", boardings_col: "boardings"})
     ridership["trip_id"] = ridership["trip_id"].astype(str).str.strip()
     ridership["boardings"] = pd.to_numeric(ridership["boardings"], errors="coerce")
@@ -1932,10 +2023,13 @@ def load_stop_ridership(
     csv_path = Path(path)
     if not csv_path.exists():
         raise FileNotFoundError(f"Stop ridership CSV not found: {csv_path}")
-    usage = pd.read_csv(csv_path, dtype=str)
+    usage = _read_optional_table(csv_path, "Stop ridership CSV")
     for col in (route_col, stop_col, boardings_col):
         if col not in usage.columns:
-            raise ValueError(f"Stop ridership CSV is missing required column {col!r}.")
+            raise ValueError(
+                f"Stop ridership CSV is missing required column {col!r}. "
+                f"Columns found: {', '.join(map(str, usage.columns))}."
+            )
     usage = usage.rename(
         columns={route_col: "route_token", stop_col: "stop_id", boardings_col: "boardings"}
     )
@@ -2626,8 +2720,10 @@ def run(cfg: Config) -> pd.DataFrame:
     )
     events = build_events(stop_times, trips, routes, service_ids)
     stops = prepare_stops_table(stops_txt, cfg.filter_platform_stops, sr)
+    logging.info("Building route alignments from shapes.txt …")
     shape_lines = build_shape_lines(feed["shapes"], sr)
     shape_miles = shape_length_miles(shape_lines, sr)
+    logging.info("Built %d route alignment(s) from shapes.txt.", len(shape_lines))
     if not shape_lines:
         logging.warning(
             "No usable shapes.txt — revenue_miles_cut will be blank and line layers skipped."
@@ -2898,7 +2994,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         run(cfg)
     except (OSError, ValueError, RuntimeError, arcpy.ExecuteError) as exc:
-        logging.error("%s", exc)
+        # The exception type is part of the message: a bare decode or lookup
+        # error text alone leaves the user with nothing to act on.
+        logging.error("%s: %s", type(exc).__name__, exc)
         return 1
     logging.info("Script completed successfully.")
     return 0
