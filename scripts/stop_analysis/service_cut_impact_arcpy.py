@@ -2109,6 +2109,17 @@ def stop_ridership_impacts(
             matched_pairs,
             len(stop_usage),
         )
+    if not matched_pairs and len(stop_usage):
+        # Either the stop ids or the route tokens are from another namespace;
+        # without this the boardings-lost estimates read 0 with no explanation.
+        logging.warning(
+            "Stop ridership: none of the %d route × stop pair(s) match service on the analysis "
+            "day, so the boardings-lost estimates will be 0. Check that %r holds GTFS stop_ids "
+            "(e.g. %s) — the route values already resolved against routes.txt.",
+            len(stop_usage),
+            STOP_RIDERSHIP_STOP_ID_COL,
+            ", ".join(sorted(set(events["stop_id"]))[:3]),
+        )
     joined["boardings_lost"] = joined["boardings"] * joined["share_cut"]
     per_stop = joined.groupby("stop_id")["boardings_lost"].sum()
     per_stop = per_stop[per_stop > 0]
@@ -2741,13 +2752,25 @@ def run(cfg: Config) -> pd.DataFrame:
         # for trips that do not operate on the analysis day are set aside.
         day_trips = set(events["trip_id"])
         stop_sums, trip_sums = ridership
-        off_day = len(set(stop_sums["trip_id"]) | set(trip_sums["trip_id"])) - len(
-            (set(stop_sums["trip_id"]) | set(trip_sums["trip_id"])) & day_trips
-        )
+        rider_trips = set(stop_sums["trip_id"]) | set(trip_sums["trip_id"])
+        matched = rider_trips & day_trips
+        off_day = len(rider_trips) - len(matched)
         if off_day:
             logging.info(
                 "Ridership: ignoring rows for %d trip(s) not operating on the analysis day.",
                 off_day,
+            )
+        if rider_trips and not matched:
+            # Vendor exports usually key on their own trip number; without this
+            # warning the join silently empties and every rider metric reads 0.
+            logging.warning(
+                "Ridership: none of the %d trip id(s) in the ridership table match any trip "
+                "operating on the analysis day, so every rider metric will be 0. Check that "
+                "%r holds GTFS trip_ids (e.g. %s) rather than vendor trip numbers (e.g. %s).",
+                len(rider_trips),
+                RIDERSHIP_TRIP_ID_COL,
+                ", ".join(sorted(day_trips)[:3]),
+                ", ".join(sorted(rider_trips)[:3]),
             )
         ridership = (
             stop_sums[stop_sums["trip_id"].isin(day_trips)].reset_index(drop=True),
