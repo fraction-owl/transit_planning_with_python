@@ -170,13 +170,17 @@ EXPORT_SCENARIO_GTFS: bool = False
 DEMOGRAPHICS_PATH: str = r""
 DEMOGRAPHIC_FIELDS: Sequence[str] = ("population",)
 
-# Optional trip-level ridership CSV of average daily boardings. Rows carry a
-# trip_id, an optional stop_id (blank/absent = whole-trip total), and a numeric
-# boardings column. Leave the path "" to skip ridership accounting.
+# Optional trip-level ridership CSV of average daily boardings. Rows carry an
+# optional stop_id (blank/absent = whole-trip total) and a numeric boardings
+# column, and are tied to GTFS trips by the match mode below. Leave the path ""
+# to skip ridership accounting. The column names default to a ridecheck export;
+# for the trip_id/stop_id/avg_daily_boardings frame that this repo's
+# ridership_by_hour.py writes, set RIDERSHIP_BOARDINGS_COL to
+# "avg_daily_boardings" and RIDERSHIP_TRIP_MATCH_MODE to "trip_id".
 RIDERSHIP_CSV: str = r""
 RIDERSHIP_TRIP_ID_COL: str = "trip_id"
 RIDERSHIP_STOP_ID_COL: str = "stop_id"
-RIDERSHIP_BOARDINGS_COL: str = "avg_daily_boardings"
+RIDERSHIP_BOARDINGS_COL: str = "PASSENGERS_ON"
 
 # How those rows are matched to GTFS trips. "trip_id" joins on the column above.
 # "route_start_time" is the fallback for vendor exports whose trip number is a
@@ -185,7 +189,7 @@ RIDERSHIP_BOARDINGS_COL: str = "avg_daily_boardings"
 # the tolerance below. Start times may be GTFS "HH:MM[:SS]" (25:30 included), an
 # Excel time cell, or "7:23:00 AM"; a 1:30 AM value also matches a GTFS 25:30
 # departure. Rows for other service days simply do not match the analysis day.
-RIDERSHIP_TRIP_MATCH_MODE: str = "trip_id"
+RIDERSHIP_TRIP_MATCH_MODE: str = "route_start_time"
 RIDERSHIP_ROUTE_COL: str = "ROUTE_NUMBER"
 RIDERSHIP_START_TIME_COL: str = "TRIP_START_TIME"
 RIDERSHIP_START_TIME_TOLERANCE_MIN: int = 2
@@ -207,7 +211,7 @@ RIDERSHIP_DATE_COL: str = ""
 STOP_RIDERSHIP_CSV: str = r""
 STOP_RIDERSHIP_ROUTE_COL: str = "ROUTE_NUMBER"
 STOP_RIDERSHIP_STOP_ID_COL: str = "STOP_ID"
-STOP_RIDERSHIP_BOARDINGS_COL: str = "XBOARDINGS"
+STOP_RIDERSHIP_BOARDINGS_COL: str = "BOARD_ALL"
 
 # Which stops.txt column the ridership files' stop ids refer to. Vendor exports
 # usually carry the public-facing stop number, which GTFS holds in stop_code

@@ -53,6 +53,22 @@ def vendor_spec() -> RidershipSpec:
     )
 
 
+def gtfs_spec(**overrides: object) -> RidershipSpec:
+    """Spec for a feed-native file joined on ``trip_id``.
+
+    Stated explicitly rather than relying on ``RidershipSpec()`` defaults,
+    which are deployment config an analyst is expected to edit.
+    """
+    fields: dict[str, object] = {
+        "trip_col": "trip_id",
+        "stop_col": "stop_id",
+        "boardings_col": "avg_daily_boardings",
+        "match_mode": "trip_id",
+    }
+    fields.update(overrides)
+    return RidershipSpec(**fields)  # type: ignore[arg-type]
+
+
 def _write(tmp_path: Path, frame: pd.DataFrame) -> str:
     path = tmp_path / "ridership.csv"
     frame.to_csv(path, index=False)
@@ -118,7 +134,7 @@ def test_missing_boardings_column_lists_the_columns_found(tmp_path, events, rout
 
 def test_trip_id_mode_does_not_require_the_route_columns(tmp_path) -> None:
     path = _write(tmp_path, pd.DataFrame({"trip_id": ["t1"], "avg_daily_boardings": [10.0]}))
-    stop_sums, trip_sums = load_ridership(path, RidershipSpec())
+    stop_sums, trip_sums = load_ridership(path, gtfs_spec())
     assert stop_sums.empty
     assert trip_sums.set_index("trip_id")["boardings"].to_dict() == {"t1": 10.0}
 
@@ -126,7 +142,7 @@ def test_trip_id_mode_does_not_require_the_route_columns(tmp_path) -> None:
 def test_unrecognised_match_mode_is_rejected(tmp_path) -> None:
     path = _write(tmp_path, pd.DataFrame({"trip_id": ["t1"], "avg_daily_boardings": [1.0]}))
     with pytest.raises(ValueError, match="RIDERSHIP_TRIP_MATCH_MODE"):
-        load_ridership(path, RidershipSpec(match_mode="by_vibes"))
+        load_ridership(path, gtfs_spec(match_mode="by_vibes"))
 
 
 def test_route_start_time_without_a_feed_is_rejected(tmp_path, vendor_spec) -> None:
@@ -244,7 +260,7 @@ def test_date_averaging_works_in_trip_id_mode(tmp_path) -> None:
         }
     )
     path = _write(tmp_path, frame)
-    _, trip_sums = load_ridership(path, RidershipSpec(date_col="SURVEY_DATE"))
+    _, trip_sums = load_ridership(path, gtfs_spec(date_col="SURVEY_DATE"))
     assert trip_sums.set_index("trip_id")["boardings"].to_dict() == {"t1": 15.0}
 
 
@@ -262,7 +278,7 @@ def test_trip_grain_rows_are_dropped_for_trips_that_have_stop_grain(tmp_path) ->
         }
     )
     path = _write(tmp_path, frame)
-    stop_sums, trip_sums = load_ridership(path, RidershipSpec())
+    stop_sums, trip_sums = load_ridership(path, gtfs_spec())
     assert stop_sums.set_index(["trip_id", "stop_id"])["boardings"].to_dict() == {("t1", "s1"): 4.0}
     # t1's whole-trip row is ignored so its boardings are not counted twice.
     assert trip_sums.set_index("trip_id")["boardings"].to_dict() == {"t2": 7.0}
@@ -273,24 +289,24 @@ def test_stop_codes_translate_to_stop_ids(tmp_path) -> None:
     lookup = build_stop_id_lookup(stops, "stop_code")
     frame = pd.DataFrame({"trip_id": ["t1"], "stop_id": ["1001"], "avg_daily_boardings": [3.0]})
     path = _write(tmp_path, frame)
-    stop_sums, _ = load_ridership(path, RidershipSpec(), stop_lookup=lookup)
+    stop_sums, _ = load_ridership(path, gtfs_spec(), stop_lookup=lookup)
     assert stop_sums.set_index(["trip_id", "stop_id"])["boardings"].to_dict() == {("t1", "s1"): 3.0}
 
 
 def test_non_numeric_boardings_rows_are_dropped(tmp_path) -> None:
     frame = pd.DataFrame({"trip_id": ["t1", "t2"], "avg_daily_boardings": ["10.0", "n/a"]})
     path = _write(tmp_path, frame)
-    _, trip_sums = load_ridership(path, RidershipSpec())
+    _, trip_sums = load_ridership(path, gtfs_spec())
     assert trip_sums.set_index("trip_id")["boardings"].to_dict() == {"t1": 10.0}
 
 
 def test_blank_path_disables_ridership() -> None:
-    assert load_ridership("", RidershipSpec()) is None
+    assert load_ridership("", gtfs_spec()) is None
 
 
 def test_missing_file_is_reported(tmp_path) -> None:
     with pytest.raises(FileNotFoundError):
-        load_ridership(str(tmp_path / "nope.csv"), RidershipSpec())
+        load_ridership(str(tmp_path / "nope.csv"), gtfs_spec())
 
 
 # ---------------------------------------------------------------------------
@@ -351,6 +367,21 @@ def test_vendor_workbook_shapes_match_and_lost_times_drop(
     # Serial, datetime, and AM/PM rows all match; numeric 232 resolves to the
     # route despite Excel storing it as a float. The text "1/0/1900" row —
     # whose time of day is unrecoverable — is dropped, not guessed at.
+    assert trip_sums.set_index("trip_id")["boardings"].to_dict() == {
+        "t1": 4.2,
+        "t2": 7.5,
+        "t3": 1.1,
+    }
+
+
+def test_shipped_defaults_load_a_vendor_workbook_with_no_overrides(
+    vendor_xlsx, route_232_events, route_232
+) -> None:
+    # RidershipSpec() straight from the module constants, i.e. what an analyst
+    # gets after setting only RIDERSHIP_CSV.
+    _, trip_sums = load_ridership(
+        vendor_xlsx, RidershipSpec(), events=route_232_events, routes=route_232
+    )
     assert trip_sums.set_index("trip_id")["boardings"].to_dict() == {
         "t1": 4.2,
         "t2": 7.5,
