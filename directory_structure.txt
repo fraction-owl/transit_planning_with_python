@@ -42,6 +42,7 @@ transit_planning_with_python/
 │   │   ├── gbfs_ridership_join.py
 │   │   └── gbfs_stations_exporter.py
 │   ├── gtfs_data_quality/
+│   │   ├── gtfs_block_conflict_checker.py
 │   │   ├── gtfs_calendar_inspector.py
 │   │   ├── gtfs_skipped_stop_flagger_gpd.py
 │   │   ├── gtfs_stop_proximity_qc.py
@@ -234,6 +235,7 @@ transit_planning_with_python/
 │   ├── test_flag_stop_upgrades.py
 │   ├── test_gbfs_ridership_join.py
 │   ├── test_gbfs_stations_exporter.py
+│   ├── test_gtfs_block_conflict_checker.py
 │   ├── test_gtfs_calendar_inspector.py
 │   ├── test_gtfs_linear_diff_gpd.py
 │   ├── test_gtfs_route_diff.py
