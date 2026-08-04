@@ -23,7 +23,7 @@ Generate GTFS-to-Census catchment areas and calculate service coverage by distri
 *Folders:* `service_coverage/`, `national_data_tools/`
 
 ### GTFS Data Quality & Validation *(arcpy + GeoPandas)*
-Catch errors before they go live. Cross-check GTFS stops against road centerlines, flag skipped stops, validate stop spacing and proximity, check USPS suffix conventions, and identify stops that conflict with road geometry.
+Catch errors before they go live. Cross-check GTFS stops against road centerlines, flag skipped stops, validate stop spacing and proximity, check USPS suffix conventions, and identify stops that conflict with road geometry. A block conflict checker (`gtfs_block_conflict_checker.py`) flags vehicle blocks scheduled at the same stop at the same time — grouping the service_ids that actually operate on the same dates, treating blockless trips as single-trip vehicles, and also catching blocks scheduled in two places at once. It's the lightweight, zero-setup companion to the minute-by-minute block-timeline → bay-usage pipeline in `gtfs_exports/` and `facilities_tools/`.
 *Folder:* `gtfs_data_quality/`
 
 ### Stop Placement & Impact Analysis *(arcpy + GeoPandas)*
