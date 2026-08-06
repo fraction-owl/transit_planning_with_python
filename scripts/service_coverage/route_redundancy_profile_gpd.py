@@ -23,12 +23,15 @@ five angles of it at once and emits one row per (schedule, route):
    walk-distance buffers around its stops. The *solo* portion is covered by no
    other route; the *shared* portion overlaps at least one other route's
    service area.
-5. **Paired routes** — two routes whose service areas mutually overlap by at
-   least ``PAIRED_ROUTE_MIN_OVERLAP_PCT`` (default 90%) are flagged as a pair:
-   a one-way couplet or a loop split into two direction-named routes. Pairs
-   read as near-total redundancy on every other angle, but they are really one
-   service split by direction — the flag keeps them from being mistaken for
-   candidates to consolidate away.
+5. **Paired routes** — a one-way couplet, or a loop published as two
+   direction-named routes, reads as near-total redundancy on every other angle
+   but is really one service split by direction. Pairs declared in
+   ``ROUTE_PAIRS`` are excluded from each other's metrics, so a couplet's
+   redundancy is measured against the rest of the network. Undeclared pairs
+   whose service areas mutually overlap by at least
+   ``PAIRED_ROUTE_MIN_OVERLAP_PCT`` (default 90%) are *suggested* — in a
+   ``suggested_pairs`` column and a warning log — for review and declaration
+   on a rerun; suggestions alone never change any number.
 
 Every angle is computed independently per schedule calendar. Each service_id is
 classified from its real active-date pattern (calendar.txt × calendar_dates.txt
@@ -52,11 +55,11 @@ Outputs:
     - ``route_redundancy_profile.csv``: one row per (schedule, route) with
       shared/solo stop counts, routes within walking distance, timed
       alternatives, shared timepoint counts, total/solo/shared service area
-      in square miles, and any paired routes.
+      in square miles, declared paired routes, and suggested pairs.
     - ``route_redundancy_partners.csv`` (optional): one row per
       (schedule, route, partner route) pair with shared stop and timepoint
       counts, the nearest walk distance, the shortest feasible wait, the
-      service-area overlap percentage, and the paired flag.
+      service-area overlap percentage, and the paired/suggested flags.
     - A run-log sidecar capturing the verbatim CONFIGURATION block.
 
 Typical usage:
@@ -109,11 +112,20 @@ ENABLE_TIME_CHECK: bool = True
 WALK_SPEED_MPH: float = 3.0
 MAX_ALTERNATIVE_WAIT_MINUTES: float = 30.0
 
-# --- Paired-route detection --------------------------------------------------
-# Two routes are flagged as a *pair* — e.g. a one-way couplet or a loop split
-# into two direction-named routes — when each route's service area overlaps
-# the other's by at least this percentage. Pairs read as near-total redundancy
-# on every other angle, but they are really one service split by direction.
+# --- Paired routes ------------------------------------------------------------
+# Known direction-split pairs — one-way couplets, or a loop published as two
+# direction-named routes. Declare each pair once, by route_id or
+# route_short_name, e.g. [("99A", "99B")]. Declared partners stop counting as
+# "another route" in each other's metrics (shared stops, routes within walk,
+# timed alternatives, timepoints, shared area): a couplet is one service split
+# by direction, not redundancy. Its metrics are then measured against the rest
+# of the network.
+ROUTE_PAIRS: list[tuple[str, str]] = []
+
+# Undeclared route pairs whose service areas mutually overlap by at least this
+# percentage are *suggested* in the output (``suggested_pairs`` column and a
+# warning log) so they can be reviewed and added to ROUTE_PAIRS. Suggestions
+# never change any metric — only declared pairs do.
 PAIRED_ROUTE_MIN_OVERLAP_PCT: float = 90.0
 
 # Schedule calendars to profile, matched against the classification labels
@@ -185,6 +197,8 @@ SUMMARY_COLUMNS: List[str] = [
     "pct_area_shared",
     "n_paired_routes",
     "paired_routes",
+    "n_suggested_pairs",
+    "suggested_pairs",
 ]
 DETAIL_COLUMNS: List[str] = [
     "schedule",
@@ -199,6 +213,7 @@ DETAIL_COLUMNS: List[str] = [
     "min_alternative_wait_min",
     "area_overlap_pct",
     "paired",
+    "suggested_pair",
 ]
 
 # Fixed display order for the schedule labels produced by classification.
@@ -579,18 +594,26 @@ def build_route_buffers(
     return buffers
 
 
-def compute_service_areas(buffers: Mapping[str, Any]) -> dict[str, tuple[float, float, float]]:
+def compute_service_areas(
+    buffers: Mapping[str, Any],
+    declared_pairs: Optional[set[frozenset[str]]] = None,
+) -> dict[str, tuple[float, float, float]]:
     """Compute each route's total, solo, and shared service area.
 
     The solo portion is what remains after subtracting every other route's
-    service area; shared is the difference.
+    service area; shared is the difference. A route's declared pair partner
+    is not subtracted — the couplet's other half is the same service, so it
+    cannot make coverage "shared".
 
     Args:
         buffers: Output of :func:`build_route_buffers`.
+        declared_pairs: Output of :func:`resolve_route_pairs`; ``None`` means
+            no pairs are declared.
 
     Returns:
         Mapping of route_id → ``(total_sqmi, solo_sqmi, shared_sqmi)``.
     """
+    pairs_declared = declared_pairs or set()
     route_ids = list(buffers)
     geom_list = [buffers[r] for r in route_ids]
     tree = STRtree(geom_list)
@@ -601,7 +624,11 @@ def compute_service_areas(buffers: Mapping[str, Any]) -> dict[str, tuple[float, 
         if geom.is_empty:
             areas[route_id] = (0.0, 0.0, 0.0)
             continue
-        others = [geom_list[int(j)] for j in tree.query(geom) if int(j) != i]
+        others = [
+            geom_list[int(j)]
+            for j in tree.query(geom)
+            if int(j) != i and frozenset((route_id, route_ids[int(j)])) not in pairs_declared
+        ]
         overlap = union_all(others) if others else Polygon()
         solo = geom.difference(overlap)
         total_sqmi = geom.area / _SQM_PER_SQMI
@@ -665,6 +692,64 @@ def build_route_lookup(routes: pd.DataFrame) -> pd.DataFrame:
     return lookup.set_index("route_id")
 
 
+def resolve_route_pairs(
+    pairs: Sequence[Sequence[str]],
+    routes: pd.DataFrame,
+) -> set[frozenset[str]]:
+    """Resolve declared pair tokens to canonical route_id pairs.
+
+    Each token matches against ``route_id`` OR ``route_short_name`` so users
+    can list whichever identifier they know. A short name that maps to several
+    route_ids pairs every combination. A pair with an unmatched token is
+    skipped with a warning rather than failing the run.
+
+    Args:
+        pairs: Two-token sequences, e.g. ``[("99A", "99B")]``.
+        routes: Parsed *routes.txt*.
+
+    Returns:
+        Set of two-element ``frozenset``s of route_id strings.
+
+    Raises:
+        ValueError: If an entry does not contain exactly two tokens.
+    """
+    ids = {str(r) for r in routes["route_id"]}
+    short_to_ids: dict[str, set[str]] = {}
+    if "route_short_name" in routes.columns:
+        for rid, short in zip(routes["route_id"], routes["route_short_name"].fillna("")):
+            token = str(short).strip()
+            if token:
+                short_to_ids.setdefault(token, set()).add(str(rid))
+
+    def _match(token: str) -> set[str]:
+        text = str(token).strip()
+        return {text} if text in ids else short_to_ids.get(text, set())
+
+    declared: set[frozenset[str]] = set()
+    for pair in pairs:
+        if len(pair) != 2:
+            raise ValueError(
+                f"Route pairs must name exactly two routes (route_id or route_short_name); "
+                f"got {tuple(pair)!r}."
+            )
+        matches = [_match(token) for token in pair]
+        unmatched = [str(token) for token, found in zip(pair, matches) if not found]
+        if unmatched:
+            logging.warning(
+                "Declared route pair %r: no route matches %s — pair ignored.",
+                tuple(pair),
+                ", ".join(unmatched),
+            )
+            continue
+        for id_a in matches[0]:
+            for id_b in matches[1]:
+                if id_a != id_b:
+                    declared.add(frozenset((id_a, id_b)))
+    if declared:
+        logging.info("Declared route pair(s) resolved: %d.", len(declared))
+    return declared
+
+
 def build_profile_tables(
     schedule: str,
     serves: Mapping[str, set[str]],
@@ -675,9 +760,16 @@ def build_profile_tables(
     overlap_pcts: Mapping[tuple[str, str], float],
     route_lookup: pd.DataFrame,
     check_times: bool,
+    declared_pairs: Optional[set[frozenset[str]]] = None,
     paired_min_overlap_pct: float = PAIRED_ROUTE_MIN_OVERLAP_PCT,
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
     """Assemble the summary and partner-detail rows for one schedule.
+
+    Declared pair partners are excluded from each other's redundancy metrics
+    (shared stops, routes within walk, timed alternatives, timepoint sharing)
+    — a couplet is one service split by direction, so its other half is not
+    competition. Undeclared partners whose service areas mutually overlap by
+    at least *paired_min_overlap_pct* are surfaced as suggestions instead.
 
     Args:
         schedule: The schedule-calendar label (e.g. ``"Weekday"``).
@@ -689,13 +781,16 @@ def build_profile_tables(
         overlap_pcts: Output of :func:`compute_area_overlap_pcts`.
         route_lookup: Output of :func:`build_route_lookup`.
         check_times: Whether the timed-alternative columns carry values.
+        declared_pairs: Output of :func:`resolve_route_pairs` — the declared
+            direction-split pairs. ``None`` means none are declared.
         paired_min_overlap_pct: Mutual service-area overlap (percent) at or
-            above which two routes are flagged as a pair.
+            above which an undeclared pair is suggested.
 
     Returns:
         A ``(summary_rows, detail_rows)`` tuple of row dicts, routes sorted
         by display label.
     """
+    pairs_declared = declared_pairs or set()
     route_stops: dict[str, set[str]] = {}
     for stop_id, route_ids in serves.items():
         for route_id in route_ids:
@@ -733,22 +828,31 @@ def build_profile_tables(
         short_name, long_name = _names(route_id)
         n_stops = len(route_stops[route_id])
         route_partners = partners.get(route_id, {})
+
+        def _is_pair(partner_id: str, me: str = route_id) -> bool:
+            return frozenset((me, partner_id)) in pairs_declared
+
+        all_ids = sorted(route_partners, key=_label)
+        # Declared partners count whenever they run this schedule, walkable or not.
+        paired_ids = sorted((p for p in route_stops if _is_pair(p)), key=_label)
+        walk_ids = [p for p in all_ids if not _is_pair(p)]
+        timed_ids = [p for p in walk_ids if route_partners[p].timed_feasible]
+
         shared_stops: set[str] = set()
-        for stats in route_partners.values():
-            shared_stops |= stats.shared_stops
+        for partner_id in walk_ids:
+            shared_stops |= route_partners[partner_id].shared_stops
         n_shared = len(shared_stops)
 
         n_timepoints = len(tp_route_stops.get(route_id, set()))
         route_tp_partners = tp_partners.get(route_id, {})
+        tp_ids = [p for p in sorted(route_tp_partners, key=_label) if not _is_pair(p)]
         shared_timepoints: set[str] = set()
-        for stats in route_tp_partners.values():
-            shared_timepoints |= stats.shared_stops
+        for partner_id in tp_ids:
+            shared_timepoints |= route_tp_partners[partner_id].shared_stops
         n_tp_shared = len(shared_timepoints)
 
-        walk_ids = sorted(route_partners, key=_label)
-        timed_ids = [p for p in walk_ids if route_partners[p].timed_feasible]
         total_sqmi, solo_sqmi, shared_sqmi = areas.get(route_id, (0.0, 0.0, 0.0))
-        paired_ids = [
+        suggested_ids = [
             p
             for p in walk_ids
             if overlap_pcts.get((route_id, p), 0.0) >= paired_min_overlap_pct
@@ -775,10 +879,8 @@ def build_profile_tables(
                 "n_shared_timepoints": n_tp_shared,
                 "n_solo_timepoints": n_timepoints - n_tp_shared,
                 "pct_timepoints_shared": _pct(n_tp_shared, n_timepoints),
-                "n_timepoint_partner_routes": len(route_tp_partners),
-                "timepoint_partner_routes": ", ".join(
-                    _label(p) for p in sorted(route_tp_partners, key=_label)
-                ),
+                "n_timepoint_partner_routes": len(tp_ids),
+                "timepoint_partner_routes": ", ".join(_label(p) for p in tp_ids),
                 "service_area_sqmi": round(total_sqmi, 3),
                 "solo_area_sqmi": round(solo_sqmi, 3),
                 "shared_area_sqmi": round(shared_sqmi, 3),
@@ -787,10 +889,12 @@ def build_profile_tables(
                 ),
                 "n_paired_routes": len(paired_ids),
                 "paired_routes": ", ".join(_label(p) for p in paired_ids),
+                "n_suggested_pairs": len(suggested_ids),
+                "suggested_pairs": ", ".join(_label(p) for p in suggested_ids),
             }
         )
 
-        for partner_id in walk_ids:
+        for partner_id in all_ids:
             stats = route_partners[partner_id]
             partner_short, _ = _names(partner_id)
             tp_stats = route_tp_partners.get(partner_id)
@@ -811,6 +915,7 @@ def build_profile_tables(
                     ),
                     "area_overlap_pct": round(overlap_pcts.get((route_id, partner_id), 0.0), 1),
                     "paired": partner_id in paired_ids,
+                    "suggested_pair": partner_id in suggested_ids,
                 }
             )
 
@@ -1398,6 +1503,7 @@ def run(
     service_ids: Sequence[str] = (),
     projected_crs: str = PROJECTED_CRS,
     write_detail: bool = WRITE_DETAIL,
+    route_pairs: Sequence[Sequence[str]] = (),
     paired_min_overlap_pct: float = PAIRED_ROUTE_MIN_OVERLAP_PCT,
 ) -> pd.DataFrame:
     """Compute the redundancy profile for every route and write all artifacts.
@@ -1417,8 +1523,15 @@ def run(
         service_ids: service_ids to keep; empty keeps all.
         projected_crs: Metric CRS for distance and area math.
         write_detail: Also write the per-pair partner detail CSV.
+        route_pairs: Declared direction-split pairs, two tokens each
+            (route_id or route_short_name); their partners are excluded from
+            each other's redundancy metrics.
         paired_min_overlap_pct: Mutual service-area overlap (percent) at or
-            above which two routes are flagged as a pair.
+            above which an undeclared pair is suggested.
+
+    Raises:
+        ValueError: Also raised when a route-pair entry does not contain
+            exactly two tokens.
 
     Returns:
         The summary DataFrame (also written to disk).
@@ -1449,6 +1562,7 @@ def run(
 
     trips = filter_trips(data["trips"], data["routes"], service_ids, routes_include, routes_exclude)
     route_lookup = build_route_lookup(data["routes"])
+    declared_pairs = resolve_route_pairs(route_pairs, data["routes"])
 
     stops = filter_platform_stops(data["stops"])
     stops_gdf = project_stops(stops, projected_crs)
@@ -1534,7 +1648,7 @@ def run(
             for route_id in route_ids:
                 route_stops.setdefault(route_id, set()).add(stop_id)
         buffers = build_route_buffers(stops_gdf, route_stops, radius_m)
-        areas = compute_service_areas(buffers)
+        areas = compute_service_areas(buffers, declared_pairs)
         overlap_pcts = compute_area_overlap_pcts(buffers)
 
         label_summary, label_detail = build_profile_tables(
@@ -1547,6 +1661,7 @@ def run(
             overlap_pcts,
             route_lookup,
             check_times,
+            declared_pairs=declared_pairs,
             paired_min_overlap_pct=paired_min_overlap_pct,
         )
         summary_rows.extend(label_summary)
@@ -1560,6 +1675,23 @@ def run(
 
     summary = pd.DataFrame(summary_rows, columns=SUMMARY_COLUMNS)
     detail = pd.DataFrame(detail_rows, columns=DETAIL_COLUMNS)
+
+    suggestions: set[tuple[str, str]] = set()
+    for row in summary.itertuples():
+        if str(row.suggested_pairs):
+            me = str(row.route_short_name) or str(row.route_id)
+            for other in str(row.suggested_pairs).split(", "):
+                suggestions.add(tuple(sorted((me, other))))
+    if suggestions:
+        logging.warning(
+            "%d undeclared route pair(s) look like one service split by direction "
+            "(>= %g%% mutual service-area overlap): %s. If so, declare them in "
+            'ROUTE_PAIRS (or --route-pairs "A:B") and rerun so each partner stops '
+            "counting toward the other's redundancy.",
+            len(suggestions),
+            paired_min_overlap_pct,
+            "; ".join(f"{a} + {b}" for a, b in sorted(suggestions)),
+        )
 
     ensure_dir(output_dir)
     summary_path = output_dir / SUMMARY_FILENAME
@@ -1575,7 +1707,8 @@ def run(
         f"Walking distance:     {walk_distance:g} {walk_distance_unit} ({radius_m:.0f} m)",
         f"Timed alternatives:   "
         f"{f'on (max wait {max_wait_minutes:g} min)' if check_times else 'off'}",
-        f"Paired-route flag:    >= {paired_min_overlap_pct:g}% mutual service-area overlap",
+        f"Declared route pairs: {len(declared_pairs)}",
+        f"Pair suggestions:     >= {paired_min_overlap_pct:g}% mutual service-area overlap",
         f"Schedules profiled:   {', '.join(ordered_labels)}",
         f"Route profile rows:   {len(summary)}",
         f"Partner pair rows:    {len(detail)}",
@@ -1633,10 +1766,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Longest wait accepted by the timed-alternative check.",
     )
     parser.add_argument(
+        "--route-pairs",
+        nargs="*",
+        default=[f"{a}:{b}" for a, b in ROUTE_PAIRS],
+        help=(
+            "Declared direction-split pairs as ROUTE_A:ROUTE_B tokens (route_id or "
+            "route_short_name), e.g. 99A:99B. Partners are excluded from each other's "
+            "redundancy metrics."
+        ),
+    )
+    parser.add_argument(
         "--paired-overlap-pct",
         type=float,
         default=PAIRED_ROUTE_MIN_OVERLAP_PCT,
-        help="Mutual service-area overlap (percent) at or above which routes are flagged paired.",
+        help="Mutual service-area overlap (percent) at or above which undeclared pairs are "
+        "suggested.",
     )
     parser.add_argument(
         "--no-time-check",
@@ -1691,6 +1835,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         return 2
 
+    route_pairs: list[tuple[str, str]] = []
+    for token in args.route_pairs:
+        parts = [part.strip() for part in str(token).split(":")]
+        if len(parts) != 2 or not all(parts):
+            logging.warning(
+                "--route-pairs entries must look like ROUTE_A:ROUTE_B (route_id or "
+                "route_short_name); got %r.",
+                token,
+            )
+            return 2
+        route_pairs.append((parts[0], parts[1]))
+
     try:
         run(
             gtfs_path=args.gtfs,
@@ -1703,6 +1859,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             routes_include=args.routes_include,
             routes_exclude=args.routes_exclude,
             service_ids=FILTER_SERVICE_IDS,
+            route_pairs=route_pairs,
             paired_min_overlap_pct=args.paired_overlap_pct,
         )
     except (OSError, ValueError, RuntimeError) as exc:

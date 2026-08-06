@@ -16,6 +16,7 @@ from scripts.service_coverage.route_redundancy_profile_gpd import (
     compute_pair_stats,
     compute_service_areas,
     filter_platform_stops,
+    resolve_route_pairs,
     run,
 )
 
@@ -186,6 +187,41 @@ def test_compute_area_overlap_pcts_mutual_and_disjoint() -> None:
     assert ("C", "A") not in pcts
 
 
+def test_compute_service_areas_declared_pair_is_not_shared() -> None:
+    stops = gpd.GeoDataFrame({"stop_id": ["S1"]}, geometry=[Point(0.0, 0.0)])
+    buffers = build_route_buffers(stops, {"A": {"S1"}, "B": {"S1"}}, radius_m=400.0)
+    areas = compute_service_areas(buffers, declared_pairs={frozenset(("A", "B"))})
+
+    # B is A's declared pair, so B's identical buffer no longer makes A's
+    # coverage "shared": everything stays solo.
+    total_a, solo_a, shared_a = areas["A"]
+    assert solo_a == pytest.approx(total_a)
+    assert shared_a == pytest.approx(0.0, abs=1e-9)
+
+
+# ---------------------------------------------------------------------------
+# resolve_route_pairs
+# ---------------------------------------------------------------------------
+
+
+def _routes_table() -> pd.DataFrame:
+    return pd.DataFrame({"route_id": ["A", "B", "C"], "route_short_name": ["99A", "99B", "10"]})
+
+
+def test_resolve_route_pairs_matches_short_names_and_route_ids() -> None:
+    declared = resolve_route_pairs([("99A", "99B"), ("A", "10")], _routes_table())
+    assert declared == {frozenset(("A", "B")), frozenset(("A", "C"))}
+
+
+def test_resolve_route_pairs_ignores_unmatched_tokens() -> None:
+    assert resolve_route_pairs([("99A", "NOPE")], _routes_table()) == set()
+
+
+def test_resolve_route_pairs_rejects_wrong_arity() -> None:
+    with pytest.raises(ValueError):
+        resolve_route_pairs([("99A", "99B", "10")], _routes_table())
+
+
 # ---------------------------------------------------------------------------
 # filter_platform_stops
 # ---------------------------------------------------------------------------
@@ -305,11 +341,12 @@ def test_run_end_to_end(tmp_path: Path) -> None:
     assert 0.0 < a["solo_area_sqmi"] < 0.05
     assert a["shared_area_sqmi"] > 0.3
 
-    # Angle 5: A and B are a couplet — ~93% mutual service-area overlap, so
-    # each is flagged as the other's pair.
-    assert int(a["n_paired_routes"]) == 1
-    assert a["paired_routes"] == "20"
-    assert b["paired_routes"] == "10"
+    # Angle 5: A and B look like a couplet (~93% mutual overlap). With no
+    # declaration they are only *suggested* — metrics above are unchanged.
+    assert int(a["n_paired_routes"]) == 0
+    assert int(a["n_suggested_pairs"]) == 1
+    assert a["suggested_pairs"] == "20"
+    assert b["suggested_pairs"] == "10"
 
     # Saturday: A runs alone, so nothing is shared on any angle.
     sat = summary.loc[summary["schedule"] == "Saturday"].iloc[0]
@@ -330,7 +367,35 @@ def test_run_end_to_end(tmp_path: Path) -> None:
     assert str(a_to_b["timed_alternative"]) == "True"
     assert a_to_b["min_alternative_wait_min"] == pytest.approx(5.0)
     assert a_to_b["area_overlap_pct"] > 90.0
+    assert str(a_to_b["paired"]) == "False"
+    assert str(a_to_b["suggested_pair"]) == "True"
+
+
+def test_run_declared_pair_excluded_from_metrics(tmp_path: Path) -> None:
+    feed = tmp_path / "gtfs"
+    out = tmp_path / "out"
+    _write_feed(feed)
+
+    summary = run(gtfs_path=str(feed), output_dir=out, route_pairs=[("10", "20")])
+    wk = summary.loc[summary["schedule"] == "Weekday"].set_index("route_id")
+    a = wk.loc["A"]
+
+    # B is declared as A's other direction, so nothing counts as shared:
+    # every stop, timepoint, and square mile of A is solo again.
+    assert int(a["n_shared_stops"]) == 0
+    assert int(a["n_routes_within_walk"]) == 0
+    assert int(a["n_timed_alternative_routes"]) == 0
+    assert int(a["n_shared_timepoints"]) == 0
+    assert a["solo_area_sqmi"] == pytest.approx(a["service_area_sqmi"])
+    assert a["paired_routes"] == "20"
+    assert int(a["n_suggested_pairs"]) == 0
+
+    # The pair itself stays visible in the partner detail, flagged as paired.
+    detail = pd.read_csv(out / rrp.DETAIL_FILENAME)
+    a_to_b = detail.loc[(detail["schedule"] == "Weekday") & (detail["route_id"] == "A")].iloc[0]
+    assert a_to_b["partner_route_id"] == "B"
     assert str(a_to_b["paired"]) == "True"
+    assert str(a_to_b["suggested_pair"]) == "False"
 
 
 def test_run_service_label_filter(tmp_path: Path) -> None:
