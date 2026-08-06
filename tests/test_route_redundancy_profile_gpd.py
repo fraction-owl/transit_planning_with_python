@@ -10,7 +10,9 @@ from shapely.geometry import Point
 
 import scripts.service_coverage.route_redundancy_profile_gpd as rrp
 from scripts.service_coverage.route_redundancy_profile_gpd import (
+    build_route_buffers,
     build_schedule_service_ids,
+    compute_area_overlap_pcts,
     compute_pair_stats,
     compute_service_areas,
     filter_platform_stops,
@@ -149,7 +151,8 @@ def test_compute_service_areas_splits_solo_and_shared() -> None:
         geometry=[Point(0.0, 0.0), Point(10000.0, 0.0)],
     )
     # A and B both serve S1 (identical buffers); C is alone at S2.
-    areas = compute_service_areas(stops, {"A": {"S1"}, "B": {"S1"}, "C": {"S2"}}, radius_m=400.0)
+    buffers = build_route_buffers(stops, {"A": {"S1"}, "B": {"S1"}, "C": {"S2"}}, radius_m=400.0)
+    areas = compute_service_areas(buffers)
     circle_sqmi = np.pi * 400.0**2 / rrp._SQM_PER_SQMI
 
     total_a, solo_a, shared_a = areas["A"]
@@ -164,8 +167,23 @@ def test_compute_service_areas_splits_solo_and_shared() -> None:
 
 def test_compute_service_areas_route_with_no_located_stops_is_zero() -> None:
     stops = gpd.GeoDataFrame({"stop_id": ["S1"]}, geometry=[Point(0.0, 0.0)])
-    areas = compute_service_areas(stops, {"A": {"MISSING"}}, radius_m=400.0)
+    areas = compute_service_areas(build_route_buffers(stops, {"A": {"MISSING"}}, radius_m=400.0))
     assert areas["A"] == (0.0, 0.0, 0.0)
+
+
+def test_compute_area_overlap_pcts_mutual_and_disjoint() -> None:
+    stops = gpd.GeoDataFrame(
+        {"stop_id": ["S1", "S2"]},
+        geometry=[Point(0.0, 0.0), Point(10000.0, 0.0)],
+    )
+    buffers = build_route_buffers(stops, {"A": {"S1"}, "B": {"S1"}, "C": {"S2"}}, radius_m=400.0)
+    pcts = compute_area_overlap_pcts(buffers)
+
+    # Identical buffers overlap 100% both ways; C intersects nobody.
+    assert pcts[("A", "B")] == pytest.approx(100.0)
+    assert pcts[("B", "A")] == pytest.approx(100.0)
+    assert ("A", "C") not in pcts
+    assert ("C", "A") not in pcts
 
 
 # ---------------------------------------------------------------------------
@@ -287,6 +305,12 @@ def test_run_end_to_end(tmp_path: Path) -> None:
     assert 0.0 < a["solo_area_sqmi"] < 0.05
     assert a["shared_area_sqmi"] > 0.3
 
+    # Angle 5: A and B are a couplet — ~93% mutual service-area overlap, so
+    # each is flagged as the other's pair.
+    assert int(a["n_paired_routes"]) == 1
+    assert a["paired_routes"] == "20"
+    assert b["paired_routes"] == "10"
+
     # Saturday: A runs alone, so nothing is shared on any angle.
     sat = summary.loc[summary["schedule"] == "Saturday"].iloc[0]
     assert sat["route_id"] == "A"
@@ -295,6 +319,7 @@ def test_run_end_to_end(tmp_path: Path) -> None:
     assert int(sat["n_shared_timepoints"]) == 0
     assert sat["solo_area_sqmi"] == pytest.approx(sat["service_area_sqmi"])
     assert sat["pct_area_shared"] == pytest.approx(0.0)
+    assert int(sat["n_paired_routes"]) == 0
 
     detail = pd.read_csv(out / rrp.DETAIL_FILENAME)
     a_to_b = detail.loc[(detail["schedule"] == "Weekday") & (detail["route_id"] == "A")].iloc[0]
@@ -304,6 +329,8 @@ def test_run_end_to_end(tmp_path: Path) -> None:
     assert 100 < a_to_b["nearest_walk_distance_ft"] < 200
     assert str(a_to_b["timed_alternative"]) == "True"
     assert a_to_b["min_alternative_wait_min"] == pytest.approx(5.0)
+    assert a_to_b["area_overlap_pct"] > 90.0
+    assert str(a_to_b["paired"]) == "True"
 
 
 def test_run_service_label_filter(tmp_path: Path) -> None:
