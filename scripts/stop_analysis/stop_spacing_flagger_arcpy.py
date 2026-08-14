@@ -13,10 +13,11 @@ The long-spacing check examines whether stops from other routes fall within a
 specified buffer distance of unusually long segments and may merit further
 review as possible missed service opportunities.
 
-An optional stop-deletion scenario (``STOPS_TO_DELETE``) runs the pipeline
-twice – once on the original feed and once with the listed stops removed from
-service – writing each run to its own subfolder plus a CSV summarizing the
-spacing gap each deletion opens up.
+An optional stop-deletion scenario (``STOPS_TO_DELETE`` and/or
+``STOPS_TO_DELETE_BY_ROUTE``) runs the pipeline twice – once on the original
+feed and once with the listed stops removed from service, either everywhere
+or from a single route – writing each run to its own subfolder plus a CSV
+summarizing the spacing gap each deletion opens up.
 
 Typical usage:
 Update the paths in the CONFIGURATION section and run from ArcGIS Pro's Python
@@ -33,7 +34,7 @@ import tempfile
 import zipfile
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, NamedTuple, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, NamedTuple, Sequence, Tuple
 
 import arcpy
 import numpy as np
@@ -70,14 +71,19 @@ NEAR_BUFFER_FT: float = 99.0
 LONG_SPACING_LOG_FILE: str = "long_spacing_segments.txt"  # currently unused (CSV + summary)
 LONG_SPACING_CSV_FILE: str = "long_spacing_segments.csv"
 
-# Optional stop-deletion scenario. Leave STOPS_TO_DELETE empty for a single
-# normal run. When non-empty the pipeline runs twice – the original feed goes
-# to OUTPUT_FOLDER/BASELINE_SUBFOLDER and a feed with the listed stops
-# removed from service goes to OUTPUT_FOLDER/SCENARIO_SUBFOLDER – and a CSV
-# describing the gap each deletion opens is written to OUTPUT_FOLDER.
+# Optional stop-deletion scenario. Leave both settings empty for a single
+# normal run. When either is non-empty the pipeline runs twice – the original
+# feed goes to OUTPUT_FOLDER/BASELINE_SUBFOLDER and a feed with the listed
+# stops removed from service goes to OUTPUT_FOLDER/SCENARIO_SUBFOLDER – and a
+# CSV describing the gap each deletion opens is written to OUTPUT_FOLDER.
 # Entries may be stop_id or stop_code values; stop_code wins when an entry
 # matches both (same convention as stop_removal_impact_gpd.py).
+# STOPS_TO_DELETE removes stops from every route and from stops.txt entirely.
+# STOPS_TO_DELETE_BY_ROUTE (route_id → entries) removes them from that one
+# route's trips only; the stop keeps existing for other routes, so the
+# scenario's long-spacing QA may legitimately re-suggest it as a nearby stop.
 STOPS_TO_DELETE: list[str] = []  # e.g. ["1001", "1002"]
+STOPS_TO_DELETE_BY_ROUTE: dict[str, list[str]] = {}  # e.g. {"101": ["1001"]}
 BASELINE_SUBFOLDER: str = r"baseline"
 SCENARIO_SUBFOLDER: str = r"stops_removed"
 DELETION_IMPACT_CSV_FILE: str = r"stop_deletion_impact.csv"
@@ -1018,6 +1024,7 @@ class PipelineArtifacts(NamedTuple):
 def _resolve_stops_to_delete(
     stops_df: pd.DataFrame,
     identifiers: Sequence[str],
+    label: str = "STOPS_TO_DELETE",
 ) -> set[str]:
     """Resolve user-entered identifiers to canonical GTFS stop_ids.
 
@@ -1030,9 +1037,13 @@ def _resolve_stops_to_delete(
     error-level hint shows sample identifiers from this feed so the user can
     spot format mismatches (missing stop_code column, leading zeros, etc.).
 
+    This helper is deliberately kept as a verbatim copy in both spacing
+    flaggers (arcpy and gpd); see tests/test_pipeline_contracts.py.
+
     Args:
         stops_df: stops.txt DataFrame.
-        identifiers: Raw stop_id / stop_code values from STOPS_TO_DELETE.
+        identifiers: Raw stop_id / stop_code values from the deletion config.
+        label: Config-setting name used in log messages.
 
     Returns:
         Set of matched stop_id strings (possibly empty).
@@ -1063,7 +1074,8 @@ def _resolve_stops_to_delete(
             unmatched.append(key)
 
     logging.info(
-        "Stop-deletion list resolved: %d identifier(s) → %d unique stop_id(s), %d unmatched.",
+        "%s resolved: %d identifier(s) → %d unique stop_id(s), %d unmatched.",
+        label,
         len(identifiers),
         len(resolved),
         len(unmatched),
@@ -1078,79 +1090,288 @@ def _resolve_stops_to_delete(
         if id_by_stop_code:
             code_examples = ", ".join(stops_df["stop_code"].astype(str).head(3))
             logging.error(
-                "None of the STOPS_TO_DELETE entries matched this feed, though both "
-                "fields were checked. Compare your entries against the feed's values – "
-                "stop_ids look like [%s] and stop_codes like [%s]. Watch for quoting, "
+                "None of the %s entries matched this feed, though both fields were "
+                "checked. Compare your entries against the feed's values – stop_ids "
+                "look like [%s] and stop_codes like [%s]. Watch for quoting, "
                 "prefixes, or leading zeros lost to numeric parsing.",
+                label,
                 sid_examples,
                 code_examples,
             )
         else:
             logging.error(
-                "None of the STOPS_TO_DELETE entries matched this feed, and its "
-                "stops.txt has no stop_code column, so entries can only match "
-                "stop_id. This feed's stop_ids look like [%s].",
+                "None of the %s entries matched this feed, and its stops.txt has "
+                "no stop_code column, so entries can only match stop_id. This "
+                "feed's stop_ids look like [%s].",
+                label,
                 sid_examples,
             )
     return resolved
 
 
+def _build_deletion_plan(
+    stops_df: pd.DataFrame,
+    routes_df: pd.DataFrame,
+    global_identifiers: Sequence[str],
+    by_route_identifiers: Mapping[str, Sequence[str]],
+) -> Tuple[set[str], Dict[str, set[str]]]:
+    """Resolve the global and per-route deletion configs against the feed.
+
+    This helper is deliberately kept as a verbatim copy in both spacing
+    flaggers (arcpy and gpd); see tests/test_pipeline_contracts.py.
+
+    Args:
+        stops_df: stops.txt DataFrame.
+        routes_df: routes.txt DataFrame, used to validate the route keys.
+        global_identifiers: STOPS_TO_DELETE entries, deleted from every route.
+        by_route_identifiers: STOPS_TO_DELETE_BY_ROUTE mapping of route_id to
+            entries deleted from that route only.
+
+    Returns:
+        (global_ids, by_route_ids); route keys that match no route_id in
+        routes.txt are warned about and skipped.
+    """
+    global_ids: set[str] = set()
+    if global_identifiers:
+        global_ids = _resolve_stops_to_delete(stops_df, global_identifiers)
+
+    by_route_ids: Dict[str, set[str]] = {}
+    known_routes = set(routes_df["route_id"].astype(str))
+    for route_key, idents in by_route_identifiers.items():
+        rid = str(route_key).strip()
+        if rid not in known_routes:
+            logging.warning(
+                "STOPS_TO_DELETE_BY_ROUTE key %r does not match any route_id in "
+                "routes.txt; skipping its %d entries.",
+                route_key,
+                len(idents),
+            )
+            continue
+        ids = _resolve_stops_to_delete(
+            stops_df,
+            idents,
+            label=f"STOPS_TO_DELETE_BY_ROUTE[{route_key!r}]",
+        )
+        if ids:
+            by_route_ids[rid] = ids
+    return global_ids, by_route_ids
+
+
 def _drop_stops_from_feed(
     dfs: Dict[str, pd.DataFrame],
     stop_ids: set[str],
+    by_route: Dict[str, set[str]] | None = None,
 ) -> Dict[str, pd.DataFrame]:
     """Return a copy of the GTFS tables with the given stops removed.
 
-    Rows are dropped from stop_times (so the stops are no longer served by
-    any trip) and from stops (so the long-spacing QA does not suggest a
-    deleted stop as a candidate fill for the gap it left behind).
+    Globally deleted stops (stop_ids) are dropped from stop_times entirely
+    and from stops itself, so the long-spacing QA does not suggest a deleted
+    stop as a candidate fill for the gap it left behind. Route-scoped
+    deletions (by_route) drop only the stop_times rows belonging to that
+    route's trips: the stop keeps existing – and stays served by any other
+    routes – so the scenario's long-spacing QA may legitimately re-suggest
+    it as a nearby stop for the route it was removed from.
+
+    This helper is deliberately kept as a verbatim copy in both spacing
+    flaggers (arcpy and gpd); see tests/test_pipeline_contracts.py.
 
     Args:
         dfs: Raw GTFS tables keyed by name.
-        stop_ids: Canonical stop_ids to remove.
+        stop_ids: Canonical stop_ids to remove from every route.
+        by_route: Mapping route_id → stop_ids to remove from that route only.
 
     Returns:
         New table mapping; untouched tables are shared, not copied.
     """
+    by_route = by_route or {}
     stop_times = dfs["stop_times"]
     stops = dfs["stops"]
 
+    st_stop_ids = stop_times["stop_id"].astype(str)
+    global_mask = st_stop_ids.isin(stop_ids)
+    drop_mask = global_mask.copy()
+    if by_route:
+        trips = dfs["trips"]
+        trip_to_route = dict(zip(trips["trip_id"].astype(str), trips["route_id"].astype(str)))
+        st_routes = stop_times["trip_id"].astype(str).map(trip_to_route)
+        for rid, ids in by_route.items():
+            drop_mask |= (st_routes == rid) & st_stop_ids.isin(ids)
+
     out = dict(dfs)
-    out["stop_times"] = stop_times.loc[~stop_times["stop_id"].astype(str).isin(stop_ids)].copy()
+    out["stop_times"] = stop_times.loc[~drop_mask].copy()
     out["stops"] = stops.loc[~stops["stop_id"].astype(str).isin(stop_ids)].copy()
 
     logging.info(
-        "Scenario feed: dropped %d stop_times row(s) and %d stop(s).",
-        len(stop_times) - len(out["stop_times"]),
+        "Scenario feed: dropped %d stop_times row(s) (%d everywhere, %d route-scoped) "
+        "and removed %d stop(s) from stops.txt.",
+        int(drop_mask.sum()),
+        int(global_mask.sum()),
+        int((drop_mask & ~global_mask).sum()),
         len(stops) - len(out["stops"]),
     )
     return out
 
 
+def _deletion_impact_rows_for_route(
+    stops: List[RouteStop],
+    deleted_ids: set[str],
+    global_ids: set[str],
+    ft_factor: float,
+    long_threshold_ft: float,
+    route_id: str,
+    route_short: Any,
+    direction_id: int,
+) -> List[Dict[str, Any]]:
+    """Return deletion-impact CSV rows for one route/direction stop sequence.
+
+    Walks the ordered baseline stops and groups each run of consecutive
+    deleted stops between two surviving stops into one row: the worst
+    sub-gap before deletion, the merged survivor-to-survivor gap after
+    deletion, and a flag when that new gap exceeds long_threshold_ft.
+    Deletions at a pattern end (which shorten the route rather than open a
+    gap) get an explanatory note. The deletion_scope column says whether the
+    run's stops were deleted everywhere or only from this route.
+
+    This helper is deliberately kept as a verbatim copy in both spacing
+    flaggers (arcpy and gpd); see tests/test_pipeline_contracts.py.
+
+    Args:
+        stops: Baseline stops ordered along the route polyline.
+        deleted_ids: Stop_ids deleted from this route (global + route-scoped).
+        global_ids: Stop_ids deleted from every route, for scope labeling.
+        ft_factor: Multiplier converting measure units to feet.
+        long_threshold_ft: Gap length that triggers the "exceeds" flag.
+        route_id: Route identifier for the output rows.
+        route_short: Route short name for the output rows.
+        direction_id: Direction identifier for the output rows.
+
+    Returns:
+        One dict per deleted run, ready for the impact CSV.
+    """
+    rows: List[Dict[str, Any]] = []
+    i = 0
+    n = len(stops)
+    while i < n:
+        if stops[i].stop_id not in deleted_ids:
+            i += 1
+            continue
+
+        j = i
+        while j < n and stops[j].stop_id in deleted_ids:
+            j += 1
+        removed = stops[i:j]
+
+        prev_stop = stops[i - 1] if i > 0 else None
+        next_stop = stops[j] if j < n else None
+
+        chain = [s for s in [prev_stop, *removed, next_stop] if s is not None]
+        old_max_ft: float | None = None
+        if len(chain) >= 2:
+            old_max_ft = max(
+                (b.measure - a.measure) * ft_factor for a, b in zip(chain[:-1], chain[1:])
+            )
+
+        new_spacing_ft: float | None = None
+        note = ""
+        if prev_stop is not None and next_stop is not None:
+            new_spacing_ft = (next_stop.measure - prev_stop.measure) * ft_factor
+        elif prev_stop is None and next_stop is None:
+            note = "all served stops on this route/direction deleted"
+        else:
+            end = "start" if prev_stop is None else "end"
+            note = f"deleted at route {end}; pattern shortened, no new gap"
+
+        scopes = {"all routes" if s.stop_id in global_ids else "this route" for s in removed}
+        scope = scopes.pop() if len(scopes) == 1 else "mixed"
+
+        rows.append(
+            {
+                "route_id": route_id,
+                "route_short": route_short,
+                "direction_id": direction_id,
+                "prev_stop_id": prev_stop.stop_id if prev_stop else "",
+                "prev_stop_name": (prev_stop.stop_name or "") if prev_stop else "",
+                "next_stop_id": next_stop.stop_id if next_stop else "",
+                "next_stop_name": (next_stop.stop_name or "") if next_stop else "",
+                "deleted_stop_ids": ",".join(s.stop_id for s in removed),
+                "deleted_stop_names": ";".join(str(s.stop_name) for s in removed),
+                "n_deleted": len(removed),
+                "deletion_scope": scope,
+                "old_max_spacing_ft": round(old_max_ft, 1) if old_max_ft is not None else "",
+                "new_spacing_ft": round(new_spacing_ft, 1) if new_spacing_ft is not None else "",
+                "exceeds_long_ft": (
+                    ""
+                    if new_spacing_ft is None
+                    else ("yes" if new_spacing_ft > long_threshold_ft else "no")
+                ),
+                "note": note,
+            }
+        )
+        i = j
+
+    return rows
+
+
+def _log_unserved_deletions(
+    global_ids: set[str],
+    by_route: Dict[str, set[str]],
+    served_deleted: set[str],
+    seen_by_route: Dict[str, set[str]],
+) -> None:
+    """Log deletion-list stops that never appeared on an analyzed route.
+
+    This helper is deliberately kept as a verbatim copy in both spacing
+    flaggers (arcpy and gpd); see tests/test_pipeline_contracts.py.
+
+    Args:
+        global_ids: Stop_ids slated for deletion from every route.
+        by_route: Mapping route_id → stop_ids slated for per-route deletion.
+        served_deleted: Deletion-list stop_ids seen on any analyzed route.
+        seen_by_route: Mapping route_id → deletion-list stop_ids seen there.
+    """
+    unserved = sorted(global_ids - served_deleted)
+    if unserved:
+        logging.info(
+            "%d deleted stop(s) are not served by the analyzed routes: %s",
+            len(unserved),
+            ", ".join(unserved[:20]) + ("…" if len(unserved) > 20 else ""),
+        )
+    for rid in sorted(by_route):
+        missing = sorted(by_route[rid] - seen_by_route.get(rid, set()))
+        if missing:
+            logging.info(
+                "Route %s: %d stop(s) slated for per-route deletion are not served "
+                "by that route in the baseline: %s",
+                rid,
+                len(missing),
+                ", ".join(missing[:20]) + ("…" if len(missing) > 20 else ""),
+            )
+
+
 def _report_stop_deletion_impact(
     baseline: PipelineArtifacts,
-    deleted_ids: set[str],
+    global_ids: set[str],
+    by_route: Dict[str, set[str]],
     long_threshold_ft: float,
     csv_path: Path,
 ) -> None:
     """Write a CSV describing the spacing gap each stop deletion opens.
 
     For every (route_id, direction_id) in the baseline run, the ordered stop
-    sequence is re-walked and each run of consecutive deleted stops between
-    two surviving stops becomes one row: the worst sub-gap before deletion,
-    the merged survivor-to-survivor gap after deletion, and a flag when that
-    new gap exceeds long_threshold_ft. Deletions at a pattern end (which
-    shorten the route rather than open a gap) get an explanatory note.
+    sequence is re-walked; see _deletion_impact_rows_for_route for the row
+    semantics. Per-route deletions only affect the rows of their own route.
 
     Args:
         baseline: Artifacts from the baseline (pre-deletion) pipeline run.
-        deleted_ids: Canonical stop_ids removed in the scenario run.
+        global_ids: Canonical stop_ids removed from every route.
+        by_route: Mapping route_id → stop_ids removed from that route only.
         long_threshold_ft: Gap length that triggers the "exceeds" flag.
         csv_path: Destination CSV path.
     """
     ft_factor = _feet_factor(baseline.sr)
     rows: List[Dict[str, Any]] = []
     served_deleted: set[str] = set()
+    seen_by_route: Dict[str, set[str]] = {}
 
     for rec in baseline.routes:
         line: arcpy.Polyline = rec["geometry"]
@@ -1169,74 +1390,25 @@ def _report_stop_deletion_impact(
 
         rid = rec["route_id"]
         drn = int(rec["direction_id"])
-        rshort = rec.get("route_short")
+        effective_ids = global_ids | by_route.get(rid, set())
+        deleted_here = [s.stop_id for s in stops if s.stop_id in effective_ids]
+        served_deleted.update(deleted_here)
+        seen_by_route.setdefault(rid, set()).update(deleted_here)
 
-        i = 0
-        n = len(stops)
-        while i < n:
-            if stops[i].stop_id not in deleted_ids:
-                i += 1
-                continue
-
-            j = i
-            while j < n and stops[j].stop_id in deleted_ids:
-                j += 1
-            removed = stops[i:j]
-            served_deleted.update(s.stop_id for s in removed)
-
-            prev_stop = stops[i - 1] if i > 0 else None
-            next_stop = stops[j] if j < n else None
-
-            chain = [s for s in [prev_stop, *removed, next_stop] if s is not None]
-            old_max_ft: float | None = None
-            if len(chain) >= 2:
-                old_max_ft = max(
-                    (b.measure - a.measure) * ft_factor for a, b in zip(chain[:-1], chain[1:])
-                )
-
-            new_spacing_ft: float | None = None
-            note = ""
-            if prev_stop is not None and next_stop is not None:
-                new_spacing_ft = (next_stop.measure - prev_stop.measure) * ft_factor
-            elif prev_stop is None and next_stop is None:
-                note = "all served stops on this route/direction deleted"
-            else:
-                end = "start" if prev_stop is None else "end"
-                note = f"deleted at route {end}; pattern shortened, no new gap"
-
-            rows.append(
-                {
-                    "route_id": rid,
-                    "route_short": rshort,
-                    "direction_id": drn,
-                    "prev_stop_id": prev_stop.stop_id if prev_stop else "",
-                    "prev_stop_name": (prev_stop.stop_name or "") if prev_stop else "",
-                    "next_stop_id": next_stop.stop_id if next_stop else "",
-                    "next_stop_name": (next_stop.stop_name or "") if next_stop else "",
-                    "deleted_stop_ids": ",".join(s.stop_id for s in removed),
-                    "deleted_stop_names": ";".join(str(s.stop_name) for s in removed),
-                    "n_deleted": len(removed),
-                    "old_max_spacing_ft": round(old_max_ft, 1) if old_max_ft is not None else "",
-                    "new_spacing_ft": (
-                        round(new_spacing_ft, 1) if new_spacing_ft is not None else ""
-                    ),
-                    "exceeds_long_ft": (
-                        ""
-                        if new_spacing_ft is None
-                        else ("yes" if new_spacing_ft > long_threshold_ft else "no")
-                    ),
-                    "note": note,
-                }
+        rows.extend(
+            _deletion_impact_rows_for_route(
+                stops,
+                effective_ids,
+                global_ids,
+                ft_factor,
+                long_threshold_ft,
+                rid,
+                rec.get("route_short"),
+                drn,
             )
-            i = j
-
-    unserved = sorted(deleted_ids - served_deleted)
-    if unserved:
-        logging.info(
-            "%d deleted stop(s) are not served by the analyzed routes: %s",
-            len(unserved),
-            ", ".join(unserved[:20]) + ("…" if len(unserved) > 20 else ""),
         )
+
+    _log_unserved_deletions(global_ids, by_route, served_deleted, seen_by_route)
 
     if not rows:
         logging.info("Deletion impact: no deleted stop appears on the analyzed routes.")
@@ -1253,6 +1425,7 @@ def _report_stop_deletion_impact(
         "deleted_stop_ids",
         "deleted_stop_names",
         "n_deleted",
+        "deletion_scope",
         "old_max_spacing_ft",
         "new_spacing_ft",
         "exceeds_long_ft",
@@ -1373,10 +1546,11 @@ def _run_pipeline(
 def main() -> int:  # noqa: D401
     """Run the entire GTFS-to-GIS pipeline with both spacing QA checks.
 
-    When STOPS_TO_DELETE is non-empty the pipeline runs twice – the original
-    feed into BASELINE_SUBFOLDER and the feed minus the listed stops into
-    SCENARIO_SUBFOLDER – followed by a stop-deletion impact CSV in
-    OUTPUT_FOLDER comparing spacing before and after the removals.
+    When STOPS_TO_DELETE and/or STOPS_TO_DELETE_BY_ROUTE is non-empty the
+    pipeline runs twice – the original feed into BASELINE_SUBFOLDER and the
+    feed minus the listed stops into SCENARIO_SUBFOLDER – followed by a
+    stop-deletion impact CSV in OUTPUT_FOLDER comparing spacing before and
+    after the removals.
 
     Returns:
         Process exit code: 0 on success, 1 on failure, 2 if required
@@ -1405,15 +1579,23 @@ def main() -> int:  # noqa: D401
         logging.error("ERROR – invalid GTFS feed:\n%s", err)
         return 1
 
-    if not STOPS_TO_DELETE:
+    if not (STOPS_TO_DELETE or STOPS_TO_DELETE_BY_ROUTE):
         _run_pipeline(dfs, out_dir)
         logging.info("All done! Outputs in: %s", out_dir)
         logging.info("Script completed successfully.")
         return 0
 
-    deleted_ids = _resolve_stops_to_delete(dfs["stops"], STOPS_TO_DELETE)
-    if not deleted_ids:
-        logging.error("STOPS_TO_DELETE is set but matched no stops – nothing to simulate.")
+    global_ids, by_route_ids = _build_deletion_plan(
+        dfs["stops"],
+        dfs["routes"],
+        STOPS_TO_DELETE,
+        STOPS_TO_DELETE_BY_ROUTE,
+    )
+    if not (global_ids or by_route_ids):
+        logging.error(
+            "A stop-deletion scenario is configured but no entry matched the feed – "
+            "nothing to simulate."
+        )
         return 1
 
     baseline_dir = _ensure_output_folder(out_dir / BASELINE_SUBFOLDER)
@@ -1422,14 +1604,16 @@ def main() -> int:  # noqa: D401
     logging.info("=== Baseline run (original feed) → %s ===", baseline_dir)
     baseline = _run_pipeline(dfs, baseline_dir, label="baseline")
 
-    logging.info("=== Scenario run (%d stop(s) removed) → %s ===", len(deleted_ids), scenario_dir)
-    scenario_dfs = _drop_stops_from_feed(dfs, deleted_ids)
+    n_unique = len(global_ids.union(*by_route_ids.values()) if by_route_ids else global_ids)
+    logging.info("=== Scenario run (%d stop(s) removed) → %s ===", n_unique, scenario_dir)
+    scenario_dfs = _drop_stops_from_feed(dfs, global_ids, by_route_ids)
     _run_pipeline(scenario_dfs, scenario_dir, label="stops removed")
 
     logging.info("STEP 8  Stop-deletion impact report …")
     _report_stop_deletion_impact(
         baseline,
-        deleted_ids,
+        global_ids,
+        by_route_ids,
         LONG_SPACING_FT,
         out_dir / DELETION_IMPACT_CSV_FILE,
     )
