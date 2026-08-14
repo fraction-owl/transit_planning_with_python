@@ -1026,6 +1026,10 @@ def _resolve_stops_to_delete(
     stop_id; the first field that matches wins. A stop_code shared by several
     stops resolves to all of them.
 
+    Unmatched entries are logged as warnings; when nothing matches at all, an
+    error-level hint shows sample identifiers from this feed so the user can
+    spot format mismatches (missing stop_code column, leading zeros, etc.).
+
     Args:
         stops_df: stops.txt DataFrame.
         identifiers: Raw stop_id / stop_code values from STOPS_TO_DELETE.
@@ -1069,6 +1073,25 @@ def _resolve_stops_to_delete(
             "Unmatched identifiers (neither stop_code nor stop_id): %s",
             ", ".join(unmatched[:20]) + ("…" if len(unmatched) > 20 else ""),
         )
+    if unmatched and not resolved:
+        sid_examples = ", ".join(sid_series.head(3))
+        if id_by_stop_code:
+            code_examples = ", ".join(stops_df["stop_code"].astype(str).head(3))
+            logging.error(
+                "None of the STOPS_TO_DELETE entries matched this feed, though both "
+                "fields were checked. Compare your entries against the feed's values – "
+                "stop_ids look like [%s] and stop_codes like [%s]. Watch for quoting, "
+                "prefixes, or leading zeros lost to numeric parsing.",
+                sid_examples,
+                code_examples,
+            )
+        else:
+            logging.error(
+                "None of the STOPS_TO_DELETE entries matched this feed, and its "
+                "stops.txt has no stop_code column, so entries can only match "
+                "stop_id. This feed's stop_ids look like [%s].",
+                sid_examples,
+            )
     return resolved
 
 
