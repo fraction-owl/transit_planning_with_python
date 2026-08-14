@@ -13,6 +13,9 @@ no project on sys.path):
       GTFS-derived bundle keys.
     - ``extract_config_block``: the run-log helper whose canonical version lives
       in ``utils/run_log.py``.
+    - The stop-deletion scenario helpers shared by the two stop-spacing
+      flaggers (gpd + arcpy): pure-pandas logic that must stay in lockstep so
+      both flaggers simulate identical deletion scenarios.
 
 The key-normalization copies are compared by AST (no imports, so the
 arcpy-dependent scripts are checked too); the run-log copies are checked
@@ -113,6 +116,38 @@ def test_canonical_key_agrees_with_normalise_route(value: object) -> None:
     assert canonical == nab.normalise_route(value), (
         f"_canonical_key({value!r}) = {canonical!r} but normalise_route gives "
         f"{nab.normalise_route(value)!r}; anchor and bundle keys will not join."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Stop-deletion scenario helpers: the two spacing flaggers carry verbatim
+# copies so each stays self-contained (the arcpy script can't import the gpd
+# module's geopandas stack and vice versa). Compared by AST so the
+# arcpy-dependent copy is checked without importing arcpy.
+# ---------------------------------------------------------------------------
+
+STOP_DELETION_HELPER_FILES = [
+    "scripts/stop_analysis/stop_spacing_flagger_gpd.py",
+    "scripts/stop_analysis/stop_spacing_flagger_arcpy.py",
+]
+
+STOP_DELETION_HELPERS = [
+    "_resolve_stops_to_delete",
+    "_build_deletion_plan",
+    "_drop_stops_from_feed",
+    "_deletion_impact_rows_for_route",
+    "_log_unserved_deletions",
+]
+
+
+@pytest.mark.parametrize("name", STOP_DELETION_HELPERS)
+def test_stop_deletion_helper_copies_are_identical(name: str) -> None:
+    reference = _function_fingerprint(REPO_ROOT / STOP_DELETION_HELPER_FILES[0], name)
+    assert _function_fingerprint(REPO_ROOT / STOP_DELETION_HELPER_FILES[1], name) == reference, (
+        f"{name} in {STOP_DELETION_HELPER_FILES[1]} has drifted from "
+        f"{STOP_DELETION_HELPER_FILES[0]}. The stop-deletion scenario helpers are "
+        "maintained as verbatim copies in both spacing flaggers; apply the same "
+        "change to both."
     )
 
 
