@@ -1,24 +1,29 @@
 """Assess stop-level service impacts of cutting bus routes, trips, or stops, by scenario.
 
-Every service cut — eliminating whole routes, dropping individual trips (by id or by
-route/direction/departure window), or removing stops from a route (truncation) — reduces
-to removing rows from ``stop_times``. This script exploits that: each configured scenario
-is resolved to a removal mask over the baseline feed's stop events, and every impact
-metric is a before/after comparison of products derived from the surviving rows. Scenarios
-are evaluated independently against the same baseline, so alternatives (drop route 101
-*or* drop 202 and 303) can be compared in one run.
+ArcPy port of ``service_cut_impact_gpd.py`` for environments running ArcGIS
+Pro's bundled Python (arcpy + pandas + numpy, no geopandas/shapely). Every
+service cut — eliminating whole routes, dropping individual trips (by id or by
+route/direction/departure window), or removing stops from a route (truncation) —
+reduces to removing rows from ``stop_times``. This script exploits that: each
+configured scenario is resolved to a removal mask over the baseline feed's stop
+events, and every impact metric is a before/after comparison of products derived
+from the surviving rows. Scenarios are evaluated independently against the same
+baseline, so alternatives (drop route 101 *or* drop 202 and 303) can be compared
+in one run.
 
-Metrics are computed for a single representative service day (default: weekday), chosen
-from the feed's real calendar the same way ``headway_span_exporter.py`` does, so holiday
-and weekend services cannot leak into weekday counts. Coverage uses straight-line stop
-buffers — no pedestrian network — and optional demographic and trip-level ridership
-inputs upgrade the impact accounting from areas to people.
+Metrics are computed for a single representative service day (default: weekday),
+chosen from the feed's real calendar the same way ``headway_span_exporter.py``
+does, so holiday and weekend services cannot leak into weekday counts. Coverage
+uses straight-line stop buffers — no pedestrian network — and optional
+demographic and trip-level ridership inputs upgrade the impact accounting from
+areas to people.
 
 Inputs:
     - A GTFS feed (folder or .zip): stops, routes, trips, stop_times, plus calendar /
       calendar_dates and shapes when present.
-    - Optional demographics polygon layer (any geopandas-readable format) with numeric
-      fields to apportion over lost coverage.
+    - Optional demographics polygon layer (any feature class arcpy can read —
+      shapefile, file geodatabase, ...) with numeric fields to apportion over
+      lost coverage.
     - Optional trip-level ridership CSV of average daily boardings by ``trip_id`` (and
       optionally ``stop_id``), from APC/ridecheck processing. Exports carrying no
       GTFS trip_id match on route + start time (``RIDERSHIP_TRIP_MATCH_MODE``), and
@@ -57,9 +62,14 @@ Limitations:
     (replacement direction match, added wait) and a Title VI equity screen are future
     work.
 
+Requires:
+    ArcGIS Pro (arcpy) plus pandas and numpy, all bundled with Pro. Outputs land
+    in a filesystem folder (shapefiles + CSVs), not a geodatabase.
+
 Typical usage:
     Update the paths and SCENARIOS in the CONFIGURATION section (or pass the matching
-    CLI flags) and run from a shell or a Jupyter notebook.
+    CLI flags) and run from a shell, ArcGIS Pro's Python window, or a Jupyter notebook
+    using ArcGIS Pro's bundled Python.
 """
 
 from __future__ import annotations
@@ -71,14 +81,12 @@ import os
 import re
 import sys
 import zipfile
-from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, List, Literal, NamedTuple, Optional
+from typing import Any, Dict, List, Literal, Mapping, NamedTuple, Optional, Sequence, Set, Tuple
 
-import geopandas as gpd
+import arcpy
+import numpy as np
 import pandas as pd
-from shapely.geometry import LineString, Polygon
-from shapely.geometry.base import BaseGeometry
 
 # Sentinel markers used by extract_config_block / write_run_log to identify the
 # configuration block within this file's source. Each string must appear exactly
@@ -136,10 +144,11 @@ TIME_BIN_MINUTES: int = 60
 # Walk-access buffer radius around stops for the coverage comparison.
 STOP_BUFFER_MILES: float = 0.25
 
-# Projected CRS used for buffering, distances, and areas (DC-area default), and
-# the linear unit of that CRS: "feet" or "meters".
-CRS_EPSG_CODE: int = 2248
-CRS_UNITS: str = "feet"
+# Projected spatial reference (WKID) used for buffering, distances, and areas.
+# 2248 = NAD83 / Maryland State Plane (US feet), the DC-area default. Any
+# projected WKID works — its linear unit is read from the spatial reference, so
+# no unit constant has to be kept in sync by hand.
+PROJECTED_CRS_WKID: int = 2248
 
 # Keep only platform stops (location_type 0 or blank) in stop-level outputs.
 FILTER_TO_PLATFORM_STOPS: bool = True
@@ -227,8 +236,22 @@ _SCENARIO_KEYS: frozenset[str] = frozenset(
     {"name", "description", "routes", "trip_ids", "trip_windows", "stops", "route_stops"}
 )
 
+# Stops buffered per arcpy Multipoint before the chunk buffers are unioned. One
+# huge multipoint is slower to buffer than a handful of moderate ones, and the
+# chunk unions keep peak geometry size bounded on large feeds.
+_BUFFER_CHUNK_STOPS: int = 500
+
+# Rows compared per numpy distance block. Distance work is done as chunked
+# broadcasting rather than a spatial index so the script needs nothing beyond
+# the numpy that ships with ArcGIS Pro.
+_DISTANCE_CHUNK: int = 256
+
+# Longest string a shapefile text field can hold (dBASE limit).
+_SHP_TEXT_MAX: int = 254
+
 # Excel workbook suffixes accepted for the optional ridership tables. Legacy
-# .xls is read with xlrd, the .xlsx family with openpyxl.
+# .xls is read with xlrd, the .xlsx family with openpyxl — both ship with
+# ArcGIS Pro.
 _EXCEL_SUFFIXES: tuple[str, ...] = (".xls", ".xlsx", ".xlsm", ".xltx", ".xltm")
 
 # Share of a ridership table's trips that must match the analysis day before
@@ -854,6 +877,28 @@ def extract_config_block(source_file: Path) -> str:
 # =============================================================================
 
 
+class Config(NamedTuple):
+    """Runtime configuration for a service-cut impact run."""
+
+    gtfs_dir: str
+    output_dir: Path
+    scenarios: "Sequence[Mapping[str, Any]] | str" = SCENARIOS
+    service_day: str = SERVICE_DAY
+    service_date: str = SERVICE_DATE
+    time_bin_minutes: int = TIME_BIN_MINUTES
+    stop_buffer_miles: float = STOP_BUFFER_MILES
+    crs_wkid: int = PROJECTED_CRS_WKID
+    filter_platform_stops: bool = FILTER_TO_PLATFORM_STOPS
+    export_map_layers: bool = EXPORT_MAP_LAYERS
+    export_scenario_gtfs: bool = EXPORT_SCENARIO_GTFS
+    demographics_path: str = DEMOGRAPHICS_PATH
+    demographic_fields: Sequence[str] = tuple(DEMOGRAPHIC_FIELDS)
+    ridership_csv: str = RIDERSHIP_CSV
+    stop_ridership_csv: str = STOP_RIDERSHIP_CSV
+    ridership_stop_field: str = RIDERSHIP_STOP_MATCH_FIELD
+    ridership_trip_mode: str = RIDERSHIP_TRIP_MATCH_MODE
+
+
 class RidershipSpec(NamedTuple):
     """Column names and join strategy for the trip-level ridership file.
 
@@ -879,27 +924,28 @@ class RidershipSpec(NamedTuple):
     date_col: str = RIDERSHIP_DATE_COL
 
 
-class Config(NamedTuple):
-    """Runtime configuration for a service-cut impact run."""
+class Baseline(NamedTuple):
+    """Baseline products every scenario is compared against.
 
-    gtfs_dir: str
-    output_dir: Path
-    scenarios: "Sequence[Mapping[str, Any]] | str" = SCENARIOS
-    service_day: str = SERVICE_DAY
-    service_date: str = SERVICE_DATE
-    time_bin_minutes: int = TIME_BIN_MINUTES
-    stop_buffer_miles: float = STOP_BUFFER_MILES
-    crs_epsg: int = CRS_EPSG_CODE
-    crs_units: str = CRS_UNITS
-    filter_platform_stops: bool = FILTER_TO_PLATFORM_STOPS
-    export_map_layers: bool = EXPORT_MAP_LAYERS
-    export_scenario_gtfs: bool = EXPORT_SCENARIO_GTFS
-    demographics_path: str = DEMOGRAPHICS_PATH
-    demographic_fields: Sequence[str] = tuple(DEMOGRAPHIC_FIELDS)
-    ridership_csv: str = RIDERSHIP_CSV
-    stop_ridership_csv: str = STOP_RIDERSHIP_CSV
-    ridership_stop_field: str = RIDERSHIP_STOP_MATCH_FIELD
-    ridership_trip_mode: str = RIDERSHIP_TRIP_MATCH_MODE
+    The baseline is identical for every scenario, so it is built once per run
+    instead of once per scenario — the arcpy buffer union in particular is far
+    too slow to repeat for each of the hundreds of scenarios screening mode
+    generates.
+
+    Attributes:
+        events: The baseline stop-event table (:func:`build_events`).
+        stats: Per-stop service statistics (:func:`summarize_stops`).
+        bins: Per-stop × time-bin trip counts (:func:`bin_counts`).
+        coverage: Walk-buffer union of every stop with baseline service
+            (``None`` when no stop has usable coordinates).
+        coverage_sqmi: Area of *coverage* in square miles.
+    """
+
+    events: pd.DataFrame
+    stats: pd.DataFrame
+    bins: pd.DataFrame
+    coverage: Optional[Any]
+    coverage_sqmi: float
 
 
 # =============================================================================
@@ -907,20 +953,45 @@ class Config(NamedTuple):
 # =============================================================================
 
 
-def _miles_to_crs_units(miles: float, crs_units: str) -> float:
-    """Convert miles to the projected CRS's linear unit ("feet" or "meters")."""
-    unit = crs_units.strip().lower()
-    if unit == "feet":
-        return miles * 5280.0
-    if unit == "meters":
-        return miles * 1609.344
-    raise ValueError(f"CRS_UNITS must be 'feet' or 'meters'; got {crs_units!r}.")
+def _spatial_reference(wkid: int) -> Any:
+    """Return the projected spatial reference for *wkid*.
+
+    Raises:
+        ValueError: If the WKID is unknown to arcpy or is not projected —
+            buffering, lengths, and areas are meaningless in degrees.
+    """
+    unknown = f"PROJECTED_CRS_WKID {wkid!r} is not a spatial reference arcpy knows."
+    try:
+        sr = arcpy.SpatialReference(int(wkid))
+    except (RuntimeError, TypeError, ValueError) as exc:
+        raise ValueError(unknown) from exc
+    if not sr.name or sr.name == "Unknown":
+        raise ValueError(unknown)
+    if sr.type != "Projected":
+        raise ValueError(
+            f"PROJECTED_CRS_WKID must reference a projected spatial reference; "
+            f"got {sr.name!r} ({sr.type})."
+        )
+    return sr
 
 
-def _area_to_sqmi(area: float, crs_units: str) -> float:
-    """Convert an area in squared CRS units to square miles."""
-    per_mile = _miles_to_crs_units(1.0, crs_units)
-    return area / (per_mile * per_mile)
+def _miles_to_sr_units(miles: float, sr: Any) -> float:
+    """Convert miles to the linear unit of the projected spatial reference."""
+    meters_per_unit = float(sr.metersPerUnit or 1.0)
+    return miles * 1609.344 / meters_per_unit
+
+
+def _sr_units_to_miles(value: float, sr: Any) -> float:
+    """Convert a length in spatial-reference units to miles."""
+    meters = float(value) * float(sr.metersPerUnit or 1.0)
+    miles = convert_distance(meters, input_unit="meters", output_unit="miles")
+    return float("nan") if miles is None else miles
+
+
+def _area_to_sqmi(area: float, sr: Any) -> float:
+    """Convert an area in squared spatial-reference units to square miles."""
+    per_mile = _miles_to_sr_units(1.0, sr)
+    return float(area) / (per_mile * per_mile)
 
 
 def _sanitize_name(name: str) -> str:
@@ -941,6 +1012,188 @@ def _as_sorted_csv(values: Sequence[str]) -> str:
     """Join unique, non-blank values into one sorted comma-separated string."""
     uniq = sorted({str(v).strip() for v in values if str(v).strip()})
     return ",".join(uniq)
+
+
+def _shp_text(value: Any) -> str:
+    """Trim a value to what a shapefile text field can hold."""
+    text = "" if value is None else str(value)
+    if len(text) > _SHP_TEXT_MAX:
+        return text[:_SHP_TEXT_MAX]
+    return text
+
+
+# =============================================================================
+# GEOMETRY HELPERS (arcpy)
+# =============================================================================
+
+
+def _is_empty(geometry: Optional[Any]) -> bool:
+    """Return True when *geometry* is absent or encloses no area."""
+    return geometry is None or float(geometry.area) <= 0.0
+
+
+def _project_lonlat(
+    lons: Sequence[float], lats: Sequence[float], sr: Any
+) -> Tuple[List[float], List[float]]:
+    """Project WGS84 coordinate pairs into *sr*.
+
+    Args:
+        lons: Longitudes in decimal degrees.
+        lats: Latitudes in decimal degrees.
+        sr: Target projected spatial reference.
+
+    Returns:
+        Tuple of (x values, y values) in *sr* units, aligned to the inputs.
+    """
+    wgs84 = arcpy.SpatialReference(4326)
+    xs: List[float] = []
+    ys: List[float] = []
+    for lon, lat in zip(lons, lats):
+        point = arcpy.PointGeometry(arcpy.Point(float(lon), float(lat)), wgs84).projectAs(sr)
+        xs.append(float(point.firstPoint.X))
+        ys.append(float(point.firstPoint.Y))
+    return xs, ys
+
+
+def _xy_array(points: pd.DataFrame) -> np.ndarray:
+    """Return an (n, 2) float array of the projected ``x``/``y`` columns."""
+    if points.empty:
+        return np.empty((0, 2), dtype=float)
+    return points[["x", "y"]].to_numpy(dtype=float)
+
+
+def _nearest_neighbors(
+    source_xy: np.ndarray, target_xy: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Find each source point's nearest target point by planar distance.
+
+    Chunked numpy broadcasting stands in for a spatial index so nothing beyond
+    ArcGIS Pro's bundled numpy is required; distances match the planar nearest
+    join the GeoPandas twin performs.
+
+    Args:
+        source_xy: (n, 2) array of projected query coordinates.
+        target_xy: (m, 2) array of projected candidate coordinates.
+
+    Returns:
+        Tuple of (index into *target_xy* of each source point's nearest
+        neighbour, distance to it in spatial-reference units). Both arrays are
+        empty when either input is.
+    """
+    n = len(source_xy)
+    if n == 0 or len(target_xy) == 0:
+        return np.empty(0, dtype=int), np.empty(0, dtype=float)
+    idx = np.zeros(n, dtype=int)
+    dist = np.zeros(n, dtype=float)
+    for start in range(0, n, _DISTANCE_CHUNK):
+        block = source_xy[start : start + _DISTANCE_CHUNK]
+        dx = block[:, 0][:, None] - target_xy[:, 0][None, :]
+        dy = block[:, 1][:, None] - target_xy[:, 1][None, :]
+        squared = dx * dx + dy * dy
+        nearest = squared.argmin(axis=1)
+        idx[start : start + len(block)] = nearest
+        dist[start : start + len(block)] = np.sqrt(squared[np.arange(len(block)), nearest])
+    return idx, dist
+
+
+def _within_radius_mask(target_xy: np.ndarray, source_xy: np.ndarray, radius: float) -> np.ndarray:
+    """Flag the target points lying within *radius* of any source point.
+
+    Args:
+        target_xy: (m, 2) array of projected coordinates to test.
+        source_xy: (n, 2) array of projected reference coordinates.
+        radius: Distance threshold in spatial-reference units.
+
+    Returns:
+        Boolean array of length ``len(target_xy)``.
+    """
+    mask = np.zeros(len(target_xy), dtype=bool)
+    if len(target_xy) == 0 or len(source_xy) == 0:
+        return mask
+    limit = float(radius) ** 2
+    for start in range(0, len(source_xy), _DISTANCE_CHUNK):
+        block = source_xy[start : start + _DISTANCE_CHUNK]
+        dx = target_xy[:, 0][:, None] - block[:, 0][None, :]
+        dy = target_xy[:, 1][:, None] - block[:, 1][None, :]
+        mask |= ((dx * dx + dy * dy) <= limit).any(axis=1)
+    return mask
+
+
+def buffer_union(points: pd.DataFrame, radius: float, sr: Any) -> Optional[Any]:
+    """Buffer projected points by *radius* and dissolve the result.
+
+    Points are buffered in chunks and the chunk polygons unioned, which keeps
+    each intermediate geometry small enough for arcpy to handle comfortably on
+    agency-sized feeds.
+
+    Args:
+        points: Table carrying projected ``x``/``y`` columns.
+        radius: Buffer radius in spatial-reference units.
+        sr: Projected spatial reference of the coordinates.
+
+    Returns:
+        The dissolved buffer polygon, or ``None`` when *points* is empty.
+    """
+    if points.empty:
+        return None
+    coords = _xy_array(points)
+    union: Optional[Any] = None
+    for start in range(0, len(coords), _BUFFER_CHUNK_STOPS):
+        block = coords[start : start + _BUFFER_CHUNK_STOPS]
+        multipoint = arcpy.Multipoint(
+            arcpy.Array([arcpy.Point(float(x), float(y)) for x, y in block]), sr
+        )
+        chunk_buffer = multipoint.buffer(radius)
+        union = chunk_buffer if union is None else union.union(chunk_buffer)
+    return union
+
+
+def _extents_overlap(a: Any, b: Any) -> bool:
+    """Return True when two arcpy extents intersect (a cheap prefilter)."""
+    return not (a.XMax < b.XMin or a.XMin > b.XMax or a.YMax < b.YMin or a.YMin > b.YMax)
+
+
+def write_feature_shapefile(
+    output_dir: Path,
+    filename: str,
+    geometry_type: str,
+    sr: Any,
+    fields: Sequence[Tuple[str, str, int]],
+    rows: Sequence[Sequence[Any]],
+) -> Path:
+    """Create a shapefile and insert *rows* into it, replacing any existing file.
+
+    Args:
+        output_dir: Folder the shapefile and its sidecar files are written to.
+        filename: Shapefile name including the ``.shp`` extension.
+        geometry_type: arcpy geometry type, e.g. ``"POLYGON"``/``"POLYLINE"``.
+        sr: Spatial reference of the geometries.
+        fields: Field definitions as ``(name, arcpy field type, text length)``;
+            the length is ignored for non-text fields. Shapefile field names
+            are capped at 10 characters by the dBASE format.
+        rows: One sequence per feature: the field values in *fields* order,
+            followed by the geometry.
+
+    Returns:
+        Path of the shapefile written.
+    """
+    out_path = output_dir / filename
+    if arcpy.Exists(str(out_path)):
+        arcpy.management.Delete(str(out_path))
+    arcpy.management.CreateFeatureclass(
+        str(output_dir), filename, geometry_type, spatial_reference=sr
+    )
+    for name, field_type, length in fields:
+        if field_type == "TEXT":
+            arcpy.management.AddField(str(out_path), name, field_type, field_length=length)
+        else:
+            arcpy.management.AddField(str(out_path), name, field_type)
+
+    cursor_fields = [name for name, _, _ in fields] + ["SHAPE@"]
+    with arcpy.da.InsertCursor(str(out_path), cursor_fields) as cursor:
+        for row in rows:
+            cursor.insertRow(tuple(row))
+    return out_path
 
 
 # =============================================================================
@@ -1107,19 +1360,17 @@ def build_events(
     return events.reset_index(drop=True)
 
 
-def prepare_stops_gdf(
-    stops: pd.DataFrame, filter_platform_stops: bool, crs_epsg: int
-) -> gpd.GeoDataFrame:
-    """Project stops to the analysis CRS, keeping platform stops by default.
+def prepare_stops_table(stops: pd.DataFrame, filter_platform_stops: bool, sr: Any) -> pd.DataFrame:
+    """Project stops into the analysis spatial reference, keeping platforms by default.
 
     Args:
         stops: Parsed ``stops.txt``.
         filter_platform_stops: Keep only ``location_type`` 0/blank rows.
-        crs_epsg: EPSG code of the projected analysis CRS.
+        sr: Projected spatial reference of the analysis.
 
     Returns:
-        GeoDataFrame with ``stop_id``, ``stop_name``, ``stop_lat``, ``stop_lon``
-        and projected point geometry.
+        DataFrame with ``stop_id``, ``stop_name``, ``stop_lat``, ``stop_lon`` and
+        the projected ``x``/``y`` coordinates.
     """
     s = stops.drop_duplicates(subset=["stop_id"]).copy()
     s["stop_id"] = s["stop_id"].astype(str)
@@ -1134,12 +1385,13 @@ def prepare_stops_gdf(
     if bad:
         logging.warning("Dropped stop rows with unparseable coordinates (%d bad values).", bad)
     s = s[s["stop_lat"].notna() & s["stop_lon"].notna()].copy()
-    gdf = gpd.GeoDataFrame(
-        s[["stop_id", "stop_name", "stop_lat", "stop_lon"]],
-        geometry=gpd.points_from_xy(s["stop_lon"], s["stop_lat"]),
-        crs="EPSG:4326",
-    )
-    return gdf.to_crs(epsg=crs_epsg)
+
+    out = s[["stop_id", "stop_name", "stop_lat", "stop_lon"]].reset_index(drop=True)
+    xs, ys = _project_lonlat(out["stop_lon"].tolist(), out["stop_lat"].tolist(), sr)
+    out["x"] = xs
+    out["y"] = ys
+    logging.info("Projected %d stop(s) to %s.", len(out), sr.name)
+    return out
 
 
 # =============================================================================
@@ -1358,7 +1610,7 @@ def compute_stop_impacts(
     scen_stats: pd.DataFrame,
     base_bins: pd.DataFrame,
     scen_bins: pd.DataFrame,
-    stops_gdf: gpd.GeoDataFrame,
+    stops: pd.DataFrame,
 ) -> pd.DataFrame:
     """Compare baseline and scenario stop statistics and classify each stop.
 
@@ -1367,7 +1619,7 @@ def compute_stop_impacts(
         scen_stats: :func:`summarize_stops` of the surviving events.
         base_bins: :func:`bin_counts` of the baseline events.
         scen_bins: :func:`bin_counts` of the surviving events.
-        stops_gdf: Projected stops layer (for names and coordinates).
+        stops: Projected stops table (for names and coordinates).
 
     Returns:
         One row per stop with baseline service, sorted with eliminated stops
@@ -1398,7 +1650,7 @@ def compute_stop_impacts(
             merged[f"{col}_{side}"] = merged[f"{col}_min_{side}"].map(minutes_to_hhmm)
         merged = merged.drop(columns=[f"{col}_min_baseline", f"{col}_min_scenario"])
 
-    lookup = stops_gdf.drop(columns="geometry").set_index("stop_id")
+    lookup = stops[["stop_id", "stop_name", "stop_lat", "stop_lon"]].set_index("stop_id")
     merged = merged.join(lookup, how="left")
     merged["routes_scenario"] = merged["routes_scenario"].fillna("")
     order = pd.CategoricalDtype(["eliminated", "reduced", "unchanged"], ordered=True)
@@ -1406,15 +1658,13 @@ def compute_stop_impacts(
     return merged.sort_values(["classification", "trips_delta", "stop_id"]).reset_index()
 
 
-def add_nearest_remaining(
-    impacts: pd.DataFrame, stops_gdf: gpd.GeoDataFrame, crs_units: str
-) -> pd.DataFrame:
+def add_nearest_remaining(impacts: pd.DataFrame, stops: pd.DataFrame, sr: Any) -> pd.DataFrame:
     """Attach each eliminated stop's nearest stop that keeps service.
 
     Args:
         impacts: Output of :func:`compute_stop_impacts`.
-        stops_gdf: Projected stops layer.
-        crs_units: Linear unit of the projected CRS.
+        stops: Projected stops table.
+        sr: Projected spatial reference (for the distance conversion).
 
     Returns:
         *impacts* with ``nearest_remaining_stop_id`` and
@@ -1424,77 +1674,158 @@ def add_nearest_remaining(
     impacts["nearest_remaining_stop_id"] = ""
     impacts["nearest_remaining_stop_miles"] = float("nan")
 
-    eliminated_ids = impacts.loc[impacts["classification"] == "eliminated", "stop_id"]
-    remaining_ids = impacts.loc[impacts["classification"] != "eliminated", "stop_id"]
-    eliminated = stops_gdf[stops_gdf["stop_id"].isin(set(eliminated_ids))]
-    remaining = stops_gdf[stops_gdf["stop_id"].isin(set(remaining_ids))]
+    eliminated_ids = set(impacts.loc[impacts["classification"] == "eliminated", "stop_id"])
+    remaining_ids = set(impacts.loc[impacts["classification"] != "eliminated", "stop_id"])
+    eliminated = stops[stops["stop_id"].isin(eliminated_ids)].reset_index(drop=True)
+    remaining = stops[stops["stop_id"].isin(remaining_ids)].reset_index(drop=True)
     if eliminated.empty or remaining.empty:
         return impacts
 
-    joined = gpd.sjoin_nearest(
-        eliminated[["stop_id", "geometry"]],
-        remaining[["stop_id", "geometry"]].rename(columns={"stop_id": "near_stop_id"}),
-        how="left",
-        distance_col="_dist",
-    ).drop_duplicates(subset=["stop_id"])
-    near = joined.set_index("stop_id")
-    idx = impacts["stop_id"].map(near["near_stop_id"])
-    dist = (
-        impacts["stop_id"]
-        .map(near["_dist"])
-        .map(lambda v: convert_distance(v, input_unit=crs_units, output_unit="miles"))
+    idx, dist = _nearest_neighbors(_xy_array(eliminated), _xy_array(remaining))
+    near_id = pd.Series(
+        remaining["stop_id"].to_numpy()[idx], index=eliminated["stop_id"].to_numpy()
     )
+    near_miles = pd.Series(
+        [_sr_units_to_miles(d, sr) for d in dist], index=eliminated["stop_id"].to_numpy()
+    )
+
     is_elim = impacts["classification"] == "eliminated"
-    impacts.loc[is_elim, "nearest_remaining_stop_id"] = idx[is_elim].fillna("")
+    impacts.loc[is_elim, "nearest_remaining_stop_id"] = (
+        impacts.loc[is_elim, "stop_id"].map(near_id).fillna("")
+    )
     impacts.loc[is_elim, "nearest_remaining_stop_miles"] = pd.to_numeric(
-        dist[is_elim], errors="coerce"
+        impacts.loc[is_elim, "stop_id"].map(near_miles), errors="coerce"
     ).round(3)
     return impacts
 
 
 def coverage_stats(
-    base_stop_ids: set[str],
-    scen_stop_ids: set[str],
-    stops_gdf: gpd.GeoDataFrame,
+    base_stop_ids: Set[str],
+    scen_stop_ids: Set[str],
+    stops: pd.DataFrame,
     buffer_miles: float,
-    crs_units: str,
-) -> tuple[float, float, BaseGeometry, BaseGeometry]:
+    sr: Any,
+    base_union: Optional[Any],
+    base_sqmi: float,
+    include_remaining: bool = True,
+) -> Tuple[float, float, Optional[Any], Optional[Any]]:
     """Compare walk-buffer coverage of served stops before and after the cut.
+
+    The scenario's buffer union is a subset of the baseline's, so the lost area
+    is computed from the eliminated stops alone: only surviving stops within two
+    buffer radii of an eliminated stop can cover any of its buffer, and the
+    remaining coverage is the baseline minus what was lost. That is identical to
+    the twin's ``baseline.difference(scenario)`` while buffering a handful of
+    stops per scenario instead of the whole network.
 
     Args:
         base_stop_ids: Stops with baseline service.
         scen_stop_ids: Stops with surviving service.
-        stops_gdf: Projected stops layer.
+        stops: Projected stops table.
         buffer_miles: Walk-access buffer radius in miles.
-        crs_units: Linear unit of the projected CRS.
+        sr: Projected spatial reference.
+        base_union: Precomputed baseline buffer union (see :class:`Baseline`).
+        base_sqmi: Area of *base_union* in square miles.
+        include_remaining: Compute the remaining-coverage polygon. Set False
+            when no map layer needs it (screening mode) to skip the overlay.
 
     Returns:
         Tuple of (baseline area sq mi, scenario area sq mi, lost-coverage
-        geometry, remaining-coverage geometry) — geometries in the projected
-        CRS, possibly empty.
+        geometry, remaining-coverage geometry) — geometries in the analysis
+        spatial reference, ``None`` when they enclose no area.
     """
-    radius = _miles_to_crs_units(buffer_miles, crs_units)
+    eliminated_ids = set(base_stop_ids) - set(scen_stop_ids)
+    eliminated = stops[stops["stop_id"].isin(eliminated_ids)]
+    if base_union is None or eliminated.empty:
+        return base_sqmi, base_sqmi, None, base_union if include_remaining else None
 
-    def _union(ids: set[str]) -> BaseGeometry:
-        subset = stops_gdf[stops_gdf["stop_id"].isin(ids)]
-        if subset.empty:
-            return Polygon()
-        return subset.geometry.buffer(radius).union_all()
+    radius = _miles_to_sr_units(buffer_miles, sr)
+    lost = buffer_union(eliminated, radius, sr)
+    if lost is None:
+        return base_sqmi, base_sqmi, None, base_union if include_remaining else None
 
-    base_union = _union(base_stop_ids)
-    scen_union = _union(scen_stop_ids)
-    lost = base_union.difference(scen_union)
-    return (
-        _area_to_sqmi(base_union.area, crs_units),
-        _area_to_sqmi(scen_union.area, crs_units),
-        lost,
-        scen_union,
+    surviving = stops[stops["stop_id"].isin(set(scen_stop_ids))]
+    nearby = surviving[
+        _within_radius_mask(_xy_array(surviving), _xy_array(eliminated), 2.0 * radius)
+    ]
+    nearby_union = buffer_union(nearby, radius, sr)
+    if nearby_union is not None:
+        lost = lost.difference(nearby_union)
+
+    if _is_empty(lost):
+        return base_sqmi, base_sqmi, None, base_union if include_remaining else None
+
+    lost_sqmi = _area_to_sqmi(lost.area, sr)
+    remaining = base_union.difference(lost) if include_remaining else None
+    return base_sqmi, base_sqmi - lost_sqmi, lost, remaining
+
+
+def load_demographics(path: str, fields: Sequence[str], sr: Any) -> List[Dict[str, Any]]:
+    """Read the demographics polygons, projected into the analysis reference.
+
+    Args:
+        path: Feature class or shapefile path (any layer arcpy can read).
+        fields: Numeric field names to carry through for apportionment.
+        sr: Projected spatial reference the geometries are projected into.
+
+    Returns:
+        One record per polygon with its ``geometry``, ``extent``, projected
+        ``area``, and the requested field ``values``.
+
+    Raises:
+        FileNotFoundError: If *path* does not exist.
+        ValueError: If arcpy cannot read the layer's fields or rows — most often
+            a shapefile whose .dbf declares the wrong codepage.
+    """
+    if not arcpy.Exists(path):
+        raise FileNotFoundError(f"Demographics layer not found: {path}")
+
+    logging.info("Reading demographics layer: %s", path)
+    try:
+        available = {f.name.lower(): f.name for f in arcpy.ListFields(path)}
+    except (RuntimeError, UnicodeDecodeError, arcpy.ExecuteError) as exc:
+        raise ValueError(f"Could not list the fields of demographics layer {path}: {exc}") from exc
+    resolved: List[Tuple[str, str]] = []
+    for name in fields:
+        actual = available.get(str(name).strip().lower())
+        if actual is None:
+            logging.warning("Demographic field %r not found in the demographics layer.", name)
+        else:
+            resolved.append((str(name), actual))
+
+    cursor_fields = ["SHAPE@"] + [actual for _, actual in resolved]
+    records: List[Dict[str, Any]] = []
+    try:
+        with arcpy.da.SearchCursor(path, cursor_fields, spatial_reference=sr) as cursor:
+            for row in cursor:
+                geometry = row[0]
+                if geometry is None:
+                    continue
+                values: Dict[str, float] = {}
+                for offset, (name, _) in enumerate(resolved, start=1):
+                    number = pd.to_numeric(row[offset], errors="coerce")
+                    values[name] = 0.0 if pd.isna(number) else float(number)
+                records.append(
+                    {
+                        "geometry": geometry,
+                        "extent": geometry.extent,
+                        "area": float(geometry.area),
+                        "values": values,
+                    }
+                )
+    except (RuntimeError, UnicodeDecodeError, arcpy.ExecuteError) as exc:
+        raise ValueError(f"Could not read demographics layer {path}: {exc}") from exc
+    logging.info(
+        "Demographics: %d polygon(s); fields: %s",
+        len(records),
+        ", ".join(name for name, _ in resolved) or "(none resolved)",
     )
+    return records
 
 
 def apportion_demographics(
-    lost_geom: BaseGeometry,
-    demographics: gpd.GeoDataFrame,
+    lost_geom: Optional[Any],
+    demographics: Sequence[Mapping[str, Any]],
     fields: Sequence[str],
 ) -> dict[str, float]:
     """Area-weight demographic fields onto the lost-coverage polygon.
@@ -1503,8 +1834,8 @@ def apportion_demographics(
     area-apportionment simplification.
 
     Args:
-        lost_geom: Lost-coverage geometry (projected CRS, may be empty).
-        demographics: Demographics polygons already projected to the same CRS.
+        lost_geom: Lost-coverage geometry (analysis CRS, may be ``None``).
+        demographics: Records from :func:`load_demographics`.
         fields: Numeric field names to apportion.
 
     Returns:
@@ -1512,21 +1843,27 @@ def apportion_demographics(
         geometry is empty).
     """
     out = {f"{name}_lost": 0.0 for name in fields}
-    if lost_geom.is_empty:
+    if _is_empty(lost_geom) or not demographics:
         return out
-    inter_area = demographics.geometry.intersection(lost_geom).area
-    poly_area = demographics.geometry.area
-    frac = (inter_area / poly_area.where(poly_area > 0)).fillna(0.0)
-    for name in fields:
-        if name not in demographics.columns:
-            logging.warning("Demographic field %r not found in the demographics layer.", name)
+
+    lost_extent = lost_geom.extent
+    for record in demographics:
+        if record["area"] <= 0 or not _extents_overlap(record["extent"], lost_extent):
             continue
-        values = pd.to_numeric(demographics[name], errors="coerce").fillna(0.0)
-        out[f"{name}_lost"] = float((values * frac).sum())
+        clipped = record["geometry"].intersect(lost_geom, 4)  # 4 = polygon dimension
+        if clipped is None:
+            continue
+        frac = float(clipped.area) / record["area"]
+        if frac <= 0:
+            continue
+        for name in fields:
+            value = record["values"].get(name)
+            if value:
+                out[f"{name}_lost"] += value * frac
     return out
 
 
-def build_stop_id_lookup(stops: pd.DataFrame, match_field: str) -> Optional[dict[str, str]]:
+def build_stop_id_lookup(stops: pd.DataFrame, match_field: str) -> Optional[Dict[str, str]]:
     """Map the ridership files' stop values onto GTFS ``stop_id``.
 
     Vendor stop-usage exports normally carry the public-facing stop number,
@@ -1749,13 +2086,13 @@ def match_trips_by_route_and_time(
 
     first_dep = events.groupby("trip_id")["dep_min"].min()
     trip_route = events.drop_duplicates("trip_id").set_index("trip_id")["route_id"].astype(str)
-    by_route: dict[str, list[tuple[int, str]]] = {}
+    by_route: Dict[str, List[Tuple[int, str]]] = {}
     for trip_id, departure in first_dep.items():
         by_route.setdefault(trip_route.get(trip_id, ""), []).append((int(departure), str(trip_id)))
     for departures in by_route.values():
         departures.sort()
 
-    matched: list[str] = []
+    matched: List[str] = []
     unknown_routes: set[str] = set()
     unparsed_times = 0
     no_trip_in_window = 0
@@ -1876,7 +2213,7 @@ def _read_optional_table(path: Path, label: str) -> pd.DataFrame:
 
     Raises:
         ValueError: If the file is neither readable text nor a workbook the
-            installed Excel engines can open.
+            bundled Excel engines can open.
     """
     logging.info("%s: reading %s", label, path)
     with open(path, "rb") as handle:
@@ -1898,7 +2235,7 @@ def _read_optional_table(path: Path, label: str) -> pd.DataFrame:
         except ImportError as exc:
             raise ValueError(
                 f"{label} {path} is an Excel workbook, but the {excel_engine} engine is not "
-                f"installed. Install it, or re-save the file as a CSV and re-run."
+                f"available in this Python environment. Re-save it as a CSV and re-run."
             ) from exc
         for column in frame.columns:
             frame[column] = frame[column].map(_cell_to_text)
@@ -2358,20 +2695,20 @@ def export_scenario_gtfs(
     )
 
 
-def build_shape_lines(shapes: Optional[pd.DataFrame], crs_epsg: int) -> gpd.GeoDataFrame:
-    """Assemble one projected LineString per shape from ``shapes.txt``.
+def build_shape_lines(shapes: Optional[pd.DataFrame], sr: Any) -> Dict[str, Any]:
+    """Assemble one projected polyline per shape from ``shapes.txt``.
 
     Args:
         shapes: Parsed ``shapes.txt`` or ``None``.
-        crs_epsg: EPSG code of the projected analysis CRS.
+        sr: Projected spatial reference of the analysis.
 
     Returns:
-        GeoDataFrame with ``shape_id`` and line geometry (empty when shapes are
-        missing or no shape has two usable points).
+        Mapping of ``shape_id`` to its projected arcpy polyline (empty when
+        shapes are missing or no shape has two usable points).
     """
-    empty = gpd.GeoDataFrame({"shape_id": []}, geometry=[], crs=f"EPSG:{crs_epsg}")
+    lines: Dict[str, Any] = {}
     if shapes is None or shapes.empty:
-        return empty
+        return lines
     pts = shapes.copy()
     pts["shape_pt_sequence"] = pd.to_numeric(pts["shape_pt_sequence"], errors="coerce")
     pts["shape_pt_lat"] = pd.to_numeric(pts["shape_pt_lat"], errors="coerce")
@@ -2379,36 +2716,36 @@ def build_shape_lines(shapes: Optional[pd.DataFrame], crs_epsg: int) -> gpd.GeoD
     pts = pts.dropna(subset=["shape_pt_sequence", "shape_pt_lat", "shape_pt_lon"])
     pts = pts.sort_values(["shape_id", "shape_pt_sequence"])
 
-    ids: list[str] = []
-    lines: list[LineString] = []
+    wgs84 = arcpy.SpatialReference(4326)
     for shape_id, group in pts.groupby("shape_id"):
         if len(group) < 2:
             continue
-        ids.append(str(shape_id))
-        lines.append(LineString(zip(group["shape_pt_lon"], group["shape_pt_lat"])))
-    if not lines:
-        return empty
-    gdf = gpd.GeoDataFrame({"shape_id": ids}, geometry=lines, crs="EPSG:4326")
-    return gdf.to_crs(epsg=crs_epsg)
+        vertices = arcpy.Array(
+            [
+                arcpy.Point(float(lon), float(lat))
+                for lon, lat in zip(group["shape_pt_lon"], group["shape_pt_lat"])
+            ]
+        )
+        lines[str(shape_id)] = arcpy.Polyline(vertices, wgs84).projectAs(sr)
+    return lines
 
 
-def shape_length_miles(shape_lines: gpd.GeoDataFrame, crs_units: str) -> pd.Series:
+def shape_length_miles(shape_lines: Mapping[str, Any], sr: Any) -> pd.Series:
     """Measure each shape line's length in miles.
 
     Args:
         shape_lines: Output of :func:`build_shape_lines`.
-        crs_units: Linear unit of the projected CRS.
+        sr: Projected spatial reference of the lines.
 
     Returns:
         Series of miles indexed by ``shape_id`` (empty when no lines exist).
     """
-    if shape_lines.empty:
+    if not shape_lines:
         return pd.Series(dtype=float)
-    miles = shape_lines.geometry.length.map(
-        lambda v: convert_distance(v, input_unit=crs_units, output_unit="miles")
-    )
     return pd.Series(
-        pd.to_numeric(miles, errors="coerce").to_numpy(), index=shape_lines["shape_id"].tolist()
+        [_sr_units_to_miles(line.length, sr) for line in shape_lines.values()],
+        index=list(shape_lines),
+        dtype=float,
     )
 
 
@@ -2416,9 +2753,10 @@ def export_line_layers(
     events: pd.DataFrame,
     drop_mask: pd.Series,
     trips: pd.DataFrame,
-    shape_lines: gpd.GeoDataFrame,
+    shape_lines: Mapping[str, Any],
     output_dir: Path,
     token: str,
+    sr: Any,
 ) -> None:
     """Write the remaining- and removed-alignment line shapefiles for a scenario.
 
@@ -2434,11 +2772,12 @@ def export_line_layers(
         shape_lines: Output of :func:`build_shape_lines` (non-empty).
         output_dir: Destination folder.
         token: Sanitized scenario name used as the filename prefix.
+        sr: Projected spatial reference of the lines.
     """
     trip_info = events.drop_duplicates(subset=["trip_id"])[["trip_id", "route_label"]]
-    shape_map = trips.drop_duplicates(subset=["trip_id"])[["trip_id", "shape_id"]].copy()
-    if "shape_id" not in shape_map.columns:
+    if "shape_id" not in trips.columns:
         return
+    shape_map = trips.drop_duplicates(subset=["trip_id"])[["trip_id", "shape_id"]].copy()
     shape_map["trip_id"] = shape_map["trip_id"].astype(str)
     shape_map["shape_id"] = shape_map["shape_id"].fillna("").astype(str)
     usage = trip_info.merge(shape_map, on="trip_id", how="left")
@@ -2455,19 +2794,36 @@ def export_line_layers(
         trips_left=("surviving", "sum"),
     )
     per_shape["trips_left"] = per_shape["trips_left"].astype(int)
-    layer = shape_lines.merge(per_shape, on="shape_id", how="inner")
-    missing_geom = len(per_shape) - len(layer)
+    drawable = per_shape[per_shape.index.isin(shape_lines)]
+    missing_geom = len(per_shape) - len(drawable)
     if missing_geom:
         logging.warning("%d used shape(s) have no drawable geometry in shapes.txt.", missing_geom)
 
+    fields = (
+        ("shape_id", "TEXT", 100),
+        ("routes", "TEXT", _SHP_TEXT_MAX),
+        ("trips_base", "LONG", 0),
+        ("trips_left", "LONG", 0),
+    )
     for label, subset in (
-        ("remaining_lines", layer[layer["trips_left"] > 0]),
-        ("removed_lines", layer[layer["trips_left"] == 0]),
+        ("remaining_lines", drawable[drawable["trips_left"] > 0]),
+        ("removed_lines", drawable[drawable["trips_left"] == 0]),
     ):
         if subset.empty:
             continue
-        path = output_dir / f"{token}_{label}.shp"
-        subset.to_file(path)
+        rows = [
+            (
+                _shp_text(shape_id),
+                _shp_text(row.routes),
+                int(row.trips_base),
+                int(row.trips_left),
+                shape_lines[shape_id],
+            )
+            for shape_id, row in zip(subset.index, subset.itertuples(index=False))
+        ]
+        path = write_feature_shapefile(
+            output_dir, f"{token}_{label}.shp", "POLYLINE", sr, fields, rows
+        )
         logging.info("Wrote: %s (%d shape(s))", path, len(subset))
 
 
@@ -2540,39 +2896,77 @@ def operational_savings(
 # =============================================================================
 
 
+def build_baseline(events: pd.DataFrame, stops: pd.DataFrame, cfg: Config, sr: Any) -> Baseline:
+    """Compute the products every scenario is compared against, once per run.
+
+    Args:
+        events: Baseline event table.
+        stops: Projected stops table.
+        cfg: Resolved configuration.
+        sr: Projected spatial reference.
+
+    Returns:
+        The populated :class:`Baseline`.
+    """
+    stats = summarize_stops(events)
+    bins = bin_counts(events, cfg.time_bin_minutes)
+    served = stops[stops["stop_id"].isin(set(stats.index))]
+    missing_geom = len(set(stats.index)) - len(served)
+    if missing_geom > 0:
+        logging.warning(
+            "%d served stop(s) have no usable coordinates (or were filtered out) and "
+            "are excluded from the coverage comparison.",
+            missing_geom,
+        )
+    radius = _miles_to_sr_units(cfg.stop_buffer_miles, sr)
+    coverage = buffer_union(served, radius, sr)
+    coverage_sqmi = 0.0 if coverage is None else _area_to_sqmi(coverage.area, sr)
+    logging.info(
+        "Baseline walk-access coverage: %.2f sq mi from %d served stop(s) at %.2f mi.",
+        coverage_sqmi,
+        len(served),
+        cfg.stop_buffer_miles,
+    )
+    return Baseline(
+        events=events, stats=stats, bins=bins, coverage=coverage, coverage_sqmi=coverage_sqmi
+    )
+
+
 def run_scenario(
     scenario: Mapping[str, Any],
-    events: pd.DataFrame,
+    baseline: Baseline,
     routes: pd.DataFrame,
     trips: pd.DataFrame,
-    stops_gdf: gpd.GeoDataFrame,
-    shape_lines: gpd.GeoDataFrame,
+    stops: pd.DataFrame,
+    shape_lines: Mapping[str, Any],
     shape_miles: pd.Series,
-    demographics: Optional[gpd.GeoDataFrame],
+    demographics: Optional[Sequence[Mapping[str, Any]]],
     ridership: Optional[tuple[pd.DataFrame, pd.DataFrame]],
     stop_usage: Optional[pd.DataFrame],
     feed: Mapping[str, Optional[pd.DataFrame]],
     events_all: Optional[pd.DataFrame],
     cfg: Config,
+    sr: Any,
     write_details: bool = True,
 ) -> dict[str, Any]:
     """Evaluate one scenario end-to-end and write its per-scenario outputs.
 
     Args:
         scenario: One SCENARIOS entry.
-        events: Baseline event table.
+        baseline: Shared baseline products from :func:`build_baseline`.
         routes: Parsed ``routes.txt``.
         trips: Parsed ``trips.txt``.
-        stops_gdf: Projected stops layer.
+        stops: Projected stops table.
         shape_lines: Projected shape lines from :func:`build_shape_lines`.
         shape_miles: Shape lengths from :func:`shape_length_miles`.
-        demographics: Projected demographics polygons or ``None``.
+        demographics: Records from :func:`load_demographics` or ``None``.
         ridership: Output of :func:`load_ridership` or ``None``.
         stop_usage: Output of :func:`load_stop_ridership` or ``None``.
         feed: Loaded feed tables (for the scenario GTFS export).
         events_all: All-days event table for the GTFS export, or ``None`` when
             the export is disabled.
         cfg: Resolved configuration.
+        sr: Projected spatial reference.
         write_details: When False (screening mode), compute the summary row but
             skip every per-scenario file — impact/matrix CSVs, shapefiles, and
             the scenario GTFS export.
@@ -2586,20 +2980,19 @@ def run_scenario(
     token = _sanitize_name(name)
     logging.info("--- Scenario %r ---", name)
 
+    events = baseline.events
     drop_mask = resolve_drop_mask(scenario, events, routes)
     dropped = events[drop_mask]
     surviving = events[~drop_mask]
     if dropped.empty:
         logging.warning("Scenario %r removes nothing — check its route/trip/stop keys.", name)
 
-    base_stats = summarize_stops(events)
     scen_stats = summarize_stops(surviving)
-    base_bins = bin_counts(events, cfg.time_bin_minutes)
     scen_bins = bin_counts(surviving, cfg.time_bin_minutes)
 
-    impacts = compute_stop_impacts(base_stats, scen_stats, base_bins, scen_bins, stops_gdf)
+    impacts = compute_stop_impacts(baseline.stats, scen_stats, baseline.bins, scen_bins, stops)
     if write_details:
-        impacts = add_nearest_remaining(impacts, stops_gdf, cfg.crs_units)
+        impacts = add_nearest_remaining(impacts, stops, sr)
 
     eliminated_ids = set(impacts.loc[impacts["classification"] == "eliminated", "stop_id"])
     reduced_ids = set(impacts.loc[impacts["classification"] == "reduced", "stop_id"])
@@ -2607,11 +3000,14 @@ def run_scenario(
 
     ops = operational_savings(events, drop_mask, trips, shape_miles)
     base_sqmi, scen_sqmi, lost_geom, remaining_geom = coverage_stats(
-        set(base_stats.index),
+        set(baseline.stats.index),
         set(scen_stats.index),
-        stops_gdf,
+        stops,
         cfg.stop_buffer_miles,
-        cfg.crs_units,
+        sr,
+        baseline.coverage,
+        baseline.coverage_sqmi,
+        include_remaining=write_details and cfg.export_map_layers,
     )
     demo_lost: dict[str, float] = {}
     if demographics is not None:
@@ -2639,7 +3035,7 @@ def run_scenario(
         impacted.to_csv(impacts_path, index=False)
         logging.info("Wrote: %s (%d impacted stops)", impacts_path, len(impacted))
 
-        matrix = base_bins.merge(
+        matrix = baseline.bins.merge(
             scen_bins,
             on=["stop_id", "bin_start_min"],
             how="outer",
@@ -2650,7 +3046,7 @@ def run_scenario(
         )
         matrix["trips_delta"] = matrix["trips_scenario"] - matrix["trips_baseline"]
         matrix["bin_start"] = matrix["bin_start_min"].map(minutes_to_hhmm)
-        names = stops_gdf.set_index("stop_id")["stop_name"]
+        names = stops.set_index("stop_id")["stop_name"]
         matrix["stop_name"] = matrix["stop_id"].map(names).fillna("")
         matrix = matrix.sort_values(["stop_id", "bin_start_min"])
         matrix_path = cfg.output_dir / f"{token}_stop_time_bins.csv"
@@ -2659,25 +3055,31 @@ def run_scenario(
         ].to_csv(matrix_path, index=False)
         logging.info("Wrote: %s", matrix_path)
 
-    lost_sqmi = _area_to_sqmi(lost_geom.area, cfg.crs_units)
-    if write_details and not lost_geom.is_empty and lost_geom.area > 0:
-        lost_gdf = gpd.GeoDataFrame(
-            {"scenario": [name]}, geometry=[lost_geom], crs=f"EPSG:{cfg.crs_epsg}"
+    lost_sqmi = 0.0 if _is_empty(lost_geom) else _area_to_sqmi(lost_geom.area, sr)
+    if write_details and not _is_empty(lost_geom):
+        coverage_path = write_feature_shapefile(
+            cfg.output_dir,
+            f"{token}_lost_coverage.shp",
+            "POLYGON",
+            sr,
+            (("scenario", "TEXT", _SHP_TEXT_MAX),),
+            [(_shp_text(name), lost_geom)],
         )
-        coverage_path = cfg.output_dir / f"{token}_lost_coverage.shp"
-        lost_gdf.to_file(coverage_path)
         logging.info("Wrote: %s (%.2f sq mi lost)", coverage_path, lost_sqmi)
 
     if write_details and cfg.export_map_layers:
-        if not remaining_geom.is_empty and remaining_geom.area > 0:
-            remaining_gdf = gpd.GeoDataFrame(
-                {"scenario": [name]}, geometry=[remaining_geom], crs=f"EPSG:{cfg.crs_epsg}"
+        if not _is_empty(remaining_geom):
+            remaining_path = write_feature_shapefile(
+                cfg.output_dir,
+                f"{token}_remaining_coverage.shp",
+                "POLYGON",
+                sr,
+                (("scenario", "TEXT", _SHP_TEXT_MAX),),
+                [(_shp_text(name), remaining_geom)],
             )
-            remaining_path = cfg.output_dir / f"{token}_remaining_coverage.shp"
-            remaining_gdf.to_file(remaining_path)
             logging.info("Wrote: %s (%.2f sq mi remaining)", remaining_path, scen_sqmi)
-        if not shape_lines.empty:
-            export_line_layers(events, drop_mask, trips, shape_lines, cfg.output_dir, token)
+        if shape_lines:
+            export_line_layers(events, drop_mask, trips, shape_lines, cfg.output_dir, token, sr)
 
     if write_details and cfg.export_scenario_gtfs and events_all is not None:
         drop_mask_all = resolve_drop_mask(scenario, events_all, routes)
@@ -2783,12 +3185,13 @@ def run(cfg: Config) -> pd.DataFrame:
     Returns:
         The cross-scenario summary table (also written to disk).
     """
+    sr = _spatial_reference(cfg.crs_wkid)
     feed = load_feed(cfg.gtfs_dir)
-    stops = feed["stops"]
+    stops_txt = feed["stops"]
     routes = feed["routes"]
     trips = feed["trips"]
     stop_times = feed["stop_times"]
-    assert isinstance(stops, pd.DataFrame)
+    assert isinstance(stops_txt, pd.DataFrame)
     assert isinstance(routes, pd.DataFrame)
     assert isinstance(trips, pd.DataFrame)
     assert isinstance(stop_times, pd.DataFrame)
@@ -2797,24 +3200,21 @@ def run(cfg: Config) -> pd.DataFrame:
         feed["calendar"], feed["calendar_dates"], cfg.service_day, cfg.service_date
     )
     events = build_events(stop_times, trips, routes, service_ids)
-    stops_gdf = prepare_stops_gdf(stops, cfg.filter_platform_stops, cfg.crs_epsg)
-    shape_lines = build_shape_lines(feed["shapes"], cfg.crs_epsg)
-    shape_miles = shape_length_miles(shape_lines, cfg.crs_units)
-    if shape_lines.empty:
+    stops = prepare_stops_table(stops_txt, cfg.filter_platform_stops, sr)
+    logging.info("Building route alignments from shapes.txt …")
+    shape_lines = build_shape_lines(feed["shapes"], sr)
+    shape_miles = shape_length_miles(shape_lines, sr)
+    logging.info("Built %d route alignment(s) from shapes.txt.", len(shape_lines))
+    if not shape_lines:
         logging.warning(
             "No usable shapes.txt — revenue_miles_cut will be blank and line layers skipped."
         )
 
-    demographics: Optional[gpd.GeoDataFrame] = None
+    demographics: Optional[List[Dict[str, Any]]] = None
     if cfg.demographics_path.strip():
-        demographics = gpd.read_file(cfg.demographics_path).to_crs(epsg=cfg.crs_epsg)
-        logging.info(
-            "Demographics: %d polygon(s); fields: %s",
-            len(demographics),
-            ", ".join(cfg.demographic_fields),
-        )
+        demographics = load_demographics(cfg.demographics_path, cfg.demographic_fields, sr)
 
-    stop_lookup = build_stop_id_lookup(stops, cfg.ridership_stop_field)
+    stop_lookup = build_stop_id_lookup(stops_txt, cfg.ridership_stop_field)
 
     ridership = load_ridership(
         cfg.ridership_csv,
@@ -2895,13 +3295,14 @@ def run(cfg: Config) -> pd.DataFrame:
         raise ValueError(f"Scenario names must be unique; got {names}.")
 
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
+    baseline = build_baseline(events, stops, cfg, sr)
     summary_rows = [
         run_scenario(
             scenario,
-            events,
+            baseline,
             routes,
             trips,
-            stops_gdf,
+            stops,
             shape_lines,
             shape_miles,
             demographics,
@@ -2910,6 +3311,7 @@ def run(cfg: Config) -> pd.DataFrame:
             feed,
             events_all,
             cfg,
+            sr,
             write_details=not screening,
         )
         for scenario in scenarios
@@ -2935,6 +3337,7 @@ def run(cfg: Config) -> pd.DataFrame:
     summary_lines = [
         f"Scenarios evaluated: {len(summary_rows)}",
         f"Service day:         {cfg.service_date or cfg.service_day}",
+        f"Spatial reference:   {sr.name} (WKID {cfg.crs_wkid})",
     ] + [
         f"  {row['scenario']}: {row['trips_cut']} trip(s) cut, "
         f"{row['stops_eliminated']} stop(s) eliminated, "
@@ -2961,7 +3364,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     map to flags. Edit it in the CONFIGURATION section.
     """
     p = argparse.ArgumentParser(
-        description="Scenario-based service-cut impact analysis for a GTFS feed.",
+        description="Scenario-based service-cut impact analysis for a GTFS feed (ArcPy).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--gtfs-dir", default=GTFS_DIR, help="GTFS folder or .zip path.")
@@ -2986,12 +3389,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=STOP_BUFFER_MILES,
         help="Walk-access buffer radius around stops, in miles.",
     )
-    p.add_argument("--epsg", type=int, default=CRS_EPSG_CODE, help="Projected CRS EPSG code.")
     p.add_argument(
-        "--crs-units",
-        default=CRS_UNITS,
-        choices=("feet", "meters"),
-        help="Linear unit of the projected CRS.",
+        "--wkid",
+        "--epsg",
+        dest="wkid",
+        type=int,
+        default=PROJECTED_CRS_WKID,
+        help="Projected spatial reference WKID (EPSG code) for buffers and areas.",
     )
     p.add_argument(
         "--demographics",
@@ -3077,6 +3481,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             "--output-dir before running."
         )
         return 2
+    if str(args.output_dir).lower().endswith((".gdb", ".sde")):
+        logging.error(
+            "OUTPUT_DIR must be a filesystem folder — this script writes CSVs and "
+            "shapefiles alongside each other, which a geodatabase cannot hold."
+        )
+        return 2
+
+    arcpy.env.overwriteOutput = True
 
     cfg = Config(
         gtfs_dir=args.gtfs_dir,
@@ -3086,8 +3498,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         service_date=args.service_date,
         time_bin_minutes=args.time_bin_minutes,
         stop_buffer_miles=args.buffer_miles,
-        crs_epsg=args.epsg,
-        crs_units=args.crs_units,
+        crs_wkid=args.wkid,
         demographics_path=args.demographics,
         demographic_fields=list(args.demographic_fields),
         ridership_csv=args.ridership,
@@ -3100,7 +3511,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         run(cfg)
-    except (OSError, ValueError, RuntimeError) as exc:
+    except (OSError, ValueError, RuntimeError, arcpy.ExecuteError) as exc:
         # The exception type is part of the message: a bare decode or lookup
         # error text alone leaves the user with nothing to act on.
         logging.error("%s: %s", type(exc).__name__, exc)
