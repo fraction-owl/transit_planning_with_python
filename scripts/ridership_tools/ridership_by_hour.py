@@ -32,13 +32,15 @@ Outputs:
     - ``low_ridership_trips.csv``: trips whose ``LOW_RIDERSHIP_MEASURE``
       (passengers per revenue hour by default; per revenue mile and raw
       boardings also available) falls below ``LOW_RIDERSHIP_THRESHOLD``, with
-      route, start time, service-day hour, and all three measures; each
+      route, direction, start time, service-day hour, and all three measures;
+      each
       flagged day type is also logged as a warning. Written only when trips
       are flagged; set the threshold to 0 to disable.
     - ``charts/``: one bar chart PNG per route per day type, plus a system chart
       per day type (``EXPORT_CHARTS``).
-    - ``charts/trips/``: one per-trip bar chart PNG per route per day type on
-      the ``LOW_RIDERSHIP_MEASURE`` scale, y-axis shared within each day type,
+    - ``charts/trips/``: one per-trip bar chart PNG per route — split by
+      direction where the data carries one — per day type on the
+      ``LOW_RIDERSHIP_MEASURE`` scale, y-axis shared within each day type,
       with the threshold as a dashed line and below-threshold trips
       highlighted (``EXPORT_TRIP_CHARTS``).
     - A run-log sidecar capturing the verbatim CONFIGURATION block.
@@ -108,6 +110,7 @@ XLSX_SHEET: Optional[str] = None
 XLSX_COLUMN_MAP: Mapping[str, str] = {
     "route": "ROUTE_NUMBER",
     "route_name": "ROUTE_NAME",
+    "direction": "DIRECTION_NAME",
     "trip_id": "TRIP_NUMBER",
     "trip_start_time": "TRIP_START_TIME",
     "boardings": "PASSENGERS_ON",
@@ -174,11 +177,13 @@ CHARTS_SUBDIR: str = r"charts"
 CHART_MEASURE: str = "boardings"  # "boardings" or "alightings"
 
 # Per-trip charts (written to CHARTS_SUBDIR/trips, gated by EXPORT_CHARTS):
-# one PNG per route per day type with one bar per trip in start-time order,
-# on the LOW_RIDERSHIP_MEASURE scale. The y-axis is shared across routes
-# within a day type so routes compare directly. When the low-ridership
-# threshold is enabled it is drawn as a dashed line and trips below it are
-# highlighted — the visual counterpart of low_ridership_trips.csv.
+# one PNG per route — split by direction when the direction column is mapped
+# (xlsx mode) or trips_performed carries direction_id (tides mode) — per day
+# type, with one bar per trip in start-time order on the LOW_RIDERSHIP_MEASURE
+# scale. The y-axis is shared across routes within a day type so routes (and a
+# route's two directions) compare directly. When the low-ridership threshold
+# is enabled it is drawn as a dashed line and trips below it are highlighted —
+# the visual counterpart of low_ridership_trips.csv.
 EXPORT_TRIP_CHARTS: bool = True
 
 LOG_LEVEL: int = logging.INFO
@@ -197,6 +202,7 @@ _TRIP_ROW_COLS: List[str] = [
     "day_type",
     "route",
     "route_name",
+    "direction",
     "trip_id",
     "start_time",
     "hour",
@@ -416,10 +422,10 @@ def load_route_trip_workbook(path: Path, day_type: str) -> pd.DataFrame:
 
     Returns:
         DataFrame with columns ``day_type``, ``route``, ``route_name``,
-        ``trip_id`` (blank when unmapped), ``start_time``, ``hour``,
-        ``boardings``, ``alightings``, ``days_observed``, ``revenue_hours``,
-        ``revenue_miles`` — one row per scheduled trip. Unmapped optional
-        columns come back as NaN.
+        ``direction``, ``trip_id`` (blank when unmapped), ``start_time``,
+        ``hour``, ``boardings``, ``alightings``, ``days_observed``,
+        ``revenue_hours``, ``revenue_miles`` — one row per scheduled trip.
+        Unmapped optional columns come back as NaN (text columns as "").
 
     Raises:
         FileNotFoundError: If *path* does not exist.
@@ -453,6 +459,10 @@ def load_route_trip_workbook(path: Path, day_type: str) -> pd.DataFrame:
     trip_col = colmap.get("trip_id")
     out["trip_id"] = (
         raw[trip_col].astype(str).str.strip() if trip_col and trip_col in raw.columns else ""
+    )
+    dir_col = colmap.get("direction")
+    out["direction"] = (
+        raw[dir_col].astype(str).str.strip() if dir_col and dir_col in raw.columns else ""
     )
 
     start_min = raw[colmap["trip_start_time"]].map(parse_time_to_minutes)
@@ -665,7 +675,8 @@ def build_hourly_from_tides(
         boardings across the dates each trip was observed, with ``hour`` set
         to the trip's earliest observed stop-visit hour, ``pass_per_hour``
         derived from the trips_performed actual (or scheduled) start/end
-        times, ``pass_per_mile`` NaN (no mileage in TIDES event data), and
+        times, ``direction`` from trips_performed ``direction_id`` when
+        present, ``pass_per_mile`` NaN (no mileage in TIDES event data), and
         ``start_time`` blank (no scheduled start time in the event data).
 
     Raises:
@@ -711,8 +722,9 @@ def build_hourly_from_tides(
     routes = performed.drop_duplicates(subset=["service_date", "trip_id_performed"]).copy()
     routes["duration_hours"] = _trip_duration_hours(routes)
     route_cols = ["service_date", "trip_id_performed", "route_id", "duration_hours"]
-    if "trip_id_scheduled" in routes.columns:
-        route_cols.append("trip_id_scheduled")
+    for optional in ("trip_id_scheduled", "direction_id"):
+        if optional in routes.columns:
+            route_cols.append(optional)
     events = visits.merge(routes[route_cols], on=["service_date", "trip_id_performed"], how="left")
     unmatched = int(events["route_id"].isna().sum())
     if unmatched:
@@ -756,6 +768,10 @@ def build_hourly_from_tides(
         events["_stop"] = events["stop_id"].fillna("").astype(str).str.strip()
     else:
         events["_stop"] = ""
+    if "direction_id" in events.columns:
+        events["direction"] = events["direction_id"].fillna("").astype(str).str.strip()
+    else:
+        events["direction"] = ""
     trip_tables: dict[str, pd.DataFrame] = {}
     trip_row_frames: list[pd.DataFrame] = []
     for day_type, sub in events.groupby("day_type"):
@@ -767,6 +783,7 @@ def build_hourly_from_tides(
 
         detail = sub.groupby("trip_key", as_index=False).agg(
             route=("route", "first"),
+            direction=("direction", "first"),
             hour=("hour", "min"),
             boardings=("boardings", "sum"),
             days_observed=("service_date", "nunique"),
@@ -1049,12 +1066,16 @@ def draw_trip_chart(
 def export_trip_charts(
     trip_rows: pd.DataFrame, measure: str, threshold: float, out_dir: Path
 ) -> int:
-    """Write one per-trip chart per route per day type.
+    """Write one per-trip chart per route (and direction, where known) per day type.
 
-    The y-axis is shared across all routes within a day type (and stretched to
-    keep the threshold line visible) so charts compare directly. Trips with no
-    value for *measure* cannot be placed on the scale and are left off, same
-    as the flagging pass.
+    Routes whose rows carry a direction get one chart per direction, so a
+    trip is compared against its same-direction neighbours rather than an
+    interleaved mix; rows with a blank direction (unmapped column, loop
+    routes exported without one) fall back to one chart per route. The
+    y-axis is shared across all routes within a day type (and stretched to
+    keep the threshold line visible) so charts — including a route's two
+    directions — compare directly. Trips with no value for *measure* cannot
+    be placed on the scale and are left off, same as the flagging pass.
 
     Args:
         trip_rows: Per-trip rows from either input mode (``_TRIP_ROW_COLS``).
@@ -1081,11 +1102,15 @@ def export_trip_charts(
         y_by_day = y_by_day.clip(lower=threshold * 1.2)
 
     written = 0
-    for (day_type, route), sub in rows.groupby(["day_type", "route"]):
+    for (day_type, route, direction), sub in rows.groupby(["day_type", "route", "direction"]):
         sub = sub.sort_values("_sort")
         name = sub["route_name"].iloc[0]
         label = f"Route {route}" + (f" ({name})" if name and name != str(route) else "")
-        out_path = out_dir / f"route_{_sanitize_token(route)}_{_sanitize_token(day_type)}.png"
+        stem = f"route_{_sanitize_token(route)}"
+        if direction:
+            label = f"{label} {direction}"
+            stem = f"{stem}_{_sanitize_token(direction)}"
+        out_path = out_dir / f"{stem}_{_sanitize_token(day_type)}.png"
         draw_trip_chart(
             sub,
             f"{label} — {day_type} {measure} by trip",
