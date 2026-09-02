@@ -391,6 +391,50 @@ def _sanitize_token(name: str) -> str:
     return token or "unnamed"
 
 
+# Excel stores a time of day as a fraction of a day, so a midnight trip start
+# is the serial number zero — which Excel displays (and some exports save as
+# literal text) as its epoch date, "1/0/1900" on the 1900 date system or
+# "12/30/1899" once a reader converts it. No time appears in the cell at all.
+_EXCEL_EPOCH_ZERO: Sequence[str] = (
+    "1/0/1900",
+    "1900-01-00",
+    "12/30/1899",
+    "30/12/1899",
+    "1899-12-30",
+)
+# An HH:MM[:SS] time embedded in a longer string (e.g. "1899-12-30 00:00:00"
+# from a datetime-typed cell stringified by the reader).
+_TIME_IN_TEXT_RE = re.compile(r"\b(\d{1,2}:\d{2}(?::\d{2})?)\b")
+
+
+def _trip_start_minutes(value: object) -> Optional[int]:
+    """Parse a trip-start cell to minutes past midnight, tolerating Excel quirks.
+
+    Accepts everything ``parse_time_to_minutes`` does, plus two forms vendor
+    xlsx exports produce: a datetime-typed cell that stringifies with a date
+    prefix (the embedded time is extracted), and a midnight start saved as
+    Excel's epoch-zero date text (see ``_EXCEL_EPOCH_ZERO``), which parses to
+    0 so owl trips at 00:00 are kept and land on the 24+ service-day clock
+    instead of being dropped as unparseable.
+
+    Args:
+        value: Raw trip-start cell value (already stringified by the reader).
+
+    Returns:
+        Minutes since midnight, or ``None`` if no time can be recovered.
+    """
+    text = "" if value is None else str(value).strip()
+    minutes = parse_time_to_minutes(text)
+    if minutes is not None:
+        return minutes
+    match = _TIME_IN_TEXT_RE.search(text)
+    if match:
+        return parse_time_to_minutes(match.group(1))
+    if text in _EXCEL_EPOCH_ZERO:
+        return 0
+    return None
+
+
 def _validate_measure(measure: str) -> None:
     """Raise ValueError when *measure* is not a recognised low-ridership measure."""
     if measure not in _LOW_RIDERSHIP_MEASURES:
@@ -465,7 +509,7 @@ def load_route_trip_workbook(path: Path, day_type: str) -> pd.DataFrame:
         raw[dir_col].astype(str).str.strip() if dir_col and dir_col in raw.columns else ""
     )
 
-    start_min = raw[colmap["trip_start_time"]].map(parse_time_to_minutes)
+    start_min = raw[colmap["trip_start_time"]].map(_trip_start_minutes)
     bad_time = int(start_min.isna().sum())
     if bad_time:
         logging.warning(
