@@ -899,7 +899,7 @@ def flag_low_ridership(
         return 0
     flagged["hour"] = flagged["hour"].astype(int)
     flagged.insert(
-        flagged.columns.get_loc("hour") + 1,
+        list(flagged.columns).index("hour") + 1,
         "hour_label",
         flagged["hour"].map(lambda h: minutes_to_hhmm(h * 60)),
     )
