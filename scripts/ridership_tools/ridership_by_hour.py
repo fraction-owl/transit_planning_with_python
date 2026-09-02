@@ -37,6 +37,10 @@ Outputs:
       are flagged; set the threshold to 0 to disable.
     - ``charts/``: one bar chart PNG per route per day type, plus a system chart
       per day type (``EXPORT_CHARTS``).
+    - ``charts/trips/``: one per-trip bar chart PNG per route per day type on
+      the ``LOW_RIDERSHIP_MEASURE`` scale, y-axis shared within each day type,
+      with the threshold as a dashed line and below-threshold trips
+      highlighted (``EXPORT_TRIP_CHARTS``).
     - A run-log sidecar capturing the verbatim CONFIGURATION block.
 
 Notes:
@@ -169,6 +173,14 @@ EXPORT_CHARTS: bool = True
 CHARTS_SUBDIR: str = r"charts"
 CHART_MEASURE: str = "boardings"  # "boardings" or "alightings"
 
+# Per-trip charts (written to CHARTS_SUBDIR/trips, gated by EXPORT_CHARTS):
+# one PNG per route per day type with one bar per trip in start-time order,
+# on the LOW_RIDERSHIP_MEASURE scale. The y-axis is shared across routes
+# within a day type so routes compare directly. When the low-ridership
+# threshold is enabled it is drawn as a dashed line and trips below it are
+# highlighted — the visual counterpart of low_ridership_trips.csv.
+EXPORT_TRIP_CHARTS: bool = True
+
 LOG_LEVEL: int = logging.INFO
 
 # When True, a failed run-log write aborts the script so an output is never left
@@ -201,6 +213,17 @@ _LOW_RIDERSHIP_MEASURES: Sequence[str] = ("boardings", "pass_per_hour", "pass_pe
 _BAR_COLOR: str = "#2a78d6"
 _INK_COLOR: str = "#52514e"
 _GRID_COLOR: str = "#e3e2de"
+# Status red for below-threshold trips and the threshold line; kept distinct
+# from the series blue and never the only encoding (the dashed line and the
+# legend carry the same meaning).
+_FLAG_COLOR: str = "#d03b3b"
+
+# Axis labels for the per-trip chart measures.
+_MEASURE_LABELS: Mapping[str, str] = {
+    "boardings": "Avg daily boardings",
+    "pass_per_hour": "Avg boardings / revenue hour",
+    "pass_per_mile": "Avg boardings / revenue mile",
+}
 
 
 # =============================================================================
@@ -360,6 +383,15 @@ def _sanitize_token(name: str) -> str:
     """Reduce a route/day label to a filesystem-safe token."""
     token = re.sub(r"[^A-Za-z0-9_-]+", "_", str(name).strip()).strip("_")
     return token or "unnamed"
+
+
+def _validate_measure(measure: str) -> None:
+    """Raise ValueError when *measure* is not a recognised low-ridership measure."""
+    if measure not in _LOW_RIDERSHIP_MEASURES:
+        raise ValueError(
+            f"LOW_RIDERSHIP_MEASURE must be one of {list(_LOW_RIDERSHIP_MEASURES)}; "
+            f"got {measure!r}."
+        )
 
 
 def _day_sort_key(day: str) -> int:
@@ -827,11 +859,7 @@ def flag_low_ridership(
     Raises:
         ValueError: On an unrecognised *measure*.
     """
-    if measure not in _LOW_RIDERSHIP_MEASURES:
-        raise ValueError(
-            f"LOW_RIDERSHIP_MEASURE must be one of {list(_LOW_RIDERSHIP_MEASURES)}; "
-            f"got {measure!r}."
-        )
+    _validate_measure(measure)
     if threshold <= 0 or trip_rows.empty:
         return 0
     values = trip_rows[measure]
@@ -947,6 +975,127 @@ def export_charts(route_table: pd.DataFrame, system: pd.DataFrame, out_dir: Path
         )
         written += 1
     logging.info("Wrote %d chart PNG(s) to '%s'.", written, out_dir)
+    return written
+
+
+def draw_trip_chart(
+    sub: pd.DataFrame,
+    title: str,
+    measure: str,
+    threshold: float,
+    out_path: Path,
+    y_max: Optional[float],
+) -> None:
+    """Draw one per-trip bar chart PNG for a single route and day type.
+
+    One bar per trip in start-time order. When *threshold* is positive it is
+    drawn as a dashed line and bars below it are highlighted, so the flag is
+    carried by both position and color; a legend names both.
+
+    Args:
+        sub: Per-trip rows for one route on one day type, already sorted by
+            start time, with a ``_label`` column for the x axis.
+        title: Chart title.
+        measure: Per-trip column to plot.
+        threshold: Low-ridership threshold; <= 0 draws no line or highlight.
+        out_path: PNG destination.
+        y_max: Shared y-axis limit (None lets matplotlib autoscale).
+    """
+    values = sub[measure].astype(float).tolist()
+    colors = [_FLAG_COLOR if threshold > 0 and v < threshold else _BAR_COLOR for v in values]
+
+    fig, ax = plt.subplots(figsize=(8.0, 3.2))
+    ax.bar(range(len(values)), values, color=colors, width=0.72)
+    # Floor the axis width so a route with few trips keeps bars proportioned
+    # like the hourly charts instead of a handful of full-width slabs.
+    ax.set_xlim(-0.5, max(len(values), 12) - 0.5)
+    step = max(1, len(values) // 24)  # keep x labels legible on busy routes
+    ticks = list(range(0, len(values), step))
+    ax.set_xticks(ticks)
+    ax.set_xticklabels(
+        [sub["_label"].iloc[i] for i in ticks],
+        rotation=45,
+        ha="right",
+        fontsize=7,
+        color=_INK_COLOR,
+    )
+    ax.tick_params(axis="y", labelsize=8, colors=_INK_COLOR)
+    ax.set_ylabel(_MEASURE_LABELS.get(measure, measure), fontsize=9, color=_INK_COLOR)
+    ax.set_title(title, fontsize=10, color="#0b0b0b", loc="left")
+    ax.grid(axis="y", color=_GRID_COLOR, linewidth=0.8)
+    ax.set_axisbelow(True)
+    if y_max is not None and y_max > 0:
+        ax.set_ylim(0, y_max)
+    if threshold > 0:
+        ax.axhline(
+            threshold,
+            linestyle="--",
+            linewidth=1.2,
+            color=_FLAG_COLOR,
+            label=f"threshold ({threshold:g})",
+        )
+        if any(c == _FLAG_COLOR for c in colors):
+            ax.bar(0, 0, color=_FLAG_COLOR, label="below threshold")
+        ax.legend(fontsize=7, frameon=False, loc="upper right")
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    for side in ("left", "bottom"):
+        ax.spines[side].set_color(_GRID_COLOR)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
+def export_trip_charts(
+    trip_rows: pd.DataFrame, measure: str, threshold: float, out_dir: Path
+) -> int:
+    """Write one per-trip chart per route per day type.
+
+    The y-axis is shared across all routes within a day type (and stretched to
+    keep the threshold line visible) so charts compare directly. Trips with no
+    value for *measure* cannot be placed on the scale and are left off, same
+    as the flagging pass.
+
+    Args:
+        trip_rows: Per-trip rows from either input mode (``_TRIP_ROW_COLS``).
+        measure: Per-trip column to plot.
+        threshold: Low-ridership threshold; <= 0 draws plain charts.
+        out_dir: Charts folder (created if needed).
+
+    Returns:
+        Number of PNGs written.
+    """
+    _validate_measure(measure)
+    rows = trip_rows[trip_rows[measure].notna()].copy()
+    if rows.empty:
+        logging.warning("No trips have a %s value — skipping per-trip charts.", measure)
+        return 0
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    start_min = rows["start_time"].map(parse_time_to_minutes)
+    rows["_sort"] = start_min.fillna(rows["hour"].astype(float) * 60)
+    labels = rows["start_time"].astype(str).str.strip()
+    rows["_label"] = labels.where(labels != "", rows["trip_id"].astype(str))
+    y_by_day = rows.groupby("day_type")[measure].max() * 1.05
+    if threshold > 0:
+        y_by_day = y_by_day.clip(lower=threshold * 1.2)
+
+    written = 0
+    for (day_type, route), sub in rows.groupby(["day_type", "route"]):
+        sub = sub.sort_values("_sort")
+        name = sub["route_name"].iloc[0]
+        label = f"Route {route}" + (f" ({name})" if name and name != str(route) else "")
+        out_path = out_dir / f"route_{_sanitize_token(route)}_{_sanitize_token(day_type)}.png"
+        draw_trip_chart(
+            sub,
+            f"{label} — {day_type} {measure} by trip",
+            measure,
+            threshold,
+            out_path,
+            float(y_by_day[day_type]),
+        )
+        written += 1
+    logging.info("Wrote %d per-trip chart PNG(s) to '%s'.", written, out_dir)
     return written
 
 
@@ -1084,21 +1233,26 @@ def run(
                 "XLSX_COLUMN_MAP['trip_id'] (xlsx mode) to write engine-ready trip tables."
             )
 
+    low_measure = LOW_RIDERSHIP_MEASURE.strip().lower()
     low_flagged = flag_low_ridership(
-        trip_rows,
-        LOW_RIDERSHIP_MEASURE.strip().lower(),
-        LOW_RIDERSHIP_THRESHOLD,
-        output_dir / LOW_RIDERSHIP_FILENAME,
+        trip_rows, low_measure, LOW_RIDERSHIP_THRESHOLD, output_dir / LOW_RIDERSHIP_FILENAME
     )
 
     charts_written = 0
+    trip_charts_written = 0
     if export_charts_flag:
         charts_written = export_charts(route_table, system, output_dir / CHARTS_SUBDIR)
+        if EXPORT_TRIP_CHARTS:
+            trip_charts_written = export_trip_charts(
+                trip_rows,
+                low_measure,
+                LOW_RIDERSHIP_THRESHOLD,
+                output_dir / CHARTS_SUBDIR / "trips",
+            )
 
     day_types = ", ".join(sorted(route_table["day_type"].unique(), key=_day_sort_key))
     low_summary = (
-        f"{low_flagged} trip(s) below {LOW_RIDERSHIP_THRESHOLD:g} "
-        f"{LOW_RIDERSHIP_MEASURE.strip().lower()}"
+        f"{low_flagged} trip(s) below {LOW_RIDERSHIP_THRESHOLD:g} {low_measure}"
         if LOW_RIDERSHIP_THRESHOLD > 0
         else "disabled (LOW_RIDERSHIP_THRESHOLD <= 0)"
     )
@@ -1110,6 +1264,7 @@ def run(
         f"Trip tables:       {trip_files}",
         f"Low ridership:     {low_summary}",
         f"Charts written:    {charts_written}",
+        f"Trip charts:       {trip_charts_written}",
     ]
     if not write_run_log(output_dir, summary_lines) and REQUIRE_RUN_LOG:
         raise RuntimeError(
