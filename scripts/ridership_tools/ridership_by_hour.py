@@ -54,6 +54,10 @@ Notes:
     xlsx export's trip-number column must hold GTFS ``trip_id`` values, and
     TIDES trips should carry ``trip_id_scheduled``; otherwise blank the
     ``trip_id`` mapping / expect unmatched ids downstream.
+    Routes are identified by name, not code: an export may number a route 3695
+    and name it "RIBS5", and the name is what the route filters match and what
+    leads chart titles and filenames (the code appears in parentheses when the
+    two differ). Routes the export leaves unnamed fall back to the code.
 
 Typical usage:
     Update the paths in the CONFIGURATION section (or pass the matching CLI
@@ -141,7 +145,11 @@ TIDES_ALIGHTING_COLS: Sequence[str] = ("alighting_1", "alighting_2")
 # day; set 3 if your agency's service day starts at 3am (hours run to 26).
 LATE_NIGHT_CUTOVER_HOUR: int = 4
 
-# Optional route filters (matched against the route column as strings).
+# Optional route filters. These match the route NAME as it appears in the
+# export (ROUTE_NAME — e.g. "RIBS5"), which is what planners recognise and
+# what load_factor_monitor.py filters on too; the route code stands in only
+# for routes the export leaves unnamed. An entry matching no route is logged
+# as a warning rather than silently filtering nothing.
 ROUTES_TO_INCLUDE: Sequence[str] = ()
 ROUTES_TO_EXCLUDE: Sequence[str] = ()
 
@@ -374,15 +382,76 @@ def _service_hour(clock_hour: int, cutover_hour: int) -> int:
     return clock_hour
 
 
+def _route_labels(table: pd.DataFrame) -> pd.Series:
+    """Return each row's planner-facing route identifier.
+
+    The route *name* rules: an export may number a route 3695 and name it
+    "RIBS5", and the name is what planners recognise and type. The route code
+    stands in only where the export carries no name for the route.
+
+    Args:
+        table: Any frame carrying a ``route`` column (and usually
+            ``route_name``; its absence falls back to the code).
+
+    Returns:
+        Series of stripped labels, aligned to *table*'s index.
+    """
+    codes = table["route"].astype(str).str.strip()
+    if "route_name" not in table.columns:
+        return codes
+    names = table["route_name"].fillna("").astype(str).str.strip()
+    return names.where(names != "", codes)
+
+
+def _warn_unmatched_routes(
+    setting: str, values: Sequence[str], table: pd.DataFrame, labels: pd.Series
+) -> None:
+    """Log filter entries that match no route, so a filter never no-ops silently."""
+    if not values:
+        return
+    present = set(labels)
+    by_code = dict(zip(table["route"].astype(str).str.strip(), labels))
+    for raw in values:
+        token = str(raw).strip()
+        if token in present:
+            continue
+        named = by_code.get(token)
+        hint = f" — route code {token} is named {named!r}; filter on the name" if named else ""
+        logging.warning("%s entry %r matched no route%s.", setting, token, hint)
+
+
 def _apply_route_filters(table: pd.DataFrame) -> pd.DataFrame:
-    """Apply the ROUTES_TO_INCLUDE / ROUTES_TO_EXCLUDE config filters."""
+    """Apply the ROUTES_TO_INCLUDE / ROUTES_TO_EXCLUDE config filters by route name."""
+    labels = _route_labels(table)
+    _warn_unmatched_routes("ROUTES_TO_INCLUDE", ROUTES_TO_INCLUDE, table, labels)
+    _warn_unmatched_routes("ROUTES_TO_EXCLUDE", ROUTES_TO_EXCLUDE, table, labels)
+    keep = pd.Series(True, index=table.index)
     if ROUTES_TO_INCLUDE:
-        keep = {str(r) for r in ROUTES_TO_INCLUDE}
-        table = table[table["route"].isin(keep)]
+        keep &= labels.isin({str(r).strip() for r in ROUTES_TO_INCLUDE})
     if ROUTES_TO_EXCLUDE:
-        drop = {str(r) for r in ROUTES_TO_EXCLUDE}
-        table = table[~table["route"].isin(drop)]
-    return table
+        keep &= ~labels.isin({str(r).strip() for r in ROUTES_TO_EXCLUDE})
+    return table[keep]
+
+
+def _route_display(route: object, name: object) -> "tuple[str, str]":
+    """Build a chart title fragment and filename token for one route.
+
+    The name leads, with the code appended in parentheses when the two differ,
+    so "RIBS5" is what a planner reads first and 3695 stays discoverable.
+
+    Args:
+        route: Route code (``route`` column value).
+        name: Route name (``route_name`` value); blank falls back to the code.
+
+    Returns:
+        Tuple of (title fragment, filename token).
+    """
+    code = "" if route is None else str(route).strip()
+    label = "" if name is None else str(name).strip()
+    if not label:
+        label = code
+    suffix = f" ({code})" if code and code != label else ""
+    return f"Route {label}{suffix}", label
 
 
 def _sanitize_token(name: str) -> str:
@@ -1023,8 +1092,8 @@ def export_charts(route_table: pd.DataFrame, system: pd.DataFrame, out_dir: Path
     written = 0
     for (day_type, route), sub in route_table.groupby(["day_type", "route"]):
         name = sub["route_name"].iloc[0]
-        label = f"Route {route}" + (f" ({name})" if name and name != str(route) else "")
-        out_path = out_dir / f"route_{_sanitize_token(route)}_{_sanitize_token(day_type)}.png"
+        label, token = _route_display(route, name)
+        out_path = out_dir / f"route_{_sanitize_token(token)}_{_sanitize_token(day_type)}.png"
         draw_hour_chart(
             sub, f"{label} — {day_type} {measure} by hour", measure, out_path, hour_span
         )
@@ -1149,8 +1218,8 @@ def export_trip_charts(
     for (day_type, route, direction), sub in rows.groupby(["day_type", "route", "direction"]):
         sub = sub.sort_values("_sort")
         name = sub["route_name"].iloc[0]
-        label = f"Route {route}" + (f" ({name})" if name and name != str(route) else "")
-        stem = f"route_{_sanitize_token(route)}"
+        label, token = _route_display(route, name)
+        stem = f"route_{_sanitize_token(token)}"
         if direction:
             label = f"{label} {direction}"
             stem = f"{stem}_{_sanitize_token(direction)}"

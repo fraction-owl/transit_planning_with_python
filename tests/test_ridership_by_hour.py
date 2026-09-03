@@ -7,6 +7,7 @@ as midnight (service-day hour 24), not be dropped as unparseable.
 """
 
 import datetime
+from pathlib import Path
 
 import openpyxl
 import pytest
@@ -73,3 +74,68 @@ def test_load_route_trip_workbook_keeps_midnight_trips(tmp_path) -> None:
     assert by_trip.loc["48", "hour"] == 5
     assert by_trip.loc["48", "start_time"] == "05:13"
     assert (by_trip["direction"] == "LOOP").all()
+
+
+@pytest.mark.parametrize(
+    ("route", "name", "expected_title", "expected_token"),
+    [
+        ("3695", "RIBS5", "Route RIBS5 (3695)", "RIBS5"),  # name leads, code kept visible
+        ("232", "232", "Route 232", "232"),  # name == code: no redundant suffix
+        ("451", "", "Route 451", "451"),  # unnamed route falls back to the code
+        ("451", None, "Route 451", "451"),
+    ],
+)
+def test_route_display(route, name, expected_title, expected_token) -> None:
+    assert ridership_by_hour._route_display(route, name) == (expected_title, expected_token)
+
+
+def _ribs5_workbook(tmp_path) -> Path:
+    """A two-trip workbook whose route is numbered 3695 but named RIBS5."""
+    path = tmp_path / "RIDERSHIP_BY_ROUTE_AND_TRIP_weekday.xlsx"
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.append(_HEADER)
+    sheet.append([3695, "RIBS5", "LOOP", 44, datetime.time(6, 15), 11.0, 11.0, 150, 0.75, 9.04])
+    sheet.append([3695, "RIBS5", "LOOP", 46, datetime.time(7, 15), 8.0, 8.0, 150, 0.75, 9.04])
+    workbook.save(path)
+    return path
+
+
+def test_route_filter_matches_the_route_name(tmp_path, monkeypatch) -> None:
+    """The name planners recognise is what the filters key on."""
+    path = _ribs5_workbook(tmp_path)
+    monkeypatch.setattr(ridership_by_hour, "ROUTES_TO_EXCLUDE", ("RIBS5",))
+    with pytest.raises(ValueError, match="No usable trip rows"):
+        ridership_by_hour.build_hourly_from_xlsx({"weekday": str(path)})
+
+    monkeypatch.setattr(ridership_by_hour, "ROUTES_TO_EXCLUDE", ())
+    monkeypatch.setattr(ridership_by_hour, "ROUTES_TO_INCLUDE", ("RIBS5",))
+    _, _, rows = ridership_by_hour.build_hourly_from_xlsx({"weekday": str(path)})
+    assert len(rows) == 2
+
+
+def test_route_filter_on_the_code_warns_and_names_the_route(tmp_path, monkeypatch, caplog) -> None:
+    """A code-based entry no longer filters, and says which name to use instead."""
+    path = _ribs5_workbook(tmp_path)
+    monkeypatch.setattr(ridership_by_hour, "ROUTES_TO_EXCLUDE", ("3695",))
+    with caplog.at_level("WARNING"):
+        _, _, rows = ridership_by_hour.build_hourly_from_xlsx({"weekday": str(path)})
+    assert len(rows) == 2, "the code must not silently filter the route out"
+    assert "RIBS5" in caplog.text and "3695" in caplog.text
+
+
+def test_unmatched_route_filter_is_never_silent(tmp_path, monkeypatch, caplog) -> None:
+    path = _ribs5_workbook(tmp_path)
+    monkeypatch.setattr(ridership_by_hour, "ROUTES_TO_EXCLUDE", ("RIBS6",))
+    with caplog.at_level("WARNING"):
+        ridership_by_hour.build_hourly_from_xlsx({"weekday": str(path)})
+    assert "RIBS6" in caplog.text
+
+
+def test_trip_chart_filename_uses_the_route_name(tmp_path) -> None:
+    """Charts file under the name a planner would look for, not the code."""
+    path = _ribs5_workbook(tmp_path)
+    _, _, rows = ridership_by_hour.build_hourly_from_xlsx({"weekday": str(path)})
+    out_dir = tmp_path / "charts"
+    assert ridership_by_hour.export_trip_charts(rows, "pass_per_hour", 5.0, out_dir) == 1
+    assert (out_dir / "route_RIBS5_LOOP_weekday.png").exists()
