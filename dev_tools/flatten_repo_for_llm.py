@@ -24,18 +24,25 @@ names collide only when two files share a basename, and the MANIFEST maps every
 output file back to its original path.
 
 Nothing in the source repository is modified, moved, or deleted; the tool only
-reads the repo and writes into OUTPUT_DIR.
+reads the repo and writes into OUTPUT_DIR. It works strictly downward: it walks
+into the source folder and, for a relative OUTPUT_DIR, writes into a subfolder
+of it — never beside or above the repo.
 
 Inputs
 ------
-- REPO_ROOT: The repository to ingest. Files are listed with
-  ``git ls-files`` (tracked files only, so ignored build junk never appears)
-  and fall back to a filtered directory walk when git is unavailable.
+- SOURCE: The repository to ingest, as either a checkout folder or a .zip
+  export (GitHub's "Download ZIP"). An archive is extracted to a temporary
+  directory that is deleted on exit, and a single wrapping folder such as
+  ``transit_planning_with_python-main/`` is unwrapped automatically.
+  A checkout's files are listed with ``git ls-files`` — tracked files only,
+  so ignored build junk never appears; a .zip (which carries no git metadata)
+  and a non-checkout folder fall back to a filtered directory walk.
 
 Outputs
 -------
 - OUTPUT_DIR: The flattened copy (``flat``) or the per-folder Markdown
-  bundles (``bundle``).
+  bundles (``bundle``). Relative paths land inside the source folder;
+  ``llm_upload/`` is gitignored.
 - MANIFEST.txt: The verbatim CONFIGURATION block, a timestamp, the source
   repo path, and one ``output name <- original/path`` line per file.
 - .flatten_repo_for_llm: A marker file identifying the directory as tool
@@ -48,6 +55,7 @@ flags) and run from a shell or a Jupyter notebook::
 
     python dev_tools/flatten_repo_for_llm.py
     python dev_tools/flatten_repo_for_llm.py --mode bundle --clean
+    python dev_tools/flatten_repo_for_llm.py --source ~/Downloads/repo-main.zip
 """
 
 from __future__ import annotations
@@ -58,6 +66,8 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import zipfile
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -68,12 +78,15 @@ from typing import Dict, List, Optional, Sequence, Tuple
 # ==================================================================================================
 # === BEGIN CONFIG ===
 
-# Repository to ingest (defaults to the repo containing this script).
-REPO_ROOT: str = str(Path(__file__).resolve().parent.parent)
+# Repository to ingest: either a checkout folder or a .zip export (the
+# archive GitHub's "Download ZIP" button produces). Defaults to the repo
+# containing this script.
+SOURCE: str = str(Path(__file__).resolve().parent.parent)
 
-# Where the upload-ready copy is written. Keep this OUTSIDE the repository so
-# the copy is never committed and never ingested by the next run.
-OUTPUT_DIR: str = r"../transit_planning_flat"
+# Where the upload-ready copy is written. A relative path is resolved
+# DOWNWARD from the source folder, so the copy lands inside the repo and is
+# never written beside or above it. Use an absolute path to send it elsewhere.
+OUTPUT_DIR: str = r"llm_upload"
 
 # "flat"   - one folder per top-level directory, subfolders dissolved.
 # "bundle" - one Markdown file per top-level directory (fewer files to upload).
@@ -168,6 +181,75 @@ def notebook_safe_argv(argv: Optional[Sequence[str]]) -> Optional[List[str]]:
     return None
 
 
+def extract_archive(archive_path: Path, destination: Path) -> Path:
+    """Extract a .zip repository export and return its content root.
+
+    GitHub's "Download ZIP" wraps the whole repo in a single ``<repo>-<ref>/``
+    folder; when the archive has exactly one top-level directory it is
+    unwrapped so the flattener sees ``scripts/`` rather than
+    ``transit_planning_with_python-main/scripts/``.
+
+    Args:
+        archive_path: The .zip file to read.
+        destination: An empty directory to extract into.
+
+    Returns:
+        The directory holding the repository contents.
+
+    Raises:
+        ValueError: The archive is unreadable or holds a member whose path
+            would escape *destination*.
+    """
+    try:
+        with zipfile.ZipFile(archive_path) as archive:
+            for member in archive.namelist():
+                resolved = (destination / member).resolve()
+                if resolved != destination and destination not in resolved.parents:
+                    raise ValueError(f"Archive member escapes the extraction directory: {member!r}")
+            archive.extractall(destination)
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"Not a readable .zip archive: {archive_path} ({exc})") from exc
+
+    entries = [
+        entry
+        for entry in destination.iterdir()
+        if entry.name != "__MACOSX" and not entry.name.startswith("._")
+    ]
+    if len(entries) == 1 and entries[0].is_dir():
+        return entries[0]
+    return destination
+
+
+def resolve_output_dir(output_dir: str, source_root: Path, source_is_archive: bool) -> Path:
+    """Resolve OUTPUT_DIR, keeping a relative path downward from its base.
+
+    Args:
+        output_dir: The configured output path, absolute or relative.
+        source_root: The repository folder being ingested.
+        source_is_archive: True when *source_root* is a temporary extraction
+            directory, in which case a relative path is resolved from the
+            current working directory instead.
+
+    Returns:
+        The resolved output directory.
+
+    Raises:
+        ValueError: A relative path climbs above its base directory.
+    """
+    candidate = Path(output_dir).expanduser()
+    if candidate.is_absolute():
+        return candidate.resolve()
+
+    base = Path.cwd().resolve() if source_is_archive else source_root
+    resolved = (base / candidate).resolve()
+    if base not in resolved.parents:
+        raise ValueError(
+            f"A relative OUTPUT_DIR must name a folder inside {base}; {output_dir!r} resolves "
+            f"to {resolved}. Pass an absolute path to write outside it."
+        )
+    return resolved
+
+
 def list_git_files(repo_root: Path) -> Optional[List[Path]]:
     """List repository-relative paths of git-tracked files.
 
@@ -250,7 +332,8 @@ def select_files(
             skipped.append((relative, "missing on disk"))
             continue
         if output_dir == absolute or output_dir in absolute.parents:
-            skipped.append((relative, "inside OUTPUT_DIR"))
+            # A previous run's own output, reached by the directory-walk
+            # fallback. Not a source file, so it is not worth reporting.
             continue
         if max_file_bytes and absolute.stat().st_size > max_file_bytes:
             skipped.append((relative, f"larger than {max_file_bytes} bytes"))
@@ -464,7 +547,7 @@ def extract_config_block(script_path: Path) -> str:
 
 def write_manifest(
     output_dir: Path,
-    repo_root: Path,
+    source_label: str,
     written: Sequence[Tuple[str, Path]],
     skipped: Sequence[Tuple[Path, str]],
     mode: str,
@@ -473,7 +556,7 @@ def write_manifest(
 
     Args:
         output_dir: Destination root.
-        repo_root: Repository that was ingested.
+        source_label: The folder or archive that was ingested, as configured.
         written: ``(output name, source path)`` pairs.
         skipped: ``(source path, reason)`` pairs.
         mode: The output shape that produced *written*.
@@ -482,7 +565,7 @@ def write_manifest(
         The manifest path.
     """
     lines = [
-        f"# Flattened copy of {repo_root}",
+        f"# Flattened copy of {source_label}",
         f"# Generated {datetime.now().astimezone().isoformat(timespec='seconds')}",
         f"# Source script: {Path(__file__).resolve()}",
         f"# Mode: {mode}",
@@ -507,6 +590,7 @@ def write_manifest(
 def flatten_repo(
     repo_root: Path,
     output_dir: Path,
+    source_label: str,
     mode: str,
     name_style: str,
     exclude_top_level: Sequence[str],
@@ -518,8 +602,9 @@ def flatten_repo(
     """Build the upload-ready copy of a repository.
 
     Args:
-        repo_root: Repository to ingest.
+        repo_root: Repository folder to ingest (an extracted archive counts).
         output_dir: Destination root.
+        source_label: The folder or archive as configured, for the manifest.
         mode: ``"flat"`` or ``"bundle"``.
         name_style: ``"auto"``, ``"prefixed"``, or ``"basename"``.
         exclude_top_level: Top-level folders to drop.
@@ -566,7 +651,7 @@ def flatten_repo(
         size_kb = sum((repo_root / f).stat().st_size for f in files) / 1024
         logging.info("%-12s %3d files  %7.1f KB", top or "(root)", len(files), size_kb)
 
-    manifest_path = write_manifest(output_dir, repo_root, written, skipped, mode)
+    manifest_path = write_manifest(output_dir, source_label, written, skipped, mode)
     renamed = sum(1 for name, relative in written if Path(name).name != relative.name)
     if mode == "flat" and renamed:
         logging.info("%d file(s) renamed to avoid collisions — see the manifest.", renamed)
@@ -588,8 +673,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--repo-root", default=REPO_ROOT, help="Repository to ingest.")
-    parser.add_argument("--output-dir", default=OUTPUT_DIR, help="Where the copy is written.")
+    parser.add_argument(
+        "--source", default=SOURCE, help="Repository folder or .zip export to ingest."
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=OUTPUT_DIR,
+        help="Where the copy is written; a relative path stays inside the source folder.",
+    )
     parser.add_argument("--mode", choices=("flat", "bundle"), default=MODE, help="Output shape.")
     parser.add_argument(
         "--name-style",
@@ -648,19 +739,35 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         format="%(levelname)s: %(message)s",
     )
 
-    repo_root = Path(args.repo_root).expanduser().resolve()
-    output_dir = Path(args.output_dir).expanduser().resolve()
+    source = Path(args.source).expanduser().resolve()
+    source_is_archive = source.is_file() and source.suffix.lower() == ".zip"
+    if not source.exists():
+        logging.error("SOURCE does not exist: %s", source)
+        return 2
+    if not source_is_archive and not source.is_dir():
+        logging.error("SOURCE must be a folder or a .zip archive: %s", source)
+        return 2
 
+    scratch: Optional[tempfile.TemporaryDirectory[str]] = None
     try:
+        if source_is_archive:
+            scratch = tempfile.TemporaryDirectory(prefix="flatten_repo_")
+            logging.info("Extracting %s", source.name)
+            repo_root = extract_archive(source, Path(scratch.name))
+        else:
+            repo_root = source
+
+        output_dir = resolve_output_dir(args.output_dir, repo_root, source_is_archive)
         manifest_path = flatten_repo(
             repo_root=repo_root,
             output_dir=output_dir,
+            source_label=str(source),
             mode=args.mode,
             name_style=args.name_style,
             exclude_top_level=args.exclude,
             include_extensions=args.extensions,
             max_file_bytes=args.max_bytes,
-            use_git=args.use_git,
+            use_git=args.use_git and not source_is_archive,
             clean_output=args.clean_output,
         )
     except ValueError as exc:
@@ -669,6 +776,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except OSError as exc:
         logging.error("File system error: %s", exc)
         return 1
+    finally:
+        if scratch is not None:
+            scratch.cleanup()
 
     logging.info("Manifest: %s", manifest_path)
     logging.info("Done. Upload the folders in %s to your project.", output_dir)
