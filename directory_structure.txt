@@ -21,6 +21,7 @@ transit_planning_with_python/
 │   ├── check_style.py
 │   ├── export_repo_file_tree.py
 │   ├── export_requirements.py
+│   ├── flatten_repo_for_llm.py
 │   ├── generate_mock_bikeshare_trips.py
 │   ├── generate_mock_gtfs.py
 │   ├── generate_mock_points_of_interest.py
