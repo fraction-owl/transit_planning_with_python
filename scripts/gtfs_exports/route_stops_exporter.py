@@ -20,8 +20,8 @@ Inputs
 ------
 - A GTFS feed folder or ``.zip`` containing ``routes.txt``, ``trips.txt``,
   ``stop_times.txt``, and ``stops.txt``.
-- ``ROUTE_TOKENS`` and/or ``ROUTE_TOKENS_FILE`` (one token per line, ``#``
-  comments allowed): the routes to export. Each token is matched against
+- ``ROUTE_NAMES`` and/or ``ROUTE_NAMES_FILE`` (one name per line, ``#``
+  comments allowed): the routes to export. Each name is matched against
   ``route_short_name`` first and ``route_id`` second.
 - Optional ``SERVICE_IDS`` to restrict the trips considered to particular
   calendars (e.g. weekday only).
@@ -38,7 +38,7 @@ Outputs
 
 Typical usage
 -------------
-Update the paths and ``ROUTE_TOKENS`` in the CONFIGURATION section (or pass
+Update the paths and ``ROUTE_NAMES`` in the CONFIGURATION section (or pass
 ``--gtfs-dir`` / ``--output-dir`` / ``--routes``) and run from a shell,
 ArcGIS Pro's Python window, or a Jupyter notebook.
 """
@@ -65,13 +65,13 @@ import pandas as pd
 GTFS_DIR: Path = Path(r"Path\To\Your\GTFS_Folder")  # ←–– change me
 OUTPUT_DIR: Path = Path(r"Path\To\Your\Output_Folder")  # ←–– change me
 
-# Routes to export. Each token is matched against route_short_name first and
-# route_id second, so either form works (e.g. "101" or "101-WKD-2025").
-ROUTE_TOKENS: List[str] = ["101", "102"]  # ←–– change me
+# Routes to export, e.g. ["101", "102"]. Each name is matched against
+# route_short_name first and route_id second, so either form works.
+ROUTE_NAMES: List[str] = []  # ←–– change me
 
-# Optional text file with one route token per line ('#' starts a comment).
-# Its tokens are unioned with ROUTE_TOKENS. None or "" to skip.
-ROUTE_TOKENS_FILE: Optional[str] = None
+# Optional text file with one route name per line ('#' starts a comment).
+# Its names are unioned with ROUTE_NAMES. None or "" to skip.
+ROUTE_NAMES_FILE: Optional[str] = None
 
 # Optional service_id filter (values from trips.txt). Leave empty to consider
 # every calendar; set e.g. ["WKD"] to list only the stops served on weekdays.
@@ -361,20 +361,20 @@ def route_label(route_short_name: str, route_id: str) -> str:
     return short if short and short.lower() != "nan" else str(route_id).strip()
 
 
-def identify_target_route_ids(routes: pd.DataFrame, tokens: set[str]) -> tuple[set[str], set[str]]:
-    """Resolve route tokens to route_id values.
+def identify_target_route_ids(routes: pd.DataFrame, names: set[str]) -> tuple[set[str], set[str]]:
+    """Resolve route names to route_id values.
 
-    Each token is compared (trimmed) against ``route_short_name`` first and
-    ``route_id`` second, so a token that names a short name shared by several
+    Each name is compared (trimmed) against ``route_short_name`` first and
+    ``route_id`` second, so a name that names a short name shared by several
     ``route_id`` values (a common pattern for per-calendar route ids) selects
     all of them.
 
     Args:
         routes: The routes.txt table (string columns).
-        tokens: Route tokens to resolve.
+        names: Route names to resolve.
 
     Returns:
-        A tuple ``(matched_route_ids, unmatched_tokens)``.
+        A tuple ``(matched_route_ids, unmatched_names)``.
     """
     route_ids = routes["route_id"].astype(str).str.strip()
     if "route_short_name" in routes.columns:
@@ -384,10 +384,10 @@ def identify_target_route_ids(routes: pd.DataFrame, tokens: set[str]) -> tuple[s
 
     matched: set[str] = set()
     unmatched: set[str] = set()
-    for token in sorted(tokens):
-        hits = route_ids[(short_names == token) | (route_ids == token)]
+    for name in sorted(names):
+        hits = route_ids[(short_names == name) | (route_ids == name)]
         if hits.empty:
-            unmatched.add(token)
+            unmatched.add(name)
         else:
             matched.update(hits.tolist())
     return matched, unmatched
@@ -629,8 +629,8 @@ def write_run_log(output_dir: Path, summary_lines: List[str]) -> bool:
 def run(
     gtfs_dir: Path | None = None,
     output_dir: Path | None = None,
-    route_tokens: Optional[Sequence[str]] = None,
-    route_tokens_file: Optional[str] = None,
+    route_names: Optional[Sequence[str]] = None,
+    route_names_file: Optional[str] = None,
     service_ids: Optional[Sequence[str]] = None,
     platform_stops_only: Optional[bool] = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -642,8 +642,8 @@ def run(
     Args:
         gtfs_dir: GTFS feed folder or ``.zip``.
         output_dir: Folder for the CSVs and run-log sidecar.
-        route_tokens: Route short names and/or ids to export.
-        route_tokens_file: Optional text file of route tokens (one per line).
+        route_names: Route short names and/or ids to export.
+        route_names_file: Optional text file of route names (one per line).
         service_ids: Calendars to keep; empty/None per config = all.
         platform_stops_only: Keep only ``location_type`` 0/blank stops.
 
@@ -653,21 +653,21 @@ def run(
     Raises:
         OSError: If the feed is missing files, or the run log is required but
             cannot be written.
-        ValueError: If no route token matches the feed, no trips match the
+        ValueError: If no route name matches the feed, no trips match the
             service filter, or the selected routes serve no kept stops.
     """
     gtfs_dir = GTFS_DIR if gtfs_dir is None else Path(gtfs_dir)
     output_dir = OUTPUT_DIR if output_dir is None else Path(output_dir)
-    route_tokens = ROUTE_TOKENS if route_tokens is None else route_tokens
-    route_tokens_file = ROUTE_TOKENS_FILE if route_tokens_file is None else route_tokens_file
+    route_names = ROUTE_NAMES if route_names is None else route_names
+    route_names_file = ROUTE_NAMES_FILE if route_names_file is None else route_names_file
     service_ids = SERVICE_IDS if service_ids is None else service_ids
     platform_stops_only = (
         PLATFORM_STOPS_ONLY if platform_stops_only is None else platform_stops_only
     )
 
-    tokens = load_id_set(route_tokens, route_tokens_file or None, kind="route")
-    if not tokens:
-        raise ValueError("No route tokens given — set ROUTE_TOKENS / ROUTE_TOKENS_FILE.")
+    names = load_id_set(route_names, route_names_file or None, kind="route")
+    if not names:
+        raise ValueError("No route names given — set ROUTE_NAMES / ROUTE_NAMES_FILE.")
     service_id_set = {str(s).strip() for s in service_ids if str(s).strip()}
 
     gtfs = load_gtfs_data(str(gtfs_dir), files=REQUIRED_GTFS_FILES)
@@ -678,21 +678,21 @@ def run(
         gtfs["stops"],
     )
 
-    target_route_ids, unmatched = identify_target_route_ids(routes, tokens)
+    target_route_ids, unmatched = identify_target_route_ids(routes, names)
     if unmatched:
         logging.warning(
-            "%d route token(s) matched no route_short_name or route_id and were skipped: %s",
+            "%d route name(s) matched no route_short_name or route_id and were skipped: %s",
             len(unmatched),
             ", ".join(sorted(unmatched)),
         )
     if not target_route_ids:
         raise ValueError(
-            f"None of the route tokens {sorted(tokens)} matched a route_short_name or "
+            f"None of the route names {sorted(names)} matched a route_short_name or "
             "route_id in routes.txt."
         )
     logging.info(
-        "Resolved %d token(s) to %d route_id(s): %s",
-        len(tokens) - len(unmatched),
+        "Resolved %d name(s) to %d route_id(s): %s",
+        len(names) - len(unmatched),
         len(target_route_ids),
         ", ".join(sorted(target_route_ids)),
     )
@@ -730,8 +730,8 @@ def run(
 
     summary_lines = [
         f"GTFS feed:          {gtfs_dir}",
-        f"Route tokens:       {', '.join(sorted(tokens))}",
-        f"Unmatched tokens:   {', '.join(sorted(unmatched)) or '-'}",
+        f"Route names:        {', '.join(sorted(names))}",
+        f"Unmatched names:    {', '.join(sorted(unmatched)) or '-'}",
         f"Resolved route_ids: {', '.join(sorted(target_route_ids))}",
         f"Service filter:     {', '.join(sorted(service_id_set)) or 'all service_ids'}",
         f"Platform stops only: {platform_stops_only}",
@@ -777,14 +777,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--routes",
         nargs="*",
-        default=ROUTE_TOKENS,
+        default=ROUTE_NAMES,
         metavar="ROUTE",
         help="Route short names and/or route_ids to export.",
     )
     parser.add_argument(
         "--routes-file",
-        default=ROUTE_TOKENS_FILE,
-        help="Text file of route tokens, one per line ('#' comments allowed).",
+        default=ROUTE_NAMES_FILE,
+        help="Text file of route names, one per line ('#' comments allowed).",
     )
     parser.add_argument(
         "--service-ids",
@@ -827,12 +827,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             "block or pass --gtfs-dir/--output-dir before running."
         )
         return 2
+    if not args.routes and not args.routes_file:
+        logging.warning(
+            "No routes selected. Fill in ROUTE_NAMES (or ROUTE_NAMES_FILE) in the "
+            "configuration block, or pass --routes/--routes-file."
+        )
+        return 2
     try:
         run(
             gtfs_dir=args.gtfs_dir,
             output_dir=args.output_dir,
-            route_tokens=args.routes,
-            route_tokens_file=args.routes_file,
+            route_names=args.routes,
+            route_names_file=args.routes_file,
             service_ids=args.service_ids,
             platform_stops_only=args.platform_stops_only,
         )

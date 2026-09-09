@@ -80,7 +80,7 @@ def _write_feed(parent: Path, name: str = "feed", zipped: bool = False) -> Path:
 def test_detail_and_unique_tables_for_one_route(tmp_path: Path) -> None:
     feed = _write_feed(tmp_path)
     out = tmp_path / "out"
-    detail, unique = target.run(gtfs_dir=feed, output_dir=out, route_tokens=["10"])
+    detail, unique = target.run(gtfs_dir=feed, output_dir=out, route_names=["10"])
 
     # One row per (direction, stop): 3 outbound + 3 inbound.
     assert len(detail) == 6
@@ -114,13 +114,13 @@ def test_detail_and_unique_tables_for_one_route(tmp_path: Path) -> None:
     assert runlog.exists()
     text = runlog.read_text(encoding="utf-8")
     assert "# === BEGIN CONFIG ===" in text
-    assert "Route tokens:       10" in text
+    assert "Route names:        10" in text
 
 
-def test_multiple_routes_platform_filter_and_route_id_tokens(tmp_path: Path) -> None:
+def test_multiple_routes_platform_filter_and_route_id_names(tmp_path: Path) -> None:
     feed = _write_feed(tmp_path)
     detail, unique = target.run(
-        gtfs_dir=feed, output_dir=tmp_path / "out", route_tokens=["10", "R20"]
+        gtfs_dir=feed, output_dir=tmp_path / "out", route_names=["10", "R20"]
     )
     # Station STN is dropped by the platform filter.
     assert "STN" not in set(detail["stop_id"])
@@ -137,7 +137,7 @@ def test_non_platform_stops_kept_when_filter_off(tmp_path: Path) -> None:
     detail, _ = target.run(
         gtfs_dir=feed,
         output_dir=tmp_path / "out",
-        route_tokens=["20"],
+        route_names=["20"],
         platform_stops_only=False,
     )
     assert list(detail["stop_id"]) == ["B", "D", "STN"]
@@ -146,7 +146,7 @@ def test_non_platform_stops_kept_when_filter_off(tmp_path: Path) -> None:
 def test_service_id_filter_limits_trips_and_other_routes(tmp_path: Path) -> None:
     feed = _write_feed(tmp_path)
     detail, unique = target.run(
-        gtfs_dir=feed, output_dir=tmp_path / "out", route_tokens=["20"], service_ids=["WKD"]
+        gtfs_dir=feed, output_dir=tmp_path / "out", route_names=["20"], service_ids=["WKD"]
     )
     assert set(detail["stop_id"]) == {"B", "D"}
     by_stop = unique.set_index("stop_id")
@@ -158,21 +158,21 @@ def test_service_id_filter_limits_trips_and_other_routes(tmp_path: Path) -> None
         target.run(
             gtfs_dir=feed,
             output_dir=tmp_path / "out2",
-            route_tokens=["10"],
+            route_names=["10"],
             service_ids=["NOPE"],
         )
 
 
-def test_routes_file_and_unmatched_token_warning(tmp_path: Path, caplog) -> None:
+def test_routes_file_and_unmatched_names_warning(tmp_path: Path, caplog) -> None:
     feed = _write_feed(tmp_path, zipped=True)
-    tokens_file = tmp_path / "routes.txt"
-    tokens_file.write_text("# my routes\n10  # main street\n\n999\n", encoding="utf-8")
+    names_file = tmp_path / "routes.txt"
+    names_file.write_text("# my routes\n10  # main street\n\n999\n", encoding="utf-8")
     with caplog.at_level(logging.WARNING):
         detail, _ = target.run(
             gtfs_dir=feed,
             output_dir=tmp_path / "out",
-            route_tokens=[],
-            route_tokens_file=str(tokens_file),
+            route_names=[],
+            route_names_file=str(names_file),
         )
     assert set(detail["route_id"]) == {"R10"}
     assert "999" in caplog.text
@@ -181,7 +181,7 @@ def test_routes_file_and_unmatched_token_warning(tmp_path: Path, caplog) -> None
 def test_no_matching_route_raises(tmp_path: Path) -> None:
     feed = _write_feed(tmp_path)
     with pytest.raises(ValueError, match="matched"):
-        target.run(gtfs_dir=feed, output_dir=tmp_path / "out", route_tokens=["999"])
+        target.run(gtfs_dir=feed, output_dir=tmp_path / "out", route_names=["999"])
 
 
 def test_identify_target_route_ids_matches_short_name_then_id() -> None:
@@ -198,6 +198,13 @@ def test_identify_target_route_ids_matches_short_name_then_id() -> None:
 
 def test_main_returns_2_on_placeholder_paths() -> None:
     assert target.main([]) == 2
+
+
+def test_main_returns_2_when_no_routes_selected(tmp_path: Path) -> None:
+    feed = _write_feed(tmp_path)
+    rc = target.main(["--gtfs-dir", str(feed), "--output-dir", str(tmp_path / "out")])
+    assert rc == 2
+    assert not (tmp_path / "out").exists()
 
 
 def test_main_cli_flags_run_end_to_end(tmp_path: Path) -> None:
@@ -222,6 +229,13 @@ def test_main_cli_flags_run_end_to_end(tmp_path: Path) -> None:
 
 def test_main_returns_1_on_bad_feed(tmp_path: Path) -> None:
     rc = target.main(
-        ["--gtfs-dir", str(tmp_path / "missing"), "--output-dir", str(tmp_path / "out")]
+        [
+            "--gtfs-dir",
+            str(tmp_path / "missing"),
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--routes",
+            "10",
+        ]
     )
     assert rc == 1
