@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import shutil
+import sys
+import types
 import zipfile
 from pathlib import Path
 
@@ -239,3 +241,63 @@ def test_main_returns_1_on_bad_feed(tmp_path: Path) -> None:
         ]
     )
     assert rc == 1
+
+
+class _FakeIPython:
+    def __init__(self, cells: list[str], **user_ns: str) -> None:
+        self.user_ns: dict[str, object] = {"In": cells, **user_ns}
+
+
+def _fake_ipython_module(ip: _FakeIPython | None) -> types.ModuleType:
+    module = types.ModuleType("IPython")
+    module.get_ipython = lambda: ip  # type: ignore[attr-defined]
+    return module
+
+
+def test_run_log_reads_config_from_notebook_cell_without_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    feed = _write_feed(tmp_path)
+    source = Path(target.__file__).read_text(encoding="utf-8")
+    cell = source.replace("ROUTE_NAMES: List[str] = []", 'ROUTE_NAMES: List[str] = ["from-cell"]')
+    assert cell != source
+    ip = _FakeIPython(["print(1)", cell, "run()"], __session__="C:/notebooks/stops.ipynb")
+    monkeypatch.setitem(sys.modules, "IPython", _fake_ipython_module(ip))
+    monkeypatch.delattr(target, "__file__")  # what a pasted-into-a-cell script sees
+
+    out = tmp_path / "out"
+    target.run(gtfs_dir=feed, output_dir=out, route_names=["10"])
+    text = (out / target.RUN_LOG_FILENAME).read_text(encoding="utf-8")
+    assert 'ROUTE_NAMES: List[str] = ["from-cell"]' in text
+    assert "Source script:    C:/notebooks/stops.ipynb" in text
+
+
+def test_run_log_falls_back_to_file_when_kernel_has_no_config_cell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    feed = _write_feed(tmp_path)
+    ip = _FakeIPython(["%run route_stops_exporter.py"])
+    monkeypatch.setitem(sys.modules, "IPython", _fake_ipython_module(ip))
+    out = tmp_path / "out"
+    target.run(gtfs_dir=feed, output_dir=out, route_names=["10"])
+    text = (out / target.RUN_LOG_FILENAME).read_text(encoding="utf-8")
+    assert "ROUTE_NAMES: List[str] = []" in text
+    assert str(Path(target.__file__).resolve()) in text
+
+
+def test_no_config_source_aborts_before_writing_outputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    feed = _write_feed(tmp_path)
+    monkeypatch.setitem(sys.modules, "IPython", _fake_ipython_module(None))
+    monkeypatch.delattr(target, "__file__")
+    out = tmp_path / "out"
+    with pytest.raises(OSError, match="REQUIRE_RUN_LOG"):
+        target.run(gtfs_dir=feed, output_dir=out, route_names=["10"])
+    assert not (out / target.DETAIL_FILENAME).exists()
+
+    monkeypatch.setattr(target, "REQUIRE_RUN_LOG", False)
+    detail, _ = target.run(gtfs_dir=feed, output_dir=out, route_names=["10"])
+    assert len(detail) == 6
+    text = (out / target.RUN_LOG_FILENAME).read_text(encoding="utf-8")
+    assert "config block unavailable" in text

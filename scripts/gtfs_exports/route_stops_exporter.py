@@ -34,7 +34,9 @@ Outputs
   routes, with ``selected_routes`` and ``other_routes`` (routes outside the
   selection that also serve the stop under the same service filter).
 - ``route_stops_exporter_runlog.txt``: run-log sidecar capturing the verbatim
-  CONFIGURATION block plus a run summary.
+  CONFIGURATION block plus a run summary. In a notebook (including ArcGIS
+  Pro) the block is read from the cell that was run, so pasting the whole
+  script into a cell still produces a faithful log.
 
 Typical usage
 -------------
@@ -60,6 +62,10 @@ import pandas as pd
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+
+CONFIG_BEGIN_MARKER: str = "# === BEGIN CONFIG ==="
+CONFIG_END_MARKER: str = "# === END CONFIG ==="
+
 # === BEGIN CONFIG ===
 
 GTFS_DIR: Path = Path(r"Path\To\Your\GTFS_Folder")  # ←–– change me
@@ -578,26 +584,113 @@ def build_unique_stop_table(
     return unique
 
 
-def write_run_log(output_dir: Path, summary_lines: List[str]) -> bool:
+def _extract_config_from_text(source_text: str, source_label: str) -> str:
+    """Return the text between the CONFIG markers in *source_text*.
+
+    Same slicing as :func:`extract_config_block`, for source that is already
+    in memory (a notebook cell) rather than on disk.
+
+    Raises:
+        ValueError: If either marker is missing or they appear out of order.
+    """
+    lines = source_text.splitlines()
+    begin_idx: Optional[int] = None
+    end_idx: Optional[int] = None
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if begin_idx is None and stripped == CONFIG_BEGIN_MARKER:
+            begin_idx = i
+        elif begin_idx is not None and stripped == CONFIG_END_MARKER:
+            end_idx = i
+            break
+    if begin_idx is None or end_idx is None:
+        raise ValueError(
+            f"Config markers not found in '{source_label}'. "
+            f"Expected '{CONFIG_BEGIN_MARKER}' and '{CONFIG_END_MARKER}'."
+        )
+    return "\n".join(lines[begin_idx + 1 : end_idx])
+
+
+def _notebook_path(ip: Any) -> Optional[str]:
+    """Return the notebook file path from the IPython kernel namespace, or None.
+
+    Tries the known frontend-specific variables in order:
+      * ``__vsc_ipynb_file__``  – VS Code / Pylance Jupyter extension
+      * ``__session__``         – JupyterLab ≥ 4 kernel session path
+
+    Returns None when running in an environment that doesn't expose a path
+    (ArcGIS Pro notebooks, classic Notebook, plain IPython console, etc.).
+    """
+    for var in ("__vsc_ipynb_file__", "__session__"):
+        val = ip.user_ns.get(var)
+        if val:
+            return str(val)
+    return None
+
+
+def resolve_config_source() -> tuple[str, str]:
+    """Return ``(config_text, source_label)`` for the running configuration.
+
+    Resolution order:
+
+    1. **Jupyter / IPython kernel** (including ArcGIS Pro notebooks) – walks
+       the ``In`` cell history in reverse and uses the most recent cell that
+       contains both CONFIG markers, so pasting this whole script into a cell
+       still yields a faithful run log. ``__file__`` does not exist in a
+       kernel, which is why this comes first.
+    2. **Plain script / imported module** – reads ``__file__``.
+
+    Raises:
+        RuntimeError: If neither source can be located.
+        ValueError: If the located source has no CONFIG markers.
+        OSError: If the source file cannot be read.
+    """
+    # IPython registers itself in sys.modules when a kernel starts; avoid a
+    # direct import so the dependency stays optional. get_ipython() returns
+    # None outside a live kernel.
+    _ipython = sys.modules.get("IPython")
+    ip = _ipython.get_ipython() if _ipython is not None else None  # type: ignore[attr-defined]
+    if ip is not None:
+        history: List[str] = ip.user_ns.get("In", [])
+        for cell in reversed(history):
+            if CONFIG_BEGIN_MARKER in cell and CONFIG_END_MARKER in cell:
+                label = _notebook_path(ip) or "<Jupyter cell>"
+                return _extract_config_from_text(cell, label), label
+
+    file_attr: Optional[str] = globals().get("__file__")
+    if file_attr is not None:
+        source_path = Path(file_attr).resolve()
+        return extract_config_block(source_path), str(source_path)
+
+    raise RuntimeError(
+        "Cannot locate the script source for the run log: __file__ is not defined "
+        "and no notebook cell containing the CONFIG markers was found. Run the cell "
+        "that holds the CONFIGURATION block (or the whole script) before writing output."
+    )
+
+
+def write_run_log(
+    output_dir: Path, summary_lines: List[str], config_text: str, source_label: str
+) -> bool:
     """Write the verbatim config block plus a run summary into *output_dir*.
+
+    Args:
+        output_dir: Folder that receives ``RUN_LOG_FILENAME``.
+        summary_lines: Human-readable lines describing this run.
+        config_text: The CONFIG block, from :func:`resolve_config_source`.
+        source_label: Where the config came from (file path or notebook).
 
     Returns:
         ``True`` if the log was written successfully, ``False`` otherwise.
     """
     log_path = output_dir / RUN_LOG_FILENAME
-    try:
-        config_text = extract_config_block(Path(__file__))
-    except (OSError, ValueError) as exc:
-        logging.error("Could not extract config block for run log: %s", exc)
-        return False
-
     lines: List[str] = [
         "=" * 72,
         "ROUTE STOPS EXPORTER RUN LOG",
         "=" * 72,
         f"Run timestamp:    {datetime.now().isoformat(timespec='seconds')}",
         f"Output directory: {output_dir}",
-        f"Source script:    {Path(__file__).resolve()}",
+        f"Source script:    {source_label}",
         "",
         "-" * 72,
         "RUN SUMMARY",
@@ -607,9 +700,9 @@ def write_run_log(output_dir: Path, summary_lines: List[str]) -> bool:
         "-" * 72,
         "CONFIGURATION (verbatim)",
         "-" * 72,
-        "# === BEGIN CONFIG ===",
+        CONFIG_BEGIN_MARKER,
         config_text,
-        "# === END CONFIG ===",
+        CONFIG_END_MARKER,
         "",
     ]
     try:
@@ -664,6 +757,17 @@ def run(
     platform_stops_only = (
         PLATFORM_STOPS_ONLY if platform_stops_only is None else platform_stops_only
     )
+
+    # Locate the CONFIG block first so an untraceable run aborts before any
+    # output is written (REQUIRE_RUN_LOG), not after.
+    try:
+        config_text, source_label = resolve_config_source()
+    except (OSError, ValueError, RuntimeError) as exc:
+        if REQUIRE_RUN_LOG:
+            raise OSError(f"Run log source unavailable and REQUIRE_RUN_LOG is True: {exc}") from exc
+        logging.warning("Run log will not record the configuration: %s", exc)
+        config_text = "(config block unavailable — see warning in the console log)"
+        source_label = "<unknown>"
 
     names = load_id_set(route_names, route_names_file or None, kind="route")
     if not names:
@@ -740,7 +844,7 @@ def run(
         f"Detail CSV:         {detail_path}",
         f"Unique-stop CSV:    {unique_path}",
     ]
-    if not write_run_log(output_dir, summary_lines) and REQUIRE_RUN_LOG:
+    if not write_run_log(output_dir, summary_lines, config_text, source_label) and REQUIRE_RUN_LOG:
         raise OSError(
             f"Run log could not be written to '{output_dir}' and REQUIRE_RUN_LOG is True."
         )
