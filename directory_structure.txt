@@ -59,6 +59,7 @@ transit_planning_with_python/
 │   │   ├── gtfs_to_shapefile_arcpy.py
 │   │   ├── gtfs_to_shapefile_gpd.py
 │   │   ├── headway_span_exporter.py
+│   │   ├── route_stops_exporter.py
 │   │   ├── route_transfer_calculator.py
 │   │   ├── segment_speed_exporter.py
 │   │   ├── stop_pattern_exporter.py
@@ -271,6 +272,7 @@ transit_planning_with_python/
 │   ├── test_ridership_ml_model.py
 │   ├── test_route_direction_classifier.py
 │   ├── test_route_performance_model.py
+│   ├── test_route_stops_exporter.py
 │   ├── test_route_transfer_calculator.py
 │   ├── test_runtime_by_route.py
 │   ├── test_runtime_by_segment.py
