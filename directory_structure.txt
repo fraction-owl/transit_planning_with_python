@@ -116,6 +116,8 @@ transit_planning_with_python/
 │   │   ├── points_of_interest_coverage_gpd.py
 │   │   ├── private_shuttle_coverage_by_route_arcpy.py
 │   │   ├── private_shuttle_coverage_by_route_gpd.py
+│   │   ├── route_redundancy_profile_arcpy.py
+│   │   ├── route_redundancy_profile_gpd.py
 │   │   ├── school_coverage_by_route_arcpy.py
 │   │   ├── school_coverage_by_route_gpd.py
 │   │   ├── site_route_proximity_arcpy.py
