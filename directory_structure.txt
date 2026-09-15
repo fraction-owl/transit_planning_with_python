@@ -30,6 +30,7 @@ transit_planning_with_python/
 │   └── lint_pr.py
 ├── scripts/
 │   ├── facilities_tools/
+│   │   ├── bay_change_sweep.py
 │   │   ├── bay_usage_analyzer.py
 │   │   ├── flag_stop_upgrades.py
 │   │   └── stop_improvement_coverage_summary.py
@@ -216,6 +217,7 @@ transit_planning_with_python/
 │   │   ├── tl_2025_51_tabblock20_sample.zip
 │   │   ├── trips_performed.csv
 │   │   └── va_wac_S000_JT00_2023.csv.gz
+│   ├── test_bay_change_sweep.py
 │   ├── test_bay_usage_analyzer.py
 │   ├── test_bikeshare_ridership_trends.py
 │   ├── test_block_status_timeline_exporter.py
