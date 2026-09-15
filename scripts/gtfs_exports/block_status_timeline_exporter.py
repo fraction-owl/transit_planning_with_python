@@ -93,7 +93,7 @@ MAX_TRIPS_PER_BLOCK = 150
 # give a date (YYYYMMDD): every service_id active on that date per calendar.txt
 # and calendar_dates.txt is used. Leave both empty to process every trip in
 # the feed regardless of service.
-CALENDAR_SERVICE_IDS: list[str] = ["3"]
+CALENDAR_SERVICE_IDS: list[str] = ["4"]
 SERVICE_DATE = ""
 
 # Scenario testing: move a route's visits from one stop (bay) to another before
