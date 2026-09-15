@@ -44,6 +44,8 @@ Outputs
   "Packages" and "Package finalists" (a beam search over singles and the
   best pairs, up to ``MAX_CHANGES_PER_PACKAGE`` steps); "Rejected"
   (infeasible or non-improving changes and why); and "Config used".
+- A ``_runlog.txt`` sidecar next to each workbook capturing the verbatim
+  CONFIGURATION block.
 
 Typical usage
 -------------
@@ -59,6 +61,8 @@ from __future__ import annotations
 import logging
 import os
 from collections import defaultdict
+from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -68,6 +72,7 @@ from pandas import DataFrame
 # ==================================================================================================
 # CONFIGURATION
 # ==================================================================================================
+# === BEGIN CONFIG ===
 
 # --- Inputs ---------------------------------------------------------------------------------------
 # One Step 1 scenario folder per standard. Every candidate is scored on all of
@@ -141,7 +146,13 @@ BEAM_WIDTH = 8  # partial packages kept alive at each step
 ENUMERATE_PAIRS = True  # score every compatible pair of feasible singles
 TOP_N = 30
 
+# Every output must be traceable: a failed run-log write aborts the script.
+# Set to False only when writing to a genuinely read-only location.
+REQUIRE_RUN_LOG: bool = True
+
 LOG_LEVEL = logging.INFO
+
+# === END CONFIG ===
 
 # Statuses (from Step 1)
 BAY_STATUSES = {"ARRIVE", "DEPART", "ARRIVE/DEPART", "LOADING", "DWELL"}
@@ -505,6 +516,7 @@ def run_discover() -> str:
         stub,
     )
     logging.info("Discover workbook written to %s", out_path)
+    require_run_log(write_run_log(Path(out_path)))
     return out_path
 
 
@@ -1069,7 +1081,126 @@ def run_sweep() -> str:
             writer, sheet_name="Config used", index=False
         )
     logging.info("Sweep workbook for %s written to %s", CLUSTER_NAME, out_path)
+    require_run_log(write_run_log(Path(out_path)))
     return out_path
+
+
+# --------------------------------------------------------------------------------------------------
+# RUN LOG
+# --------------------------------------------------------------------------------------------------
+
+
+class RunLogError(RuntimeError):
+    """Raised when the required ``_runlog.txt`` sidecar could not be written."""
+
+
+# Canonical version lives in utils/run_log.py -- keep this copy in sync.
+def extract_config_block(source_file: Path) -> str:
+    r"""Return the text between the CONFIG markers in *source_file*.
+
+    Reads ``source_file`` as UTF-8 text and slices out the lines strictly
+    *between* the first occurrence of ``# === BEGIN CONFIG ===`` and the first
+    subsequent occurrence of ``# === END CONFIG ===``.  The marker lines
+    themselves are excluded; whitespace and inline comments inside the block
+    are preserved verbatim.
+
+    Args:
+        source_file: Path to the Python source file to scan (typically
+            ``Path(__file__)`` from the calling script).
+
+    Returns:
+        The verbatim text of the configuration block, joined with ``\n``.
+
+    Raises:
+        ValueError: If either marker is missing or they appear out of order.
+        OSError: If ``source_file`` cannot be read.
+    """
+    _BEGIN = "# === BEGIN CONFIG ==="
+    _END = "# === END CONFIG ==="
+
+    lines: list[str] = source_file.read_text(encoding="utf-8").splitlines()
+
+    begin_idx: int | None = None
+    end_idx: int | None = None
+    for i, line in enumerate(lines):
+        stripped: str = line.strip()
+        if begin_idx is None and stripped == _BEGIN:
+            begin_idx = i
+        elif begin_idx is not None and stripped == _END:
+            end_idx = i
+            break
+
+    if begin_idx is None or end_idx is None:
+        raise ValueError(
+            f"Config markers not found in '{source_file}'. Expected '{_BEGIN}' and '{_END}'."
+        )
+
+    return "\n".join(lines[begin_idx + 1 : end_idx])
+
+
+def resolve_source_file() -> Optional[Path]:
+    """Path of this script on disk, or ``None`` in an interactive session without ``__file__``."""
+    try:
+        return Path(__file__).resolve()
+    except NameError:
+        return None
+
+
+def write_run_log(output_file: Path) -> bool:
+    """Write the ``_runlog.txt`` sidecar for *output_file* (same folder, same stem).
+
+    The log captures this script's CONFIGURATION block verbatim, between the
+    ``# === BEGIN CONFIG ===`` / ``# === END CONFIG ===`` markers, so it can
+    never drift from the values actually used.
+
+    Returns:
+        ``True`` if the log was written successfully, ``False`` otherwise.
+    """
+    log_path = output_file.with_name(f"{output_file.stem}_runlog.txt")
+
+    source_file = resolve_source_file()
+    if source_file is None:
+        config_text = "(config block unavailable: interactive session, no __file__ on disk)"
+        source_display = "<interactive>"
+    else:
+        try:
+            config_text = extract_config_block(source_file)
+        except (OSError, ValueError) as exc:
+            logging.error("Could not extract config block for run log: %s", exc)
+            return False
+        source_display = str(source_file)
+
+    lines: List[str] = [
+        "=" * 72,
+        "BAY CHANGE SWEEP RUN LOG",
+        "=" * 72,
+        f"Run timestamp:    {datetime.now().isoformat(timespec='seconds')}",
+        f"Output file:      {output_file}",
+        f"Source script:    {source_display}",
+        "",
+        "-" * 72,
+        "CONFIGURATION (verbatim from source)",
+        "-" * 72,
+        config_text,
+        "=" * 72,
+    ]
+
+    try:
+        log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except OSError as exc:
+        logging.error("Error writing run log: %s", exc)
+        return False
+    logging.info("Run log saved to %s", log_path)
+    return True
+
+
+def require_run_log(written: bool) -> None:
+    """Raise :class:`RunLogError` when a run log failed and ``REQUIRE_RUN_LOG`` is set."""
+    if not written and REQUIRE_RUN_LOG:
+        raise RunLogError(
+            "Run log could not be written. Set REQUIRE_RUN_LOG = False to suppress this "
+            "error when a sidecar file is genuinely impossible."
+        )
 
 
 # ==================================================================================================
@@ -1092,8 +1223,9 @@ def main() -> int:
     """Run the discover pass or the sweep, depending on ``DISCOVER_ONLY``.
 
     Returns:
-        Process exit code: 0 on success, 2 if required CONFIGURATION values
-        are still placeholders or a Step 1 folder does not exist.
+        Process exit code: 0 on success, 1 if the required run log could not
+        be written, 2 if required CONFIGURATION values are still placeholders
+        or a Step 1 folder does not exist.
     """
     logging.basicConfig(
         level=LOG_LEVEL,
@@ -1118,10 +1250,14 @@ def main() -> int:
             ", ".join(missing),
         )
         return 2
-    if DISCOVER_ONLY:
-        run_discover()
-    else:
-        run_sweep()
+    try:
+        if DISCOVER_ONLY:
+            run_discover()
+        else:
+            run_sweep()
+    except RunLogError as exc:
+        logging.error("%s", exc)
+        return 1
     logging.info("Script completed successfully.")
     return 0
 

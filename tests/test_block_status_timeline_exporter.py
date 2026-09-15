@@ -438,6 +438,36 @@ def test_run_step1_writes_real_block_workbooks(
     assumptions = (tmp_path / mod.ASSUMPTIONS_FILE).read_text(encoding="utf-8")
     assert f"THROUGH_DWELL_MINUTES={mod.THROUGH_DWELL_MINUTES}" in assumptions
     assert "SERVICE_IDS_USED=['WKDY']" in assumptions
+    # The run-log sidecar carries the CONFIGURATION block verbatim from the source.
+    run_log = (tmp_path / mod.RUN_LOG_FILENAME).read_text(encoding="utf-8")
+    assert "CONFIGURATION (verbatim from source)" in run_log
+    assert "IN_BAY_LAYOVER_MAX_MINUTES = 10" in run_log
+    assert "# === BEGIN CONFIG ===" not in run_log  # markers themselves are excluded
+
+
+def _point_at_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fixture = Path(__file__).parent / "fixtures" / "gtfs_basic"
+    monkeypatch.setattr(mod, "GTFS_FOLDER_PATH", str(fixture))
+    monkeypatch.setattr(mod, "BLOCK_OUTPUT_FOLDER", str(tmp_path))
+    monkeypatch.setattr(mod, "CALENDAR_SERVICE_IDS", ["WKDY"])
+    monkeypatch.setattr(mod, "WRITE_PER_BLOCK_FILES", False)
+
+
+def test_main_returns_1_when_required_run_log_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _point_at_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(mod, "write_run_log", lambda output_dir: False)
+    monkeypatch.setattr(mod, "REQUIRE_RUN_LOG", True)
+    assert mod.main() == 1
+    monkeypatch.setattr(mod, "REQUIRE_RUN_LOG", False)
+    assert mod.main() == 0
+
+
+def test_extract_config_block_matches_source() -> None:
+    block = mod.extract_config_block(Path(mod.__file__))
+    assert block.lstrip().startswith("GTFS_FOLDER_PATH")
+    assert "REQUIRE_RUN_LOG: bool = True" in block
 
 
 def test_run_step1_service_date_and_scenario_subfolder(

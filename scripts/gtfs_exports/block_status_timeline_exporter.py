@@ -35,6 +35,8 @@ Outputs
 - Optionally a single ``COMBINED_TIMELINE_FILE`` (CSV) holding every block's
   rows, which Step 2 can read directly instead of re-opening each workbook.
 - ``ASSUMPTIONS_FILE`` recording the parameters used for the run.
+- ``RUN_LOG_FILENAME``, a run-log sidecar in the same folder capturing the
+  verbatim CONFIGURATION block.
 
 Typical usage
 -------------
@@ -49,13 +51,16 @@ import logging
 import os
 import zipfile
 from collections.abc import Mapping, Sequence
-from typing import Any, Optional
+from datetime import datetime
+from pathlib import Path
+from typing import Any, List, Optional
 
 import pandas as pd
 
 # ==================================================================================================
 # CONFIGURATION
 # ==================================================================================================
+# === BEGIN CONFIG ===
 
 GTFS_FOLDER_PATH = r"your_GTFS_folder_path\here"
 BLOCK_OUTPUT_FOLDER = r"your_output_folder_path\here"
@@ -114,6 +119,7 @@ STOP_CODE_FILTER: list[str] = []
 WRITE_PER_BLOCK_FILES = True
 COMBINED_TIMELINE_FILE = r"all_blocks_timeline.csv"  # in the run folder; "" to skip
 ASSUMPTIONS_FILE = r"timeline_assumptions.txt"  # in the run folder; "" to skip
+RUN_LOG_FILENAME = r"block_status_timeline_exporter_runlog.txt"  # in the run folder
 
 CLUSTER_DEFINITIONS = {
     "Metro": {
@@ -140,7 +146,13 @@ BUS_STOP_CLUSTERS_STEP1 = [
     {"name": name, "stops": info["stops"]} for name, info in CLUSTER_DEFINITIONS.items()
 ]
 
+# Every output must be traceable: a failed run-log write aborts the script.
+# Set to False only when writing to a genuinely read-only location.
+REQUIRE_RUN_LOG: bool = True
+
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
+
+# === END CONFIG ===
 
 # ==================================================================================================
 # FUNCTIONS
@@ -993,6 +1005,7 @@ def run_step1_gtfs_to_blocks() -> None:
             handle.write(assumptions_text(service_ids))
         logging.info("Assumptions written to %s", assumptions_path)
 
+    require_run_log(write_run_log(Path(out_folder)))
     logging.info("\nStep 1 complete: All block-level spreadsheets generated.")
 
 
@@ -1015,6 +1028,126 @@ def assumptions_text(service_ids: Optional[Sequence[str]] = None) -> str:
         f"CLUSTER_DEFINITIONS={CLUSTER_DEFINITIONS}",
     ]
     return "\n".join(lines) + "\n"
+
+
+# --------------------------------------------------------------------------------------------------
+# RUN LOG
+# --------------------------------------------------------------------------------------------------
+
+
+class RunLogError(RuntimeError):
+    """Raised when the required ``_runlog.txt`` sidecar could not be written."""
+
+
+# Canonical version lives in utils/run_log.py -- keep this copy in sync.
+def extract_config_block(source_file: Path) -> str:
+    r"""Return the text between the CONFIG markers in *source_file*.
+
+    Reads ``source_file`` as UTF-8 text and slices out the lines strictly
+    *between* the first occurrence of ``# === BEGIN CONFIG ===`` and the first
+    subsequent occurrence of ``# === END CONFIG ===``.  The marker lines
+    themselves are excluded; whitespace and inline comments inside the block
+    are preserved verbatim.
+
+    Args:
+        source_file: Path to the Python source file to scan (typically
+            ``Path(__file__)`` from the calling script).
+
+    Returns:
+        The verbatim text of the configuration block, joined with ``\n``.
+
+    Raises:
+        ValueError: If either marker is missing or they appear out of order.
+        OSError: If ``source_file`` cannot be read.
+    """
+    _BEGIN = "# === BEGIN CONFIG ==="
+    _END = "# === END CONFIG ==="
+
+    lines: list[str] = source_file.read_text(encoding="utf-8").splitlines()
+
+    begin_idx: int | None = None
+    end_idx: int | None = None
+    for i, line in enumerate(lines):
+        stripped: str = line.strip()
+        if begin_idx is None and stripped == _BEGIN:
+            begin_idx = i
+        elif begin_idx is not None and stripped == _END:
+            end_idx = i
+            break
+
+    if begin_idx is None or end_idx is None:
+        raise ValueError(
+            f"Config markers not found in '{source_file}'. Expected '{_BEGIN}' and '{_END}'."
+        )
+
+    return "\n".join(lines[begin_idx + 1 : end_idx])
+
+
+def resolve_source_file() -> Optional[Path]:
+    """Path of this script on disk, or ``None`` in an interactive session without ``__file__``."""
+    try:
+        return Path(__file__).resolve()
+    except NameError:
+        return None
+
+
+def write_run_log(output_dir: Path) -> bool:
+    """Write the ``_runlog.txt`` sidecar for this run into *output_dir*.
+
+    The run writes many files (one workbook per block), so a single log named
+    after the script sits alongside them. It captures this script's
+    CONFIGURATION block verbatim, between the ``# === BEGIN CONFIG ===`` /
+    ``# === END CONFIG ===`` markers, so it can never drift from the values
+    actually used.
+
+    Returns:
+        ``True`` if the log was written successfully, ``False`` otherwise.
+    """
+    log_path = output_dir / RUN_LOG_FILENAME
+
+    source_file = resolve_source_file()
+    if source_file is None:
+        config_text = "(config block unavailable: interactive session, no __file__ on disk)"
+        source_display = "<interactive>"
+    else:
+        try:
+            config_text = extract_config_block(source_file)
+        except (OSError, ValueError) as exc:
+            logging.error("Could not extract config block for run log: %s", exc)
+            return False
+        source_display = str(source_file)
+
+    lines: List[str] = [
+        "=" * 72,
+        "BLOCK STATUS TIMELINE RUN LOG",
+        "=" * 72,
+        f"Run timestamp:    {datetime.now().isoformat(timespec='seconds')}",
+        f"Output folder:    {output_dir}",
+        f"Source script:    {source_display}",
+        "",
+        "-" * 72,
+        "CONFIGURATION (verbatim from source)",
+        "-" * 72,
+        config_text,
+        "=" * 72,
+    ]
+
+    try:
+        log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except OSError as exc:
+        logging.error("Error writing run log: %s", exc)
+        return False
+    logging.info("Run log saved to %s", log_path)
+    return True
+
+
+def require_run_log(written: bool) -> None:
+    """Raise :class:`RunLogError` when a run log failed and ``REQUIRE_RUN_LOG`` is set."""
+    if not written and REQUIRE_RUN_LOG:
+        raise RunLogError(
+            "Run log could not be written. Set REQUIRE_RUN_LOG = False to suppress this "
+            "error when a sidecar file is genuinely impossible."
+        )
 
 
 # --------------------------------------------------------------------------------------------------
@@ -1288,8 +1421,9 @@ def main() -> int:
     """Master entry point.
 
     Returns:
-        Process exit code: 0 on success, 2 if required CONFIGURATION values
-        are still placeholders or ``GTFS_FOLDER_PATH`` does not exist.
+        Process exit code: 0 on success, 1 if the required run log could not
+        be written, 2 if required CONFIGURATION values are still placeholders
+        or ``GTFS_FOLDER_PATH`` does not exist.
     """
     logging.basicConfig(
         level=LOG_LEVEL,
@@ -1311,7 +1445,11 @@ def main() -> int:
             GTFS_FOLDER_PATH,
         )
         return 2
-    run_step1_gtfs_to_blocks()
+    try:
+        run_step1_gtfs_to_blocks()
+    except RunLogError as exc:
+        logging.error("%s", exc)
+        return 1
     logging.info("Script completed successfully.")
     return 0
 

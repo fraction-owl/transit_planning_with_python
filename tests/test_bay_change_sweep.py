@@ -313,6 +313,8 @@ def test_run_discover_writes_workbook_and_stub(
     stub = "\n".join(str(v) for v in pd.read_excel(out, sheet_name="Config stub")["config_stub"])
     assert '"route_end": "20 arrive"' in stub
     assert '"21": [-3, -2, -1, 1, 2, 3],  # whole route' in stub
+    run_log = (tmp_path / "out" / "test_discover_runlog.txt").read_text(encoding="utf-8")
+    assert "MIN_LAYOVER_MINUTES = 3" in run_log
 
 
 def test_run_sweep_finds_bay_move(
@@ -360,6 +362,19 @@ def test_run_sweep_finds_bay_move(
     finalists = pd.read_excel(out, sheet_name="Package finalists")
     assert finalists.loc[0, "change"] == "20 arrive to Bay B"
     assert finalists.loc[0, "Direct before"] == 2  # scored against the untouched baseline
+    assert (tmp_path / "out" / "test_sweep_runlog.txt").is_file()
+
+
+def test_main_returns_1_when_required_run_log_fails(
+    step1_folder: Path, tmp_path: Path, cluster: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(target, "TIMELINES", {"Direct": str(step1_folder)})
+    monkeypatch.setattr(target, "OUTPUT_FOLDER", str(tmp_path / "out"))
+    monkeypatch.setattr(target, "DISCOVER_ONLY", True)
+    monkeypatch.setattr(target, "write_run_log", lambda output_file: False)
+    assert target.main() == 1
+    monkeypatch.setattr(target, "REQUIRE_RUN_LOG", False)
+    assert target.main() == 0
 
 
 def test_main_returns_2_on_placeholders(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -692,3 +692,26 @@ def test_step2_end_to_end_on_step1_output(tmp_path: Path, monkeypatch: pytest.Mo
     # Step 1's assumptions are echoed into the Summary sheet.
     summary = pd.read_excel(workbook, sheet_name="Summary", header=None, dtype=str)
     assert any(str(v).startswith("THROUGH_DWELL_MINUTES=") for v in summary[1])
+    # A run-log sidecar sits next to the workbook with the CONFIGURATION block verbatim.
+    run_log = (tmp_path / "step2" / "Hub_Conflicts_runlog.txt").read_text(encoding="utf-8")
+    assert "COUNT_IN_BAY_LAYOVER_AT_STOP: bool = True" in run_log
+
+
+def test_require_run_log_honours_switch(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(target, "REQUIRE_RUN_LOG", True)
+    target.require_run_log(True)
+    with pytest.raises(target.RunLogError):
+        target.require_run_log(False)
+    monkeypatch.setattr(target, "REQUIRE_RUN_LOG", False)
+    target.require_run_log(False)
+
+
+def test_main_returns_1_when_required_run_log_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(target, "BLOCK_OUTPUT_FOLDER", str(tmp_path))
+    monkeypatch.setattr(target, "CLUSTER_CONFLICT_OUTPUT_FOLDER", str(tmp_path / "out"))
+    monkeypatch.setattr(
+        target, "run_step2_conflict_detection", lambda: target.require_run_log(False)
+    )
+    assert target.main() == 1
