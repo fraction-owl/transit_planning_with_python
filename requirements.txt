@@ -40,7 +40,7 @@ pyproj==3.7.1                # Coordinate reference systems and transformations
 requests==2.32.3             # Fetch GBFS and other web-hosted feeds
 
 # String Matching and Text Utilities
-rapidfuzz==3.13.0            # Fast fuzzy string matching
+rapidfuzz==3.14.6            # Fast fuzzy string matching
 
 # Optimization
 pulp==2.9.0                  # Linear programming solver interface
