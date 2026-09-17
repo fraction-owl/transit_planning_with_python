@@ -17,7 +17,7 @@ scipy==1.12.0                # Scientific computing and optimization
 # Required by scripts/modeling/ridership_ml_model.py (random-forest + gradient-
 # boosting ridership models). The linear ridership_regression_model.py needs
 # none of this and still runs on the bare ArcGIS Pro numpy/scipy stack.
-scikit-learn==1.9.1          # Tree-ensemble ridership models + model selection
+scikit-learn==1.8.0          # Tree-ensemble ridership models + model selection
 
 # Network Analysis (also listed in requirements_arcpro.txt)
 networkx==2.8.4              # Graph and network analysis
