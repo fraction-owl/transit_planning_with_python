@@ -5,7 +5,7 @@
 # so local hooks and CI use the same ruff version.
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.15.12
+    rev: v0.16.8
     hooks:
       - id: ruff-check
         args: [--fix]

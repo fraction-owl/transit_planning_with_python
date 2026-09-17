@@ -13,14 +13,14 @@ pytest-cov                   # Test coverage reporting
 
 # Linting & formatting
 # Keep this version in sync with `rev` in .pre-commit-config.yaml.
-ruff==0.15.12                # Linting & formatting
+ruff==0.16.8                 # Linting & formatting
 pre-commit                   # Local git hooks (ruff)
 
 # Type checking
 # Pinned while [tool.ty.rules] entries are promoted to "error": ty is pre-1.0
 # and new releases add or reclassify diagnostics, which would break CI on an
 # unplanned upgrade. Bump deliberately and re-run `ty check scripts`.
-ty==0.0.56                   # Type checks; error-level rules block CI
+ty==0.0.81                   # Type checks; error-level rules block CI
 
 # Data Processing
 # Required only by the dev fixture builders (dev_tools/build_cacensus_fixtures.py);

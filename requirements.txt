@@ -17,7 +17,7 @@ scipy==1.12.0                # Scientific computing and optimization
 # Required by scripts/modeling/ridership_ml_model.py (random-forest + gradient-
 # boosting ridership models). The linear ridership_regression_model.py needs
 # none of this and still runs on the bare ArcGIS Pro numpy/scipy stack.
-scikit-learn==1.5.1          # Tree-ensemble ridership models + model selection
+scikit-learn==1.8.0          # Tree-ensemble ridership models + model selection
 
 # Network Analysis (also listed in requirements_arcpro.txt)
 networkx==2.8.4              # Graph and network analysis
@@ -33,14 +33,14 @@ xlrd==2.0.1                  # Read legacy Excel .xls files (no .xlsx support)
 # Geospatial Libraries (GeoPandas stack — open-source only)
 geopandas==1.1.1             # Geospatial data handling (open-source)
 fiona==1.10.1                # Shapefile I/O engine (used for schema-controlled writes)
-shapely==2.1.1               # Geometry operations
+shapely==2.1.2               # Geometry operations
 pyproj==3.7.1                # Coordinate reference systems and transformations
 
 # HTTP / Web Feeds
 requests==2.32.3             # Fetch GBFS and other web-hosted feeds
 
 # String Matching and Text Utilities
-rapidfuzz==3.13.0            # Fast fuzzy string matching
+rapidfuzz==3.14.6            # Fast fuzzy string matching
 
 # Optimization
 pulp==2.9.0                  # Linear programming solver interface
