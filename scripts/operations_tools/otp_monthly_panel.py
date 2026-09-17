@@ -82,9 +82,9 @@ from typing import Dict, List, Mapping, Optional, Sequence
 import matplotlib
 
 matplotlib.use("Agg")  # headless-safe; charts are written to disk, never shown
-import matplotlib.pyplot as plt  # noqa: E402
-import numpy as np  # noqa: E402
-import pandas as pd  # noqa: E402
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
 
 # =============================================================================
 # CONFIGURATION
