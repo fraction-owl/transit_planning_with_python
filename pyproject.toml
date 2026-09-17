@@ -128,7 +128,7 @@ unresolved-import = "error"
 # sites are cleaned up.
 invalid-return-type = "warn"
 # Downgraded from "error" to "warn" to unblock CI: these fire only on
-# pre-existing diagnostics (~210 as of ty 0.0.81), dominated by
+# pre-existing diagnostics (~200 as of ty 0.0.81), dominated by
 # pandas-stubs/geopandas overload noise. They stay visible as warnings;
 # restore to "error" after a dedicated type-cleanup pass.
 invalid-assignment = "warn"
