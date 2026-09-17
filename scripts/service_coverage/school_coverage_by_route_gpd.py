@@ -252,10 +252,12 @@ def _prepare_route_buffers(
     return gpd.GeoDataFrame(buffers, geometry="geometry", crs=projected_crs)
 
 
-def _crs_is_metric(crs: object) -> bool:
+def _crs_is_metric(crs: CRS | None) -> bool:
     """Return True when *crs* measures distance in meters (best-effort)."""
+    if crs is None:
+        return True  # default GTFS reprojection target (3857) is metric
     try:
-        unit = crs.axis_info[0].unit_name.lower()  # type: ignore[attr-defined]
+        unit = crs.axis_info[0].unit_name.lower()
     except (AttributeError, IndexError):
         return True  # default GTFS reprojection target (3857) is metric
     return "metre" in unit or "meter" in unit
