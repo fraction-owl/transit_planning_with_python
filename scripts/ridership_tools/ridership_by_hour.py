@@ -29,8 +29,20 @@ Outputs:
       average daily boardings by ``trip_id`` (and ``stop_id`` in tides mode) —
       the exact ``RIDERSHIP_CSV`` input ``service_cut_impact_gpd.py`` expects;
       pass the file matching that script's ``SERVICE_DAY``.
+    - ``low_ridership_trips.csv``: trips whose ``LOW_RIDERSHIP_MEASURE``
+      (passengers per revenue hour by default; per revenue mile and raw
+      boardings also available) falls below ``LOW_RIDERSHIP_THRESHOLD``, with
+      route, direction, start time, service-day hour, and all three measures;
+      each
+      flagged day type is also logged as a warning. Written only when trips
+      are flagged; set the threshold to 0 to disable.
     - ``charts/``: one bar chart PNG per route per day type, plus a system chart
       per day type (``EXPORT_CHARTS``).
+    - ``charts/trips/``: one per-trip bar chart PNG per route — split by
+      direction where the data carries one — per day type on the
+      ``LOW_RIDERSHIP_MEASURE`` scale, y-axis shared within each day type,
+      with the threshold as a dashed line and below-threshold trips
+      highlighted (``EXPORT_TRIP_CHARTS``).
     - A run-log sidecar capturing the verbatim CONFIGURATION block.
 
 Notes:
@@ -42,6 +54,10 @@ Notes:
     xlsx export's trip-number column must hold GTFS ``trip_id`` values, and
     TIDES trips should carry ``trip_id_scheduled``; otherwise blank the
     ``trip_id`` mapping / expect unmatched ids downstream.
+    Routes are identified by name, not code: an export may number a route 3695
+    and name it "RIBS5", and the name is what the route filters match and what
+    leads chart titles and filenames (the code appears in parentheses when the
+    two differ). Routes the export leaves unnamed fall back to the code.
 
 Typical usage:
     Update the paths in the CONFIGURATION section (or pass the matching CLI
@@ -98,11 +114,14 @@ XLSX_SHEET: Optional[str] = None
 XLSX_COLUMN_MAP: Mapping[str, str] = {
     "route": "ROUTE_NUMBER",
     "route_name": "ROUTE_NAME",
+    "direction": "DIRECTION_NAME",
     "trip_id": "TRIP_NUMBER",
     "trip_start_time": "TRIP_START_TIME",
     "boardings": "PASSENGERS_ON",
     "alightings": "PASSENGERS_OFF",
     "days_observed": "TRIPS_COUNT",
+    "revenue_hours": "REVENUE_HOURS",
+    "revenue_miles": "REVENUE_MILES",
 }
 
 # --- tides mode ---------------------------------------------------------------
@@ -126,12 +145,32 @@ TIDES_ALIGHTING_COLS: Sequence[str] = ("alighting_1", "alighting_2")
 # day; set 3 if your agency's service day starts at 3am (hours run to 26).
 LATE_NIGHT_CUTOVER_HOUR: int = 4
 
-# Optional route filters (matched against the route column as strings).
+# Optional route filters. These match the route NAME as it appears in the
+# export (ROUTE_NAME — e.g. "RIBS5"), which is what planners recognise and
+# what load_factor_monitor.py filters on too; the route code stands in only
+# for routes the export leaves unnamed. An entry matching no route is logged
+# as a warning rather than silently filtering nothing.
 ROUTES_TO_INCLUDE: Sequence[str] = ()
 ROUTES_TO_EXCLUDE: Sequence[str] = ()
 
 ROUTE_OUTPUT_FILENAME: str = r"ridership_by_hour_route.csv"
 SYSTEM_OUTPUT_FILENAME: str = r"ridership_by_hour_system.csv"
+
+# Flag individual trips whose LOW_RIDERSHIP_MEASURE falls below this
+# threshold. Flagged trips are logged as warnings per day type and written to
+# LOW_RIDERSHIP_FILENAME with their route, start time, and service-day hour.
+# Set the threshold to 0 to disable the flagging pass entirely.
+#
+# Measures: "pass_per_hour" (average boardings per revenue hour, the
+# productivity measure most agency service standards use), "pass_per_mile"
+# (per revenue mile), or "boardings" (raw average boardings per trip, which
+# favors longer trips). xlsx mode computes the ratios from the revenue_hours /
+# revenue_miles column mappings; tides mode derives hours from the
+# trips_performed start/end times and has no mileage, so "pass_per_mile"
+# works only in xlsx mode. Trips missing the measure are logged and skipped.
+LOW_RIDERSHIP_MEASURE: str = "pass_per_hour"
+LOW_RIDERSHIP_THRESHOLD: float = 5.0
+LOW_RIDERSHIP_FILENAME: str = r"low_ridership_trips.csv"
 
 # Also write ridership_by_trip_<day>.csv per day type — average daily boardings
 # by trip_id (and stop_id in tides mode), in exactly the schema
@@ -145,6 +184,16 @@ EXPORT_CHARTS: bool = True
 CHARTS_SUBDIR: str = r"charts"
 CHART_MEASURE: str = "boardings"  # "boardings" or "alightings"
 
+# Per-trip charts (written to CHARTS_SUBDIR/trips, gated by EXPORT_CHARTS):
+# one PNG per route — split by direction when the direction column is mapped
+# (xlsx mode) or trips_performed carries direction_id (tides mode) — per day
+# type, with one bar per trip in start-time order on the LOW_RIDERSHIP_MEASURE
+# scale. The y-axis is shared across routes within a day type so routes (and a
+# route's two directions) compare directly. When the low-ridership threshold
+# is enabled it is drawn as a dashed line and trips below it are highlighted —
+# the visual counterpart of low_ridership_trips.csv.
+EXPORT_TRIP_CHARTS: bool = True
+
 LOG_LEVEL: int = logging.INFO
 
 # When True, a failed run-log write aborts the script so an output is never left
@@ -156,10 +205,39 @@ REQUIRE_RUN_LOG: bool = True
 # Day types recognised, in output order.
 _DAY_ORDER: List[str] = ["weekday", "saturday", "sunday"]
 
+# Per-trip row schema shared by both input modes; feeds flag_low_ridership.
+_TRIP_ROW_COLS: List[str] = [
+    "day_type",
+    "route",
+    "route_name",
+    "direction",
+    "trip_id",
+    "start_time",
+    "hour",
+    "boardings",
+    "pass_per_hour",
+    "pass_per_mile",
+    "days_observed",
+]
+
+# Valid LOW_RIDERSHIP_MEASURE values.
+_LOW_RIDERSHIP_MEASURES: Sequence[str] = ("boardings", "pass_per_hour", "pass_per_mile")
+
 # Chart styling: series hue and neutral ink drawn from the repo's chart palette.
 _BAR_COLOR: str = "#2a78d6"
 _INK_COLOR: str = "#52514e"
 _GRID_COLOR: str = "#e3e2de"
+# Status red for below-threshold trips and the threshold line; kept distinct
+# from the series blue and never the only encoding (the dashed line and the
+# legend carry the same meaning).
+_FLAG_COLOR: str = "#d03b3b"
+
+# Axis labels for the per-trip chart measures.
+_MEASURE_LABELS: Mapping[str, str] = {
+    "boardings": "Avg daily boardings",
+    "pass_per_hour": "Avg boardings / revenue hour",
+    "pass_per_mile": "Avg boardings / revenue mile",
+}
 
 
 # =============================================================================
@@ -304,21 +382,135 @@ def _service_hour(clock_hour: int, cutover_hour: int) -> int:
     return clock_hour
 
 
+def _route_labels(table: pd.DataFrame) -> pd.Series:
+    """Return each row's planner-facing route identifier.
+
+    The route *name* rules: an export may number a route 3695 and name it
+    "RIBS5", and the name is what planners recognise and type. The route code
+    stands in only where the export carries no name for the route.
+
+    Args:
+        table: Any frame carrying a ``route`` column (and usually
+            ``route_name``; its absence falls back to the code).
+
+    Returns:
+        Series of stripped labels, aligned to *table*'s index.
+    """
+    codes = table["route"].astype(str).str.strip()
+    if "route_name" not in table.columns:
+        return codes
+    names = table["route_name"].fillna("").astype(str).str.strip()
+    return names.where(names != "", codes)
+
+
+def _warn_unmatched_routes(
+    setting: str, values: Sequence[str], table: pd.DataFrame, labels: pd.Series
+) -> None:
+    """Log filter entries that match no route, so a filter never no-ops silently."""
+    if not values:
+        return
+    present = set(labels)
+    by_code = dict(zip(table["route"].astype(str).str.strip(), labels))
+    for raw in values:
+        token = str(raw).strip()
+        if token in present:
+            continue
+        named = by_code.get(token)
+        hint = f" — route code {token} is named {named!r}; filter on the name" if named else ""
+        logging.warning("%s entry %r matched no route%s.", setting, token, hint)
+
+
 def _apply_route_filters(table: pd.DataFrame) -> pd.DataFrame:
-    """Apply the ROUTES_TO_INCLUDE / ROUTES_TO_EXCLUDE config filters."""
+    """Apply the ROUTES_TO_INCLUDE / ROUTES_TO_EXCLUDE config filters by route name."""
+    labels = _route_labels(table)
+    _warn_unmatched_routes("ROUTES_TO_INCLUDE", ROUTES_TO_INCLUDE, table, labels)
+    _warn_unmatched_routes("ROUTES_TO_EXCLUDE", ROUTES_TO_EXCLUDE, table, labels)
+    keep = pd.Series(True, index=table.index)
     if ROUTES_TO_INCLUDE:
-        keep = {str(r) for r in ROUTES_TO_INCLUDE}
-        table = table[table["route"].isin(keep)]
+        keep &= labels.isin({str(r).strip() for r in ROUTES_TO_INCLUDE})
     if ROUTES_TO_EXCLUDE:
-        drop = {str(r) for r in ROUTES_TO_EXCLUDE}
-        table = table[~table["route"].isin(drop)]
-    return table
+        keep &= ~labels.isin({str(r).strip() for r in ROUTES_TO_EXCLUDE})
+    return table[keep]
+
+
+def _route_display(route: object, name: object) -> "tuple[str, str]":
+    """Build a chart title fragment and filename token for one route.
+
+    The name leads, with the code appended in parentheses when the two differ,
+    so "RIBS5" is what a planner reads first and 3695 stays discoverable.
+
+    Args:
+        route: Route code (``route`` column value).
+        name: Route name (``route_name`` value); blank falls back to the code.
+
+    Returns:
+        Tuple of (title fragment, filename token).
+    """
+    code = "" if route is None else str(route).strip()
+    label = "" if name is None else str(name).strip()
+    if not label:
+        label = code
+    suffix = f" ({code})" if code and code != label else ""
+    return f"Route {label}{suffix}", label
 
 
 def _sanitize_token(name: str) -> str:
     """Reduce a route/day label to a filesystem-safe token."""
     token = re.sub(r"[^A-Za-z0-9_-]+", "_", str(name).strip()).strip("_")
     return token or "unnamed"
+
+
+# Excel stores a time of day as a fraction of a day, so a midnight trip start
+# is the serial number zero — which Excel displays (and some exports save as
+# literal text) as its epoch date, "1/0/1900" on the 1900 date system or
+# "12/30/1899" once a reader converts it. No time appears in the cell at all.
+_EXCEL_EPOCH_ZERO: Sequence[str] = (
+    "1/0/1900",
+    "1900-01-00",
+    "12/30/1899",
+    "30/12/1899",
+    "1899-12-30",
+)
+# An HH:MM[:SS] time embedded in a longer string (e.g. "1899-12-30 00:00:00"
+# from a datetime-typed cell stringified by the reader).
+_TIME_IN_TEXT_RE = re.compile(r"\b(\d{1,2}:\d{2}(?::\d{2})?)\b")
+
+
+def _trip_start_minutes(value: object) -> Optional[int]:
+    """Parse a trip-start cell to minutes past midnight, tolerating Excel quirks.
+
+    Accepts everything ``parse_time_to_minutes`` does, plus two forms vendor
+    xlsx exports produce: a datetime-typed cell that stringifies with a date
+    prefix (the embedded time is extracted), and a midnight start saved as
+    Excel's epoch-zero date text (see ``_EXCEL_EPOCH_ZERO``), which parses to
+    0 so owl trips at 00:00 are kept and land on the 24+ service-day clock
+    instead of being dropped as unparseable.
+
+    Args:
+        value: Raw trip-start cell value (already stringified by the reader).
+
+    Returns:
+        Minutes since midnight, or ``None`` if no time can be recovered.
+    """
+    text = "" if value is None else str(value).strip()
+    minutes = parse_time_to_minutes(text)
+    if minutes is not None:
+        return minutes
+    match = _TIME_IN_TEXT_RE.search(text)
+    if match:
+        return parse_time_to_minutes(match.group(1))
+    if text in _EXCEL_EPOCH_ZERO:
+        return 0
+    return None
+
+
+def _validate_measure(measure: str) -> None:
+    """Raise ValueError when *measure* is not a recognised low-ridership measure."""
+    if measure not in _LOW_RIDERSHIP_MEASURES:
+        raise ValueError(
+            f"LOW_RIDERSHIP_MEASURE must be one of {list(_LOW_RIDERSHIP_MEASURES)}; "
+            f"got {measure!r}."
+        )
 
 
 def _day_sort_key(day: str) -> int:
@@ -343,8 +535,10 @@ def load_route_trip_workbook(path: Path, day_type: str) -> pd.DataFrame:
 
     Returns:
         DataFrame with columns ``day_type``, ``route``, ``route_name``,
-        ``trip_id`` (blank when unmapped), ``hour``, ``boardings``,
-        ``alightings``, ``days_observed`` — one row per scheduled trip.
+        ``direction``, ``trip_id`` (blank when unmapped), ``start_time``,
+        ``hour``, ``boardings``, ``alightings``, ``days_observed``,
+        ``revenue_hours``, ``revenue_miles`` — one row per scheduled trip.
+        Unmapped optional columns come back as NaN (text columns as "").
 
     Raises:
         FileNotFoundError: If *path* does not exist.
@@ -379,8 +573,12 @@ def load_route_trip_workbook(path: Path, day_type: str) -> pd.DataFrame:
     out["trip_id"] = (
         raw[trip_col].astype(str).str.strip() if trip_col and trip_col in raw.columns else ""
     )
+    dir_col = colmap.get("direction")
+    out["direction"] = (
+        raw[dir_col].astype(str).str.strip() if dir_col and dir_col in raw.columns else ""
+    )
 
-    start_min = raw[colmap["trip_start_time"]].map(parse_time_to_minutes)
+    start_min = raw[colmap["trip_start_time"]].map(_trip_start_minutes)
     bad_time = int(start_min.isna().sum())
     if bad_time:
         logging.warning(
@@ -392,6 +590,7 @@ def load_route_trip_workbook(path: Path, day_type: str) -> pd.DataFrame:
     out["hour"] = start_min.map(
         lambda m: None if pd.isna(m) else _service_hour(int(m) // 60, LATE_NIGHT_CUTOVER_HOUR)
     )
+    out["start_time"] = start_min.map(minutes_to_hhmm)
 
     out["boardings"] = pd.to_numeric(raw[colmap["boardings"]], errors="coerce")
     bad_board = int(out["boardings"].isna().sum()) - bad_time
@@ -402,11 +601,12 @@ def load_route_trip_workbook(path: Path, day_type: str) -> pd.DataFrame:
         out["alightings"] = pd.to_numeric(raw[alight_col], errors="coerce")
     else:
         out["alightings"] = float("nan")
-    obs_col = colmap.get("days_observed")
-    if obs_col and obs_col in raw.columns:
-        out["days_observed"] = pd.to_numeric(raw[obs_col], errors="coerce")
-    else:
-        out["days_observed"] = float("nan")
+    for key in ("days_observed", "revenue_hours", "revenue_miles"):
+        col = colmap.get(key)
+        if col and col in raw.columns:
+            out[key] = pd.to_numeric(raw[col], errors="coerce")
+        else:
+            out[key] = float("nan")
 
     out["day_type"] = day_type
     out = out[out["hour"].notna() & out["boardings"].notna()]
@@ -416,7 +616,7 @@ def load_route_trip_workbook(path: Path, day_type: str) -> pd.DataFrame:
 
 def build_hourly_from_xlsx(
     inputs: Mapping[str, str],
-) -> "tuple[pd.DataFrame, dict[str, pd.DataFrame]]":
+) -> "tuple[pd.DataFrame, dict[str, pd.DataFrame], pd.DataFrame]":
     """Build the route × day × hour table from Route-and-Trip workbooks.
 
     Each trip's period-average boardings are assigned wholly to the hour of the
@@ -426,12 +626,16 @@ def build_hourly_from_xlsx(
         inputs: Mapping of day-type label to workbook path.
 
     Returns:
-        Tuple of (hourly table, engine trip tables). The hourly table has one
-        row per (day_type, route, hour): summed average ``boardings``/
-        ``alightings``, scheduled ``trips`` in that hour, and the mean
-        ``days_observed`` behind those averages. The trip tables map day type
-        to a ``trip_id``/``stop_id``/``avg_daily_boardings`` frame ready for
-        ``service_cut_impact_gpd.py`` (empty when ``trip_id`` is unmapped).
+        Tuple of (hourly table, engine trip tables, per-trip rows). The hourly
+        table has one row per (day_type, route, hour): summed average
+        ``boardings``/``alightings``, scheduled ``trips`` in that hour, and the
+        mean ``days_observed`` behind those averages. The trip tables map day
+        type to a ``trip_id``/``stop_id``/``avg_daily_boardings`` frame ready
+        for ``service_cut_impact_gpd.py`` (empty when ``trip_id`` is unmapped).
+        The per-trip rows are one row per scheduled trip (``_TRIP_ROW_COLS``)
+        for the low-ridership flagging pass, with ``pass_per_hour``/
+        ``pass_per_mile`` computed from the revenue_hours / revenue_miles
+        column mappings (NaN when unmapped or zero).
 
     Raises:
         ValueError: If *inputs* is empty.
@@ -474,7 +678,14 @@ def build_hourly_from_xlsx(
             table = table.rename(columns={"boardings": "avg_daily_boardings"})
             table.insert(1, "stop_id", "")
             trip_tables[str(day_type)] = table
-    return grouped, trip_tables
+    trips_rows = trips_rows.copy()
+    trips_rows["pass_per_hour"] = trips_rows["boardings"] / trips_rows["revenue_hours"].where(
+        trips_rows["revenue_hours"] > 0
+    )
+    trips_rows["pass_per_mile"] = trips_rows["boardings"] / trips_rows["revenue_miles"].where(
+        trips_rows["revenue_miles"] > 0
+    )
+    return grouped, trip_tables, trips_rows[_TRIP_ROW_COLS]
 
 
 # =============================================================================
@@ -530,9 +741,30 @@ def _event_service_hour(time_value: object, service_date: object, cutover_hour: 
     return float(hour)
 
 
+def _trip_duration_hours(performed: pd.DataFrame) -> pd.Series:
+    """Per-row trip duration in hours from trips_performed start/end times.
+
+    Prefers ``actual_trip_start``/``actual_trip_end`` and falls back to
+    ``schedule_trip_start``/``schedule_trip_end`` per row. Rows where neither
+    pair parses to a positive duration come back NaN.
+    """
+    duration = pd.Series(float("nan"), index=performed.index)
+    for start_col, end_col in (
+        ("actual_trip_start", "actual_trip_end"),
+        ("schedule_trip_start", "schedule_trip_end"),
+    ):
+        if start_col not in performed.columns or end_col not in performed.columns:
+            continue
+        start = pd.to_datetime(performed[start_col], errors="coerce")
+        end = pd.to_datetime(performed[end_col], errors="coerce")
+        hours = (end - start).dt.total_seconds() / 3600.0
+        duration = duration.fillna(hours.where(hours > 0))
+    return duration
+
+
 def build_hourly_from_tides(
     stop_visits_path: Path, trips_performed_path: Path
-) -> "tuple[pd.DataFrame, dict[str, pd.DataFrame]]":
+) -> "tuple[pd.DataFrame, dict[str, pd.DataFrame], pd.DataFrame]":
     """Build the route × day × hour table from TIDES event files.
 
     Boardings are counted at the hour each stop visit occurred and averaged
@@ -544,14 +776,21 @@ def build_hourly_from_tides(
         trips_performed_path: TIDES ``trips_performed`` CSV.
 
     Returns:
-        Tuple of (hourly table, engine trip tables). The hourly table has one
-        row per (day_type, route, hour): average daily ``boardings``/
-        ``alightings``, average daily distinct ``trips``, and the number of
-        service dates observed (``days_observed``). The trip tables map day
-        type to a ``trip_id``/``stop_id``/``avg_daily_boardings`` frame ready
-        for ``service_cut_impact_gpd.py``, keyed on ``trip_id_scheduled``
+        Tuple of (hourly table, engine trip tables, per-trip rows). The hourly
+        table has one row per (day_type, route, hour): average daily
+        ``boardings``/``alightings``, average daily distinct ``trips``, and the
+        number of service dates observed (``days_observed``). The trip tables
+        map day type to a ``trip_id``/``stop_id``/``avg_daily_boardings`` frame
+        ready for ``service_cut_impact_gpd.py``, keyed on ``trip_id_scheduled``
         (the GTFS trip_id) when trips_performed carries it, with per-stop
-        grain when stop_visits carries ``stop_id``.
+        grain when stop_visits carries ``stop_id``. The per-trip rows are one
+        row per trip for the low-ridership flagging pass: average daily
+        boardings across the dates each trip was observed, with ``hour`` set
+        to the trip's earliest observed stop-visit hour, ``pass_per_hour``
+        derived from the trips_performed actual (or scheduled) start/end
+        times, ``direction`` from trips_performed ``direction_id`` when
+        present, ``pass_per_mile`` NaN (no mileage in TIDES event data), and
+        ``start_time`` blank (no scheduled start time in the event data).
 
     Raises:
         FileNotFoundError: If either file does not exist.
@@ -593,10 +832,12 @@ def build_hourly_from_tides(
     visits = visits[visits["hour"].notna()].copy()
     visits["hour"] = visits["hour"].astype(int)
 
-    routes = performed.drop_duplicates(subset=["service_date", "trip_id_performed"])
-    route_cols = ["service_date", "trip_id_performed", "route_id"]
-    if "trip_id_scheduled" in routes.columns:
-        route_cols.append("trip_id_scheduled")
+    routes = performed.drop_duplicates(subset=["service_date", "trip_id_performed"]).copy()
+    routes["duration_hours"] = _trip_duration_hours(routes)
+    route_cols = ["service_date", "trip_id_performed", "route_id", "duration_hours"]
+    for optional in ("trip_id_scheduled", "direction_id"):
+        if optional in routes.columns:
+            route_cols.append(optional)
     events = visits.merge(routes[route_cols], on=["service_date", "trip_id_performed"], how="left")
     unmatched = int(events["route_id"].isna().sum())
     if unmatched:
@@ -640,14 +881,43 @@ def build_hourly_from_tides(
         events["_stop"] = events["stop_id"].fillna("").astype(str).str.strip()
     else:
         events["_stop"] = ""
+    if "direction_id" in events.columns:
+        events["direction"] = events["direction_id"].fillna("").astype(str).str.strip()
+    else:
+        events["direction"] = ""
     trip_tables: dict[str, pd.DataFrame] = {}
+    trip_row_frames: list[pd.DataFrame] = []
     for day_type, sub in events.groupby("day_type"):
         trip_dates = sub.groupby("trip_key")["service_date"].nunique()
         table = sub.groupby(["trip_key", "_stop"], as_index=False)["boardings"].sum()
         table["avg_daily_boardings"] = table["boardings"] / table["trip_key"].map(trip_dates)
         table = table.rename(columns={"trip_key": "trip_id", "_stop": "stop_id"})
         trip_tables[str(day_type)] = table[["trip_id", "stop_id", "avg_daily_boardings"]]
-    return totals.drop(columns=["trip_visits"]), trip_tables
+
+        detail = sub.groupby("trip_key", as_index=False).agg(
+            route=("route", "first"),
+            direction=("direction", "first"),
+            hour=("hour", "min"),
+            boardings=("boardings", "sum"),
+            days_observed=("service_date", "nunique"),
+        )
+        detail["boardings"] = detail["boardings"] / detail["days_observed"]
+        per_date = sub.drop_duplicates(subset=["trip_key", "service_date"])
+        mean_duration = per_date.groupby("trip_key")["duration_hours"].mean()
+        duration = detail["trip_key"].map(mean_duration)
+        detail["pass_per_hour"] = detail["boardings"] / duration.where(duration > 0)
+        detail["pass_per_mile"] = float("nan")  # no mileage in TIDES event data
+        detail["day_type"] = str(day_type)
+        detail["route_name"] = ""
+        detail["start_time"] = ""
+        detail = detail.rename(columns={"trip_key": "trip_id"})
+        trip_row_frames.append(detail)
+    trip_rows = (
+        pd.concat(trip_row_frames, ignore_index=True)[_TRIP_ROW_COLS]
+        if trip_row_frames
+        else pd.DataFrame(columns=_TRIP_ROW_COLS)
+    )
+    return totals.drop(columns=["trip_visits"]), trip_tables, trip_rows
 
 
 # =============================================================================
@@ -693,6 +963,79 @@ def finalize_tables(hourly: pd.DataFrame) -> "tuple[pd.DataFrame, pd.DataFrame]"
         "days_observed",
     ]
     return table[cols], system
+
+
+def flag_low_ridership(
+    trip_rows: pd.DataFrame, measure: str, threshold: float, out_path: Path
+) -> int:
+    """Log and export trips whose *measure* falls below *threshold*.
+
+    Flagged trips are written to *out_path* sorted by day type, route, and
+    service-day hour, and a warning is logged per day type so low performers
+    surface in the console and run log even when nobody opens the CSV.
+
+    Args:
+        trip_rows: Per-trip rows from either input mode (``_TRIP_ROW_COLS``).
+        measure: Column to test — ``"boardings"``, ``"pass_per_hour"``, or
+            ``"pass_per_mile"``. Trips where the measure is NaN (unmapped
+            revenue columns, missing trip times) are skipped with a warning.
+        threshold: Trips with *measure* strictly below this are flagged.
+            Values <= 0 disable the pass.
+        out_path: Destination CSV (only written when trips are flagged).
+
+    Returns:
+        Number of trips flagged.
+
+    Raises:
+        ValueError: On an unrecognised *measure*.
+    """
+    _validate_measure(measure)
+    if threshold <= 0 or trip_rows.empty:
+        return 0
+    values = trip_rows[measure]
+    missing = int(values.isna().sum())
+    if missing:
+        logging.warning(
+            "%d trip(s) have no %s value (unmapped revenue columns or missing trip "
+            "times) and were not evaluated for the low-ridership flag.",
+            missing,
+            measure,
+        )
+    flagged = trip_rows[values < threshold].copy()
+    if flagged.empty:
+        logging.info(
+            "No trips below %.1f %s (%d trips checked).",
+            threshold,
+            measure,
+            len(trip_rows) - missing,
+        )
+        return 0
+    flagged["hour"] = flagged["hour"].astype(int)
+    flagged.insert(
+        list(flagged.columns).index("hour") + 1,
+        "hour_label",
+        flagged["hour"].map(lambda h: minutes_to_hhmm(h * 60)),
+    )
+    flagged["_day_order"] = flagged["day_type"].map(_day_sort_key)
+    flagged = flagged.sort_values(["_day_order", "route", "hour", measure]).drop(
+        columns="_day_order"
+    )
+    round_cols = ["boardings", "pass_per_hour", "pass_per_mile", "days_observed"]
+    flagged[round_cols] = flagged[round_cols].round(2)
+    flagged.to_csv(out_path, index=False)
+    for day_type in sorted(flagged["day_type"].unique(), key=_day_sort_key):
+        sub = flagged[flagged["day_type"] == day_type]
+        logging.warning(
+            "%s: %d of %d trip(s) below %.1f %s, on %d route(s).",
+            day_type,
+            len(sub),
+            int((trip_rows["day_type"] == day_type).sum()),
+            threshold,
+            measure,
+            sub["route"].nunique(),
+        )
+    logging.info("Wrote: %s (%d rows)", out_path, len(flagged))
+    return len(flagged)
 
 
 def draw_hour_chart(
@@ -749,8 +1092,8 @@ def export_charts(route_table: pd.DataFrame, system: pd.DataFrame, out_dir: Path
     written = 0
     for (day_type, route), sub in route_table.groupby(["day_type", "route"]):
         name = sub["route_name"].iloc[0]
-        label = f"Route {route}" + (f" ({name})" if name and name != str(route) else "")
-        out_path = out_dir / f"route_{_sanitize_token(route)}_{_sanitize_token(day_type)}.png"
+        label, token = _route_display(route, name)
+        out_path = out_dir / f"route_{_sanitize_token(token)}_{_sanitize_token(day_type)}.png"
         draw_hour_chart(
             sub, f"{label} — {day_type} {measure} by hour", measure, out_path, hour_span
         )
@@ -762,6 +1105,135 @@ def export_charts(route_table: pd.DataFrame, system: pd.DataFrame, out_dir: Path
         )
         written += 1
     logging.info("Wrote %d chart PNG(s) to '%s'.", written, out_dir)
+    return written
+
+
+def draw_trip_chart(
+    sub: pd.DataFrame,
+    title: str,
+    measure: str,
+    threshold: float,
+    out_path: Path,
+    y_max: Optional[float],
+) -> None:
+    """Draw one per-trip bar chart PNG for a single route and day type.
+
+    One bar per trip in start-time order. When *threshold* is positive it is
+    drawn as a dashed line and bars below it are highlighted, so the flag is
+    carried by both position and color; a legend names both.
+
+    Args:
+        sub: Per-trip rows for one route on one day type, already sorted by
+            start time, with a ``_label`` column for the x axis.
+        title: Chart title.
+        measure: Per-trip column to plot.
+        threshold: Low-ridership threshold; <= 0 draws no line or highlight.
+        out_path: PNG destination.
+        y_max: Shared y-axis limit (None lets matplotlib autoscale).
+    """
+    values = sub[measure].astype(float).tolist()
+    colors = [_FLAG_COLOR if threshold > 0 and v < threshold else _BAR_COLOR for v in values]
+
+    fig, ax = plt.subplots(figsize=(8.0, 3.2))
+    ax.bar(range(len(values)), values, color=colors, width=0.72)
+    # Floor the axis width so a route with few trips keeps bars proportioned
+    # like the hourly charts instead of a handful of full-width slabs.
+    ax.set_xlim(-0.5, max(len(values), 12) - 0.5)
+    step = max(1, len(values) // 24)  # keep x labels legible on busy routes
+    ticks = list(range(0, len(values), step))
+    ax.set_xticks(ticks)
+    ax.set_xticklabels(
+        [sub["_label"].iloc[i] for i in ticks],
+        rotation=45,
+        ha="right",
+        fontsize=7,
+        color=_INK_COLOR,
+    )
+    ax.tick_params(axis="y", labelsize=8, colors=_INK_COLOR)
+    ax.set_ylabel(_MEASURE_LABELS.get(measure, measure), fontsize=9, color=_INK_COLOR)
+    ax.set_title(title, fontsize=10, color="#0b0b0b", loc="left")
+    ax.grid(axis="y", color=_GRID_COLOR, linewidth=0.8)
+    ax.set_axisbelow(True)
+    if y_max is not None and y_max > 0:
+        ax.set_ylim(0, y_max)
+    if threshold > 0:
+        ax.axhline(
+            threshold,
+            linestyle="--",
+            linewidth=1.2,
+            color=_FLAG_COLOR,
+            label=f"threshold ({threshold:g})",
+        )
+        if any(c == _FLAG_COLOR for c in colors):
+            ax.bar(0, 0, color=_FLAG_COLOR, label="below threshold")
+        ax.legend(fontsize=7, frameon=False, loc="upper right")
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    for side in ("left", "bottom"):
+        ax.spines[side].set_color(_GRID_COLOR)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
+def export_trip_charts(
+    trip_rows: pd.DataFrame, measure: str, threshold: float, out_dir: Path
+) -> int:
+    """Write one per-trip chart per route (and direction, where known) per day type.
+
+    Routes whose rows carry a direction get one chart per direction, so a
+    trip is compared against its same-direction neighbours rather than an
+    interleaved mix; rows with a blank direction (unmapped column, loop
+    routes exported without one) fall back to one chart per route. The
+    y-axis is shared across all routes within a day type (and stretched to
+    keep the threshold line visible) so charts — including a route's two
+    directions — compare directly. Trips with no value for *measure* cannot
+    be placed on the scale and are left off, same as the flagging pass.
+
+    Args:
+        trip_rows: Per-trip rows from either input mode (``_TRIP_ROW_COLS``).
+        measure: Per-trip column to plot.
+        threshold: Low-ridership threshold; <= 0 draws plain charts.
+        out_dir: Charts folder (created if needed).
+
+    Returns:
+        Number of PNGs written.
+    """
+    _validate_measure(measure)
+    rows = trip_rows[trip_rows[measure].notna()].copy()
+    if rows.empty:
+        logging.warning("No trips have a %s value — skipping per-trip charts.", measure)
+        return 0
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    start_min = rows["start_time"].map(parse_time_to_minutes)
+    rows["_sort"] = start_min.fillna(rows["hour"].astype(float) * 60)
+    labels = rows["start_time"].astype(str).str.strip()
+    rows["_label"] = labels.where(labels != "", rows["trip_id"].astype(str))
+    y_by_day = rows.groupby("day_type")[measure].max() * 1.05
+    if threshold > 0:
+        y_by_day = y_by_day.clip(lower=threshold * 1.2)
+
+    written = 0
+    for (day_type, route, direction), sub in rows.groupby(["day_type", "route", "direction"]):
+        sub = sub.sort_values("_sort")
+        name = sub["route_name"].iloc[0]
+        label, token = _route_display(route, name)
+        stem = f"route_{_sanitize_token(token)}"
+        if direction:
+            label = f"{label} {direction}"
+            stem = f"{stem}_{_sanitize_token(direction)}"
+        out_path = out_dir / f"{stem}_{_sanitize_token(day_type)}.png"
+        draw_trip_chart(
+            sub,
+            f"{label} — {day_type} {measure} by trip",
+            measure,
+            threshold,
+            out_path,
+            float(y_by_day[day_type]),
+        )
+        written += 1
+    logging.info("Wrote %d per-trip chart PNG(s) to '%s'.", written, out_dir)
     return written
 
 
@@ -858,9 +1330,11 @@ def run(
     """
     mode = input_mode.strip().lower()
     if mode == "route_trip_xlsx":
-        hourly, trip_tables = build_hourly_from_xlsx(xlsx_inputs)
+        hourly, trip_tables, trip_rows = build_hourly_from_xlsx(xlsx_inputs)
     elif mode == "tides":
-        hourly, trip_tables = build_hourly_from_tides(stop_visits_path, trips_performed_path)
+        hourly, trip_tables, trip_rows = build_hourly_from_tides(
+            stop_visits_path, trips_performed_path
+        )
     else:
         raise ValueError(f"INPUT_MODE must be 'route_trip_xlsx' or 'tides'; got {input_mode!r}.")
 
@@ -897,18 +1371,38 @@ def run(
                 "XLSX_COLUMN_MAP['trip_id'] (xlsx mode) to write engine-ready trip tables."
             )
 
+    low_measure = LOW_RIDERSHIP_MEASURE.strip().lower()
+    low_flagged = flag_low_ridership(
+        trip_rows, low_measure, LOW_RIDERSHIP_THRESHOLD, output_dir / LOW_RIDERSHIP_FILENAME
+    )
+
     charts_written = 0
+    trip_charts_written = 0
     if export_charts_flag:
         charts_written = export_charts(route_table, system, output_dir / CHARTS_SUBDIR)
+        if EXPORT_TRIP_CHARTS:
+            trip_charts_written = export_trip_charts(
+                trip_rows,
+                low_measure,
+                LOW_RIDERSHIP_THRESHOLD,
+                output_dir / CHARTS_SUBDIR / "trips",
+            )
 
     day_types = ", ".join(sorted(route_table["day_type"].unique(), key=_day_sort_key))
+    low_summary = (
+        f"{low_flagged} trip(s) below {LOW_RIDERSHIP_THRESHOLD:g} {low_measure}"
+        if LOW_RIDERSHIP_THRESHOLD > 0
+        else "disabled (LOW_RIDERSHIP_THRESHOLD <= 0)"
+    )
     summary_lines = [
         f"Input mode:        {mode}",
         f"Day types:         {day_types}",
         f"Routes:            {route_table['route'].nunique()}",
         f"Route rows:        {len(route_table)}",
         f"Trip tables:       {trip_files}",
+        f"Low ridership:     {low_summary}",
         f"Charts written:    {charts_written}",
+        f"Trip charts:       {trip_charts_written}",
     ]
     if not write_run_log(output_dir, summary_lines) and REQUIRE_RUN_LOG:
         raise RuntimeError(
