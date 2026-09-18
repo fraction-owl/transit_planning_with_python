@@ -70,6 +70,7 @@ from shapely.ops import unary_union
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+# === BEGIN CONFIG ===
 
 # Select analysis mode: "network", "route", or "stop"
 ANALYSIS_MODE = "network"  # Options: "network", "route", "stop"
@@ -279,6 +280,7 @@ ROUTE_GEOMETRY_GTFS_FILE = "shapes.txt"
 METERS_PER_MILE: Final[float] = 1609.34
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
+# === END CONFIG ===
 
 # =============================================================================
 # FUNCTIONS

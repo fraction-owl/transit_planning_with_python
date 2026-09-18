@@ -30,6 +30,7 @@ from openpyxl.utils import get_column_letter
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+# === BEGIN CONFIG ===
 
 GTFS_FOLDER_PATH = r"Path\To\Your\GTFS_Folder"  # Folder contains GTFS .txt files
 
@@ -73,6 +74,7 @@ OPTIONAL_GTFS_FILES: tuple[str, ...] = (
 )
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
+# === END CONFIG ===
 
 # =============================================================================
 # FUNCTIONS

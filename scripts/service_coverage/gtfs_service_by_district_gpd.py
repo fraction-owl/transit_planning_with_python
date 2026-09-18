@@ -32,6 +32,7 @@ import pandas as pd
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+# === BEGIN CONFIG ===
 
 # Shapefile of Districts (already in or to be projected to EPSG:2248, for example)
 DISTRICTS_SHP = r"Path\To\Your\Districts.shp"
@@ -64,6 +65,7 @@ TARGET_EPSG = 2248  # Adjust if your region uses a different EPSG code
 DISTRICT_FIELD = "DISTRICT"
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
+# === END CONFIG ===
 
 # =============================================================================
 # FUNCTIONS

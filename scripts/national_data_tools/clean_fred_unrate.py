@@ -381,6 +381,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     args = parser.parse_args(notebook_safe_argv(argv))
     run(args.input, args.output, use_long_names=args.long_names, write_log=args.log)
+    logger.info("Script completed successfully.")
     return 0
 
 

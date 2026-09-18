@@ -86,6 +86,7 @@ from pandas import DataFrame
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+# === BEGIN CONFIG ===
 
 # ---- Stage 1: CSV inputs ----------------------------------------------------
 #: Root folder holding Census Profile 2021 CSVs, per-province zips, or a
@@ -200,6 +201,7 @@ _DEFAULT_INPUT_SHP_DIR: str = r"Path\To\Your\DA_Boundary_Dir"
 _DEFAULT_OUTPUT_DIR: str = r"Path\To\Your\Output"
 _DEFAULT_FINAL_JOINED_FEATURES: str = str(Path(_DEFAULT_OUTPUT_DIR) / "da_joined.gpkg")
 _DEFAULT_INTERMEDIATE_COMBINED_CSV: str = str(Path(_DEFAULT_OUTPUT_DIR) / "da_attributes.csv")
+# === END CONFIG ===
 
 # =============================================================================
 # STAGE 1: CSV DISCOVERY & PIVOT  (pandas)

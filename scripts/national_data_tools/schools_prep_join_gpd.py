@@ -783,6 +783,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             states={s.upper() for s in args.states},
             output_crs=args.crs,
         )
+    logger.info("Script completed successfully.")
     return 0
 
 

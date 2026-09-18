@@ -39,6 +39,7 @@ import pandas as pd
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+# === BEGIN CONFIG ===
 
 #: Folder that holds every Census download (plain CSV, *.csv.gz*, or ZIPs).
 #: Sub-directories are searched automatically.
@@ -87,6 +88,7 @@ LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
 # Sentinel values — detect un-edited placeholder paths
 _DEFAULT_ROOT_DATA_DIR: str = r"Path\To\Your\Census_Table_Data_Files"
 _DEFAULT_OUTPUT_DIR: str = r"Path\To\Your\Output_Folder"
+# === END CONFIG ===
 
 # =============================================================================
 # FUNCTIONS

@@ -31,6 +31,7 @@ import pandas as pd
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+# === BEGIN CONFIG ===
 
 GTFS_DIR = Path(r"Path\To\GIS\Folder")
 OUTPUT_DIR = Path(r"Path\To\Output_Folder")
@@ -49,6 +50,7 @@ SERVICE_ID_FILTER: set[str] | None = {"2", "3", "4"}  # Replace with your values
 OUTPUT_FILENAME = "stop_route_calendar_impacts.csv"
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
+# === END CONFIG ===
 
 
 # =============================================================================

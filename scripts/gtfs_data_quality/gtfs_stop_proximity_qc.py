@@ -37,6 +37,7 @@ import pandas as pd
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+# === BEGIN CONFIG ===
 
 GTFS_DIR = Path(r"path\to\gtfs")  # folder containing GTFS .txt files
 OUT_DIR = Path(r"path\to\output")  # output folder for CSVs
@@ -58,6 +59,7 @@ PASS_SAFE_STOPS = True  # if True, skip any close pair where either stop is "saf
 EXCLUDE_OPPOSITE_DIRECTION_SAME_ROUTE_PAIRS = True
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
+# === END CONFIG ===
 
 # =============================================================================
 # GEOMETRY HELPERS

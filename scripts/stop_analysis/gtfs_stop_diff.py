@@ -45,8 +45,9 @@ import pandas as pd
 from scipy.spatial import cKDTree
 
 # =============================================================================
-# Config
+# CONFIGURATION
 # =============================================================================
+# === BEGIN CONFIG ===
 
 BEFORE_GTFS_DIR = Path(r"Path\To\GTFS\Dir")
 AFTER_GTFS_DIR = Path(r"Path\to\GTFS\Dir")
@@ -64,6 +65,7 @@ NEAREST_MATCHES_MAX_FEET = 500.0  # only report nearest matches within this dist
 ENABLE_ROUTE_CONTEXT = True
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
+# === END CONFIG ===
 
 
 # =============================================================================

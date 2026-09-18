@@ -64,6 +64,7 @@ from shapely.geometry import Point
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+# === BEGIN CONFIG ===
 
 # One or more GTFS feed folders. Each must contain stops.txt, routes.txt,
 # trips.txt, and stop_times.txt. Use raw strings (r"") for Windows paths.
@@ -144,6 +145,7 @@ _DAY_COLUMNS = (
     "saturday",
     "sunday",
 )
+# === END CONFIG ===
 
 # =============================================================================
 # FUNCTIONS

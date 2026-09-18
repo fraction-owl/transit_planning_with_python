@@ -78,8 +78,9 @@ import numpy as np
 import pandas as pd
 
 # =============================================================================
-# CONFIG
+# CONFIGURATION
 # =============================================================================
+# === BEGIN CONFIG ===
 
 BEFORE_GTFS_DIR = Path(r"Path\To\Old\GTFS\Dir")
 AFTER_GTFS_DIR = Path(r"Path\To\New\GTFS\Dir")
@@ -163,6 +164,7 @@ _WEEKDAY_COLS: tuple[str, ...] = (
     "saturday",
     "sunday",
 )
+# === END CONFIG ===
 
 
 # =============================================================================

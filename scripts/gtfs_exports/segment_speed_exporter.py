@@ -30,6 +30,7 @@ from openpyxl.utils import get_column_letter
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+# === BEGIN CONFIG ===
 
 GTFS_FOLDER: Path = Path(r"Path\To\Your\GTFS_Folder")  # ←–– change me
 
@@ -48,6 +49,7 @@ INPUT_DISTANCE_UNIT: Literal["feet", "meters", "km"] = "meters"
 MISSING_VAL: str = "–"
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
+# === END CONFIG ===
 
 # -----------------------------------------------------------------------------
 # CONSTANTS

@@ -89,6 +89,7 @@ import pandas as pd
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+# === BEGIN CONFIG ===
 
 STOP_VISITS_PATH: str = r"Path\To\Your\stop_visits.csv"
 TRIPS_PERFORMED_PATH: str = r"Path\To\Your\trips_performed.csv"
@@ -128,6 +129,7 @@ COVERAGE_WARN_PCT: float = 90.0
 # Filenames
 PROCESSED_FILENAME: str = "otp_monthly_processed.csv"
 COVERAGE_FILENAME: str = "otp_coverage_monthly.csv"
+# === END CONFIG ===
 
 # =============================================================================
 # DATA STRUCTURES

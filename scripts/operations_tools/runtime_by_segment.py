@@ -63,6 +63,7 @@ import pandas as pd
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+# === BEGIN CONFIG ===
 
 STOP_VISITS_PATH: str = r"Path\To\Your\stop_visits.csv"
 TRIPS_PERFORMED_PATH: str = r"Path\To\Your\trips_performed.csv"
@@ -87,6 +88,7 @@ PERCENTILES: Sequence[float] = (1, 5, 85, 95, 99)
 LOG_LEVEL: int = logging.INFO
 
 LONG_FILENAME: str = "segment_runtime_long.csv"
+# === END CONFIG ===
 
 # =============================================================================
 # DATA STRUCTURES

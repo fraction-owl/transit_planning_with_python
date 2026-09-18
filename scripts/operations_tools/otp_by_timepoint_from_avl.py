@@ -66,6 +66,7 @@ import pandas as pd
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+# === BEGIN CONFIG ===
 
 CSV_PATH: Path | str = r"Path\To\Your\OTP by Timepoint Aggregated.csv"
 OUTPUT_DIR: Path | str = r"Path\To\Your\Output_Folder"
@@ -110,6 +111,7 @@ OTP_EARLY_MIN: int = -1
 OTP_LATE_MIN: int = 6
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
+# === END CONFIG ===
 
 # =============================================================================
 # ARGUMENTS

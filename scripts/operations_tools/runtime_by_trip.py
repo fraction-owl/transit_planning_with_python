@@ -56,6 +56,7 @@ import pandas as pd
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+# === BEGIN CONFIG ===
 
 STOP_VISITS_PATH: str = r"Path\To\Your\stop_visits.csv"
 TRIPS_PERFORMED_PATH: str = r"Path\To\Your\trips_performed.csv"
@@ -97,6 +98,7 @@ DOW_ORDER: List[str] = [
     "Saturday",
     "Sunday",
 ]
+# === END CONFIG ===
 
 # =============================================================================
 # DATA STRUCTURES
