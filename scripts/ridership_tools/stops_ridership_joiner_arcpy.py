@@ -30,12 +30,12 @@ Typical usage:
 """
 
 import csv
+import datetime as _dt  # aliased: notebooks often rebind 'datetime' to the module
 import logging
 import math
 import os
 import sys
 import time
-from datetime import datetime
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
@@ -80,15 +80,15 @@ SPLIT_BY_ROUTE = False
 
 # OUTPUTS -------------------------------------------------------------------
 OUTPUT_FOLDER = r"Your\Folder\Path\To\Output"
-os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
 # Subfolder names (under OUTPUT_FOLDER) for the two bulky output types.
 # CSVs and the run log stay at the OUTPUT_FOLDER root.
 SHAPEFILE_SUBDIR: str = "shapefiles"
 PLOT_SUBDIR: str = "plots"
 
+# Folders are created in main() after the placeholder guard passes, so an
+# un-edited config never leaves a literal "Your\Folder\..." tree behind.
 SHAPEFILE_DIR: str = os.path.join(OUTPUT_FOLDER, SHAPEFILE_SUBDIR)
-os.makedirs(SHAPEFILE_DIR, exist_ok=True)
 
 # Optional: Polygon features to join ridership data to.
 # If empty, the spatial-join and aggregation steps will be skipped.
@@ -182,6 +182,15 @@ SOURCE_FILE_OVERRIDE: str = r""
 
 # === END CONFIG ===
 
+# Placeholder values that the guard in main() refuses to run with. Keys are the
+# names of the path constants above; values are the shipped defaults.
+_PLACEHOLDER_PATHS: dict[str, str] = {
+    "BUS_STOPS_INPUT": r"Your\File\Path\To\GTFS_folder",
+    "EXCEL_FILE": r"Your\File\Path\To\STOP_USAGE_(BY_STOP_ID).XLSX",
+    "OUTPUT_FOLDER": r"Your\Folder\Path\To\Output",
+    "POLYGON_LAYER": r"Your\File\Path\To\census_blocks.shp",
+}
+
 # =============================================================================
 # FUNCTIONS
 # =============================================================================
@@ -209,6 +218,84 @@ def resolve_stops_table(bus_stops_input: str) -> str:
     if os.path.isdir(bus_stops_input):
         return os.path.join(bus_stops_input, "stops.txt")
     return bus_stops_input
+
+
+def _clear_readonly(fc: str) -> None:
+    """Best-effort: clear the read-only attribute on a shapefile's sidecar files.
+
+    Some network shares create shapefile components read-only, which makes
+    AddField fail with ERROR 000499 ("table is not editable").
+    """
+    import stat
+
+    base = os.path.splitext(fc)[0]
+    for ext in (".dbf", ".shp", ".shx", ".prj", ".cpg", ".sbn", ".sbx", ".shp.xml"):
+        p = base + ext
+        if os.path.isfile(p):
+            try:
+                os.chmod(p, stat.S_IWRITE | stat.S_IREAD)
+            except OSError:
+                pass
+
+
+def _retry_arcpy(
+    func: Callable[..., object],
+    *args: object,
+    what: str,
+    attempts: int = 3,
+    delay: float = 1.5,
+) -> object:
+    """Run a flaky arcpy write op with bounded retries.
+
+    Writes to a UNC share intermittently fail with ERROR 999999 (generic) or
+    000499 (schema lock), often from a transient network hiccup or a lingering
+    lock. Retry a few times, then fail loud — a live ArcGIS Pro map lock can't
+    be retried away.
+
+    Args:
+        func: The arcpy callable (e.g. arcpy.CopyFeatures_management).
+        *args: Positional args passed to ``func``.
+        what: Short description for log messages (e.g. "CopyFeatures 671").
+        attempts: Max attempts before re-raising.
+        delay: Seconds to wait between attempts.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            return func(*args)
+        except arcpy.ExecuteError:
+            if attempt == attempts:
+                logging.error(
+                    "%s failed after %d attempts (ERROR 999999/000499 = generic write "
+                    "failure or lock). Close any layers from the output folder in an open "
+                    "ArcGIS Pro map, confirm the target is writable on the share, then re-run.",
+                    what,
+                    attempts,
+                )
+                raise
+            logging.warning("%s attempt %d failed; retrying…", what, attempt)
+            time.sleep(delay)
+    return None
+
+
+def _add_fields_with_retry(fc: str, fields: List[Tuple[str, str]]) -> None:
+    """Add any missing (name, type) fields to *fc*, clearing read-only first.
+
+    ERROR 000499 ("table is not editable") on AddField over a UNC share is
+    usually a read-only sidecar file or a transient lock. Clear read-only,
+    then retry a few times before failing loud.
+    """
+    _clear_readonly(fc)
+    existing = {f.name for f in arcpy.ListFields(fc)}
+    for f_name, f_type in fields:
+        if f_name in existing:
+            continue
+        _retry_arcpy(
+            arcpy.management.AddField,
+            fc,
+            f_name,
+            f_type,
+            what=f"AddField {f_name} on {os.path.basename(fc)}",
+        )
 
 
 def create_bus_stops_feature_class() -> Tuple[str, List[str]]:
@@ -369,13 +456,13 @@ def filter_matched_bus_stops(current_fc: str, df_joined: pd.DataFrame, key_field
     matched_keys = df_joined[key_field].dropna().unique().tolist()
     if not matched_keys:
         logging.error("No matched bus stops found in Excel data. Exiting script.")
-        exit()
+        sys.exit(1)
 
     arcpy.MakeFeatureLayer_management(current_fc, "joined_lyr")
     fields = arcpy.ListFields(current_fc, key_field)
     if not fields:
         logging.error("Field '%s' not found in '%s'. Exiting.", key_field, current_fc)
-        exit()
+        sys.exit(1)
 
     field_type = fields[0].type
     field_delimited = arcpy.AddFieldDelimiters(current_fc, key_field)
@@ -394,7 +481,7 @@ def filter_matched_bus_stops(current_fc: str, df_joined: pd.DataFrame, key_field
             field_type,
             key_field,
         )
-        exit()
+        sys.exit(1)
 
     # Due to potential large number of keys, split into chunks
     chunk_size = 999
@@ -420,70 +507,22 @@ def filter_matched_bus_stops(current_fc: str, df_joined: pd.DataFrame, key_field
     selected_count = int(arcpy.GetCount_management("joined_lyr").getOutput(0))
     if selected_count == 0:
         logging.error("No features matched the WHERE clause. Exiting script.")
-        exit()
+        sys.exit(1)
     else:
         logging.info("Number of features selected: %d", selected_count)
 
-    arcpy.CopyFeatures_management("joined_lyr", MATCHED_JOINED_FC)
+    _retry_arcpy(
+        arcpy.CopyFeatures_management,
+        "joined_lyr",
+        MATCHED_JOINED_FC,
+        what="CopyFeatures matched stops",
+    )
     logging.info("Filtered joined feature class created at: %s", MATCHED_JOINED_FC)
 
+    # Release the in-memory layer so it can't hold a lock on later steps.
+    arcpy.management.Delete("joined_lyr")
+
     return MATCHED_JOINED_FC
-
-
-def _clear_readonly(fc: str) -> None:
-    """Best-effort: clear the read-only attribute on a shapefile's sidecar files.
-
-    Some network shares create shapefile components read-only, which makes
-    AddField fail with ERROR 000499 ("table is not editable").
-    """
-    import stat
-
-    base = os.path.splitext(fc)[0]
-    for ext in (".dbf", ".shp", ".shx", ".prj", ".cpg", ".sbn", ".sbx", ".shp.xml"):
-        p = base + ext
-        if os.path.isfile(p):
-            try:
-                os.chmod(p, stat.S_IWRITE | stat.S_IREAD)
-            except OSError:
-                pass
-
-
-def _retry_arcpy(
-    func: Callable[..., object],
-    *args: object,
-    what: str,
-    attempts: int = 3,
-    delay: float = 1.5,
-) -> object:
-    """Run a flaky arcpy write op with bounded retries.
-
-    Writes to a UNC share intermittently fail with ERROR 999999 (generic) or
-    000499 (schema lock), often from a transient network hiccup or a lingering
-    lock. Retry a few times, then fail loud — a live ArcGIS Pro map lock can't
-    be retried away.
-
-    Args:
-        func: The arcpy callable (e.g. arcpy.CopyFeatures_management).
-        *args: Positional args passed to ``func``.
-        what: Short description for log messages (e.g. "CopyFeatures 671").
-        attempts: Max attempts before re-raising.
-        delay: Seconds to wait between attempts.
-    """
-    for attempt in range(1, attempts + 1):
-        try:
-            return func(*args)
-        except arcpy.ExecuteError:
-            if attempt == attempts:
-                logging.error(
-                    "%s failed after %d attempts (ERROR 999999/000499 = generic write "
-                    "failure or lock). Close any layers from the output folder in an open "
-                    "ArcGIS Pro map, confirm the target is writable on the share, then re-run.",
-                    what,
-                    attempts,
-                )
-                raise
-            logging.warning("%s attempt %d failed; retrying…", what, attempt)
-            time.sleep(delay)
 
 
 def update_bus_stops_ridership(current_fc: str, df_joined: pd.DataFrame, key_field: str) -> None:
@@ -494,32 +533,7 @@ def update_bus_stops_ridership(current_fc: str, df_joined: pd.DataFrame, key_fie
         ("XTOTAL", "DOUBLE"),
     ]
 
-    # ERROR 000499 ("table is not editable") on AddField over a UNC share is
-    # usually a read-only sidecar file or a transient lock. Clear read-only,
-    # then retry a few times before failing loud (a live Pro map lock can't be
-    # retried away — the message says what to do).
-    _clear_readonly(current_fc)
-    existing_fields = [f.name for f in arcpy.ListFields(current_fc)]
-    for f_name, f_type in ridership_fields:
-        if f_name in existing_fields:
-            continue
-        for attempt in range(1, 4):
-            try:
-                arcpy.management.AddField(current_fc, f_name, f_type)
-                break
-            except arcpy.ExecuteError:
-                if attempt == 3:
-                    logging.error(
-                        "AddField failed for '%s' on '%s' (ERROR 000499 = schema lock / "
-                        "not editable). Remove this shapefile from any open ArcGIS Pro map "
-                        "and confirm it is not read-only on the share, then re-run.",
-                        f_name,
-                        current_fc,
-                    )
-                    raise
-                logging.warning("AddField '%s' attempt %d failed; retrying…", f_name, attempt)
-                time.sleep(1.5)
-
+    _add_fields_with_retry(current_fc, ridership_fields)
     logging.info("Ridership fields added (if not existing).")
 
     # Build dictionary from the joined DataFrame
@@ -551,11 +565,22 @@ def update_bus_stops_ridership(current_fc: str, df_joined: pd.DataFrame, key_fie
 def aggregate_ridership(df_joined: pd.DataFrame) -> None:
     """Aggregate ridership by the polygon join field and update the polygon layer shapefile.
 
+    *df_joined* must already carry POLYGON_JOIN_FIELD (i.e. be the output of
+    merge_ridership_and_csv, or a concatenation of such outputs).
+
     Also exports the aggregated data to CSV for verification.
     """
     if not POLYGON_LAYER.strip():
         logging.info("POLYGON_LAYER is empty, so aggregation steps have been skipped.")
         return
+
+    if POLYGON_JOIN_FIELD not in df_joined.columns:
+        logging.error(
+            "aggregate_ridership: column '%s' not present in the joined data. "
+            "Pass the merged (stop + polygon) frame, not the raw ridership export.",
+            POLYGON_JOIN_FIELD,
+        )
+        sys.exit(1)
 
     # Group by the designated polygon join field, e.g. "GEOID"
     df_agg = df_joined.groupby(POLYGON_JOIN_FIELD, as_index=False).agg(
@@ -569,19 +594,19 @@ def aggregate_ridership(df_joined: pd.DataFrame) -> None:
     logging.info("Aggregated ridership by polygon exported to: %s", agg_polygon_csv)
 
     # Copy the source polygons so we can add fields without touching the original
-    arcpy.management.CopyFeatures(POLYGON_LAYER, POLYGON_WITH_RIDERSHIP_SHP)
+    _retry_arcpy(
+        arcpy.management.CopyFeatures,
+        POLYGON_LAYER,
+        POLYGON_WITH_RIDERSHIP_SHP,
+        what="CopyFeatures polygon layer",
+    )
 
     agg_fields = [
         ("XBOARD_SUM", "DOUBLE"),
         ("XALITE_SUM", "DOUBLE"),
         ("TOTAL_SUM", "DOUBLE"),
     ]
-
-    existing_fields_blocks = [f.name for f in arcpy.ListFields(POLYGON_WITH_RIDERSHIP_SHP)]
-    for f_name, f_type in agg_fields:
-        if f_name not in existing_fields_blocks:
-            arcpy.management.AddField(POLYGON_WITH_RIDERSHIP_SHP, f_name, f_type)
-
+    _add_fields_with_retry(POLYGON_WITH_RIDERSHIP_SHP, agg_fields)
     logging.info(
         "Aggregation fields added to polygon shapefile (if not existing).",
     )
@@ -655,6 +680,105 @@ def process_stops_for_single_run() -> None:
     aggregate_ridership(df_joined)
 
     logging.info("Single-run process complete.")
+
+
+def process_stops_per_route() -> None:
+    """Per-route flow: one BusStops_<route>.shp per unique ROUTE_NAME.
+
+    After all routes are processed, the polygon aggregation runs once over the
+    concatenated per-route joined frames, so a stop served by several routes
+    contributes each route's ridership to its polygon (same totals as the
+    single-run collapse-then-merge path).
+    """
+    # Step 1: Create or identify the bus stops feature class
+    bus_stops_fc, fields_to_export = create_bus_stops_feature_class()
+
+    # Step 2: Spatial Join (Optional) -> also exports CSV
+    current_fc = spatial_join_bus_stops_to_polygons(bus_stops_fc, fields_to_export)
+
+    # Step 3: Read ridership data from Excel & optionally filter by routes
+    df_excel = read_and_filter_ridership_data()
+
+    # Identify unique routes
+    unique_routes = df_excel["ROUTE_NAME"].unique()
+    logging.info("Found the following unique routes: %s", unique_routes)
+
+    joined_frames: list[pd.DataFrame] = []
+
+    # For each route, merge, filter, and export a shapefile
+    for route in unique_routes:
+        logging.info("=== Processing route: %s ===", route)
+        df_route = df_excel[df_excel["ROUTE_NAME"] == route].copy()
+        if df_route.empty:
+            logging.warning("No ridership data for route %s. Skipping.", route)
+            continue
+
+        # Merge data
+        df_joined, key_field = merge_ridership_and_csv(df_route, fields_to_export)
+        if df_joined.empty:
+            logging.warning(
+                "No matched bus stops found for route %s. Skipping.",
+                route,
+            )
+            continue
+
+        # Create a route-specific feature class path
+        route_output_fc = os.path.join(SHAPEFILE_DIR, f"BusStops_{route}.shp")
+
+        matched_keys = df_joined[key_field].dropna().unique().tolist()
+        if not matched_keys:
+            logging.warning("No matched bus stops found. Skipping route %s.", route)
+            continue
+
+        arcpy.MakeFeatureLayer_management(current_fc, "joined_lyr_route")
+        field_delimited = arcpy.AddFieldDelimiters(current_fc, key_field)
+
+        # We have to chunk keys to avoid 'IN' clause limit
+        chunk_size = 999
+        where_clauses = []
+        for i in range(0, len(matched_keys), chunk_size):
+            chunk = matched_keys[i : i + chunk_size]
+            # Quote or not quote based on field type if needed.
+            # Here we'll assume string type for simplicity:
+            chunk_str = ", ".join(f"'{k}'" for k in chunk)
+            where_clauses.append(f"{field_delimited} IN ({chunk_str})")
+
+        route_where_clause = " OR ".join(where_clauses)
+        arcpy.SelectLayerByAttribute_management(
+            "joined_lyr_route", "NEW_SELECTION", route_where_clause
+        )
+
+        selected_count = int(arcpy.GetCount_management("joined_lyr_route").getOutput(0))
+        if selected_count == 0:
+            logging.warning(
+                "No bus stops found in FC for route %s. Skipping.",
+                route,
+            )
+            arcpy.management.Delete("joined_lyr_route")
+            continue
+
+        _retry_arcpy(
+            arcpy.CopyFeatures_management,
+            "joined_lyr_route",
+            route_output_fc,
+            what=f"CopyFeatures {route}",
+        )
+        logging.info("Route-specific shapefile created at: %s", route_output_fc)
+
+        # Release the in-memory layer so it can't hold a lock on the next iteration.
+        arcpy.management.Delete("joined_lyr_route")
+
+        # Now update ridership fields
+        update_bus_stops_ridership(route_output_fc, df_joined, key_field)
+        joined_frames.append(df_joined)
+
+    # Polygon aggregation across *all* routes' matched stops.
+    if joined_frames:
+        aggregate_ridership(pd.concat(joined_frames, ignore_index=True))
+    else:
+        logging.warning("No routes produced matched stops; polygon aggregation skipped.")
+
+    logging.info("Per-route process complete.")
 
 
 # =============================================================================
@@ -1161,7 +1285,7 @@ def write_run_log(output_folder: str) -> bool:
         "=" * 72,
         "STOPS RIDERSHIP JOINER (ARCPY) RUN LOG",
         "=" * 72,
-        f"Run timestamp:    {datetime.now().isoformat(timespec='seconds')}",
+        f"Run timestamp:    {_dt.datetime.now().isoformat(timespec='seconds')}",
         f"Output folder:    {output_folder}",
         f"Source script:    {source_label}",
         "",
@@ -1202,110 +1326,29 @@ def main() -> int:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    _DEFAULT_BUS_STOPS = r"Your\File\Path\To\GTFS_folder"
-    _DEFAULT_EXCEL = r"Your\File\Path\To\STOP_USAGE_(BY_STOP_ID).XLSX"
-    if BUS_STOPS_INPUT == _DEFAULT_BUS_STOPS or EXCEL_FILE == _DEFAULT_EXCEL:
+    # Placeholder guard: refuse to run (and create nothing) if any path constant
+    # is still at its shipped default. POLYGON_LAYER = "" is a valid opt-out and
+    # is not flagged.
+    still_default = [
+        name for name, default in _PLACEHOLDER_PATHS.items() if globals()[name] == default
+    ]
+    if still_default:
         logging.warning(
-            "File paths are still set to their defaults. Update BUS_STOPS_INPUT and "
-            "EXCEL_FILE in the CONFIGURATION section before running."
+            "File paths are still set to their defaults: %s. Update them in the "
+            "CONFIGURATION section before running.",
+            ", ".join(still_default),
         )
         return 2
 
-    # >>>>> NEW BRANCHING LOGIC <<<<<
+    for folder in (OUTPUT_FOLDER, SHAPEFILE_DIR):
+        os.makedirs(folder, exist_ok=True)
+
     if not SPLIT_BY_ROUTE:
-        # ---- Original single-run approach ----
         logging.info("SPLIT_BY_ROUTE = False. Running single shapefile process.")
         process_stops_for_single_run()
-
     else:
-        # ---- Per-route approach (from the second script) ----
         logging.info("SPLIT_BY_ROUTE = True. Creating one shapefile per route.")
-
-        # Step 1: Create or identify the bus stops feature class
-        bus_stops_fc, fields_to_export = create_bus_stops_feature_class()
-
-        # Step 2: Spatial Join (Optional) -> also exports CSV
-        current_fc = spatial_join_bus_stops_to_polygons(bus_stops_fc, fields_to_export)
-
-        # Step 3: Read ridership data from Excel & optionally filter by routes
-        df_excel = read_and_filter_ridership_data()
-
-        # Identify unique routes
-        unique_routes = df_excel["ROUTE_NAME"].unique()
-        logging.info("Found the following unique routes: %s", unique_routes)
-
-        # For each route, merge, filter, and export a shapefile
-        for route in unique_routes:
-            logging.info("=== Processing route: %s ===", route)
-            df_route = df_excel[df_excel["ROUTE_NAME"] == route].copy()
-            if df_route.empty:
-                logging.warning("No ridership data for route %s. Skipping.", route)
-                continue
-
-            # Merge data
-            df_joined, key_field = merge_ridership_and_csv(df_route, fields_to_export)
-            if df_joined.empty:
-                logging.warning(
-                    "No matched bus stops found for route %s. Skipping.",
-                    route,
-                )
-                continue
-
-            # Create a route-specific feature class path
-            route_output_fc = os.path.join(SHAPEFILE_DIR, f"BusStops_{route}.shp")
-
-            matched_keys = df_joined[key_field].dropna().unique().tolist()
-            if not matched_keys:
-                logging.warning("No matched bus stops found. Skipping route %s.", route)
-                continue
-
-            arcpy.MakeFeatureLayer_management(current_fc, "joined_lyr_route")
-            field_delimited = arcpy.AddFieldDelimiters(current_fc, key_field)
-
-            # We have to chunk keys to avoid 'IN' clause limit
-            chunk_size = 999
-            where_clauses = []
-            for i in range(0, len(matched_keys), chunk_size):
-                chunk = matched_keys[i : i + chunk_size]
-                # Quote or not quote based on field type if needed.
-                # Here we'll assume string type for simplicity:
-                chunk_str = ", ".join(f"'{k}'" for k in chunk)
-                where_clauses.append(f"{field_delimited} IN ({chunk_str})")
-
-            route_where_clause = " OR ".join(where_clauses)
-            arcpy.SelectLayerByAttribute_management(
-                "joined_lyr_route", "NEW_SELECTION", route_where_clause
-            )
-
-            selected_count = int(arcpy.GetCount_management("joined_lyr_route").getOutput(0))
-            if selected_count == 0:
-                logging.warning(
-                    "No bus stops found in FC for route %s. Skipping.",
-                    route,
-                )
-                continue
-
-            _retry_arcpy(
-                arcpy.CopyFeatures_management,
-                "joined_lyr_route",
-                route_output_fc,
-                what=f"CopyFeatures {route}",
-            )
-            logging.info("Route-specific shapefile created at: %s", route_output_fc)
-
-            # Release the in-memory layer so it can't hold a lock on the next iteration.
-            arcpy.management.Delete("joined_lyr_route")
-
-            # Now update ridership fields
-            update_bus_stops_ridership(route_output_fc, df_joined, key_field)
-
-        # After all routes are processed, optionally aggregate if you want
-        # aggregated polygon results across *all* stops (regardless of route).
-        # If you only want polygons by route, you'd do a per-route polygon join.
-        # For simplicity, we show it once for the entire dataset:
-        aggregate_ridership(df_excel)
-
-        logging.info("Per-route process complete.")
+        process_stops_per_route()
 
     # Per-route ridership maps (independent of SPLIT_BY_ROUTE).
     if DRAW_PLOTS:
