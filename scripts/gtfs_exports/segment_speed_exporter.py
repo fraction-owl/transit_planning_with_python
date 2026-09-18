@@ -38,7 +38,9 @@ OUTPUT_FOLDER: Path = Path(r"Path\To\Your\Output_Folder")  # ←–– change me
 # Optional filters – leave empty to process everything
 FILTER_IN_ROUTE_SHORT_NAMES: List[str] = ["101", "660"]
 FILTER_OUT_ROUTE_SHORT_NAMES: List[str] = []
-FILTER_IN_SERVICE_IDS: List[str] = ["3"]
+# service_id values are agency-specific and come from calendar.txt —
+# REPLACE WITH YOUR VALUES (the placeholder assumes a regular-weekday service).
+FILTER_IN_SERVICE_IDS: List[str] = ["4"]
 FILTER_OUT_SERVICE_IDS: List[str] = []
 
 EXPORT_TIMEPOINTS_ONLY: bool = True

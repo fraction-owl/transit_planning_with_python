@@ -97,7 +97,9 @@ MAX_TRIPS_PER_BLOCK = 150
 # Service day. Either list service_ids explicitly, or leave the list empty and
 # give a date (YYYYMMDD): every service_id active on that date per calendar.txt
 # and calendar_dates.txt is used. Leave both empty to process every trip in
-# the feed regardless of service.
+# the feed regardless of service. service_id values are agency-specific —
+# REPLACE WITH YOUR VALUES (the placeholder assumes a regular-weekday service),
+# or set SERVICE_DATE instead and let the calendar resolve the ids for you.
 CALENDAR_SERVICE_IDS: list[str] = ["4"]
 SERVICE_DATE = ""
 
