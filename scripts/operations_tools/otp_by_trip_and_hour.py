@@ -64,7 +64,7 @@ Outputs (all in ``OUTPUT_DIR``):
   4) ``plots/otp_by_hour_<day_type>.png`` - % on-time by hour, as bars (bars
      rather than a line so hours with no service read as gaps instead of
      being bridged), each annotated with its evaluated visit count.
-  5) ``plots/otp_by_trip_[<route>_]<day_type>.png`` - % on-time per trip in
+  5) ``plots/otp_by_trip_<day_type>[_<route>].png`` - % on-time per trip in
      scheduled-start order (skipped above ``MAX_TRIPS_PER_CHART`` bars).
   6) A run-log sidecar capturing the verbatim CONFIGURATION block.
 
@@ -395,6 +395,13 @@ def join_trip_attributes(
     are dropped, since their stop visits are not meaningful for OTP. The join
     key is ``trip_id_performed``, unique per performed trip in TIDES.
 
+    The inner join discards stop visits for two very different reasons, so they
+    are logged apart: a visit whose trip was filtered out above is an intended
+    drop (INFO), while a visit whose ``trip_id_performed`` is absent from
+    ``trips_performed`` altogether is an orphan (WARNING) -- usually two exports
+    covering different date ranges, which silently shrinks the denominator of
+    every percentage downstream.
+
     Args:
         stop_visits: Output of :func:`load_stop_visits`.
         trips_performed: Output of :func:`load_trips_performed`.
@@ -403,6 +410,7 @@ def join_trip_attributes(
         Stop visits with the ``_TRIP_ATTR_COLS`` attributes joined on.
     """
     trips = trips_performed.copy()
+    known_trip_ids = set(trips["trip_id_performed"].dropna())
     if "schedule_relationship" in trips.columns:
         trips = trips.loc[trips["schedule_relationship"].fillna("Scheduled") != "Canceled"]
     if "trip_type" in trips.columns:
@@ -411,7 +419,26 @@ def join_trip_attributes(
     attr_cols = [c for c in _TRIP_ATTR_COLS if c in trips.columns]
     trips = trips[["trip_id_performed", *attr_cols]].drop_duplicates("trip_id_performed")
 
-    return stop_visits.merge(trips, on="trip_id_performed", how="inner")
+    merged = stop_visits.merge(trips, on="trip_id_performed", how="inner")
+
+    # trips is deduplicated on the join key, so the merge is many-to-one and
+    # every dropped row is one stop visit -- the two causes therefore add up.
+    n_orphans = int((~stop_visits["trip_id_performed"].isin(known_trip_ids)).sum())
+    n_filtered = len(stop_visits) - len(merged) - n_orphans
+    if n_orphans:
+        logging.warning(
+            "%d of %d stop visits reference a trip_id_performed that is absent from "
+            "trips_performed and were dropped by the join -- check that both exports "
+            "cover the same date range.",
+            n_orphans,
+            len(stop_visits),
+        )
+    if n_filtered:
+        logging.info(
+            "%d stop visits dropped for trips that were Canceled or not in service.",
+            n_filtered,
+        )
+    return merged
 
 
 def assign_trip_id(df: pd.DataFrame) -> pd.DataFrame:
@@ -757,7 +784,9 @@ def build_trip_table(scored: pd.DataFrame, day_type_order: Sequence[str]) -> pd.
 
     The scheduled start is the median across dates of each date's earliest
     scheduled timepoint time, in service-day clock terms (so an owl trip can
-    read ``24:15``). Route/direction columns are carried when present.
+    read ``24:15``); it is left blank when that start falls outside the service
+    day, since the clock string would otherwise read as nonsense. Route and
+    direction columns are carried when present.
 
     Args:
         scored: Day-typed, classified visits with ``trip_id``, ``sched_minutes``.
@@ -789,8 +818,17 @@ def build_trip_table(scored: pd.DataFrame, day_type_order: Sequence[str]) -> pd.
     )
     agg = agg.merge(starts, on=keys, how="left")
     agg["scheduled_start_minutes"] = agg["scheduled_start_minutes"].round(0)
-    agg["scheduled_start"] = agg["scheduled_start_minutes"].map(
-        lambda m: _format_service_minutes(m) if pd.notna(m) else pd.NA
+    # A start outside the service day means the timestamps and service_date
+    # disagree -- the same defect add_service_hour blanks the hour for (and
+    # already warns about). Blank the clock string rather than rendering a
+    # nonsense time like "-1:30"; the raw minutes stay for diagnosis.
+    in_service_day = agg["scheduled_start_minutes"].between(
+        0, _SERVICE_DAY_HOUR_MAX * 60, inclusive="left"
+    )
+    agg["scheduled_start"] = (
+        agg["scheduled_start_minutes"]
+        .where(in_service_day)
+        .map(lambda m: _format_service_minutes(m) if pd.notna(m) else pd.NA)
     )
 
     front = [*keys, "scheduled_start", "scheduled_start_minutes", "n_dates"]
@@ -983,7 +1021,7 @@ def plot_trips(
         )
         step = max(1, int(np.ceil(len(g) / 30)))
         plt.xticks(ticks=x[::step], labels=labels[::step], rotation=90, fontsize=7)
-        plt.ylim(0, 100)
+        plt.ylim(0, 105)
         plt.xlabel("Trip (by scheduled start)")
         plt.ylabel("% On-time")
         plt.title(f"{label} - OTP by trip")

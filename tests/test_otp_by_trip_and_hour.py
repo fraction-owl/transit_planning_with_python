@@ -82,6 +82,59 @@ def test_add_day_type_buckets_overlap_and_drop() -> None:
 
 
 # =============================================================================
+# LOADING & JOINING
+# =============================================================================
+
+
+def test_join_trip_attributes_separates_orphans_from_filtered_trips(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Orphan visits warn; trips filtered out as non-revenue only inform."""
+    stop_visits = pd.DataFrame(
+        {
+            "trip_id_performed": ["TP1", "TP2", "TP_MISSING"],
+            "trip_stop_sequence": ["1", "1", "1"],
+        }
+    )
+    trips_performed = pd.DataFrame(
+        {
+            "trip_id_performed": ["TP1", "TP2"],
+            "trip_type": ["In service", "Deadhead"],
+            "route_id": ["101", "101"],
+        }
+    )
+    with caplog.at_level("INFO"):
+        merged = target.join_trip_attributes(stop_visits, trips_performed)
+
+    # TP1 survives; TP2's trip is out of service; TP_MISSING has no trip at all.
+    assert merged["trip_id_performed"].tolist() == ["TP1"]
+    orphan_warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(orphan_warnings) == 1
+    assert "absent from trips_performed" in orphan_warnings[0].getMessage()
+    assert "1 of 3 stop visits" in orphan_warnings[0].getMessage()
+    assert any(
+        "Canceled or not in service" in r.getMessage()
+        for r in caplog.records
+        if r.levelname == "INFO"
+    )
+
+
+def test_join_trip_attributes_is_quiet_when_nothing_is_dropped(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A clean join logs no drop diagnostics at all."""
+    stop_visits = pd.DataFrame({"trip_id_performed": ["TP1", "TP2"]})
+    trips_performed = pd.DataFrame(
+        {"trip_id_performed": ["TP1", "TP2"], "route_id": ["101", "202"]}
+    )
+    with caplog.at_level("INFO"):
+        merged = target.join_trip_attributes(stop_visits, trips_performed)
+
+    assert len(merged) == 2
+    assert not caplog.records
+
+
+# =============================================================================
 # SCORING & SERVICE-DAY HOUR
 # =============================================================================
 
@@ -156,6 +209,25 @@ def test_build_day_type_table_summarizes(scored: pd.DataFrame) -> None:
     assert row["n_dates"] > 1
     assert row["n_trips"] > 1
     assert row["early"] + row["on_time"] + row["late"] == row["evaluated"]
+
+
+def test_build_trip_table_blanks_start_outside_the_service_day() -> None:
+    """A start before service_date reads blank, not as a negative clock."""
+    df = pd.DataFrame(
+        {
+            "day_type": ["Weekday", "Weekday"],
+            "trip_id": ["BAD", "GOOD"],
+            "service_date": pd.to_datetime(["2025-01-06", "2025-01-06"]),
+            # -30 minutes: the scheduled timestamp precedes its service_date.
+            "sched_minutes": [-30.0, 480.0],
+            "otp_class": ["on_time", "on_time"],
+        }
+    )
+    table = target.build_trip_table(df, ["Weekday"]).set_index("trip_id")
+    assert pd.isna(table.loc["BAD", "scheduled_start"])
+    assert table.loc["GOOD", "scheduled_start"] == "08:00"
+    # The raw minutes survive either way, so the defect stays diagnosable.
+    assert table.loc["BAD", "scheduled_start_minutes"] == -30.0
 
 
 # =============================================================================
