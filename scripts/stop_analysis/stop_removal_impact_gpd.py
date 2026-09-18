@@ -516,7 +516,7 @@ def _build_path_geometry(
 
     a_part = (
         linestring_substring(a_seg, a_s, 0.0) if a_to_u else linestring_substring(a_seg, a_s, L_a)
-    )  # noqa: E501
+    )
 
     fulls: List[LineString] = []
     for u, v in zip(node_path[:-1], node_path[1:]):
@@ -529,7 +529,7 @@ def _build_path_geometry(
 
     b_part = (
         linestring_substring(b_seg, 0.0, b_s) if b_from_u else linestring_substring(b_seg, L_b, b_s)
-    )  # noqa: E501
+    )
 
     return _concat_lines([a_part, *_ensure_oriented(fulls, node_path), b_part])
 
@@ -862,7 +862,7 @@ def main() -> int:
         np.array([(p.x, p.y) for p in kept_stops.geometry])
         if not kept_stops.empty
         else np.empty((0, 2))
-    )  # noqa: E501
+    )
     kd = cKDTree(kept_coords) if kept_coords.size else None
 
     results: Dict[str, Dict[str, object]] = {}
@@ -926,7 +926,7 @@ def main() -> int:
             flag = None
             if lin_ft <= ACROSS_STREET_MAX_FT and (
                 math.isinf(net_ft)
-                or net_ft > max(ACROSS_STREET_ABS_FT, ACROSS_STREET_RATIO * lin_ft)  # noqa: E501
+                or net_ft > max(ACROSS_STREET_ABS_FT, ACROSS_STREET_RATIO * lin_ft)
             ):
                 path_geom = LineString([(x, y), (float(tgt.geometry.x), float(tgt.geometry.y))])
                 net_ft = lin_ft
@@ -946,7 +946,7 @@ def main() -> int:
                 nearest_stop_id=None,
                 linear_dist_miles=round(float(lin_ft) / FT_PER_MILE, 4)
                 if lin_ft is not None
-                else None,  # noqa: E501
+                else None,
                 network_dist_miles="> 0.25",
                 path_geom=None,
                 sanity_flag=flag,

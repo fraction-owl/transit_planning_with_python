@@ -124,8 +124,9 @@ pip install -r requirements-dev.txt
 pre-commit install
 ```
 
-After this, `ruff check` and `ruff format` run automatically on every `git commit`. The hook reads its config
-from `pyproject.toml` and uses the same ruff version that CI does (pinned in `requirements-dev.txt`).
+After this, `ruff check` and `ruff format` run automatically on every `git commit`. The hooks are defined in
+`.pre-commit-config.yaml` at the repository root, pinned to the same ruff version CI uses (see
+`requirements-dev.txt`); the ruff rules they enforce come from `pyproject.toml`.
 
 ### 📝 Module docstrings
 

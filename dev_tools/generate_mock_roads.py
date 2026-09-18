@@ -811,7 +811,7 @@ def _planar_poly_to_wgs(poly: object, planar_to_wgs: Callable[[float, float], Pl
     def _tx(
         x: float,
         y: float,
-        z: float | None = None,  # noqa: ANN202
+        z: float | None = None,
     ) -> tuple[float, float]:
         lon, lat = planar_to_wgs(x, y)
         return (lon, lat)
@@ -1130,7 +1130,7 @@ def main() -> None:
 # name is `__main__`, so we additionally publish it under the expected name. When
 # the file IS on disk and imported normally, this assignment is a harmless no-op
 # (it just points the entry at itself).
-import sys as _sys  # noqa: E402,I001
+import sys as _sys  # noqa: E402
 
 _sys.modules["generate_mock_roads"] = _sys.modules[__name__]
 del _sys

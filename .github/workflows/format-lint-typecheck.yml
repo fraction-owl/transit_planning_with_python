@@ -52,4 +52,4 @@ jobs:
         # warning-level diagnostics; a newer ty started exiting non-zero on warnings.
         # --exit-zero-on-warning keeps those warnings advisory (still printed in the log)
         # while error-level diagnostics continue to fail the build.
-        run: ty check scripts --exclude "**/*arcpy*" --exit-zero-on-warning
+        run: ty check scripts utils --exclude "**/*arcpy*" --exit-zero-on-warning

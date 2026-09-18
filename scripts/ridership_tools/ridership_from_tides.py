@@ -82,8 +82,8 @@ from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 import matplotlib
 
 matplotlib.use("Agg")  # headless-safe; charts are written to disk, never shown
-import matplotlib.pyplot as plt  # noqa: E402
-import pandas as pd  # noqa: E402
+import matplotlib.pyplot as plt
+import pandas as pd
 
 # Sentinel markers used by extract_config_block / write_run_log to identify the
 # configuration block within this file's source. Each string must appear exactly

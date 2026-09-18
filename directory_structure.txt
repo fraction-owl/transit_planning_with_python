@@ -4,7 +4,6 @@ transit_planning_with_python/
 │   │   ├── README.md
 │   │   └── main_branch_protection.json
 │   ├── workflows/
-│   │   ├── .pre-commit-config.yaml
 │   │   ├── format-lint-autofix-weekly.yml
 │   │   ├── format-lint-typecheck.yml
 │   │   ├── helper-audit.yml
@@ -226,6 +225,7 @@ transit_planning_with_python/
 │   ├── test_cabi_coverage_by_route_gpd.py
 │   ├── test_cacensus_da_join_gpd.py
 │   ├── test_calendar_helpers.py
+│   ├── test_cli_helpers.py
 │   ├── test_clean_eia_gas_prices.py
 │   ├── test_clean_fred_unrate.py
 │   ├── test_clean_noaa_weather.py
@@ -309,6 +309,7 @@ transit_planning_with_python/
 │   ├── shapefile_helpers.py
 │   └── time_helpers.py
 ├── .gitignore
+├── .pre-commit-config.yaml
 ├── CONTRIBUTING.md
 ├── LICENSE
 ├── README.md
