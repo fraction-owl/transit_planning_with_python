@@ -33,6 +33,7 @@ from openpyxl.utils import get_column_letter
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+# === BEGIN CONFIG ===
 
 # Folder containing the raw GTFS feed (must include at least stops.txt, trips.txt,
 # stop_times.txt, and routes.txt). Use a raw string (r"") for Windows UNC paths.
@@ -72,6 +73,7 @@ EXPORT_TIMEPOINTS_ONLY: bool = True
 VALIDATE_TIMEPOINT_DISTANCE: bool = True
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
+# === END CONFIG ===
 
 # =============================================================================
 # FUNCTIONS

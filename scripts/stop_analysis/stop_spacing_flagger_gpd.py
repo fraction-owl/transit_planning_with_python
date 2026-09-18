@@ -37,6 +37,7 @@ from shapely.ops import split as split_line
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+# === BEGIN CONFIG ===
 
 GTFS_PATH: str = r"Path\To\Your\GTFS_Data_Folder"  # folder or .zip
 OUTPUT_FOLDER: str = r"Path\To\Your\Output_Folder"
@@ -58,6 +59,7 @@ LONG_SPACING_LOG_FILE: str = "long_spacing_segments.txt"
 LONG_SPACING_CSV_FILE: str = "long_spacing_segments.csv"
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
+# === END CONFIG ===
 
 # =============================================================================
 # FUNCTIONS

@@ -47,6 +47,7 @@ import pandas as pd
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+# === BEGIN CONFIG ===
 
 # ---- GTFS paths
 # Folder containing GTFS text files (stops.txt, stop_times.txt, trips.txt, routes.txt)
@@ -107,6 +108,7 @@ LOG_SHARED_STOPS: bool = True
 QA_REPORT_CSV: str = os.path.join(OUTPUT_FOLDER, "qa_shared_stops.csv")
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
+# === END CONFIG ===
 
 
 # =============================================================================

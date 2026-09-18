@@ -54,6 +54,7 @@ import pandas as pd
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+# === BEGIN CONFIG ===
 
 INPUT_CSV: Path = Path(r"Path\To\Event Runtime Analysis.csv")
 OUTPUT_DIR: Path = Path(r"Path\To\Your\Output_Folder")
@@ -152,6 +153,7 @@ REQ_COLS: list[str] = [
 ]
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
+# === END CONFIG ===
 
 # =============================================================================
 # HELPERS

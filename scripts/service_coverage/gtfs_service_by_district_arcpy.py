@@ -43,6 +43,7 @@ import pandas as pd
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+# === BEGIN CONFIG ===
 
 DISTRICTS_FC = r"Path\To\Your\Districts.shp"
 GTFS_DIR = r"Path\To\Your\GTFS_data"
@@ -66,6 +67,7 @@ LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
 # Optional whitelist of routes to include (matched against route_short_name).
 # Leave as None or an empty list to include all routes in the feed.
 ROUTE_WHITELIST: Optional[Sequence[str]] = None
+# === END CONFIG ===
 
 
 def configure_logging(log_dir: str) -> None:

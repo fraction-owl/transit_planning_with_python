@@ -28,6 +28,7 @@ import pandas as pd
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+# === BEGIN CONFIG ===
 
 GTFS_FOLDER = r"path\to\your\GTFS"
 ROADWAYS_PATH = r"path\to\your\roadways.shp"
@@ -63,6 +64,7 @@ DESCRIPTIONS_ROADWAY = {
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
 
 arcpy.env.overwriteOutput = True
+# === END CONFIG ===
 
 # =============================================================================
 # FUNCTIONS

@@ -36,6 +36,7 @@ from shapely.geometry import LineString, Point
 # ===========================================================================
 # CONFIGURATION
 # ===========================================================================
+# === BEGIN CONFIG ===
 
 GTFS_CRS = "EPSG:4326"  # Standard CRS for GTFS (WGS 84)
 # Type alias for export choices for clarity
@@ -60,6 +61,7 @@ SPLIT_BY_ROUTE: bool = False
 PER_ROUTE_SUBDIR: str = "gtfs_lines_by_route"
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
+# === END CONFIG ===
 
 # ===========================================================================
 # FUNCTIONS

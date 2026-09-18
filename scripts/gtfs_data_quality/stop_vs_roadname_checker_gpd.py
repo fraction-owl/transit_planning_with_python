@@ -33,6 +33,7 @@ from rapidfuzz import fuzz, process
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+# === BEGIN CONFIG ===
 
 # Paths to input files
 GTFS_FOLDER = r"path\to\your\GTFS\folder"  # Replace with your GTFS folder path
@@ -73,6 +74,7 @@ DESCRIPTIONS_ROADWAY = {
 }
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
+# === END CONFIG ===
 
 # =============================================================================
 # FUNCTIONS

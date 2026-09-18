@@ -65,6 +65,7 @@ import pandas as pd
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+# === BEGIN CONFIG ===
 
 # ---- Input roots ----
 INPUT_CSV_DIR: str | Path = r"Folder\Path\To\Your\input_csvs"  # <<< EDIT ME
@@ -131,6 +132,7 @@ _DEFAULT_INTERMEDIATE_COMBINED_CSV: str = str(
 )
 _DEFAULT_FINAL_OUTPUT_DIR: str = r"File\Path\To\Your\output_final"
 _DEFAULT_FINAL_JOINED_FEATURES: str = str(Path(_DEFAULT_FINAL_OUTPUT_DIR) / "blocks_with_attrs.shp")
+# === END CONFIG ===
 
 
 def _gp(msg: str, level: str = "info") -> None:

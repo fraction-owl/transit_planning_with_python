@@ -486,6 +486,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         write_log=args.log,
         write_weekly=args.weekly,
     )
+    logger.info("Script completed successfully.")
     return 0
 
 

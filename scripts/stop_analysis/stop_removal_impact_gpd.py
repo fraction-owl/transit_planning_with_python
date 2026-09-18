@@ -56,6 +56,7 @@ from shapely.strtree import STRtree
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+# === BEGIN CONFIG ===
 
 SIDEWALK_SHP = Path(r"Path\To\Your\Sidewalks_Centerline.shp")  # Must be a functional network
 GTFS_DIR = Path(r"Path\To\Your\GTFS_Folder")  # folder path must contain stops.txt
@@ -97,6 +98,7 @@ LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
 
 NodeKey = Tuple[float, float]  # quantized (x, y)
 EdgeID = int
+# === END CONFIG ===
 
 # =============================================================================
 # FUNCTIONS

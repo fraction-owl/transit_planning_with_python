@@ -39,6 +39,7 @@ import pandas as pd
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+# === BEGIN CONFIG ===
 
 # Ridership source workbook
 RIDERSHIP_XLSX: Path = Path(r"Your\File\Path\To\STOP_USAGE_(BY_STOP_ID).xlsx")
@@ -84,6 +85,7 @@ _AMENITY_ALIASES: Dict[str, str] = {
     "trash_can": "TRASHCAN",
     "trashcan": "TRASHCAN",
 }
+# === END CONFIG ===
 
 # =============================================================================
 # FUNCTIONS

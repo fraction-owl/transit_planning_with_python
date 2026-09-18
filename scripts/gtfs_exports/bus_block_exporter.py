@@ -46,6 +46,7 @@ import pandas as pd
 # ==============================================================================
 # CONFIGURATION
 # ==============================================================================
+# === BEGIN CONFIG ===
 
 GTFS_FOLDER_PATH: str = r"Path\To\Your\GTFS_Folder"
 OUTPUT_FOLDER: str = r"Path\To\Your\Output_Folder"
@@ -62,6 +63,7 @@ LAYOVER_THRESHOLD: int = 20  # minutes
 MAX_TRIPS_PER_BLOCK: int = 150
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
+# === END CONFIG ===
 
 # ==============================================================================
 # FUNCTIONS

@@ -39,6 +39,7 @@ from openpyxl.utils import get_column_letter
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+# === BEGIN CONFIG ===
 
 _DEFAULT_GTFS_FOLDER_PATH = r"Path\To\Your\Input\Folder"
 _DEFAULT_BASE_OUTPUT_PATH = r"Path\To\Your\Output\Folder"
@@ -66,6 +67,7 @@ MISSING_VALUE = "_____"
 MAX_COLUMN_WIDTH = 35
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
+# === END CONFIG ===
 
 # =============================================================================
 # FUNCTIONS

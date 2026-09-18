@@ -46,6 +46,7 @@ import pandas as pd
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+# === BEGIN CONFIG ===
 
 # ---- GTFS input
 GTFS_DIR: Path = Path(r"Path\To\Your\GTFS_Folder")
@@ -96,6 +97,7 @@ DETAIL_CSV_NAME: str = "stop_improvement_detail.csv"
 
 # ---- Logging
 LOG_LEVEL: str = "INFO"
+# === END CONFIG ===
 
 # =============================================================================
 # REUSABLE HELPERS (copied from utils/gtfs_helpers.py)
