@@ -53,7 +53,10 @@ OUTPUT_FOLDER: str = r"Path\To\Your\Output_Folder"
 ROUTE_SHORTNAME_FILTER: list[str] = []  # e.g. ["350", "353"]; [] = all
 AGGREGATE_BY_ROUTE_DIR: bool = False  # False → block XLSX; True → route/dir XLSX
 
-CALENDAR_SERVICE_IDS: list[str] = ["3"]
+# service_ids from calendar.txt to analyze; [] = every trip regardless of service.
+# service_id values are agency-specific — REPLACE WITH YOUR VALUES (the placeholder
+# below assumes a regular-weekday service).
+CALENDAR_SERVICE_IDS: list[str] = ["4"]
 DEFAULT_HOURS: int = 26
 TIME_INTERVAL_MIN: int = 1
 

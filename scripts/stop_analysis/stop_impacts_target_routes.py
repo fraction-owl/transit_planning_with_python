@@ -42,9 +42,11 @@ TARGET_ROUTE_TOKENS = {"101"}
 FILTER_TO_PLATFORM_STOPS = True
 
 # Optional service_id filter:
-# - None to include all service_ids
-# - e.g. {"2","3","4"} to restrict analysis to those calendars only
-SERVICE_ID_FILTER: set[str] | None = {"2", "3", "4"}  # Replace with your values
+# - None (the default) to include every service_id in the feed; output rows are
+#   already keyed by service, so nothing is conflated across service days
+# - e.g. {"2","3","4"} to restrict analysis to those calendars only. service_id
+#   values are agency-specific — REPLACE WITH YOUR VALUES if you set a filter.
+SERVICE_ID_FILTER: set[str] | None = None
 
 OUTPUT_FILENAME = "stop_route_calendar_impacts.csv"
 
