@@ -106,6 +106,24 @@ def main(
     root_name: Optional[str] = None,
 ) -> None:
     """Generate and output the directory tree for all files."""
+    _DEFAULT_TARGET_DIR = r"/path/to/transit_planning_with_python"
+    _DEFAULT_OUTPUT_DIR = r"/path/to/output_directory"
+    if directory == _DEFAULT_TARGET_DIR or output_dir == _DEFAULT_OUTPUT_DIR:
+        print(
+            "TARGET_DIR and/or OUTPUT_DIR are still set to their placeholder values. "
+            "Edit the CONFIGURATION block at the top of this script to point at the "
+            "repository you want to scan and the folder to write the tree into.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    if not os.path.isdir(directory):
+        print(
+            f"TARGET_DIR is not an existing directory: {directory}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
     tree = build_tree(directory)
     if root_name is None:
         root_name = os.path.basename(os.path.abspath(directory)) or directory
