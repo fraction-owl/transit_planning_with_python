@@ -30,6 +30,7 @@ import pandas as pd
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+# === BEGIN CONFIG ===
 
 # Top-level directories
 GTFS_DIR = Path(r"Path\To\Your\GTFS_Data")  # folder containing GTFS .txt files
@@ -87,6 +88,7 @@ TRANSFER_DISTANCE_FT: float = 150.0  # Max stop-to-stop distance for a transfer 
 TRANSFER_TIME_MIN: float = 40.0  # Max time difference between trips at transfer (minutes)
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
+# === END CONFIG ===
 
 
 # =============================================================================

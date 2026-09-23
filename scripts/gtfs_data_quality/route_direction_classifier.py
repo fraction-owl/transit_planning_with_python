@@ -31,6 +31,7 @@ from shapely.geometry import LineString
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+# === BEGIN CONFIG ===
 
 GTFS_FOLDER = r"/path/to/your/gtfs_folder"
 OUTPUT_FOLDER = r"/path/to/your/output_folder"
@@ -52,6 +53,7 @@ EXPORT_JPEG = True
 ANALYZE_ONLY_DOMINANT_SHAPE = True
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
+# === END CONFIG ===
 
 # =============================================================================
 # FUNCTIONS

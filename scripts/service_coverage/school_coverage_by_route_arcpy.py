@@ -64,6 +64,7 @@ import pandas as pd
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+# === BEGIN CONFIG ===
 
 # Top-level directories
 GTFS_DIR = Path(r"Path\To\Your\GTFS_Data")  # folder containing GTFS .txt files
@@ -115,6 +116,7 @@ OUTPUT_CSV_NAME = "school_coverage_by_route.csv"
 PROJECTED_CRS_WKID = 3857
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
+# === END CONFIG ===
 
 # =============================================================================
 # FUNCTIONS

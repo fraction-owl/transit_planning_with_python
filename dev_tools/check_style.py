@@ -10,7 +10,8 @@ Checks performed (per-file):
     1.  no_utils_import   – No runtime imports from utils/ at module level.
     2.  config_section    – A CONFIGURATION section is present.
     3.  run_log_present   – Run-log sidecar machinery present for output-writing scripts.
-    4.  raw_string_paths  – Raw-string literals (r"…") used for path/dir config variables.
+    4.  raw_string_paths  – Raw-string literals (r"…") used for path/dir config
+        variables whose value contains a backslash.
     5.  dc_crs            – Washington DC CRS referenced when a CRS config variable is defined.
     6.  imperial_units    – Imperial units (feet/miles) referenced when metric distances appear.
     7.  notebook_guard    – `if __name__ == "__main__": raise SystemExit(main())`
@@ -297,7 +298,11 @@ def check_run_log_present(src: str) -> list[Violation]:
 
 
 def check_raw_string_paths(src: str) -> list[Violation]:
-    """Flag path/dir/file config variables assigned to plain (non-raw) strings."""
+    """Flag path config variables assigned a plain string containing a backslash.
+
+    A backslash-free literal needs no raw prefix, and CONTRIBUTING.md gives
+    ``"input_data.csv"`` as a correct placeholder, so those are left alone.
+    """
     # Prefer to scan only the config block; fall back to the full source.
     search_in = _extract_config_block(src) or src
 
@@ -312,21 +317,35 @@ def check_raw_string_paths(src: str) -> list[Violation]:
     found: list[Violation] = []
     for m in assignment_pat.finditer(search_in):
         var_name = m.group(1)
+        quote = m.group(2)
         # Walk back to start of line and check whether a raw prefix exists.
         line_start = search_in.rfind("\n", 0, m.start()) + 1
         line_end = search_in.find("\n", m.start())
         line = search_in[line_start : line_end if line_end != -1 else None]
-        if not re.search(r'=[ \t]*(?:Path\s*\(\s*)?[rR]["\']', line):
-            found.append(
-                Violation(
-                    check="raw_string_paths",
-                    line=None,
-                    message=(
-                        f"Config variable `{var_name}` uses a plain string for a path — "
-                        r'use r"…" (raw string) to avoid backslash-escape issues on Windows'
-                    ),
-                )
+        if re.search(r'=[ \t]*(?:Path\s*\(\s*)?[rR]["\']', line):
+            continue  # already a raw string
+
+        # Only a literal that actually contains a backslash can be mangled by
+        # escape processing.  CONTRIBUTING.md explicitly endorses plain strings
+        # for backslash-free values (e.g. "input_data.csv"), so flagging those
+        # would contradict the house style the rule exists to enforce.
+        body_start = m.end() - line_start
+        close = line.find(quote, body_start)
+        literal = line[body_start : close if close != -1 else len(line)]
+        if "\\" not in literal:
+            continue
+
+        found.append(
+            Violation(
+                check="raw_string_paths",
+                line=None,
+                message=(
+                    f"Config variable `{var_name}` uses a plain string for a path "
+                    "containing a backslash — "
+                    r'use r"…" (raw string) to avoid backslash-escape issues on Windows'
+                ),
             )
+        )
     return found
 
 
@@ -396,30 +415,62 @@ def check_imperial_units(src: str) -> list[Violation]:
     return []
 
 
-def check_notebook_guard(src: str) -> list[Violation]:
+def _is_main_guard_test(test: ast.expr) -> bool:
+    """Return True if *test* is the `__name__ == "__main__"` comparison."""
+    if not isinstance(test, ast.Compare) or len(test.ops) != 1:
+        return False
+    if not isinstance(test.ops[0], ast.Eq):
+        return False
+    left, right = test.left, test.comparators[0]
+    for name_node, const_node in ((left, right), (right, left)):
+        if (
+            isinstance(name_node, ast.Name)
+            and name_node.id == "__name__"
+            and isinstance(const_node, ast.Constant)
+            and const_node.value == "__main__"
+        ):
+            return True
+    return False
+
+
+def _calls_main(node: ast.stmt) -> bool:
+    """Return True if *node* contains a call to a bare `main(...)`."""
+    return any(
+        isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name) and sub.func.id == "main"
+        for sub in ast.walk(node)
+    )
+
+
+def check_notebook_guard(src: str, path: Path) -> list[Violation]:
     """Flag the absence of an `if __name__ == '__main__':` guard calling main().
 
     Accepted guard bodies: `raise SystemExit(main())` (preferred — propagates
     main()'s integer return value as the process exit code), `sys.exit(main())`,
-    and the legacy bare `main()`.
+    and the legacy bare `main()`.  The guard body is matched structurally, so an
+    intervening comment, a `try:` wrapper, or a trailing `# pragma: no cover` on
+    the `if` line does not hide an otherwise valid guard.
     """
-    if not re.search(
-        r'if\s+__name__\s*==\s*["\']__main__["\']\s*:\s*\n'
-        r"[ \t]+(?:raise\s+SystemExit\s*\(\s*main|sys\.exit\s*\(\s*main|main)\s*\(",
-        src,
-    ):
-        return [
-            Violation(
-                check="notebook_guard",
-                line=None,
-                message=(
-                    'Missing `if __name__ == "__main__": raise SystemExit(main())` guard — '
-                    "required so the script runs from both a Jupyter notebook and the CLI, "
-                    "and so shell callers see a non-zero exit code on failure"
-                ),
-            )
-        ]
-    return []
+    try:
+        tree = ast.parse(src, filename=str(path))
+    except SyntaxError:
+        return []
+
+    for node in tree.body:
+        if isinstance(node, ast.If) and _is_main_guard_test(node.test):
+            if any(_calls_main(stmt) for stmt in node.body):
+                return []
+
+    return [
+        Violation(
+            check="notebook_guard",
+            line=None,
+            message=(
+                'Missing `if __name__ == "__main__": raise SystemExit(main())` guard — '
+                "required so the script runs from both a Jupyter notebook and the CLI, "
+                "and so shell callers see a non-zero exit code on failure"
+            ),
+        )
+    ]
 
 
 def check_main_function(src: str, path: Path) -> list[Violation]:
@@ -472,9 +523,14 @@ def check_logging_present(src: str) -> list[Violation]:
 
 
 def check_success_message(src: str) -> list[Violation]:
-    """Flag scripts that don't log a success or completion message."""
+    """Flag scripts that don't log a success or completion message.
+
+    Accepts the module-level ``logger = logging.getLogger(__name__)`` alias as
+    well as bare ``logging.*`` calls — both are the logging module, which is
+    what CONTRIBUTING.md asks for.
+    """
     if not re.search(
-        r"logging\.\w+\s*\([^)]*(?:success|complet|finish|done)",
+        r"(?<![A-Za-z0-9_])_?(?:logging|logger|log)\.\w+\s*\([^)]*(?:success|complet|finish|done)",
         src,
         re.IGNORECASE,
     ):
@@ -654,7 +710,7 @@ def audit_file(path: Path) -> FileResult:
     if enabled.get("imperial_units", True):
         violations.extend(check_imperial_units(src))
     if enabled.get("notebook_guard", True):
-        violations.extend(check_notebook_guard(src))
+        violations.extend(check_notebook_guard(src, path))
     if enabled.get("main_function", True):
         violations.extend(check_main_function(src, path))
     if enabled.get("logging_present", True):

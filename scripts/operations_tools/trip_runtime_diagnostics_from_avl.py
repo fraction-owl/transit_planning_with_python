@@ -53,6 +53,7 @@ import seaborn as sns
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+# === BEGIN CONFIG ===
 
 INPUT_ROOT_DIR: Final[Path] = Path(r"Path\To\Your\Data_Folder_with_observed_trips")
 OUTPUT_ROOT_DIR: Final[Path] = Path(r"Path\To\Your\Output_Folder")
@@ -123,6 +124,7 @@ LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
 # ---------------------------------------------------------------------
 
 PlotFunc: TypeAlias = Callable[[pd.DataFrame], None]
+# === END CONFIG ===
 
 # =============================================================================
 # FUNCTIONS

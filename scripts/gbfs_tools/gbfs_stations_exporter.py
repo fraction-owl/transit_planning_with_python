@@ -40,6 +40,7 @@ from shapely.geometry import Point
 # ===========================================================================
 # CONFIGURATION
 # ===========================================================================
+# === BEGIN CONFIG ===
 
 GBFS_CRS = "EPSG:4326"  # GBFS coordinates are always WGS 84
 # Type alias for export choices for clarity
@@ -63,6 +64,7 @@ PREFERRED_LANGUAGE: str = "en"
 REQUEST_TIMEOUT: int = 30
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
+# === END CONFIG ===
 
 # ===========================================================================
 # FUNCTIONS

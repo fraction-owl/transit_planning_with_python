@@ -31,6 +31,7 @@ from shapely.geometry import Point
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+# === BEGIN CONFIG ===
 
 GTFS_FOLDER = r"Path\To\Your\GTFS\Folder"
 OUTPUT_FOLDER = r"Path\To\Your\Output\Folder"
@@ -62,6 +63,7 @@ STOP_CODE_FILTER: list[str] = []
 OUTPUT_FILE_NAME = "proximity_results.csv"
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
+# === END CONFIG ===
 
 # =============================================================================
 # FUNCTIONS

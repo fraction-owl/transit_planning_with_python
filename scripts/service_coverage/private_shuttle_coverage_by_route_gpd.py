@@ -40,6 +40,20 @@ date — match it to the ridership anchor's period so a shuttle that shut down
 years ago doesn't inflate today's counts. A site with an unknown start or end
 date is treated as active.
 
+Outputs
+-------
+Written to ``OUTPUT_DIR``:
+
+- ``private_shuttles_clean.csv`` — the cleaned, deduplicated registry.
+- ``private_shuttles_needs_geocoding.csv`` — rows whose coordinates are missing
+  or invalid, for manual geocoding before a re-run.
+- ``Private_Shuttle_Stops.zip`` — the clean rows as a zipped point shapefile,
+  ready to drop into a coverage script's ``SHP_INPUT_DIR``.
+- ``private_shuttle_coverage_by_route.csv`` — per-``route_id`` shuttle counts.
+  Written only when a GTFS folder is supplied.
+- ``private_shuttles_runlog.txt`` — run-log sidecar capturing the CONFIGURATION
+  block verbatim, plus a timestamp and this script's path.
+
 Typical usage
 -------------
 Update the paths in the CONFIGURATION section (or pass the matching CLI flags,

@@ -40,6 +40,7 @@ import pandas as pd
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+# === BEGIN CONFIG ===
 
 # --- Output destinations and names ---
 OUTPUT_DIR: str = r"projects\my_stop_analysis\output"
@@ -83,6 +84,7 @@ LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
 
 # Scratch
 TMP_WS = arcpy.env.scratchGDB
+# === END CONFIG ===
 
 # =============================================================================
 # FUNCTIONS

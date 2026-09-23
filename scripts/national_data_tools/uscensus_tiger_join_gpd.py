@@ -89,6 +89,7 @@ from pandas import DataFrame
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+# === BEGIN CONFIG ===
 
 # ---- Stage 1: CSV inputs ----------------------------------------------------
 #: Root folder holding every Census download (plain CSV, *.csv.gz*, or ZIPs).
@@ -227,6 +228,7 @@ _DEFAULT_INTERMEDIATE_MERGED_SHP: str = str(
 _DEFAULT_FINAL_JOINED_FEATURES: str = str(
     Path(_DEFAULT_OUTPUT_DIR) / "va_md_dc_blocks_plus_data.shp"
 )
+# === END CONFIG ===
 
 
 class _Unset:

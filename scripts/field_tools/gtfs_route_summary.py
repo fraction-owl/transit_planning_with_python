@@ -32,6 +32,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 # ==== CONFIGURATION ==========================================================
+# === BEGIN CONFIG ===
 
 _DEFAULT_GTFS_FOLDER_PATH = r"Path\To\Your\GTFS_Folder"
 _DEFAULT_BASE_OUTPUT_PATH = r"Path\To\Your\Output_Folder"
@@ -49,6 +50,7 @@ LAST_CHANGED_PATH = ""
 RIDERSHIP_PATH = ""
 
 REQUIRED_GTFS_FILES = ["routes.txt", "trips.txt", "stop_times.txt", "calendar.txt"]
+# === END CONFIG ===
 
 # -----------------------------------------------------------------------------
 # Classification thresholds

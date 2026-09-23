@@ -73,6 +73,7 @@ from shapely.ops import unary_union
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+# === BEGIN CONFIG ===
 
 # Top-level directories
 GTFS_DIR = Path(r"data/gtfs")  # folder containing GTFS .txt files
@@ -120,6 +121,7 @@ OUTPUT_CSV_NAME = "cabi_coverage_by_route.csv"
 PROJECTED_CRS = "EPSG:3857"
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
+# === END CONFIG ===
 
 # =============================================================================
 # FUNCTIONS
