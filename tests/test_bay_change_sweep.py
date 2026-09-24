@@ -9,6 +9,7 @@ import pandas as pd
 import pytest
 
 import scripts.facilities_tools.bay_change_sweep as target
+import scripts.gtfs_exports.block_status_timeline_exporter as step1
 
 # ---------------------------------------------------------------------------
 # Synthetic Step 1 timeline: two blocks meeting at a two-bay cluster
@@ -97,6 +98,87 @@ def step1_folder(tmp_path: Path) -> Path:
     folder.mkdir()
     _timeline().to_csv(folder / "all_blocks_timeline.csv", index=False)
     return folder
+
+
+# The same schedule as GTFS, exported by Step 1 with the manifest and schedule snapshot the
+# sweep needs. POST_ARRIVAL_MINUTES = 1 reproduces the hand-built timeline above.
+_GTFS_TRIPS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
+    ("T1", "10", "B1", [("S9", "07:50:00"), ("S1", "08:00:00")]),
+    ("T2", "10", "B1", [("S1", "08:10:00"), ("S9", "08:20:00")]),
+    ("T3", "20", "B2", [("S8", "07:45:00"), ("S1", "08:00:00")]),
+    ("T4", "21", "B2", [("S1", "08:20:00"), ("S8", "08:35:00")]),
+]
+
+
+def _export(
+    gtfs: Path,
+    out: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    trips: list[tuple[str, str, str, list[tuple[str, str]]]] = _GTFS_TRIPS,
+) -> Path:
+    """Write *trips* as a GTFS feed and run Step 1 on it; return the run folder."""
+    gtfs.mkdir(parents=True)
+    stops = ["S1", "S2", "S8", "S9"]
+    pd.DataFrame({"stop_id": stops, "stop_name": [f"Stop {s}" for s in stops]}).to_csv(
+        gtfs / "stops.txt", index=False
+    )
+    routes = ["10", "20", "21"]
+    pd.DataFrame(
+        {"route_id": [f"R{r}" for r in routes], "route_short_name": routes, "route_type": 3}
+    ).to_csv(gtfs / "routes.txt", index=False)
+    pd.DataFrame(
+        [
+            {
+                "route_id": f"R{route}",
+                "service_id": "WKDY",
+                "trip_id": trip_id,
+                "direction_id": "0",
+                "block_id": block,
+                "trip_headsign": f"Route {route} headsign",
+            }
+            for trip_id, route, block, _ in trips
+        ]
+    ).to_csv(gtfs / "trips.txt", index=False)
+    pd.DataFrame(
+        [
+            {
+                "trip_id": trip_id,
+                "arrival_time": time,
+                "departure_time": time,
+                "stop_id": stop,
+                "stop_sequence": seq,
+            }
+            for trip_id, _, _, visits in trips
+            for seq, (stop, time) in enumerate(visits, start=1)
+        ]
+    ).to_csv(gtfs / "stop_times.txt", index=False)
+    settings: dict[str, Any] = {
+        "GTFS_FOLDER_PATH": str(gtfs),
+        "BLOCK_OUTPUT_FOLDER": str(out),
+        "SCENARIO_NAME": "",
+        "CALENDAR_SERVICE_IDS": ["WKDY"],
+        "SERVICE_DATE": "",
+        "ROUTE_SHORTNAME_FILTER": [],
+        "STOP_ID_FILTER": [],
+        "STOP_CODE_FILTER": [],
+        "BAY_OVERRIDES": [],
+        "WRITE_PER_BLOCK_FILES": False,
+        "BUS_STOP_CLUSTERS_STEP1": [{"name": "TC", "stops": ["S1", "S2"]}],
+        "THROUGH_DWELL_MINUTES": 2,
+        "PRE_DEPARTURE_MINUTES": 5,
+        "POST_ARRIVAL_MINUTES": 1,
+        "IN_BAY_LAYOVER_MAX_MINUTES": 10,
+        "LAYOVER_THRESHOLD": 20,
+    }
+    for name, value in settings.items():
+        monkeypatch.setattr(step1, name, value)
+    step1.run_step1_gtfs_to_blocks()
+    return out
+
+
+@pytest.fixture
+def exported_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    return _export(tmp_path / "gtfs", tmp_path / "step1_run", monkeypatch)
 
 
 @pytest.fixture
@@ -195,6 +277,9 @@ def test_route_ends_with_no_chains() -> None:
                 "last_stop": "S1",
                 "last_bay": "A",
                 "through_bays": "",
+                "departure": 470,
+                "arrival": 480,
+                "through_visits": [],
             }
         ]
     )
@@ -215,10 +300,26 @@ def test_change_combine_and_compatible() -> None:
     b = target.Change(shifts={"20": 2})
     c = target.Change(shifts={"20": -2})
     assert a.compatible(b)
-    assert not b.compatible(c)
+    assert not b.compatible(c)  # one route cannot shift both ways
+    assert not b.compatible(b)  # nothing new to add
     combined = a.combine(b)
     assert combined.label() == "10 arrive to Bay B; 20 +2 min"
-    assert b.combine(c).shifts == {}  # shifts on one key add up; zero drops out
+    assert b.combine(target.Change(shifts={"20": 2})).shifts == {"20": 2}  # applied once
+    with pytest.raises(ValueError, match="conflicting"):
+        b.combine(c)
+
+
+def test_expand_groups_refuses_contradictions_and_follows_overlaps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(target, "SHIFT_TOGETHER", [["20 arrive", "21 depart"]])
+    with pytest.raises(ValueError, match="Conflicting"):
+        target.expand_groups(target.Change(shifts={"20 arrive": 2, "21 depart": 1}))
+    monkeypatch.setattr(
+        target, "SAME_BAY_GROUPS", [["10 depart", "20 arrive"], ["10 arrive", "10 depart"]]
+    )
+    out = target.expand_groups(target.Change(moves={"10 arrive": "B"}))
+    assert out.moves == {"10 arrive": "B", "10 depart": "B", "20 arrive": "B"}
 
 
 def test_expand_groups_moves_members_together(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -229,32 +330,68 @@ def test_expand_groups_moves_members_together(monkeypatch: pytest.MonkeyPatch) -
     assert out.shifts == {"20 arrive": 3, "21 depart": 3}
 
 
-def test_standard_baseline_conflicts(step1_folder: Path, cluster: None) -> None:
-    df = target.load_timeline(str(step1_folder))
+def test_standard_baseline_conflicts(exported_run: Path, cluster: None) -> None:
+    df = target.load_timeline(str(exported_run))
     std = target.Standard("x", df, target.build_trips(df))
-    total, per_bay, conflict = std.score(std.bays0, std.minutes0)
+    total, per_bay, conflict = std.score(std.occ)
     assert (total, per_bay) == (2, {"A": 2})
-    who, kinds = std.detail(std.bays0, std.minutes0, conflict)
+    who, kinds = std.detail(std.occ, conflict)
     assert kinds == {"boarding/boarding": 2}
     assert set(who.values()) == {("10 arrive", "20 arrive")}
 
 
-def test_standard_bay_move_clears_conflict(step1_folder: Path, cluster: None) -> None:
-    df = target.load_timeline(str(step1_folder))
+def test_standard_bay_move_clears_conflict(exported_run: Path, cluster: None) -> None:
+    df = target.load_timeline(str(exported_run))
     std = target.Standard("x", df, target.build_trips(df))
-    bays, minutes = std.apply(target.Change(moves={"20 arrive": "B"}))
-    assert std.score(bays, minutes)[0] == 0
+    assert std.score(std.apply(target.Change(moves={"20 arrive": "B"})))[0] == 0
 
 
-def test_standard_shift_drops_own_overlapping_rows(step1_folder: Path, cluster: None) -> None:
-    df = target.load_timeline(str(step1_folder))
+def test_standard_shift_rebuilds_the_block(exported_run: Path, cluster: None) -> None:
+    df = target.load_timeline(str(exported_run))
     std = target.Standard("x", df, target.build_trips(df))
-    # Moving route 10's departure 5 minutes earlier slides its LOADING rows over
-    # T1's arrival rows on the same block; the departing rows win, so bay A still
-    # holds one route-10 bus and one route-20 bus at 08:00-08:01.
-    bays, minutes = std.apply(target.Change(shifts={"10 depart": -5}))
-    assert std.score(bays, minutes)[0] == 2
-    assert (bays == -1).sum() > 0
+    # Route 10 departing 5 minutes earlier turns T1's arrival buffer into loading for T2;
+    # bay A still holds one route-10 bus and one route-20 bus at 08:00-08:01.
+    rebuilt = std.apply(target.Change(shifts={"10 depart": -5}))
+    assert std.score(rebuilt)[0] == 2
+    assert not rebuilt.duplicated(["Block", "Minute"]).any()
+    b1 = rebuilt[rebuilt["Block"] == "B1"].set_index("Minute")["Status"]
+    assert list(b1.loc[480:485]) == ["ARRIVE", "LOADING", "LOADING", "LOADING", "LOADING", "DEPART"]
+
+
+# Each change, and the GTFS edit that makes the same change for a fresh Step 1 run.
+_EDITS: dict[str, tuple[dict[str, Any], dict[str, list[tuple[str, str]]]]] = {
+    "bay move": ({"moves": {"20 arrive": "B"}}, {"T3": [("S8", "07:45:00"), ("S2", "08:00:00")]}),
+    "route-end shift": (
+        {"shifts": {"10 depart": -5}},
+        {"T2": [("S1", "08:05:00"), ("S9", "08:15:00")]},
+    ),
+    "whole-route shift": ({"shifts": {"21": 3}}, {"T4": [("S1", "08:23:00"), ("S8", "08:38:00")]}),
+    # Changes that move a turn between the bay and the overflow space.
+    "earlier arrival leaves the bay": (
+        {"shifts": {"10 arrive": -3}},
+        {"T1": [("S9", "07:47:00"), ("S1", "07:57:00")]},  # 13-minute turn: overflow
+    ),
+    "interline shift into the bay": (
+        {"shifts": {"21": -10}},
+        {"T4": [("S1", "08:10:00"), ("S8", "08:25:00")]},  # 10-minute turn: in the bay
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_EDITS))
+def test_standard_rebuild_matches_a_fresh_export(
+    case: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cluster: None
+) -> None:
+    change, edits = _EDITS[case]
+    baseline = _export(tmp_path / "gtfs", tmp_path / "base", monkeypatch)
+    edited = [(tid, route, blk, edits.get(tid, visits)) for tid, route, blk, visits in _GTFS_TRIPS]
+    fresh = _export(tmp_path / "gtfs_edited", tmp_path / "edited", monkeypatch, edited)
+    df = target.load_timeline(str(baseline))
+    std = target.Standard("x", df, target.build_trips(df))
+    columns = ["Block", "Minute", "Bay", "Status", "route_end"]
+    rebuilt = std.apply(target.Change(**change))[columns].astype(str)
+    expected = std._occupancy(target.load_timeline(str(fresh)))[columns].astype(str)
+    assert sorted(map(tuple, rebuilt.to_numpy())) == sorted(map(tuple, expected.to_numpy()))
 
 
 def test_feasibility_rejects_gap_below_minimum(step1_folder: Path, cluster: None) -> None:
@@ -269,6 +406,15 @@ def test_feasibility_rejects_gap_below_minimum(step1_folder: Path, cluster: None
     ok, _, tightest = feas.check(target.Change(shifts={"21 depart": -18}))
     assert (ok, tightest) == (True, 2)
     assert not feas.check(target.Change(shifts={"21 depart": -19}))[0]
+
+
+def test_trip_shift_applies_overlapping_selectors_once(exported_run: Path, cluster: None) -> None:
+    trips = target.build_trips(target.load_timeline(str(exported_run)))
+    feas = target.Feasibility(trips, target.build_block_chains(trips))
+    shift = dict(zip(feas.trips["trip_id"], feas.trip_shift({"10": 2, "10 depart": 2})))
+    assert (shift["T1"], shift["T2"], shift["T3"]) == (2, 2, 0)  # T2 moves 2, not 4
+    with pytest.raises(ValueError, match="different shifts"):
+        feas.trip_shift({"10": 2, "10 depart": 3})
 
 
 def test_feasibility_off_clockface_note(step1_folder: Path, cluster: None) -> None:
@@ -318,10 +464,10 @@ def test_run_discover_writes_workbook_and_stub(
 
 
 def test_run_sweep_finds_bay_move(
-    step1_folder: Path, tmp_path: Path, cluster: None, monkeypatch: pytest.MonkeyPatch
+    exported_run: Path, tmp_path: Path, cluster: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
-        target, "TIMELINES", {"Direct": str(step1_folder), "Likely": str(step1_folder)}
+        target, "TIMELINES", {"Direct": str(exported_run), "Likely": str(exported_run)}
     )
     monkeypatch.setattr(target, "OUTPUT_FOLDER", str(tmp_path / "out"))
     monkeypatch.setattr(target, "SCENARIO_LABEL", "test")
@@ -363,6 +509,39 @@ def test_run_sweep_finds_bay_move(
     assert finalists.loc[0, "change"] == "20 arrive to Bay B"
     assert finalists.loc[0, "Direct before"] == 2  # scored against the untouched baseline
     assert (tmp_path / "out" / "test_sweep_runlog.txt").is_file()
+
+
+def test_run_sweep_refuses_legacy_timelines(
+    step1_folder: Path, tmp_path: Path, cluster: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(target, "TIMELINES", {"Direct": str(step1_folder)})
+    monkeypatch.setattr(target, "OUTPUT_FOLDER", str(tmp_path / "out"))
+    with pytest.raises(ValueError, match="revised exporter"):
+        target.run_sweep()
+
+
+def test_run_discover_on_exported_run_with_pull_out_loading(
+    exported_run: Path, tmp_path: Path, cluster: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Pull-out LOADING rows carry no Arrival Time; trip ends must still be read correctly.
+    monkeypatch.setattr(target, "TIMELINES", {"Direct": str(exported_run)})
+    monkeypatch.setattr(target, "OUTPUT_FOLDER", str(tmp_path / "out"))
+    monkeypatch.setattr(target, "SCENARIO_LABEL", "test")
+    chains = pd.read_excel(target.run_discover(), sheet_name="Block chains Direct")
+    assert sorted(chains["gap_min"]) == [10, 20]
+
+
+def test_legacy_trips_ignore_blank_arrival_times(tmp_path: Path, cluster: None) -> None:
+    rows = [
+        *[_row("B1", f"07:4{m}", "LOADING", "T1", "10", "S9", "", "07:50") for m in range(5, 10)],
+        *_timeline().to_dict("records"),
+    ]
+    folder = tmp_path / "legacy"
+    folder.mkdir()
+    pd.DataFrame(rows).to_csv(folder / "all_blocks_timeline.csv", index=False)
+    trips = target.build_trips(target.load_timeline(str(folder))).set_index("trip_id")
+    assert (trips.loc["T1", "start"], trips.loc["T1", "end"]) == (470, 480)
+    assert target.build_block_chains(trips.reset_index())["gap_min"].tolist() == [10, 20]
 
 
 def test_main_returns_1_when_required_run_log_fails(

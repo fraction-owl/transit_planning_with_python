@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 import os
+import shutil
+import zipfile
 from pathlib import Path
 
 import openpyxl
@@ -9,19 +12,19 @@ import pytest
 
 import scripts.gtfs_exports.block_status_timeline_exporter as mod
 from scripts.gtfs_exports.block_status_timeline_exporter import (
-    _gap_status,
     _merge_and_filter_data,
-    _row_for_inactive,
     apply_bay_overrides,
     assumptions_text,
     fill_stop_ids_for_dwell_layover_loading,
     find_cluster,
+    gap_status,
     get_status_for_minute,
     mark_first_and_last_stops,
     minutes_to_hhmm,
     parse_time_to_minutes,
     process_block,
     resolve_service_ids,
+    row_for_inactive,
     run_output_folder,
     validate_folders,
 )
@@ -203,6 +206,20 @@ def test_get_status_for_minute_through_stop_dwell_window() -> None:
     assert get_status_for_minute(432, _SEQ_THROUGH)[0] == "TRAVELING BETWEEN STOPS"
 
 
+def test_get_status_for_minute_hold_boundaries_are_occupied() -> None:
+    # A one-minute timed hold at a mid-trip stop occupies the stop at both of its minutes.
+    seq = [
+        (420, 420, "S1", "Main St", "T1", True, False, 1, 0),
+        (430, 431, "S2", "Oak Ave", "T1", False, False, 2, 0),
+        (440, 440, "S3", "Elm St", "T1", False, True, 3, 0),
+    ]
+    assert [get_status_for_minute(m, seq)[:2] for m in (430, 431, 432)] == [
+        ("DWELL", "S2"),
+        ("DWELL", "S2"),
+        ("TRAVELING BETWEEN STOPS", None),
+    ]
+
+
 def test_get_status_for_minute_later_stop_wins_over_stretched_window(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -229,7 +246,7 @@ def test_get_status_for_minute_later_stop_wins_over_stretched_window(
     ],
 )
 def test_gap_status(gap: int, same_place: bool, expected: tuple[str, str]) -> None:
-    assert _gap_status(gap, same_place) == expected
+    assert gap_status(gap, same_place, mod.occupancy_settings()) == expected
 
 
 def _trip(trip_id: str, start: int, end: int, first_stop: str, last_stop: str) -> dict:
@@ -255,8 +272,8 @@ _HUB = [{"name": "Hub", "stops": ["S1", "S2"]}]
 
 
 def test_row_for_inactive_short_gap_same_stop_is_in_bay_dwell() -> None:
-    trips = [_trip("T1", 400, 420, "S9", "S1"), _trip("T2", 428, 450, "S1", "S9")]
-    row = _row_for_inactive(422, "B1", trips, [])
+    trips = [_trip("T1", 400, 420, "S9", "S1"), _trip("T2", 430, 450, "S1", "S9")]
+    row = row_for_inactive(423, "B1", trips, [], mod.occupancy_settings())
     assert row["Status"] == "DWELL"
     assert row["Layover Location"] == "in bay"
     assert row["Stop ID"] == "S1"
@@ -266,24 +283,24 @@ def test_row_for_inactive_short_gap_same_stop_is_in_bay_dwell() -> None:
 
 def test_row_for_inactive_longer_gap_moves_to_overflow() -> None:
     trips = [_trip("T1", 400, 420, "S9", "S1"), _trip("T2", 435, 450, "S1", "S9")]
-    row = _row_for_inactive(425, "B1", trips, [])
+    row = row_for_inactive(425, "B1", trips, [], mod.occupancy_settings())
     assert (row["Status"], row["Layover Location"]) == ("LAYOVER", "overflow")
     trips = [_trip("T1", 400, 420, "S9", "S1"), _trip("T2", 445, 460, "S1", "S9")]
-    row = _row_for_inactive(430, "B1", trips, [])
+    row = row_for_inactive(430, "B1", trips, [], mod.occupancy_settings())
     assert (row["Status"], row["Layover Location"]) == ("LONG BREAK", "overflow")
 
 
 def test_row_for_inactive_same_cluster_counts_as_same_place() -> None:
-    trips = [_trip("T1", 400, 420, "S9", "S1"), _trip("T2", 428, 450, "S2", "S9")]
-    assert _row_for_inactive(422, "B1", trips, [])["Status"] == "DEADHEAD"
-    row = _row_for_inactive(422, "B1", trips, _HUB)
+    trips = [_trip("T1", 400, 420, "S9", "S1"), _trip("T2", 430, 450, "S2", "S9")]
+    assert row_for_inactive(423, "B1", trips, [], mod.occupancy_settings())["Status"] == "DEADHEAD"
+    row = row_for_inactive(423, "B1", trips, _HUB, mod.occupancy_settings())
     assert row["Status"] == "DWELL"
     assert row["Stop ID"] == "S1"  # the arrival bay
 
 
 def test_row_for_inactive_deadhead_has_no_stop() -> None:
-    trips = [_trip("T1", 400, 420, "S9", "S1"), _trip("T2", 428, 450, "S5", "S9")]
-    row = _row_for_inactive(422, "B1", trips, _HUB)
+    trips = [_trip("T1", 400, 420, "S9", "S1"), _trip("T2", 430, 450, "S5", "S9")]
+    row = row_for_inactive(423, "B1", trips, _HUB, mod.occupancy_settings())
     assert row["Status"] == "DEADHEAD"
     assert row["Stop ID"] == ""
     assert (row["Prev Trip ID"], row["Next Trip ID"]) == ("T1", "T2")
@@ -292,20 +309,30 @@ def test_row_for_inactive_deadhead_has_no_stop() -> None:
 def test_row_for_inactive_loading_and_arrive_windows() -> None:
     trips = [_trip("T1", 400, 420, "S9", "S1"), _trip("T2", 428, 450, "S3", "S9")]
     # Within PRE_DEPARTURE_MINUTES (5) of T2: LOADING at T2's first stop.
-    row = _row_for_inactive(424, "B1", trips, [])
+    row = row_for_inactive(424, "B1", trips, [], mod.occupancy_settings())
     assert (row["Status"], row["Stop ID"], row["Trip ID"]) == ("LOADING", "S3", "T2")
     # Within POST_ARRIVAL_MINUTES (2) after T1: ARRIVE at T1's last stop.
-    row = _row_for_inactive(421, "B1", trips, [])
+    row = row_for_inactive(421, "B1", trips, [], mod.occupancy_settings())
     assert (row["Status"], row["Stop ID"], row["Trip ID"]) == ("ARRIVE", "S1", "T1")
+
+
+def test_row_for_inactive_arrival_buffer_is_post_arrival_minutes_long() -> None:
+    trips = [_trip("T1", 400, 420, "S9", "S1"), _trip("T2", 430, 450, "S1", "S9")]
+    settings = {**mod.occupancy_settings(), "POST_ARRIVAL_MINUTES": 2}
+    statuses = [row_for_inactive(m, "B1", trips, [], settings)["Status"] for m in (421, 422, 423)]
+    assert statuses == ["ARRIVE", "ARRIVE", "DWELL"]  # two minutes after the 420 arrival
+    settings["POST_ARRIVAL_MINUTES"] = 1
+    assert row_for_inactive(421, "B1", trips, [], settings)["Status"] == "ARRIVE"
+    assert row_for_inactive(422, "B1", trips, [], settings)["Status"] == "DWELL"
 
 
 def test_row_for_inactive_pull_out_and_inactive() -> None:
     trips = [_trip("T1", 428, 450, "S3", "S9")]
-    assert _row_for_inactive(300, "B1", trips, [])["Status"] == "INACTIVE"
-    row = _row_for_inactive(424, "B1", trips, [])
+    assert row_for_inactive(300, "B1", trips, [], mod.occupancy_settings())["Status"] == "INACTIVE"
+    row = row_for_inactive(424, "B1", trips, [], mod.occupancy_settings())
     assert (row["Status"], row["Stop ID"]) == ("LOADING", "S3")  # pull-out
     trips = [_trip("T1", 400, 420, "S9", "S1")]
-    assert _row_for_inactive(600, "B1", trips, [])["Status"] == "INACTIVE"
+    assert row_for_inactive(600, "B1", trips, [], mod.occupancy_settings())["Status"] == "INACTIVE"
 
 
 # ---------------------------------------------------------------------------
@@ -395,13 +422,27 @@ def test_process_block_row_count_matches_timeline() -> None:
 # run_step1_gtfs_to_blocks — full pipeline against gtfs_basic, real xlsx output
 # ---------------------------------------------------------------------------
 
+_GTFS_BASIC = Path(__file__).parent / "fixtures" / "gtfs_basic"
+
+
+def _gtfs_basic_without_frequencies(tmp_path: Path) -> Path:
+    """Copy gtfs_basic without frequencies.txt, so its trip T2 is an ordinary scheduled trip.
+
+    The exporter stops on selected frequency-based trips (see the tests below);
+    the tests that use this copy exercise other behavior on the same schedule.
+    """
+    feed = tmp_path / "gtfs_basic_scheduled"
+    shutil.copytree(_GTFS_BASIC, feed)
+    (feed / "frequencies.txt").unlink()
+    return feed
+
 
 def test_run_step1_writes_real_block_workbooks(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import scripts.gtfs_exports.block_status_timeline_exporter as mod
 
-    fixture = Path(__file__).parent / "fixtures" / "gtfs_basic"
+    fixture = _gtfs_basic_without_frequencies(tmp_path)
     monkeypatch.setattr(mod, "GTFS_FOLDER_PATH", str(fixture))
     monkeypatch.setattr(mod, "BLOCK_OUTPUT_FOLDER", str(tmp_path))
     monkeypatch.setattr(mod, "CALENDAR_SERVICE_IDS", ["WKDY"])
@@ -443,10 +484,20 @@ def test_run_step1_writes_real_block_workbooks(
     assert "CONFIGURATION (verbatim from source)" in run_log
     assert "IN_BAY_LAYOVER_MAX_MINUTES = 10" in run_log
     assert "# === BEGIN CONFIG ===" not in run_log  # markers themselves are excluded
+    # The manifest marks the run complete and fingerprints every file it wrote.
+    manifest = json.loads((tmp_path / "timeline_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "complete"
+    assert set(manifest["block_workbooks"]) == set(names)
+    assert set(manifest["files"]) == {
+        *names,
+        mod.COMBINED_TIMELINE_FILE,
+        mod.SCHEDULE_SNAPSHOT_FILE,
+        mod.ASSUMPTIONS_FILE,
+    }
 
 
 def _point_at_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    fixture = Path(__file__).parent / "fixtures" / "gtfs_basic"
+    fixture = _gtfs_basic_without_frequencies(tmp_path)
     monkeypatch.setattr(mod, "GTFS_FOLDER_PATH", str(fixture))
     monkeypatch.setattr(mod, "BLOCK_OUTPUT_FOLDER", str(tmp_path))
     monkeypatch.setattr(mod, "CALENDAR_SERVICE_IDS", ["WKDY"])
@@ -464,6 +515,22 @@ def test_main_returns_1_when_required_run_log_fails(
     assert mod.main() == 0
 
 
+def test_run_step1_uses_configured_stop_clusters(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _point_at_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(mod, "PRE_DEPARTURE_MINUTES", 0)
+    monkeypatch.setattr(mod, "POST_ARRIVAL_MINUTES", 0)
+    monkeypatch.setattr(mod, "BUS_STOP_CLUSTERS_STEP1", [{"name": "Hub", "stops": ["S6", "S7"]}])
+    mod.run_step1_gtfs_to_blocks()
+    combined = pd.read_csv(tmp_path / mod.COMBINED_TIMELINE_FILE, dtype=str)
+    b1 = combined[combined["Block"] == "B1"].set_index("Timestamp")["Status"]
+    # B1 turns from S6 (07:25) to S7 (07:30): one place inside the Hub, not a deadhead.
+    assert list(b1.loc["07:26":"07:29"]) == ["DWELL"] * 4
+    snapshot = json.loads((tmp_path / mod.SCHEDULE_SNAPSHOT_FILE).read_text(encoding="utf-8"))
+    assert snapshot["clusters"] == [{"name": "Hub", "stops": ["S6", "S7"]}]
+
+
 def test_extract_config_block_matches_source() -> None:
     block = mod.extract_config_block(Path(mod.__file__))
     assert block.lstrip().startswith("GTFS_FOLDER_PATH")
@@ -473,7 +540,7 @@ def test_extract_config_block_matches_source() -> None:
 def test_run_step1_service_date_and_scenario_subfolder(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    fixture = Path(__file__).parent / "fixtures" / "gtfs_basic"
+    fixture = _gtfs_basic_without_frequencies(tmp_path)
     monkeypatch.setattr(mod, "GTFS_FOLDER_PATH", str(fixture))
     monkeypatch.setattr(mod, "BLOCK_OUTPUT_FOLDER", str(tmp_path))
     monkeypatch.setattr(mod, "SCENARIO_NAME", "alt")
@@ -500,6 +567,105 @@ def test_run_step1_service_date_with_no_service_raises(
     monkeypatch.setattr(mod, "SERVICE_DATE", "20260703")  # removed in calendar_dates.txt
     with pytest.raises(ValueError, match="No service_id is active"):
         mod.run_step1_gtfs_to_blocks()
+
+
+def test_run_step1_rejects_selected_frequency_trips(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(mod, "GTFS_FOLDER_PATH", str(_GTFS_BASIC))
+    monkeypatch.setattr(mod, "BLOCK_OUTPUT_FOLDER", str(tmp_path))
+    monkeypatch.setattr(mod, "CALENDAR_SERVICE_IDS", ["WKDY"])
+    # T2 is repeated by frequencies.txt; one template cannot stand for its vehicles.
+    with pytest.raises(ValueError, match=r"frequency-based \(T2\)"):
+        mod.run_step1_gtfs_to_blocks()
+    manifest = json.loads((tmp_path / "timeline_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "failed"
+
+
+def test_run_step1_ignores_frequency_trips_outside_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(mod, "GTFS_FOLDER_PATH", str(_GTFS_BASIC))
+    monkeypatch.setattr(mod, "BLOCK_OUTPUT_FOLDER", str(tmp_path))
+    monkeypatch.setattr(mod, "CALENDAR_SERVICE_IDS", ["WKDY"])
+    monkeypatch.setattr(mod, "WRITE_PER_BLOCK_FILES", False)
+    monkeypatch.setattr(mod, "ROUTE_SHORTNAME_FILTER", ["R3"])  # blocks B4-B6; T2 is on B2
+    mod.run_step1_gtfs_to_blocks()
+    combined = pd.read_csv(tmp_path / mod.COMBINED_TIMELINE_FILE, dtype=str)
+    assert sorted(combined["Block"].unique()) == ["B4", "B5", "B6"]
+
+
+def test_run_step1_accepts_feed_without_optional_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    feed = tmp_path / "core_only"
+    feed.mkdir()
+    for name in ("trips.txt", "stop_times.txt", "stops.txt", "routes.txt"):
+        shutil.copy(_GTFS_BASIC / name, feed / name)
+    (feed / "calendar_dates.txt").write_text("", encoding="utf-8")  # zero-byte: skipped
+    monkeypatch.setattr(mod, "GTFS_FOLDER_PATH", str(feed))
+    monkeypatch.setattr(mod, "BLOCK_OUTPUT_FOLDER", str(tmp_path / "out"))
+    monkeypatch.setattr(mod, "CALENDAR_SERVICE_IDS", ["WKDY"])
+    monkeypatch.setattr(mod, "WRITE_PER_BLOCK_FILES", False)
+    mod.run_step1_gtfs_to_blocks()
+    combined = pd.read_csv(tmp_path / "out" / mod.COMBINED_TIMELINE_FILE, dtype=str)
+    assert combined["Block"].nunique() == 6
+
+
+def test_run_step1_reads_zip_feed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    feed = _gtfs_basic_without_frequencies(tmp_path)
+    archive = tmp_path / "feed.zip"
+    with zipfile.ZipFile(archive, "w") as handle:
+        for path in feed.iterdir():
+            handle.write(path, f"wrapper/{path.name}")  # nested one folder deep
+    monkeypatch.setattr(mod, "GTFS_FOLDER_PATH", str(archive))
+    monkeypatch.setattr(mod, "BLOCK_OUTPUT_FOLDER", str(tmp_path / "out"))
+    monkeypatch.setattr(mod, "CALENDAR_SERVICE_IDS", ["WKDY"])
+    monkeypatch.setattr(mod, "WRITE_PER_BLOCK_FILES", False)
+    mod.run_step1_gtfs_to_blocks()
+    manifest = json.loads((tmp_path / "out" / "timeline_manifest.json").read_text("utf-8"))
+    assert manifest["status"] == "complete"
+
+
+def test_run_step1_extends_timeline_past_default_hours(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    feed = _gtfs_basic_without_frequencies(tmp_path)
+    trips = pd.read_csv(feed / "trips.txt", dtype=str)
+    late = trips.iloc[[0]].assign(trip_id="TLATE", block_id="B9")
+    pd.concat([trips, late]).to_csv(feed / "trips.txt", index=False)
+    stop_times = pd.read_csv(feed / "stop_times.txt", dtype=str)
+    late_times = pd.DataFrame(
+        {
+            "trip_id": ["TLATE", "TLATE"],
+            "arrival_time": ["25:50:00", "26:10:00"],
+            "departure_time": ["25:50:00", "26:10:00"],
+            "stop_id": ["S1", "S2"],
+            "stop_sequence": ["1", "2"],
+        }
+    )
+    pd.concat([stop_times, late_times]).to_csv(feed / "stop_times.txt", index=False)
+    monkeypatch.setattr(mod, "GTFS_FOLDER_PATH", str(feed))
+    monkeypatch.setattr(mod, "BLOCK_OUTPUT_FOLDER", str(tmp_path / "out"))
+    monkeypatch.setattr(mod, "CALENDAR_SERVICE_IDS", ["WKDY"])
+    monkeypatch.setattr(mod, "WRITE_PER_BLOCK_FILES", False)
+    mod.run_step1_gtfs_to_blocks()
+    combined = pd.read_csv(tmp_path / "out" / mod.COMBINED_TIMELINE_FILE, dtype=str)
+    late_rows = combined[combined["Block"] == "B9"].set_index("Timestamp")["Status"]
+    assert late_rows["26:10"] == "ARRIVE"  # DEFAULT_HOURS alone would stop at 25:59
+    assert late_rows.index[-1] == "26:12"  # the arrival plus POST_ARRIVAL_MINUTES
+
+
+def test_available_gtfs_files_folder_zip_and_empty(tmp_path: Path) -> None:
+    (tmp_path / "calendar.txt").write_text("service_id\nWKDY\n", encoding="utf-8")
+    (tmp_path / "frequencies.txt").write_text("", encoding="utf-8")
+    names = ("calendar.txt", "calendar_dates.txt", "frequencies.txt")
+    assert mod.available_gtfs_files(str(tmp_path), names) == ("calendar.txt",)
+    archive = tmp_path / "feed.zip"
+    with zipfile.ZipFile(archive, "w") as handle:
+        handle.writestr("feed/calendar_dates.txt", "service_id,date,exception_type\n")
+        handle.writestr("feed/frequencies.txt", "")
+    assert mod.available_gtfs_files(str(archive), names) == ("calendar_dates.txt",)
 
 
 # ---------------------------------------------------------------------------
@@ -640,10 +806,16 @@ def test_merge_and_filter_data_orders_stop_sequence_numerically() -> None:
             "stop_sequence": ["1", "9", "10"],  # as read from GTFS: strings
         }
     )
-    merged = _merge_and_filter_data(trips, stop_times, _STOPS.iloc[:2], ["WKDY"])
+    stops = pd.concat(
+        [_STOPS.iloc[:2], pd.DataFrame({"stop_id": ["S3"], "stop_name": ["Stop S3"]})]
+    )
+    merged = _merge_and_filter_data(trips, stop_times, stops, ["WKDY"])
     # "10" sorts before "9" as text; numerically S3 (seq 10) is the last stop.
     assert merged.loc[merged["is_last_stop"], "stop_id"].tolist() == ["S3"]
     assert merged.loc[merged["is_first_stop"], "stop_id"].tolist() == ["S1"]
+    # A stop missing from stops.txt is a broken reference, not a nameless stop.
+    with pytest.raises(ValueError, match="populated stop_name"):
+        _merge_and_filter_data(trips, stop_times, _STOPS.iloc[:2], ["WKDY"])
 
 
 def test_run_output_folder_appends_scenario(monkeypatch: pytest.MonkeyPatch) -> None:
