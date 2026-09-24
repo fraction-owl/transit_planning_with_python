@@ -15,6 +15,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Optional
 
@@ -22,6 +24,24 @@ import pandas as pd
 from pandas import DataFrame
 
 from utils.time_helpers import minutes_to_hhmm
+
+# -----------------------------------------------------------------------------
+# ROUTE NAMES
+# -----------------------------------------------------------------------------
+
+
+def route_display_name(short_name: object, long_name: object, route_id: object) -> str:
+    """Name a route for reports: its short name, else its long name, else its route_id.
+
+    GTFS requires only one of route_short_name and route_long_name, so either
+    may be blank; route_id, which is always present, identifies the route.
+    """
+    for value in (short_name, long_name, route_id):
+        text = "" if value is None or pd.isna(value) else str(value).strip()
+        if text:
+            return text
+    return ""
+
 
 # -----------------------------------------------------------------------------
 # BLOCK RENDERER
@@ -86,12 +106,18 @@ def make_timeline_row(
     next_trip_id: str = "",
     stop_role: str = "",
 ) -> dict[str, Any]:
-    """Build one timeline row with explicit visit role and scheduled trip bounds."""
+    """Build one timeline row with explicit visit role and scheduled trip bounds.
+
+    ``Estimated Time`` is True when the row's stop visit has an interpolated
+    time; ``Trip Start Minute`` / ``Trip End Minute`` are the trip's occupancy
+    bounds (first-stop arrival, last-stop departure).
+    """
     return {
         "Timestamp": minutes_to_hhmm(minute),
         "Block": block_id,
         "Route": trip["route_id"] if trip else "",
         "Route Short Name": trip["route_short_name"] if trip else "",
+        "Route Long Name": trip.get("route_long_name", "") if trip else "",
         "Direction": trip["direction_id"] if trip else "",
         "Trip Headsign": trip["trip_headsign"] if trip else "",
         "Trip ID": trip_id,
@@ -106,6 +132,7 @@ def make_timeline_row(
         "Next Trip ID": next_trip_id,
         "Timepoint": timepoint,
         "Stop Role": stop_role,
+        "Estimated Time": bool(trip) and stop_seq in trip.get("estimated_stop_sequences", ()),
         "Trip Start Minute": trip["start"] if trip else "",
         "Trip End Minute": trip["end"] if trip else "",
     }
@@ -118,15 +145,23 @@ def row_for_inactive(
     bus_stop_clusters: list[dict[str, Any]],
     settings: dict[str, int],
 ) -> dict[str, Any]:
-    """Recalculate loading, post-arrival occupancy and layovers between trips."""
+    """Recalculate loading, post-arrival occupancy and layovers between trips.
+
+    Presence follows each trip's occupancy bounds -- ``start`` (first-stop
+    arrival) to ``end`` (last-stop departure) -- so a scheduled hold before the
+    next departure stays occupied and the layover is classified on the
+    occupancy gap between them. The Arrival/Departure Time columns quote the
+    schedule: the previous trip's last-stop arrival and the next trip's
+    first-stop departure.
+    """
     previous = [trip for trip in all_trips if trip["end"] < minute]
     upcoming = [trip for trip in all_trips if trip["start"] > minute]
     prev = max(previous, key=lambda trip: trip["end"]) if previous else None
     nxt = min(upcoming, key=lambda trip: trip["start"]) if upcoming else None
     prev_id = prev["trip_id"] if prev else ""
     next_id = nxt["trip_id"] if nxt else ""
-    arr = minutes_to_hhmm(prev["end"]) if prev else ""
-    dep = minutes_to_hhmm(nxt["start"]) if nxt else ""
+    arr = minutes_to_hhmm(prev["arrival"]) if prev else ""
+    dep = minutes_to_hhmm(nxt["departure"]) if nxt else ""
     if nxt and minute >= nxt["start"] - settings["PRE_DEPARTURE_MINUTES"]:
         return make_timeline_row(
             minute,
@@ -165,7 +200,8 @@ def row_for_inactive(
         a = find_cluster(prev["last_stop_id"], bus_stop_clusters)
         b = find_cluster(nxt["first_stop_id"], bus_stop_clusters)
         same_place = prev["last_stop_id"] == nxt["first_stop_id"] or (a is not None and a == b)
-        status, location = gap_status(nxt["start"] - prev["end"], same_place, settings)
+        occupancy_gap = nxt["start"] - prev["end"]
+        status, location = gap_status(occupancy_gap, same_place, settings)
         if status != "DEADHEAD":
             return make_timeline_row(
                 minute,
@@ -390,3 +426,30 @@ def read_timeline_files(folder: str, combined_name: str) -> DataFrame:
         if not differences.empty and not differences.eq(1).all():
             raise ValueError("Timeline must contain consecutive one-minute rows for each block.")
     return frame
+
+
+# -----------------------------------------------------------------------------
+# REPORT WORKBOOKS
+# -----------------------------------------------------------------------------
+
+
+@contextmanager
+def open_report_workbook(path: str) -> Iterator[pd.ExcelWriter]:
+    """Open an openpyxl workbook writer whose cleanup never hides a writing error.
+
+    Build every sheet's data before entering, so a failed calculation never
+    leaves an empty workbook behind. If the body raises, the writer is closed
+    with any error from closing suppressed (an unfinished workbook cannot be
+    saved), the partial file is removed and the original error propagates.
+    """
+    writer = pd.ExcelWriter(path, engine="openpyxl")
+    try:
+        yield writer
+    except BaseException:
+        try:
+            writer.close()
+        except Exception:  # noqa: BLE001 -- the error from the body is the one to report
+            logging.debug("Discarding unfinished workbook %s.", path, exc_info=True)
+        Path(path).unlink(missing_ok=True)
+        raise
+    writer.close()

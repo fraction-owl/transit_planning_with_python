@@ -54,6 +54,8 @@ import json
 import logging
 import os
 import re
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -173,6 +175,9 @@ LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
 
 CONFLICT_FILL = PatternFill(start_color="FFF4CCCC", end_color="FFF4CCCC", fill_type="solid")
 
+# Step 1 names the block of a trip analyzed without a block_id "trip-only:<trip_id>".
+TRIP_ONLY_BLOCK_PREFIX = "trip-only:"
+
 # ==================================================================================================
 # FUNCTIONS
 # ==================================================================================================
@@ -244,9 +249,25 @@ def timestamp_to_minutes(ts: object) -> Optional[int]:
     return hours * 60 + minute if hours >= 0 and 0 <= minute < 60 else None
 
 
+# Canonical version lives in utils/block_timeline_helpers.py -- keep this copy in sync.
+def route_display_name(short_name: object, long_name: object, route_id: object) -> str:
+    """Name a route for reports: its short name, else its long name, else its route_id.
+
+    GTFS requires only one of route_short_name and route_long_name, so either
+    may be blank; route_id, which is always present, identifies the route.
+    """
+    for value in (short_name, long_name, route_id):
+        text = "" if value is None or pd.isna(value) else str(value).strip()
+        if text:
+            return text
+    return ""
+
+
 def bus_label(row: pd.Series) -> str:
     """Short human-readable identifier for the bus on a timeline row."""
-    route = _txt(row.get("Route Short Name")).strip() or _txt(row.get("Route")).strip()
+    route = route_display_name(
+        row.get("Route Short Name"), row.get("Route Long Name"), row.get("Route")
+    )
     headsign = _txt(row.get("Trip Headsign")).strip()
     block = _txt(row.get("Block")).strip()
     trip = _txt(row.get("Trip ID")).strip()
@@ -503,6 +524,17 @@ def annotate_conflicts(
 # --------------------------------------------------------------------------------------------------
 
 
+def estimated_rows(frame: DataFrame) -> pd.Series:
+    """Rows whose stop visit has a time Step 1 interpolated (its ``Estimated Time`` column).
+
+    Timelines written before Step 1 could interpolate have no such column and no
+    estimated rows.
+    """
+    if "Estimated Time" not in frame.columns:
+        return pd.Series(False, index=frame.index)
+    return frame["Estimated Time"].astype(str).str.strip().str.lower().eq("true")
+
+
 def _stop_occupancy(df_in: DataFrame) -> DataFrame:
     """Rows that occupy a stop (bay), with a numeric minute column."""
     occ = df_in[bay_occupancy_mask(df_in) & df_in["Stop ID"].notna()].copy()
@@ -515,7 +547,8 @@ def build_conflict_events(df_in: DataFrame) -> DataFrame:
 
     An event is a run of consecutive minutes at one stop during which more
     buses occupy it than its capacity. Buses named on the event are every bus
-    present at that stop during the run.
+    present at that stop during the run. ``Estimated Times`` is ``YES`` when
+    any of those visits has an interpolated time.
 
     Args:
     ----------
@@ -538,7 +571,7 @@ def build_conflict_events(df_in: DataFrame) -> DataFrame:
         conflict_minutes = sorted(m for m, g in per_minute if len(g) > cap)
         if not conflict_minutes:
             continue
-        stop_name = stop_df["Stop Name"].iloc[0]
+        stop_name = _txt(stop_df["Stop Name"].iloc[0]) or str(stop_id)
 
         run_start = conflict_minutes[0]
         run_prev = run_start
@@ -557,6 +590,7 @@ def build_conflict_events(df_in: DataFrame) -> DataFrame:
                     "Minutes": int(run_prev - run_start + 1),
                     "Peak Buses": int(window.groupby("Minute").size().max()),
                     "Buses": int(window["Block"].nunique()),
+                    "Estimated Times": "YES" if estimated_rows(window).any() else "",
                     "Bus 1": labels[0] if len(labels) > 0 else "",
                     "Bus 2": labels[1] if len(labels) > 1 else "",
                     "Bus 3": labels[2] if len(labels) > 2 else "",
@@ -574,6 +608,7 @@ def build_conflict_events(df_in: DataFrame) -> DataFrame:
         "Minutes",
         "Peak Buses",
         "Buses",
+        "Estimated Times",
         "Bus 1",
         "Bus 2",
         "Bus 3",
@@ -776,7 +811,7 @@ def build_bay_tally(df_in: DataFrame, events: DataFrame) -> DataFrame:
         rows.append(
             {
                 "Stop ID": stop_id,
-                "Stop Name": stop_df["Stop Name"].iloc[0],
+                "Stop Name": _txt(stop_df["Stop Name"].iloc[0]) or str(stop_id),
                 "Capacity": cap,
                 "Conflict Minutes": minutes,
                 "Conflict Events": int((events["Stop ID"] == stop_id).sum())
@@ -829,7 +864,10 @@ def _layover_run_row(
         prev_tid = _txt(first.get("Trip ID"))
     if last["Status"] == "LOADING" and not next_tid:
         next_tid = _txt(last.get("Trip ID"))
-    if not prev_tid:
+    if str(block).startswith(TRIP_ONLY_BLOCK_PREFIX):
+        # Step 1 had no block_id for this trip: where the bus comes from or goes is unknown.
+        run_type = "trip only"
+    elif not prev_tid:
         run_type = "pull-out"
     elif not next_tid:
         run_type = "pull-in"
@@ -873,9 +911,11 @@ def build_layover_runs(df_in: DataFrame, cluster_name: str) -> DataFrame:
     A run is a maximal sequence of consecutive minutes for one block whose
     status is in ``SIT_STATUSES`` and whose stop is in the cluster. Runs are
     typed ``in bay`` (all minutes in a bay), ``overflow`` (some minutes on
-    the overflow space), ``pull-out`` (no previous trip) or ``pull-in`` (no
-    next trip). ``Flag`` marks in-bay runs ending in a departure whose length
-    is between ``SIT_FLAG_MIN_MINUTES`` and ``SIT_FLAG_MAX_MINUTES``.
+    the overflow space), ``pull-out`` (no previous trip), ``pull-in`` (no
+    next trip) or ``trip only`` (a trip Step 1 analyzed without a block_id,
+    whose vehicle's previous and next trips are unknown). ``Flag`` marks
+    in-bay runs ending in a departure whose length is between
+    ``SIT_FLAG_MIN_MINUTES`` and ``SIT_FLAG_MAX_MINUTES``.
 
     Args:
     ----------
@@ -900,7 +940,9 @@ def build_layover_runs(df_in: DataFrame, cluster_name: str) -> DataFrame:
     for _, r in df[df["Trip ID"].notna() & (df["Trip ID"].astype(str) != "")].iterrows():
         tid = str(r["Trip ID"])
         if tid not in trip_lookup:
-            route = _txt(r.get("Route Short Name")).strip() or _txt(r.get("Route")).strip()
+            route = route_display_name(
+                r.get("Route Short Name"), r.get("Route Long Name"), r.get("Route")
+            )
             headsign = _txt(r.get("Trip Headsign")).strip()
             trip_lookup[tid] = f"{route} {headsign}".strip()
 
@@ -1108,6 +1150,29 @@ def _is_placeholder_path(p: str) -> bool:
     return any(marker in s for marker in _PLACEHOLDER_MARKERS)
 
 
+# Canonical version lives in utils/block_timeline_helpers.py -- keep this copy in sync.
+@contextmanager
+def open_report_workbook(path: str) -> Iterator[pd.ExcelWriter]:
+    """Open an openpyxl workbook writer whose cleanup never hides a writing error.
+
+    Build every sheet's data before entering, so a failed calculation never
+    leaves an empty workbook behind. If the body raises, the writer is closed
+    with any error from closing suppressed (an unfinished workbook cannot be
+    saved), the partial file is removed and the original error propagates.
+    """
+    writer = pd.ExcelWriter(path, engine="openpyxl")
+    try:
+        yield writer
+    except BaseException:
+        try:
+            writer.close()
+        except Exception:  # noqa: BLE001 -- the error from the body is the one to report
+            logging.debug("Discarding unfinished workbook %s.", path, exc_info=True)
+        Path(path).unlink(missing_ok=True)
+        raise
+    writer.close()
+
+
 def _highlight_conflict_rows(worksheet: Worksheet, frame: DataFrame) -> None:
     """Bold and shade the rows of *frame* on *worksheet* whose ConflictType is not NONE."""
     conflict_col = int(frame.columns.get_loc("ConflictType")) + 1  # 1-based
@@ -1127,16 +1192,32 @@ def _write_summary_sheet(
     tally: DataFrame,
     rules: Dict[str, Any],
     n_cluster_conflicts: int,
+    events: Optional[DataFrame] = None,
+    trip_only_blocks: int = 0,
 ) -> None:
-    """Write the Summary sheet: assumptions, per-stop tally, and minute counts by rule."""
+    """Write the Summary sheet: assumptions, per-stop tally, and minute counts by rule.
+
+    Also states how many conflict events rest on interpolated stop times and
+    how many blocks were analyzed trip by trip without a block_id.
+    """
     lines: List[Tuple[str, Any]] = [("Cluster", cname)]
     lines += [("Step 1 assumption", a) for a in assumptions] or [
         ("Step 1 assumption", "(no assumptions file found)")
     ]
+    estimated_events = (
+        int(events["Estimated Times"].eq("YES").sum())
+        if events is not None and "Estimated Times" in events
+        else 0
+    )
     lines += [
         ("Stop occupancy statuses", ", ".join(sorted(bay_statuses()))),
         ("Count between-trip in-bay layovers", COUNT_IN_BAY_LAYOVER_AT_STOP),
         ("Overflow bays defined", rules["overflow_capacity"]),
+        ("Conflict events involving interpolated stop times", estimated_events),
+        (
+            "Trips analyzed without a block_id (layovers and vehicle continuity unknown)",
+            trip_only_blocks,
+        ),
         ("", ""),
         ("Minutes with any stop over capacity", rules["any_stop"]),
         (
@@ -1248,7 +1329,7 @@ def run_step2_conflict_detection() -> None:
         raise ValueError(f"Missing columns in block-level data: {missing_cols}")
     # Prev/Next Trip ID stay absent when Step 1 did not write them, so the
     # in-bay layover switch can fall back to excluding every DWELL row.
-    for optional in ("Route Short Name", "Trip Headsign", "Layover Location"):
+    for optional in ("Route Short Name", "Route Long Name", "Trip Headsign", "Layover Location"):
         if optional not in df.columns:
             df[optional] = None
 
@@ -1284,6 +1365,8 @@ def run_step2_conflict_detection() -> None:
         overflow_events = build_overflow_events(sub, cinfo)
         runs = build_layover_runs(cluster_blocks, cname)
         n_cluster_conflicts = sum(1 for c, _ in cluster_conflicts if c == cname)
+        trip_only = sub["Block"].astype(str).str.startswith(TRIP_ONLY_BLOCK_PREFIX)
+        trip_only_blocks = int(sub.loc[trip_only, "Block"].nunique())
 
         safe_name = re.sub(r'[<>:"/\\|?*]', "_", cname).replace(" ", "_")
         suffix = f"_{SCENARIO_NAME}" if SCENARIO_NAME else ""
@@ -1296,10 +1379,18 @@ def run_step2_conflict_detection() -> None:
         # Sort by timestamp, then by block or stop ID
         sub = sub.sort_values(["Timestamp", "Block", "Stop ID"])
 
-        with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
+        with open_report_workbook(out_path) as writer:
             # 3a) Summary, Conflict Events, Layover Runs
             _write_summary_sheet(
-                writer, cname, cinfo, assumptions, tally, rules, n_cluster_conflicts
+                writer,
+                cname,
+                cinfo,
+                assumptions,
+                tally,
+                rules,
+                n_cluster_conflicts,
+                events,
+                trip_only_blocks,
             )
             events.to_excel(writer, sheet_name="Conflict Events", index=False)
             overflow_events.to_excel(writer, sheet_name="Overflow Events", index=False)

@@ -11,19 +11,33 @@ Discover pass (``DISCOVER_ONLY = True``)
 Run this first. It writes ``<label>_discover.xlsx`` with every route-end found
 at the cluster (``<route> arrive``, ``<route> depart``, ``<route> through
 <direction>``) and the bay(s) it uses, every block's chain of trips with the
-gap between them and where it is spent, and the interline hand-offs whose
+gaps between them and where they are spent, and the interline hand-offs whose
 gaps a time shift has to respect. It also logs a ``BAY_CANDIDATES`` /
 ``SHIFT_CANDIDATES`` stub to paste into this CONFIGURATION.
+
+Two gaps are reported between consecutive trips of a block. The schedule gap
+runs from the previous trip's scheduled arrival (last stop) to the next trip's
+scheduled departure (first stop): the layover a timetable shows. The occupancy
+gap runs from the previous trip's last scheduled time (last-stop departure) to
+the next trip's first (first-stop arrival); a scheduled hold at the first stop
+belongs to the next trip, so this gap is shorter than the schedule gap when
+there is one.
+
+Routes are identified by route_id. Reports and CONFIGURATION name a route by
+its short name, else its long name, else its route_id; where two routes would
+share a name the route_id is added in brackets (``Express [R12]``). Names may
+contain spaces. A route_id is accepted wherever a route name is.
 
 Sweep (``DISCOVER_ONLY = False``)
 ---------------------------------
 Every listed single change is applied to the scheduled trips. Occupancy is
 rebuilt for affected blocks, including loading, arrival buffers and layover
 thresholds. A route-end shift moves the entire trips serving that end. Each
-change is also checked against the block chains: a shift that
-reduces any gap on any affected block below the minimums is rejected with the
-reason. Counts are shown per standard and never summed across them; conflicts
-are broken out by kind (boarding/boarding, boarding/waiting, waiting/waiting)
+change is also checked against the block chains and rejected, with the
+reason, if it shrinks a schedule gap below its minimum or makes a trip begin
+before the previous trip on its vehicle ends (a negative occupancy gap).
+Counts are shown per standard and never summed across them; conflicts are
+broken out by kind (boarding/boarding, boarding/waiting, waiting/waiting)
 rather than weighted.
 
 Inputs
@@ -33,6 +47,8 @@ Inputs
   workbooks. Sweeps require the revised exporter's ``schedule_snapshot.json``
   and ``timeline_manifest.json`` sidecars. Rerun Step 1 for every standard.
   Discover can inspect legacy timelines, but exact sweeps cannot use them.
+  Both refuse runs that Step 1 exported in trip-only mode (trips without a
+  block_id), because block chains need every trip's vehicle.
 
 Outputs
 -------
@@ -73,7 +89,11 @@ import hashlib
 import json
 import logging
 import os
-from collections import OrderedDict, defaultdict
+import re
+from collections import Counter, OrderedDict, defaultdict
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -119,7 +139,8 @@ DISCOVER_ONLY = True
 # A route-end is "<route> arrive" (trips ending here), "<route> depart"
 # (trips starting here) or "<route> through <direction_id>" (mid-trip
 # visits). A route-end moves as a whole, all day. Anything not listed is
-# locked.
+# locked. <route> is the route's name as the discover pass lists it, or its
+# route_id.
 BAY_CANDIDATES: List[Dict[str, Any]] = [
     # {"route_end": "101 arrive", "bays": ["A", "B"]},
 ]
@@ -132,9 +153,8 @@ SAME_BAY_GROUPS: List[List[str]] = [
 # --- Time-shift candidates ------------------------------------------------------------------------
 # Shifts in minutes, per route-end: only the trips that make up that
 # route-end move ("101 arrive" shifts the trips that end at the cluster).
-# Use the route name alone ("101") to shift every trip of the route. Route
-# names must not contain spaces. Every gap on every affected block is checked
-# against the minimums below.
+# Use the route name alone ("101") to shift every trip of the route. Every
+# gap on every affected block is checked against the minimums below.
 SHIFT_CANDIDATES: Dict[str, List[int]] = {
     # "101 arrive": [-5, -4, -3, -2, -1, 1, 2, 3, 4, 5],
     # "102": [-5, -4, -3, -2, -1, 1, 2, 3, 4, 5],
@@ -147,6 +167,9 @@ SHIFT_TOGETHER: List[List[str]] = [
 ]
 
 # --- Feasibility (hard constraints, from the block chains) ---------------------------------------
+# Minimum schedule gaps (scheduled arrival to next scheduled departure). A shift
+# is also rejected when a trip would begin before the previous one on its
+# vehicle ends.
 MIN_INTERLINE_TURN_MINUTES = 2  # gap between two different routes on one block
 MIN_LAYOVER_MINUTES = 3  # any other gap between trips on one block
 FLAG_OFF_CLOCKFACE = True  # note, do not reject, when a shift takes departures off :00/:30
@@ -178,6 +201,7 @@ TRIP_COLUMNS = [
     "trip_id",
     "block",
     "route",
+    "route_name",
     "headsign",
     "direction",
     "start",
@@ -193,7 +217,8 @@ TRIP_COLUMNS = [
 ]
 CHAIN_COLUMNS = [
     "block",
-    "gap_min",
+    "schedule_gap_min",
+    "occupancy_gap_min",
     "where",
     "from_route",
     "from_headsign",
@@ -398,12 +423,18 @@ def make_timeline_row(
     next_trip_id: str = "",
     stop_role: str = "",
 ) -> dict[str, Any]:
-    """Build one timeline row with explicit visit role and scheduled trip bounds."""
+    """Build one timeline row with explicit visit role and scheduled trip bounds.
+
+    ``Estimated Time`` is True when the row's stop visit has an interpolated
+    time; ``Trip Start Minute`` / ``Trip End Minute`` are the trip's occupancy
+    bounds (first-stop arrival, last-stop departure).
+    """
     return {
         "Timestamp": minutes_to_hhmm(minute),
         "Block": block_id,
         "Route": trip["route_id"] if trip else "",
         "Route Short Name": trip["route_short_name"] if trip else "",
+        "Route Long Name": trip.get("route_long_name", "") if trip else "",
         "Direction": trip["direction_id"] if trip else "",
         "Trip Headsign": trip["trip_headsign"] if trip else "",
         "Trip ID": trip_id,
@@ -418,6 +449,7 @@ def make_timeline_row(
         "Next Trip ID": next_trip_id,
         "Timepoint": timepoint,
         "Stop Role": stop_role,
+        "Estimated Time": bool(trip) and stop_seq in trip.get("estimated_stop_sequences", ()),
         "Trip Start Minute": trip["start"] if trip else "",
         "Trip End Minute": trip["end"] if trip else "",
     }
@@ -430,15 +462,23 @@ def row_for_inactive(
     bus_stop_clusters: list[dict[str, Any]],
     settings: dict[str, int],
 ) -> dict[str, Any]:
-    """Recalculate loading, post-arrival occupancy and layovers between trips."""
+    """Recalculate loading, post-arrival occupancy and layovers between trips.
+
+    Presence follows each trip's occupancy bounds -- ``start`` (first-stop
+    arrival) to ``end`` (last-stop departure) -- so a scheduled hold before the
+    next departure stays occupied and the layover is classified on the
+    occupancy gap between them. The Arrival/Departure Time columns quote the
+    schedule: the previous trip's last-stop arrival and the next trip's
+    first-stop departure.
+    """
     previous = [trip for trip in all_trips if trip["end"] < minute]
     upcoming = [trip for trip in all_trips if trip["start"] > minute]
     prev = max(previous, key=lambda trip: trip["end"]) if previous else None
     nxt = min(upcoming, key=lambda trip: trip["start"]) if upcoming else None
     prev_id = prev["trip_id"] if prev else ""
     next_id = nxt["trip_id"] if nxt else ""
-    arr = minutes_to_hhmm(prev["end"]) if prev else ""
-    dep = minutes_to_hhmm(nxt["start"]) if nxt else ""
+    arr = minutes_to_hhmm(prev["arrival"]) if prev else ""
+    dep = minutes_to_hhmm(nxt["departure"]) if nxt else ""
     if nxt and minute >= nxt["start"] - settings["PRE_DEPARTURE_MINUTES"]:
         return make_timeline_row(
             minute,
@@ -477,7 +517,8 @@ def row_for_inactive(
         a = find_cluster(prev["last_stop_id"], bus_stop_clusters)
         b = find_cluster(nxt["first_stop_id"], bus_stop_clusters)
         same_place = prev["last_stop_id"] == nxt["first_stop_id"] or (a is not None and a == b)
-        status, location = gap_status(nxt["start"] - prev["end"], same_place, settings)
+        occupancy_gap = nxt["start"] - prev["end"]
+        status, location = gap_status(occupancy_gap, same_place, settings)
         if status != "DEADHEAD":
             return make_timeline_row(
                 minute,
@@ -603,6 +644,7 @@ def load_timeline(folder: str) -> DataFrame:
     df = read_timeline_files(folder, COMBINED_TIMELINE_FILE)
     for column in (
         "Route Short Name",
+        "Route Long Name",
         "Trip Headsign",
         "Direction",
         "Prev Trip ID",
@@ -619,15 +661,128 @@ def load_timeline(folder: str) -> DataFrame:
 
 
 # ==================================================================================================
+# ROUTE NAMES AND ROUTE-ENDS
+# ==================================================================================================
+
+
+# Canonical version lives in utils/block_timeline_helpers.py -- keep this copy in sync.
+def route_display_name(short_name: object, long_name: object, route_id: object) -> str:
+    """Name a route for reports: its short name, else its long name, else its route_id.
+
+    GTFS requires only one of route_short_name and route_long_name, so either
+    may be blank; route_id, which is always present, identifies the route.
+    """
+    for value in (short_name, long_name, route_id):
+        text = "" if value is None or pd.isna(value) else str(value).strip()
+        if text:
+            return text
+    return ""
+
+
+@dataclass(frozen=True, order=True)
+class RouteEnd:
+    """What a candidate moves or shifts: a route's arrivals, departures or through visits.
+
+    ``route`` is the route_id. ``role`` is ``"arrive"``, ``"depart"``,
+    ``"through"``, or ``""`` for every trip of the route; ``direction`` (a
+    direction_id) applies to ``"through"`` only. ``name`` is the route's report
+    label and takes no part in comparisons.
+    """
+
+    route: str
+    role: str = ""
+    direction: str = ""
+    name: str = field(default="", compare=False)
+
+    @property
+    def label(self) -> str:
+        """The route's report label, or its route_id when none is attached."""
+        return self.name or self.route
+
+    def __str__(self) -> str:
+        """Render as CONFIGURATION writes it, e.g. ``"101 arrive"`` or ``"101 through 0"``."""
+        role = f"{self.role} {self.direction}".strip() if self.role == "through" else self.role
+        return f"{self.label} {role}".strip()
+
+
+class RouteNames:
+    """Route labels for reports, and the route each CONFIGURATION name refers to.
+
+    A route's label is its display name (see :func:`route_display_name`); where
+    that name is shared with another route, or is another route's route_id, the
+    route_id is added: ``"Express [R12]"``. CONFIGURATION may name a route by
+    its label, its display name or its route_id, provided the name fits one
+    route only.
+    """
+
+    def __init__(self, display: Dict[str, str]) -> None:
+        """Label each route from its display name (``route_id -> name``)."""
+        counts = Counter(display.values())
+        self.label = {
+            route: name
+            if counts[name] == 1 and (name == route or name not in display)
+            else f"{name} [{route}]"
+            for route, name in display.items()
+        }
+        self.routes: Dict[str, set[str]] = defaultdict(set)
+        for route, name in display.items():
+            for alias in (route, name, self.label[route]):
+                self.routes[alias].add(route)
+
+    def parse(self, text: str) -> Optional[RouteEnd]:
+        """Read ``"<route>"``, ``"<route> arrive|depart"`` or ``"<route> through [<dir>]"``.
+
+        Returns:
+            The route-end, or ``None`` if no route has that name.
+
+        Raises:
+            ValueError: If the text fits more than one route or reading.
+        """
+        text = str(text).strip()
+        readings = [(text, "", "")]
+        for role in ("arrive", "depart"):
+            if text.endswith(" " + role):
+                readings.append((text[: -len(role)].strip(), role, ""))
+        through = re.fullmatch(r"(.+) through(?: (\S+))?", text)
+        if through:
+            readings.append((through.group(1).strip(), "through", through.group(2) or ""))
+        found = {
+            RouteEnd(route, role, direction, self.label[route])
+            for name, role, direction in readings
+            for route in self.routes.get(name, ())
+        }
+        if len(found) > 1:
+            raise ValueError(
+                f"{text!r} could mean {', '.join(sorted(map(str, found)))}; name the route "
+                "by the label the discover pass lists, or by its route_id."
+            )
+        return found.pop() if found else None
+
+
+def snapshot_route_names(snapshot: dict[str, Any]) -> RouteNames:
+    """Names of the routes in a Step 1 schedule snapshot."""
+    return RouteNames(
+        {
+            trip["route_id"]: route_display_name(
+                trip["route_short_name"], trip.get("route_long_name"), trip["route_id"]
+            )
+            for trip in snapshot["trips"]
+        }
+    )
+
+
+# ==================================================================================================
 # TRIPS, ROUTE-ENDS, BLOCK CHAINS
 # ==================================================================================================
 
 
 def build_trips(df: DataFrame) -> DataFrame:
-    """One row per trip: route, headsign, direction, block, scheduled start/end and end stops.
+    """One row per trip: route, headsign, direction, block, scheduled times and end stops.
 
-    Start is the first stop's scheduled departure (the DEPART row); end is the
-    last stop's scheduled arrival (the largest Arrival Time on the trip).
+    Uses the run's schedule snapshot when there is one. A legacy timeline has
+    no snapshot: departure is then the DEPART row's minute and start its
+    Arrival Time; end and arrival are the last stop's scheduled arrival (the
+    largest Arrival Time on the trip).
     """
     if df.attrs.get("schedule_snapshot") is not None:
         return trips_from_snapshot(df.attrs["schedule_snapshot"])
@@ -657,7 +812,10 @@ def build_trips(df: DataFrame) -> DataFrame:
             {
                 "trip_id": tid,
                 "block": first["Block"],
-                "route": first["Route Short Name"],
+                "route": first["Route"],
+                "route_name": route_display_name(
+                    first["Route Short Name"], first.get("Route Long Name"), first["Route"]
+                ),
                 "headsign": first["Trip Headsign"],
                 "direction": first["Direction"],
                 "start": start,
@@ -678,30 +836,40 @@ def build_trips(df: DataFrame) -> DataFrame:
             }
         )
     trips = DataFrame(rows, columns=TRIP_COLUMNS)
+    names = RouteNames(dict(zip(trips["route"], trips["route_name"])))
+    trips["route_name"] = trips["route"].map(names.label)
     return trips.sort_values(["block", "start"]).reset_index(drop=True)
 
 
-def route_end_of(trip: pd.Series) -> List[Tuple[str, str]]:
+def route_end_of(trip: pd.Series) -> List[Tuple[RouteEnd, str]]:
     """Which route-ends this trip contributes at the cluster: ``[(route_end, bay), ...]``."""
     out = []
+    route, name = str(trip["route"]), str(trip.get("route_name", "") or "")
     if trip["first_bay"]:
-        out.append((f"{trip['route']} depart", trip["first_bay"]))
+        out.append((RouteEnd(route, "depart", "", name), trip["first_bay"]))
     if trip["last_bay"]:
-        out.append((f"{trip['route']} arrive", trip["last_bay"]))
+        out.append((RouteEnd(route, "arrive", "", name), trip["last_bay"]))
     for bay in [b for b in str(trip["through_bays"]).split(",") if b]:
-        out.append((f"{trip['route']} through {trip['direction']}", bay))
+        out.append((RouteEnd(route, "through", str(trip["direction"]), name), bay))
     return out
 
 
 def build_block_chains(trips: DataFrame) -> DataFrame:
-    """Consecutive trip pairs on each block with the gap and where it is spent."""
+    """Consecutive trip pairs on each block with both gaps and where they are spent.
+
+    ``schedule_gap_min`` runs from the previous trip's scheduled arrival to the
+    next trip's scheduled departure: the layover a timetable shows, which the
+    minimums in CONFIGURATION apply to. ``occupancy_gap_min`` runs from the
+    previous trip's last scheduled time (last-stop departure) to the next
+    trip's first (first-stop arrival): the time the vehicle belongs to neither
+    trip, which may not drop below zero.
+    """
     rows = []
     for block, g in trips.groupby("block", sort=False):
         g = g.sort_values("start")
         prev = None
         for _, t in g.iterrows():
             if prev is not None:
-                gap = int(t["start"] - prev["end"])
                 if prev["last_stop"] == t["first_stop"]:
                     bay = f" (Bay {prev['last_bay']})" if prev["last_bay"] else ""
                     where = f"same stop{bay}"
@@ -709,22 +877,25 @@ def build_block_chains(trips: DataFrame) -> DataFrame:
                     where = f"cluster (Bay {prev['last_bay']} to Bay {t['first_bay']})"
                 else:
                     where = "elsewhere"
+                arriving = RouteEnd(prev["route"], "arrive", "", prev["route_name"])
+                departing = RouteEnd(t["route"], "depart", "", t["route_name"])
                 rows.append(
                     {
                         "block": block,
-                        "gap_min": gap,
+                        "schedule_gap_min": int(t["departure"] - prev["arrival"]),
+                        "occupancy_gap_min": int(t["start"] - prev["end"]),
                         "where": where,
-                        "from_route": prev["route"],
+                        "from_route": prev["route_name"],
                         "from_headsign": prev["headsign"],
                         "from_trip": prev["trip_id"],
-                        "arrives": minutes_to_hhmm(int(prev["end"])),
-                        "to_route": t["route"],
+                        "arrives": minutes_to_hhmm(int(prev["arrival"])),
+                        "to_route": t["route_name"],
                         "to_headsign": t["headsign"],
                         "to_trip": t["trip_id"],
-                        "departs": minutes_to_hhmm(int(t["start"])),
+                        "departs": minutes_to_hhmm(int(t["departure"])),
                         "interline": prev["route"] != t["route"],
-                        "from_route_end": f"{prev['route']} arrive" if prev["last_bay"] else "",
-                        "to_route_end": f"{t['route']} depart" if t["first_bay"] else "",
+                        "from_route_end": str(arriving) if prev["last_bay"] else "",
+                        "to_route_end": str(departing) if t["first_bay"] else "",
                     }
                 )
             prev = t
@@ -733,15 +904,15 @@ def build_block_chains(trips: DataFrame) -> DataFrame:
 
 def build_route_ends(trips: DataFrame, chains: DataFrame) -> DataFrame:
     """Inventory of route-ends at the cluster with bays, visits, times and tightest gaps."""
-    visits: Dict[str, List[Tuple[str, int, str]]] = defaultdict(list)  # -> [(bay, minute, trip)]
+    visits: Dict[RouteEnd, List[Tuple[str, int, str]]] = defaultdict(list)  # [(bay, min, trip)]
     for _, t in trips.iterrows():
         for route_end, bay in route_end_of(t):
-            if " through " in route_end:
+            if route_end.role == "through":
                 for visit_bay, minute in t["through_visits"]:
                     if visit_bay == bay:
                         visits[route_end].append((bay, int(minute), t["trip_id"]))
             else:
-                minute = t["departure"] if route_end.endswith("depart") else t["arrival"]
+                minute = t["departure"] if route_end.role == "depart" else t["arrival"]
                 visits[route_end].append((bay, int(minute), t["trip_id"]))
     rows = []
     for route_end, lst in sorted(visits.items()):
@@ -755,37 +926,44 @@ def build_route_ends(trips: DataFrame, chains: DataFrame) -> DataFrame:
         )
         rows.append(
             {
-                "route_end": route_end,
+                "route_end": str(route_end),
+                "route_name": route_end.label,
                 "bays": ",".join(bays),
                 "visits_per_day": len(lst),
                 "first": minutes_to_hhmm(min(mins)),
                 "last": minutes_to_hhmm(max(mins)),
-                "min_gap_before": int(before["gap_min"].min()) if not before.empty else "",
-                "min_gap_after": int(after["gap_min"].min()) if not after.empty else "",
+                "min_schedule_gap_before": (
+                    int(before["schedule_gap_min"].min()) if not before.empty else ""
+                ),
+                "min_schedule_gap_after": (
+                    int(after["schedule_gap_min"].min()) if not after.empty else ""
+                ),
                 "interlines_with": ",".join(sorted(partners)),
             }
         )
     cols = [
         "route_end",
+        "route_name",
         "bays",
         "visits_per_day",
         "first",
         "last",
-        "min_gap_before",
-        "min_gap_after",
+        "min_schedule_gap_before",
+        "min_schedule_gap_after",
         "interlines_with",
     ]
     return DataFrame(rows, columns=cols)
 
 
 def interline_summary(chains: DataFrame) -> DataFrame:
-    """Minimum hand-off gap per ordered route pair, with the count and the tightest example."""
+    """Tightest hand-off per ordered route pair, with the count and the tightest example."""
     cols = [
         "from_route",
         "to_route",
         "hand_offs_per_day",
-        "min_gap_min",
-        "max_gap_min",
+        "min_schedule_gap_min",
+        "max_schedule_gap_min",
+        "min_occupancy_gap_min",
         "tightest_example",
         "shift_together_needed",
     ]
@@ -794,22 +972,25 @@ def interline_summary(chains: DataFrame) -> DataFrame:
     inter = chains[chains["interline"]]
     rows = []
     for (a, b), g in inter.groupby(["from_route", "to_route"]):
-        tight = g.sort_values("gap_min").iloc[0]
+        tight = g.sort_values("schedule_gap_min").iloc[0]
         rows.append(
             {
                 "from_route": a,
                 "to_route": b,
                 "hand_offs_per_day": len(g),
-                "min_gap_min": int(g["gap_min"].min()),
-                "max_gap_min": int(g["gap_min"].max()),
+                "min_schedule_gap_min": int(g["schedule_gap_min"].min()),
+                "max_schedule_gap_min": int(g["schedule_gap_min"].max()),
+                "min_occupancy_gap_min": int(g["occupancy_gap_min"].min()),
                 "tightest_example": (
                     f"{tight['arrives']} {tight['from_headsign']} -> "
                     f"{tight['departs']} {tight['to_headsign']} ({tight['where']})"
                 ),
-                "shift_together_needed": bool(g["gap_min"].min() <= MIN_INTERLINE_TURN_MINUTES + 3),
+                "shift_together_needed": bool(
+                    g["schedule_gap_min"].min() <= MIN_INTERLINE_TURN_MINUTES + 3
+                ),
             }
         )
-    return DataFrame(rows, columns=cols).sort_values("min_gap_min")
+    return DataFrame(rows, columns=cols).sort_values("min_schedule_gap_min")
 
 
 # ==================================================================================================
@@ -830,7 +1011,7 @@ def config_stub(route_ends: DataFrame, inter: DataFrame) -> str:
     lines.append("SHIFT_CANDIDATES: Dict[str, List[int]] = {")
     for _, r in route_ends.iterrows():
         lines.append(f'    # "{r["route_end"]}": [-3, -2, -1, 1, 2, 3],')
-    for route in sorted({str(re_).split(" ")[0] for re_ in route_ends["route_end"]}):
+    for route in sorted(set(route_ends["route_name"])):
         lines.append(f'    # "{route}": [-3, -2, -1, 1, 2, 3],  # whole route')
     lines.append("}")
     lines.append("SHIFT_TOGETHER: List[List[str]] = [")
@@ -838,47 +1019,73 @@ def config_stub(route_ends: DataFrame, inter: DataFrame) -> str:
         for _, r in inter[inter["shift_together_needed"]].iterrows():
             lines.append(
                 f'    # ["{r["from_route"]} arrive", "{r["to_route"]} depart"],'
-                f"  # hand-off as tight as {r['min_gap_min']} min"
+                f"  # hand-off as tight as {r['min_schedule_gap_min']} min"
             )
     lines.append("]")
     return "\n".join(lines)
 
 
+# Canonical version lives in utils/block_timeline_helpers.py -- keep this copy in sync.
+@contextmanager
+def open_report_workbook(path: str) -> Iterator[pd.ExcelWriter]:
+    """Open an openpyxl workbook writer whose cleanup never hides a writing error.
+
+    Build every sheet's data before entering, so a failed calculation never
+    leaves an empty workbook behind. If the body raises, the writer is closed
+    with any error from closing suppressed (an unfinished workbook cannot be
+    saved), the partial file is removed and the original error propagates.
+    """
+    writer = pd.ExcelWriter(path, engine="openpyxl")
+    try:
+        yield writer
+    except BaseException:
+        try:
+            writer.close()
+        except Exception:  # noqa: BLE001 -- the error from the body is the one to report
+            logging.debug("Discarding unfinished workbook %s.", path, exc_info=True)
+        Path(path).unlink(missing_ok=True)
+        raise
+    writer.close()
+
+
 def run_discover() -> str:
     """Write the discover workbook and log the CONFIGURATION stub.
+
+    Every sheet is calculated before the workbook is opened, so a timeline that
+    cannot be read stops the pass with its own error and writes no workbook.
 
     Returns:
         Path of the workbook written.
     """
     validate_sweep_configuration()
+    sheets: List[Tuple[str, DataFrame]] = []
+    stub = ""
+    for tier, folder in TIMELINES.items():
+        df = load_timeline(folder)
+        trips = build_trips(df)
+        chains = build_block_chains(trips)
+        route_ends = build_route_ends(trips, chains)
+        inter = interline_summary(chains)
+        tag = "".join(ch for ch in tier if ch.isalnum())[:12]
+        sheets += [(f"Route-ends {tag}", route_ends), (f"Block chains {tag}", chains)]
+        if not inter.empty:
+            sheets.append((f"Interlines {tag}", inter))
+        logging.info(
+            "%s: %d trips, %d route-ends, %d block hand-offs (%d interline)",
+            tier,
+            len(trips),
+            len(route_ends),
+            len(chains),
+            int(chains["interline"].sum()) if not chains.empty else 0,
+        )
+        if not stub:
+            stub = config_stub(route_ends, inter)
+    sheets.append(("Config stub", DataFrame({"config_stub": stub.split("\n")})))
     os.makedirs(OUTPUT_FOLDER, exist_ok=True)
     out_path = os.path.join(OUTPUT_FOLDER, f"{SCENARIO_LABEL}_discover.xlsx")
-    with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
-        stub = ""
-        for tier, folder in TIMELINES.items():
-            df = load_timeline(folder)
-            trips = build_trips(df)
-            chains = build_block_chains(trips)
-            route_ends = build_route_ends(trips, chains)
-            inter = interline_summary(chains)
-            tag = "".join(ch for ch in tier if ch.isalnum())[:12]
-            route_ends.to_excel(writer, sheet_name=f"Route-ends {tag}", index=False)
-            chains.to_excel(writer, sheet_name=f"Block chains {tag}", index=False)
-            if not inter.empty:
-                inter.to_excel(writer, sheet_name=f"Interlines {tag}", index=False)
-            logging.info(
-                "%s: %d trips, %d route-ends, %d block hand-offs (%d interline)",
-                tier,
-                len(trips),
-                len(route_ends),
-                len(chains),
-                int(chains["interline"].sum()) if not chains.empty else 0,
-            )
-            if not stub:
-                stub = config_stub(route_ends, inter)
-        DataFrame({"config_stub": stub.split("\n")}).to_excel(
-            writer, sheet_name="Config stub", index=False
-        )
+    with open_report_workbook(out_path) as writer:
+        for sheet_name, frame in sheets:
+            frame.to_excel(writer, sheet_name=sheet_name, index=False)
     logging.info(
         "Paste into CONFIGURATION (uncomment what may move) -- also on the "
         "'Config stub' sheet:\n%s",
@@ -898,7 +1105,9 @@ class Change:
     """Absolute bay assignments and shifts; overlapping selectors never add shifts twice."""
 
     def __init__(
-        self, moves: Optional[Dict[str, str]] = None, shifts: Optional[Dict[str, int]] = None
+        self,
+        moves: Optional[Dict[RouteEnd, str]] = None,
+        shifts: Optional[Dict[RouteEnd, int]] = None,
     ) -> None:
         """Copy candidate settings so search combinations do not mutate their inputs."""
         self.moves = dict(moves or {})
@@ -930,7 +1139,49 @@ class Change:
             return False
 
 
-def expand_groups(change: Change) -> Change:
+@dataclass
+class Selections:
+    """The CONFIGURATION candidates and groups, read as route-ends of the loaded schedule."""
+
+    bay_candidates: List[Tuple[RouteEnd, List[str]]] = field(default_factory=list)
+    shift_candidates: List[Tuple[RouteEnd, List[int]]] = field(default_factory=list)
+    same_bay_groups: List[List[RouteEnd]] = field(default_factory=list)
+    shift_together: List[List[RouteEnd]] = field(default_factory=list)
+
+
+def resolve_selections(names: RouteNames) -> Selections:
+    """Read BAY_CANDIDATES, SHIFT_CANDIDATES and the groups as structured route-ends.
+
+    A name no route has is skipped with a warning, as a route-end absent from
+    the timelines is. A name that fits more than one route stops the sweep.
+    """
+
+    def read(text: str, setting: str) -> Optional[RouteEnd]:
+        route_end = names.parse(text)
+        if route_end is None:
+            logging.warning("%s: no route in the timelines is named '%s'; skipped.", setting, text)
+        return route_end
+
+    selections = Selections()
+    for candidate in BAY_CANDIDATES:
+        route_end = read(candidate["route_end"], "BAY_CANDIDATES")
+        if route_end is not None:
+            selections.bay_candidates.append((route_end, list(candidate["bays"])))
+    for key, shifts in SHIFT_CANDIDATES.items():
+        route_end = read(key, "SHIFT_CANDIDATES")
+        if route_end is not None:
+            selections.shift_candidates.append((route_end, list(shifts)))
+    for setting, groups, resolved in (
+        ("SAME_BAY_GROUPS", SAME_BAY_GROUPS, selections.same_bay_groups),
+        ("SHIFT_TOGETHER", SHIFT_TOGETHER, selections.shift_together),
+    ):
+        for group in groups:
+            members = [read(member, setting) for member in group]
+            resolved.append([member for member in members if member is not None])
+    return selections
+
+
+def expand_groups(change: Change, selections: Selections) -> Change:
     """Expand overlapping groups to closure and reject contradictory member assignments."""
 
     def expand(values: dict, groups: list) -> dict:
@@ -940,18 +1191,24 @@ def expand_groups(change: Change) -> Change:
             for group in groups:
                 assigned = {result[key] for key in group if key in result}
                 if len(assigned) > 1:
-                    raise ValueError(f"Conflicting assignments within group {group}.")
+                    raise ValueError(
+                        f"Conflicting assignments within group {', '.join(map(str, group))}."
+                    )
                 if assigned:
                     value = next(iter(assigned))
                     result.update({key: value for key in group})
             if before == result:
                 return result
 
-    return Change(expand(change.moves, SAME_BAY_GROUPS), expand(change.shifts, SHIFT_TOGETHER))
+    return Change(
+        expand(change.moves, selections.same_bay_groups),
+        expand(change.shifts, selections.shift_together),
+    )
 
 
 def trips_from_snapshot(snapshot: dict[str, Any]) -> DataFrame:
     """Build complete trip metadata directly from scheduled visits, including zero-gap handoffs."""
+    names = snapshot_route_names(snapshot)
     rows = []
     for trip in snapshot["trips"]:
         first, last = trip["stop_times_sequence"][0], trip["stop_times_sequence"][-1]
@@ -964,13 +1221,14 @@ def trips_from_snapshot(snapshot: dict[str, Any]) -> DataFrame:
             {
                 "trip_id": trip["trip_id"],
                 "block": trip["block"],
-                "route": trip["route_short_name"],
+                "route": trip["route_id"],
+                "route_name": names.label[trip["route_id"]],
                 "headsign": trip["trip_headsign"],
                 "direction": trip["direction_id"],
                 "start": int(trip["start"]),
                 "end": int(trip["end"]),
-                "departure": int(first[1]),
-                "arrival": int(last[0]),
+                "departure": int(trip["departure"]),
+                "arrival": int(trip["arrival"]),
                 "first_stop": first[2],
                 "first_bay": CLUSTER_STOPS.get(first[2], ""),
                 "last_stop": last[2],
@@ -979,20 +1237,36 @@ def trips_from_snapshot(snapshot: dict[str, Any]) -> DataFrame:
                 "through_visits": through,
             }
         )
-    return DataFrame(rows).sort_values(["block", "start"]).reset_index(drop=True)
+    trips = DataFrame(rows, columns=TRIP_COLUMNS)
+    return trips.sort_values(["block", "start"]).reset_index(drop=True)
 
 
 def load_schedule_snapshot(folder: str) -> Optional[dict[str, Any]]:
-    """Load the canonical schedule belonging to a completed exporter run."""
+    """Load the canonical schedule belonging to a completed exporter run.
+
+    Raises:
+        ValueError: If the snapshot predates the current exporter, has no trips,
+            or holds trips exported without a block_id (trip-only mode), whose
+            vehicles' other trips the block chains would need.
+    """
     manifest = read_run_manifest(folder)
     if manifest is None:
         return None
     path = verified_run_file(folder, manifest.get("schedule_snapshot", ""), manifest)
     snapshot = json.loads(path.read_text(encoding="utf-8"))
-    if snapshot.get("schema_version") != 1 or snapshot.get("interval_minutes") != 1:
-        raise ValueError("Unsupported schedule snapshot. Rerun the revised exporter.")
+    if snapshot.get("schema_version") != 2 or snapshot.get("interval_minutes") != 1:
+        raise ValueError(
+            f"The schedule snapshot in {folder} is from an earlier exporter. Rerun Step 1."
+        )
     if not snapshot.get("trips"):
         raise ValueError("Schedule snapshot has no trips.")
+    trip_only = snapshot.get("trip_only_trips", [])
+    if trip_only:
+        raise ValueError(
+            f"{folder} was exported in trip-only mode: {len(trip_only)} trip(s) have no "
+            "block_id, so their vehicles' other trips are unknown and block chains cannot be "
+            "built. Fill in block_id, or filter those trips out, and rerun Step 1."
+        )
     return snapshot
 
 
@@ -1010,8 +1284,7 @@ class Standard:
             )
         self.snapshot = snapshot
         self.trips = trips
-        if trips["route"].astype(str).str.contains(r"\s", regex=True).any():
-            raise ValueError("Route short names cannot contain whitespace in sweep selectors.")
+        self.names = snapshot_route_names(snapshot)
         self.bay_names = sorted(set(CLUSTER_STOPS.values()))
         self.bay_index = {name: i for i, name in enumerate(self.bay_names)}
         self.cap = np.array([CLUSTER_CAPACITY.get(name, 1) for name in self.bay_names], dtype=int)
@@ -1034,10 +1307,10 @@ class Standard:
             raise ValueError("CLUSTER_STOPS must belong to one cluster in the exporter settings.")
         self.shift_model = Feasibility(trips, DataFrame(columns=CHAIN_COLUMNS))
         self.occ = self._occupancy(df)
+        codes = {key: code for code, key in enumerate(self.shift_model.masks)}
+        found = self.occ["route_end"].map(codes)
         self.mask_route_end = {
-            key: self.occ["route_end"].eq(key).to_numpy()
-            for key in self.shift_model.masks
-            if " " in key
+            key: found.eq(code).to_numpy() for key, code in codes.items() if key.role
         }
         self.cache: OrderedDict[tuple, DataFrame] = OrderedDict()
 
@@ -1054,9 +1327,11 @@ class Standard:
         roles = frame["Stop Role"].fillna("")
         if not roles.isin({"arrive", "depart", "through"}).all():
             raise ValueError("Bay occupancy is missing a visit role; rerun the revised exporter.")
-        frame["route_end"] = frame["Route Short Name"] + " " + roles
-        through = roles.eq("through")
-        frame.loc[through, "route_end"] += " " + frame.loc[through, "Direction"].fillna("")
+        directions = frame["Direction"].fillna("").astype(str).where(roles.eq("through"), "")
+        frame["route_end"] = [
+            RouteEnd(route, role, direction, self.names.label.get(route, route))
+            for route, role, direction in zip(frame["Route"].astype(str), roles, directions)
+        ]
         return frame.reset_index(drop=True)
 
     def apply(self, change: Change) -> DataFrame:
@@ -1069,31 +1344,26 @@ class Standard:
             return self.cache[key]
         shifts = self.shift_model.trip_shift(change.shifts)
         by_trip = dict(zip(self.trips["trip_id"], shifts))
-        moved_routes = {route_end.split(" ", 1)[0] for route_end in change.moves}
+        moved_routes = {route_end.route for route_end in change.moves}
         changed: Dict[str, List[dict[str, Any]]] = {}
         for block, originals in self.block_trips.items():
             revised = []
             affected = False
             for original in originals:
                 shift = int(by_trip[original["trip_id"]])
-                if not shift and original["route_short_name"] not in moved_routes:
+                if not shift and original["route_id"] not in moved_routes:
                     revised.append(original)
                     continue
                 trip = copy.deepcopy(original)
                 affected |= bool(shift)
-                trip["start"] += shift
-                trip["end"] += shift
+                for bound in ("start", "end", "departure", "arrival"):
+                    trip[bound] += shift
                 stops = []
                 for original_stop in trip["stop_times_sequence"]:
                     stop = list(original_stop)
-                    role = (
-                        "depart"
-                        if stop[5]
-                        else "arrive"
-                        if stop[6]
-                        else f"through {trip['direction_id']}"
-                    )
-                    route_end = f"{trip['route_short_name']} {role}"
+                    role = "depart" if stop[5] else "arrive" if stop[6] else "through"
+                    direction = str(trip["direction_id"]) if role == "through" else ""
+                    route_end = RouteEnd(str(trip["route_id"]), role, direction)
                     if stop[2] in CLUSTER_STOPS and route_end in change.moves:
                         target = self.target_stops[change.moves[route_end]]
                         affected |= target != stop[2]
@@ -1151,7 +1421,7 @@ class Standard:
 
     def detail(
         self, frame: DataFrame, conflict: np.ndarray
-    ) -> Tuple[Dict[int, Tuple[str, ...]], Dict[str, int]]:
+    ) -> Tuple[Dict[int, Tuple[RouteEnd, ...]], Dict[str, int]]:
         """Describe the actual rebuilt rows involved in each conflict."""
         keys = frame["Bay"].map(self.bay_index).to_numpy(dtype=np.int64) * BIG + frame[
             "Minute"
@@ -1179,7 +1449,11 @@ class Standard:
 
 
 class Feasibility:
-    """Vectorized gap check over the block chains for a change's shifts."""
+    """Vectorized check of a change's shifts against the block chains.
+
+    A shift may not shrink a schedule gap below its minimum, nor make a trip
+    begin before the previous trip on its vehicle ends.
+    """
 
     def __init__(self, trips: DataFrame, chains: DataFrame) -> None:
         """Index the chains by trip so a change's shifts can be applied to every gap at once."""
@@ -1188,29 +1462,32 @@ class Feasibility:
         idx = {tid: i for i, tid in enumerate(self.trips["trip_id"])}
         empty = np.array([], dtype=int)
         if chains.empty:
-            self.from_idx = self.to_idx = self.gap = self.floor = empty
+            self.from_idx = self.to_idx = self.floor = empty
+            self.schedule_gap = self.occupancy_gap = empty
         else:
             self.from_idx = self.chains["from_trip"].map(idx).to_numpy(dtype=int)
             self.to_idx = self.chains["to_trip"].map(idx).to_numpy(dtype=int)
-            self.gap = self.chains["gap_min"].to_numpy(dtype=int)
+            self.schedule_gap = self.chains["schedule_gap_min"].to_numpy(dtype=int)
+            self.occupancy_gap = self.chains["occupancy_gap_min"].to_numpy(dtype=int)
             self.floor = np.where(
                 self.chains["interline"].to_numpy(dtype=bool),
                 MIN_INTERLINE_TURN_MINUTES,
                 MIN_LAYOVER_MINUTES,
             )
         ends = [dict(route_end_of(t)) for _, t in self.trips.iterrows()]
-        self.masks: Dict[str, np.ndarray] = {}
-        for r in set(self.trips["route"]):
-            self.masks[r] = (self.trips["route"] == r).to_numpy()
-        for re_ in {k for e in ends for k in e}:
+        labels = dict(zip(self.trips["route"], self.trips["route_name"]))
+        self.masks: Dict[RouteEnd, np.ndarray] = {}
+        for r in sorted(set(self.trips["route"])):
+            self.masks[RouteEnd(r, name=labels[r])] = (self.trips["route"] == r).to_numpy()
+        for re_ in sorted({k for e in ends for k in e}):
             self.masks[re_] = np.array([re_ in e for e in ends])
         self.first_bay = self.trips["first_bay"].to_numpy()
         self.start = self.trips["departure"].to_numpy(dtype=int)
         self.active_start = self.trips["start"].to_numpy(dtype=int)
         self.active_end = self.trips["end"].to_numpy(dtype=int)
-        self.route = self.trips["route"].to_numpy()
+        self.route = self.trips["route_name"].to_numpy()
 
-    def trip_shift(self, shifts: Dict[str, int]) -> np.ndarray:
+    def trip_shift(self, shifts: Dict[RouteEnd, int]) -> np.ndarray:
         """Minutes each trip moves under *shifts* (route-end and whole-route keys)."""
         out = np.zeros(len(self.trips), dtype=int)
         assigned = np.zeros(len(self.trips), dtype=bool)
@@ -1227,11 +1504,12 @@ class Feasibility:
         return out
 
     def check(self, change: Change) -> Tuple[bool, str, Optional[int]]:
-        """Whether the change keeps every affected gap at or above its minimum.
+        """Whether the change keeps every affected block chain workable.
 
         Returns:
-            ``(feasible, reason, tightest_gap_after)``. A gap already below
-            its minimum is only rejected if the change shrinks it further.
+            ``(feasible, reason, tightest_schedule_gap_after)``. A schedule gap
+            already below its minimum is only rejected if the change shrinks it
+            further; an occupancy gap may never drop below zero.
         """
         try:
             ts = self.trip_shift(change.shifts)
@@ -1239,21 +1517,33 @@ class Feasibility:
             return False, str(exc), None
         if ((self.active_start + ts < 0) | (self.active_end + ts >= BIG - 1)).any():
             return False, "Shifted trip falls outside the supported service-day range", None
-        if not change.shifts or len(self.gap) == 0:
+        if not change.shifts or len(self.schedule_gap) == 0:
             return True, "", None
-        new = self.gap + ts[self.to_idx] - ts[self.from_idx]
-        changed = new != self.gap
-        bad = changed & (new < self.gap) & (new < self.floor)
-        if bad.any():
-            i = int(np.argmax(bad))
+        moved = ts[self.to_idx] - ts[self.from_idx]
+        changed = moved != 0
+        schedule_gap = self.schedule_gap + moved
+        occupancy_gap = self.occupancy_gap + moved
+        short = changed & (schedule_gap < self.schedule_gap) & (schedule_gap < self.floor)
+        if short.any():
+            i = int(np.argmax(short))
             c = self.chains.iloc[i]
             reason = (
-                f"gap {c['from_route']} {c['arrives']} -> {c['to_route']} {c['departs']} "
-                f"({c['where']}) goes {int(self.gap[i])} -> {int(new[i])} min, "
-                f"below {int(self.floor[i])}"
+                f"schedule gap {c['from_route']} {c['arrives']} -> {c['to_route']} "
+                f"{c['departs']} ({c['where']}) goes {int(self.schedule_gap[i])} -> "
+                f"{int(schedule_gap[i])} min, below {int(self.floor[i])}"
             )
             return False, reason, None
-        return True, "", (int(new[changed].min()) if changed.any() else None)
+        overlap = changed & (occupancy_gap < 0)
+        if overlap.any():
+            i = int(np.argmax(overlap))
+            c = self.chains.iloc[i]
+            reason = (
+                f"trip {c['to_trip']} ({c['to_route']}) would begin {-int(occupancy_gap[i])} "
+                f"min before trip {c['from_trip']} ({c['from_route']}) ends on block "
+                f"{c['block']}"
+            )
+            return False, reason, None
+        return True, "", (int(schedule_gap[changed].min()) if changed.any() else None)
 
     def off_clockface(self, change: Change) -> str:
         """Note naming routes whose :00/:30 cluster departures a shift takes off the clockface."""
@@ -1270,11 +1560,13 @@ class Feasibility:
 
 
 def describe_delta(
-    std: Standard, before: Dict[int, Tuple[str, ...]], after: Dict[int, Tuple[str, ...]]
+    std: Standard,
+    before: Dict[int, Tuple[RouteEnd, ...]],
+    after: Dict[int, Tuple[RouteEnd, ...]],
 ) -> Tuple[str, str]:
     """Conflicts removed and created, collapsed into windows with the route pair."""
 
-    def windows(keys: List[int], src: Dict[int, Tuple[str, ...]]) -> str:
+    def windows(keys: List[int], src: Dict[int, Tuple[RouteEnd, ...]]) -> str:
         out = []
         labelled = sorted((std.key_label(k), k) for k in keys)
         by_bay: Dict[str, List[Tuple[int, int]]] = defaultdict(list)
@@ -1290,7 +1582,7 @@ def describe_delta(
                 span = minutes_to_hhmm(start)
                 if prev != start:
                     span += f"-{minutes_to_hhmm(prev)}"
-                out.append(f"{bay} {span} {'/'.join(x.split(' ')[0] for x in pr)}")
+                out.append(f"{bay} {span} {'/'.join(x.label for x in pr)}")
                 if minute is not None and k is not None:
                     start = prev = minute
                     pr = src[k]
@@ -1301,42 +1593,47 @@ def describe_delta(
     return windows(removed, before) if removed else "", windows(created, after) if created else ""
 
 
-def single_candidates(standards: Dict[str, Standard]) -> List[Change]:
+def single_candidates(standards: Dict[str, Standard], selections: Selections) -> List[Change]:
     """Every listed single change that exists in the timelines: one bay move or one shift."""
-    known = set()
+    known: set[RouteEnd] = set()
     for std in standards.values():
         known |= set(std.mask_route_end)
     first = next(iter(standards.values()))
     out: List[Change] = []
-    for c in BAY_CANDIDATES:
-        re_ = c["route_end"]
+    for re_, bays in selections.bay_candidates:
         if re_ not in known:
             logging.warning(
                 "BAY_CANDIDATES: route-end '%s' not found in the timelines; skipped.", re_
             )
             continue
         current = set(first.occ.loc[first.occ["route_end"] == re_, "Bay"])
-        for bay in c["bays"]:
+        for bay in bays:
             if current != {bay} and bay in first.bay_index:
                 out.append(Change(moves={re_: bay}))
-    for key, ks in SHIFT_CANDIDATES.items():
-        if key not in known and not any(re_.startswith(key + " ") for re_ in known):
+    for key, ks in selections.shift_candidates:
+        whole_route = not key.role and any(re_.route == key.route for re_ in known)
+        if key not in known and not whole_route:
             logging.warning("SHIFT_CANDIDATES: '%s' not found in the timelines; skipped.", key)
             continue
         for k in ks:
             if k:
                 out.append(Change(shifts={key: k}))
-    unique = {expand_groups(change).key(): expand_groups(change) for change in out}
+    unique = {
+        expand_groups(change, selections).key(): expand_groups(change, selections) for change in out
+    }
     return list(unique.values())
 
 
 class Scorer:
     """Score rebuilt schedules against a baseline on every occupancy standard."""
 
-    def __init__(self, standards: Dict[str, Standard], feas: Feasibility) -> None:
-        """Initialize baseline scores and the shared block-feasibility model."""
+    def __init__(
+        self, standards: Dict[str, Standard], feas: Feasibility, selections: Selections
+    ) -> None:
+        """Initialize baseline scores, the shared block-feasibility model and the groups."""
         self.standards = standards
         self.feas = feas
+        self.selections = selections
         self.base_change = Change()
         self.base: Dict[str, Tuple[int, Dict[str, int], np.ndarray]] = {}
         self.rebase(Change())
@@ -1352,7 +1649,7 @@ class Scorer:
     def quick(self, change: Change) -> Optional[Dict[str, int]]:
         """Return score improvements, or None when a combined change is infeasible."""
         try:
-            combined = expand_groups(self.base_change.combine(change))
+            combined = expand_groups(self.base_change.combine(change), self.selections)
             if not self.feas.check(combined)[0]:
                 return None
             return {
@@ -1368,19 +1665,19 @@ class Scorer:
             "change": change.label(),
             "feasible": False,
             "reason": "",
-            "tightest gap after": "",
+            "tightest schedule gap after": "",
             "note": "",
             "_change": change,
             "_improvement": {},
         }
         try:
-            combined = expand_groups(self.base_change.combine(change))
+            combined = expand_groups(self.base_change.combine(change), self.selections)
             ok, reason, tightest = self.feas.check(combined)
             if not ok:
                 raise ValueError(reason)
             rebuilt = {name: standard.apply(combined) for name, standard in self.standards.items()}
             row.update(feasible=True, note=self.feas.off_clockface(combined))
-            row["tightest gap after"] = tightest if tightest is not None else ""
+            row["tightest schedule gap after"] = tightest if tightest is not None else ""
             for name, standard in self.standards.items():
                 before, _, before_keys = self.base[name]
                 total, per, keys = standard.score(rebuilt[name])
@@ -1452,7 +1749,7 @@ def _search_packages(
                 if not package.compatible(addition):
                     continue
                 try:
-                    candidate = expand_groups(package.combine(addition))
+                    candidate = expand_groups(package.combine(addition), scorer.selections)
                 except ValueError:
                     continue
                 key = candidate.key()
@@ -1477,7 +1774,7 @@ def _search_packages(
                 row[f"{name} conflict minutes"] = result[f"{name} after"]
                 row[f"{name} per bay"] = result[f"{name} per bay after"]
                 row[f"{name} kinds"] = result[f"{name} kinds after"]
-            row["tightest gap after"] = result["tightest gap after"]
+            row["tightest schedule gap after"] = result["tightest schedule gap after"]
             row["note"] = result["note"]
             best_per_step.append(row)
     finalists = sorted(winners.values(), key=lambda item: (item[0], item[1].key()))[:5]
@@ -1508,8 +1805,13 @@ def validate_sweep_configuration() -> None:
         if any(not isinstance(value, int) or isinstance(value, bool) for value in candidates):
             raise ValueError("Shift candidates must be integer minutes.")
     for candidate in BAY_CANDIDATES:
+        if not isinstance(candidate.get("route_end"), str):
+            raise ValueError(f"Each bay candidate needs a route_end string: {candidate}")
         if set(candidate["bays"]) - set(CLUSTER_STOPS.values()):
             raise ValueError(f"Candidate contains unknown bays: {candidate}")
+    names = [*SHIFT_CANDIDATES, *(m for g in [*SAME_BAY_GROUPS, *SHIFT_TOGETHER] for m in g)]
+    if any(not isinstance(name, str) for name in names):
+        raise ValueError("Shift candidates and groups must name route-ends as strings.")
     if MIN_INTERLINE_TURN_MINUTES < 0 or MIN_LAYOVER_MINUTES < 0:
         raise ValueError("Minimum gaps must be nonnegative.")
 
@@ -1524,10 +1826,11 @@ def run_sweep() -> str:
     Returns:
         Path of the workbook written.
     """
-    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
     standards: Dict[str, Standard] = {}
     trips: Optional[DataFrame] = None
     chains: Optional[DataFrame] = None
+    names: Optional[RouteNames] = None
+    estimated_visits = 0
     schedule_identity = None
     validate_sweep_configuration()
     for name, folder in TIMELINES.items():
@@ -1553,16 +1856,25 @@ def run_sweep() -> str:
         t = build_trips(df)
         if trips is None or chains is None:
             trips, chains = t, build_block_chains(t)
+            names = snapshot_route_names(snapshot)
+            estimated_visits = int(snapshot.get("estimated_stop_visits", 0))
         standards[name] = Standard(name, df, t)
-    if trips is None or chains is None:
+    if trips is None or chains is None or names is None:
         raise ValueError("TIMELINES is empty; list at least one Step 1 scenario folder.")
+    if estimated_visits:
+        logging.warning(
+            "The schedule has %d stop visit(s) with interpolated times; conflicts involving "
+            "them rest on estimated times.",
+            estimated_visits,
+        )
+    selections = resolve_selections(names)
     feas = Feasibility(trips, chains)
-    scorer = Scorer(standards, feas)
+    scorer = Scorer(standards, feas, selections)
     for n, (total, per, _) in scorer.base.items():
         logging.info("%s baseline: %d conflict minutes %s", n, total, dict(sorted(per.items())))
 
     # ---- singles
-    singles = single_candidates(standards)
+    singles = single_candidates(standards, selections)
     logging.info("Scoring %d single changes.", len(singles))
     single_imp = [(c, scorer.quick(c)) for c in singles]
     win_rows = sorted(
@@ -1605,47 +1917,50 @@ def run_sweep() -> str:
     pool = singles + [r["_change"] for r in pair_rows]
     packages, finalist_rows = _search_packages(scorer, pool, standards)
 
-    out_path = os.path.join(OUTPUT_FOLDER, f"{SCENARIO_LABEL}_sweep.xlsx")
-    with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
-        base_rows = []
-        for n, s in standards.items():
-            total, per, conf = scorer.base[n]
-            _, kinds = s.detail(s.occ, conf)
-            base_rows.append(
-                {
-                    "standard": n,
-                    "total": total,
-                    **{f"Bay {b}": per.get(b, 0) for b in s.bay_names},
-                    **kinds,
-                }
-            )
-        DataFrame(base_rows).to_excel(writer, sheet_name="Baseline", index=False)
-        _public(win_rows[:TOP_N]).to_excel(writer, sheet_name="Easy wins", index=False)
-        if ENUMERATE_PAIRS:
-            _public(pair_rows).to_excel(writer, sheet_name="Pairs", index=False)
-        DataFrame(packages).to_excel(writer, sheet_name="Packages", index=False)
-        _public(finalist_rows).to_excel(writer, sheet_name="Package finalists", index=False)
-        _public(rejected_rows).to_excel(writer, sheet_name="Rejected", index=False)
-        cfg = {
-            "CLUSTER_NAME": CLUSTER_NAME,
-            "CLUSTER_STOPS": CLUSTER_STOPS,
-            "CLUSTER_CAPACITY": CLUSTER_CAPACITY,
-            "TIMELINES": TIMELINES,
-            "BAY_CANDIDATES": BAY_CANDIDATES,
-            "SAME_BAY_GROUPS": SAME_BAY_GROUPS,
-            "SHIFT_CANDIDATES": SHIFT_CANDIDATES,
-            "SHIFT_TOGETHER": SHIFT_TOGETHER,
-            "MIN_INTERLINE_TURN_MINUTES": MIN_INTERLINE_TURN_MINUTES,
-            "MIN_LAYOVER_MINUTES": MIN_LAYOVER_MINUTES,
-            "REQUIRE_NO_WORSE_ON": REQUIRE_NO_WORSE_ON,
-            "MIN_IMPROVEMENT_MINUTES": MIN_IMPROVEMENT_MINUTES,
-            "MAX_CHANGES_PER_PACKAGE": MAX_CHANGES_PER_PACKAGE,
-            "BEAM_WIDTH": BEAM_WIDTH,
-            "ENUMERATE_PAIRS": ENUMERATE_PAIRS,
-        }
-        DataFrame({"setting": list(cfg), "value": [str(v) for v in cfg.values()]}).to_excel(
-            writer, sheet_name="Config used", index=False
+    base_rows = []
+    for n, s in standards.items():
+        total, per, conf = scorer.base[n]
+        _, kinds = s.detail(s.occ, conf)
+        base_rows.append(
+            {
+                "standard": n,
+                "total": total,
+                **{f"Bay {b}": per.get(b, 0) for b in s.bay_names},
+                **kinds,
+            }
         )
+    cfg = {
+        "CLUSTER_NAME": CLUSTER_NAME,
+        "CLUSTER_STOPS": CLUSTER_STOPS,
+        "CLUSTER_CAPACITY": CLUSTER_CAPACITY,
+        "TIMELINES": TIMELINES,
+        "BAY_CANDIDATES": BAY_CANDIDATES,
+        "SAME_BAY_GROUPS": SAME_BAY_GROUPS,
+        "SHIFT_CANDIDATES": SHIFT_CANDIDATES,
+        "SHIFT_TOGETHER": SHIFT_TOGETHER,
+        "MIN_INTERLINE_TURN_MINUTES": MIN_INTERLINE_TURN_MINUTES,
+        "MIN_LAYOVER_MINUTES": MIN_LAYOVER_MINUTES,
+        "REQUIRE_NO_WORSE_ON": REQUIRE_NO_WORSE_ON,
+        "MIN_IMPROVEMENT_MINUTES": MIN_IMPROVEMENT_MINUTES,
+        "MAX_CHANGES_PER_PACKAGE": MAX_CHANGES_PER_PACKAGE,
+        "BEAM_WIDTH": BEAM_WIDTH,
+        "ENUMERATE_PAIRS": ENUMERATE_PAIRS,
+        "Stop visits with interpolated times (Step 1)": estimated_visits,
+    }
+    sheets = [
+        ("Baseline", DataFrame(base_rows)),
+        ("Easy wins", _public(win_rows[:TOP_N])),
+        *([("Pairs", _public(pair_rows))] if ENUMERATE_PAIRS else []),
+        ("Packages", DataFrame(packages)),
+        ("Package finalists", _public(finalist_rows)),
+        ("Rejected", _public(rejected_rows)),
+        ("Config used", DataFrame({"setting": list(cfg), "value": [str(v) for v in cfg.values()]})),
+    ]
+    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+    out_path = os.path.join(OUTPUT_FOLDER, f"{SCENARIO_LABEL}_sweep.xlsx")
+    with open_report_workbook(out_path) as writer:
+        for sheet_name, frame in sheets:
+            frame.to_excel(writer, sheet_name=sheet_name, index=False)
     logging.info("Sweep workbook for %s written to %s", CLUSTER_NAME, out_path)
     require_run_log(write_run_log(Path(out_path)))
     return out_path

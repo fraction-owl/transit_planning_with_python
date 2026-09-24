@@ -398,6 +398,22 @@ def test_bus_label_prefers_short_name_and_headsign() -> None:
     assert target.bus_label(row) == "R101 (blk B1, trip T1)"
 
 
+def test_bus_label_falls_back_to_long_name_then_route_id() -> None:
+    row = pd.Series(
+        {
+            "Route Short Name": None,
+            "Route Long Name": "Crosstown",
+            "Route": "R7",
+            "Trip Headsign": None,
+            "Block": "B1",
+            "Trip ID": "T1",
+        }
+    )
+    assert target.bus_label(row) == "Crosstown (blk B1, trip T1)"
+    assert target.route_display_name("", " ", "R7") == "R7"
+    assert target.route_display_name(float("nan"), "Crosstown", "R7") == "Crosstown"
+
+
 # ---------------------------------------------------------------------------
 # Conflict events, tallies, minute rules, overflow events
 # ---------------------------------------------------------------------------
@@ -465,6 +481,16 @@ def test_build_conflict_events_collapses_consecutive_minutes() -> None:
     second = events.iloc[1]
     assert (second["Start"], second["End"], second["Minutes"]) == ("08:05", "08:05", 1)
     assert second["Bus 2"] == "303 Downtown (blk B3, trip T3)"
+
+
+def test_build_conflict_events_flags_events_with_interpolated_times() -> None:
+    df = _conflict_df().assign(**{"Estimated Time": "False"})
+    df.loc[6, "Estimated Time"] = "True"  # B3's through visit at 08:05 was interpolated
+    with patch.object(target, "CLUSTER_DEFINITIONS", TEST_CLUSTERS):
+        events = target.build_conflict_events(df)
+        legacy = target.build_conflict_events(_conflict_df())  # no Estimated Time column
+    assert list(events["Estimated Times"]) == ["", "YES"]
+    assert list(legacy["Estimated Times"]) == ["", ""]
 
 
 def test_build_conflict_events_empty_when_no_conflicts() -> None:
@@ -663,6 +689,15 @@ def test_build_layover_runs_pull_out_before_first_trip() -> None:
     assert runs.loc[0, "Departing Trip ID"] == "T1"
 
 
+def test_build_layover_runs_marks_trip_only_blocks() -> None:
+    rows = [
+        {**_run_row("06:55", "200", "LOADING", trip="T1", nxt="T1"), "Block": "trip-only:T1"},
+        {**_run_row("06:56", "200", "DEPART", trip="T1"), "Block": "trip-only:T1"},
+    ]
+    runs = target.build_layover_runs(pd.DataFrame(rows), "Metro")
+    assert list(runs["Type"]) == ["trip only"]  # the vehicle's earlier trips are unknown
+
+
 def test_build_layover_runs_only_reports_the_named_cluster() -> None:
     rows = [
         _run_row("06:55", "200", "LOADING", trip="T1", nxt="T1"),
@@ -757,3 +792,78 @@ def test_main_returns_1_when_required_run_log_fails(
         target, "run_step2_conflict_detection", lambda: target.require_run_log(False)
     )
     assert target.main() == 1
+
+
+def test_step2_discloses_estimated_times_and_trip_only_blocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import scripts.gtfs_exports.block_status_timeline_exporter as step1
+
+    # T1 passes the Hub bay S1 at an untimed stop; T2 ends there. Neither trip has a
+    # block_id, the route has only a long name and S1 has no stop_name.
+    feed = tmp_path / "feed"
+    feed.mkdir()
+    tables = {
+        "routes": "route_id,route_short_name,route_long_name,route_type\nR1,,Crosstown,3\n",
+        "stops": "stop_id,stop_name\nS1,\nS2,Elm St\nS3,Oak St\n",
+        "trips": "route_id,service_id,trip_id,direction_id\nR1,WKDY,T1,0\nR1,WKDY,T2,1\n",
+        "stop_times": "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+        "T1,07:00:00,07:00:00,S3,1\nT1,,,S1,2\nT1,07:10:00,07:10:00,S2,3\n"
+        "T2,07:00:00,07:00:00,S2,1\nT2,07:05:00,07:05:00,S1,2\n",
+    }
+    for name, text in tables.items():
+        (feed / f"{name}.txt").write_text(text, encoding="utf-8")
+    settings = {
+        "GTFS_FOLDER_PATH": str(feed),
+        "BLOCK_OUTPUT_FOLDER": str(tmp_path / "step1"),
+        "SCENARIO_NAME": "",
+        "CALENDAR_SERVICE_IDS": ["WKDY"],
+        "SERVICE_DATE": "",
+        "WRITE_PER_BLOCK_FILES": False,
+        "BUS_STOP_CLUSTERS_STEP1": [{"name": "Hub", "stops": ["S1"]}],
+        "ROUTE_SHORTNAME_FILTER": [],
+        "STOP_ID_FILTER": [],
+        "STOP_CODE_FILTER": [],
+        "BAY_OVERRIDES": [],
+        "THROUGH_DWELL_MINUTES": 2,
+        "POST_ARRIVAL_MINUTES": 2,
+        "INTERPOLATE_UNTIMED_STOPS": True,
+        "TRIP_ONLY_WITHOUT_BLOCK_ID": True,
+    }
+    for name, value in settings.items():
+        monkeypatch.setattr(step1, name, value)
+    step1.run_step1_gtfs_to_blocks()
+
+    clusters = {
+        "Hub": {
+            "single_bay_stops": ["S1"],
+            "double_bay_stops": [],
+            "triple_bay_stops": [],
+            "overflow_bays": [],
+        }
+    }
+    monkeypatch.setattr(target, "BLOCK_OUTPUT_FOLDER", str(tmp_path / "step1"))
+    monkeypatch.setattr(target, "SCENARIO_NAME", "")
+    monkeypatch.setattr(target, "CLUSTER_CONFLICT_OUTPUT_FOLDER", str(tmp_path / "step2"))
+    monkeypatch.setattr(target, "CLUSTER_DEFINITIONS", clusters)
+    target.run_step2_conflict_detection()
+
+    workbook = tmp_path / "step2" / "Hub_Conflicts.xlsx"
+    events = pd.read_excel(workbook, sheet_name="Conflict Events", dtype=str)
+    assert len(events) == 1
+    event = events.iloc[0]
+    # T1's interpolated 07:05 pass and T2's 07:05 arrival share the one-bus bay.
+    assert (event["Stop Name"], event["Start"], event["End"]) == ("S1", "07:05", "07:06")
+    assert event["Estimated Times"] == "YES"
+    assert event["Bus 1"] == "Crosstown (blk trip-only:T1, trip T1)"
+    rows = list(openpyxl.load_workbook(workbook)["Summary"].iter_rows(values_only=True))
+    values = {row[0]: row[1] for row in rows}
+    assert values["Conflict events involving interpolated stop times"] == 1
+    assert (
+        values["Trips analyzed without a block_id (layovers and vehicle continuity unknown)"] == 2
+    )
+    notes = " ".join(str(row[1]) for row in rows)
+    assert "ESTIMATED_STOP_VISITS=1" in notes
+    assert "TRIP_ONLY_TRIPS=2" in notes
+    runs = pd.read_excel(workbook, sheet_name="Layover Runs", dtype=str)
+    assert set(runs["Type"]) == {"trip only"}

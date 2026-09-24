@@ -254,6 +254,8 @@ def _trip(trip_id: str, start: int, end: int, first_stop: str, last_stop: str) -
         "trip_id": trip_id,
         "start": start,
         "end": end,
+        "departure": start,
+        "arrival": end,
         "stop_times_sequence": [],
         "route_id": "R1",
         "route_short_name": "R1",
@@ -814,7 +816,7 @@ def test_merge_and_filter_data_orders_stop_sequence_numerically() -> None:
     assert merged.loc[merged["is_last_stop"], "stop_id"].tolist() == ["S3"]
     assert merged.loc[merged["is_first_stop"], "stop_id"].tolist() == ["S1"]
     # A stop missing from stops.txt is a broken reference, not a nameless stop.
-    with pytest.raises(ValueError, match="populated stop_name"):
+    with pytest.raises(ValueError, match="absent from stops.txt: S3"):
         _merge_and_filter_data(trips, stop_times, _STOPS.iloc[:2], ["WKDY"])
 
 
@@ -831,3 +833,301 @@ def test_assumptions_text_lists_settings_and_service_ids() -> None:
     assert f"PRE_DEPARTURE_MINUTES={mod.PRE_DEPARTURE_MINUTES}" in text
     assert "SERVICE_IDS_USED=['WKDY']" in text
     assert text.endswith("\n")
+
+
+# ---------------------------------------------------------------------------
+# Optional GTFS fields: untimed stops, route and stop names, trips without blocks
+# ---------------------------------------------------------------------------
+
+# One vehicle (B1) runs T1 from Elm St (S3) to the Hub (S1), then T2 back out to Oak St (S4).
+_FEED = {
+    "routes": "route_id,route_short_name,route_long_name,route_type\nR1,1,Line One,3\n",
+    "stops": "stop_id,stop_name\nS1,Hub Bay 1\nS2,Hub Bay 2\nS3,Elm St\nS4,Oak St\n",
+    "trips": "route_id,service_id,trip_id,direction_id,block_id\n"
+    "R1,WKDY,T1,0,B1\nR1,WKDY,T2,1,B1\n",
+    "stop_times": "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+    "T1,07:00:00,07:00:00,S3,1\nT1,07:10:00,07:10:00,S1,2\n"
+    "T2,07:20:00,07:20:00,S1,1\nT2,07:30:00,07:30:00,S4,2\n",
+}
+
+
+def _feed(tmp_path: Path, **tables: str) -> Path:
+    """Write a GTFS folder; tables not given come from ``_FEED``."""
+    feed = tmp_path / "feed"
+    feed.mkdir()
+    for name, text in {**_FEED, **tables}.items():
+        (feed / f"{name}.txt").write_text(text, encoding="utf-8")
+    return feed
+
+
+def _export(feed: Path, out: Path, monkeypatch: pytest.MonkeyPatch, **settings: object) -> Path:
+    """Run Step 1 on *feed* into *out* and return *out*."""
+    base = {
+        "GTFS_FOLDER_PATH": str(feed),
+        "BLOCK_OUTPUT_FOLDER": str(out),
+        "SCENARIO_NAME": "",
+        "CALENDAR_SERVICE_IDS": ["WKDY"],
+        "SERVICE_DATE": "",
+        "WRITE_PER_BLOCK_FILES": False,
+        "BUS_STOP_CLUSTERS_STEP1": [{"name": "Hub", "stops": ["S1", "S2"]}],
+        "ROUTE_SHORTNAME_FILTER": [],
+        "STOP_ID_FILTER": [],
+        "STOP_CODE_FILTER": [],
+        "BAY_OVERRIDES": [],
+        "PRE_DEPARTURE_MINUTES": 5,
+        "POST_ARRIVAL_MINUTES": 2,
+    }
+    for name, value in {**base, **settings}.items():
+        monkeypatch.setattr(mod, name, value)
+    mod.run_step1_gtfs_to_blocks()
+    return out
+
+
+def _timeline(out: Path) -> pd.DataFrame:
+    return pd.read_csv(out / mod.COMBINED_TIMELINE_FILE, dtype=str, keep_default_na=False)
+
+
+def _json(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+_UNTIMED = (
+    "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+    "T1,07:00:00,07:00:00,S3,1\nT1,,,S2,2\nT1,,,S4,3\nT1,07:09:00,07:09:00,S1,4\n"
+    "T2,07:20:00,07:20:00,S1,1\nT2,07:30:00,07:30:00,S4,2\n"
+)
+
+
+def test_untimed_stops_stop_the_export_unless_interpolation_is_enabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    feed = _feed(tmp_path, stop_times=_UNTIMED)
+    with pytest.raises(ValueError, match=r"2 selected stop visit\(s\) on 1 trip\(s\).*\(T1\)"):
+        _export(feed, tmp_path / "strict", monkeypatch)
+    assert _json(tmp_path / "strict" / "timeline_manifest.json")["status"] == "failed"
+
+    out = _export(feed, tmp_path / "out", monkeypatch, INTERPOLATE_UNTIMED_STOPS=True)
+    rows = _timeline(out).set_index("Timestamp")
+    # Evenly by stop order between 07:00 and 07:09: S2 at 07:03, S4 at 07:06.
+    assert rows.loc["07:03", ["Stop ID", "Status", "Estimated Time"]].tolist() == [
+        "S2",
+        "ARRIVE/DEPART",
+        "True",
+    ]
+    assert rows.loc["07:06", ["Stop ID", "Estimated Time"]].tolist() == ["S4", "True"]
+    assert rows.loc["07:09", ["Stop ID", "Status", "Estimated Time"]].tolist() == [
+        "S1",
+        "ARRIVE",
+        "False",
+    ]
+    assert set(rows.loc[rows["Estimated Time"] == "True", "Stop Sequence"]) == {"2", "3"}
+    assert "ESTIMATED_STOP_VISITS=2 stop visit(s) on 1 trip(s)" in (
+        out / mod.ASSUMPTIONS_FILE
+    ).read_text(encoding="utf-8")
+    snapshot = _json(out / mod.SCHEDULE_SNAPSHOT_FILE)
+    t1 = next(trip for trip in snapshot["trips"] if trip["trip_id"] == "T1")
+    assert t1["estimated_stop_sequences"] == [2, 3]
+    assert snapshot["estimated_stop_visits"] == 2
+    assert _json(out / "timeline_manifest.json")["estimated_stop_visits"] == 2
+
+
+def _merged(stop_times: str, **trips: str) -> pd.DataFrame:
+    """Run _merge_and_filter_data on ``_FEED`` with other stop_times (and trips)."""
+    from io import StringIO
+
+    def table(name: str, text: str) -> pd.DataFrame:
+        return pd.read_csv(StringIO(text), dtype=str)
+
+    routes = table("routes", _FEED["routes"])
+    trip_table = table("trips", trips.get("trips", _FEED["trips"])).merge(routes, on="route_id")
+    return _merge_and_filter_data(
+        trip_table, table("stop_times", stop_times), table("stops", _FEED["stops"]), ["WKDY"]
+    )
+
+
+def _times(merged: pd.DataFrame, trip: str = "T1") -> list[tuple[str, int, int, bool]]:
+    rows = merged[merged["trip_id"] == trip].sort_values("stop_sequence")
+    return list(
+        zip(rows["stop_id"], rows["arrival_min"], rows["departure_min"], rows["estimated_time"])
+    )
+
+
+def test_interpolation_follows_shape_distance_when_the_whole_stretch_has_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mod, "INTERPOLATE_UNTIMED_STOPS", True)
+    stop_times = (
+        "trip_id,arrival_time,departure_time,stop_id,stop_sequence,shape_dist_traveled\n"
+        "T1,07:00:00,07:00:00,S3,1,0\nT1,,,S2,2,100\nT1,,,S4,3,800\n"
+        "T1,07:09:00,07:09:00,S1,4,900\n"
+        "T2,07:20:00,07:20:00,S1,1,0\nT2,07:30:00,07:30:00,S4,2,500\n"
+    )
+    assert _times(_merged(stop_times)) == [
+        ("S3", 420, 420, False),
+        ("S2", 421, 421, True),  # 100 of 900 distance units along: one minute in
+        ("S4", 428, 428, True),
+        ("S1", 429, 429, False),
+    ]
+    # One stop of the stretch without a distance: the stretch is spaced by stop order.
+    merged = _merged(stop_times.replace("T1,,,S4,3,800", "T1,,,S4,3,"))
+    assert [row[1] for row in _times(merged)] == [420, 423, 426, 429]
+    estimated = merged[merged["estimated_time"]]
+    assert set(estimated["timepoint"]) == {0}  # estimated through visits are not timepoints
+
+
+def test_interpolation_needs_timed_first_and_last_stops_and_valid_times(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mod, "INTERPOLATE_UNTIMED_STOPS", True)
+    untimed_start = _UNTIMED.replace("T1,07:00:00,07:00:00,S3,1", "T1,,,S3,1")
+    with pytest.raises(ValueError, match=r"untimed first or last stop \(T1\)"):
+        _merged(untimed_start)
+    with pytest.raises(ValueError, match="invalid arrival_time, e.g. '7:6x' in trip T2"):
+        _merged(_UNTIMED.replace("T2,07:20:00,07:20:00", "T2,7:6x,07:20:00"))
+    # A stop that gives only its arrival uses it for both times, flagged as estimated.
+    one_sided = _UNTIMED.replace("T1,,,S2,2", "T1,07:04:00,,S2,2")
+    assert _times(_merged(one_sided))[1] == ("S2", 424, 424, True)
+
+
+def test_route_name_mask_uses_long_name_or_route_id_only_without_short_name() -> None:
+    routes = pd.DataFrame(
+        {
+            "route_id": ["R10", "R20", "10"],
+            "route_short_name": ["10", "", "5"],
+            "route_long_name": ["Ten", "Crosstown", ""],
+        }
+    )
+    assert mod.route_name_mask(routes, ["10"]).tolist() == [True, False, False]
+    assert mod.route_name_mask(routes, ["Crosstown"]).tolist() == [False, True, False]
+    assert mod.route_name_mask(routes, ["R20"]).tolist() == [False, True, False]
+    assert not mod.route_name_mask(routes, ["Ten"]).any()  # R10 is named by its short name
+
+
+def test_route_without_short_name_is_exported_filtered_and_overridden(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    routes = "route_id,route_short_name,route_long_name,route_type\nR1,,Line One,3\n"
+    feed = _feed(tmp_path, routes=routes)
+    out = _export(
+        feed,
+        tmp_path / "out",
+        monkeypatch,
+        ROUTE_SHORTNAME_FILTER=["Line One"],
+        BAY_OVERRIDES=[
+            {"route_short_name": "Line One", "from_stop_ids": ["S1"], "to_stop_id": "S2"}
+        ],
+    )
+    rows = _timeline(out)
+    trip_rows = rows[rows["Trip ID"] == "T1"]
+    assert set(trip_rows["Route"]) == {"R1"}
+    assert set(trip_rows["Route Short Name"]) == {""}
+    assert set(trip_rows["Route Long Name"]) == {"Line One"}
+    assert rows.set_index("Timestamp").loc["07:10", "Stop ID"] == "S2"  # override applied
+    snapshot = _json(out / mod.SCHEDULE_SNAPSHOT_FILE)
+    assert {trip["route_long_name"] for trip in snapshot["trips"]} == {"Line One"}
+
+
+def test_bay_override_by_route_id_and_configuration_check(monkeypatch: pytest.MonkeyPatch) -> None:
+    merged = _merged_for_overrides().assign(route_id=["R1", "R1", "R2"])
+    monkeypatch.setattr(
+        mod, "BAY_OVERRIDES", [{"route_id": "R2", "from_stop_ids": ["S1"], "to_stop_id": "S9"}]
+    )
+    assert list(apply_bay_overrides(merged, _STOPS)["stop_id"]) == ["S1", "S2", "S9"]
+    monkeypatch.setattr(
+        mod,
+        "BAY_OVERRIDES",
+        [{"route_id": "R2", "route_short_name": "R2", "from_stop_ids": ["S1"], "to_stop_id": "S9"}],
+    )
+    with pytest.raises(ValueError, match="exactly one of route_short_name and route_id"):
+        mod.validate_configuration()
+
+
+def test_unnamed_stop_is_labeled_by_its_id_and_still_counted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    stops = "stop_id,stop_name\nS1,\nS2,Hub Bay 2\nS3,Elm St\nS4,Oak St\n"
+    out = _export(_feed(tmp_path, stops=stops), tmp_path / "out", monkeypatch)
+    assert "1 stop(s) used by the selected trips have no stop_name" in caplog.text
+    at_hub = _timeline(out).set_index("Timestamp").loc["07:10"]
+    assert (at_hub["Stop ID"], at_hub["Stop Name"], at_hub["Status"]) == ("S1", "S1", "ARRIVE")
+    snapshot = _json(out / mod.SCHEDULE_SNAPSHOT_FILE)
+    assert {"stop_id": "S1", "stop_name": "S1"} in snapshot["stops"]
+
+
+def test_trip_without_block_stops_the_export_unless_trip_only_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trips = "route_id,service_id,trip_id,direction_id,block_id\nR1,WKDY,T1,0,B1\nR1,WKDY,T2,1,\n"
+    feed = _feed(tmp_path, trips=trips)
+    with pytest.raises(ValueError, match=r"1 selected trip\(s\) have no block_id \(T2\)"):
+        _export(feed, tmp_path / "strict", monkeypatch)
+    # A blockless trip outside the selection does not matter.
+    extra = "R2,WKDY,T3,0,\n"
+    feed2 = tmp_path / "second"
+    feed2.mkdir()
+    for name, text in {
+        **_FEED,
+        "routes": _FEED["routes"] + "R2,2,Line Two,3\n",
+        "trips": _FEED["trips"] + extra,
+        "stop_times": _FEED["stop_times"]
+        + "T3,09:00:00,09:00:00,S3,1\nT3,09:10:00,09:10:00,S4,2\n",
+    }.items():
+        (feed2 / f"{name}.txt").write_text(text, encoding="utf-8")
+    out = _export(feed2, tmp_path / "filtered", monkeypatch, ROUTE_SHORTNAME_FILTER=["1"])
+    assert set(_timeline(out)["Block"]) == {"B1"}
+
+
+def test_trip_only_mode_analyzes_each_blockless_trip_alone_and_discloses_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trips = "route_id,service_id,trip_id,direction_id\nR1,WKDY,T1,0\nR1,WKDY,T2,1\n"  # no block_id
+    out = _export(
+        _feed(tmp_path, trips=trips), tmp_path / "out", monkeypatch, TRIP_ONLY_WITHOUT_BLOCK_ID=True
+    )
+    rows = _timeline(out)
+    assert set(rows["Block"]) == {"trip-only:T1", "trip-only:T2"}
+    t1 = rows[rows["Block"] == "trip-only:T1"].set_index("Timestamp")["Status"]
+    t2 = rows[rows["Block"] == "trip-only:T2"].set_index("Timestamp")["Status"]
+    # T1's arrival buffer and T2's loading are kept; the 07:10-07:20 layover between them
+    # belongs to no known vehicle, so neither block shows it.
+    assert list(t1.loc["07:10":"07:13"]) == ["ARRIVE", "ARRIVE", "ARRIVE", "INACTIVE"]
+    assert list(t2.loc["07:14":"07:20"]) == ["INACTIVE"] + ["LOADING"] * 5 + ["DEPART"]
+    assert not rows["Status"].isin({"DWELL", "LAYOVER", "LONG BREAK"}).any()
+    assumptions = (out / mod.ASSUMPTIONS_FILE).read_text(encoding="utf-8")
+    assert "TRIP_ONLY_TRIPS=2 trip(s) without a block_id" in assumptions
+    assert "vehicle continuity are unknown" in assumptions
+    assert _json(out / mod.SCHEDULE_SNAPSHOT_FILE)["trip_only_trips"] == ["T1", "T2"]
+    assert _json(out / "timeline_manifest.json")["trip_only_trips"] == 2
+
+
+def test_trip_only_block_ids_cannot_collide_with_real_blocks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mod, "TRIP_ONLY_WITHOUT_BLOCK_ID", True)
+    trips = (
+        "route_id,service_id,trip_id,direction_id,block_id\n"
+        "R1,WKDY,T1,0,trip-only:T2\nR1,WKDY,T2,1,\n"
+    )
+    with pytest.raises(ValueError, match="'trip-only:T2' is used in trips.txt"):
+        _merged(_FEED["stop_times"], trips=trips)
+
+
+def test_first_stop_hold_occupies_the_bay_and_reports_the_scheduled_departure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # T2 reaches the Hub at 07:12 and holds there until its scheduled 07:20 departure.
+    stop_times = _FEED["stop_times"].replace(
+        "T2,07:20:00,07:20:00,S1,1", "T2,07:12:00,07:20:00,S1,1"
+    )
+    out = _export(_feed(tmp_path, stop_times=stop_times), tmp_path / "out", monkeypatch)
+    rows = _timeline(out).set_index("Timestamp").loc["07:10":"07:20"]
+    assert set(rows["Stop ID"]) == {"S1"}  # the bus is in the bay throughout
+    assert list(rows["Status"]) == ["ARRIVE"] + ["LOADING"] * 1 + ["DWELL"] * 3 + [
+        "LOADING"
+    ] * 5 + ["DEPART"]
+    # The between-trip row quotes the schedule: T1's 07:10 arrival, T2's 07:20 departure.
+    assert rows.loc["07:11", ["Arrival Time", "Departure Time"]].tolist() == ["07:10", "07:20"]
+    snapshot = _json(out / mod.SCHEDULE_SNAPSHOT_FILE)
+    assert snapshot["schema_version"] == 2
+    t2 = next(trip for trip in snapshot["trips"] if trip["trip_id"] == "T2")
+    assert (t2["start"], t2["departure"], t2["arrival"], t2["end"]) == (432, 440, 450, 450)

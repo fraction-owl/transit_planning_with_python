@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+import openpyxl
 import pandas as pd
 import pytest
 
@@ -15,8 +16,10 @@ from utils.block_timeline_helpers import (
     build_schedule_rows,
     find_cluster,
     gap_status,
+    open_report_workbook,
     read_run_manifest,
     read_timeline_files,
+    route_display_name,
     row_for_inactive,
     status_for_same_trip,
     timestamp_to_minutes,
@@ -46,14 +49,15 @@ RENDERER = {
     "build_schedule_rows",
 }
 READERS = {"timestamp_to_minutes", "read_run_manifest", "verified_run_file", "read_timeline_files"}
+REPORTS = {"route_display_name", "open_report_workbook"}
 COPIES = {
     "scripts/gtfs_exports/block_status_timeline_exporter.py": RENDERER,
-    "scripts/facilities_tools/bay_usage_analyzer.py": READERS,
-    "scripts/facilities_tools/bay_change_sweep.py": RENDERER | READERS,
+    "scripts/facilities_tools/bay_usage_analyzer.py": READERS | REPORTS,
+    "scripts/facilities_tools/bay_change_sweep.py": RENDERER | READERS | REPORTS,
 }
 
 
-def _functions(path: Path) -> dict[str, str]:
+def _functions(path: Path) -> dict[str, str]:  # decorators are part of each node
     tree = ast.parse(path.read_text(encoding="utf-8"))
     return {node.name: ast.dump(node) for node in tree.body if isinstance(node, ast.FunctionDef)}
 
@@ -98,6 +102,8 @@ def _trip(trip_id: str, visits: list[tuple]) -> dict[str, Any]:
         "trip_id": trip_id,
         "start": visits[0][0],
         "end": visits[-1][1],
+        "departure": visits[0][1],
+        "arrival": visits[-1][0],
         "stop_times_sequence": visits,
         "route_id": "R1",
         "route_short_name": "1",
@@ -197,6 +203,52 @@ def test_build_schedule_rows_occupancy_only_and_zero_gap_handoff() -> None:
     )
     assert {r["Status"] for r in occupancy} <= {"LOADING", "DEPART", "ARRIVE"}
     assert occupancy[0]["Timestamp"] == "06:35"  # pull-out LOADING, five minutes before 06:40
+
+
+def test_row_for_inactive_quotes_the_schedule_but_counts_the_hold() -> None:
+    # T2 reaches S1 at 10:02 and departs at 10:10; T1 last arrived there at 10:00.
+    t1 = _trip("T1", [_stop(580, 580, "S9", True, False, 1), _stop(600, 600, "S1", False, True, 2)])
+    t2 = _trip(
+        "T2",
+        [_stop(602, 610, "S1", True, False, 1, "T2"), _stop(630, 630, "S9", False, True, 2, "T2")],
+    )
+    rows = build_schedule_rows([t1, t2], range(600, 611), "B1", [], SETTINGS)
+    assert {row["Stop ID"] for row in rows} == {"S1"}  # in the bay from 10:00 to 10:10
+    between = rows[1]  # 10:01, before T2's first scheduled time
+    assert (between["Status"], between["Arrival Time"], between["Departure Time"]) == (
+        "LOADING",
+        "10:00",
+        "10:10",
+    )
+    # The layover is classified on the 20-minute occupancy gap (LAYOVER), not the
+    # 40-minute schedule gap from 09:30 to 10:10 (which would be a LONG BREAK).
+    t1_early = _trip(
+        "T1", [_stop(550, 550, "S9", True, False, 1), _stop(570, 570, "S1", False, True, 2)]
+    )
+    t2_long_hold = _trip(
+        "T2",
+        [_stop(590, 610, "S1", True, False, 1, "T2"), _stop(630, 630, "S9", False, True, 2, "T2")],
+    )
+    row = row_for_inactive(575, "B1", [t1_early, t2_long_hold], [], SETTINGS)
+    assert (row["Status"], row["Departure Time"]) == ("LAYOVER", "10:10")
+
+
+def test_build_schedule_rows_flags_estimated_visits() -> None:
+    trip = _trip(
+        "T1",
+        [
+            _stop(420, 420, "S1", True, False, 1),
+            _stop(425, 425, "S2", False, False, 2),
+            _stop(430, 430, "S3", False, True, 3),
+        ],
+    )
+    trip["estimated_stop_sequences"] = [2]
+    rows = {
+        r["Timestamp"]: r for r in build_schedule_rows([trip], range(420, 431), "B1", [], SETTINGS)
+    }
+    assert rows["07:05"]["Estimated Time"] is True
+    assert rows["07:00"]["Estimated Time"] is False
+    assert rows["07:03"]["Estimated Time"] is False  # traveling, not at a stop
 
 
 def test_build_schedule_rows_requires_one_minute_steps() -> None:
@@ -311,3 +363,35 @@ def test_read_timeline_files_rejects_malformed_timelines(
     frame.to_csv(tmp_path / "timeline.csv", index=False)
     with pytest.raises(ValueError, match=message):
         read_timeline_files(str(tmp_path), "timeline.csv")
+
+
+# ---------------------------------------------------------------------------
+# Route names and report workbooks
+# ---------------------------------------------------------------------------
+
+
+def test_route_display_name_falls_back_from_short_to_long_to_route_id() -> None:
+    assert route_display_name("10", "Crosstown", "R10") == "10"
+    assert route_display_name("", "Crosstown", "R10") == "Crosstown"
+    assert route_display_name(None, float("nan"), "R10") == "R10"
+    assert route_display_name(" ", " Green Line ", "R4") == "Green Line"
+
+
+def test_open_report_workbook_keeps_the_original_error_and_removes_the_file(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "report.xlsx"
+    # Nothing written yet: closing would fail with "At least one sheet must be visible".
+    with pytest.raises(KeyError, match="calculation"):
+        with open_report_workbook(str(path)):
+            raise KeyError("calculation")
+    assert not path.exists()
+    # A failure after some sheets were written leaves no half-written workbook either.
+    with pytest.raises(RuntimeError, match="second sheet"):
+        with open_report_workbook(str(path)) as writer:
+            pd.DataFrame({"a": [1]}).to_excel(writer, sheet_name="First", index=False)
+            raise RuntimeError("second sheet")
+    assert not path.exists()
+    with open_report_workbook(str(path)) as writer:
+        pd.DataFrame({"a": [1]}).to_excel(writer, sheet_name="First", index=False)
+    assert openpyxl.load_workbook(path).sheetnames == ["First"]
