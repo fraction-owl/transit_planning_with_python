@@ -41,12 +41,19 @@ Typical usage
 -------------
 Update the paths in the CONFIGURATION section and run from a Jupyter
 notebook, ArcGIS Pro’s “Python” pane, or directly from the command line.
+
+With revised exporter output, the run manifest identifies current files and
+rejects interrupted runs or modified inputs. Older timelines are accepted with
+a warning and checked for duplicate vehicle rows and one-minute sampling.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -81,8 +88,9 @@ COMBINED_TIMELINE_FILE: str = r"all_blocks_timeline.csv"
 # Optional: Step 1's assumptions file, echoed into the Summary sheet if present.
 ASSUMPTIONS_FILE: str = r"timeline_assumptions.txt"
 
-# Count a bus laying over *in its bay* (Step 1 status DWELL) as occupying that
-# stop. Buses on the overflow/layover space (LAYOVER, LONG BREAK) never do.
+# Count between-trip DWELL as occupying the arrival bay. Timed holds within
+# a trip still occupy their bay when this switch is False. Overflow statuses
+# (LAYOVER, LONG BREAK) never occupy the arrival bay.
 COUNT_IN_BAY_LAYOVER_AT_STOP: bool = True
 
 # Optional: which overflow bay a laying-over bus uses, by Step 1 status.
@@ -170,32 +178,67 @@ CONFLICT_FILL = PatternFill(start_color="FFF4CCCC", end_color="FFF4CCCC", fill_t
 # ==================================================================================================
 
 
+def bay_occupancy_mask(frame: DataFrame) -> pd.Series:
+    """Select physical bay occupancy; the layover switch only excludes between-trip dwell."""
+    mask = frame["Status"].isin(PASSENGER_SERVICE_STATUSES | {"DWELL"})
+    if not COUNT_IN_BAY_LAYOVER_AT_STOP:
+        previous = frame.get("Prev Trip ID", pd.Series("", index=frame.index)).fillna("").ne("")
+        upcoming = frame.get("Next Trip ID", pd.Series("", index=frame.index)).fillna("").ne("")
+        mask &= ~(frame["Status"].eq("DWELL") & previous & upcoming)
+    return mask
+
+
+def validate_cluster_configuration() -> None:
+    """Reject duplicate physical stops/spaces and ambiguous overflow routing."""
+    seen: set[str] = set()
+    for name, info in CLUSTER_DEFINITIONS.items():
+        stops = [
+            str(value) for value in get_all_official_stops(info) + info.get("overflow_bays", [])
+        ]
+        if len(stops) != len(set(stops)) or seen.intersection(stops):
+            raise ValueError(
+                f"Stops/spaces must be unique across capacity lists and clusters: {name}"
+            )
+        seen.update(stops)
+        routed = [
+            status
+            for space, statuses in OVERFLOW_ROUTING.items()
+            if space in info.get("overflow_bays", [])
+            for status in statuses
+        ]
+        if len(routed) != len(set(routed)) or set(routed) - OVERFLOW_STATUSES:
+            raise ValueError(
+                f"Overflow routing is ambiguous or has unsupported statuses for {name}."
+            )
+    if not 0 <= SIT_FLAG_MIN_MINUTES <= SIT_FLAG_MAX_MINUTES:
+        raise ValueError("Sit-flag minimum/maximum must be nonnegative and ordered.")
+
+
 def bay_statuses() -> Set[str]:
-    """Statuses that count as occupying a stop, honoring the in-bay layover switch."""
-    if COUNT_IN_BAY_LAYOVER_AT_STOP:
-        return PASSENGER_SERVICE_STATUSES | {"DWELL"}
-    return set(PASSENGER_SERVICE_STATUSES)
+    """Statuses that can occupy a bay; the row-level mask handles between-trip layovers."""
+    return PASSENGER_SERVICE_STATUSES | {"DWELL"}
 
 
 def timestamp_to_minutes(ts: object) -> Optional[int]:
-    """Convert an ``HH:MM`` timestamp (hours may exceed 24) to minutes past midnight."""
+    """Parse an HH:MM timeline timestamp, retaining hours beyond midnight."""
     if ts is None or pd.isna(ts):
         return None
     parts = str(ts).strip().split(":")
-    if len(parts) < 2:
+    if len(parts) != 2:
         return None
     try:
-        return int(parts[0]) * 60 + int(parts[1])
+        hours, minute = map(int, parts)
     except ValueError:
         return None
+    return hours * 60 + minute if hours >= 0 and 0 <= minute < 60 else None
 
 
 def bus_label(row: pd.Series) -> str:
     """Short human-readable identifier for the bus on a timeline row."""
-    route = str(row.get("Route Short Name") or row.get("Route") or "").strip()
-    headsign = str(row.get("Trip Headsign") or "").strip()
-    block = str(row.get("Block") or "").strip()
-    trip = str(row.get("Trip ID") or "").strip()
+    route = _txt(row.get("Route Short Name")).strip() or _txt(row.get("Route")).strip()
+    headsign = _txt(row.get("Trip Headsign")).strip()
+    block = _txt(row.get("Block")).strip()
+    trip = _txt(row.get("Trip ID")).strip()
     name = f"{route} {headsign}".strip() or "?"
     return f"{name} (blk {block}, trip {trip})"
 
@@ -277,33 +320,18 @@ def build_stop_capacities() -> Dict[str, int]:
 
 
 def normalize_stop_id(stop_id: object) -> Optional[str]:
-    """Return a normalized stop-ID string.
-
-    Converts ``2956.0`` → ``"2956"`` and gracefully handles *NaN*.
-
-    Args:
-    ----
-    stop_id :
-        Value from the ``Stop ID`` column, potentially numeric or NaN.
-
-    Returns:
-    -------
-    str | None
-        Cleaned stop ID or *None* if ``stop_id`` is NaN.
-    """
-    if pd.isna(stop_id):
+    """Preserve textual GTFS IDs; normalize only genuinely numeric Excel values."""
+    if stop_id is None or pd.isna(stop_id):
         return None
-    sid_str = str(stop_id).strip()
-    if sid_str.endswith(".0"):
-        sid_str = sid_str[:-2]
-    return sid_str
+    if isinstance(stop_id, float) and stop_id.is_integer():
+        return str(int(stop_id))
+    return str(stop_id).strip() or None
 
 
 def assign_cluster_name(df_in: DataFrame) -> DataFrame:
     """Add a ``ClusterName`` column indicating which cluster each stop belongs to.
 
-    If a stop appears in multiple clusters (unlikely), the first match in
-    ``CLUSTER_DEFINITIONS`` wins.
+    Configuration validation rejects stops appearing in multiple clusters.
 
     Args:
     ----------
@@ -383,7 +411,7 @@ def find_stop_conflicts(df_in: DataFrame) -> Set[Tuple[str, str]]:
     stop_caps = build_stop_capacities()
     conflict_set: Set[Tuple[str, str]] = set()
 
-    pass_df = df_in[df_in["Status"].isin(bay_statuses())].copy()
+    pass_df = df_in[bay_occupancy_mask(df_in)].copy()
     # only stops with a defined capacity (cluster bays and overflow); other
     # stops in a block's day are not being assessed
     pass_df = pass_df[pass_df["Stop ID"].isin(stop_caps.keys())]
@@ -426,13 +454,18 @@ def annotate_conflicts(
     df_out = df_in.copy()
     conflict_types: List[str] = []
 
-    for _, row in df_out.iterrows():
+    occupied = bay_occupancy_mask(df_out)
+    for idx, row in df_out.iterrows():
         cname = row["ClusterName"]
         ts = row["Timestamp"]
         sid = row["Stop ID"]
 
-        has_cluster_conf = pd.notna(cname) and (cname, ts) in cluster_conflicts
-        has_stop_conf = sid is not None and (sid, ts) in stop_conflicts
+        has_cluster_conf = (
+            row["Status"] in PRESENCE_STATUSES
+            and pd.notna(cname)
+            and (cname, ts) in cluster_conflicts
+        )
+        has_stop_conf = bool(occupied.loc[idx]) and sid is not None and (sid, ts) in stop_conflicts
 
         if has_cluster_conf and has_stop_conf:
             conflict_types.append("BOTH")
@@ -454,7 +487,7 @@ def annotate_conflicts(
 
 def _stop_occupancy(df_in: DataFrame) -> DataFrame:
     """Rows that occupy a stop (bay), with a numeric minute column."""
-    occ = df_in[df_in["Status"].isin(bay_statuses()) & df_in["Stop ID"].notna()].copy()
+    occ = df_in[bay_occupancy_mask(df_in) & df_in["Stop ID"].notna()].copy()
     occ["Minute"] = occ["Timestamp"].apply(timestamp_to_minutes)
     return occ.dropna(subset=["Minute"])
 
@@ -505,7 +538,7 @@ def build_conflict_events(df_in: DataFrame) -> DataFrame:
                     "End": window["Timestamp"].max(),
                     "Minutes": int(run_prev - run_start + 1),
                     "Peak Buses": int(window.groupby("Minute").size().max()),
-                    "Buses": len(labels),
+                    "Buses": int(window["Block"].nunique()),
                     "Bus 1": labels[0] if len(labels) > 0 else "",
                     "Bus 2": labels[1] if len(labels) > 1 else "",
                     "Bus 3": labels[2] if len(labels) > 2 else "",
@@ -613,7 +646,7 @@ def build_overflow_events(df_in: DataFrame, cluster_info: Dict[str, List[str]]) 
                     "End": window["Timestamp"].max(),
                     "Minutes": int(run_prev - run_start + 1),
                     "Peak Buses": int(window.groupby("Minute").size().max()),
-                    "Buses": len(labels),
+                    "Buses": int(window["Block"].nunique()),
                     "Bus 1": labels[0] if len(labels) > 0 else "",
                     "Bus 2": labels[1] if len(labels) > 1 else "",
                     "Bus 3": labels[2] if len(labels) > 2 else "",
@@ -816,7 +849,7 @@ def _layover_run_row(
     }
 
 
-def build_layover_runs(df_in: DataFrame) -> DataFrame:
+def build_layover_runs(df_in: DataFrame, cluster_name: str) -> DataFrame:
     """List every stretch a block spends at the cluster between trips.
 
     A run is a maximal sequence of consecutive minutes for one block whose
@@ -829,8 +862,10 @@ def build_layover_runs(df_in: DataFrame) -> DataFrame:
     Args:
     ----------
     df_in :
-        Timeline rows for one cluster's blocks (all statuses, so the row
-        after a run can be inspected). Needs ``ClusterName``.
+        Timeline rows for blocks touching the cluster (all statuses, so the
+        row after a run can be inspected). Needs ``ClusterName``.
+    cluster_name:
+        Only runs within this exact cluster are included.
 
     Returns:
     -------
@@ -847,8 +882,8 @@ def build_layover_runs(df_in: DataFrame) -> DataFrame:
     for _, r in df[df["Trip ID"].notna() & (df["Trip ID"].astype(str) != "")].iterrows():
         tid = str(r["Trip ID"])
         if tid not in trip_lookup:
-            route = str(r.get("Route Short Name") or r.get("Route") or "").strip()
-            headsign = str(r.get("Trip Headsign") or "").strip()
+            route = _txt(r.get("Route Short Name")).strip() or _txt(r.get("Route")).strip()
+            headsign = _txt(r.get("Trip Headsign")).strip()
             trip_lookup[tid] = f"{route} {headsign}".strip()
 
     occupying = bay_statuses()
@@ -856,7 +891,11 @@ def build_layover_runs(df_in: DataFrame) -> DataFrame:
     for block, g in df.groupby("Block", sort=False):
         current: List[Dict[str, Any]] = []
         for r in g.to_dict("records"):
-            in_cluster = pd.notna(r.get("ClusterName")) and r["Status"] in SIT_STATUSES
+            in_cluster = (
+                r.get("ClusterName") == cluster_name
+                and r["Status"] in SIT_STATUSES
+                and r.get("Stop Role") != "through"
+            )
             if in_cluster and (not current or r["Minute"] == current[-1]["Minute"] + 1):
                 current.append(r)
                 continue
@@ -907,41 +946,8 @@ def build_layover_runs(df_in: DataFrame) -> DataFrame:
 
 
 def gather_block_spreadsheets(block_folder: str) -> DataFrame:
-    """Read and concatenate every ``block_*.xlsx`` spreadsheet in *block_folder*.
-
-    Args:
-    ----------
-    block_folder :
-        Directory containing the Step 1 block-level output workbooks.
-
-    Returns:
-    -------
-    pandas.DataFrame
-        Combined DataFrame of all block files.
-
-    Raises:
-    ------
-    FileNotFoundError
-        If no eligible ``block_*.xlsx`` files are found.
-    """
-    all_files = [
-        f
-        for f in os.listdir(block_folder)
-        if f.lower().endswith(".xlsx") and f.startswith("block_")
-    ]
-    if not all_files:
-        raise FileNotFoundError(f"No block_*.xlsx files found in {block_folder}.")
-
-    big_df_list: List[DataFrame] = []
-    for fname in all_files:
-        path = os.path.join(block_folder, fname)
-        temp_df = pd.read_excel(path, dtype=str)  # keep IDs and route names as text
-        temp_df["FileName"] = fname
-        big_df_list.append(temp_df)
-
-    df_combined = pd.concat(big_df_list, ignore_index=True)
-    logging.info("Loaded %d total rows from Step 1 block XLSX files.", len(df_combined))
-    return df_combined
+    """Read only manifest-listed block workbooks, validating vehicle/minute uniqueness."""
+    return read_timeline_files(block_folder, "").replace({"": None})
 
 
 def run_input_folder() -> str:
@@ -951,24 +957,116 @@ def run_input_folder() -> str:
     )
 
 
+def read_run_manifest(folder: str) -> Optional[dict[str, Any]]:
+    """Read a completed run manifest; refuse failed or interrupted exporter runs."""
+    path = Path(folder) / "timeline_manifest.json"
+    if not path.exists():
+        return None
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    if manifest.get("schema_version") != 1 or manifest.get("status") != "complete":
+        raise ValueError(f"Exporter run in {folder} is not complete. Rerun Step 1 successfully.")
+    if manifest.get("interval_minutes") != 1:
+        raise ValueError("Timeline input must use one-minute intervals.")
+    return manifest
+
+
+def verified_run_file(folder: str, name: str, manifest: dict[str, Any]) -> Path:
+    """Resolve one manifest-listed file and verify it belongs to that completed run."""
+    if not name or Path(name).name != name or "\\" in name:
+        raise ValueError(f"Expected a filename inside the run folder, got {name!r}.")
+    expected = manifest.get("files", {}).get(name)
+    path = Path(folder) / name
+    if not expected or not path.is_file():
+        raise ValueError(f"Missing current-run file {name!r}; rerun Step 1.")
+    if hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+        raise ValueError(f"{name} has changed since Step 1 completed; rerun Step 1.")
+    return path
+
+
+def read_timeline_files(folder: str, combined_name: str) -> DataFrame:
+    """Read only current-run outputs, with an explicit legacy-input fallback."""
+    manifest = read_run_manifest(folder)
+    if manifest is not None:
+        combined = manifest.get("combined_timeline", "")
+        if combined_name and combined:
+            if combined_name != combined:
+                raise ValueError("COMBINED_TIMELINE_FILE does not match the exporter manifest.")
+            path = verified_run_file(folder, combined, manifest)
+            frame = pd.read_csv(path, dtype=str, keep_default_na=False)
+        else:
+            names = manifest.get("block_workbooks", [])
+            if not names:
+                raise ValueError("This run has no block workbooks; enable the combined CSV input.")
+            frames = []
+            for name in names:
+                part = pd.read_excel(
+                    verified_run_file(folder, name, manifest), dtype=str, keep_default_na=False
+                )
+                frames.append(part.assign(FileName=name))
+            frame = pd.concat(frames, ignore_index=True)
+    else:
+        logging.warning(
+            "Legacy timeline without a run manifest: current-run identity cannot be checked."
+        )
+        combined_path = Path(folder) / combined_name
+        if combined_name and combined_path.is_file():
+            frame = pd.read_csv(combined_path, dtype=str, keep_default_na=False)
+        else:
+            paths = sorted(Path(folder).glob("block_*.xlsx"))
+            if not paths:
+                raise FileNotFoundError(f"No timeline CSV or block workbooks in {folder}.")
+            frame = pd.concat(
+                [
+                    pd.read_excel(path, dtype=str, keep_default_na=False).assign(FileName=path.name)
+                    for path in paths
+                ],
+                ignore_index=True,
+            )
+    required = {"Timestamp", "Block", "Trip ID", "Stop ID", "Status"}
+    missing = required - set(frame.columns)
+    if missing:
+        raise ValueError(f"Timeline is missing columns: {sorted(missing)}")
+    if frame.empty:
+        raise ValueError("Timeline contains no rows.")
+    if frame["Block"].eq("").any():
+        raise ValueError("Timeline contains blank block IDs.")
+    if frame.duplicated(["Block", "Timestamp"]).any():
+        raise ValueError("Duplicate block/timestamp rows: check for mixed or stale input files.")
+    minute = frame["Timestamp"].map(timestamp_to_minutes)
+    if minute.isna().any():
+        raise ValueError("Timeline contains invalid timestamps.")
+    if frame.assign(_minute=minute).duplicated(["Block", "_minute"]).any():
+        raise ValueError("Timeline contains duplicate block/minute rows.")
+    for _, group in frame.assign(_minute=minute).groupby("Block", sort=False):
+        differences = group["_minute"].sort_values().diff().dropna()
+        if not differences.empty and not differences.eq(1).all():
+            raise ValueError("Timeline must contain consecutive one-minute rows for each block.")
+    return frame
+
+
 def load_timeline(block_folder: str) -> DataFrame:
-    """Load Step 1 output: the combined CSV if configured and present, else the block workbooks."""
-    if COMBINED_TIMELINE_FILE:
-        combined_path = os.path.join(block_folder, COMBINED_TIMELINE_FILE)
-        if os.path.isfile(combined_path):
-            df = pd.read_csv(combined_path, dtype=str, keep_default_na=False)
-            df = df.replace({"": None})
-            logging.info("Loaded %d rows from %s.", len(df), combined_path)
-            return df
-        logging.info("No %s found; reading block_*.xlsx instead.", COMBINED_TIMELINE_FILE)
-    return gather_block_spreadsheets(block_folder)
+    """Load the current exporter run and normalize blanks consistently for CSV and Excel."""
+    frame = read_timeline_files(block_folder, COMBINED_TIMELINE_FILE)
+    frame["Timestamp"] = (
+        frame["Timestamp"]
+        .map(timestamp_to_minutes)
+        .map(lambda minute: f"{minute // 60:02d}:{minute % 60:02d}")
+    )
+    return frame.replace({"": None})
 
 
 def read_assumptions(block_folder: str) -> List[str]:
     """Return the lines of Step 1's assumptions file, or an empty list if absent."""
     if not ASSUMPTIONS_FILE:
         return []
-    path = os.path.join(block_folder, ASSUMPTIONS_FILE)
+    manifest = read_run_manifest(block_folder)
+    if manifest is not None:
+        name = manifest.get("assumptions_file", "")
+        if not name:
+            return []
+        path = str(verified_run_file(block_folder, name, manifest))
+    else:
+        path = os.path.join(block_folder, ASSUMPTIONS_FILE)
     if not os.path.isfile(path):
         return []
     with open(path, encoding="utf-8") as handle:
@@ -1018,6 +1116,7 @@ def _write_summary_sheet(
     ]
     lines += [
         ("Stop occupancy statuses", ", ".join(sorted(bay_statuses()))),
+        ("Count between-trip in-bay layovers", COUNT_IN_BAY_LAYOVER_AT_STOP),
         ("Overflow bays defined", rules["overflow_capacity"]),
         ("", ""),
         ("Minutes with any stop over capacity", rules["any_stop"]),
@@ -1101,9 +1200,10 @@ def run_step2_conflict_detection() -> None:
             "Input folder does not exist: %s. Run Step 1 with the same SCENARIO_NAME first.",
             in_folder,
         )
-        return
+        raise FileNotFoundError(f"Input folder not found: {in_folder}")
 
     os.makedirs(CLUSTER_CONFLICT_OUTPUT_FOLDER, exist_ok=True)
+    validate_cluster_configuration()
     _validate_overflow_routing()
 
     # 1) Gather Step 1 data
@@ -1167,10 +1267,10 @@ def run_step2_conflict_detection() -> None:
         tally = build_bay_tally(sub, events)
         rules = build_minute_rules(sub, cinfo)
         overflow_events = build_overflow_events(sub, cinfo)
-        runs = build_layover_runs(cluster_blocks)
+        runs = build_layover_runs(cluster_blocks, cname)
         n_cluster_conflicts = sum(1 for c, _ in cluster_conflicts if c == cname)
 
-        safe_name = cname.replace(" ", "_")
+        safe_name = re.sub(r'[<>:"/\\|?*]', "_", cname).replace(" ", "_")
         suffix = f"_{SCENARIO_NAME}" if SCENARIO_NAME else ""
         out_path = os.path.join(
             CLUSTER_CONFLICT_OUTPUT_FOLDER,
@@ -1202,10 +1302,16 @@ def run_step2_conflict_detection() -> None:
                     continue
 
                 # Make a sheet name that is safe in Excel (≤31 chars)
-                sheet_name = f"Stop_{sid_str}"
+                sheet_name = re.sub(r"[\[\]:*?/\\]", "_", f"Stop_{sid_str}")
                 if len(sheet_name) > 31:
                     sheet_name = sheet_name[:31]
 
+                base_sheet = sheet_name
+                number = 1
+                while sheet_name.casefold() in {value.casefold() for value in writer.sheets}:
+                    suffix = f"_{number}"
+                    sheet_name = base_sheet[: 31 - len(suffix)] + suffix
+                    number += 1
                 stop_df.to_excel(writer, sheet_name=sheet_name, index=False)
                 _highlight_conflict_rows(writer.sheets[sheet_name], stop_df)
 
@@ -1295,8 +1401,7 @@ def write_run_log(output_file: Path) -> bool:
     """Write the ``_runlog.txt`` sidecar for *output_file* (same folder, same stem).
 
     The log captures this script's CONFIGURATION block verbatim, between the
-    ``# === BEGIN CONFIG ===`` / ``# === END CONFIG ===`` markers, so it can
-    never drift from the values actually used.
+    ``# === BEGIN CONFIG ===`` / ``# === END CONFIG ===`` markers, and appends the effective runtime values, including notebook edits.
 
     Returns:
         ``True`` if the log was written successfully, ``False`` otherwise.
@@ -1327,6 +1432,13 @@ def write_run_log(output_file: Path) -> bool:
         "CONFIGURATION (verbatim from source)",
         "-" * 72,
         config_text,
+        "",
+        "EFFECTIVE RUNTIME SETTINGS",
+        json.dumps(
+            {name: value for name, value in globals().items() if name.isupper()},
+            indent=2,
+            default=str,
+        ),
         "=" * 72,
     ]
 
@@ -1375,7 +1487,7 @@ def main() -> int:
         return 2
     try:
         run_step2_conflict_detection()
-    except RunLogError as exc:
+    except (RunLogError, ValueError, OSError, KeyError) as exc:
         logging.error("%s", exc)
         return 1
     logging.info("Script completed successfully.")
