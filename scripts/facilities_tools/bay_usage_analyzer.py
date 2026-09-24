@@ -179,12 +179,22 @@ CONFLICT_FILL = PatternFill(start_color="FFF4CCCC", end_color="FFF4CCCC", fill_t
 
 
 def bay_occupancy_mask(frame: DataFrame) -> pd.Series:
-    """Select physical bay occupancy; the layover switch only excludes between-trip dwell."""
+    """Select physical bay occupancy; the layover switch only excludes between-trip dwell.
+
+    A DWELL row is between trips when it carries both a previous and a next trip
+    ID, as Step 1 writes them. A timeline without those columns (Step 1 output
+    older than the trip links) cannot tell a layover from a timed hold, so there
+    the switch excludes every DWELL row, as it did before holds were separated.
+    """
     mask = frame["Status"].isin(PASSENGER_SERVICE_STATUSES | {"DWELL"})
     if not COUNT_IN_BAY_LAYOVER_AT_STOP:
-        previous = frame.get("Prev Trip ID", pd.Series("", index=frame.index)).fillna("").ne("")
-        upcoming = frame.get("Next Trip ID", pd.Series("", index=frame.index)).fillna("").ne("")
-        mask &= ~(frame["Status"].eq("DWELL") & previous & upcoming)
+        if "Prev Trip ID" in frame.columns or "Next Trip ID" in frame.columns:
+            blank = pd.Series("", index=frame.index)
+            previous = frame.get("Prev Trip ID", blank).fillna("").ne("")
+            upcoming = frame.get("Next Trip ID", blank).fillna("").ne("")
+            mask &= ~(frame["Status"].eq("DWELL") & previous & upcoming)
+        else:
+            mask &= frame["Status"].ne("DWELL")
     return mask
 
 
@@ -219,6 +229,7 @@ def bay_statuses() -> Set[str]:
     return PASSENGER_SERVICE_STATUSES | {"DWELL"}
 
 
+# Canonical version lives in utils/block_timeline_helpers.py -- keep this copy in sync.
 def timestamp_to_minutes(ts: object) -> Optional[int]:
     """Parse an HH:MM timeline timestamp, retaining hours beyond midnight."""
     if ts is None or pd.isna(ts):
@@ -320,12 +331,19 @@ def build_stop_capacities() -> Dict[str, int]:
 
 
 def normalize_stop_id(stop_id: object) -> Optional[str]:
-    """Preserve textual GTFS IDs; normalize only genuinely numeric Excel values."""
+    """Return a stop ID as text, undoing the ``.0`` a spreadsheet adds to numeric IDs.
+
+    ``2956.0`` (as a number or as text) becomes ``"2956"``; other textual GTFS
+    IDs, including non-numeric ones ending in ``.0``, are kept as written.
+    """
     if stop_id is None or pd.isna(stop_id):
         return None
     if isinstance(stop_id, float) and stop_id.is_integer():
         return str(int(stop_id))
-    return str(stop_id).strip() or None
+    text = str(stop_id).strip()
+    if re.fullmatch(r"\d+\.0", text):
+        text = text[:-2]
+    return text or None
 
 
 def assign_cluster_name(df_in: DataFrame) -> DataFrame:
@@ -957,6 +975,7 @@ def run_input_folder() -> str:
     )
 
 
+# Canonical versions live in utils/block_timeline_helpers.py -- keep these copies in sync.
 def read_run_manifest(folder: str) -> Optional[dict[str, Any]]:
     """Read a completed run manifest; refuse failed or interrupted exporter runs."""
     path = Path(folder) / "timeline_manifest.json"
@@ -1227,13 +1246,9 @@ def run_step2_conflict_detection() -> None:
     missing_cols = [c for c in required_cols if c not in df.columns]
     if missing_cols:
         raise ValueError(f"Missing columns in block-level data: {missing_cols}")
-    for optional in (
-        "Route Short Name",
-        "Trip Headsign",
-        "Layover Location",
-        "Prev Trip ID",
-        "Next Trip ID",
-    ):
+    # Prev/Next Trip ID stay absent when Step 1 did not write them, so the
+    # in-bay layover switch can fall back to excluding every DWELL row.
+    for optional in ("Route Short Name", "Trip Headsign", "Layover Location"):
         if optional not in df.columns:
             df[optional] = None
 
@@ -1401,7 +1416,8 @@ def write_run_log(output_file: Path) -> bool:
     """Write the ``_runlog.txt`` sidecar for *output_file* (same folder, same stem).
 
     The log captures this script's CONFIGURATION block verbatim, between the
-    ``# === BEGIN CONFIG ===`` / ``# === END CONFIG ===`` markers, and appends the effective runtime values, including notebook edits.
+    ``# === BEGIN CONFIG ===`` / ``# === END CONFIG ===`` markers, and appends
+    the effective runtime values, including notebook edits.
 
     Returns:
         ``True`` if the log was written successfully, ``False`` otherwise.

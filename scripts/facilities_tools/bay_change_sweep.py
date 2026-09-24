@@ -59,8 +59,9 @@ and run again, from a shell, ArcGIS Pro's Python window, or a Jupyter
 notebook.
 
 The three scripts remain standalone: the sweep contains an identical copy of
-the exporter's occupancy renderer. Search is bounded by BEAM_WIDTH and the
-step limit; the returned packages are candidates, not a guaranteed optimum.
+the exporter's occupancy renderer (canonical in utils/block_timeline_helpers.py).
+Search is bounded by BEAM_WIDTH and the step limit; the returned packages are
+candidates, not a guaranteed optimum.
 Overlapping shift selectors apply the same shift once or reject contradictory
 values. All standards must describe the same source trips and bay assignments.
 """
@@ -212,6 +213,7 @@ CHAIN_COLUMNS = [
 # ==================================================================================================
 
 
+# Canonical version lives in utils/block_timeline_helpers.py -- keep this copy in sync.
 def timestamp_to_minutes(ts: object) -> Optional[int]:
     """Parse an HH:MM timeline timestamp, retaining hours beyond midnight."""
     if ts is None or pd.isna(ts):
@@ -248,6 +250,7 @@ def minutes_to_hhmm(minutes: Optional[float], missing: str = "") -> str:
     return f"{hours:02d}:{mins:02d}"
 
 
+# Canonical versions live in utils/block_timeline_helpers.py -- keep these copies in sync.
 def read_run_manifest(folder: str) -> Optional[dict[str, Any]]:
     """Read a completed run manifest; refuse failed or interrupted exporter runs."""
     path = Path(folder) / "timeline_manifest.json"
@@ -335,16 +338,17 @@ def read_timeline_files(folder: str, combined_name: str) -> DataFrame:
     return frame
 
 
-def find_cluster(stop_id: str, bus_stop_clusters: list[dict[str, Any]]) -> Optional[str]:
-    """Given a stop_id, return the named cluster (if any) or None if not found."""
-    for cluster_item in bus_stop_clusters:
+# Canonical version lives in utils/block_timeline_helpers.py -- keep this copy in sync.
+def find_cluster(stop_id: str, clusters: list[dict[str, Any]]) -> Optional[str]:
+    """Return cluster name containing the given stop ID, if any."""
+    for cluster_item in clusters:
         if stop_id in cluster_item["stops"]:
             return cluster_item["name"]
     return None
 
 
-# Canonical rendering logic: kept identical to block_status_timeline_exporter.py.
-def _status_for_same_trip(
+# Canonical versions live in utils/block_timeline_helpers.py -- keep these copies in sync.
+def status_for_same_trip(
     minute: int, stop_info: tuple, settings: dict[str, int]
 ) -> Optional[tuple]:
     """Return a visit's occupancy, including both boundaries of a scheduled hold."""
@@ -366,7 +370,7 @@ def _status_for_same_trip(
     return None
 
 
-def _gap_status(gap: int, same_place: bool, settings: dict[str, int]) -> tuple[str, str]:
+def gap_status(gap: int, same_place: bool, settings: dict[str, int]) -> tuple[str, str]:
     """Classify a between-trip gap using this scenario's occupancy assumptions."""
     if not same_place:
         return "DEADHEAD", ""
@@ -377,7 +381,7 @@ def _gap_status(gap: int, same_place: bool, settings: dict[str, int]) -> tuple[s
     return "LONG BREAK", "overflow"
 
 
-def _make_row(
+def make_timeline_row(
     minute: int,
     block_id: str,
     status: str,
@@ -419,7 +423,7 @@ def _make_row(
     }
 
 
-def _row_for_inactive(
+def row_for_inactive(
     minute: int,
     block_id: str,
     all_trips: list[dict[str, Any]],
@@ -436,7 +440,7 @@ def _row_for_inactive(
     arr = minutes_to_hhmm(prev["end"]) if prev else ""
     dep = minutes_to_hhmm(nxt["start"]) if nxt else ""
     if nxt and minute >= nxt["start"] - settings["PRE_DEPARTURE_MINUTES"]:
-        return _make_row(
+        return make_timeline_row(
             minute,
             block_id,
             "LOADING",
@@ -453,7 +457,7 @@ def _row_for_inactive(
             stop_role="depart",
         )
     if prev and minute <= prev["end"] + settings["POST_ARRIVAL_MINUTES"]:
-        return _make_row(
+        return make_timeline_row(
             minute,
             block_id,
             "ARRIVE",
@@ -473,9 +477,9 @@ def _row_for_inactive(
         a = find_cluster(prev["last_stop_id"], bus_stop_clusters)
         b = find_cluster(nxt["first_stop_id"], bus_stop_clusters)
         same_place = prev["last_stop_id"] == nxt["first_stop_id"] or (a is not None and a == b)
-        status, location = _gap_status(nxt["start"] - prev["end"], same_place, settings)
+        status, location = gap_status(nxt["start"] - prev["end"], same_place, settings)
         if status != "DEADHEAD":
-            return _make_row(
+            return make_timeline_row(
                 minute,
                 block_id,
                 status,
@@ -491,11 +495,15 @@ def _row_for_inactive(
                 next_trip_id=next_id,
                 stop_role="arrive",
             )
-        return _make_row(minute, block_id, status, prev_trip_id=prev_id, next_trip_id=next_id)
-    return _make_row(minute, block_id, "INACTIVE", prev_trip_id=prev_id, next_trip_id=next_id)
+        return make_timeline_row(
+            minute, block_id, status, prev_trip_id=prev_id, next_trip_id=next_id
+        )
+    return make_timeline_row(
+        minute, block_id, "INACTIVE", prev_trip_id=prev_id, next_trip_id=next_id
+    )
 
 
-def _build_schedule_rows(
+def build_schedule_rows(
     trips_summary: list[dict[str, Any]],
     timeline: range,
     block_id: str,
@@ -536,7 +544,7 @@ def _build_schedule_rows(
                 finish = min(finish, sequence[i + 1][0] - 1)
             finish = min(finish, trip["end"], timeline.stop - 1)
             for minute in range(max(arr, timeline.start), finish + 1):
-                status = _status_for_same_trip(minute, stop, settings)
+                status = status_for_same_trip(minute, stop, settings)
                 if status is not None:
                     role = "depart" if stop[5] else "arrive" if stop[6] else "through"
                     visits[trip["trip_id"], minute] = (*status, role)
@@ -559,7 +567,7 @@ def _build_schedule_rows(
             )
             state, sid, name, arr, dep, tid, seq, point, role = status
             rows.append(
-                _make_row(
+                make_timeline_row(
                     minute,
                     block_id,
                     state,
@@ -579,12 +587,12 @@ def _build_schedule_rows(
             if not occupancy_only:
                 trip = min(active[minute], key=lambda value: (value["start"], value["trip_id"]))
                 rows.append(
-                    _make_row(
+                    make_timeline_row(
                         minute, block_id, "TRAVELING BETWEEN STOPS", trip, trip_id=trip["trip_id"]
                     )
                 )
         else:
-            row = _row_for_inactive(minute, block_id, trips_summary, bus_stop_clusters, settings)
+            row = row_for_inactive(minute, block_id, trips_summary, bus_stop_clusters, settings)
             if not occupancy_only or row["Status"] not in {"INACTIVE", "DEADHEAD"}:
                 rows.append(row)
     return rows
@@ -1109,7 +1117,7 @@ class Standard:
             )
             if min(trip["start"] for trip in trips) < 0 or end >= BIG:
                 raise ValueError("Shifted schedule falls outside the supported service-day range.")
-            rows = _build_schedule_rows(
+            rows = build_schedule_rows(
                 sorted(trips, key=lambda trip: (trip["start"], trip["trip_id"])),
                 range(end),
                 block,
@@ -1538,7 +1546,8 @@ def run_sweep() -> str:
         )
         if schedule_identity is not None and identity != schedule_identity:
             raise ValueError(
-                "TIMELINES must use the same trips, times, stops and clusters; only occupancy assumptions may differ."
+                "TIMELINES must use the same trips, times, stops and clusters; "
+                "only occupancy assumptions may differ."
             )
         schedule_identity = identity
         t = build_trips(df)
@@ -1707,7 +1716,8 @@ def write_run_log(output_file: Path) -> bool:
     """Write the ``_runlog.txt`` sidecar for *output_file* (same folder, same stem).
 
     The log captures this script's CONFIGURATION block verbatim, between the
-    ``# === BEGIN CONFIG ===`` / ``# === END CONFIG ===`` markers, and appends the effective runtime values, including notebook edits.
+    ``# === BEGIN CONFIG ===`` / ``# === END CONFIG ===`` markers, and appends
+    the effective runtime values, including notebook edits.
 
     Returns:
         ``True`` if the log was written successfully, ``False`` otherwise.
@@ -1786,9 +1796,9 @@ def main() -> int:
     """Run the discover pass or the sweep, depending on ``DISCOVER_ONLY``.
 
     Returns:
-        Process exit code: 0 on success, 1 if the required run log could not
-        be written, 2 if required CONFIGURATION values are still placeholders
-        or a Step 1 folder does not exist.
+        Process exit code: 0 on success, 1 if the input or configuration is
+        invalid or the required run log could not be written, 2 if required
+        CONFIGURATION values are still placeholders or a Step 1 folder does not exist.
     """
     logging.basicConfig(
         level=LOG_LEVEL,

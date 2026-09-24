@@ -224,6 +224,7 @@ transit_planning_with_python/
 │   ├── test_bay_usage_analyzer.py
 │   ├── test_bikeshare_ridership_trends.py
 │   ├── test_block_status_timeline_exporter.py
+│   ├── test_block_timeline_helpers.py
 │   ├── test_bus_block_exporter.py
 │   ├── test_cabi_coverage_by_route_gpd.py
 │   ├── test_cacensus_da_join_gpd.py
@@ -304,6 +305,7 @@ transit_planning_with_python/
 │   ├── test_uscensus_tiger_join_gpd.py
 │   └── test_validate_gtfs_files_exist.py
 ├── utils/
+│   ├── block_timeline_helpers.py
 │   ├── calendar_helpers.py
 │   ├── cli_helpers.py
 │   ├── distance_helpers.py

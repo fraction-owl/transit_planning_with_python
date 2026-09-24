@@ -11,9 +11,12 @@ anywhere in the cluster.
 Inputs
 ------
 - A GTFS folder (or ``.zip``) containing trips.txt, stop_times.txt,
-  routes.txt, stops.txt, calendar.txt and calendar_dates.txt. The service day
-  to analyze is selected via ``CALENDAR_SERVICE_IDS`` or ``SERVICE_DATE``;
-  optional route and stop filters narrow the run.
+  routes.txt and stops.txt, plus calendar.txt / calendar_dates.txt when the
+  service day is selected by ``SERVICE_DATE``. The service day to analyze is
+  selected via ``CALENDAR_SERVICE_IDS`` or ``SERVICE_DATE``; optional route and
+  stop filters narrow the run. Frequency-based trips (frequencies.txt) are not
+  modeled: the export stops if any are in the selected service, routes and
+  stops, and ignores the rest.
 
 Occupancy assumptions
 ---------------------
@@ -168,6 +171,10 @@ LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
 
 # === END CONFIG ===
 
+# GTFS tables read by the export; the optional ones are loaded only when the feed has them.
+REQUIRED_GTFS_FILES: tuple[str, ...] = ("trips.txt", "stop_times.txt", "stops.txt", "routes.txt")
+OPTIONAL_GTFS_FILES: tuple[str, ...] = ("calendar.txt", "calendar_dates.txt", "frequencies.txt")
+
 # ==================================================================================================
 # FUNCTIONS
 # ==================================================================================================
@@ -214,7 +221,7 @@ def validate_configuration() -> None:
     for name in filenames:
         if Path(name).name != name or "\\" in name:
             raise ValueError("Output filename settings must be basenames inside the run folder.")
-    stops = [str(stop) for info in CLUSTER_DEFINITIONS.values() for stop in info["stops"]]
+    stops = [str(stop) for cluster in BUS_STOP_CLUSTERS_STEP1 for stop in cluster["stops"]]
     if len(stops) != len(set(stops)):
         raise ValueError("A stop may belong to only one cluster.")
 
@@ -270,8 +277,62 @@ def validate_folders(input_path: str, output_path: str) -> None:
     if not os.path.isdir(input_path) and not (
         os.path.isfile(input_path) and zipfile.is_zipfile(input_path)
     ):
-        raise ValueError(f"Input must be a GTFS directory or ZIP archive: {input_path}")
+        raise NotADirectoryError(f"Input must be a GTFS directory or ZIP archive: {input_path}")
     os.makedirs(output_path, exist_ok=True)
+
+
+def available_gtfs_files(gtfs_path: str, names: Sequence[str]) -> tuple[str, ...]:
+    """Return the *names* present, and not empty, in a GTFS folder or ZIP archive.
+
+    ZIP members are matched by base name, as :func:`load_gtfs_data` matches
+    them, so a feed nested one folder deep inside the archive is found too.
+    Zero-byte files are skipped with a warning because the loader rejects them.
+    """
+    sizes: dict[str, int] = {}
+    if os.path.isdir(gtfs_path):
+        for name in names:
+            path = os.path.join(gtfs_path, name)
+            if os.path.isfile(path):
+                sizes[name] = os.path.getsize(path)
+    else:
+        with zipfile.ZipFile(gtfs_path) as archive:
+            for info in archive.infolist():
+                name = os.path.basename(info.filename)
+                if name in names:
+                    sizes[name] = max(sizes.get(name, 0), info.file_size)
+    for name in names:
+        if sizes.get(name) == 0:
+            logging.warning("Skipping empty optional file %s.", name)
+    return tuple(name for name in names if sizes.get(name, 0) > 0)
+
+
+def reject_selected_frequency_trips(
+    frequencies: Optional[pd.DataFrame], merged_df: pd.DataFrame
+) -> None:
+    """Stop on frequency-based trips in the analyzed selection; ignore the rest.
+
+    A frequencies.txt trip is a template repeated at a headway, and its block
+    does not say which vehicle runs each repetition, so it cannot be rendered
+    as one vehicle's schedule. Trips outside the selected service, routes and
+    stops do not reach the export and are only counted in the log.
+
+    Raises:
+        ValueError: If any trip in *merged_df* appears in *frequencies*.
+    """
+    if frequencies is None or frequencies.empty or "trip_id" not in frequencies:
+        return
+    frequency_trips = set(frequencies["trip_id"].dropna().astype(str))
+    selected = sorted(frequency_trips & set(merged_df["trip_id"].astype(str)))
+    if selected:
+        listed = ", ".join(selected[:5]) + (", ..." if len(selected) > 5 else "")
+        raise ValueError(
+            f"{len(selected)} selected trip(s) are frequency-based ({listed}). Expand them "
+            "into scheduled trips, or exclude them with the service, route or stop filters."
+        )
+    logging.info(
+        "Ignoring %d frequency-based trip(s) outside the selected service, routes and stops.",
+        len(frequency_trips),
+    )
 
 
 # --------------------------------------------------------------------------------------------------
@@ -308,7 +369,7 @@ def parse_time_to_minutes(time_value: Optional[str]) -> Optional[int]:
         return None
     if hours < 0 or not 0 <= minutes < 60 or not 0 <= seconds < 60:
         return None
-    return hours * 60 + minutes + (seconds + 30) // 60
+    return hours * 60 + minutes + round(seconds / 60)
 
 
 def minutes_to_hhmm(minutes: Optional[float], missing: str = "") -> str:
@@ -343,20 +404,24 @@ def mark_first_and_last_stops(df_in: pd.DataFrame) -> pd.DataFrame:
     return df_out
 
 
-def find_cluster(stop_id: str, bus_stop_clusters: list[dict[str, Any]]) -> Optional[str]:
-    """Given a stop_id, return the named cluster (if any) or None if not found."""
-    for cluster_item in bus_stop_clusters:
+# Canonical version lives in utils/block_timeline_helpers.py -- keep this copy in sync.
+def find_cluster(stop_id: str, clusters: list[dict[str, Any]]) -> Optional[str]:
+    """Return cluster name containing the given stop ID, if any."""
+    for cluster_item in clusters:
         if stop_id in cluster_item["stops"]:
             return cluster_item["name"]
     return None
 
 
 # --------------------------------------------------------------------------------------------------
-# BRIDGING LOGIC REFACTOR
+# BLOCK RENDERER
 # --------------------------------------------------------------------------------------------------
 
+# status_for_same_trip, gap_status, make_timeline_row, row_for_inactive and build_schedule_rows:
+# canonical versions live in utils/block_timeline_helpers.py -- keep these copies in sync.
 
-def _status_for_same_trip(
+
+def status_for_same_trip(
     minute: int, stop_info: tuple, settings: dict[str, int]
 ) -> Optional[tuple]:
     """Return a visit's occupancy, including both boundaries of a scheduled hold."""
@@ -378,7 +443,7 @@ def _status_for_same_trip(
     return None
 
 
-def _gap_status(gap: int, same_place: bool, settings: dict[str, int]) -> tuple[str, str]:
+def gap_status(gap: int, same_place: bool, settings: dict[str, int]) -> tuple[str, str]:
     """Classify a between-trip gap using this scenario's occupancy assumptions."""
     if not same_place:
         return "DEADHEAD", ""
@@ -467,7 +532,7 @@ def _create_trips_summary(
     return trips_summary
 
 
-def _make_row(
+def make_timeline_row(
     minute: int,
     block_id: str,
     status: str,
@@ -509,7 +574,7 @@ def _make_row(
     }
 
 
-def _row_for_inactive(
+def row_for_inactive(
     minute: int,
     block_id: str,
     all_trips: list[dict[str, Any]],
@@ -526,7 +591,7 @@ def _row_for_inactive(
     arr = minutes_to_hhmm(prev["end"]) if prev else ""
     dep = minutes_to_hhmm(nxt["start"]) if nxt else ""
     if nxt and minute >= nxt["start"] - settings["PRE_DEPARTURE_MINUTES"]:
-        return _make_row(
+        return make_timeline_row(
             minute,
             block_id,
             "LOADING",
@@ -543,7 +608,7 @@ def _row_for_inactive(
             stop_role="depart",
         )
     if prev and minute <= prev["end"] + settings["POST_ARRIVAL_MINUTES"]:
-        return _make_row(
+        return make_timeline_row(
             minute,
             block_id,
             "ARRIVE",
@@ -563,9 +628,9 @@ def _row_for_inactive(
         a = find_cluster(prev["last_stop_id"], bus_stop_clusters)
         b = find_cluster(nxt["first_stop_id"], bus_stop_clusters)
         same_place = prev["last_stop_id"] == nxt["first_stop_id"] or (a is not None and a == b)
-        status, location = _gap_status(nxt["start"] - prev["end"], same_place, settings)
+        status, location = gap_status(nxt["start"] - prev["end"], same_place, settings)
         if status != "DEADHEAD":
-            return _make_row(
+            return make_timeline_row(
                 minute,
                 block_id,
                 status,
@@ -581,11 +646,15 @@ def _row_for_inactive(
                 next_trip_id=next_id,
                 stop_role="arrive",
             )
-        return _make_row(minute, block_id, status, prev_trip_id=prev_id, next_trip_id=next_id)
-    return _make_row(minute, block_id, "INACTIVE", prev_trip_id=prev_id, next_trip_id=next_id)
+        return make_timeline_row(
+            minute, block_id, status, prev_trip_id=prev_id, next_trip_id=next_id
+        )
+    return make_timeline_row(
+        minute, block_id, "INACTIVE", prev_trip_id=prev_id, next_trip_id=next_id
+    )
 
 
-def _build_schedule_rows(
+def build_schedule_rows(
     trips_summary: list[dict[str, Any]],
     timeline: range,
     block_id: str,
@@ -626,7 +695,7 @@ def _build_schedule_rows(
                 finish = min(finish, sequence[i + 1][0] - 1)
             finish = min(finish, trip["end"], timeline.stop - 1)
             for minute in range(max(arr, timeline.start), finish + 1):
-                status = _status_for_same_trip(minute, stop, settings)
+                status = status_for_same_trip(minute, stop, settings)
                 if status is not None:
                     role = "depart" if stop[5] else "arrive" if stop[6] else "through"
                     visits[trip["trip_id"], minute] = (*status, role)
@@ -649,7 +718,7 @@ def _build_schedule_rows(
             )
             state, sid, name, arr, dep, tid, seq, point, role = status
             rows.append(
-                _make_row(
+                make_timeline_row(
                     minute,
                     block_id,
                     state,
@@ -669,15 +738,125 @@ def _build_schedule_rows(
             if not occupancy_only:
                 trip = min(active[minute], key=lambda value: (value["start"], value["trip_id"]))
                 rows.append(
-                    _make_row(
+                    make_timeline_row(
                         minute, block_id, "TRAVELING BETWEEN STOPS", trip, trip_id=trip["trip_id"]
                     )
                 )
         else:
-            row = _row_for_inactive(minute, block_id, trips_summary, bus_stop_clusters, settings)
+            row = row_for_inactive(minute, block_id, trips_summary, bus_stop_clusters, settings)
             if not occupancy_only or row["Status"] not in {"INACTIVE", "DEADHEAD"}:
                 rows.append(row)
     return rows
+
+
+def get_status_for_minute(
+    minute: int, stop_times_sequence: list[tuple]
+) -> tuple[
+    str,
+    Optional[str],
+    Optional[str],
+    Optional[str],
+    Optional[str],
+    Optional[str],
+    Optional[int],
+    int,
+]:
+    """Determine one trip's status at a specific minute, using the block renderer's rules.
+
+    Kept for existing callers: it renders the single trip with
+    :func:`build_schedule_rows` and the current occupancy settings, so holds,
+    through-stop dwell and loading follow the same rules as the export.
+
+    Returns tuple:
+       (status, stop_id, stop_name, arrival_str, departure_str,
+        trip_id_for_status, stop_sequence, timepoint_value)
+    ``"EMPTY"`` when the sequence is empty or the minute falls outside the trip.
+    """
+    if not stop_times_sequence:
+        return ("EMPTY", None, None, None, None, None, None, 0)
+    start, end = stop_times_sequence[0][0], stop_times_sequence[-1][1]
+    if not start <= minute <= end:
+        return ("EMPTY", None, None, None, None, None, None, 0)
+    trip = {
+        "trip_id": stop_times_sequence[0][4],
+        "start": start,
+        "end": end,
+        "stop_times_sequence": stop_times_sequence,
+        "route_id": "",
+        "route_short_name": "",
+        "trip_headsign": "",
+        "direction_id": "",
+    }
+    row = build_schedule_rows([trip], range(minute, minute + 1), "", [], occupancy_settings())[0]
+    value = {column: None if cell == "" else cell for column, cell in row.items()}
+    return (
+        row["Status"],
+        value["Stop ID"],
+        value["Stop Name"],
+        value["Arrival Time"],
+        value["Departure Time"],
+        value["Trip ID"],
+        value["Stop Sequence"],
+        row["Timepoint"],
+    )
+
+
+def fill_stop_ids_for_dwell_layover_loading(
+    df_in: pd.DataFrame,
+) -> pd.DataFrame:  # Added return type annotation
+    """Fills in missing stop information for certain vehicle statuses.
+
+    For rows with a status of 'DWELL', 'LAYOVER', or 'LOADING', where the
+    'Stop ID' is typically empty, this function populates the 'Stop ID',
+    'Stop Name', 'Stop Sequence', 'Arrival Time', 'Departure Time', and
+    'Trip ID' fields. The data used for filling is based on the last known
+    stop information from the same vehicle block, enhancing the readability
+    of the final output.
+
+    The block renderer now writes the stop details on these rows itself, so
+    the export no longer calls this; it is kept for existing callers.
+
+    Args:
+        df_in (pd.DataFrame): The input DataFrame containing vehicle status and
+            stop information.
+
+    Returns:
+        pd.DataFrame: A new DataFrame with the missing stop information filled in.
+    """
+    df_out = df_in.copy()
+    last_stop_id = None
+    last_stop_name = None
+    last_stop_seq = None
+    last_arr = None
+    last_dep = None
+    last_trip_id = None
+
+    for idx in df_out.index:
+        status = df_out.loc[idx, "Status"]
+        stop_id = df_out.loc[idx, "Stop ID"]
+        if stop_id:
+            # Update "last known" stop info
+            last_stop_id = stop_id
+            last_stop_name = df_out.loc[idx, "Stop Name"]
+            last_stop_seq = df_out.loc[idx, "Stop Sequence"]
+            last_arr = df_out.loc[idx, "Arrival Time"]
+            last_dep = df_out.loc[idx, "Departure Time"]
+            last_trip_id = df_out.loc[idx, "Trip ID"]
+        else:
+            if status in ["DWELL", "LAYOVER", "LOADING"]:
+                if last_stop_id is not None:
+                    df_out.loc[idx, "Stop ID"] = last_stop_id
+                if last_stop_name is not None:
+                    df_out.loc[idx, "Stop Name"] = last_stop_name
+                if last_stop_seq is not None:
+                    df_out.loc[idx, "Stop Sequence"] = last_stop_seq
+                if last_arr is not None:
+                    df_out.loc[idx, "Arrival Time"] = last_arr
+                if last_dep is not None:
+                    df_out.loc[idx, "Departure Time"] = last_dep
+                if last_trip_id is not None:
+                    df_out.loc[idx, "Trip ID"] = last_trip_id
+    return df_out
 
 
 def process_block(
@@ -687,8 +866,10 @@ def process_block(
     bus_stop_clusters: list[dict[str, Any]],
 ) -> pd.DataFrame:
     """Generate a minute-by-minute schedule DataFrame for a single block."""
+    if "block_id" not in block_subset:
+        block_subset = block_subset.assign(block_id=block_id)
     trips_summary = _create_trips_summary(block_subset)
-    rows = _build_schedule_rows(
+    rows = build_schedule_rows(
         trips_summary, timeline, block_id, bus_stop_clusters, occupancy_settings()
     )
     df = pd.DataFrame(rows)
@@ -885,11 +1066,11 @@ def run_step1_gtfs_to_blocks() -> None:
     write_json_atomic(manifest_path, manifest)
     try:
         validate_configuration()
-        data = load_gtfs_data(GTFS_FOLDER_PATH, dtype=str)
-        if "frequencies" in data and not data["frequencies"].empty:
-            raise ValueError(
-                "Frequency-based trips must be expanded into scheduled trips before analysis."
-            )
+        data = load_gtfs_data(
+            GTFS_FOLDER_PATH,
+            files=REQUIRED_GTFS_FILES + available_gtfs_files(GTFS_FOLDER_PATH, OPTIONAL_GTFS_FILES),
+            dtype=str,
+        )
         trips_df = data["trips"]
         if "route_short_name" not in trips_df:
             trips_df = trips_df.merge(
@@ -906,8 +1087,9 @@ def run_step1_gtfs_to_blocks() -> None:
                 data.get("calendar"), data.get("calendar_dates"), SERVICE_DATE
             )
             if not service_ids:
-                raise ValueError(f"No service is active on {SERVICE_DATE}.")
+                raise ValueError(f"No service_id is active on {SERVICE_DATE} in this feed.")
         merged = _merge_and_filter_data(trips_df, data["stop_times"], data["stops"], service_ids)
+        reject_selected_frequency_trips(data.get("frequencies"), merged)
         summaries = []
         for block, group in merged.groupby("block_id", sort=False):
             check_for_overlapping_trips(group, str(block))
@@ -921,7 +1103,8 @@ def run_step1_gtfs_to_blocks() -> None:
             DEFAULT_HOURS * 60, max(trip["end"] for trip in summaries) + POST_ARRIVAL_MINUTES + 1
         )
         clusters = [
-            {"name": name, "stops": info["stops"]} for name, info in CLUSTER_DEFINITIONS.items()
+            {"name": str(cluster["name"]), "stops": [str(stop) for stop in cluster["stops"]]}
+            for cluster in BUS_STOP_CLUSTERS_STEP1
         ]
         snapshot = {
             "schema_version": 1,
@@ -940,7 +1123,7 @@ def run_step1_gtfs_to_blocks() -> None:
         for block, group in merged.groupby("block_id", sort=False):
             block_trips = [trip for trip in summaries if trip["block"] == str(block)]
             frame = pd.DataFrame(
-                _build_schedule_rows(block_trips, range(end), str(block), clusters, settings)
+                build_schedule_rows(block_trips, range(end), str(block), clusters, settings)
             )
             routes = "_".join(sorted(group["route_id"].astype(str).unique()))
             filename = "block_" + re.sub(r'[<>:"/\\|?*]', "_", f"{block}_{routes}") + ".xlsx"
@@ -1079,7 +1262,8 @@ def write_run_log(output_dir: Path) -> bool:
     The run writes many files (one workbook per block), so a single log named
     after the script sits alongside them. It captures this script's
     CONFIGURATION block verbatim, between the ``# === BEGIN CONFIG ===`` /
-    ``# === END CONFIG ===`` markers, and appends the effective runtime values, including notebook edits.
+    ``# === END CONFIG ===`` markers, and appends the effective runtime
+    values, including notebook edits.
 
     Returns:
         ``True`` if the log was written successfully, ``False`` otherwise.
@@ -1290,9 +1474,8 @@ def load_gtfs_data(
             producers and most open-data portals distribute feeds in. Zip
             members may sit at the archive root or nested one level inside
             a single wrapper folder; both layouts are handled.
-        files: Explicit file names, all required when supplied. With ``None``,
-            the standard 13 files are attempted, but only trips, stop_times,
-            stops and routes are required; missing optional files are skipped.
+        files: Explicit sequence of file names to load. If ``None``,
+            the standard 13 GTFS text files are attempted.
         dtype: Value forwarded to :pyfunc:`pandas.read_csv(dtype=…)` to
             control column dtypes. Supply a mapping for per-column dtypes.
         logger: Logger for progress messages. Defaults to this module's
@@ -1319,7 +1502,6 @@ def load_gtfs_data(
     if not os.path.exists(gtfs_path):
         raise OSError(f"The path '{gtfs_path}' does not exist.")
 
-    explicit_files = files is not None
     if files is None:
         files = (
             "agency.txt",
@@ -1373,15 +1555,8 @@ def load_gtfs_data(
                 f"Ambiguous GTFS files in '{gtfs_path}' (found in multiple "
                 f"locations): {', '.join(ambiguous)}"
             )
-        required = (
-            set(files)
-            if explicit_files
-            else {"trips.txt", "stop_times.txt", "stops.txt", "routes.txt"}
-        )
-        required_missing = sorted(required.intersection(missing))
-        if required_missing:
-            raise OSError(f"Missing required GTFS files: {', '.join(required_missing)}")
-        files = [name for name in files if name not in missing]
+        if missing:
+            raise OSError(f"Missing GTFS files in '{gtfs_path}': {', '.join(missing)}")
 
         data: dict[str, pd.DataFrame] = {}
         for file_name in files:
@@ -1389,23 +1564,15 @@ def load_gtfs_data(
             try:
                 if archive is None:
                     df = pd.read_csv(
-                        os.path.join(gtfs_path, file_name),
-                        dtype=dtype,
-                        low_memory=False,
-                        keep_default_na=False,
+                        os.path.join(gtfs_path, file_name), dtype=dtype, low_memory=False
                     )
                 else:
                     with archive.open(resolved[file_name]) as handle:
-                        df = pd.read_csv(
-                            handle, dtype=dtype, low_memory=False, keep_default_na=False
-                        )
+                        df = pd.read_csv(handle, dtype=dtype, low_memory=False)
                 data[key] = df
                 log.info("Loaded %s (%d records).", file_name, len(df))
 
             except pd.errors.EmptyDataError as exc:
-                if file_name not in required:
-                    log.warning("Skipping empty optional file %s.", file_name)
-                    continue
                 raise ValueError(f"File '{file_name}' in '{gtfs_path}' is empty.") from exc
 
             except pd.errors.ParserError as exc:
@@ -1426,9 +1593,9 @@ def main() -> int:
     """Master entry point.
 
     Returns:
-        Process exit code: 0 on success, 1 if the required run log could not
-        be written, 2 if required CONFIGURATION values are still placeholders
-        or ``GTFS_FOLDER_PATH`` does not exist.
+        Process exit code: 0 on success, 1 if the input or configuration is
+        invalid or the required run log could not be written, 2 if required
+        CONFIGURATION values are still placeholders or ``GTFS_FOLDER_PATH`` does not exist.
     """
     logging.basicConfig(
         level=LOG_LEVEL,
