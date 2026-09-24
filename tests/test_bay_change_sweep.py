@@ -584,6 +584,58 @@ def test_legacy_trips_ignore_blank_arrival_times(tmp_path: Path, cluster: None) 
     assert chains["schedule_gap_min"].tolist() == [10, 20]
 
 
+def _legacy_trips(folder: Path, edit: dict[tuple[str, str], dict[str, str]]) -> Any:
+    """build_trips on the hand-built legacy timeline with rows of (trip, status) edited."""
+    rows = [
+        {**row, **edit.get((row["Trip ID"], row["Status"]), edit.get((row["Trip ID"], "*"), {}))}
+        for row in _timeline().to_dict("records")
+    ]
+    folder.mkdir()
+    pd.DataFrame(rows).to_csv(folder / "all_blocks_timeline.csv", index=False)
+    return target.build_trips(target.load_timeline(str(folder)))
+
+
+@pytest.mark.parametrize(
+    ("edit", "message"),
+    [
+        ({("T4", "*"): {"Arrival Time": ""}}, "Trip 'T4' in block 'B2' has no readable arrival"),
+        ({("T2", "DEPART"): {"Arrival Time": ""}}, "Trip 'T2' in block 'B1' has no readable first"),
+        (
+            {("T2", "DEPART"): {"Departure Time": ""}},
+            "Trip 'T2' in block 'B1' has no readable first",
+        ),
+        ({("T1", "ARRIVE"): {"Arrival Time": ""}}, "Trip 'T1' in block 'B1' has no readable final"),
+        ({("T2", "DEPART"): {"Status": "LOADING"}}, "Trip 'T2' in block 'B1' has no DEPART row"),
+    ],
+)
+def test_legacy_trips_name_the_trip_and_block_with_unreadable_times(
+    tmp_path: Path, cluster: None, edit: dict[tuple[str, str], dict[str, str]], message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        _legacy_trips(tmp_path / "legacy", edit)
+
+
+def test_legacy_trips_read_the_scheduled_departure_after_a_hold(
+    tmp_path: Path, cluster: None
+) -> None:
+    # T2's DEPART row: it reached bay A at 08:02 and departs at 08:10.
+    trips = _legacy_trips(tmp_path / "legacy", {("T2", "DEPART"): {"Arrival Time": "08:02"}})
+    t2 = trips.set_index("trip_id").loc["T2"]
+    assert (t2["start"], t2["departure"]) == (482, 490)
+    b1 = target.build_block_chains(trips).set_index("block").loc["B1"]
+    assert (b1["departs"], b1["schedule_gap_min"], b1["occupancy_gap_min"]) == ("08:10", 10, 2)
+
+
+def test_run_discover_requires_timelines(
+    tmp_path: Path, cluster: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(target, "TIMELINES", {})
+    monkeypatch.setattr(target, "OUTPUT_FOLDER", str(tmp_path / "out"))
+    with pytest.raises(ValueError, match="TIMELINES is empty; list at least one Step 1"):
+        target.run_discover()
+    assert not (tmp_path / "out").exists()
+
+
 def test_main_returns_1_when_required_run_log_fails(
     step1_folder: Path, tmp_path: Path, cluster: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:

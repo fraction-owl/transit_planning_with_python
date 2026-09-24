@@ -777,12 +777,25 @@ def snapshot_route_names(snapshot: dict[str, Any]) -> RouteNames:
 
 
 def build_trips(df: DataFrame) -> DataFrame:
-    """One row per trip: route, headsign, direction, block, scheduled times and end stops.
+    """Build one row per trip with scheduled times, endpoints, and block details.
 
     Uses the run's schedule snapshot when there is one. A legacy timeline has
-    no snapshot: departure is then the DEPART row's minute and start its
+    no snapshot: departure is then the first stop's scheduled departure (the
+    DEPART row's Departure Time, after any scheduled hold) and start its
     Arrival Time; end and arrival are the last stop's scheduled arrival (the
-    largest Arrival Time on the trip).
+    largest Arrival Time on the trip's ARRIVE rows). Missing times on
+    individual timeline rows are excluded.
+
+    Args:
+        df: Step 1 timeline with Minute and Bay columns added by load_timeline.
+
+    Returns:
+        Trip records sorted by block and start time.
+
+    Raises:
+        ValueError: If a legacy trip has no readable arrival times, no DEPART
+            row, no readable first-stop arrival or departure time, or no
+            readable final arrival.
     """
     if df.attrs.get("schedule_snapshot") is not None:
         return trips_from_snapshot(df.attrs["schedule_snapshot"])
@@ -792,17 +805,34 @@ def build_trips(df: DataFrame) -> DataFrame:
         (df["Trip ID"] != "") & df["Status"].isin(BAY_STATUSES | {"TRAVELING BETWEEN STOPS"})
     ]
     for tid, g in on_trip.groupby("Trip ID", sort=False):
+        block = g["Block"].iloc[0]
         dep = g[g["Status"] == "DEPART"]
         arr_minutes = g["Arrival Time"].map(timestamp_to_minutes)
-        arr_times = arr_minutes.dropna().tolist()
-        if not arr_times or dep.empty:
-            raise ValueError(f"Cannot recover scheduled endpoints for trip {tid}. Rerun Step 1.")
-        start = int(dep["Arrival Time"].map(timestamp_to_minutes).dropna().iloc[0])
-        arrivals = g[g["Status"].eq("ARRIVE")]
+        # Pandas can convert None to NaN; dropna handles both.
+        arr_times = arr_minutes.dropna().astype(int).tolist()
+        if not arr_times:
+            raise ValueError(
+                f"Trip {tid!r} in block {block!r} has no readable arrival times. "
+                "Cannot determine its end time or build reliable block chains."
+            )
+        if dep.empty:
+            raise ValueError(f"Trip {tid!r} in block {block!r} has no DEPART row. Rerun Step 1.")
+        first = dep.iloc[0]
+        # Read the scheduled departure rather than the timeline row's minute; the first
+        # stop's arrival is kept separately as the trip's occupancy start.
+        departure = timestamp_to_minutes(first["Departure Time"])
+        start = timestamp_to_minutes(first["Arrival Time"])
+        if departure is None or start is None:
+            raise ValueError(
+                f"Trip {tid!r} in block {block!r} has no readable first-stop "
+                "arrival and departure times."
+            )
+        arrivals = arr_minutes[g["Status"].eq("ARRIVE")].dropna()
         if arrivals.empty:
-            raise ValueError(f"Cannot recover the scheduled arrival for trip {tid}. Rerun Step 1.")
-        end = int(arrivals["Arrival Time"].map(timestamp_to_minutes).dropna().max())
-        first = dep.iloc[0] if not dep.empty else g.sort_values("Minute").iloc[0]
+            raise ValueError(
+                f"Trip {tid!r} in block {block!r} has no readable final arrival. Rerun Step 1."
+            )
+        end = int(arrivals.max())
         last_rows = g[arr_minutes == end]
         if last_rows.empty:
             last_rows = g
@@ -825,7 +855,7 @@ def build_trips(df: DataFrame) -> DataFrame:
                 "last_stop": last["Stop ID"],
                 "last_bay": CLUSTER_STOPS.get(last["Stop ID"], ""),
                 "through_bays": ",".join(sorted(set(through))),
-                "departure": int(dep["Minute"].iloc[0]),
+                "departure": departure,
                 "arrival": int(end),
                 "through_visits": [
                     (r["Bay"], int(r["Minute"]))
@@ -1056,10 +1086,14 @@ def run_discover() -> str:
 
     Returns:
         Path of the workbook written.
+
+    Raises:
+        ValueError: If no input scenarios are configured or trip times are invalid.
     """
     validate_sweep_configuration()
     sheets: List[Tuple[str, DataFrame]] = []
     stub = ""
+    # Finish calculations first so a data error cannot be hidden by Excel cleanup.
     for tier, folder in TIMELINES.items():
         df = load_timeline(folder)
         trips = build_trips(df)
@@ -1783,8 +1817,10 @@ def _search_packages(
 
 def validate_sweep_configuration() -> None:
     """Validate search limits, physical bay capacities and integer candidate shifts."""
-    if not TIMELINES or not CLUSTER_STOPS:
-        raise ValueError("TIMELINES and CLUSTER_STOPS must be populated.")
+    if not TIMELINES:
+        raise ValueError("TIMELINES is empty; list at least one Step 1 scenario folder.")
+    if not CLUSTER_STOPS:
+        raise ValueError("CLUSTER_STOPS is empty; map the cluster's stop_ids to bay labels.")
     if REQUIRE_NO_WORSE_ON not in {"all", "any"}:
         raise ValueError("REQUIRE_NO_WORSE_ON must be 'all' or 'any'.")
     values = {
