@@ -548,6 +548,7 @@ def test_run_sweep_finds_bay_move(
     assert finalists.loc[0, "change"] == "20 arrive to Bay B"
     assert finalists.loc[0, "Direct before"] == 2  # scored against the untouched baseline
     assert (tmp_path / "out" / "test_sweep_runlog.txt").is_file()
+    assert not (tmp_path / "out" / "test_bay_reports").exists()  # detailed reports are opt-in
 
 
 def test_run_sweep_refuses_legacy_timelines(
@@ -844,3 +845,146 @@ def test_sweep_discloses_interpolated_stop_times(
     monkeypatch.setattr(target, "OUTPUT_FOLDER", str(tmp_path / "out"))
     config = pd.read_excel(target.run_sweep(), sheet_name="Config used").set_index("setting")
     assert str(config.loc["Stop visits with interpolated times (Step 1)", "value"]) == "1"
+
+
+# ---------------------------------------------------------------------------
+# Detailed bay reports
+# ---------------------------------------------------------------------------
+
+
+def _bay_reports(
+    monkeypatch: pytest.MonkeyPatch, run: Path, out: Path, configurations: dict[str, dict[str, str]]
+) -> Path:
+    """Write the detailed reports for *configurations* on two standards; return their folder."""
+    monkeypatch.setattr(target, "TIMELINES", {"Direct": str(run), "Likely": str(run)})
+    monkeypatch.setattr(target, "OUTPUT_FOLDER", str(out))
+    monkeypatch.setattr(target, "SCENARIO_LABEL", "test")
+    monkeypatch.setattr(target, "BAY_REPORT_CONFIGURATIONS", configurations)
+    return Path(target.write_selected_bay_reports(target.load_sweep_standards()[0]))
+
+
+def test_bay_reports_rebuild_count_and_reconcile(
+    exported_run: Path, tmp_path: Path, cluster: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        target, "EXPECTED_REPORT_TOTALS", {"baseline": {"Direct": 2}, "move20": {"Direct": 0}}
+    )
+    folder = _bay_reports(
+        monkeypatch,
+        exported_run,
+        tmp_path / "out",
+        {"move20": {"20 arrive": "B"}, "pile_on_B": {"10 arrive": "B", "20 arrive": "B"}},
+    )
+    names = {path.name for path in folder.iterdir()}
+    assert {"Metro_Bay_Comparison.xlsx", "Metro_Bay_Comparison_runlog.txt"} <= names
+    for configuration in ("baseline", "move20", "pile_on_B"):
+        for standard in ("Direct", "Likely"):
+            stem = f"Metro_Conflicts_{configuration}_{standard}"
+            assert {f"{stem}.xlsx", f"{stem}_runlog.txt", f"{stem}_timeline.csv"} <= names
+
+    book = folder / "Metro_Conflicts_pile_on_B_Direct.xlsx"
+    # Both arrivals now share bay B: the 08:00-08:01 conflict moves from bay A to bay B.
+    summary = pd.read_excel(book, sheet_name="Summary").set_index("Space")
+    assert summary.loc["A", ["Current conflict minutes", "Proposed conflict minutes"]].tolist() == [
+        2,
+        0,
+    ]
+    assert summary.loc["B", ["Removed", "Retained", "Created"]].tolist() == [0, 0, 2]
+    assert summary.loc["All layover spaces", "Proposed conflict minutes"] == 0
+    changes = pd.read_excel(book, sheet_name="Changes vs Baseline", dtype={"Time": str})
+    assert list(zip(changes["Space"], changes["Time"], changes["Change"])) == [
+        ("A", "08:00", "Removed"),
+        ("A", "08:01", "Removed"),
+        ("B", "08:00", "Created"),
+        ("B", "08:01", "Created"),
+    ]
+    assignments = pd.read_excel(book, sheet_name="Assignments").set_index("Movement")
+    assert assignments.loc["20 arrive", ["Current bay(s)", "Proposed bay(s)"]].tolist() == [
+        "A",
+        "B",
+    ]
+    assert not assignments.loc["21 depart", "Changed"]
+    checks = pd.read_excel(folder / "Metro_Conflicts_move20_Direct.xlsx", sheet_name="Checks")
+    assert set(checks["Result"]) == {"PASS"}  # includes the expected historical total
+    totals = pd.read_excel(folder / "Metro_Bay_Comparison.xlsx", sheet_name="Comparison totals")
+    moved = totals[totals["Configuration"].eq("move20") & totals["Space type"].eq("Passenger bay")]
+    assert moved["Net reduction"].tolist() == [2, 2]  # Direct and Likely
+
+
+def test_bay_reports_reject_unknown_movements(
+    exported_run: Path, tmp_path: Path, cluster: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with pytest.raises(ValueError, match="unknown or incomplete route-end '99 arrive'"):
+        _bay_reports(monkeypatch, exported_run, tmp_path / "out", {"x": {"99 arrive": "B"}})
+
+
+def test_failed_report_check_publishes_nothing(
+    exported_run: Path, tmp_path: Path, cluster: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(target, "EXPECTED_REPORT_TOTALS", {"move20": {"Direct": 5}})
+    out = tmp_path / "out"
+    with pytest.raises(ValueError, match="expected 5 conflict bay-minutes, rebuilt 0"):
+        _bay_reports(monkeypatch, exported_run, out, {"move20": {"20 arrive": "B"}})
+    assert list(out.iterdir()) == []  # no report folder and no staging folder left behind
+
+
+def test_bay_reports_refuse_a_baseline_that_differs_from_step1(
+    exported_run: Path, tmp_path: Path, cluster: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(target, "TIMELINES", {"Direct": str(exported_run)})
+    monkeypatch.setattr(target, "OUTPUT_FOLDER", str(tmp_path / "out"))
+    standards = target.load_sweep_standards()[0]
+    timeline = standards["Direct"].timeline
+    # As an exporter with a different occupancy renderer would have written it.
+    timeline.loc[timeline["Status"].eq("LAYOVER").idxmax(), "Status"] = "DWELL"
+    with pytest.raises(ValueError, match="block B2, 08:02, Status: input 'DWELL', rebuilt"):
+        target.write_selected_bay_reports(standards)
+    assert list((tmp_path / "out").iterdir()) == []
+
+
+def test_bay_reports_write_formula_like_names_as_text(
+    tmp_path: Path, cluster: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run = _export(
+        tmp_path / "gtfs",
+        tmp_path / "run",
+        monkeypatch,
+        route_names={"10": ("=1+1", ""), "20": ("20", ""), "21": ("21", "")},
+    )
+    folder = _bay_reports(monkeypatch, run, tmp_path / "out", {})
+    sheet = openpyxl.load_workbook(folder / "Metro_Conflicts_baseline_Direct.xlsx")["AllStops"]
+    column = [cell.value for cell in sheet[1]].index("Route name")
+    cells = [row[column] for row in sheet.iter_rows(min_row=2) if row[column].value == "=1+1"]
+    assert cells and {cell.data_type for cell in cells} == {"s"}
+
+
+def test_main_writes_only_the_bay_reports(
+    exported_run: Path, tmp_path: Path, cluster: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(target, "TIMELINES", {"Direct": str(exported_run)})
+    monkeypatch.setattr(target, "OUTPUT_FOLDER", str(tmp_path / "out"))
+    monkeypatch.setattr(target, "SCENARIO_LABEL", "test")
+    monkeypatch.setattr(target, "BAY_REPORT_CONFIGURATIONS", {"move20": {"20 arrive": "B"}})
+    monkeypatch.setattr(target, "DISCOVER_ONLY", False)
+    monkeypatch.setattr(target, "REPORTS_ONLY", True)
+    assert target.main() == 0
+    assert (tmp_path / "out" / "test_bay_reports" / "Metro_Conflicts_move20_Direct.xlsx").is_file()
+    assert not (tmp_path / "out" / "test_sweep.xlsx").exists()
+
+
+def test_run_sweep_adds_bay_reports_when_asked(
+    exported_run: Path, tmp_path: Path, cluster: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(target, "TIMELINES", {"Direct": str(exported_run)})
+    monkeypatch.setattr(target, "OUTPUT_FOLDER", str(tmp_path / "out"))
+    monkeypatch.setattr(target, "SCENARIO_LABEL", "test")
+    monkeypatch.setattr(target, "BAY_CANDIDATES", [{"route_end": "20 arrive", "bays": ["B"]}])
+    monkeypatch.setattr(target, "BAY_REPORT_CONFIGURATIONS", {"move20": {"20 arrive": "B"}})
+    monkeypatch.setattr(target, "WRITE_BAY_REPORTS", True)
+    out = target.run_sweep()
+    assert Path(out).is_file()
+    summary = pd.read_excel(
+        tmp_path / "out" / "test_bay_reports" / "Metro_Conflicts_move20_Direct.xlsx",
+        sheet_name="Summary",
+    ).set_index("Space")
+    assert summary.loc["All passenger bays", "Proposed conflict minutes"] == 0

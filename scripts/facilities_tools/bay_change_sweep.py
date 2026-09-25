@@ -63,6 +63,15 @@ Outputs
   "Packages" and "Package finalists" (a beam search over singles and the
   best pairs, up to ``MAX_CHANGES_PER_PACKAGE`` steps); "Rejected"
   (infeasible or non-improving changes and why); and "Config used".
+- With REPORTS_ONLY (or WRITE_BAY_REPORTS after a sweep), selected bay-only
+  reports in ``<SCENARIO_LABEL>_bay_reports``: one ``<cluster>_Conflicts``
+  workbook per configuration and standard, and a comparison workbook.
+  Each report includes Summary, Assignments, Conflict Events, Overflow Events,
+  Conflict Minutes, Changes vs Baseline, AllStops and individual space sheets.
+  Complete rebuilt timelines are saved as CSVs. Reports include all cluster
+  presence, not only conflicting buses. Baseline is rebuilt and compared with
+  the input timeline before any reports are published. Times and blocks must
+  remain unchanged; each detailed count must equal the sweep scorer.
 - A ``_runlog.txt`` sidecar next to each workbook capturing the verbatim
   CONFIGURATION block.
 
@@ -73,6 +82,12 @@ Update the paths in the CONFIGURATION section, run once with
 into ``BAY_CANDIDATES`` / ``SHIFT_CANDIDATES``, set ``DISCOVER_ONLY = False``
 and run again, from a shell, ArcGIS Pro's Python window, or a Jupyter
 notebook.
+
+For detailed reports on bay assignments you have already chosen, list them in
+``BAY_REPORT_CONFIGURATIONS``, set ``DISCOVER_ONLY = False`` and
+``REPORTS_ONLY = True``, and run: no candidate search runs, and each
+configuration is compared with the baseline. Keep only the standards for which
+you have current Step 1 outputs.
 
 The three scripts remain standalone: the sweep contains an identical copy of
 the exporter's occupancy renderer (canonical in utils/block_timeline_helpers.py).
@@ -90,6 +105,7 @@ import json
 import logging
 import os
 import re
+import tempfile
 from collections import Counter, OrderedDict, defaultdict
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -100,6 +116,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
 from pandas import DataFrame
 
 # ==================================================================================================
@@ -181,6 +199,31 @@ MAX_CHANGES_PER_PACKAGE = 4  # beam-search steps; a step adds a single change or
 BEAM_WIDTH = 8  # partial packages kept alive at each step
 ENUMERATE_PAIRS = True  # score every compatible pair of feasible singles
 TOP_N = 30
+
+# --- Detailed bay-only reports --------------------------------------------------------------------
+# REPORTS_ONLY = True writes only the reports below: no candidate search runs.
+# DISCOVER_ONLY takes precedence. With REPORTS_ONLY = False, WRITE_BAY_REPORTS
+# = True adds the same reports after the sweep.
+REPORTS_ONLY = False
+WRITE_BAY_REPORTS = False
+# Baseline is always included. These are absolute assignments, not sequential
+# edits. They need not appear in BAY_CANDIDATES. Unknown movements fail loudly.
+BAY_REPORT_CONFIGURATIONS: Dict[str, Dict[str, str]] = {
+    # "option_a": {"101 arrive": "B", "102 depart": "A"},
+}
+# Match Step 2. These are separate physical spaces, NOT passenger bays.
+REPORT_OVERFLOW_ROUTING: Dict[str, List[str]] = {
+    "layover_bay_A": ["LAYOVER"],
+    "layover_bay_B": ["LONG BREAK"],
+}
+REPORT_OVERFLOW_CAPACITY: Dict[str, int] = {
+    "layover_bay_A": 1,
+    "layover_bay_B": 1,
+}
+# Optional historical checks, keyed by configuration then exact TIMELINES name.
+# Leave empty when testing a new feed or different occupancy assumptions.
+# Example: {"baseline": {"Likely conflict": 120}, "option_a": {"Likely conflict": 64}}
+EXPECTED_REPORT_TOTALS: Dict[str, Dict[str, int]] = {}
 
 # Every output must be traceable: a failed run-log write aborts the script.
 # Set to False only when writing to a genuinely read-only location.
@@ -1317,6 +1360,8 @@ class Standard:
                 "Rerun Step 1 for every TIMELINES scenario first."
             )
         self.snapshot = snapshot
+        self.timeline = df.copy()
+        self.timeline.attrs = {}
         self.trips = trips
         self.names = snapshot_route_names(snapshot)
         self.bay_names = sorted(set(CLUSTER_STOPS.values()))
@@ -1368,14 +1413,8 @@ class Standard:
         ]
         return frame.reset_index(drop=True)
 
-    def apply(self, change: Change) -> DataFrame:
-        """Move scheduled visits/trips, then rebuild every affected block's complete occupancy."""
-        if not change.moves and not change.shifts:
-            return self.occ
-        key = change.key()
-        if key in self.cache:
-            self.cache.move_to_end(key)
-            return self.cache[key]
+    def changed_block_trips(self, change: Change) -> Dict[str, List[dict[str, Any]]]:
+        """Apply candidate decisions to copies of affected blocks' scheduled trips."""
         shifts = self.shift_model.trip_shift(change.shifts)
         by_trip = dict(zip(self.trips["trip_id"], shifts))
         moved_routes = {route_end.route for route_end in change.moves}
@@ -1411,6 +1450,17 @@ class Standard:
                 revised.append(trip)
             if affected:
                 changed[block] = revised
+        return changed
+
+    def apply(self, change: Change) -> DataFrame:
+        """Move scheduled visits/trips, then rebuild every affected block's complete occupancy."""
+        if not change.moves and not change.shifts:
+            return self.occ
+        key = change.key()
+        if key in self.cache:
+            self.cache.move_to_end(key)
+            return self.cache[key]
+        changed = self.changed_block_trips(change)
         pieces = [self.occ[~self.occ["Block"].isin(changed)]]
         for block, trips in changed.items():
             end = max(
@@ -1852,16 +1902,8 @@ def validate_sweep_configuration() -> None:
         raise ValueError("Minimum gaps must be nonnegative.")
 
 
-def run_sweep() -> str:
-    """Score every listed change, pair and package and write the sweep workbook.
-
-    Feasibility is judged on the block chains of the first-listed standard:
-    the schedule is the same across standards, only the occupancy assumptions
-    differ.
-
-    Returns:
-        Path of the workbook written.
-    """
+def load_sweep_standards() -> Tuple[Dict[str, Standard], DataFrame, DataFrame, RouteNames, int]:
+    """Load compatible current-run inputs for either the search or detailed reports."""
     standards: Dict[str, Standard] = {}
     trips: Optional[DataFrame] = None
     chains: Optional[DataFrame] = None
@@ -1903,6 +1945,20 @@ def run_sweep() -> str:
             "them rest on estimated times.",
             estimated_visits,
         )
+    return standards, trips, chains, names, estimated_visits
+
+
+def run_sweep() -> str:
+    """Score every listed change, pair and package and write the sweep workbook.
+
+    Feasibility is judged on the block chains of the first-listed standard:
+    the schedule is the same across standards, only the occupancy assumptions
+    differ.
+
+    Returns:
+        Path of the workbook written.
+    """
+    standards, trips, chains, names, estimated_visits = load_sweep_standards()
     selections = resolve_selections(names)
     feas = Feasibility(trips, chains)
     scorer = Scorer(standards, feas, selections)
@@ -1981,6 +2037,12 @@ def run_sweep() -> str:
         "MAX_CHANGES_PER_PACKAGE": MAX_CHANGES_PER_PACKAGE,
         "BEAM_WIDTH": BEAM_WIDTH,
         "ENUMERATE_PAIRS": ENUMERATE_PAIRS,
+        "REPORTS_ONLY": REPORTS_ONLY,
+        "WRITE_BAY_REPORTS": WRITE_BAY_REPORTS,
+        "BAY_REPORT_CONFIGURATIONS": BAY_REPORT_CONFIGURATIONS,
+        "REPORT_OVERFLOW_ROUTING": REPORT_OVERFLOW_ROUTING,
+        "REPORT_OVERFLOW_CAPACITY": REPORT_OVERFLOW_CAPACITY,
+        "EXPECTED_REPORT_TOTALS": EXPECTED_REPORT_TOTALS,
         "Stop visits with interpolated times (Step 1)": estimated_visits,
     }
     sheets = [
@@ -1999,7 +2061,706 @@ def run_sweep() -> str:
             frame.to_excel(writer, sheet_name=sheet_name, index=False)
     logging.info("Sweep workbook for %s written to %s", CLUSTER_NAME, out_path)
     require_run_log(write_run_log(Path(out_path)))
+    if WRITE_BAY_REPORTS:
+        write_selected_bay_reports(standards)
     return out_path
+
+
+# ==================================================================================================
+# DETAILED BAY-ONLY REPORTS
+# ==================================================================================================
+
+
+def report_slug(value: str) -> str:
+    """Return a short, portable output name; callers check for collisions."""
+    return re.sub(r"[^A-Za-z0-9_-]+", "_", value).strip("_")[:70] or "report"
+
+
+def scheduled_identity(trips: list[dict[str, Any]]) -> str:
+    """Hash every trip field except the stop IDs/names a bay move may change."""
+    unchanged = copy.deepcopy(trips)
+    for trip in unchanged:
+        for prefix in ("first", "last"):
+            trip.pop(f"{prefix}_stop_id", None)
+            trip.pop(f"{prefix}_stop_name", None)
+        trip["stop_times_sequence"] = [
+            [*stop[:2], *stop[4:]] for stop in trip["stop_times_sequence"]
+        ]
+    payload = json.dumps(sorted(unchanged, key=lambda trip: trip["trip_id"]), sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def rebuild_bay_timeline(standard: Standard, change: Change) -> Tuple[DataFrame, str]:
+    """Rebuild all vehicle minutes and verify that only permitted bay fields changed."""
+    if change.shifts:
+        raise ValueError("Detailed reports currently accept bay changes only, not time shifts.")
+    revised = standard.changed_block_trips(change)
+    all_trips = [
+        trip
+        for block, originals in standard.block_trips.items()
+        for trip in revised.get(block, originals)
+    ]
+    signature = scheduled_identity(all_trips)
+    if signature != scheduled_identity(standard.snapshot["trips"]):
+        raise ValueError("Bay report changed a scheduled time, trip, block or other fixed field.")
+    rows = []
+    for block, originals in standard.block_trips.items():
+        trips = revised.get(block, originals)
+        rows.extend(
+            build_schedule_rows(
+                sorted(trips, key=lambda trip: (trip["start"], trip["trip_id"])),
+                range(standard.snapshot["timeline_end"]),
+                block,
+                standard.snapshot["clusters"],
+                standard.snapshot["settings"],
+            )
+        )
+    frame = DataFrame(rows)
+    if frame.duplicated(["Block", "Timestamp"]).any():
+        raise ValueError("Detailed timeline has duplicate vehicle/minute rows.")
+    return frame, signature
+
+
+def verify_baseline_timeline(standard: Standard, rebuilt: DataFrame) -> None:
+    """Compare every canonical timeline cell, ignoring only input bookkeeping columns."""
+    columns = list(rebuilt.columns)
+    missing = set(columns) - set(standard.timeline.columns)
+    if missing:
+        raise ValueError(
+            f"Baseline lacks current exporter columns: {sorted(missing)}. Rerun Step 1."
+        )
+
+    def comparable(frame: DataFrame) -> DataFrame:
+        return (
+            frame[columns]
+            .fillna("")
+            .astype(str)
+            .sort_values(["Block", "Timestamp"])
+            .reset_index(drop=True)
+        )
+
+    original, actual = comparable(standard.timeline), comparable(rebuilt)
+    if original.shape != actual.shape:
+        raise ValueError(
+            f"{standard.name}: rebuilt baseline has {len(actual)} rows; input has "
+            f"{len(original)}. Reports were not published. Rerun matching Step 1."
+        )
+    different = original.ne(actual)
+    if different.to_numpy().any():
+        row, column = np.argwhere(different.to_numpy())[0]
+        label = columns[column]
+        raise ValueError(
+            f"{standard.name}: baseline does not reproduce Step 1 at block "
+            f"{original.iloc[row]['Block']}, {original.iloc[row]['Timestamp']}, {label}: "
+            f"input {original.iloc[row, column]!r}, rebuilt {actual.iloc[row, column]!r}. "
+            "Reports were not published. Use matching exporter and sweep versions."
+        )
+
+
+def resolve_report_changes(standard: Standard) -> Dict[str, Change]:
+    """Resolve explicit report selections strictly, honoring shared-bay groups."""
+    changes = {"baseline": Change()}
+    selections = Selections()
+    for group in SAME_BAY_GROUPS:
+        members = [standard.names.parse(text) for text in group]
+        if any(member is None or not member.role for member in members):
+            raise ValueError(f"Unknown or incomplete SAME_BAY_GROUPS movement: {group}")
+        selections.same_bay_groups.append([member for member in members if member is not None])
+    for name, assignments in BAY_REPORT_CONFIGURATIONS.items():
+        if not isinstance(name, str) or not name.strip() or name.casefold() == "baseline":
+            raise ValueError("Bay report names must be nonblank and cannot be 'baseline'.")
+        if not isinstance(assignments, dict) or not assignments:
+            raise ValueError(f"Report {name!r} must contain at least one bay assignment.")
+        moves: Dict[RouteEnd, str] = {}
+        for text, bay in assignments.items():
+            movement = standard.names.parse(text)
+            if movement is None or not movement.role:
+                raise ValueError(f"Report {name!r}: unknown or incomplete route-end {text!r}.")
+            if movement in moves and moves[movement] != bay:
+                raise ValueError(f"Report {name!r}: conflicting aliases for {movement}.")
+            moves[movement] = bay
+        change = expand_groups(Change(moves=moves), selections)
+        for movement, bay in change.moves.items():
+            if movement not in standard.shift_model.masks:
+                raise ValueError(f"Report {name!r}: movement {movement} has no cluster visits.")
+            if bay not in standard.bay_names:
+                raise ValueError(f"Report {name!r}: unknown destination bay {bay!r}.")
+        changes[name] = change
+    slugs = [report_slug(name).casefold() for name in changes]
+    if len(set(slugs)) != len(slugs):
+        raise ValueError("Bay report configuration names produce duplicate filenames.")
+    return changes
+
+
+def report_assignment_table(standard: Standard, change: Change) -> DataFrame:
+    """Inventory every scheduled cluster movement, including unchanged assignments."""
+    visits: Dict[RouteEnd, List[str]] = defaultdict(list)
+    for trip in standard.snapshot["trips"]:
+        for stop in trip["stop_times_sequence"]:
+            if stop[2] not in CLUSTER_STOPS:
+                continue
+            role = "depart" if stop[5] else "arrive" if stop[6] else "through"
+            movement = RouteEnd(
+                trip["route_id"],
+                role,
+                str(trip["direction_id"]) if role == "through" else "",
+                standard.names.label[trip["route_id"]],
+            )
+            visits[movement].append(CLUSTER_STOPS[stop[2]])
+    rows = []
+    for movement, bays in sorted(visits.items()):
+        before = sorted(set(bays))
+        after = [change.moves[movement]] if movement in change.moves else before
+        rows.append(
+            {
+                "Movement": str(movement),
+                "Route ID": movement.route,
+                "Current bay(s)": ", ".join(before),
+                "Proposed bay(s)": ", ".join(after),
+                "Changed": before != after,
+                "Scheduled visits": len(bays),
+            }
+        )
+    return DataFrame(
+        rows,
+        columns=[
+            "Movement",
+            "Route ID",
+            "Current bay(s)",
+            "Proposed bay(s)",
+            "Changed",
+            "Scheduled visits",
+        ],
+    )
+
+
+def report_space_definitions(standard: Standard) -> Dict[str, Tuple[str, int]]:
+    """Validate physical layover routing and keep its capacity separate from passenger bays."""
+    spaces = {
+        bay: ("Passenger bay", int(standard.cap[i])) for i, bay in enumerate(standard.bay_names)
+    }
+    assigned = []
+    if set(REPORT_OVERFLOW_ROUTING) != set(REPORT_OVERFLOW_CAPACITY):
+        raise ValueError(
+            "REPORT_OVERFLOW_ROUTING and REPORT_OVERFLOW_CAPACITY must name the same spaces."
+        )
+    for name, statuses in REPORT_OVERFLOW_ROUTING.items():
+        capacity = REPORT_OVERFLOW_CAPACITY[name]
+        if not name or name in spaces:
+            raise ValueError(f"Invalid or duplicate layover space name: {name!r}")
+        if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 1:
+            raise ValueError(f"Layover space {name!r} needs a positive integer capacity.")
+        assigned.extend(statuses)
+        spaces[name] = ("Layover space", capacity)
+    if sorted(assigned) != ["LAYOVER", "LONG BREAK"]:
+        raise ValueError(
+            "Route LAYOVER and LONG BREAK exactly once each in REPORT_OVERFLOW_ROUTING."
+        )
+    return spaces
+
+
+def detailed_occupancy(
+    standard: Standard, timeline: DataFrame, spaces: Dict[str, Tuple[str, int]]
+) -> Tuple[DataFrame, DataFrame]:
+    """Count distinct physical blocks independently for every occupied space and minute."""
+    overflow = {
+        status: name for name, statuses in REPORT_OVERFLOW_ROUTING.items() for status in statuses
+    }
+    frame = timeline.loc[
+        timeline["Stop ID"].isin(CLUSTER_STOPS)
+        & timeline["Status"].isin(BAY_STATUSES | set(overflow))
+    ].copy()
+    frame["Space"] = frame["Stop ID"].map(CLUSTER_STOPS)
+    mask = frame["Status"].isin(overflow)
+    frame.loc[mask, "Space"] = frame.loc[mask, "Status"].map(overflow)
+    frame["Space type"] = frame["Space"].map({s: kind for s, (kind, _) in spaces.items()})
+    frame["Minute"] = frame["Timestamp"].map(timestamp_to_minutes).astype(int)
+    frame["Route name"] = frame["Route"].map(standard.names.label).fillna("")
+    frame["Capacity"] = frame["Space"].map({s: cap for s, (_, cap) in spaces.items()})
+    frame["Buses"] = frame.groupby(["Space", "Minute"])["Block"].transform("nunique")
+    frame["Conflict"] = frame["Buses"] > frame["Capacity"]
+    frame = frame.sort_values(["Minute", "Space", "Block"]).reset_index(drop=True)
+    first_columns = [
+        "Timestamp",
+        "Space",
+        "Space type",
+        "Buses",
+        "Capacity",
+        "Conflict",
+        "Block",
+        "Route name",
+        "Direction",
+        "Trip ID",
+        "Status",
+        "Stop Role",
+        "Arrival Time",
+        "Departure Time",
+        "Stop ID",
+        "Stop Name",
+    ]
+    frame = frame[first_columns + [column for column in frame if column not in first_columns]]
+    columns = [
+        "Space type",
+        "Space",
+        "Minute",
+        "Time",
+        "Buses",
+        "Capacity",
+        "Conflict",
+        "Blocks",
+        "Routes",
+        "Trips",
+        "Activities",
+        "Participants",
+    ]
+    minutes = []
+    for (space, minute), group in frame.groupby(["Space", "Minute"], sort=True):
+        first = group.iloc[0]
+        participants = [
+            f"Block {row['Block']}: route {row['Route name']}, trip {row['Trip ID']}, "
+            f"{row['Status']} ({row['Stop Role']})"
+            for _, row in group.iterrows()
+        ]
+        minutes.append(
+            {
+                "Space type": first["Space type"],
+                "Space": space,
+                "Minute": int(minute),
+                "Time": first["Timestamp"],
+                "Buses": int(first["Buses"]),
+                "Capacity": int(first["Capacity"]),
+                "Conflict": bool(first["Conflict"]),
+                "Blocks": ", ".join(sorted(set(group["Block"]))),
+                "Routes": ", ".join(sorted(set(group["Route name"]))),
+                "Trips": ", ".join(sorted(set(group["Trip ID"]))),
+                "Activities": ", ".join(sorted(set(group["Status"]))),
+                "Participants": "; ".join(participants),
+            }
+        )
+    return frame, DataFrame(minutes, columns=columns).astype(
+        {
+            "Minute": "int64",
+            "Buses": "int64",
+            "Capacity": "int64",
+            "Conflict": bool,
+        }
+    )
+
+
+def report_conflict_events(minutes: DataFrame, space_type: str) -> DataFrame:
+    """Collapse consecutive conflict minute marks; event endpoints are inclusive."""
+    columns = [
+        "Space",
+        "Start",
+        "End (inclusive)",
+        "Conflict minutes",
+        "Peak buses",
+        "Capacity",
+        "Blocks during event",
+        "Routes during event",
+        "Trips during event",
+    ]
+    conflicts = minutes[minutes["Conflict"] & minutes["Space type"].eq(space_type)]
+    rows = []
+    for space, group in conflicts.groupby("Space", sort=True):
+        group = group.sort_values("Minute")
+        runs = group["Minute"].diff().ne(1).cumsum()
+        for _, event in group.groupby(runs, sort=False):
+            row = {
+                "Space": space,
+                "Start": event.iloc[0]["Time"],
+                "End (inclusive)": event.iloc[-1]["Time"],
+                "Conflict minutes": len(event),
+                "Peak buses": int(event["Buses"].max()),
+                "Capacity": int(event.iloc[0]["Capacity"]),
+            }
+            for column in ("Blocks", "Routes", "Trips"):
+                row[f"{column} during event"] = ", ".join(
+                    sorted({item for value in event[column] for item in value.split(", ") if item})
+                )
+            rows.append(row)
+    return DataFrame(rows, columns=columns)
+
+
+def report_conflict_comparison(before: DataFrame, after: DataFrame) -> DataFrame:
+    """Compare space/minute keys; expose changed participants at retained conflicts."""
+    columns = [
+        "Space type",
+        "Space",
+        "Minute",
+        "Time",
+        "Change",
+        "Participants changed",
+        "Before buses",
+        "After buses",
+        "Before participants",
+        "After participants",
+    ]
+    old = {(row["Space"], row["Minute"]): row for row in before.to_dict("records")}
+    new = {(row["Space"], row["Minute"]): row for row in after.to_dict("records")}
+    old_keys = {key for key, row in old.items() if row["Conflict"]}
+    new_keys = {key for key, row in new.items() if row["Conflict"]}
+    rows = []
+    for key in sorted(old_keys | new_keys):
+        a, b = old.get(key, {}), new.get(key, {})
+        description = b or a
+        retained = key in old_keys and key in new_keys
+        rows.append(
+            {
+                "Space type": description["Space type"],
+                "Space": key[0],
+                "Minute": key[1],
+                "Time": minutes_to_hhmm(key[1]),
+                "Change": "Retained" if retained else "Removed" if key in old_keys else "Created",
+                "Participants changed": retained and a["Participants"] != b["Participants"],
+                "Before buses": a.get("Buses", 0),
+                "After buses": b.get("Buses", 0),
+                "Before participants": a.get("Participants", ""),
+                "After participants": b.get("Participants", ""),
+            }
+        )
+    return DataFrame(rows, columns=columns)
+
+
+def verify_report_score(standard: Standard, change: Change, minutes: DataFrame) -> int:
+    """Require independent detailed counts and exact conflict keys to match the sweep scorer."""
+    scored = standard.apply(change)
+    if scored.duplicated(["Block", "Minute"]).any():
+        raise ValueError("Sweep occupancy contains duplicate vehicle/minute rows.")
+    total, _, keys = standard.score(scored)
+    actual = minutes[minutes["Conflict"] & minutes["Space type"].eq("Passenger bay")]
+    detailed_keys = set(zip(actual["Space"], actual["Minute"]))
+    sweep_keys = {standard.key_label(int(key)) for key in keys}
+    if detailed_keys != sweep_keys or len(actual) != total:
+        raise ValueError(f"{standard.name}: detailed conflict minutes do not match sweep scoring.")
+    return total
+
+
+def write_bay_report_workbook(path: Path, sheets: List[Tuple[str, DataFrame]]) -> None:
+    """Write readable tables with frozen headers, filters and conflict highlighting."""
+    used: set[str] = set()
+    with open_report_workbook(str(path)) as writer:
+        for requested, frame in sheets:
+            stem = re.sub(r"[\[\]:*?/\\]", "_", requested).strip("'")[:31] or "Sheet"
+            name, suffix = stem, 1
+            while name.casefold() in used:
+                suffix += 1
+                name = f"{stem[:26]}_{suffix}"
+            used.add(name.casefold())
+            if len(frame) > 1_048_575:
+                raise ValueError(
+                    f"{requested} exceeds Excel's row limit. Use a shorter input period."
+                )
+            frame.to_excel(writer, sheet_name=name, index=False)
+            sheet = writer.sheets[name]
+            sheet.freeze_panes = "A2"
+            sheet.auto_filter.ref = sheet.dimensions
+            sheet.sheet_view.zoomScale = 85
+            sheet.row_dimensions[1].height = 32
+            for cell in sheet[1]:
+                cell.font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+                cell.fill = PatternFill("solid", fgColor="24435B")
+                cell.alignment = Alignment(wrap_text=True, vertical="center")
+            for i, column in enumerate(frame.columns, 1):
+                lengths = [len(str(column)), *[len(str(v)) for v in frame[column].head(300)]]
+                width = min(64, max(14, max(lengths, default=14) + 2))
+                sheet.column_dimensions[get_column_letter(i)].width = width
+            flag = list(frame.columns).index("Conflict") if "Conflict" in frame else None
+            for row in sheet.iter_rows(min_row=2):
+                conflict = flag is not None and row[flag].value is True
+                height = 15
+                for cell in row:
+                    # All report strings are literal input or labels, never Excel formulas.
+                    if isinstance(cell.value, str):
+                        cell.data_type = "s"
+                        width = sheet.column_dimensions[cell.column_letter].width
+                        height = max(
+                            height, min(180, 15 * (1 + len(cell.value) // max(1, int(width))))
+                        )
+                    cell.alignment = Alignment(vertical="top", wrap_text=True)
+                    if conflict:
+                        cell.fill = PatternFill("solid", fgColor="FCE4D6")
+                        cell.font = Font(name="Calibri", size=11, bold=True)
+                sheet.row_dimensions[row[0].row].height = height
+
+
+def write_selected_bay_reports(standards: Dict[str, Standard]) -> str:
+    """Build selected bay reports, validate all results, then publish the output files.
+
+    Baseline and each named configuration are rebuilt independently. The
+    comparison counts distinct space/minute keys; a retained key may involve
+    different buses, which the minute comparison identifies explicitly.
+    """
+    if not standards:
+        raise ValueError("Detailed bay reports require at least one occupancy standard.")
+    tags = [report_slug(name).casefold() for name in standards]
+    if len(set(tags)) != len(tags):
+        raise ValueError("Occupancy standard names produce duplicate report filenames.")
+    for configuration, expected in EXPECTED_REPORT_TOTALS.items():
+        if configuration not in {"baseline", *BAY_REPORT_CONFIGURATIONS} or set(expected) - set(
+            standards
+        ):
+            raise ValueError(
+                f"Unknown configuration/standard in EXPECTED_REPORT_TOTALS: {configuration}"
+            )
+        if any(isinstance(v, bool) or not isinstance(v, int) or v < 0 for v in expected.values()):
+            raise ValueError("Expected report totals must be nonnegative integer minutes.")
+    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+    destination = Path(OUTPUT_FOLDER) / f"{report_slug(SCENARIO_LABEL)}_bay_reports"
+    comparisons, comparison_minutes = [], []
+    # Preserve existing reports when calculation, validation or workbook generation fails.
+    with tempfile.TemporaryDirectory(prefix="bay_reports_", dir=OUTPUT_FOLDER) as temporary:
+        staged = Path(temporary)
+        for standard_name, standard in standards.items():
+            changes = resolve_report_changes(standard)
+            spaces = report_space_definitions(standard)
+            baseline, _ = rebuild_bay_timeline(standard, Change())
+            verify_baseline_timeline(standard, baseline)
+            _, before = detailed_occupancy(standard, baseline, spaces)
+            logging.info(
+                "%s: rebuilt baseline matches all %d input rows.", standard_name, len(baseline)
+            )
+            for configuration, change in changes.items():
+                logging.info("Building bay report: %s / %s", standard_name, configuration)
+                timeline, signature = rebuild_bay_timeline(standard, change)
+                occupancy, minutes = detailed_occupancy(standard, timeline, spaces)
+                total = verify_report_score(standard, change, minutes)
+                expected = EXPECTED_REPORT_TOTALS.get(configuration, {}).get(standard_name)
+                if expected is not None and total != expected:
+                    raise ValueError(
+                        f"{configuration} / {standard_name}: expected {expected} "
+                        f"conflict bay-minutes, rebuilt {total}. Reports were not published. "
+                        "Check feed and assumptions."
+                    )
+                delta = report_conflict_comparison(before, minutes)
+                assignments = report_assignment_table(standard, change)
+                summary = []
+                for space, (kind, capacity) in spaces.items():
+                    old = before[before["Space"].eq(space) & before["Conflict"]]
+                    new = minutes[minutes["Space"].eq(space) & minutes["Conflict"]]
+                    change_rows = delta[delta["Space"].eq(space)]
+                    counts = change_rows["Change"].value_counts()
+                    removed, created, retained = (
+                        int(counts.get(k, 0)) for k in ("Removed", "Created", "Retained")
+                    )
+                    if len(old) - removed + created != len(new) or retained + created != len(new):
+                        raise ValueError(
+                            "Conflict comparison does not reconcile with detailed counts."
+                        )
+                    row = {
+                        "Space type": kind,
+                        "Space": space,
+                        "Capacity": capacity,
+                        "Current conflict minutes": len(old),
+                        "Proposed conflict minutes": len(new),
+                        "Removed": removed,
+                        "Retained": retained,
+                        "Created": created,
+                        "Net reduction": len(old) - len(new),
+                    }
+                    summary.append(row)
+                    comparisons.append(
+                        {"Standard": standard_name, "Configuration": configuration, **row}
+                    )
+                for kind, label in (
+                    ("Passenger bay", "All passenger bays"),
+                    ("Layover space", "All layover spaces"),
+                ):
+                    members = [row for row in summary if row["Space type"] == kind]
+                    summary.append(
+                        {
+                            "Space type": f"{kind} total",
+                            "Space": label,
+                            "Capacity": "",
+                            **{
+                                column: sum(row[column] for row in members)
+                                for column in (
+                                    "Current conflict minutes",
+                                    "Proposed conflict minutes",
+                                    "Removed",
+                                    "Retained",
+                                    "Created",
+                                    "Net reduction",
+                                )
+                            },
+                        }
+                    )
+                comparison_minutes.append(
+                    delta.assign(Standard=standard_name, Configuration=configuration)
+                )
+                events = report_conflict_events(minutes, "Passenger bay")
+                overflow_events = report_conflict_events(minutes, "Layover space")
+                if int(events["Conflict minutes"].sum()) != total:
+                    raise ValueError(
+                        "Conflict event durations do not sum to the passenger-bay total."
+                    )
+                overflow_total = int(
+                    (minutes["Conflict"] & minutes["Space type"].eq("Layover space")).sum()
+                )
+                if int(overflow_events["Conflict minutes"].sum()) != overflow_total:
+                    raise ValueError("Overflow event durations do not reconcile.")
+                checks = DataFrame(
+                    [
+                        {
+                            "Check": "Baseline canonical rows match Step 1",
+                            "Result": "PASS",
+                            "Value": len(baseline),
+                        },
+                        {
+                            "Check": "Scheduled times, trips and blocks unchanged",
+                            "Result": "PASS",
+                            "Value": signature,
+                        },
+                        {
+                            "Check": "Detailed passenger-bay keys match sweep scorer",
+                            "Result": "PASS",
+                            "Value": total,
+                        },
+                        {
+                            "Check": "Event durations and removed/created counts reconcile",
+                            "Result": "PASS",
+                            "Value": total,
+                        },
+                        {
+                            "Check": "Optional historical total",
+                            "Result": "PASS" if expected is not None else "Not requested",
+                            "Value": expected if expected is not None else "",
+                        },
+                    ]
+                )
+                explanation = {
+                    "Configuration": configuration,
+                    "Occupancy standard": standard_name,
+                    "Passenger-bay conflict minutes": total,
+                    "Distinct minutes with any passenger-bay conflict": int(
+                        minutes.loc[
+                            minutes["Conflict"] & minutes["Space type"].eq("Passenger bay"),
+                            "Minute",
+                        ].nunique()
+                    ),
+                    "Assignment movements changed": int(assignments["Changed"].sum()),
+                    "Counting rule": (
+                        "One space above capacity for one minute is one conflict minute, "
+                        "regardless of the number of excess buses. Passenger bays and layover "
+                        "spaces are reported separately."
+                    ),
+                    "How to check": (
+                        "Summary totals equal the event durations. Filter Conflict Minutes by "
+                        "space/time; AllStops and the individual space sheets show every bus "
+                        "and its scheduled times."
+                    ),
+                    "Time labels": (
+                        "Times are minute marks. Event start and end are inclusive: 11:28 "
+                        "through 11:30 is three conflict minutes. Times beyond midnight retain "
+                        "hours of 24 or more."
+                    ),
+                    "Retained conflicts": (
+                        "Retained means the same space and minute remain above capacity. "
+                        "Participants may change; see Changes vs Baseline."
+                    ),
+                    "Event participants": (
+                        "An event lists all buses present across its conflict minutes; they "
+                        "need not all be present simultaneously. Conflict Minutes identifies "
+                        "the participants each minute."
+                    ),
+                    "Layover locations": (
+                        "Physical layover spaces are assigned by REPORT_OVERFLOW_ROUTING. The "
+                        "original Stop ID on a layover row identifies the associated stop, not "
+                        "the physical layover position; use Space."
+                    ),
+                    "Scope": (
+                        "Occupancy follows this standard's settings, including in-bay DWELL. "
+                        "No schedule shift or displaced-bus routing is simulated. These counts "
+                        "are modeled occupancy overlaps, not measured delays."
+                    ),
+                    "Selection": (
+                        "These are explicitly selected configurations, not a new optimization "
+                        "result. A changed feed or counting rule may change earlier totals."
+                    ),
+                }
+                assumptions = {
+                    "Source folder": TIMELINES.get(standard_name, ""),
+                    "Cluster stops": json.dumps(CLUSTER_STOPS, sort_keys=True),
+                    "Bay capacities": json.dumps(CLUSTER_CAPACITY, sort_keys=True),
+                    "Overflow routing": json.dumps(REPORT_OVERFLOW_ROUTING, sort_keys=True),
+                    "Overflow capacities": json.dumps(REPORT_OVERFLOW_CAPACITY, sort_keys=True),
+                    "Selected changes": change.label() or "Current assignments",
+                    "Schedule identity": signature,
+                    "Service IDs": str(standard.snapshot.get("service_ids", [])),
+                    **standard.snapshot["settings"],
+                }
+                sheets = [
+                    ("Summary", DataFrame(summary)),
+                    (
+                        "Read me",
+                        DataFrame({"Item": list(explanation), "Value": list(explanation.values())}),
+                    ),
+                    ("Assignments", assignments),
+                    ("Conflict Events", events),
+                    ("Overflow Events", overflow_events),
+                    ("Conflict Minutes", minutes[minutes["Conflict"]]),
+                    ("Changes vs Baseline", delta),
+                    ("AllStops", occupancy),
+                    *[
+                        (
+                            f"Bay {space}" if kind == "Passenger bay" else space,
+                            occupancy[occupancy["Space"].eq(space)],
+                        )
+                        for space, (kind, _) in spaces.items()
+                    ],
+                    ("Checks", checks),
+                    (
+                        "Assumptions",
+                        DataFrame(
+                            {
+                                "Setting": list(assumptions),
+                                "Value": [str(v) for v in assumptions.values()],
+                            }
+                        ),
+                    ),
+                ]
+                stem = (
+                    f"{report_slug(CLUSTER_NAME)}_Conflicts_"
+                    f"{report_slug(configuration)}_{report_slug(standard_name)}"
+                )
+                workbook_path = staged / f"{stem}.xlsx"
+                write_bay_report_workbook(workbook_path, sheets)
+                require_run_log(write_run_log(workbook_path))
+                timeline.to_csv(staged / f"{stem}_timeline.csv", index=False)
+                logging.info(
+                    "%s / %s: %d passenger-bay conflict minutes.",
+                    standard_name,
+                    configuration,
+                    total,
+                )
+        comparison_path = staged / f"{report_slug(CLUSTER_NAME)}_Bay_Comparison.xlsx"
+        comparison_by_space = DataFrame(comparisons)
+        comparison_totals = comparison_by_space.groupby(
+            ["Standard", "Configuration", "Space type"], sort=False, as_index=False
+        )[
+            [
+                "Current conflict minutes",
+                "Proposed conflict minutes",
+                "Removed",
+                "Retained",
+                "Created",
+                "Net reduction",
+            ]
+        ].sum()
+        write_bay_report_workbook(
+            comparison_path,
+            [
+                ("Comparison totals", comparison_totals),
+                ("Comparison by space", comparison_by_space),
+                ("Conflict minute changes", pd.concat(comparison_minutes, ignore_index=True)),
+            ],
+        )
+        require_run_log(write_run_log(comparison_path))
+        destination.mkdir(parents=True, exist_ok=True)
+        for path in staged.iterdir():
+            os.replace(path, destination / path.name)
+    logging.info("Detailed bay reports written to %s", destination)
+    return str(destination)
 
 
 # --------------------------------------------------------------------------------------------------
@@ -2144,7 +2905,7 @@ def _is_placeholder_path(p: str) -> bool:
 
 
 def main() -> int:
-    """Run the discover pass or the sweep, depending on ``DISCOVER_ONLY``.
+    """Run discovery, selected bay reports, or the candidate sweep.
 
     Returns:
         Process exit code: 0 on success, 1 if the input or configuration is
@@ -2177,6 +2938,9 @@ def main() -> int:
     try:
         if DISCOVER_ONLY:
             run_discover()
+        elif REPORTS_ONLY:
+            standards, _, _, _, _ = load_sweep_standards()
+            write_selected_bay_reports(standards)
         else:
             run_sweep()
     except (RunLogError, ValueError, OSError, KeyError) as exc:
