@@ -52,8 +52,8 @@ INCLUDE_ROUTE_IDS: list[str] = ["101", "202", "303"]  # empty list → all route
 ROUTE_UNION: bool = False
 
 # Projected CRS – should be feet-based if you want spacing_ft directly in feet.
-# Example: 2240 = NAD83 / Maryland (ftUS)
-PROJECTED_WKID: int = 2240
+# Example: 2248 = NAD83 / Maryland (ftUS)
+PROJECTED_WKID: int = 2248
 
 # Short-spacing QA – “too close” consecutive served stops along a route
 MIN_SPACING_FT: float = 400.0
