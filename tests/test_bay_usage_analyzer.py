@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 from typing import Any, Optional
 from unittest.mock import patch
@@ -215,6 +216,7 @@ def test_annotate_conflicts_categorises_each_row() -> None:
             "ClusterName": ["Park & Ride", "Park & Ride", None, "Metro"],
             "Stop ID": ["100", "101", "999", "200"],
             "Timestamp": ["08:00", "08:00", "08:00", "08:00"],
+            "Status": ["ARRIVE", "LOADING", "ARRIVE", "DEPART"],
         }
     )
     cluster_conflicts = {("Park & Ride", "08:00")}
@@ -223,12 +225,27 @@ def test_annotate_conflicts_categorises_each_row() -> None:
     assert list(out["ConflictType"]) == ["BOTH", "CLUSTER", "STOP", "NONE"]
 
 
+def test_annotate_conflicts_overflow_rows_are_not_stop_conflicts() -> None:
+    # A bus on the overflow space keeps its arrival stop ID but is not in that bay.
+    df = pd.DataFrame(
+        {
+            "ClusterName": ["Park & Ride", "Park & Ride"],
+            "Stop ID": ["100", "100"],
+            "Timestamp": ["08:00", "08:00"],
+            "Status": ["ARRIVE", "LAYOVER"],
+        }
+    )
+    out = target.annotate_conflicts(df, {("Park & Ride", "08:00")}, {("100", "08:00")})
+    assert list(out["ConflictType"]) == ["BOTH", "CLUSTER"]
+
+
 def test_annotate_conflicts_no_conflicts_all_none() -> None:
     df = pd.DataFrame(
         {
             "ClusterName": ["Metro"],
             "Stop ID": ["200"],
             "Timestamp": ["08:00"],
+            "Status": ["ARRIVE"],
         }
     )
     out = target.annotate_conflicts(df, set(), set())
@@ -240,9 +257,15 @@ def test_annotate_conflicts_no_conflicts_all_none() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _step1_rows(block: str, ts: str, **columns: Any) -> pd.DataFrame:
+    """One Step 1 timeline row with the columns the readers require."""
+    row = {"Timestamp": ts, "Block": block, "Trip ID": "T1", "Stop ID": "S1", "Status": "ARRIVE"}
+    return pd.DataFrame([{**row, **columns}])
+
+
 def test_gather_block_spreadsheets_concatenates_block_files(tmp_path: Path) -> None:
-    df1 = pd.DataFrame({"Timestamp": ["08:00"], "Block": ["B1"]})
-    df2 = pd.DataFrame({"Timestamp": ["09:00"], "Block": ["B2"]})
+    df1 = _step1_rows("B1", "08:00")
+    df2 = _step1_rows("B2", "09:00")
     df1.to_excel(tmp_path / "block_101.xlsx", index=False)
     df2.to_excel(tmp_path / "block_102.xlsx", index=False)
     # A non-block file that must be ignored.
@@ -259,9 +282,7 @@ def test_gather_block_spreadsheets_no_files_raises(tmp_path: Path) -> None:
 
 
 def test_gather_block_spreadsheets_keeps_ids_as_text(tmp_path: Path) -> None:
-    pd.DataFrame({"Stop ID": [2956], "Block": [101]}).to_excel(
-        tmp_path / "block_1.xlsx", index=False
-    )
+    _step1_rows(101, "08:00", **{"Stop ID": 2956}).to_excel(tmp_path / "block_1.xlsx", index=False)
     out = target.gather_block_spreadsheets(str(tmp_path))
     assert (out.loc[0, "Stop ID"], out.loc[0, "Block"]) == ("2956", "101")
 
@@ -272,12 +293,10 @@ def test_gather_block_spreadsheets_keeps_ids_as_text(tmp_path: Path) -> None:
 
 
 def test_load_timeline_prefers_combined_csv(tmp_path: Path) -> None:
-    pd.DataFrame({"Timestamp": ["08:00"], "Block": ["B1"], "Stop ID": [""]}).to_csv(
+    _step1_rows("B1", "08:00", **{"Stop ID": ""}).to_csv(
         tmp_path / "all_blocks_timeline.csv", index=False
     )
-    pd.DataFrame({"Timestamp": ["09:00"], "Block": ["B9"]}).to_excel(
-        tmp_path / "block_9.xlsx", index=False
-    )
+    _step1_rows("B9", "09:00").to_excel(tmp_path / "block_9.xlsx", index=False)
     with patch.object(target, "COMBINED_TIMELINE_FILE", "all_blocks_timeline.csv"):
         out = target.load_timeline(str(tmp_path))
     assert list(out["Block"]) == ["B1"]
@@ -288,9 +307,7 @@ def test_load_timeline_prefers_combined_csv(tmp_path: Path) -> None:
 
 
 def test_load_timeline_falls_back_to_workbooks_when_csv_missing(tmp_path: Path) -> None:
-    pd.DataFrame({"Timestamp": ["09:00"], "Block": ["B9"]}).to_excel(
-        tmp_path / "block_9.xlsx", index=False
-    )
+    _step1_rows("B9", "09:00").to_excel(tmp_path / "block_9.xlsx", index=False)
     with patch.object(target, "COMBINED_TIMELINE_FILE", "all_blocks_timeline.csv"):
         out = target.load_timeline(str(tmp_path))
     assert list(out["Block"]) == ["B9"]
@@ -332,11 +349,22 @@ def test_is_placeholder_path_real_path_is_false() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_bay_statuses_honours_in_bay_layover_toggle() -> None:
+def test_in_bay_layover_toggle_excludes_only_between_trip_dwell() -> None:
+    df = pd.DataFrame(
+        {
+            "Status": ["DWELL", "DWELL", "ARRIVE", "LAYOVER"],
+            "Prev Trip ID": ["T1", "", "", "T1"],  # row 0: between trips; row 1: a timed hold
+            "Next Trip ID": ["T2", "", "", "T2"],
+        }
+    )
+    assert "DWELL" in target.bay_statuses()  # a timed hold can always occupy a bay
     with patch.object(target, "COUNT_IN_BAY_LAYOVER_AT_STOP", True):
-        assert "DWELL" in target.bay_statuses()
+        assert list(target.bay_occupancy_mask(df)) == [True, True, True, False]
     with patch.object(target, "COUNT_IN_BAY_LAYOVER_AT_STOP", False):
-        assert target.bay_statuses() == target.PASSENGER_SERVICE_STATUSES
+        assert list(target.bay_occupancy_mask(df)) == [False, True, True, False]
+        # Without trip links (older Step 1 output) every DWELL row counts as a layover.
+        legacy = df.drop(columns=["Prev Trip ID", "Next Trip ID"])
+        assert list(target.bay_occupancy_mask(legacy)) == [False, False, True, False]
 
 
 @pytest.mark.parametrize(
@@ -368,6 +396,22 @@ def test_bus_label_prefers_short_name_and_headsign() -> None:
         }
     )
     assert target.bus_label(row) == "R101 (blk B1, trip T1)"
+
+
+def test_bus_label_falls_back_to_long_name_then_route_id() -> None:
+    row = pd.Series(
+        {
+            "Route Short Name": None,
+            "Route Long Name": "Crosstown",
+            "Route": "R7",
+            "Trip Headsign": None,
+            "Block": "B1",
+            "Trip ID": "T1",
+        }
+    )
+    assert target.bus_label(row) == "Crosstown (blk B1, trip T1)"
+    assert target.route_display_name("", " ", "R7") == "R7"
+    assert target.route_display_name(float("nan"), "Crosstown", "R7") == "Crosstown"
 
 
 # ---------------------------------------------------------------------------
@@ -437,6 +481,16 @@ def test_build_conflict_events_collapses_consecutive_minutes() -> None:
     second = events.iloc[1]
     assert (second["Start"], second["End"], second["Minutes"]) == ("08:05", "08:05", 1)
     assert second["Bus 2"] == "303 Downtown (blk B3, trip T3)"
+
+
+def test_build_conflict_events_flags_events_with_interpolated_times() -> None:
+    df = _conflict_df().assign(**{"Estimated Time": "False"})
+    df.loc[6, "Estimated Time"] = "True"  # B3's through visit at 08:05 was interpolated
+    with patch.object(target, "CLUSTER_DEFINITIONS", TEST_CLUSTERS):
+        events = target.build_conflict_events(df)
+        legacy = target.build_conflict_events(_conflict_df())  # no Estimated Time column
+    assert list(events["Estimated Times"]) == ["", "YES"]
+    assert list(legacy["Estimated Times"]) == ["", ""]
 
 
 def test_build_conflict_events_empty_when_no_conflicts() -> None:
@@ -587,7 +641,7 @@ def _layover_block_df() -> pd.DataFrame:
 
 def test_build_layover_runs_types_flags_and_trips() -> None:
     with patch.object(target, "COUNT_IN_BAY_LAYOVER_AT_STOP", True):
-        runs = target.build_layover_runs(_layover_block_df())
+        runs = target.build_layover_runs(_layover_block_df(), "Metro")
     assert len(runs) == 2
     sit, pull_in = runs.iloc[0], runs.iloc[1]
     assert (sit["Type"], sit["Flag"], sit["Start"], sit["End"]) == (
@@ -617,7 +671,7 @@ def test_build_layover_runs_overflow_type_is_not_flagged() -> None:
         _run_row("08:15", "200", "LOADING", trip="T2", prev="T1", nxt="T2"),
         _run_row("08:16", "200", "DEPART", trip="T2"),
     ]
-    runs = target.build_layover_runs(pd.DataFrame(rows))
+    runs = target.build_layover_runs(pd.DataFrame(rows), "Metro")
     assert len(runs) == 1
     run = runs.iloc[0]
     assert (run["Type"], run["Flag"], run["Total Minutes"]) == ("overflow", "", 17)
@@ -630,9 +684,29 @@ def test_build_layover_runs_pull_out_before_first_trip() -> None:
         _run_row("06:56", "200", "LOADING", trip="T1", nxt="T1"),
         _run_row("06:57", "200", "DEPART", trip="T1"),
     ]
-    runs = target.build_layover_runs(pd.DataFrame(rows))
+    runs = target.build_layover_runs(pd.DataFrame(rows), "Metro")
     assert list(runs["Type"]) == ["pull-out"]
     assert runs.loc[0, "Departing Trip ID"] == "T1"
+
+
+def test_build_layover_runs_marks_trip_only_blocks() -> None:
+    rows = [
+        {**_run_row("06:55", "200", "LOADING", trip="T1", nxt="T1"), "Block": "trip-only:T1"},
+        {**_run_row("06:56", "200", "DEPART", trip="T1"), "Block": "trip-only:T1"},
+    ]
+    runs = target.build_layover_runs(pd.DataFrame(rows), "Metro")
+    assert list(runs["Type"]) == ["trip only"]  # the vehicle's earlier trips are unknown
+
+
+def test_build_layover_runs_only_reports_the_named_cluster() -> None:
+    rows = [
+        _run_row("06:55", "200", "LOADING", trip="T1", nxt="T1"),
+        _run_row("06:56", "200", "DEPART", trip="T1"),
+        {**_run_row("07:30", "100", "LOADING", trip="T2", nxt="T2"), "ClusterName": "Park & Ride"},
+        {**_run_row("07:31", "100", "DEPART", trip="T2"), "ClusterName": "Park & Ride"},
+    ]
+    runs = target.build_layover_runs(pd.DataFrame(rows), "Metro")
+    assert list(runs["Departing Trip ID"]) == ["T1"]  # the Park & Ride run is not Metro's
 
 
 # ---------------------------------------------------------------------------
@@ -643,7 +717,10 @@ def test_build_layover_runs_pull_out_before_first_trip() -> None:
 def test_step2_end_to_end_on_step1_output(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     import scripts.gtfs_exports.block_status_timeline_exporter as step1
 
-    fixture = Path(__file__).parent / "fixtures" / "gtfs_basic"
+    # Step 1 stops on gtfs_basic's frequency-based trip T2; treat it as scheduled here.
+    fixture = tmp_path / "gtfs_basic_scheduled"
+    shutil.copytree(Path(__file__).parent / "fixtures" / "gtfs_basic", fixture)
+    (fixture / "frequencies.txt").unlink()
     step1_out = tmp_path / "step1"
     monkeypatch.setattr(step1, "GTFS_FOLDER_PATH", str(fixture))
     monkeypatch.setattr(step1, "BLOCK_OUTPUT_FOLDER", str(step1_out))
@@ -715,3 +792,78 @@ def test_main_returns_1_when_required_run_log_fails(
         target, "run_step2_conflict_detection", lambda: target.require_run_log(False)
     )
     assert target.main() == 1
+
+
+def test_step2_discloses_estimated_times_and_trip_only_blocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import scripts.gtfs_exports.block_status_timeline_exporter as step1
+
+    # T1 passes the Hub bay S1 at an untimed stop; T2 ends there. Neither trip has a
+    # block_id, the route has only a long name and S1 has no stop_name.
+    feed = tmp_path / "feed"
+    feed.mkdir()
+    tables = {
+        "routes": "route_id,route_short_name,route_long_name,route_type\nR1,,Crosstown,3\n",
+        "stops": "stop_id,stop_name\nS1,\nS2,Elm St\nS3,Oak St\n",
+        "trips": "route_id,service_id,trip_id,direction_id\nR1,WKDY,T1,0\nR1,WKDY,T2,1\n",
+        "stop_times": "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+        "T1,07:00:00,07:00:00,S3,1\nT1,,,S1,2\nT1,07:10:00,07:10:00,S2,3\n"
+        "T2,07:00:00,07:00:00,S2,1\nT2,07:05:00,07:05:00,S1,2\n",
+    }
+    for name, text in tables.items():
+        (feed / f"{name}.txt").write_text(text, encoding="utf-8")
+    settings = {
+        "GTFS_FOLDER_PATH": str(feed),
+        "BLOCK_OUTPUT_FOLDER": str(tmp_path / "step1"),
+        "SCENARIO_NAME": "",
+        "CALENDAR_SERVICE_IDS": ["WKDY"],
+        "SERVICE_DATE": "",
+        "WRITE_PER_BLOCK_FILES": False,
+        "BUS_STOP_CLUSTERS_STEP1": [{"name": "Hub", "stops": ["S1"]}],
+        "ROUTE_SHORTNAME_FILTER": [],
+        "STOP_ID_FILTER": [],
+        "STOP_CODE_FILTER": [],
+        "BAY_OVERRIDES": [],
+        "THROUGH_DWELL_MINUTES": 2,
+        "POST_ARRIVAL_MINUTES": 2,
+        "INTERPOLATE_UNTIMED_STOPS": True,
+        "TRIP_ONLY_WITHOUT_BLOCK_ID": True,
+    }
+    for name, value in settings.items():
+        monkeypatch.setattr(step1, name, value)
+    step1.run_step1_gtfs_to_blocks()
+
+    clusters = {
+        "Hub": {
+            "single_bay_stops": ["S1"],
+            "double_bay_stops": [],
+            "triple_bay_stops": [],
+            "overflow_bays": [],
+        }
+    }
+    monkeypatch.setattr(target, "BLOCK_OUTPUT_FOLDER", str(tmp_path / "step1"))
+    monkeypatch.setattr(target, "SCENARIO_NAME", "")
+    monkeypatch.setattr(target, "CLUSTER_CONFLICT_OUTPUT_FOLDER", str(tmp_path / "step2"))
+    monkeypatch.setattr(target, "CLUSTER_DEFINITIONS", clusters)
+    target.run_step2_conflict_detection()
+
+    workbook = tmp_path / "step2" / "Hub_Conflicts.xlsx"
+    events = pd.read_excel(workbook, sheet_name="Conflict Events", dtype=str)
+    assert len(events) == 1
+    event = events.iloc[0]
+    # T1's interpolated 07:05 pass and T2's 07:05 arrival share the one-bus bay.
+    assert (event["Stop Name"], event["Start"], event["End"]) == ("S1", "07:05", "07:06")
+    assert event["Estimated Times"] == "YES"
+    assert event["Bus 1"] == "Crosstown (blk trip-only:T1, trip T1)"
+    rows = list(openpyxl.load_workbook(workbook)["Summary"].iter_rows(values_only=True))
+    values = {row[0]: row[1] for row in rows}
+    assert values["Conflict events involving interpolated stop times"] == 1
+    assert (
+        values["Trips analyzed without a block_id (layovers and vehicle continuity unknown)"] == 2
+    )
+    notes = " ".join(str(row[1]) for row in rows)
+    assert "ESTIMATED_STOP_VISITS=1" in notes
+    assert "TRIP_ONLY_TRIPS=2" in notes
+    runs = pd.read_excel(workbook, sheet_name="Layover Runs", dtype=str)
+    assert set(runs["Type"]) == {"trip only"}

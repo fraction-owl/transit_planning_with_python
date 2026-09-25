@@ -11,9 +11,18 @@ anywhere in the cluster.
 Inputs
 ------
 - A GTFS folder (or ``.zip``) containing trips.txt, stop_times.txt,
-  routes.txt, stops.txt, calendar.txt and calendar_dates.txt. The service day
-  to analyze is selected via ``CALENDAR_SERVICE_IDS`` or ``SERVICE_DATE``;
-  optional route and stop filters narrow the run.
+  routes.txt and stops.txt, plus calendar.txt / calendar_dates.txt when the
+  service day is selected by ``SERVICE_DATE``. The service day to analyze is
+  selected via ``CALENDAR_SERVICE_IDS`` or ``SERVICE_DATE``; optional route and
+  stop filters narrow the run. Frequency-based trips (frequencies.txt) are not
+  modeled: the export stops if any are in the selected service, routes and
+  stops, and ignores the rest.
+- Optional GTFS fields: a route without a route_short_name is named by its
+  route_long_name, then its route_id; a stop without a stop_name by its
+  stop_id (with a warning). Untimed intermediate stops and trips without a
+  block_id stop the export unless ``INTERPOLATE_UNTIMED_STOPS`` /
+  ``TRIP_ONLY_WITHOUT_BLOCK_ID`` allow them, and the assumptions file then
+  records what was estimated or is unknown.
 
 Occupancy assumptions
 ---------------------
@@ -27,34 +36,54 @@ to a different stop so alternative bay assignments can be tested without
 editing the feed. The assumptions used are written to ``ASSUMPTIONS_FILE``
 alongside the output so downstream reports can echo them.
 
+A trip holds its vehicle from its first scheduled time (the first stop's
+arrival) to its last (the last stop's departure), so a scheduled hold at the
+first stop -- arriving 10:02, departing 10:10 -- keeps the bus in the bay
+from 10:02. Between-trip rows and reports quote the scheduled times: the
+previous trip's last-stop arrival and the next trip's first-stop departure
+(10:10).
+
 Outputs
 -------
 - One Excel workbook per vehicle block (``block_<block_id>_<route(s)>.xlsx``)
   in ``BLOCK_OUTPUT_FOLDER``: one row per minute with timestamp, route,
-  direction, trip, stop, arrival/departure times, and status.
+  direction, trip, stop, arrival/departure times, and status. ``Estimated
+  Time`` marks visits whose time was interpolated.
 - Optionally a single ``COMBINED_TIMELINE_FILE`` (CSV) holding every block's
   rows, which Step 2 can read directly instead of re-opening each workbook.
 - ``ASSUMPTIONS_FILE`` recording the parameters used for the run.
 - ``RUN_LOG_FILENAME``, a run-log sidecar in the same folder capturing the
-  verbatim CONFIGURATION block.
+  source CONFIGURATION block and the effective runtime settings.
+- ``SCHEDULE_SNAPSHOT_FILE`` with scheduled visits and occupancy settings for
+  exact bay-change rescoring, plus ``timeline_manifest.json`` identifying the
+  completed run. A failed rerun invalidates the run for downstream readers;
+  old files are retained but cannot be mistaken for current output.
 
 Typical usage
 -------------
 Update the paths in the CONFIGURATION section and run from a shell, ArcGIS
 Pro's Python window, or a Jupyter notebook.
+
+Run this revised exporter once per scenario before using the revised sweep.
+The pipeline requires one-minute sampling. The timeline automatically extends
+past DEFAULT_HOURS when a scheduled trip or its post-arrival buffer ends later.
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
+import json
 import logging
 import os
+import re
 import zipfile
 from collections.abc import Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Any, List, Optional
 
+import numpy as np
 import pandas as pd
 
 # ==================================================================================================
@@ -72,7 +101,7 @@ BLOCK_OUTPUT_FOLDER = r"your_output_folder_path\here"
 SCENARIO_NAME = ""
 
 DEFAULT_HOURS = 26
-TIME_INTERVAL_MINUTES = 1
+TIME_INTERVAL_MINUTES = 1  # must remain 1 for the downstream minute-based reports
 
 # Occupancy assumptions: how long a bus counts as occupying a stop beyond what
 # the GTFS times say, given as THROUGH_DWELL / PRE_DEPARTURE / POST_ARRIVAL /
@@ -104,22 +133,43 @@ CALENDAR_SERVICE_IDS: list[str] = ["4"]
 SERVICE_DATE = ""
 
 # Scenario testing: move a route's visits from one stop (bay) to another before
-# the timeline is built. Each entry matches rows on route_short_name and any of
+# the timeline is built. Each entry matches rows on the route and any of
 # from_stop_ids (and direction_id, if given) and rewrites stop_id/stop_name/
-# stop_code to to_stop_id. Applied before the stop filters below. Example:
-# move route 101's visits from bays 2956 and 2955 to bay 65:
+# stop_code to to_stop_id. Applied before the stop filters below. Name the
+# route by "route_short_name" (matched as ROUTE_SHORTNAME_FILTER matches) or by
+# "route_id". Example: move route 101's visits from bays 2956 and 2955 to bay 65:
 #   {"route_short_name": "101", "from_stop_ids": ["2956", "2955"], "to_stop_id": "65"}
 BAY_OVERRIDES: list[dict[str, Any]] = []
 
 # Only blocks that touch these routes / stops are processed (much faster than
 # the whole feed when only one facility matters). Leave all three empty to
-# process every block.
+# process every block. Routes are matched on route_short_name; a route without
+# a short name is matched on its route_long_name or route_id instead.
 ROUTE_SHORTNAME_FILTER: list[str] = []
 STOP_ID_FILTER: list[str] = []
 STOP_CODE_FILTER: list[str] = []
 
+# Untimed intermediate stops. GTFS lets stops between timepoints leave their
+# arrival and departure times blank. False: the export stops and names the
+# trips affected. True: each untimed stop gets a time interpolated between the
+# timed stops before and after it -- by shape_dist_traveled when those stops
+# all have one, otherwise evenly by stop order -- and its visits are flagged in
+# the timeline's "Estimated Time" column. A stop with only one of its two times
+# uses it for both, also flagged. A trip's first and last stops must be timed.
+INTERPOLATE_UNTIMED_STOPS: bool = False
+
+# Trips without a block_id. The block says which trips one vehicle runs in turn;
+# without it, how that bus spends the time between trips is unknown. False: the
+# export stops and names the trips. True ("trip-only" mode): each such trip is
+# analyzed on its own as block "trip-only:<trip_id>" -- its stop visits and the
+# loading/arrival buffers around it count toward bay occupancy, but any layover
+# before or after it is not modeled. The assumptions file records the trips, and
+# the bay-change sweep refuses such runs because it needs complete blocks.
+TRIP_ONLY_WITHOUT_BLOCK_ID: bool = False
+
 WRITE_PER_BLOCK_FILES = True
 COMBINED_TIMELINE_FILE = r"all_blocks_timeline.csv"  # in the run folder; "" to skip
+SCHEDULE_SNAPSHOT_FILE = r"schedule_snapshot.json"  # required by the exact sweep
 ASSUMPTIONS_FILE = r"timeline_assumptions.txt"  # in the run folder; "" to skip
 RUN_LOG_FILENAME = r"block_status_timeline_exporter_runlog.txt"  # in the run folder
 
@@ -156,9 +206,79 @@ LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
 
 # === END CONFIG ===
 
+# GTFS tables read by the export; the optional ones are loaded only when the feed has them.
+REQUIRED_GTFS_FILES: tuple[str, ...] = ("trips.txt", "stop_times.txt", "stops.txt", "routes.txt")
+OPTIONAL_GTFS_FILES: tuple[str, ...] = ("calendar.txt", "calendar_dates.txt", "frequencies.txt")
+
+# Block ID given to each trip analyzed in trip-only mode (TRIP_ONLY_WITHOUT_BLOCK_ID).
+TRIP_ONLY_BLOCK_PREFIX = "trip-only:"
+
 # ==================================================================================================
 # FUNCTIONS
 # ==================================================================================================
+
+
+def occupancy_settings() -> dict[str, int]:
+    """Return the effective occupancy settings used by this run."""
+    names = (
+        "THROUGH_DWELL_MINUTES",
+        "PRE_DEPARTURE_MINUTES",
+        "POST_ARRIVAL_MINUTES",
+        "IN_BAY_LAYOVER_MAX_MINUTES",
+        "LAYOVER_THRESHOLD",
+    )
+    return {name: globals()[name] for name in names}
+
+
+def validate_configuration() -> None:
+    """Reject unsupported intervals, invalid durations and ambiguous output names."""
+    if TIME_INTERVAL_MINUTES != 1:
+        raise ValueError("The downstream bay reports require TIME_INTERVAL_MINUTES = 1.")
+    for name, value in occupancy_settings().items():
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError(f"{name} must be a nonnegative integer.")
+    if THROUGH_DWELL_MINUTES < 1 or LAYOVER_THRESHOLD < IN_BAY_LAYOVER_MAX_MINUTES:
+        raise ValueError("Through dwell must be positive and layover thresholds must be ordered.")
+    if not isinstance(DEFAULT_HOURS, int) or DEFAULT_HOURS < 1 or MAX_TRIPS_PER_BLOCK < 1:
+        raise ValueError("DEFAULT_HOURS and MAX_TRIPS_PER_BLOCK must be positive integers.")
+    if not COMBINED_TIMELINE_FILE and not WRITE_PER_BLOCK_FILES:
+        raise ValueError("Enable the combined CSV or per-block workbooks.")
+    filenames = [
+        value
+        for value in (
+            COMBINED_TIMELINE_FILE,
+            ASSUMPTIONS_FILE,
+            SCHEDULE_SNAPSHOT_FILE,
+            RUN_LOG_FILENAME,
+            "timeline_manifest.json",
+        )
+        if value
+    ]
+    if not SCHEDULE_SNAPSHOT_FILE or len({name.casefold() for name in filenames}) != len(filenames):
+        raise ValueError("Output filenames must be nonempty where required and distinct.")
+    for name in filenames:
+        if Path(name).name != name or "\\" in name:
+            raise ValueError("Output filename settings must be basenames inside the run folder.")
+    stops = [str(stop) for cluster in BUS_STOP_CLUSTERS_STEP1 for stop in cluster["stops"]]
+    if len(stops) != len(set(stops)):
+        raise ValueError("A stop may belong to only one cluster.")
+    for name in ("INTERPOLATE_UNTIMED_STOPS", "TRIP_ONLY_WITHOUT_BLOCK_ID"):
+        if not isinstance(globals()[name], bool):
+            raise ValueError(f"{name} must be True or False.")
+    for override in BAY_OVERRIDES:
+        if ("route_id" in override) == ("route_short_name" in override):
+            raise ValueError(
+                f"Each bay override needs exactly one of route_short_name and route_id: {override}"
+            )
+
+
+def write_json_atomic(path: Path, value: dict[str, Any]) -> None:
+    """Publish JSON atomically so consumers never read a partial manifest or snapshot."""
+    temporary = path.with_name(path.name + ".tmp")
+    # Pandas normalizes NumPy scalar types to JSON-compatible built-ins.
+    payload = json.loads(pd.Series([value]).to_json(orient="values"))[0]
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temporary, path)
 
 
 def run_output_folder() -> str:
@@ -194,15 +314,71 @@ def resolve_service_ids(
         target = dt.datetime.strptime(service_date.strip(), "%Y%m%d").date()
     except ValueError as exc:
         raise ValueError(f"SERVICE_DATE must be a YYYYMMDD date; got {service_date!r}") from exc
-    active = expand_service_active_dates(calendar_df, calendar_dates_df)
+    active = expand_service_active_dates(calendar_df, calendar_dates_df, today=target)
     return sorted(service_ids_active_on(active, target))
 
 
 def validate_folders(input_path: str, output_path: str) -> None:
     """Check that the input folder exists, and ensure the output folder is created if not."""
-    if not os.path.isdir(input_path):
-        raise NotADirectoryError(f"Input path does not exist or is not a directory: {input_path}")
+    if not os.path.isdir(input_path) and not (
+        os.path.isfile(input_path) and zipfile.is_zipfile(input_path)
+    ):
+        raise NotADirectoryError(f"Input must be a GTFS directory or ZIP archive: {input_path}")
     os.makedirs(output_path, exist_ok=True)
+
+
+def available_gtfs_files(gtfs_path: str, names: Sequence[str]) -> tuple[str, ...]:
+    """Return the *names* present, and not empty, in a GTFS folder or ZIP archive.
+
+    ZIP members are matched by base name, as :func:`load_gtfs_data` matches
+    them, so a feed nested one folder deep inside the archive is found too.
+    Zero-byte files are skipped with a warning because the loader rejects them.
+    """
+    sizes: dict[str, int] = {}
+    if os.path.isdir(gtfs_path):
+        for name in names:
+            path = os.path.join(gtfs_path, name)
+            if os.path.isfile(path):
+                sizes[name] = os.path.getsize(path)
+    else:
+        with zipfile.ZipFile(gtfs_path) as archive:
+            for info in archive.infolist():
+                name = os.path.basename(info.filename)
+                if name in names:
+                    sizes[name] = max(sizes.get(name, 0), info.file_size)
+    for name in names:
+        if sizes.get(name) == 0:
+            logging.warning("Skipping empty optional file %s.", name)
+    return tuple(name for name in names if sizes.get(name, 0) > 0)
+
+
+def reject_selected_frequency_trips(
+    frequencies: Optional[pd.DataFrame], merged_df: pd.DataFrame
+) -> None:
+    """Stop on frequency-based trips in the analyzed selection; ignore the rest.
+
+    A frequencies.txt trip is a template repeated at a headway, and its block
+    does not say which vehicle runs each repetition, so it cannot be rendered
+    as one vehicle's schedule. Trips outside the selected service, routes and
+    stops do not reach the export and are only counted in the log.
+
+    Raises:
+        ValueError: If any trip in *merged_df* appears in *frequencies*.
+    """
+    if frequencies is None or frequencies.empty or "trip_id" not in frequencies:
+        return
+    frequency_trips = set(frequencies["trip_id"].dropna().astype(str))
+    selected = sorted(frequency_trips & set(merged_df["trip_id"].astype(str)))
+    if selected:
+        listed = ", ".join(selected[:5]) + (", ..." if len(selected) > 5 else "")
+        raise ValueError(
+            f"{len(selected)} selected trip(s) are frequency-based ({listed}). Expand them "
+            "into scheduled trips, or exclude them with the service, route or stop filters."
+        )
+    logging.info(
+        "Ignoring %d frequency-based trip(s) outside the selected service, routes and stops.",
+        len(frequency_trips),
+    )
 
 
 # --------------------------------------------------------------------------------------------------
@@ -274,61 +450,379 @@ def mark_first_and_last_stops(df_in: pd.DataFrame) -> pd.DataFrame:
     return df_out
 
 
-def find_cluster(stop_id: str, bus_stop_clusters: list[dict[str, Any]]) -> Optional[str]:
-    """Given a stop_id, return the named cluster (if any) or None if not found."""
-    for cluster_item in bus_stop_clusters:
+# Canonical version lives in utils/block_timeline_helpers.py -- keep this copy in sync.
+def find_cluster(stop_id: str, clusters: list[dict[str, Any]]) -> Optional[str]:
+    """Return cluster name containing the given stop ID, if any."""
+    for cluster_item in clusters:
         if stop_id in cluster_item["stops"]:
             return cluster_item["name"]
     return None
 
 
 # --------------------------------------------------------------------------------------------------
-# BRIDGING LOGIC REFACTOR
+# BLOCK RENDERER
 # --------------------------------------------------------------------------------------------------
 
+# status_for_same_trip, gap_status, make_timeline_row, row_for_inactive and build_schedule_rows:
+# canonical versions live in utils/block_timeline_helpers.py -- keep these copies in sync.
 
-def _status_for_same_trip(minute: int, stop_info: tuple) -> Optional[tuple]:
-    """Status of a bus at ``minute`` if it is at one of this trip's own stops.
 
-    Through stops (arrival == departure, neither first nor last) are occupied
-    for ``THROUGH_DWELL_MINUTES`` starting at the stop time. A first stop with
-    a GTFS hold (arrival < departure) is DWELL, then LOADING for the last
-    ``PRE_DEPARTURE_MINUTES`` before departure. Sitting *before* a trip's
-    first time and staying *after* its last time are handled in
-    :func:`_row_for_inactive`, because those minutes fall outside the trip.
-    """
-    (arr, dep, s_id, s_name, t_id, is_first, is_last, s_seq, t_val) = stop_info
-    detail = (s_id, s_name, minutes_to_hhmm(arr), minutes_to_hhmm(dep), t_id, s_seq, t_val)
-
-    if is_last and minute == arr:
-        return ("ARRIVE",) + detail
-    if is_first and minute == dep:
+def status_for_same_trip(
+    minute: int, stop_info: tuple, settings: dict[str, int]
+) -> Optional[tuple]:
+    """Return a visit's occupancy, including both boundaries of a scheduled hold."""
+    arr, dep, sid, name, tid, first, last, seq, timepoint = stop_info
+    detail = (sid, name, minutes_to_hhmm(arr), minutes_to_hhmm(dep), tid, seq, timepoint)
+    if first and minute == dep:
         return ("DEPART",) + detail
-    if not is_first and not is_last and arr == dep and arr <= minute < arr + THROUGH_DWELL_MINUTES:
-        return ("ARRIVE/DEPART",) + detail
-    if arr < minute < dep:
-        if is_first and minute >= dep - PRE_DEPARTURE_MINUTES:
+    if last and minute == arr:
+        return ("ARRIVE",) + detail
+    if arr <= minute <= dep:
+        if not first and not last and arr == dep:
+            return ("ARRIVE/DEPART",) + detail
+        if first and minute >= dep - settings["PRE_DEPARTURE_MINUTES"]:
             return ("LOADING",) + detail
         return ("DWELL",) + detail
+    if not first and not last and arr == dep:
+        if arr <= minute < arr + settings["THROUGH_DWELL_MINUTES"]:
+            return ("ARRIVE/DEPART",) + detail
     return None
 
 
-def _gap_status(gap: int, same_place: bool) -> tuple[str, str]:
-    """Classify the gap between two trips of one block.
-
-    Returns ``(status, layover_location)``. A gap that starts and ends at the
-    same stop or in the same cluster is a layover: in the arrival bay
-    (``DWELL``) when the gap is at most ``IN_BAY_LAYOVER_MAX_MINUTES``,
-    otherwise in the overflow/layover space (``LAYOVER``, or ``LONG BREAK``
-    beyond ``LAYOVER_THRESHOLD``). Anything else is a ``DEADHEAD``.
-    """
+def gap_status(gap: int, same_place: bool, settings: dict[str, int]) -> tuple[str, str]:
+    """Classify a between-trip gap using this scenario's occupancy assumptions."""
     if not same_place:
-        return ("DEADHEAD", "")
-    if gap <= IN_BAY_LAYOVER_MAX_MINUTES:
-        return ("DWELL", "in bay")
-    if gap <= LAYOVER_THRESHOLD:
-        return ("LAYOVER", "overflow")
-    return ("LONG BREAK", "overflow")
+        return "DEADHEAD", ""
+    if gap <= settings["IN_BAY_LAYOVER_MAX_MINUTES"]:
+        return "DWELL", "in bay"
+    if gap <= settings["LAYOVER_THRESHOLD"]:
+        return "LAYOVER", "overflow"
+    return "LONG BREAK", "overflow"
+
+
+# --------------------------------------------------------------------------------------------------
+# MAIN BLOCK PROCESSING
+# --------------------------------------------------------------------------------------------------
+
+
+def check_for_overlapping_trips(block_subset: pd.DataFrame, block_id: str) -> None:
+    """Reject positive-duration trip overlaps within one physical vehicle block."""
+    spans = block_subset.groupby("trip_id").agg(
+        start=("arrival_min", "min"), end=("departure_min", "max")
+    )
+    previous_end = -1
+    previous_id = ""
+    for trip_id, row in spans.sort_values("start").iterrows():
+        if row["start"] < previous_end:
+            raise ValueError(
+                f"Overlapping trips in block {block_id}: {previous_id} and {trip_id}. "
+                "Check service selection and the source schedule."
+            )
+        previous_end = int(row["end"])
+        previous_id = str(trip_id)
+
+
+def _text(value: object) -> str:
+    """GTFS field as text, with a missing value as ``""``."""
+    return "" if value is None or pd.isna(value) else str(value)
+
+
+def _create_trips_summary(
+    block_subset: pd.DataFrame,
+) -> list[dict[str, Any]]:  # Added return type annotation
+    """Helper to build trip summaries for a block.
+
+    Returns a list of dictionaries with trip info and sorted stop times.
+    """
+    trips_summary = []
+    for trip_id, trip_df in block_subset.groupby("trip_id"):
+        trip_df_sorted = trip_df.sort_values("stop_sequence")
+        start_time = int(trip_df_sorted["arrival_min"].iloc[0])
+        end_time = int(trip_df_sorted["departure_min"].iloc[-1])
+
+        stop_times_sequence = []
+        for _, row in trip_df_sorted.iterrows():
+            t_val = row.get("timepoint", 0)
+            stop_times_sequence.append(
+                (
+                    row["arrival_min"],
+                    row["departure_min"],
+                    row["stop_id"],
+                    row["stop_name"],
+                    row["trip_id"],
+                    row["is_first_stop"],
+                    row["is_last_stop"],
+                    row["stop_sequence"],
+                    t_val,
+                )
+            )
+
+        first_row = trip_df_sorted.iloc[0]
+        last_row = trip_df_sorted.iloc[-1]
+        flags = trip_df_sorted.get("estimated_time")
+        estimated = [] if flags is None else trip_df_sorted.loc[flags.astype(bool), "stop_sequence"]
+        trips_summary.append(
+            {
+                "trip_id": trip_id,
+                # Occupancy bounds: the trip holds its vehicle from its first scheduled
+                # time (first-stop arrival) to its last (last-stop departure).
+                "start": start_time,
+                "end": end_time,
+                # Scheduled first-stop departure and last-stop arrival, as reported.
+                "departure": int(first_row["departure_min"]),
+                "arrival": int(last_row["arrival_min"]),
+                "stop_times_sequence": stop_times_sequence,
+                "route_id": first_row["route_id"],
+                "route_short_name": _text(first_row.get("route_short_name")),
+                "route_long_name": _text(first_row.get("route_long_name")),
+                "trip_headsign": _text(first_row.get("trip_headsign")),
+                "direction_id": first_row["direction_id"],
+                "block": str(first_row["block_id"]),
+                "estimated_stop_sequences": [int(seq) for seq in estimated],
+                "first_stop_id": first_row["stop_id"],
+                "first_stop_name": first_row["stop_name"],
+                "first_stop_seq": first_row["stop_sequence"],
+                "last_stop_id": last_row["stop_id"],
+                "last_stop_name": last_row["stop_name"],
+                "last_stop_seq": last_row["stop_sequence"],
+            }
+        )
+
+    trips_summary.sort(key=lambda x: x["start"])
+    return trips_summary
+
+
+def make_timeline_row(
+    minute: int,
+    block_id: str,
+    status: str,
+    trip: Optional[dict[str, Any]] = None,
+    stop_id: str = "",
+    stop_name: str = "",
+    stop_seq: Any = "",
+    arr_str: str = "",
+    dep_str: str = "",
+    trip_id: str = "",
+    timepoint: int = 0,
+    layover_location: str = "",
+    prev_trip_id: str = "",
+    next_trip_id: str = "",
+    stop_role: str = "",
+) -> dict[str, Any]:
+    """Build one timeline row with explicit visit role and scheduled trip bounds.
+
+    ``Estimated Time`` is True when the row's stop visit has an interpolated
+    time; ``Trip Start Minute`` / ``Trip End Minute`` are the trip's occupancy
+    bounds (first-stop arrival, last-stop departure).
+    """
+    return {
+        "Timestamp": minutes_to_hhmm(minute),
+        "Block": block_id,
+        "Route": trip["route_id"] if trip else "",
+        "Route Short Name": trip["route_short_name"] if trip else "",
+        "Route Long Name": trip.get("route_long_name", "") if trip else "",
+        "Direction": trip["direction_id"] if trip else "",
+        "Trip Headsign": trip["trip_headsign"] if trip else "",
+        "Trip ID": trip_id,
+        "Stop ID": stop_id or "",
+        "Stop Name": stop_name or "",
+        "Stop Sequence": stop_seq if stop_seq is not None else "",
+        "Arrival Time": arr_str or "",
+        "Departure Time": dep_str or "",
+        "Status": status,
+        "Layover Location": layover_location,
+        "Prev Trip ID": prev_trip_id,
+        "Next Trip ID": next_trip_id,
+        "Timepoint": timepoint,
+        "Stop Role": stop_role,
+        "Estimated Time": bool(trip) and stop_seq in trip.get("estimated_stop_sequences", ()),
+        "Trip Start Minute": trip["start"] if trip else "",
+        "Trip End Minute": trip["end"] if trip else "",
+    }
+
+
+def row_for_inactive(
+    minute: int,
+    block_id: str,
+    all_trips: list[dict[str, Any]],
+    bus_stop_clusters: list[dict[str, Any]],
+    settings: dict[str, int],
+) -> dict[str, Any]:
+    """Recalculate loading, post-arrival occupancy and layovers between trips.
+
+    Presence follows each trip's occupancy bounds -- ``start`` (first-stop
+    arrival) to ``end`` (last-stop departure) -- so a scheduled hold before the
+    next departure stays occupied and the layover is classified on the
+    occupancy gap between them. The Arrival/Departure Time columns quote the
+    schedule: the previous trip's last-stop arrival and the next trip's
+    first-stop departure.
+    """
+    previous = [trip for trip in all_trips if trip["end"] < minute]
+    upcoming = [trip for trip in all_trips if trip["start"] > minute]
+    prev = max(previous, key=lambda trip: trip["end"]) if previous else None
+    nxt = min(upcoming, key=lambda trip: trip["start"]) if upcoming else None
+    prev_id = prev["trip_id"] if prev else ""
+    next_id = nxt["trip_id"] if nxt else ""
+    arr = minutes_to_hhmm(prev["arrival"]) if prev else ""
+    dep = minutes_to_hhmm(nxt["departure"]) if nxt else ""
+    if nxt and minute >= nxt["start"] - settings["PRE_DEPARTURE_MINUTES"]:
+        return make_timeline_row(
+            minute,
+            block_id,
+            "LOADING",
+            nxt,
+            nxt["first_stop_id"],
+            nxt["first_stop_name"],
+            nxt["first_stop_seq"],
+            arr,
+            dep,
+            next_id,
+            layover_location="in bay",
+            prev_trip_id=prev_id,
+            next_trip_id=next_id,
+            stop_role="depart",
+        )
+    if prev and minute <= prev["end"] + settings["POST_ARRIVAL_MINUTES"]:
+        return make_timeline_row(
+            minute,
+            block_id,
+            "ARRIVE",
+            prev,
+            prev["last_stop_id"],
+            prev["last_stop_name"],
+            prev["last_stop_seq"],
+            arr,
+            dep,
+            prev_id,
+            layover_location="in bay",
+            prev_trip_id=prev_id,
+            next_trip_id=next_id,
+            stop_role="arrive",
+        )
+    if prev and nxt:
+        a = find_cluster(prev["last_stop_id"], bus_stop_clusters)
+        b = find_cluster(nxt["first_stop_id"], bus_stop_clusters)
+        same_place = prev["last_stop_id"] == nxt["first_stop_id"] or (a is not None and a == b)
+        occupancy_gap = nxt["start"] - prev["end"]
+        status, location = gap_status(occupancy_gap, same_place, settings)
+        if status != "DEADHEAD":
+            return make_timeline_row(
+                minute,
+                block_id,
+                status,
+                prev,
+                prev["last_stop_id"],
+                prev["last_stop_name"],
+                prev["last_stop_seq"],
+                arr,
+                dep,
+                prev_id,
+                layover_location=location,
+                prev_trip_id=prev_id,
+                next_trip_id=next_id,
+                stop_role="arrive",
+            )
+        return make_timeline_row(
+            minute, block_id, status, prev_trip_id=prev_id, next_trip_id=next_id
+        )
+    return make_timeline_row(
+        minute, block_id, "INACTIVE", prev_trip_id=prev_id, next_trip_id=next_id
+    )
+
+
+def build_schedule_rows(
+    trips_summary: list[dict[str, Any]],
+    timeline: range,
+    block_id: str,
+    bus_stop_clusters: list[dict[str, Any]],
+    settings: dict[str, int],
+    occupancy_only: bool = False,
+) -> list[dict[str, Any]]:
+    """Render a block from scheduled visits, with one physical vehicle per minute.
+
+    Args:
+        trips_summary: Complete scheduled trips on this block.
+        timeline: Minutes to render; the pipeline requires a one-minute step.
+        block_id: Physical vehicle block identifier.
+        bus_stop_clusters: Stops treated as one facility for layover decisions.
+        settings: Explicit occupancy settings for this scenario.
+        occupancy_only: Omit traveling, inactive and deadhead rows for rescoring.
+
+    Returns:
+        Timeline row dictionaries in chronological order.
+    """
+    if timeline.step != 1:
+        raise ValueError("The bay-analysis pipeline requires TIME_INTERVAL_MINUTES = 1.")
+    active: dict[int, list[dict[str, Any]]] = {}
+    visits: dict[tuple[str, int], tuple] = {}
+    for trip in trips_summary:
+        for minute in range(
+            max(timeline.start, trip["start"]), min(timeline.stop, trip["end"] + 1)
+        ):
+            active.setdefault(minute, []).append(trip)
+        sequence = trip["stop_times_sequence"]
+        for i, stop in enumerate(sequence):
+            arr, dep = stop[:2]
+            finish = dep
+            if not stop[5] and not stop[6] and arr == dep:
+                finish = arr + settings["THROUGH_DWELL_MINUTES"] - 1
+            if i + 1 < len(sequence):
+                # Once the next visit begins, an earlier through dwell cannot reappear.
+                finish = min(finish, sequence[i + 1][0] - 1)
+            finish = min(finish, trip["end"], timeline.stop - 1)
+            for minute in range(max(arr, timeline.start), finish + 1):
+                status = status_for_same_trip(minute, stop, settings)
+                if status is not None:
+                    role = "depart" if stop[5] else "arrive" if stop[6] else "through"
+                    visits[trip["trip_id"], minute] = (*status, role)
+    rows: list[dict[str, Any]] = []
+    for minute in timeline:
+        candidates = [
+            (trip, visits[trip["trip_id"], minute])
+            for trip in active.get(minute, [])
+            if (trip["trip_id"], minute) in visits
+        ]
+        if candidates:
+            trip, status = min(
+                candidates,
+                key=lambda item: (
+                    item[1][0] != "DEPART",
+                    item[1][7] == 0,
+                    item[1][6],
+                    item[0]["trip_id"],
+                ),
+            )
+            state, sid, name, arr, dep, tid, seq, point, role = status
+            rows.append(
+                make_timeline_row(
+                    minute,
+                    block_id,
+                    state,
+                    trip,
+                    sid,
+                    name,
+                    seq,
+                    arr,
+                    dep,
+                    tid,
+                    point,
+                    layover_location="in bay" if state in {"DWELL", "LOADING"} else "",
+                    stop_role=role,
+                )
+            )
+        elif minute in active:
+            if not occupancy_only:
+                trip = min(active[minute], key=lambda value: (value["start"], value["trip_id"]))
+                rows.append(
+                    make_timeline_row(
+                        minute, block_id, "TRAVELING BETWEEN STOPS", trip, trip_id=trip["trip_id"]
+                    )
+                )
+        else:
+            row = row_for_inactive(minute, block_id, trips_summary, bus_stop_clusters, settings)
+            if not occupancy_only or row["Status"] not in {"INACTIVE", "DEADHEAD"}:
+                rows.append(row)
+    return rows
 
 
 def get_status_for_minute(
@@ -343,66 +837,46 @@ def get_status_for_minute(
     Optional[int],
     int,
 ]:
-    """Determine the block's status at a specific 'minute' within one trip.
+    """Determine one trip's status at a specific minute, using the block renderer's rules.
+
+    Kept for existing callers: it renders the single trip with
+    :func:`build_schedule_rows` and the current occupancy settings, so holds,
+    through-stop dwell and loading follow the same rules as the export.
 
     Returns tuple:
        (status, stop_id, stop_name, arrival_str, departure_str,
         trip_id_for_status, stop_sequence, timepoint_value)
+    ``"EMPTY"`` when the sequence is empty or the minute falls outside the trip.
     """
     if not stop_times_sequence:
         return ("EMPTY", None, None, None, None, None, None, 0)
-
-    # Later stops take precedence: when THROUGH_DWELL_MINUTES stretches one
-    # stop's window over the next stop's scheduled minute, the bus has moved on.
-    for item in reversed(stop_times_sequence):
-        same_trip_result = _status_for_same_trip(minute, item)
-        if same_trip_result:
-            return same_trip_result
-
-    for i, item in enumerate(stop_times_sequence):
-        # Between this stop and the next one of the same trip
-        if i < len(stop_times_sequence) - 1:
-            next_arr = stop_times_sequence[i + 1][0]
-            if item[1] < minute < next_arr:
-                return ("TRAVELING BETWEEN STOPS", None, None, None, None, item[4], None, 0)
-
-    return ("EMPTY", None, None, None, None, None, None, 0)
-
-
-# --------------------------------------------------------------------------------------------------
-# MAIN BLOCK PROCESSING
-# --------------------------------------------------------------------------------------------------
-
-
-def check_for_overlapping_trips(
-    block_subset: pd.DataFrame, block_id: str
-) -> None:  # Added return type annotation
-    """Print a warning if any trips within this block overlap in time."""
-    trip_times = []
-    for trip_id, group in block_subset.groupby("trip_id"):
-        start_val = group["arrival_min"].min()
-        end_val = group["departure_min"].max()
-        trip_times.append((trip_id, start_val, end_val))
-
-    trip_times.sort(key=lambda x: x[1])
-    for i in range(len(trip_times) - 1):
-        trip1_id, start1, end1 = trip_times[i]
-        for j in range(i + 1, len(trip_times)):
-            trip2_id, start2, end2 = trip_times[j]
-            # If they intersect in any way
-            if start2 <= end1 and start1 <= end2:
-                logging.warning(
-                    "WARNING: Overlapping trips in block %s: "
-                    "Trip %s (%s–%s) overlaps with "
-                    "%s (%s–%s)",
-                    block_id,
-                    trip1_id,
-                    start1,
-                    end1,
-                    trip2_id,
-                    start2,
-                    end2,
-                )
+    start, end = stop_times_sequence[0][0], stop_times_sequence[-1][1]
+    if not start <= minute <= end:
+        return ("EMPTY", None, None, None, None, None, None, 0)
+    trip = {
+        "trip_id": stop_times_sequence[0][4],
+        "start": start,
+        "end": end,
+        "departure": stop_times_sequence[0][1],
+        "arrival": stop_times_sequence[-1][0],
+        "stop_times_sequence": stop_times_sequence,
+        "route_id": "",
+        "route_short_name": "",
+        "trip_headsign": "",
+        "direction_id": "",
+    }
+    row = build_schedule_rows([trip], range(minute, minute + 1), "", [], occupancy_settings())[0]
+    value = {column: None if cell == "" else cell for column, cell in row.items()}
+    return (
+        row["Status"],
+        value["Stop ID"],
+        value["Stop Name"],
+        value["Arrival Time"],
+        value["Departure Time"],
+        value["Trip ID"],
+        value["Stop Sequence"],
+        row["Timepoint"],
+    )
 
 
 def fill_stop_ids_for_dwell_layover_loading(
@@ -416,6 +890,9 @@ def fill_stop_ids_for_dwell_layover_loading(
     'Trip ID' fields. The data used for filling is based on the last known
     stop information from the same vehicle block, enhancing the readability
     of the final output.
+
+    The block renderer now writes the stop details on these rows itself, so
+    the export no longer calls this; it is kept for existing callers.
 
     Args:
         df_in (pd.DataFrame): The input DataFrame containing vehicle status and
@@ -460,305 +937,6 @@ def fill_stop_ids_for_dwell_layover_loading(
     return df_out
 
 
-def _create_trips_summary(
-    block_subset: pd.DataFrame,
-) -> list[dict[str, Any]]:  # Added return type annotation
-    """Helper to build trip summaries for a block.
-
-    Returns a list of dictionaries with trip info and sorted stop times.
-    """
-    trips_summary = []
-    for trip_id, trip_df in block_subset.groupby("trip_id"):
-        trip_df_sorted = trip_df.sort_values("stop_sequence")
-        start_time = trip_df_sorted["arrival_min"].min()
-        end_time = trip_df_sorted["departure_min"].max()
-
-        stop_times_sequence = []
-        for _, row in trip_df_sorted.iterrows():
-            t_val = row.get("timepoint", 0)
-            stop_times_sequence.append(
-                (
-                    row["arrival_min"],
-                    row["departure_min"],
-                    row["stop_id"],
-                    row["stop_name"],
-                    row["trip_id"],
-                    row["is_first_stop"],
-                    row["is_last_stop"],
-                    row["stop_sequence"],
-                    t_val,
-                )
-            )
-
-        first_row = trip_df_sorted.iloc[0]
-        last_row = trip_df_sorted.iloc[-1]
-        trips_summary.append(
-            {
-                "trip_id": trip_id,
-                "start": start_time,
-                "end": end_time,
-                "stop_times_sequence": stop_times_sequence,
-                "route_id": first_row["route_id"],
-                "route_short_name": first_row.get("route_short_name", "") or "",
-                "trip_headsign": first_row.get("trip_headsign", "") or "",
-                "direction_id": first_row["direction_id"],
-                "first_stop_id": first_row["stop_id"],
-                "first_stop_name": first_row["stop_name"],
-                "first_stop_seq": first_row["stop_sequence"],
-                "last_stop_id": last_row["stop_id"],
-                "last_stop_name": last_row["stop_name"],
-                "last_stop_seq": last_row["stop_sequence"],
-            }
-        )
-
-    trips_summary.sort(key=lambda x: x["start"])
-    return trips_summary
-
-
-def _status_for_active_trips(
-    minute: int,
-    active_trips: list[dict[str, Any]],
-    bus_stop_clusters: list[dict[str, Any]],
-) -> tuple[Optional[dict[str, Any]], tuple]:  # Added return type annotation
-    """Among all 'active' trips for the given minute, determine the single chosen status."""
-    candidate_info = []
-    for trip_obj in active_trips:
-        status_tuple = get_status_for_minute(minute, trip_obj["stop_times_sequence"])
-        candidate_info.append((trip_obj, status_tuple))
-
-    # Filter out actual "EMPTY" statuses
-    valid_candidates = [
-        (trip_obj, stat) for (trip_obj, stat) in candidate_info if stat[0] != "EMPTY"
-    ]
-    if not valid_candidates:
-        # All were "EMPTY"
-        return None, ("EMPTY", None, None, None, None, None, None, 0)
-
-    if len(valid_candidates) == 1:
-        return valid_candidates[0]
-
-    # Tie-break if multiple
-    def candidate_sort_key(item: tuple[dict[str, Any], tuple]) -> tuple[bool, int]:
-        stat = item[1]
-        stop_seq = stat[6] if stat[6] is not None else 999999
-        timepoint_val = stat[7] if len(stat) == 8 else 0
-        # Prefer timepoints, then lower stop_sequence
-        return (timepoint_val == 0, stop_seq)
-
-    valid_candidates.sort(key=candidate_sort_key)
-    return valid_candidates[0]
-
-
-def _make_row(
-    minute: int,
-    block_id: str,
-    status: str,
-    trip: Optional[dict[str, Any]] = None,
-    stop_id: str = "",
-    stop_name: str = "",
-    stop_seq: Any = "",
-    arr_str: str = "",
-    dep_str: str = "",
-    trip_id: str = "",
-    timepoint: int = 0,
-    layover_location: str = "",
-    prev_trip_id: str = "",
-    next_trip_id: str = "",
-) -> dict[str, Any]:
-    """Assemble one output row. Route fields come from ``trip`` when given."""
-    return {
-        "Timestamp": minutes_to_hhmm(minute),
-        "Block": block_id,
-        "Route": trip["route_id"] if trip else "",
-        "Route Short Name": trip["route_short_name"] if trip else "",
-        "Direction": trip["direction_id"] if trip else "",
-        "Trip Headsign": trip["trip_headsign"] if trip else "",
-        "Trip ID": trip_id,
-        "Stop ID": stop_id or "",
-        "Stop Name": stop_name or "",
-        "Stop Sequence": stop_seq if stop_seq is not None else "",
-        "Arrival Time": arr_str or "",
-        "Departure Time": dep_str or "",
-        "Status": status,
-        "Layover Location": layover_location,
-        "Prev Trip ID": prev_trip_id,
-        "Next Trip ID": next_trip_id,
-        "Timepoint": timepoint,
-    }
-
-
-def _row_for_inactive(
-    minute: int,
-    block_id: str,
-    all_trips: list[dict[str, Any]],
-    bus_stop_clusters: list[dict[str, Any]],
-) -> dict[str, Any]:
-    """Return a row describing the vehicle when **no trip is active**.
-
-    Precedence, using the closest finished trip (``prev``) and the next
-    upcoming trip (``next``):
-
-    1. Within ``PRE_DEPARTURE_MINUTES`` of ``next``'s first time: *LOADING*
-       at ``next``'s first stop (this also covers a block's pull-out).
-    2. Within ``POST_ARRIVAL_MINUTES`` after ``prev``'s last time: *ARRIVE*
-       at ``prev``'s last stop (also covers a block's pull-in).
-    3. Otherwise, between two trips: *DWELL* (in the arrival bay),
-       *LAYOVER* / *LONG BREAK* (in the overflow space) when the next trip
-       starts at the same stop or in the same cluster; *DEADHEAD* when it
-       starts somewhere else.
-    4. No bounding trip on one side: *INACTIVE*.
-    """
-    prev_trip: Optional[dict[str, Any]] = None
-    next_trip: Optional[dict[str, Any]] = None
-
-    # ------------------------------------------------------------------ locate bounding trips
-    for trip_obj in all_trips:
-        if trip_obj["end"] < minute:
-            if prev_trip is None or trip_obj["end"] > prev_trip["end"]:
-                prev_trip = trip_obj
-        elif trip_obj["start"] > minute:
-            if next_trip is None or trip_obj["start"] < next_trip["start"]:
-                next_trip = trip_obj
-
-    prev_id = prev_trip["trip_id"] if prev_trip else ""
-    next_id = next_trip["trip_id"] if next_trip else ""
-    prev_end_str = minutes_to_hhmm(prev_trip["end"]) if prev_trip else ""
-    next_start_str = minutes_to_hhmm(next_trip["start"]) if next_trip else ""
-
-    # ------------------------------------------------------------------ status decision
-    if next_trip is not None and minute >= next_trip["start"] - PRE_DEPARTURE_MINUTES:
-        return _make_row(
-            minute,
-            block_id,
-            "LOADING",
-            trip=next_trip,
-            stop_id=next_trip["first_stop_id"],
-            stop_name=next_trip["first_stop_name"],
-            stop_seq=next_trip["first_stop_seq"],
-            arr_str=prev_end_str,
-            dep_str=next_start_str,
-            trip_id=next_id,
-            layover_location="in bay",
-            prev_trip_id=prev_id,
-            next_trip_id=next_id,
-        )
-
-    if prev_trip is not None and minute < prev_trip["end"] + POST_ARRIVAL_MINUTES:
-        return _make_row(
-            minute,
-            block_id,
-            "ARRIVE",
-            trip=prev_trip,
-            stop_id=prev_trip["last_stop_id"],
-            stop_name=prev_trip["last_stop_name"],
-            stop_seq=prev_trip["last_stop_seq"],
-            arr_str=prev_end_str,
-            dep_str=next_start_str,
-            trip_id=prev_id,
-            layover_location="in bay",
-            prev_trip_id=prev_id,
-            next_trip_id=next_id,
-        )
-
-    if prev_trip is not None and next_trip is not None:
-        same_stop = prev_trip["last_stop_id"] == next_trip["first_stop_id"]
-        prev_cluster = find_cluster(prev_trip["last_stop_id"], bus_stop_clusters)
-        next_cluster = find_cluster(next_trip["first_stop_id"], bus_stop_clusters)
-        same_cluster = prev_cluster is not None and prev_cluster == next_cluster
-        status, location = _gap_status(
-            next_trip["start"] - prev_trip["end"], same_stop or same_cluster
-        )
-        if status == "DEADHEAD":
-            return _make_row(minute, block_id, status, prev_trip_id=prev_id, next_trip_id=next_id)
-        return _make_row(
-            minute,
-            block_id,
-            status,
-            trip=prev_trip,
-            stop_id=prev_trip["last_stop_id"],
-            stop_name=prev_trip["last_stop_name"],
-            stop_seq=prev_trip["last_stop_seq"],
-            arr_str=prev_end_str,
-            dep_str=next_start_str,
-            trip_id=prev_id,
-            layover_location=location,
-            prev_trip_id=prev_id,
-            next_trip_id=next_id,
-        )
-
-    return _make_row(minute, block_id, "INACTIVE", prev_trip_id=prev_id, next_trip_id=next_id)
-
-
-def _build_schedule_rows(
-    trips_summary: list[dict[str, Any]],
-    timeline: range,
-    block_id: str,
-    bus_stop_clusters: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Create the minute-by-minute schedule rows for a single block.
-
-    Args:
-        trips_summary: Output of :func:`_create_trips_summary`.
-        timeline: Range object representing every minute to be evaluated.
-        block_id: Identifier of the vehicle block.
-        bus_stop_clusters: Cluster definitions used for dwell/layover logic.
-
-    Returns:
-        A list of dictionaries (one per minute) suitable for `pd.DataFrame`.
-    """
-    rows: list[dict[str, Any]] = []
-
-    for minute in timeline:
-        # --------------------------------------------------- identify active trips
-        possible_trips = [t for t in trips_summary if t["start"] <= minute <= t["end"]]
-
-        if possible_trips:
-            chosen_trip, chosen_status = _status_for_active_trips(
-                minute, possible_trips, bus_stop_clusters
-            )
-
-            if chosen_trip is not None:
-                (
-                    status,
-                    stop_id,
-                    stop_name,
-                    arr_str,
-                    dep_str,
-                    trip_id_for_status,
-                    stop_seq,
-                    t_val,
-                ) = chosen_status
-
-                # Treat “EMPTY” as travelling between stops.
-                if status == "EMPTY":
-                    status = "TRAVELING BETWEEN STOPS"
-
-                row = _make_row(
-                    minute,
-                    block_id,
-                    status,
-                    trip=chosen_trip,
-                    stop_id=stop_id,
-                    stop_name=stop_name,
-                    stop_seq=stop_seq,
-                    arr_str=arr_str,
-                    dep_str=dep_str,
-                    trip_id=trip_id_for_status or "",
-                    timepoint=t_val,
-                    layover_location="in bay" if status in {"DWELL", "LOADING"} else "",
-                )
-            else:
-                # All active trips returned “EMPTY”.
-                row = _make_row(minute, block_id, "TRAVELING BETWEEN STOPS")
-        else:
-            # No active trips ⇒ bridging or fully inactive.
-            row = _row_for_inactive(minute, block_id, trips_summary, bus_stop_clusters)
-
-        rows.append(row)
-
-    return rows
-
-
 def process_block(
     block_subset: pd.DataFrame,
     block_id: str,
@@ -766,10 +944,14 @@ def process_block(
     bus_stop_clusters: list[dict[str, Any]],
 ) -> pd.DataFrame:
     """Generate a minute-by-minute schedule DataFrame for a single block."""
+    if "block_id" not in block_subset:
+        block_subset = block_subset.assign(block_id=block_id)
     trips_summary = _create_trips_summary(block_subset)
-    rows = _build_schedule_rows(trips_summary, timeline, block_id, bus_stop_clusters)
+    rows = build_schedule_rows(
+        trips_summary, timeline, block_id, bus_stop_clusters, occupancy_settings()
+    )
     df = pd.DataFrame(rows)
-    return fill_stop_ids_for_dwell_layover_loading(df)
+    return df
 
 
 # --------------------------------------------------------------------------------------------------
@@ -777,13 +959,29 @@ def process_block(
 # --------------------------------------------------------------------------------------------------
 
 
+def route_name_mask(frame: pd.DataFrame, names: Sequence[str]) -> pd.Series:
+    """Rows whose route is one of *names*, as ``ROUTE_SHORTNAME_FILTER`` matches routes.
+
+    A route matches on its route_short_name. A route without a short name
+    matches on its route_long_name or its route_id instead, so routes that
+    GTFS names only by their long name can still be selected.
+    """
+    wanted = {str(name) for name in names}
+    empty = pd.Series("", index=frame.index)
+    short = frame.get("route_short_name", empty).fillna("").astype(str).str.strip()
+    long_name = frame.get("route_long_name", empty).fillna("").astype(str).str.strip()
+    route_id = frame.get("route_id", empty).fillna("").astype(str)
+    return short.isin(wanted) | (short.eq("") & (long_name.isin(wanted) | route_id.isin(wanted)))
+
+
 def apply_bay_overrides(merged_df: pd.DataFrame, stops_df: pd.DataFrame) -> pd.DataFrame:
     """Re-assign stop visits according to ``BAY_OVERRIDES``.
 
-    Each override matches rows whose ``route_short_name`` and ``stop_id`` (and
-    ``direction_id``, if the override gives one) agree, and rewrites
-    ``stop_id``, ``stop_name`` and ``stop_code`` to the target stop. Rows that
-    match no override are untouched.
+    Each override matches rows whose route (``route_id``, or ``route_short_name``
+    as :func:`route_name_mask` matches it) and ``stop_id`` (and ``direction_id``,
+    if the override gives one) agree, and rewrites ``stop_id``, ``stop_name``
+    and ``stop_code`` to the target stop. Rows that match no override are
+    untouched.
 
     Args:
         merged_df: stop_times joined to trips and stops.
@@ -798,16 +996,21 @@ def apply_bay_overrides(merged_df: pd.DataFrame, stops_df: pd.DataFrame) -> pd.D
     df_out = merged_df.copy()
     lookup = stops_df.drop_duplicates("stop_id").set_index("stop_id")
     for override in BAY_OVERRIDES:
-        route = str(override["route_short_name"])
         from_ids = [str(s) for s in override["from_stop_ids"]]
         to_id = str(override["to_stop_id"])
 
-        mask = (df_out["route_short_name"].astype(str) == route) & df_out["stop_id"].astype(
-            str
-        ).isin(from_ids)
+        if "route_id" in override:
+            route = f"route_id {override['route_id']}"
+            mask = df_out["route_id"].astype(str) == str(override["route_id"])
+        else:
+            route = str(override["route_short_name"])
+            mask = route_name_mask(df_out, [route])
+        mask &= df_out["stop_id"].astype(str).isin(from_ids)
         if override.get("direction_id") is not None:
             mask &= df_out["direction_id"].astype(str) == str(override["direction_id"])
 
+        if to_id not in lookup.index:
+            raise ValueError(f"Bay override target {to_id!r} is absent from stops.txt.")
         n_rows = int(mask.sum())
         df_out.loc[mask, "stop_id"] = to_id
         if to_id in lookup.index:
@@ -826,6 +1029,136 @@ def apply_bay_overrides(merged_df: pd.DataFrame, stops_df: pd.DataFrame) -> pd.D
     return df_out
 
 
+def _listed(values: Sequence[str], limit: int = 5) -> str:
+    """Comma-separated *values*, cut off after *limit* for error messages."""
+    return ", ".join(values[:limit]) + (", ..." if len(values) > limit else "")
+
+
+def blank_text(values: pd.Series) -> pd.Series:
+    """True where a GTFS text field is missing or only whitespace."""
+    return values.isna() | values.astype(str).str.strip().eq("")
+
+
+def label_unnamed_stops(stops_df: pd.DataFrame) -> tuple[pd.DataFrame, set[str]]:
+    """Return a copy of stops.txt whose blank stop_names are replaced by the stop_id.
+
+    GTFS allows unnamed stops (generic nodes, boarding areas), and a missing
+    label does not affect occupancy, so such stops are shown by their ID.
+
+    Returns:
+        The labeled table and the stop_ids that had no name.
+    """
+    stops_df = stops_df.copy()
+    if "stop_name" not in stops_df.columns:
+        stops_df["stop_name"] = ""
+    unnamed = blank_text(stops_df["stop_name"])
+    stops_df.loc[unnamed, "stop_name"] = stops_df.loc[unnamed, "stop_id"]
+    return stops_df, set(stops_df.loc[unnamed, "stop_id"].astype(str))
+
+
+def assign_trip_only_blocks(trips_df: pd.DataFrame) -> pd.DataFrame:
+    """Mark trips without a block_id and give each its own block, ``trip-only:<trip_id>``.
+
+    Adds a boolean ``trip_only`` column. Whether such trips may be analyzed is
+    decided once the selection is known (see ``TRIP_ONLY_WITHOUT_BLOCK_ID``).
+
+    Raises:
+        ValueError: If a real block_id equals one of the generated block IDs.
+    """
+    trips_df = trips_df.copy()
+    blockless = blank_text(trips_df["block_id"])
+    generated = TRIP_ONLY_BLOCK_PREFIX + trips_df["trip_id"].astype(str)
+    clash = generated[blockless].isin(set(trips_df.loc[~blockless, "block_id"].astype(str)))
+    if clash.any():
+        raise ValueError(
+            f"block_id {generated[blockless][clash].iloc[0]!r} is used in trips.txt and would "
+            "merge with a trip-only block; rename it."
+        )
+    trips_df["trip_only"] = blockless
+    trips_df.loc[blockless, "block_id"] = generated[blockless]
+    return trips_df
+
+
+def resolve_stop_times(merged_df: pd.DataFrame) -> pd.DataFrame:
+    """Parse each visit's scheduled times, estimating missing ones when that is enabled.
+
+    Adds integer ``arrival_min``/``departure_min`` and ``estimated_time``, True
+    where stop_times.txt did not give the time used. With
+    ``INTERPOLATE_UNTIMED_STOPS``, a stop that gives only one of its two times
+    uses it for both, and an untimed intermediate stop is placed between the
+    timed stops before and after it: by shape_dist_traveled when every stop of
+    that stretch has a distance and they increase, otherwise evenly by stop
+    order. Estimated intermediate visits are given timepoint 0.
+
+    Raises:
+        ValueError: If a time is malformed, a time is missing while
+            interpolation is off, or a trip's first or last stop is untimed.
+    """
+    df = merged_df.sort_values(["trip_id", "stop_sequence"]).copy()
+    times: dict[str, pd.Series] = {}
+    given: dict[str, pd.Series] = {}
+    for column in ("arrival_time", "departure_time"):
+        raw = df[column] if column in df.columns else pd.Series(None, index=df.index, dtype=object)
+        text = raw.where(raw.notna(), "").astype(str).str.strip()
+        minutes = text.map(parse_time_to_minutes)
+        invalid = minutes.isna() & text.ne("")
+        if invalid.any():
+            row = df.loc[invalid].iloc[0]
+            raise ValueError(
+                f"{int(invalid.sum())} selected stop_times row(s) have an invalid {column}, "
+                f"e.g. {text[invalid].iloc[0]!r} in trip {row['trip_id']} at stop_sequence "
+                f"{row['stop_sequence']}."
+            )
+        times[column] = pd.to_numeric(minutes, errors="coerce")
+        given[column] = text.ne("")
+    arrival = times["arrival_time"].fillna(times["departure_time"])
+    departure = times["departure_time"].fillna(times["arrival_time"])
+    estimated = ~(given["arrival_time"] & given["departure_time"])
+    if estimated.any() and not INTERPOLATE_UNTIMED_STOPS:
+        trips = sorted(df.loc[estimated, "trip_id"].astype(str).unique())
+        raise ValueError(
+            f"{int(estimated.sum())} selected stop visit(s) on {len(trips)} trip(s) lack an "
+            f"arrival or departure time ({_listed(trips)}). Set INTERPOLATE_UNTIMED_STOPS = "
+            "True to estimate them from each trip's timed stops, or add the times upstream."
+        )
+    untimed = arrival.isna()
+    first = ~df["trip_id"].duplicated(keep="first")
+    last = ~df["trip_id"].duplicated(keep="last")
+    if (untimed & (first | last)).any():
+        trips = sorted(df.loc[untimed & (first | last), "trip_id"].astype(str).unique())
+        raise ValueError(
+            f"{len(trips)} trip(s) have an untimed first or last stop ({_listed(trips)}); "
+            "there is no timed stop to estimate a trip's start or end from. Add those times."
+        )
+    if untimed.any():
+        # Positions of the timed stops before and after each untimed one, within its trip.
+        timed_at = pd.Series(np.arange(len(df)), index=df.index, dtype=float).where(~untimed)
+        rows = np.flatnonzero(untimed.to_numpy())
+        before = timed_at.groupby(df["trip_id"], sort=False).ffill().to_numpy()[rows].astype(int)
+        after = timed_at.groupby(df["trip_id"], sort=False).bfill().to_numpy()[rows].astype(int)
+        fraction = (rows - before) / (after - before)
+        if "shape_dist_traveled" in df.columns:
+            dist = pd.to_numeric(df["shape_dist_traveled"], errors="coerce").to_numpy(dtype=float)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                along = (dist[rows] - dist[before]) / (dist[after] - dist[before])
+            usable = pd.Series((dist[after] > dist[before]) & (along >= 0) & (along <= 1))
+            stretch = pd.Series(before)
+            rising = pd.Series(along).groupby(stretch).diff().fillna(0).ge(0)
+            by_distance = (usable & rising).groupby(stretch).transform("all").to_numpy()
+            fraction = np.where(by_distance, along, fraction)
+        leave = departure.to_numpy(dtype=float)[before]
+        reach = arrival.to_numpy(dtype=float)[after]
+        estimate = np.round(leave + fraction * (reach - leave))
+        arrival.iloc[rows] = estimate
+        departure.iloc[rows] = estimate
+    df["arrival_min"] = arrival.astype(int)
+    df["departure_min"] = departure.astype(int)
+    df["estimated_time"] = estimated
+    if "timepoint" in df.columns:
+        df.loc[estimated & ~(first | last), "timepoint"] = 0
+    return df
+
+
 def _merge_and_filter_data(
     trips_df: pd.DataFrame,
     stop_times_df: pd.DataFrame,
@@ -834,33 +1167,43 @@ def _merge_and_filter_data(
 ) -> pd.DataFrame:
     """Merge trips and stops, filter by service_id, route, etc.
 
-    Return a single merged DataFrame with arrival_min/departure_min.
+    Return a single merged DataFrame with arrival_min/departure_min, plus
+    ``estimated_time`` (see :func:`resolve_stop_times`) and ``trip_only`` (see
+    :func:`assign_trip_only_blocks`).
     """
+    required = {"trip_id", "route_id", "service_id"}
+    if required - set(trips_df.columns):
+        raise ValueError(
+            f"trips.txt is missing required fields: {sorted(required - set(trips_df.columns))}"
+        )
+    trips_df = trips_df.copy()
+    stop_times_df = stop_times_df.copy()
+    optional_text = ("direction_id", "block_id", "trip_headsign", "route_short_name")
+    for column in (*optional_text, "route_long_name"):
+        trips_df[column] = trips_df[column].fillna("") if column in trips_df.columns else ""
     # Filter by service_id if set
     if service_ids:
         trips_df = trips_df[trips_df["service_id"].isin(list(service_ids))]
+    trips_df = assign_trip_only_blocks(trips_df)
 
-    # Convert times to minutes; stop_sequence must be numeric so first/last
-    # detection and stop ordering compare 10 > 9 rather than "10" < "9"
-    stop_times_df["arrival_min"] = stop_times_df["arrival_time"].apply(parse_time_to_minutes)
-    stop_times_df["departure_min"] = stop_times_df["departure_time"].apply(parse_time_to_minutes)
+    # stop_sequence must be numeric so first/last detection and stop ordering
+    # compare 10 > 9 rather than "10" < "9"
     stop_times_df["stop_sequence"] = pd.to_numeric(stop_times_df["stop_sequence"], errors="coerce")
     # Keep only stop_times for the trips that survived
     stop_times_df = stop_times_df[stop_times_df["trip_id"].isin(trips_df["trip_id"])]
 
-    # Make sure stops_df has stop_code, and trips_df has trip_headsign
+    # Unnamed stops are labeled by stop_id; stop_code is optional
+    stops_df, unnamed = label_unnamed_stops(stops_df)
     if "stop_code" not in stops_df.columns:
         stops_df["stop_code"] = None
-    if "trip_headsign" not in trips_df.columns:
-        trips_df = trips_df.assign(trip_headsign="")
 
+    if trips_df["trip_id"].duplicated().any() or stops_df["stop_id"].duplicated().any():
+        raise ValueError("Trip IDs and stop IDs must be unique in their GTFS tables.")
     # Merge stop_times + trips
     merged_df = stop_times_df.merge(trips_df, on="trip_id", how="left")
 
-    # Merge with stops to get stop_name, stop_code, timepoint
+    # Merge with stops to get stop_name, stop_code
     stops_merge_cols = ["stop_id", "stop_name", "stop_code"]
-    if "timepoint" in stops_df.columns:
-        stops_merge_cols.append("timepoint")
     merged_df = merged_df.merge(stops_df[stops_merge_cols], on="stop_id", how="left")
 
     # Scenario bay re-assignments (before filters, so moved visits still qualify)
@@ -881,10 +1224,10 @@ def _merge_and_filter_data(
     merged_df.loc[(merged_df["is_first_stop"]) & (merged_df["timepoint"] == 0), "timepoint"] = 2
     merged_df.loc[(merged_df["is_last_stop"]) & (merged_df["timepoint"] == 0), "timepoint"] = 2
 
-    # Block-level filtering based on route_short_name, stop_id, stop_code
+    # Block-level filtering based on route, stop_id, stop_code
     if ROUTE_SHORTNAME_FILTER or STOP_ID_FILTER or STOP_CODE_FILTER:
         route_match = (
-            merged_df["route_short_name"].isin(ROUTE_SHORTNAME_FILTER)
+            route_name_mask(merged_df, ROUTE_SHORTNAME_FILTER)
             if ROUTE_SHORTNAME_FILTER
             else pd.Series(False, index=merged_df.index)
         )
@@ -909,110 +1252,207 @@ def _merge_and_filter_data(
     else:
         logging.info("No block-level filters applied.")
 
+    if merged_df.empty:
+        raise ValueError(
+            "No trips remain after service/route/stop filtering; no current timeline was produced."
+        )
+    for column in ("stop_id", "route_id"):
+        if blank_text(merged_df[column]).any():
+            raise ValueError(
+                f"Analyzed trips require a populated {column}; check GTFS joins and source fields."
+            )
+    absent = sorted(set(merged_df["stop_id"].astype(str)) - set(stops_df["stop_id"].astype(str)))
+    if absent:
+        raise ValueError(
+            f"stop_times.txt references stop_ids absent from stops.txt: {_listed(absent)}"
+        )
+    unnamed_used = sorted(unnamed & set(merged_df["stop_id"].astype(str)))
+    if unnamed_used:
+        logging.warning(
+            "%d stop(s) used by the selected trips have no stop_name; showing the stop_id: %s",
+            len(unnamed_used),
+            _listed(unnamed_used),
+        )
+    blockless = sorted(merged_df.loc[merged_df["trip_only"], "trip_id"].astype(str).unique())
+    if blockless and not TRIP_ONLY_WITHOUT_BLOCK_ID:
+        raise ValueError(
+            f"{len(blockless)} selected trip(s) have no block_id ({_listed(blockless)}). Block "
+            "analysis needs the trips each vehicle runs: fill in block_id, exclude these trips "
+            "with the filters, or set TRIP_ONLY_WITHOUT_BLOCK_ID = True to analyze each alone."
+        )
+    if merged_df["stop_sequence"].isna().any():
+        raise ValueError("Selected stop_times contain missing or invalid stop_sequence values.")
+    if (merged_df["stop_sequence"] % 1 != 0).any():
+        raise ValueError("stop_sequence must be an integer.")
+    merged_df["stop_sequence"] = merged_df["stop_sequence"].astype(int)
+    if merged_df.duplicated(["trip_id", "stop_sequence"]).any():
+        raise ValueError("Duplicate stop_sequence within a trip.")
+    merged_df = resolve_stop_times(merged_df)
+    for trip_id, group in merged_df.groupby("trip_id", sort=False):
+        group = group.sort_values("stop_sequence")
+        if (group["arrival_min"] > group["departure_min"]).any():
+            raise ValueError(f"Arrival follows departure in trip {trip_id}.")
+        if (
+            group["arrival_min"].iloc[1:].to_numpy() < group["departure_min"].iloc[:-1].to_numpy()
+        ).any():
+            raise ValueError(f"Stop times run backwards in trip {trip_id}.")
     return merged_df
 
 
 def run_step1_gtfs_to_blocks() -> None:
-    """Step 1: Generate block-level schedules from GTFS."""
-    logging.info("=== Step 1: Reading GTFS and generating block-level schedules ===")
+    """Export a complete, manifest-identified timeline and canonical schedule snapshot."""
     out_folder = run_output_folder()
     validate_folders(GTFS_FOLDER_PATH, out_folder)
-
-    # Use the standardized loader
-    logging.info("Loading GTFS data using standardized function ...")
-    gtfs_data = load_gtfs_data(GTFS_FOLDER_PATH, dtype=str)
-
-    # Pull out frames you'll need
-    trips_df = gtfs_data["trips"]
-    stop_times_df = gtfs_data["stop_times"]
-    stops_df = gtfs_data["stops"]
-
-    # Optionally handle routes
-    routes_df = gtfs_data.get("routes", None)
-    if routes_df is not None and "route_short_name" in routes_df.columns:
-        logging.info("Merging routes.txt with trips ...")
-        if "route_short_name" not in trips_df.columns:
-            trips_df = trips_df.merge(
-                routes_df[["route_id", "route_short_name"]],
-                on="route_id",
-                how="left",
-            )
-    else:
-        logging.warning("WARNING: No routes.txt found or missing route_short_name column.")
-        if "route_short_name" not in trips_df.columns:
-            trips_df["route_short_name"] = None
-
-    # Service day: explicit service_ids, or everything active on SERVICE_DATE
-    service_ids = [str(sid) for sid in CALENDAR_SERVICE_IDS]
-    if not service_ids and SERVICE_DATE:
-        service_ids = resolve_service_ids(
-            gtfs_data.get("calendar"), gtfs_data.get("calendar_dates"), SERVICE_DATE
+    manifest_path = Path(out_folder) / "timeline_manifest.json"
+    manifest = {"schema_version": 1, "status": "in_progress", "interval_minutes": 1}
+    write_json_atomic(manifest_path, manifest)
+    try:
+        validate_configuration()
+        data = load_gtfs_data(
+            GTFS_FOLDER_PATH,
+            files=REQUIRED_GTFS_FILES + available_gtfs_files(GTFS_FOLDER_PATH, OPTIONAL_GTFS_FILES),
+            dtype=str,
         )
-        logging.info("Service IDs active on %s: %s", SERVICE_DATE, service_ids)
-        if not service_ids:
-            raise ValueError(f"No service_id is active on {SERVICE_DATE} in this feed.")
-
-    # Now merge & filter to get the final dataset
-    merged_df = _merge_and_filter_data(trips_df, stop_times_df, stops_df, service_ids)
-
-    all_blocks = merged_df["block_id"].dropna().unique()
-    logging.info("Identified %d block(s) to process.", len(all_blocks))
-    logging.info("Occupancy assumptions: %s", assumptions_text(service_ids).replace("\n", "; "))
-
-    max_minutes = DEFAULT_HOURS * 60
-    timeline = range(0, max_minutes, TIME_INTERVAL_MINUTES)
-
-    combined_frames: list[pd.DataFrame] = []
-    for blk_id in all_blocks:
-        logging.info("\nProcessing block %s...", blk_id)
-        block_data = merged_df[merged_df["block_id"] == blk_id].copy()
-        trip_ids = block_data["trip_id"].unique()
-
-        check_for_overlapping_trips(block_data, blk_id)
-
-        if len(trip_ids) > MAX_TRIPS_PER_BLOCK:
-            logging.info(
-                "Block %s has %d trips > limit %d. Skipped.",
-                blk_id,
-                len(trip_ids),
-                MAX_TRIPS_PER_BLOCK,
+        # GTFS requires a route's short name or its long name, not both.
+        route_names = data["routes"].reindex(
+            columns=["route_id", "route_short_name", "route_long_name"]
+        )
+        trips_df = (
+            data["trips"]
+            .drop(columns=["route_short_name", "route_long_name"], errors="ignore")
+            .merge(route_names, on="route_id", how="left", validate="many_to_one")
+        )
+        service_ids = [str(value) for value in CALENDAR_SERVICE_IDS]
+        if SERVICE_DATE and service_ids:
+            raise ValueError("Set either CALENDAR_SERVICE_IDS or SERVICE_DATE, not both.")
+        if SERVICE_DATE:
+            service_ids = resolve_service_ids(
+                data.get("calendar"), data.get("calendar_dates"), SERVICE_DATE
             )
-            continue
-
-        block_schedule_df = process_block(block_data, blk_id, timeline, BUS_STOP_CLUSTERS_STEP1)
-        block_schedule_df = block_schedule_df.sort_values("Timestamp")
-
-        block_route_ids = block_data["route_id"].dropna().unique()
-        if len(block_route_ids) > 0:
-            block_route_str = "_".join(str(rte) for rte in block_route_ids)
-        else:
-            block_route_str = "NA"
-
-        out_name = f"block_{blk_id}_{block_route_str}.xlsx"
-        if WRITE_PER_BLOCK_FILES:
-            out_path = os.path.join(out_folder, out_name)
-            block_schedule_df.to_excel(out_path, index=False)
-            logging.info("Finished block %s; saved to %s", blk_id, out_path)
+            if not service_ids:
+                raise ValueError(f"No service_id is active on {SERVICE_DATE} in this feed.")
+        merged = _merge_and_filter_data(trips_df, data["stop_times"], data["stops"], service_ids)
+        reject_selected_frequency_trips(data.get("frequencies"), merged)
+        trip_only = sorted(merged.loc[merged["trip_only"], "trip_id"].astype(str).unique())
+        estimated = merged[merged["estimated_time"]]
+        notes = disclosure_notes(trip_only, estimated)
+        for note in notes:
+            logging.warning("%s", note)
+        summaries = []
+        for block, group in merged.groupby("block_id", sort=False):
+            check_for_overlapping_trips(group, str(block))
+            if group["trip_id"].nunique() > MAX_TRIPS_PER_BLOCK:
+                raise ValueError(
+                    f"Block {block} exceeds MAX_TRIPS_PER_BLOCK; review service selection."
+                )
+            summaries.extend(_create_trips_summary(group))
+        settings = occupancy_settings()
+        end = max(
+            DEFAULT_HOURS * 60, max(trip["end"] for trip in summaries) + POST_ARRIVAL_MINUTES + 1
+        )
+        clusters = [
+            {"name": str(cluster["name"]), "stops": [str(stop) for stop in cluster["stops"]]}
+            for cluster in BUS_STOP_CLUSTERS_STEP1
+        ]
+        snapshot = {
+            "schema_version": 2,
+            "interval_minutes": 1,
+            "timeline_end": end,
+            "settings": settings,
+            "clusters": clusters,
+            "trips": summaries,
+            "service_ids": service_ids,
+            "trip_only_trips": trip_only,
+            "estimated_stop_visits": len(estimated),
+            "stops": label_unnamed_stops(data["stops"])[0][["stop_id", "stop_name"]].to_dict(
+                "records"
+            ),
+        }
+        written: list[str] = []
+        workbooks: list[str] = []
+        frames = []
+        used_names: set[str] = set()
+        for block, group in merged.groupby("block_id", sort=False):
+            block_trips = [trip for trip in summaries if trip["block"] == str(block)]
+            frame = pd.DataFrame(
+                build_schedule_rows(block_trips, range(end), str(block), clusters, settings)
+            )
+            routes = "_".join(sorted(group["route_id"].astype(str).unique()))
+            filename = "block_" + re.sub(r'[<>:"/\\|?*]', "_", f"{block}_{routes}") + ".xlsx"
+            if filename.lower() in used_names:
+                raise ValueError("Block output filenames collide after sanitizing IDs.")
+            used_names.add(filename.lower())
+            if WRITE_PER_BLOCK_FILES:
+                frame.to_excel(Path(out_folder) / filename, index=False)
+                written.append(filename)
+                workbooks.append(filename)
+            if COMBINED_TIMELINE_FILE:
+                frames.append(frame.assign(FileName=filename))
         if COMBINED_TIMELINE_FILE:
-            combined_frames.append(block_schedule_df.assign(FileName=out_name))
+            pd.concat(frames, ignore_index=True).to_csv(
+                Path(out_folder) / COMBINED_TIMELINE_FILE, index=False
+            )
+            written.append(COMBINED_TIMELINE_FILE)
+        write_json_atomic(Path(out_folder) / SCHEDULE_SNAPSHOT_FILE, snapshot)
+        written.append(SCHEDULE_SNAPSHOT_FILE)
+        if ASSUMPTIONS_FILE:
+            (Path(out_folder) / ASSUMPTIONS_FILE).write_text(
+                assumptions_text(service_ids, notes), encoding="utf-8"
+            )
+            written.append(ASSUMPTIONS_FILE)
+        require_run_log(write_run_log(Path(out_folder)))
+        manifest.update(
+            status="complete",
+            combined_timeline=COMBINED_TIMELINE_FILE,
+            block_workbooks=workbooks,
+            schedule_snapshot=SCHEDULE_SNAPSHOT_FILE,
+            assumptions_file=ASSUMPTIONS_FILE,
+            timeline_end=end,
+            trip_only_trips=len(trip_only),
+            estimated_stop_visits=len(estimated),
+            files={
+                name: hashlib.sha256((Path(out_folder) / name).read_bytes()).hexdigest()
+                for name in written
+            },
+        )
+        write_json_atomic(manifest_path, manifest)
+        logging.info(
+            "Exported %d trips on %d blocks to %s.",
+            len(summaries),
+            merged["block_id"].nunique(),
+            out_folder,
+        )
+    except Exception as exc:
+        manifest.update(status="failed", error=str(exc))
+        write_json_atomic(manifest_path, manifest)
+        raise
 
-    if COMBINED_TIMELINE_FILE and combined_frames:
-        combined_path = os.path.join(out_folder, COMBINED_TIMELINE_FILE)
-        pd.concat(combined_frames, ignore_index=True).to_csv(combined_path, index=False)
-        logging.info("Combined timeline written to %s", combined_path)
 
-    if ASSUMPTIONS_FILE:
-        assumptions_path = os.path.join(out_folder, ASSUMPTIONS_FILE)
-        with open(assumptions_path, "w", encoding="utf-8") as handle:
-            handle.write(assumptions_text(service_ids))
-        logging.info("Assumptions written to %s", assumptions_path)
+def disclosure_notes(trip_only: Sequence[str], estimated: pd.DataFrame) -> list[str]:
+    """State what this run estimated or could not know, for the assumptions file and log.
 
-    require_run_log(write_run_log(Path(out_folder)))
-    logging.info("\nStep 1 complete: All block-level spreadsheets generated.")
+    Args:
+        trip_only: Trips analyzed without a block_id (trip-only mode).
+        estimated: Selected stop visits whose times were interpolated.
+    """
+    notes = []
+    if len(estimated):
+        notes.append(
+            f"ESTIMATED_STOP_VISITS={len(estimated)} stop visit(s) on "
+            f"{estimated['trip_id'].nunique()} trip(s) have interpolated times; their rows "
+            "are flagged in the timeline's Estimated Time column."
+        )
+    if trip_only:
+        notes.append(
+            f"TRIP_ONLY_TRIPS={len(trip_only)} trip(s) without a block_id were analyzed one "
+            f"at a time as blocks {TRIP_ONLY_BLOCK_PREFIX}<trip_id>: their between-trip "
+            "layovers and vehicle continuity are unknown and not counted."
+        )
+    return notes
 
 
-def assumptions_text(service_ids: Optional[Sequence[str]] = None) -> str:
-    """Return the run's occupancy assumptions and scenario settings as text."""
+def assumptions_text(service_ids: Optional[Sequence[str]] = None, notes: Sequence[str] = ()) -> str:
+    """Return the run's occupancy assumptions, scenario settings and *notes* as text."""
     lines = [
         f"SCENARIO_NAME={SCENARIO_NAME}",
         f"GTFS_FOLDER_PATH={GTFS_FOLDER_PATH}",
@@ -1023,11 +1463,14 @@ def assumptions_text(service_ids: Optional[Sequence[str]] = None) -> str:
         f"POST_ARRIVAL_MINUTES={POST_ARRIVAL_MINUTES}",
         f"IN_BAY_LAYOVER_MAX_MINUTES={IN_BAY_LAYOVER_MAX_MINUTES}",
         f"LAYOVER_THRESHOLD={LAYOVER_THRESHOLD}",
+        f"INTERPOLATE_UNTIMED_STOPS={INTERPOLATE_UNTIMED_STOPS}",
+        f"TRIP_ONLY_WITHOUT_BLOCK_ID={TRIP_ONLY_WITHOUT_BLOCK_ID}",
         f"BAY_OVERRIDES={BAY_OVERRIDES}",
         f"ROUTE_SHORTNAME_FILTER={ROUTE_SHORTNAME_FILTER}",
         f"STOP_ID_FILTER={STOP_ID_FILTER}",
         f"STOP_CODE_FILTER={STOP_CODE_FILTER}",
         f"CLUSTER_DEFINITIONS={CLUSTER_DEFINITIONS}",
+        *notes,
     ]
     return "\n".join(lines) + "\n"
 
@@ -1099,8 +1542,8 @@ def write_run_log(output_dir: Path) -> bool:
     The run writes many files (one workbook per block), so a single log named
     after the script sits alongside them. It captures this script's
     CONFIGURATION block verbatim, between the ``# === BEGIN CONFIG ===`` /
-    ``# === END CONFIG ===`` markers, so it can never drift from the values
-    actually used.
+    ``# === END CONFIG ===`` markers, and appends the effective runtime
+    values, including notebook edits.
 
     Returns:
         ``True`` if the log was written successfully, ``False`` otherwise.
@@ -1131,6 +1574,13 @@ def write_run_log(output_dir: Path) -> bool:
         "CONFIGURATION (verbatim from source)",
         "-" * 72,
         config_text,
+        "",
+        "EFFECTIVE RUNTIME SETTINGS",
+        json.dumps(
+            {name: value for name, value in globals().items() if name.isupper()},
+            indent=2,
+            default=str,
+        ),
         "=" * 72,
     ]
 
@@ -1423,9 +1873,9 @@ def main() -> int:
     """Master entry point.
 
     Returns:
-        Process exit code: 0 on success, 1 if the required run log could not
-        be written, 2 if required CONFIGURATION values are still placeholders
-        or ``GTFS_FOLDER_PATH`` does not exist.
+        Process exit code: 0 on success, 1 if the input or configuration is
+        invalid or the required run log could not be written, 2 if required
+        CONFIGURATION values are still placeholders or ``GTFS_FOLDER_PATH`` does not exist.
     """
     logging.basicConfig(
         level=LOG_LEVEL,
@@ -1449,7 +1899,7 @@ def main() -> int:
         return 2
     try:
         run_step1_gtfs_to_blocks()
-    except RunLogError as exc:
+    except (RunLogError, ValueError, OSError, KeyError) as exc:
         logging.error("%s", exc)
         return 1
     logging.info("Script completed successfully.")
