@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import zipfile
 from pathlib import Path
 
@@ -336,3 +337,107 @@ def test_flag_long_spacing_csv_searches_around_curves(
 def test_feet_factor_rejects_crs_without_linear_unit(crs: str | None, match: str) -> None:
     with pytest.raises(ValueError, match=match):
         _feet_factor(crs)
+
+
+# ---------------------------------------------------------------------------
+# Served stops and segment splitting
+# ---------------------------------------------------------------------------
+
+# A north-south route in EPSG:2248, whose grid is aligned with DC's meridian, so
+# the route's bounding box has no width. FULL runs 10,000 ft; SHORT is a short
+# turn ending 100 ft past its last stop (S5). Route 1 stops S0-S10 sit every
+# 1,000 ft, 35 ft east of the centreline, and S2b is 150 ft east. X is a route 2
+# stop 30 ft west, 3,500 ft along.
+_NS_X0, _NS_Y0 = 1_300_000.0, 450_000.0
+
+
+@pytest.fixture()
+def short_turn_layers() -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
+    routes = gpd.GeoDataFrame(
+        {"route_id": ["1", "1"], "direction_id": [0, 0], "route_short_name": ["1", "1"]},
+        geometry=[
+            LineString([(_NS_X0, _NS_Y0), (_NS_X0, _NS_Y0 + 10_000)]),
+            LineString([(_NS_X0, _NS_Y0), (_NS_X0, _NS_Y0 + 5_100)]),
+        ],
+        crs="EPSG:2248",
+    )
+    offsets = {f"S{i}": (35, i * 1_000) for i in range(11)}
+    offsets |= {"S2b": (150, 1_500), "X": (-30, 3_500)}
+    stops = gpd.GeoDataFrame(
+        {
+            "stop_id": list(offsets),
+            "stop_name": list(offsets),
+            "route_id": [["2"] if s == "X" else ["1"] for s in offsets],
+            "direction_id": [[0]] * len(offsets),
+        },
+        geometry=[Point(_NS_X0 + dx, _NS_Y0 + dy) for dx, dy in offsets.values()],
+        crs="EPSG:2248",
+    )
+    return routes, stops
+
+
+def test_flag_short_spacing_counts_stops_beside_grid_aligned_route(
+    short_turn_layers: tuple[gpd.GeoDataFrame, gpd.GeoDataFrame], tmp_path: Path
+) -> None:
+    routes, stops = short_turn_layers
+    log_path = tmp_path / "short.txt"
+    _flag_short_spacing(routes, stops, 600.0, log_path)
+    short = pd.read_csv(log_path, sep="\t")
+    # S1-S2b-S2 (500 ft apart) on both shapes. S6 onward are 900+ ft past the
+    # short turn's end, so they are not served by it: no S5-S6 pair.
+    assert sorted(zip(short["begin_stop_id"], short["end_stop_id"])) == sorted(
+        [("S1", "S2b"), ("S2b", "S2")] * 2
+    )
+
+
+def test_flag_long_spacing_csv_counts_stops_beside_grid_aligned_route(
+    short_turn_layers: tuple[gpd.GeoDataFrame, gpd.GeoDataFrame], tmp_path: Path
+) -> None:
+    routes, stops = short_turn_layers
+    csv_path = tmp_path / "long.csv"
+    _flag_long_spacing_csv(routes, stops, 900.0, 99.0, csv_path, summary=False)
+    flagged = pd.read_csv(csv_path)
+    rows = zip(flagged["start_stop_id"], flagged["end_stop_id"], flagged["flagged_stop_id"])
+    assert list(rows) == [("S3", "S4", "X")] * 2  # X in the S3-S4 gap of each shape
+
+
+def test_split_into_segments_keeps_route_ends_and_skips_stops_past_short_turn(
+    short_turn_layers: tuple[gpd.GeoDataFrame, gpd.GeoDataFrame],
+) -> None:
+    routes, stops = short_turn_layers
+    segs = _split_into_segments(routes, stops, "EPSG:2248")
+    full = [1_000.0, 500.0, 500.0] + [1_000.0] * 8
+    short_turn = [1_000.0, 500.0, 500.0, 1_000.0, 1_000.0, 1_000.0, 100.0]
+    assert segs["length_ft"].tolist() == pytest.approx(full + short_turn, abs=0.1)
+
+
+def test_split_into_segments_cuts_curved_route_at_each_stop() -> None:
+    # Quarter circle of radius 2,000 ft drawn with 90 chords, and stops 20 ft
+    # outside it about 800, 1,600 and 2,400 ft along. A stop projected onto a
+    # curve rarely lands exactly on it, which left shapely's split unsplit.
+    cx, cy, r = 1_300_000.0, 450_000.0, 2_000.0
+    arc = LineString(
+        [
+            (cx + r * math.cos(math.radians(a)), cy + r * math.sin(math.radians(a)))
+            for a in range(91)
+        ]
+    )
+    routes = gpd.GeoDataFrame(
+        {"route_id": ["1"], "direction_id": [0], "route_short_name": ["1"]},
+        geometry=[arc],
+        crs="EPSG:2248",
+    )
+    angles = [d / r for d in (800, 1_600, 2_400)]
+    stops = gpd.GeoDataFrame(
+        {
+            "stop_id": ["P", "Q", "R"],
+            "stop_name": ["P", "Q", "R"],
+            "route_id": [["1"]] * 3,
+            "direction_id": [[0]] * 3,
+        },
+        geometry=[Point(cx + (r + 20) * math.cos(t), cy + (r + 20) * math.sin(t)) for t in angles],
+        crs="EPSG:2248",
+    )
+    segs = _split_into_segments(routes, stops, "EPSG:2248")
+    expected = [800.0, 800.0, 800.0, arc.length - 2_400]
+    assert segs["length_ft"].tolist() == pytest.approx(expected, abs=1.0)

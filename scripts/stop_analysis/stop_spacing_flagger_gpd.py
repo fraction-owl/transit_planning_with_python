@@ -26,14 +26,13 @@ import sys
 import tempfile
 import zipfile
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence, Set, Tuple
+from typing import Any, Dict, List, Sequence, Set, Tuple
 
 import geopandas as gpd
 import numpy as np
 import pandas as pd
 from pyproj import CRS
-from shapely.geometry import LineString, MultiPoint, Point
-from shapely.ops import split as split_line
+from shapely.geometry import LineString, Point
 from shapely.ops import substring
 
 # =============================================================================
@@ -48,6 +47,10 @@ INCLUDE_ROUTE_IDS: list[str] = ["101", "202"]
 
 ROUTE_UNION: bool = False
 PROJECTED_CRS: str = "EPSG:2263"  # projected CRS in feet or metres
+
+# A route's own stops count as served by one of its shapes only within this
+# distance of it; 100 m (328 ft) is the GTFS Best Practices stop-to-shape limit.
+SERVED_STOP_MAX_OFFSET_FT: float = 328.0
 
 MIN_SPACING_FT: float = 400.0  # < this distance between served stops
 SPACING_LOG_FILE: str = "short_spacing_segments.txt"
@@ -80,6 +83,20 @@ def _served_mask(df: pd.DataFrame, rid: str, drn: int) -> pd.Series:
     )
 
 
+def _served_stops(
+    stops_gdf: gpd.GeoDataFrame,
+    line: LineString,
+    rid: str,
+    drn: int,
+    max_offset: float,
+) -> gpd.GeoDataFrame:
+    """Return stops served by rid/drn that lie within *max_offset* (CRS units) of *line*."""
+    minx, miny, maxx, maxy = line.bounds
+    box = (minx - max_offset, miny - max_offset, maxx + max_offset, maxy + max_offset)
+    cand = stops_gdf.iloc[list(stops_gdf.sindex.intersection(box))]
+    return cand[_served_mask(cand, rid, drn) & (cand.distance(line) <= max_offset)]
+
+
 def _feet_factor(crs: CRS | str | None) -> float:
     """Return factor to convert from CRS linear units to feet.
 
@@ -109,6 +126,7 @@ def _flag_long_spacing_csv(
     near_buffer_ft: float,
     csv_path: Path,
     summary: bool = True,
+    max_offset_ft: float = SERVED_STOP_MAX_OFFSET_FT,
 ) -> None:
     """Export a CSV of “missed” stops that fill unusually long gaps.
 
@@ -136,6 +154,9 @@ def _flag_long_spacing_csv(
     summary
         If *True*, also write ``<stem>_summary.txt`` listing each
         (route_id, direction_id) that triggered at least one flag.
+    max_offset_ft
+        The route's own stops farther than this from the polyline are not
+        counted as served by it.
 
     Notes:
     -----
@@ -146,6 +167,7 @@ def _flag_long_spacing_csv(
     """
     ft_factor: float = _feet_factor(stops_gdf.crs)
     near_buffer_crs: float = near_buffer_ft / ft_factor
+    max_offset_crs: float = max_offset_ft / ft_factor
     sindex = stops_gdf.sindex
 
     records: List[Dict[str, Any]] = []
@@ -157,8 +179,7 @@ def _flag_long_spacing_csv(
         line: LineString = row.geometry
 
         # —— served stops on this route/direction ————————————————
-        cand = stops_gdf.iloc[list(sindex.intersection(line.bounds))]
-        served = cand[_served_mask(cand, rid, drn)].copy()
+        served = _served_stops(stops_gdf, line, rid, drn, max_offset_crs).copy()
 
         if len(served) < 2:
             continue
@@ -395,10 +416,17 @@ def _split_into_segments(
     routes_gdf: gpd.GeoDataFrame,
     stops_gdf: gpd.GeoDataFrame,
     crs: str,
+    max_offset_ft: float = SERVED_STOP_MAX_OFFSET_FT,
 ) -> gpd.GeoDataFrame:
-    """Split each route polyline at its own stops and return segment GDF."""
+    """Split each route polyline at its own stops and return segment GDF.
+
+    The pieces before the first stop and after the last stop are kept. The
+    route's own stops farther than *max_offset_ft* from the polyline are not
+    counted as served by it.
+    """
     seg_records: list[dict[str, object]] = []
-    sindex = stops_gdf.sindex
+    ft_factor = _feet_factor(crs)
+    max_offset_crs = max_offset_ft / ft_factor
 
     for _, r in routes_gdf.iterrows():
         # -------------------------------------------------------------------
@@ -410,24 +438,18 @@ def _split_into_segments(
         rid: str = str(r.route_id)
         drn: int = int(r.direction_id)
 
-        cand = stops_gdf.iloc[list(sindex.intersection(line.bounds))]
-        cand = cand[_served_mask(cand, rid, drn)]
+        cand = _served_stops(stops_gdf, line, rid, drn, max_offset_crs)
         if cand.empty:
             continue
 
-        dists = np.array([line.project(pt) for pt in cand.geometry if isinstance(pt, Point)])
-        uniq_dists = np.unique(dists)
-        snap_pts: list[Point] = [line.interpolate(d) for d in uniq_dists]
+        # Cut at each stop's distance along the line. Unlike shapely's split,
+        # substring does not need the cut points to lie exactly on the line.
+        dists = [line.project(pt) for pt in cand.geometry if isinstance(pt, Point)]
+        cuts = np.unique(np.concatenate(([0.0], dists, [line.length])))
 
-        pieces = split_line(line, MultiPoint(snap_pts))
-        geoms: Iterable[LineString]
-        if isinstance(pieces, LineString):
-            geoms = [pieces]
-        else:
-            geoms = (g for g in pieces.geoms if isinstance(g, LineString))
-
-        for seg in geoms:
-            if seg.length > 0:
+        for start_d, end_d in zip(cuts[:-1], cuts[1:]):
+            seg = substring(line, start_d, end_d)
+            if isinstance(seg, LineString) and seg.length > 0:
                 seg_records.append(
                     {
                         "route_id": rid,
@@ -438,7 +460,7 @@ def _split_into_segments(
                 )
 
     seg_gdf = gpd.GeoDataFrame(seg_records, crs=crs)
-    seg_gdf["length_ft"] = seg_gdf.length * _feet_factor(crs)
+    seg_gdf["length_ft"] = seg_gdf.length * ft_factor
     logging.info("Segments GDF – generated %d pieces.", len(seg_gdf))
     return seg_gdf
 
@@ -465,13 +487,16 @@ def _flag_short_spacing(
     stops_gdf: gpd.GeoDataFrame,
     threshold_ft: float,
     log_path: Path,
+    max_offset_ft: float = SERVED_STOP_MAX_OFFSET_FT,
 ) -> None:
     """Write a log of consecutive stops spaced closer than *threshold_ft*.
 
-    Stops are evaluated along each route polyline.
+    Stops are evaluated along each route polyline. The route's own stops
+    farther than *max_offset_ft* from the polyline are not counted as served
+    by it.
     """
     factor_ft: float = _feet_factor(stops_gdf.crs)
-    sindex = stops_gdf.sindex
+    max_offset_crs: float = max_offset_ft / factor_ft
 
     with log_path.open("w", encoding="utf-8") as fh:
         fh.write(
@@ -484,8 +509,7 @@ def _flag_short_spacing(
             drn = int(row.direction_id)
             line: LineString = row.geometry
 
-            cand = stops_gdf.iloc[list(sindex.intersection(line.bounds))]
-            cand = cand[_served_mask(cand, rid, drn)].copy()
+            cand = _served_stops(stops_gdf, line, rid, drn, max_offset_crs).copy()
 
             if len(cand) < 2:
                 continue
@@ -632,7 +656,9 @@ def main() -> int:  # noqa: D401
     # STEP 3  Split polylines into stop-to-stop segments
     # -----------------------------------------------------------------
     logging.info("STEP 3  Splitting routes into stop-to-stop segments …")
-    segs_gdf = _split_into_segments(routes_gdf, stops_gdf, PROJECTED_CRS)
+    segs_gdf = _split_into_segments(
+        routes_gdf, stops_gdf, PROJECTED_CRS, max_offset_ft=SERVED_STOP_MAX_OFFSET_FT
+    )
     _export(segs_gdf, out_dir, "segments")  # master file
     _export_segments_by_route_dir(segs_gdf, out_dir)  # per-route files
 
@@ -645,6 +671,7 @@ def main() -> int:  # noqa: D401
         stops_gdf,  # filtered layer
         MIN_SPACING_FT,
         out_dir / SPACING_LOG_FILE,
+        max_offset_ft=SERVED_STOP_MAX_OFFSET_FT,
     )
 
     # -----------------------------------------------------------------
@@ -657,6 +684,7 @@ def main() -> int:  # noqa: D401
         LONG_SPACING_FT,
         NEAR_BUFFER_FT,
         out_dir / LONG_SPACING_CSV_FILE,
+        max_offset_ft=SERVED_STOP_MAX_OFFSET_FT,
     )
 
     logging.info("\nAll done! Outputs in: %s", out_dir)
