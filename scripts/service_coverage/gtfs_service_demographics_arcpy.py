@@ -1083,6 +1083,9 @@ def calc_original_area_for_intersecting(
     expanded by `insurance_distance_ft`. Non-intersecting features are left
     untouched, avoiding a full-table CalculateField over ~40k rows.
 
+    Call this before clipping: the clip copies `area_ac_og` from the source,
+    so values written afterwards never reach the clipped features.
+
     Args:
         demographics_fc: Input demographics polygon feature class to update.
         buffers_fc: Dissolved service-area polygons.
@@ -1179,17 +1182,20 @@ def _process_service_area_from_stops_layer(
     if area_m2 is not None:
         logging.info("Diagnostics: dissolved geodesic area = %.2f sq.m", area_m2)
 
-    # 3) Clip demographics
-    logging.info("Clipping demographics (%s)…", run_tag)
-    clipped = clip_demographics_to_buffers(DEMOGRAPHICS_FC, dissolved, clipped_path)
-
-    # 4) Precompute original area ONLY for demographics that matter (near the buffer)
+    # 3) Precompute original area ONLY for demographics that matter (near the buffer).
+    # This must run BEFORE the clip: the clip copies area_ac_og from the source
+    # rows, and a later update to the source never reaches the clipped copy (it
+    # would carry a missing value on a fresh input, or a stale one from a prior run).
     calc_original_area_for_intersecting(
         demographics_fc=DEMOGRAPHICS_FC,
         buffers_fc=dissolved,
         insurance_distance_ft=100.0,
         field_name="area_ac_og",
     )
+
+    # 4) Clip demographics (inherits the fresh area_ac_og computed above)
+    logging.info("Clipping demographics (%s)…", run_tag)
+    clipped = clip_demographics_to_buffers(DEMOGRAPHICS_FC, dissolved, clipped_path)
 
     # 5) Areas and percentages on the clipped output
     add_clipped_area_and_percentage(clipped)

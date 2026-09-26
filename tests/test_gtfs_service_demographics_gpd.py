@@ -39,6 +39,8 @@ from scripts.service_coverage.gtfs_service_demographics_gpd import (
     quantize_node,
     run,
     suggest_express_origin_stops,
+    validate_metric_crs,
+    warn_if_distorted_crs,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -562,7 +564,16 @@ def _commute_demographics() -> gpd.GeoDataFrame:
 
 def test_commute_count_fields_are_synthetic_fields() -> None:
     # The disaggregated S0801 worker counts must be apportioned like every other count.
-    for field in ("cmt_wrkrs", "cmt_trnst", "cmt_drove", "cmt_carpl", "cmt_wfh", "cmt_pmin"):
+    fields = (
+        "cmt_wrkrs",
+        "cmt_trnst",
+        "cmt_drove",
+        "cmt_carpl",
+        "cmt_wfh",
+        "cmt_pmin",
+        "cmt_timed",
+    )
+    for field in fields:
         assert field in SYNTHETIC_FIELDS
 
 
@@ -711,6 +722,70 @@ def test_stops_to_points_gdf_respects_route_filter(dc_gtfs: dict[str, pd.DataFra
     )
     assert result is not None
     assert set(result["route_short_name"]) == {"10"}
+
+
+def test_stops_to_points_gdf_uses_requested_crs(dc_gtfs: dict[str, pd.DataFrame]) -> None:
+    final_routes = get_included_routes(dc_gtfs["routes"], ["10"], [])
+    result = _stops_to_points_gdf(
+        dc_gtfs["trips"], dc_gtfs["stop_times"], dc_gtfs["stops"], final_routes, [], [], crs=32618
+    )
+    assert result is not None
+    assert result.crs.to_epsg() == 32618
+
+
+def test_validate_metric_crs_accepts_metre_projection() -> None:
+    assert validate_metric_crs(26985).is_projected
+
+
+@pytest.mark.parametrize(("code", "match"), [(4326, "not a projected"), (2248, "foot")])
+def test_validate_metric_crs_rejects_non_metric(code: int, match: str) -> None:
+    with pytest.raises(ValueError, match=match):
+        validate_metric_crs(code)
+
+
+def test_warn_if_distorted_crs_flags_world_mercator(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.WARNING):
+        mercator = warn_if_distorted_crs(validate_metric_crs(3395), -77.03, 38.9)
+    assert mercator == pytest.approx(0.283, abs=0.01)  # sec(38.9°) - 1
+    assert "distorts distances" in caplog.text
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        local = warn_if_distorted_crs(validate_metric_crs(26985), -77.03, 38.9)
+    assert local < 0.001
+    assert "distorts distances" not in caplog.text
+
+
+def test_run_crs_override_keeps_stops_and_demographics_aligned(
+    tmp_path: Path, dc_gtfs_dir: Path, dc_gtfs: dict[str, pd.DataFrame]
+) -> None:
+    # Stops used to be projected with the module default while the demographics
+    # followed the override, so the two never overlapped and every route read 0.
+    final_routes = get_included_routes(dc_gtfs["routes"], [], [])
+    stops_utm = _stops_to_points_gdf(
+        dc_gtfs["trips"], dc_gtfs["stop_times"], dc_gtfs["stops"], final_routes, [], [], crs=32618
+    )
+    assert stops_utm is not None
+    minx, miny, maxx, maxy = stops_utm.total_bounds
+    demo = gpd.GeoDataFrame(
+        {"total_pop": [1_000]},
+        geometry=[box(minx - 5_000, miny - 5_000, maxx + 5_000, maxy + 5_000)],
+        crs="EPSG:32618",
+    )
+    demo_path = tmp_path / "demo_utm.shp"
+    demo.to_file(demo_path)
+
+    out_dir = tmp_path / "out"
+    run(
+        analysis_mode="route",
+        service_area_method="stop_buffer",
+        gtfs_data_path=str(dc_gtfs_dir),
+        demographics_shp_path=str(demo_path),
+        output_directory=str(out_dir),
+        crs_epsg_code=32618,
+    )
+    summary = pd.read_csv(out_dir / "service_demographics_by_route.csv")
+    assert (summary["total_pop"] > 0).all()
 
 
 def test_stops_to_points_gdf_no_matching_stops_returns_none(
@@ -1149,6 +1224,26 @@ def test_express_route_totals_keeps_keystones_zeroes_crossterms() -> None:
     # residents (the cross-terms) are dropped.
     assert totals["total_pop"] == 1_000
     assert totals["tot_empl"] == 2_000
+
+
+@pytest.mark.parametrize("zero_crossterms", [True, False])
+def test_express_route_totals_export_sums_to_totals(zero_crossterms: bool) -> None:
+    # The per-route shapefile must carry the same numbers as the route CSV: with the
+    # cross-terms dropped, the destination's 20 residents and the origin's 5 jobs sit
+    # inside the exported catchment but must not be counted in its synthetic fields.
+    totals, combined = express_route_totals(
+        _express_stops(),
+        _express_demographics(),
+        _EXP_FIELDS,
+        **_express_kwargs(
+            zero_origin_employment=zero_crossterms,
+            zero_destination_population=zero_crossterms,
+        ),
+    )
+    assert totals is not None and combined is not None
+    for field in _EXP_FIELDS:
+        assert combined[f"synthetic_{field}"].sum() == pytest.approx(totals[field], abs=0.5)
+    assert len(combined) == 2  # each block written once
 
 
 def test_express_route_totals_keeps_crossterms_when_flags_false() -> None:
