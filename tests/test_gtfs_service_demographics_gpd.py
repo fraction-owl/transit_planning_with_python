@@ -412,6 +412,72 @@ def test_build_walk_isochrone_empty_graph_returns_none() -> None:
     assert iso is None
 
 
+# Metres: 10 minutes at 1 m/s gives a 600 m network budget.
+_ISO_KW = dict(walk_time_min=10.0, walk_speed_units_per_s=1.0, edge_buffer=50.0)
+
+
+def _iso_graph(lines: list[LineString]) -> nx.MultiGraph:
+    graph, _ = build_pedestrian_time_network(_centerlines(lines), walk_speed=1.0, node_grid=1.0)
+    return graph
+
+
+def _iso_stop(x: float, y: float) -> gpd.GeoDataFrame:
+    return gpd.GeoDataFrame(geometry=[Point(x, y)], crs="EPSG:3395")
+
+
+def test_build_walk_isochrone_does_not_cross_to_disconnected_street() -> None:
+    # Two parallel streets 200 m apart with no connection. A straight-line circle
+    # around the start would take in the far street; the network walkshed cannot.
+    graph = _iso_graph([LineString([(0, 0), (1000, 0)]), LineString([(0, 200), (1000, 200)])])
+    iso = build_walk_isochrone(_iso_stop(500, 0), graph, **_ISO_KW)
+    assert iso is not None
+    shape = iso.geometry.iloc[0]
+    assert shape.contains(Point(500, 40))  # beside the stop's own street
+    assert not shape.contains(Point(500, 200))  # the disconnected street
+    assert not shape.intersects(LineString([(0, 200), (1000, 200)]))
+
+
+def test_build_walk_isochrone_cuts_edges_at_the_remaining_budget() -> None:
+    # One long edge: the walkshed reaches 600 m along it from the stop, plus the
+    # 50 m edge buffer at each end — never the whole edge.
+    graph = _iso_graph([LineString([(-5000, 0), (5000, 0)])])
+    iso = build_walk_isochrone(_iso_stop(0, 0), graph, **_ISO_KW)
+    assert iso is not None
+    minx, _, maxx, _ = iso.total_bounds
+    assert minx == pytest.approx(-650.0, abs=1.0)
+    assert maxx == pytest.approx(650.0, abs=1.0)
+
+
+def test_build_walk_isochrone_charges_the_access_walk() -> None:
+    # A stop 60 m off the network has 540 m left once it reaches the street.
+    graph = _iso_graph([LineString([(-5000, 0), (5000, 0)])])
+    iso = build_walk_isochrone(_iso_stop(0, 60), graph, **_ISO_KW)
+    assert iso is not None
+    minx, _, maxx, maxy = iso.total_bounds
+    assert maxx == pytest.approx(590.0, abs=1.0)
+    assert minx == pytest.approx(-590.0, abs=1.0)
+    assert maxy == pytest.approx(110.0, abs=1.0)  # the access walk itself is covered
+
+
+def test_build_walk_isochrone_follows_the_network_around_corners() -> None:
+    # An L-shaped path: 400 m east, then north. Only 200 m of budget remains at the
+    # corner, so the walkshed goes 200 m up the side street, not 600 m.
+    graph = _iso_graph([LineString([(0, 0), (400, 0)]), LineString([(400, 0), (400, 1000)])])
+    iso = build_walk_isochrone(_iso_stop(0, 0), graph, **_ISO_KW)
+    assert iso is not None
+    assert iso.total_bounds[3] == pytest.approx(250.0, abs=1.0)
+
+
+def test_build_walk_isochrone_skips_stops_beyond_snap_distance(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    graph = _iso_graph([LineString([(0, 0), (1000, 0)])])
+    with caplog.at_level(logging.WARNING):
+        iso = build_walk_isochrone(_iso_stop(500, 500), graph, max_snap_distance=100.0, **_ISO_KW)
+    assert iso is None
+    assert "from the pedestrian network" in caplog.text
+
+
 # ---------------------------------------------------------------------------
 # build_service_area_polygon
 # ---------------------------------------------------------------------------

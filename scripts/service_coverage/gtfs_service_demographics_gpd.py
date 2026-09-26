@@ -12,8 +12,9 @@ independent choices:
       optional wider drive-access buffer for express origin (park-and-ride) stops.
     - ``"route_buffer"``: a fixed-radius buffer around the route-line geometry
       taken from GTFS ``shapes.txt``.
-    - ``"isochrone"``: a walk-time isochrone (walkshed) around each stop,
-      traced over a pedestrian centerline network.
+    - ``"isochrone"``: a walk-time isochrone (walkshed) around each stop: the
+      pedestrian-network segments reachable within the walk-time budget,
+      buffered by ``ISOCHRONE_EDGE_BUFFER_M``.
 
 In ``"route"`` mode each route is labeled by ``service_type``
 (``"express"``/``"local"``) and ``express_direction``
@@ -53,6 +54,7 @@ Typical usage:
 """
 
 import argparse
+import heapq
 import logging
 import os
 import sys
@@ -64,12 +66,11 @@ from typing import Any, Final, List, Optional, Tuple
 import geopandas as gpd
 import matplotlib.pyplot as plt
 import networkx as nx
-import numpy as np
 import pandas as pd
 from pyproj import CRS, Proj
-from scipy.spatial import cKDTree
+from shapely import STRtree
 from shapely.geometry import LineString, Point
-from shapely.ops import unary_union
+from shapely.ops import substring, unary_union
 
 # =============================================================================
 # CONFIGURATION
@@ -85,8 +86,9 @@ ANALYSIS_MODE = "network"  # Options: "network", "route", "stop"
 #   "route_buffer" → fixed-radius buffer around the route-line geometry from
 #                    shapes.txt (uses BUFFER_DISTANCE). Falls back to
 #                    "stop_buffer" when route geometry is unavailable.
-#   "isochrone"    → walk-time isochrone around each stop traced over the
-#                    pedestrian network (uses the ISOCHRONE_* settings below).
+#   "isochrone"    → walk-time isochrone around each stop: the pedestrian-network
+#                    segments reachable in the time budget, buffered (uses the
+#                    ISOCHRONE_* settings below).
 SERVICE_AREA_METHOD = "stop_buffer"  # Options: "stop_buffer", "route_buffer", "isochrone"
 
 # Paths
@@ -228,6 +230,14 @@ EXPRESS_EMPLOYMENT_FIELDS: list[str] = ["tot_empl", "low_wage", "mid_wage", "hig
 # Isochrone settings (only used when SERVICE_AREA_METHOD == "isochrone")
 ISOCHRONE_WALK_TIME_MIN = 10.0  # Walk-time budget in minutes
 WALK_SPEED_MPH = 3.0  # Assumed pedestrian walking speed
+# The walkshed is the pedestrian-network segments reachable within the walk-time
+# budget, buffered by ISOCHRONE_EDGE_BUFFER_M metres to take in the land fronting
+# them (roughly a lot depth). Larger values widen the walkshed along every street.
+ISOCHRONE_EDGE_BUFFER_M = 50.0
+# Farthest (metres) a stop may sit from the pedestrian network. A stop with no
+# network segment this close is skipped with a warning rather than snapped across
+# a gap; the straight-line walk onto the network is charged against the budget.
+ISOCHRONE_MAX_SNAP_M = 100.0
 
 # Optional FIPS filter (list of codes). Empty list = no filter.
 FIPS_FILTER: list[str] = []  # Replace with FIPS code(s) for desired jurisdictions (e.g. "11001")
@@ -673,67 +683,169 @@ def build_route_shapes_gdf(
     return dissolved[["route_short_name", "geometry"]]
 
 
+def _edge_ends(graph: nx.MultiGraph, line: LineString, a: Any, b: Any) -> Tuple[Any, Any]:
+    """Return the (node at ``line``'s first vertex, node at its last) for edge a–b.
+
+    Graph edges are undirected, so the stored geometry may run either way between
+    its two nodes; the node nearer the first vertex is the start.
+    """
+    x0, y0 = line.coords[0]
+    dist_a = (graph.nodes[a]["x"] - x0) ** 2 + (graph.nodes[a]["y"] - y0) ** 2
+    dist_b = (graph.nodes[b]["x"] - x0) ** 2 + (graph.nodes[b]["y"] - y0) ** 2
+    return (a, b) if dist_a <= dist_b else (b, a)
+
+
+def _network_distances(
+    graph: nx.MultiGraph, seeds: Mapping[Any, float], budget: float
+) -> dict[Any, float]:
+    """Shortest walking distance (edge ``length``) to every node within *budget*.
+
+    Dijkstra from several seed nodes at once, each starting at its own distance —
+    the walk already spent reaching it from the stop — so the search begins at the
+    stop's snap point rather than at a whole node.
+    """
+    heap = [(d, i, node) for i, (node, d) in enumerate(seeds.items()) if d <= budget]
+    heapq.heapify(heap)
+    order = len(heap)
+    dist: dict[Any, float] = {}
+    while heap:
+        d, _, node = heapq.heappop(heap)
+        if node in dist:
+            continue
+        dist[node] = d
+        for nbr, keyed in graph[node].items():
+            if nbr in dist:
+                continue
+            step = min(float(data["length"]) for data in keyed.values())
+            if d + step <= budget:
+                order += 1
+                heapq.heappush(heap, (d + step, order, nbr))
+    return dist
+
+
+def _reachable_segments(
+    graph: nx.MultiGraph, dist: Mapping[Any, float], budget: float
+) -> list[Any]:
+    """Return the parts of every edge walkable within *budget* from the reached nodes.
+
+    An edge is walked in from each reached end for whatever budget remains there,
+    so it contributes in full, as one or two partial pieces, or not at all.
+    """
+    pieces: list[Any] = []
+    seen: set[Any] = set()
+    for node in dist:
+        for nbr, keyed in graph[node].items():
+            for key, data in keyed.items():
+                edge_key = data.get("edge_id", (node, nbr, key))
+                if edge_key in seen:
+                    continue
+                seen.add(edge_key)
+                line = data["geometry"]
+                length = float(data["length"])
+                first, last = _edge_ends(graph, line, node, nbr)
+                reach_first = budget - dist[first] if first in dist else 0.0
+                reach_last = budget - dist[last] if last in dist else 0.0
+                if reach_first + reach_last >= length:
+                    pieces.append(line)
+                    continue
+                if reach_first > 0:
+                    pieces.append(substring(line, 0.0, reach_first))
+                if reach_last > 0:
+                    pieces.append(substring(line, length - reach_last, length))
+    return pieces
+
+
 def build_walk_isochrone(
     stop_points_gdf: gpd.GeoDataFrame,
     ped_graph: nx.MultiGraph,
     *,
     walk_time_min: float,
     walk_speed_units_per_s: float,
+    edge_buffer: Optional[float] = None,
+    max_snap_distance: Optional[float] = None,
 ) -> Optional[gpd.GeoDataFrame]:
-    """Build a walk-time isochrone (walkshed) around the given stop points.
+    """Build a network walkshed (walk-time isochrone) around the given stop points.
 
-    Each stop is snapped to the nearest pedestrian-network node, and Dijkstra
-    expands outward up to ``walk_time_min`` minutes. Every reachable node is
-    buffered by the distance still walkable with its leftover time budget, and
-    the union of those buffers forms the walkshed. Stops without a reachable
-    node (e.g. an empty graph) are skipped.
+    The walkshed is made of the pedestrian-network segments reachable within the
+    budget, so it cannot cross a barrier or reach a disconnected street:
+
+    1. Each stop snaps to the nearest network segment within *max_snap_distance*;
+       stops farther than that from any segment are skipped with a warning. The
+       straight-line walk onto the network is charged against the budget.
+    2. Dijkstra runs over segment lengths from the snap point, out to the budget
+       distance ``walk_time_min * 60 * walk_speed_units_per_s``.
+    3. Every segment is kept in full when walkable end to end, or cut to the
+       portion walkable from each reached end with the budget left there.
+    4. The kept segments (plus each stop's access walk) are buffered by
+       *edge_buffer* to take in the land fronting them, and dissolved.
 
     Args:
         stop_points_gdf: Stop *point* geometry in the projected CRS.
         ped_graph: Walking graph from :func:`build_pedestrian_time_network`
-            (edges weighted by ``time_s``; nodes carry ``x``/``y``).
+            (edges carry ``geometry`` and ``length``; nodes carry ``x``/``y``).
         walk_time_min: Walk-time budget in minutes.
-        walk_speed_units_per_s: Walking speed in projected-CRS units per second
-            (must match the speed used to build ``ped_graph``).
+        walk_speed_units_per_s: Walking speed in projected-CRS units per second.
+        edge_buffer: Buffer around reachable segments, in CRS units. ``None``
+            uses ``ISOCHRONE_EDGE_BUFFER_M``.
+        max_snap_distance: Farthest a stop may sit from the network, in CRS
+            units. ``None`` uses ``ISOCHRONE_MAX_SNAP_M``.
 
     Returns:
         A single-row GeoDataFrame holding the dissolved walkshed polygon, or
         ``None`` if nothing was reachable.
     """
-    if ped_graph.number_of_nodes() == 0:
+    edge_buffer = ISOCHRONE_EDGE_BUFFER_M if edge_buffer is None else edge_buffer
+    max_snap_distance = ISOCHRONE_MAX_SNAP_M if max_snap_distance is None else max_snap_distance
+    if ped_graph.number_of_edges() == 0:
         logging.warning("Pedestrian network is empty; cannot build an isochrone.")
         return None
 
-    cutoff_s = walk_time_min * 60.0
-    node_keys = list(ped_graph.nodes)
-    node_xy = np.array([(ped_graph.nodes[n]["x"], ped_graph.nodes[n]["y"]) for n in node_keys])
-    tree = cKDTree(node_xy)
+    budget = walk_time_min * 60.0 * walk_speed_units_per_s
+    edges = list(ped_graph.edges(data=True))
+    tree = STRtree([data["geometry"] for _, _, data in edges])
 
-    polygons: list[Any] = []
+    pieces: list[Any] = []
+    unsnapped = 0
     for geom in stop_points_gdf.geometry:
         if geom is None or geom.is_empty:
             continue
-        _, idx = tree.query((geom.x, geom.y))
-        source = node_keys[int(idx)]
-
-        # Reachable nodes (and their walk time) within the budget.
-        lengths = nx.single_source_dijkstra_path_length(
-            ped_graph, source, cutoff=cutoff_s, weight="time_s"
+        hits, gaps = tree.query_nearest(geom, max_distance=max_snap_distance, return_distance=True)
+        if len(hits) == 0:
+            unsnapped += 1
+            continue
+        access = float(gaps[0])
+        remaining = budget - access
+        if remaining <= 0:
+            continue
+        a, b, data = edges[int(hits[0])]
+        line = data["geometry"]
+        length = float(data["length"])
+        along = line.project(geom)
+        if access > 0:
+            pieces.append(LineString([geom, line.interpolate(along)]))
+        lo, hi = max(0.0, along - remaining), min(length, along + remaining)
+        if hi > lo:
+            pieces.append(substring(line, lo, hi))
+        first, last = _edge_ends(ped_graph, line, a, b)
+        dist = _network_distances(
+            ped_graph, {first: access + along, last: access + (length - along)}, budget
         )
-        for node, time_s in lengths.items():
-            residual_units = (cutoff_s - time_s) * walk_speed_units_per_s
-            if residual_units <= 0:
-                continue
-            node_x = ped_graph.nodes[node]["x"]
-            node_y = ped_graph.nodes[node]["y"]
-            polygons.append(Point(node_x, node_y).buffer(residual_units))
+        pieces.extend(_reachable_segments(ped_graph, dist, budget))
 
-    if not polygons:
-        logging.warning("No pedestrian-network nodes were reachable from the stops.")
+    if unsnapped:
+        logging.warning(
+            "%d stop(s) are more than %.0f CRS units from the pedestrian network and were "
+            "left out of the isochrone (raise ISOCHRONE_MAX_SNAP_M if the network is "
+            "offset from the stops).",
+            unsnapped,
+            max_snap_distance,
+        )
+    if not pieces:
+        logging.warning("No pedestrian-network segments were reachable from the stops.")
         return None
 
-    iso = unary_union(polygons)
-    return gpd.GeoDataFrame(geometry=[iso], crs=stop_points_gdf.crs)
+    walkshed = unary_union(pieces).buffer(edge_buffer)
+    return gpd.GeoDataFrame(geometry=[walkshed], crs=stop_points_gdf.crs)
 
 
 def build_service_area_polygon(
@@ -747,6 +859,8 @@ def build_service_area_polygon(
     ped_graph: Optional[nx.MultiGraph] = None,
     walk_time_min: float = 0.0,
     walk_speed_units_per_s: float = 0.0,
+    isochrone_edge_buffer_m: Optional[float] = None,
+    isochrone_max_snap_m: Optional[float] = None,
 ) -> Optional[gpd.GeoDataFrame]:
     """Build a single dissolved service-area polygon for a set of stops.
 
@@ -768,6 +882,10 @@ def build_service_area_polygon(
         ped_graph: Pedestrian graph for the ``"isochrone"`` method.
         walk_time_min: Walk-time budget (minutes) for the ``"isochrone"`` method.
         walk_speed_units_per_s: Walking speed (CRS units/s) for the isochrone.
+        isochrone_edge_buffer_m: Buffer around reachable network segments (m);
+            ``None`` uses ``ISOCHRONE_EDGE_BUFFER_M``.
+        isochrone_max_snap_m: Farthest a stop may sit from the network (m);
+            ``None`` uses ``ISOCHRONE_MAX_SNAP_M``.
 
     Returns:
         A single-row GeoDataFrame with the dissolved service area, or ``None``
@@ -785,6 +903,8 @@ def build_service_area_polygon(
                 ped_graph,
                 walk_time_min=walk_time_min,
                 walk_speed_units_per_s=walk_speed_units_per_s,
+                edge_buffer=isochrone_edge_buffer_m,
+                max_snap_distance=isochrone_max_snap_m,
             )
 
     if method == "route_buffer":
@@ -1126,6 +1246,8 @@ def do_network_analysis(
     ped_graph: Optional[nx.MultiGraph] = None,
     walk_time_min: float = 0.0,
     walk_speed_units_per_s: float = 0.0,
+    isochrone_edge_buffer_m: Optional[float] = None,
+    isochrone_max_snap_m: Optional[float] = None,
     express_route_ids: Optional[set[str]] = None,
 ) -> None:
     """Run a single network-wide service-area/clip analysis.
@@ -1155,6 +1277,8 @@ def do_network_analysis(
         ped_graph: Pedestrian network (for the ``isochrone`` method).
         walk_time_min: Walk-time budget in minutes (isochrone method).
         walk_speed_units_per_s: Walking speed in CRS units/s (isochrone method).
+        isochrone_edge_buffer_m: Buffer around reachable segments (isochrone method).
+        isochrone_max_snap_m: Farthest stop-to-network snap (isochrone method).
         express_route_ids: Express ``route_id`` values. Accepted for a uniform
             dispatch signature but unused here — the ``service_type`` label is a
             per-route output, emitted only by ``do_route_by_route_analysis``.
@@ -1197,6 +1321,8 @@ def do_network_analysis(
         ped_graph=ped_graph,
         walk_time_min=walk_time_min,
         walk_speed_units_per_s=walk_speed_units_per_s,
+        isochrone_edge_buffer_m=isochrone_edge_buffer_m,
+        isochrone_max_snap_m=isochrone_max_snap_m,
     )
     if service_area_gdf is None or service_area_gdf.empty:
         logging.info("Could not build a network service area. Aborting network analysis.")
@@ -1400,6 +1526,8 @@ def do_route_by_route_analysis(
     ped_graph: Optional[nx.MultiGraph] = None,
     walk_time_min: float = 0.0,
     walk_speed_units_per_s: float = 0.0,
+    isochrone_edge_buffer_m: Optional[float] = None,
+    isochrone_max_snap_m: Optional[float] = None,
     express_route_ids: Optional[set[str]] = None,
     unidirectional_route_ids: Optional[set[str]] = None,
     employment_fields: Optional[Sequence[str]] = None,
@@ -1552,6 +1680,8 @@ def do_route_by_route_analysis(
                 ped_graph=ped_graph,
                 walk_time_min=walk_time_min,
                 walk_speed_units_per_s=walk_speed_units_per_s,
+                isochrone_edge_buffer_m=isochrone_edge_buffer_m,
+                isochrone_max_snap_m=isochrone_max_snap_m,
             )
             if service_area_gdf is None or service_area_gdf.empty:
                 logging.info(
@@ -1634,6 +1764,8 @@ def do_stop_by_stop_analysis(
     ped_graph: Optional[nx.MultiGraph] = None,
     walk_time_min: float = 0.0,
     walk_speed_units_per_s: float = 0.0,
+    isochrone_edge_buffer_m: Optional[float] = None,
+    isochrone_max_snap_m: Optional[float] = None,
     express_route_ids: Optional[set[str]] = None,
 ) -> None:
     """Compute a service area and demographic catchment for each stop.
@@ -1693,6 +1825,8 @@ def do_stop_by_stop_analysis(
             ped_graph=ped_graph,
             walk_time_min=walk_time_min,
             walk_speed_units_per_s=walk_speed_units_per_s,
+            isochrone_edge_buffer_m=isochrone_edge_buffer_m,
+            isochrone_max_snap_m=isochrone_max_snap_m,
         )
         if service_area_gdf is None or service_area_gdf.empty:
             logging.info("Could not build a service area for stop %s - skipping.", stop_id_str)
@@ -1986,6 +2120,8 @@ def run(
     express_origin_stops_file: str | Path | None = None,
     isochrone_walk_time_min: float | None = None,
     walk_speed_mph: float | None = None,
+    isochrone_edge_buffer_m: float | None = None,
+    isochrone_max_snap_m: float | None = None,
     fips_filter: Sequence[str] | None = None,
     crs_epsg_code: int | None = None,
     express_route_ids: Sequence[str] | None = None,
@@ -2049,6 +2185,12 @@ def run(
         ISOCHRONE_WALK_TIME_MIN if isochrone_walk_time_min is None else isochrone_walk_time_min
     )
     walk_speed_mph = WALK_SPEED_MPH if walk_speed_mph is None else walk_speed_mph
+    isochrone_edge_buffer_m = (
+        ISOCHRONE_EDGE_BUFFER_M if isochrone_edge_buffer_m is None else isochrone_edge_buffer_m
+    )
+    isochrone_max_snap_m = (
+        ISOCHRONE_MAX_SNAP_M if isochrone_max_snap_m is None else isochrone_max_snap_m
+    )
     fips_filter = list(FIPS_FILTER if fips_filter is None else fips_filter)
     crs_epsg_code = CRS_EPSG_CODE if crs_epsg_code is None else crs_epsg_code
     express_route_ids = list(EXPRESS_ROUTE_IDS if express_route_ids is None else express_route_ids)
@@ -2300,6 +2442,8 @@ def run(
                 ped_graph=ped_graph,
                 walk_time_min=isochrone_walk_time_min,
                 walk_speed_units_per_s=walk_speed_units_per_s,
+                isochrone_edge_buffer_m=isochrone_edge_buffer_m,
+                isochrone_max_snap_m=isochrone_max_snap_m,
                 express_route_ids=express_route_id_set,
                 unidirectional_route_ids=unidirectional_route_id_set,
                 employment_fields=express_employment_fields,
@@ -2315,6 +2459,8 @@ def run(
                 ped_graph=ped_graph,
                 walk_time_min=isochrone_walk_time_min,
                 walk_speed_units_per_s=walk_speed_units_per_s,
+                isochrone_edge_buffer_m=isochrone_edge_buffer_m,
+                isochrone_max_snap_m=isochrone_max_snap_m,
                 express_route_ids=express_route_id_set,
             )
         else:
@@ -2483,6 +2629,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Assumed pedestrian walking speed.",
     )
     parser.add_argument(
+        "--isochrone-edge-buffer",
+        type=float,
+        default=ISOCHRONE_EDGE_BUFFER_M,
+        help="Buffer (metres) around reachable pedestrian segments (isochrone method).",
+    )
+    parser.add_argument(
+        "--isochrone-max-snap",
+        type=float,
+        default=ISOCHRONE_MAX_SNAP_M,
+        help="Farthest (metres) a stop may sit from the pedestrian network (isochrone method).",
+    )
+    parser.add_argument(
         "--fips",
         nargs="*",
         default=FIPS_FILTER,
@@ -2606,6 +2764,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             express_origin_stops_file=args.express_origin_stops_file,
             isochrone_walk_time_min=args.isochrone_walk_time,
             walk_speed_mph=args.walk_speed_mph,
+            isochrone_edge_buffer_m=args.isochrone_edge_buffer,
+            isochrone_max_snap_m=args.isochrone_max_snap,
             fips_filter=args.fips,
             crs_epsg_code=args.crs_epsg,
             express_route_ids=args.express_routes,
