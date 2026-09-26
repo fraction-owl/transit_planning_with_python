@@ -10,6 +10,7 @@ import matplotlib
 import networkx as nx
 import pandas as pd
 import pytest
+from pyproj import CRS
 from shapely.geometry import LineString, Point, Polygon, box
 
 matplotlib.use("Agg")  # headless backend; the module imports matplotlib.pyplot
@@ -18,6 +19,7 @@ from scripts.service_coverage.gtfs_service_demographics_gpd import (
     CRS_EPSG_CODE,
     METERS_PER_MILE,
     SYNTHETIC_FIELDS,
+    ServiceSelectionError,
     _present_synthetic_cols,
     _stops_to_points_gdf,
     apply_fips_filter,
@@ -26,25 +28,40 @@ from scripts.service_coverage.gtfs_service_demographics_gpd import (
     build_service_area_polygon,
     build_walk_isochrone,
     clip_and_calculate_synthetic_fields,
+    crs_acres_per_square_unit,
     export_summary_to_excel,
     express_route_totals,
-    filter_weekday_service,
     flag_express_origin_candidates,
     get_included_routes,
     get_included_stops,
     load_express_route_ids,
     load_gtfs_data,
     load_id_set,
+    main,
+    parse_args,
     pick_buffer_distance,
     quantize_node,
     run,
     suggest_express_origin_stops,
+    validate_projected_crs,
+    warn_if_distorted_crs,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
+# Synthetic geometry below is laid out in metres. Offsets placed in the default
+# CRS (US survey feet by default) are scaled by this factor so each test keeps its
+# physical layout whatever CRS_EPSG_CODE is set to.
+_UNITS_PER_M = 1.0 / CRS.from_epsg(CRS_EPSG_CODE).axis_info[0].unit_conversion_factor
+# Express accounting tests build their own layers directly in a metric CRS.
+_METRIC_CRS = "EPSG:32618"  # WGS 84 / UTM zone 18N
+
 # GTFS text files this script relies on (plus shapes.txt for route geometry).
 _REQUIRED_GTFS = ["trips.txt", "stop_times.txt", "routes.txt", "stops.txt", "calendar.txt"]
+
+# The mock feed's Monday–Friday service_id. run() defaults to "4", which the
+# fixture does not use, so every run() call names this one.
+_FIXTURE_SERVICE_IDS = ["weekday"]
 
 
 def _extract_zip(zip_path: Path, dest: Path) -> Path:
@@ -73,121 +90,6 @@ def dc_gtfs(dc_gtfs_dir: Path) -> dict[str, pd.DataFrame]:
 def dc_shapes(dc_gtfs_dir: Path) -> pd.DataFrame:
     """The DC feed's shapes.txt table (route geometry)."""
     return pd.read_csv(dc_gtfs_dir / "shapes.txt", dtype=str, low_memory=False)
-
-
-# ---------------------------------------------------------------------------
-# filter_weekday_service
-# ---------------------------------------------------------------------------
-
-
-def _calendar(rows: list[dict]) -> pd.DataFrame:
-    return pd.DataFrame(rows)
-
-
-def test_filter_weekday_service_keeps_full_week() -> None:
-    cal = _calendar(
-        [
-            {
-                "service_id": "WK",
-                "monday": 1,
-                "tuesday": 1,
-                "wednesday": 1,
-                "thursday": 1,
-                "friday": 1,
-                "saturday": 0,
-                "sunday": 0,
-            },
-            {
-                "service_id": "SAT",
-                "monday": 0,
-                "tuesday": 0,
-                "wednesday": 0,
-                "thursday": 0,
-                "friday": 0,
-                "saturday": 1,
-                "sunday": 0,
-            },
-        ]
-    )
-    result = filter_weekday_service(cal)
-    assert list(result) == ["WK"]
-
-
-def test_filter_weekday_service_drops_partial_week() -> None:
-    # Runs every weekday except Wednesday → should be excluded.
-    cal = _calendar(
-        [
-            {
-                "service_id": "PARTIAL",
-                "monday": 1,
-                "tuesday": 1,
-                "wednesday": 0,
-                "thursday": 1,
-                "friday": 1,
-                "saturday": 0,
-                "sunday": 0,
-            },
-        ]
-    )
-    assert filter_weekday_service(cal).empty
-
-
-def test_filter_weekday_service_handles_string_flags() -> None:
-    # Real feeds load calendar.txt with every column as a string. Service "2" runs the
-    # full Mon–Fri week; "1" skips Thursday; "3" is Saturday — only "2" should qualify.
-    cal = _calendar(
-        [
-            {
-                k: v
-                for k, v in zip(
-                    [
-                        "service_id",
-                        "monday",
-                        "tuesday",
-                        "wednesday",
-                        "thursday",
-                        "friday",
-                        "saturday",
-                        "sunday",
-                    ],
-                    ["1", "1", "1", "1", "0", "1", "0", "0"],
-                )
-            },
-            {
-                k: v
-                for k, v in zip(
-                    [
-                        "service_id",
-                        "monday",
-                        "tuesday",
-                        "wednesday",
-                        "thursday",
-                        "friday",
-                        "saturday",
-                        "sunday",
-                    ],
-                    ["2", "1", "1", "1", "1", "1", "0", "0"],
-                )
-            },
-            {
-                k: v
-                for k, v in zip(
-                    [
-                        "service_id",
-                        "monday",
-                        "tuesday",
-                        "wednesday",
-                        "thursday",
-                        "friday",
-                        "saturday",
-                        "sunday",
-                    ],
-                    ["3", "0", "0", "0", "0", "0", "1", "0"],
-                )
-            },
-        ]
-    )
-    assert list(filter_weekday_service(cal)) == ["2"]
 
 
 # ---------------------------------------------------------------------------
@@ -410,6 +312,75 @@ def test_build_walk_isochrone_empty_graph_returns_none() -> None:
     assert iso is None
 
 
+# US survey feet (EPSG:2248): 10 minutes at 1 ft/s gives a 600 ft network budget.
+_ISO_CRS = "EPSG:2248"
+_ISO_KW = dict(walk_time_min=10.0, walk_speed_units_per_s=1.0, edge_buffer_ft=50.0)
+
+
+def _iso_graph(lines: list[LineString]) -> nx.MultiGraph:
+    graph, _ = build_pedestrian_time_network(
+        _centerlines(lines, crs=_ISO_CRS), walk_speed=1.0, node_grid=1.0
+    )
+    return graph
+
+
+def _iso_stop(x: float, y: float) -> gpd.GeoDataFrame:
+    return gpd.GeoDataFrame(geometry=[Point(x, y)], crs=_ISO_CRS)
+
+
+def test_build_walk_isochrone_does_not_cross_to_disconnected_street() -> None:
+    # Two parallel streets 200 m apart with no connection. A straight-line circle
+    # around the start would take in the far street; the network walkshed cannot.
+    graph = _iso_graph([LineString([(0, 0), (1000, 0)]), LineString([(0, 200), (1000, 200)])])
+    iso = build_walk_isochrone(_iso_stop(500, 0), graph, **_ISO_KW)
+    assert iso is not None
+    shape = iso.geometry.iloc[0]
+    assert shape.contains(Point(500, 40))  # beside the stop's own street
+    assert not shape.contains(Point(500, 200))  # the disconnected street
+    assert not shape.intersects(LineString([(0, 200), (1000, 200)]))
+
+
+def test_build_walk_isochrone_cuts_edges_at_the_remaining_budget() -> None:
+    # One long edge: the walkshed reaches 600 m along it from the stop, plus the
+    # 50 m edge buffer at each end — never the whole edge.
+    graph = _iso_graph([LineString([(-5000, 0), (5000, 0)])])
+    iso = build_walk_isochrone(_iso_stop(0, 0), graph, **_ISO_KW)
+    assert iso is not None
+    minx, _, maxx, _ = iso.total_bounds
+    assert minx == pytest.approx(-650.0, abs=1.0)
+    assert maxx == pytest.approx(650.0, abs=1.0)
+
+
+def test_build_walk_isochrone_charges_the_access_walk() -> None:
+    # A stop 60 m off the network has 540 m left once it reaches the street.
+    graph = _iso_graph([LineString([(-5000, 0), (5000, 0)])])
+    iso = build_walk_isochrone(_iso_stop(0, 60), graph, **_ISO_KW)
+    assert iso is not None
+    minx, _, maxx, maxy = iso.total_bounds
+    assert maxx == pytest.approx(590.0, abs=1.0)
+    assert minx == pytest.approx(-590.0, abs=1.0)
+    assert maxy == pytest.approx(110.0, abs=1.0)  # the access walk itself is covered
+
+
+def test_build_walk_isochrone_follows_the_network_around_corners() -> None:
+    # An L-shaped path: 400 m east, then north. Only 200 m of budget remains at the
+    # corner, so the walkshed goes 200 m up the side street, not 600 m.
+    graph = _iso_graph([LineString([(0, 0), (400, 0)]), LineString([(400, 0), (400, 1000)])])
+    iso = build_walk_isochrone(_iso_stop(0, 0), graph, **_ISO_KW)
+    assert iso is not None
+    assert iso.total_bounds[3] == pytest.approx(250.0, abs=1.0)
+
+
+def test_build_walk_isochrone_skips_stops_beyond_snap_distance(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    graph = _iso_graph([LineString([(0, 0), (1000, 0)])])
+    with caplog.at_level(logging.WARNING):
+        iso = build_walk_isochrone(_iso_stop(500, 500), graph, max_snap_ft=100.0, **_ISO_KW)
+    assert iso is None
+    assert "from the pedestrian network" in caplog.text
+
+
 # ---------------------------------------------------------------------------
 # build_service_area_polygon
 # ---------------------------------------------------------------------------
@@ -562,7 +533,16 @@ def _commute_demographics() -> gpd.GeoDataFrame:
 
 def test_commute_count_fields_are_synthetic_fields() -> None:
     # The disaggregated S0801 worker counts must be apportioned like every other count.
-    for field in ("cmt_wrkrs", "cmt_trnst", "cmt_drove", "cmt_carpl", "cmt_wfh", "cmt_pmin"):
+    fields = (
+        "cmt_wrkrs",
+        "cmt_trnst",
+        "cmt_drove",
+        "cmt_carpl",
+        "cmt_wfh",
+        "cmt_pmin",
+        "cmt_timed",
+    )
+    for field in fields:
         assert field in SYNTHETIC_FIELDS
 
 
@@ -682,9 +662,55 @@ def test_run_raises_on_missing_demographics(tmp_path: Path, dc_gtfs_dir: Path) -
             analysis_mode="route",
             service_area_method="stop_buffer",
             gtfs_data_path=str(dc_gtfs_dir),
+            service_ids_to_include=_FIXTURE_SERVICE_IDS,
             demographics_shp_path=str(tmp_path / "does_not_exist.shp"),
             output_directory=str(tmp_path / "out"),
         )
+
+
+def test_run_stops_when_service_id_not_in_feed(
+    tmp_path: Path, dc_gtfs_dir: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The default "4" is not a service_id in the mock feed. The run logs
+    # calendar.txt, flags the unchanged default, and stops with the feed's
+    # service_ids before reading the demographics, without a traceback.
+    with (
+        caplog.at_level(logging.INFO),
+        pytest.raises(ServiceSelectionError, match=r"weekday \(203 trips\)"),
+    ):
+        run(
+            analysis_mode="route",
+            service_area_method="stop_buffer",
+            gtfs_data_path=str(dc_gtfs_dir),
+            demographics_shp_path=str(tmp_path / "does_not_exist.shp"),
+            output_directory=str(tmp_path / "out"),
+        )
+    assert "calendar.txt (4 service_id row(s))" in caplog.text
+    assert "still the default ['4']" in caplog.text
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert errors
+    assert all(r.exc_info is None for r in errors)
+
+
+def test_main_exit_code_for_service_id(tmp_path: Path, dc_gtfs_dir: Path) -> None:
+    argv = [
+        "--gtfs-path",
+        str(dc_gtfs_dir),
+        "--demographics-shp",
+        str(tmp_path / "does_not_exist.shp"),
+        "--output-dir",
+        str(tmp_path / "out"),
+    ]
+    # A service_id the feed lacks is a configuration error (2); a present one gets
+    # past the check and fails later on the missing demographics input (1).
+    assert main(argv) == 2
+    assert main([*argv, "--service-ids", "saturday"]) == 1
+
+
+def test_parse_args_service_ids() -> None:
+    assert parse_args([]).service_ids == ["4"]
+    assert parse_args(["--service-ids", "4", "5"]).service_ids == ["4", "5"]
+    assert parse_args(["--service-ids"]).service_ids == []  # every trip
 
 
 # ---------------------------------------------------------------------------
@@ -711,6 +737,104 @@ def test_stops_to_points_gdf_respects_route_filter(dc_gtfs: dict[str, pd.DataFra
     )
     assert result is not None
     assert set(result["route_short_name"]) == {"10"}
+
+
+def test_stops_to_points_gdf_uses_requested_crs(dc_gtfs: dict[str, pd.DataFrame]) -> None:
+    final_routes = get_included_routes(dc_gtfs["routes"], ["10"], [])
+    result = _stops_to_points_gdf(
+        dc_gtfs["trips"], dc_gtfs["stop_times"], dc_gtfs["stops"], final_routes, [], [], crs=32618
+    )
+    assert result is not None
+    assert result.crs.to_epsg() == 32618
+
+
+@pytest.mark.parametrize("code", [2248, 26985])
+def test_validate_projected_crs_accepts_feet_and_metres(code: int) -> None:
+    assert validate_projected_crs(code).is_projected
+
+
+def test_default_crs_is_projected_in_feet() -> None:
+    assert "foot" in validate_projected_crs(CRS_EPSG_CODE).axis_info[0].unit_name
+
+
+def test_crs_acres_per_square_unit_follows_the_crs_unit() -> None:
+    assert crs_acres_per_square_unit("EPSG:3395") == pytest.approx(1 / 4046.86)
+    assert crs_acres_per_square_unit("EPSG:2248") == pytest.approx(1 / 43_560, rel=1e-4)
+
+
+def test_build_service_area_polygon_buffers_in_feet() -> None:
+    # A quarter mile is 1,320 ft: the buffer must use the CRS's feet, not metres.
+    pts = gpd.GeoDataFrame({"stop_id": ["S1"]}, geometry=[Point(0.0, 0.0)], crs="EPSG:2248")
+    result = build_service_area_polygon(
+        pts,
+        method="stop_buffer",
+        buffer_distance_mi=0.25,
+        large_buffer_distance_mi=2.0,
+        stop_ids_large_buffer=[],
+    )
+    assert result is not None
+    assert result.geometry.iloc[0].area == pytest.approx(math.pi * 1_320.0**2, rel=0.02)
+
+
+def test_clip_and_calculate_synthetic_fields_acres_in_feet() -> None:
+    side = 43_560**0.5  # one acre, in feet
+    block = gpd.GeoDataFrame({"total_pop": [10]}, geometry=[box(0, 0, side, side)], crs="EPSG:2248")
+    half = gpd.GeoDataFrame(geometry=[box(0, 0, side / 2, side)], crs="EPSG:2248")
+    result = clip_and_calculate_synthetic_fields(block, half, ["total_pop"])
+    assert result["area_ac_og"].iloc[0] == pytest.approx(1.0, rel=1e-4)
+    assert result["area_ac_cl"].iloc[0] == pytest.approx(0.5, rel=1e-4)
+    assert result["synthetic_total_pop"].iloc[0] == pytest.approx(5.0, rel=1e-4)
+
+
+def test_validate_projected_crs_rejects_geographic() -> None:
+    with pytest.raises(ValueError, match="not a projected"):
+        validate_projected_crs(4326)
+
+
+def test_warn_if_distorted_crs_flags_world_mercator(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.WARNING):
+        mercator = warn_if_distorted_crs(validate_projected_crs(3395), -77.03, 38.9)
+    assert mercator == pytest.approx(0.283, abs=0.01)  # sec(38.9°) - 1
+    assert "distorts distances" in caplog.text
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        local = warn_if_distorted_crs(validate_projected_crs(26985), -77.03, 38.9)
+    assert local < 0.001
+    assert "distorts distances" not in caplog.text
+
+
+def test_run_crs_override_keeps_stops_and_demographics_aligned(
+    tmp_path: Path, dc_gtfs_dir: Path, dc_gtfs: dict[str, pd.DataFrame]
+) -> None:
+    # Stops used to be projected with the module default while the demographics
+    # followed the override, so the two never overlapped and every route read 0.
+    final_routes = get_included_routes(dc_gtfs["routes"], [], [])
+    stops_utm = _stops_to_points_gdf(
+        dc_gtfs["trips"], dc_gtfs["stop_times"], dc_gtfs["stops"], final_routes, [], [], crs=32618
+    )
+    assert stops_utm is not None
+    minx, miny, maxx, maxy = stops_utm.total_bounds
+    demo = gpd.GeoDataFrame(
+        {"total_pop": [1_000]},
+        geometry=[box(minx - 5_000, miny - 5_000, maxx + 5_000, maxy + 5_000)],
+        crs="EPSG:32618",
+    )
+    demo_path = tmp_path / "demo_utm.shp"
+    demo.to_file(demo_path)
+
+    out_dir = tmp_path / "out"
+    run(
+        analysis_mode="route",
+        service_area_method="stop_buffer",
+        gtfs_data_path=str(dc_gtfs_dir),
+        service_ids_to_include=_FIXTURE_SERVICE_IDS,
+        demographics_shp_path=str(demo_path),
+        output_directory=str(out_dir),
+        crs_epsg_code=32618,
+    )
+    summary = pd.read_csv(out_dir / "service_demographics_by_route.csv")
+    assert (summary["total_pop"] > 0).all()
 
 
 def test_stops_to_points_gdf_no_matching_stops_returns_none(
@@ -775,7 +899,7 @@ def test_load_express_route_ids_reads_repo_fixture() -> None:
 def _covering_demographics(stops_gdf: gpd.GeoDataFrame, tmp_path: Path) -> Path:
     """Write a demographics shapefile whose single square covers every stop."""
     minx, miny, maxx, maxy = stops_gdf.total_bounds
-    pad = 5_000.0  # metres, comfortably larger than the 0.25-mile stop buffer
+    pad = 5_000.0 * _UNITS_PER_M  # 5 km, comfortably larger than the 0.25-mile stop buffer
     demo = gpd.GeoDataFrame(
         {"total_pop": [1_000]},
         geometry=[box(minx - pad, miny - pad, maxx + pad, maxy + pad)],
@@ -802,6 +926,7 @@ def test_run_route_mode_labels_express_routes(
         analysis_mode="route",
         service_area_method="stop_buffer",
         gtfs_data_path=str(dc_gtfs_dir),
+        service_ids_to_include=_FIXTURE_SERVICE_IDS,
         demographics_shp_path=str(demo_path),
         output_directory=str(out_dir),
         express_route_ids=[express_id],
@@ -833,6 +958,7 @@ def test_run_route_mode_all_local_without_express_list(
         analysis_mode="route",
         service_area_method="stop_buffer",
         gtfs_data_path=str(dc_gtfs_dir),
+        service_ids_to_include=_FIXTURE_SERVICE_IDS,
         demographics_shp_path=str(demo_path),
         output_directory=str(out_dir),
         express_route_ids=[],
@@ -916,9 +1042,10 @@ def test_run_route_mode_express_origin_widens_catchment(
     origin_route = str(stops_gdf.loc[origin_idx, "route_short_name"])
     oy = stops_gdf.loc[origin_idx].geometry.y
 
-    background = box(minx - 450, miny - 450, maxx + 450, maxy + 450)
-    far_cx = maxx + 1_000.0  # ≥ 1 km from every stop (all stops have x ≤ maxx)
-    far_block = box(far_cx - 100, oy - 100, far_cx + 100, oy + 100)
+    m = _UNITS_PER_M
+    background = box(minx - 450 * m, miny - 450 * m, maxx + 450 * m, maxy + 450 * m)
+    far_cx = maxx + 1_000.0 * m  # ≥ 1 km from every stop (all stops have x ≤ maxx)
+    far_block = box(far_cx - 100 * m, oy - 100 * m, far_cx + 100 * m, oy + 100 * m)
     demo = gpd.GeoDataFrame(
         {"total_pop": [5_000, 1_000]},
         geometry=[background, far_block],
@@ -932,6 +1059,7 @@ def test_run_route_mode_express_origin_widens_catchment(
             analysis_mode="route",
             service_area_method="stop_buffer",
             gtfs_data_path=str(dc_gtfs_dir),
+            service_ids_to_include=_FIXTURE_SERVICE_IDS,
             demographics_shp_path=str(demo_path),
             output_directory=str(out_dir),
             express_origin_buffer_distance=2.0,
@@ -1026,7 +1154,8 @@ def test_suggest_express_origin_stops_writes_candidates(
     anchor = route_stops.drop_duplicates("stop_id").iloc[0]
     anchor_stop_id = str(anchor["stop_id"])
     ax, ay = anchor.geometry.x, anchor.geometry.y
-    jobs_block = box(ax - 200, ay - 200, ax + 200, ay + 200)
+    half = 200 * _UNITS_PER_M
+    jobs_block = box(ax - half, ay - half, ax + half, ay + half)
     demo = gpd.GeoDataFrame(
         {"tot_empl": [1_000]}, geometry=[jobs_block], crs=f"EPSG:{CRS_EPSG_CODE}"
     )
@@ -1088,7 +1217,7 @@ def test_suggest_express_origin_stops_no_jobs_field_is_noop(
 # express_route_totals — access-mode accounting math (Phase 4)
 # ---------------------------------------------------------------------------
 
-# Projected metres (EPSG:CRS_EPSG_CODE). Origin and destination sit 50 km apart,
+# Projected metres (_METRIC_CRS). Origin and destination sit 50 km apart,
 # far beyond either buffer, so the two end catchments never overlap.
 _ORIGIN_XY = (0.0, 0.0)
 _DEST_XY = (50_000.0, 0.0)
@@ -1101,7 +1230,7 @@ def _express_stops() -> gpd.GeoDataFrame:
     return gpd.GeoDataFrame(
         {"stop_id": ["O", "D"], "route_short_name": ["X", "X"]},
         geometry=[Point(*_ORIGIN_XY), Point(*_DEST_XY)],
-        crs=f"EPSG:{CRS_EPSG_CODE}",
+        crs=_METRIC_CRS,
     )
 
 
@@ -1122,7 +1251,7 @@ def _express_demographics() -> gpd.GeoDataFrame:
             "tot_empl": [5, 2_000],  # origin park-and-ride jobs, destination jobs
         },
         geometry=[home, job],
-        crs=f"EPSG:{CRS_EPSG_CODE}",
+        crs=_METRIC_CRS,
     )
 
 
@@ -1149,6 +1278,26 @@ def test_express_route_totals_keeps_keystones_zeroes_crossterms() -> None:
     # residents (the cross-terms) are dropped.
     assert totals["total_pop"] == 1_000
     assert totals["tot_empl"] == 2_000
+
+
+@pytest.mark.parametrize("zero_crossterms", [True, False])
+def test_express_route_totals_export_sums_to_totals(zero_crossterms: bool) -> None:
+    # The per-route shapefile must carry the same numbers as the route CSV: with the
+    # cross-terms dropped, the destination's 20 residents and the origin's 5 jobs sit
+    # inside the exported catchment but must not be counted in its synthetic fields.
+    totals, combined = express_route_totals(
+        _express_stops(),
+        _express_demographics(),
+        _EXP_FIELDS,
+        **_express_kwargs(
+            zero_origin_employment=zero_crossterms,
+            zero_destination_population=zero_crossterms,
+        ),
+    )
+    assert totals is not None and combined is not None
+    for field in _EXP_FIELDS:
+        assert combined[f"synthetic_{field}"].sum() == pytest.approx(totals[field], abs=0.5)
+    assert len(combined) == 2  # each block written once
 
 
 def test_express_route_totals_keeps_crossterms_when_flags_false() -> None:
@@ -1194,7 +1343,7 @@ def test_express_route_totals_employment_is_walk_scaled_at_origin() -> None:
             "tot_empl": [0, 500, 2_000],  # -, far origin jobs, destination jobs
         },
         geometry=[home, origin_far, job],
-        crs=f"EPSG:{CRS_EPSG_CODE}",
+        crs=_METRIC_CRS,
     )
     totals, _ = express_route_totals(
         _express_stops(),
@@ -1266,6 +1415,7 @@ def test_run_route_mode_express_direction_labels(
         analysis_mode="route",
         service_area_method="stop_buffer",
         gtfs_data_path=str(dc_gtfs_dir),
+        service_ids_to_include=_FIXTURE_SERVICE_IDS,
         demographics_shp_path=str(demo_path),
         output_directory=str(out_dir),
         express_unidirectional_route_ids=_ids_for(uni_short),
@@ -1309,11 +1459,12 @@ def test_run_route_mode_bidirectional_employment_walk_scaled(
         .tolist()
     )
 
-    background = box(minx - 450, miny - 450, maxx + 450, maxy + 450)
+    m = _UNITS_PER_M
+    background = box(minx - 450 * m, miny - 450 * m, maxx + 450 * m, maxy + 450 * m)
     # A block 1 km east of the origin stop: inside the 2.0-mi drive buffer but
     # beyond every 0.25-mi walk buffer, carrying both population and employment.
-    far_cx = maxx + 1_000.0
-    far_block = box(far_cx - 100, oy - 100, far_cx + 100, oy + 100)
+    far_cx = maxx + 1_000.0 * m
+    far_block = box(far_cx - 100 * m, oy - 100 * m, far_cx + 100 * m, oy + 100 * m)
 
     def _row(name: str, demo: gpd.GeoDataFrame) -> pd.Series:
         demo_path = tmp_path / f"{name}_demo.shp"
@@ -1323,6 +1474,7 @@ def test_run_route_mode_bidirectional_employment_walk_scaled(
             analysis_mode="route",
             service_area_method="stop_buffer",
             gtfs_data_path=str(dc_gtfs_dir),
+            service_ids_to_include=_FIXTURE_SERVICE_IDS,
             demographics_shp_path=str(demo_path),
             output_directory=str(out_dir),
             express_origin_buffer_distance=2.0,
@@ -1376,7 +1528,8 @@ def test_run_route_mode_origin_employment_knob_changes_total(
 
     # Uniform employment everywhere; the origin is the easternmost stop, so its
     # walk buffer covers area no other stop's does.
-    background = box(minx - 450, miny - 450, maxx + 450, maxy + 450)
+    m = _UNITS_PER_M
+    background = box(minx - 450 * m, miny - 450 * m, maxx + 450 * m, maxy + 450 * m)
     demo = gpd.GeoDataFrame(
         {"total_pop": [5_000], "tot_empl": [4_000]},
         geometry=[background],
@@ -1390,6 +1543,7 @@ def test_run_route_mode_origin_employment_knob_changes_total(
             analysis_mode="route",
             service_area_method="stop_buffer",
             gtfs_data_path=str(dc_gtfs_dir),
+            service_ids_to_include=_FIXTURE_SERVICE_IDS,
             demographics_shp_path=str(demo_path),
             output_directory=str(out_dir),
             express_origin_buffer_distance=2.0,

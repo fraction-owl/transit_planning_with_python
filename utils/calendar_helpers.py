@@ -1,9 +1,10 @@
 """Canonical GTFS service-calendar helpers for transit data workflows.
 
-Holds the canonical versions of the calendar expansion, classification, and
-representative-date helpers used across the repository. Per CONTRIBUTING.md,
-scripts do not import these at runtime — they carry verbatim copies, and CI's
-helper-function audit flags any copy that drifts from this file.
+Holds the canonical versions of the calendar expansion, classification,
+representative-date, and service_id selection helpers used across the
+repository. Per CONTRIBUTING.md, scripts do not import these at runtime — they
+carry verbatim copies, and CI's helper-function audit flags any copy that
+drifts from this file.
 
 The design principle behind these helpers: the only reliable description of
 when a GTFS service actually operates is its expanded set of active dates
@@ -18,7 +19,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Optional
 
 import pandas as pd
@@ -26,6 +27,14 @@ import pandas as pd
 # -----------------------------------------------------------------------------
 # REUSABLE FUNCTIONS
 # -----------------------------------------------------------------------------
+
+
+class ServiceSelectionError(ValueError):
+    """A requested GTFS service_id is not used by any trip in the feed.
+
+    A configuration problem rather than a crash: callers report it without a
+    traceback and exit with code 2.
+    """
 
 
 def expand_service_active_dates(
@@ -342,3 +351,75 @@ def representative_service_date(
         share * 100,
     )
     return chosen, set(modal_ids)
+
+
+def log_service_calendar(calendar_df: Optional[pd.DataFrame]) -> None:
+    """Log calendar.txt in full, so the user can see which service_id runs on which days.
+
+    calendar.txt is usually a handful of rows; printing it lets the user check or
+    pick the service_id(s) to analyze without opening the feed.
+
+    Args:
+        calendar_df: Parsed ``calendar.txt``, or ``None`` when the feed has none.
+    """
+    if calendar_df is None or calendar_df.empty:
+        logging.info("calendar.txt is absent or empty; see trips.txt for the feed's service_ids.")
+        return
+    logging.info(
+        "calendar.txt (%d service_id row(s)):\n%s",
+        len(calendar_df),
+        calendar_df.to_string(index=False),
+    )
+
+
+def select_trips_by_service(
+    trips_df: pd.DataFrame,
+    service_ids: Sequence[str],
+    *,
+    default_service_ids: Sequence[str] = (),
+) -> pd.DataFrame:
+    """Return the trips that run on *service_ids*; every trip when it is empty.
+
+    Warns when *service_ids* still equals *default_service_ids* (the calling
+    script's shipped default), so an unedited default is noticed, and warns that an
+    empty selection combines every service day.
+
+    Args:
+        trips_df: Parsed ``trips.txt`` (needs a ``service_id`` column).
+        service_ids: The service_id values to keep. Empty keeps every trip.
+        default_service_ids: The calling script's default, used only for the warning.
+
+    Returns:
+        The trips whose ``service_id`` is in *service_ids*.
+
+    Raises:
+        ServiceSelectionError: If a requested service_id is used by no trip. The
+            message lists the feed's service_ids with their trip counts.
+    """
+    wanted = [str(s).strip() for s in service_ids if str(s).strip()]
+    if not wanted:
+        logging.warning(
+            "No service_id selected: using every trip in the feed, all service days "
+            "combined. Set SERVICE_IDS_TO_INCLUDE to analyze a single service day."
+        )
+        return trips_df
+    defaults = [str(s).strip() for s in default_service_ids]
+    if defaults and wanted == defaults:
+        logging.warning(
+            "SERVICE_IDS_TO_INCLUDE is still the default %s. Check it against calendar.txt "
+            "and change it if this feed uses other service_ids or you want another day.",
+            wanted,
+        )
+    trip_service = trips_df["service_id"].astype(str).str.strip()
+    counts = trip_service.value_counts().sort_index()
+    missing = [s for s in wanted if s not in counts.index]
+    if missing:
+        available = ", ".join(f"{sid} ({n} trips)" for sid, n in counts.items())
+        raise ServiceSelectionError(
+            f"service_id(s) {missing} are not used by any trip in trips.txt. This feed's "
+            f"service_ids: {available}. Set SERVICE_IDS_TO_INCLUDE to the service day to "
+            "analyze (calendar.txt shows which days each service_id runs)."
+        )
+    kept = trips_df[trip_service.isin(wanted)]
+    logging.info("Service filter %s: trips %d -> %d.", wanted, len(trips_df), len(kept))
+    return kept

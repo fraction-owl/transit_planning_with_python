@@ -249,6 +249,7 @@ transit_planning_with_python/
 │   ├── test_gtfs_route_timeline.py
 │   ├── test_gtfs_service_by_district_gpd.py
 │   ├── test_gtfs_service_change_dates.py
+│   ├── test_gtfs_service_demographics_arcpy.py
 │   ├── test_gtfs_service_demographics_gpd.py
 │   ├── test_gtfs_skipped_stop_flagger_gpd.py
 │   ├── test_gtfs_stop_diff.py
@@ -302,6 +303,7 @@ transit_planning_with_python/
 │   ├── test_timepoint_schedule_exporter.py
 │   ├── test_trip_runtime_diagnostics_from_avl.py
 │   ├── test_uscensus_table_build.py
+│   ├── test_uscensus_tiger_join_arcpy.py
 │   ├── test_uscensus_tiger_join_gpd.py
 │   └── test_validate_gtfs_files_exist.py
 ├── utils/

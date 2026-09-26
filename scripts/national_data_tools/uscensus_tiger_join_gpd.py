@@ -14,8 +14,11 @@ Stages
         GeoDataFrame, with the same optional FIPS filter applied.
 3) Join stage (GeoPandas):
         Merge attributes onto block geometry on the 15-digit block FIPS
-        identifier, optionally patch in supplemental job sites missing from
-        LODES (see ``SUPPLEMENTAL_JOBS_CSV``), and write the final output.
+        identifier, split every tract count across its blocks by block
+        population (TIGER POP20) or households (block-level H9; TIGER
+        HOUSING20, which includes vacant units, as a warned fallback),
+        optionally patch in supplemental job sites missing from LODES (see
+        ``SUPPLEMENTAL_JOBS_CSV``), and write the final output.
 
 Configuration
 -------------
@@ -59,6 +62,7 @@ run from a shell or a Jupyter notebook.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import io
 import logging
 import re
@@ -170,7 +174,11 @@ MAX_FIELD_LEN: Final[int] = 10  # DBF column-name limit
 
 # ---- CSV topic signatures ---------------------------------------------------
 #: File-name token signatures used to bucket CSV/GZ/ZIP inputs by topic.
-#: ALL tokens listed for a topic must appear in the file name (case-insensitive).
+#: ALL tokens listed for a topic must appear in the file name (case-insensitive), each
+#: as a whole code: "B19001" matches "ACSDT5Y2024.B19001-Data.csv" but not the race
+#: iteration "B19001A", and "P1" does not match "P12". Pin a vintage by adding its
+#: product code, e.g. ("ACSDT5Y2024", "B19001"). Files that disagree on the same
+#: geography (two vintages, say) abort the run rather than one being silently kept.
 TOPIC_SIGNATURES: dict[str, Sequence[str] | str] = {
     "POP_FILES": ("P1",),
     "HH_FILES": ("H9",),
@@ -211,8 +219,47 @@ TRACT_COUNT_DISAGG: dict[str, tuple[str, str]] = {
     "commute_drove": ("total_pop", "cmt_drove"),  # drove alone
     "commute_carpool": ("total_pop", "cmt_carpl"),  # carpooled
     "commute_wfh": ("total_pop", "cmt_wfh"),  # worked from home
-    "commute_person_min": ("total_pop", "cmt_pmin"),  # worker-minutes (mean = /workers)
+    "commute_person_min": ("total_pop", "cmt_pmin"),  # commuter-minutes (excl. WFH)
+    "commute_timed": ("total_pop", "cmt_timed"),  # their commuters (mean = cmt_pmin / this)
 }
+
+#: Every other tract count (income bands, race groups, per-language LEP, vehicle
+#: detail, age bands) is split the same way, in place, so no block row carries a
+#: whole-tract figure that could be summed as a block count. Counts from the
+#: household-universe tables listed here are weighted by households; all others by
+#: population.
+HOUSEHOLD_UNIVERSE_COUNTS: frozenset[str] = frozenset(
+    {
+        # B19001 household income
+        "sub_10k",
+        "10k_15k",
+        "15k_20k",
+        "20k_25k",
+        "25k_30k",
+        "30k_35k",
+        "35k_40k",
+        "40k_45k",
+        "45k_50k",
+        "50k_60k",
+        "low_income",
+        # B08201 household size by vehicles available
+        "all_hhs",
+        "veh_0_all_hh",
+        "veh_1_all_hh",
+        "veh_0_hh_1",
+        "veh_1_hh_1",
+        "veh_0_hh_2",
+        "veh_1_hh_2",
+        "veh_0_hh_3",
+        "veh_1_hh_3",
+        "veh_2_hh_3",
+        "veh_0_hh_4p",
+        "veh_1_hh_4p",
+        "veh_2_hh_4p",
+        "all_lo_veh_hh",
+        "all_lo_veh_hh_mod",
+    }
+)
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
 
@@ -242,31 +289,67 @@ _UNSET: Final[_Unset] = _Unset()
 
 GEO_ID_COL: Final[str] = "GEO_ID"
 _UNFRIENDLY_COL_RE = re.compile(r"^[A-Z]{2,}\d{3,}.*")
+#: Temporary per-row record of the input file, used to name files in duplicate errors.
+_SOURCE_COL: Final[str] = "_source_file"
 
 
 def _token_match(name: str, tokens: Sequence[str] | str) -> bool:
-    """Return True if *all* tokens occur in *name* (case-insensitive)."""
+    """Return True if *all* tokens occur in *name* as whole codes (case-insensitive).
+
+    A token that starts or ends with a letter or digit must sit against a
+    non-alphanumeric boundary there, so a table code matches only itself:
+    ``B19001`` does not match the race-iteration table ``B19001A``, and ``P1`` does
+    not match ``P12`` or ``DP1``. Tokens that begin and end with a separator (the
+    LODES ``_S000_JT00_``) still match anywhere.
+    """
     if isinstance(tokens, str):
         tokens = (tokens,)
     low = name.lower()
-    return all(tok.lower() in low for tok in tokens)
+    for tok in tokens:
+        tok_low = tok.lower()
+        pattern = re.escape(tok_low)
+        if tok_low[:1].isalnum():
+            pattern = r"(?<![a-z0-9])" + pattern
+        if tok_low[-1:].isalnum():
+            pattern += r"(?![a-z0-9])"
+        if re.search(pattern, low) is None:
+            return False
+    return True
 
 
-def _zip_data_member_sizes(zip_path: str | Path) -> dict[str, int]:
-    """Map each '*-Data.csv' member's base name to its uncompressed size in bytes.
+def _zip_data_members(zip_path: str | Path) -> dict[str, list[tuple[str, int]]]:
+    """Map each '*-Data.csv' member's base name to its (member name, size) entries.
 
     Reads only the ZIP central directory (no extraction). Returns an empty map
     when the archive cannot be read, so a corrupt ZIP never suppresses a loose CSV.
     """
+    members: dict[str, list[tuple[str, int]]] = {}
     try:
         with zipfile.ZipFile(zip_path) as zf:
-            return {
-                Path(info.filename).name.lower(): info.file_size
-                for info in zf.infolist()
-                if info.filename.lower().endswith("-data.csv")
-            }
+            for info in zf.infolist():
+                if info.filename.lower().endswith("-data.csv"):
+                    base = Path(info.filename).name.lower()
+                    members.setdefault(base, []).append((info.filename, info.file_size))
     except (zipfile.BadZipFile, OSError):
         return {}
+    return members
+
+
+def _sha256(stream: Any) -> str:
+    """Return the SHA-256 hex digest of a binary stream, read in 1 MiB chunks."""
+    digest = hashlib.sha256()
+    for chunk in iter(lambda: stream.read(1 << 20), b""):
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _same_as_zip_member(loose: Path, zip_path: str, member: str) -> bool:
+    """Return True if *loose* has exactly the bytes of *member* inside *zip_path*."""
+    try:
+        with zipfile.ZipFile(zip_path) as zf, zf.open(member) as packed, loose.open("rb") as fh:
+            return _sha256(packed) == _sha256(fh)
+    except (zipfile.BadZipFile, OSError):
+        return False
 
 
 def _dedupe_extracted_zip_members(paths: Sequence[str]) -> list[str]:
@@ -277,32 +360,37 @@ def _dedupe_extracted_zip_members(paths: Sequence[str]) -> list[str]:
     orchestrator does by default, and a human may do manually — the scanned root
     holds both the ``*.zip`` and the extracted ``*-Data.csv``. Bucketing both
     would concatenate the identical table twice (duplicate GEO_ID rows). A loose
-    CSV is treated as redundant only when its base name AND byte size match a
-    member of a ZIP in the same bucket, so the ZIP is kept and the extracted copy
-    dropped; genuinely distinct downloads (e.g. other geographies, which differ
-    in size) are never removed.
+    CSV is treated as redundant only when its base name matches a member of a ZIP
+    in the same bucket AND its bytes are identical to that member (size first,
+    then a content hash), so the ZIP is kept and the extracted copy dropped.
+    Anything else — another geography, a re-saved or edited copy — is kept, and a
+    real conflict is then caught by the duplicate check in ``_load_and_concat``.
     """
-    member_sizes: dict[str, set[int]] = {}
+    members: dict[str, list[tuple[str, str, int]]] = {}
     for p in paths:
         if p.lower().endswith(".zip"):
-            for name, size in _zip_data_member_sizes(p).items():
-                member_sizes.setdefault(name, set()).add(size)
-    if not member_sizes:
+            for base, entries in _zip_data_members(p).items():
+                members.setdefault(base, []).extend((p, name, size) for name, size in entries)
+    if not members:
         return list(paths)
 
     kept: list[str] = []
     for p in paths:
         base = Path(p).name.lower()
-        if base.endswith("-data.csv") and base in member_sizes:
+        if base.endswith("-data.csv") and base in members:
             try:
-                if Path(p).stat().st_size in member_sizes[base]:
-                    logging.info(
-                        "Skipping '%s'; byte-identical to a ZIP member already in this bucket.",
-                        p,
-                    )
-                    continue
+                size = Path(p).stat().st_size
             except OSError:
-                pass
+                size = -1
+            if any(
+                member_size == size and _same_as_zip_member(Path(p), zip_path, member)
+                for zip_path, member, member_size in members[base]
+            ):
+                logging.info(
+                    "Skipping '%s'; byte-identical to a ZIP member already in this bucket.",
+                    p,
+                )
+                continue
         kept.append(p)
     return kept
 
@@ -363,39 +451,50 @@ def _clean_name_cols(df: pd.DataFrame) -> None:
         df[col] = df[col].astype(str).str.replace(r"[\r\n\t]+", " ", regex=True).str.strip()
 
 
-def _dedupe_topic_rows(df: pd.DataFrame, key: Hashable, *, source: str) -> pd.DataFrame:
-    """Collapse rows that repeat *key* to the first occurrence, logging any drops.
+def _dedupe_topic_rows(df: pd.DataFrame, key: Hashable) -> pd.DataFrame:
+    """Collapse rows that repeat *key* with identical data; reject conflicting repeats.
 
-    A topic bucket can legitimately gather more than one input file for the same
-    geography: multiple ACS vintages of a table, or race/ethnicity iteration
-    tables (e.g. ``B19001A``..``B19001I``, ``B01001A``..``B01001I``) whose codes
-    contain the base topic's token and so match the same signature. Concatenated,
-    those files repeat every ``GEO_ID``, and because the later GEO_ID merges and
-    the one-to-many block<->tract join both fan out on the key, each repeat becomes
-    a *multiplicative* row explosion — enough to violate the Stage 3 ``1:1`` join
-    and abort the whole pipeline.
+    A topic bucket can gather more than one input file for the same geography — a
+    copy of the same download, or a second ACS vintage of the table. Concatenated,
+    those files repeat every ``GEO_ID``, and because the later GEO_ID merges and the
+    one-to-many block<->tract join both fan out on the key, each repeat becomes a
+    *multiplicative* row explosion.
 
-    Collapsing here, at load time and before any merge, keeps each geography to a
-    single row. Files are read in sorted order, so ``keep="first"`` deterministically
-    prefers the base table over its race iterations (``B19001`` sorts before
-    ``B19001A``) and, for true vintage duplicates, the earliest file.
+    Rows that repeat a key with the same data (``NAME`` labels aside) are collapsed
+    to one. A key that repeats with *different* data is an ambiguous input — keeping
+    either row would silently pick a vintage — so it raises, naming the files. The
+    temporary ``_SOURCE_COL`` added by ``_load_and_concat`` is dropped on return.
+
+    Raises:
+        ValueError: If any key repeats with conflicting values.
     """
     if key not in df.columns:
-        return df
-    before = len(df)
-    deduped = df.drop_duplicates(subset=[key], keep="first")
-    dropped = before - len(deduped)
+        return df.drop(columns=_SOURCE_COL, errors="ignore")
+    data_cols = [c for c in df.columns if c != _SOURCE_COL and not str(c).startswith("NAME")]
+    unique = df.drop_duplicates(subset=data_cols)
+    conflicts = unique[unique.duplicated(subset=[key], keep=False)]
+    if not conflicts.empty:
+        keys = conflicts[key].astype(str).unique().tolist()
+        files = (
+            sorted(conflicts[_SOURCE_COL].astype(str).unique())
+            if _SOURCE_COL in conflicts.columns
+            else []
+        )
+        raise ValueError(
+            f"{len(keys)} geography key(s) in '{key}' carry conflicting values across input "
+            f"rows (e.g. {', '.join(keys[:3])}); files involved: {files}. Keep one table and "
+            "vintage per topic: remove the extra file, or pin the vintage in TOPIC_SIGNATURES "
+            "(e.g. ('ACSDT5Y2024', 'B19001'))."
+        )
+    dropped = len(df) - len(unique)
     if dropped:
-        logging.warning(
-            "Dropped %d row(s) repeating '%s' while loading %s (kept the first of each). "
-            "More than one input file covered the same geography — typically multiple ACS "
-            "vintages of a table, or race-iteration tables sharing the topic's token. Keep "
-            "one file per topic per geography to avoid this.",
+        logging.info(
+            "Collapsed %d duplicate row(s) on '%s' carrying identical data (same geography "
+            "supplied more than once).",
             dropped,
             key,
-            source,
         )
-    return deduped.reset_index(drop=True)
+    return unique.drop(columns=_SOURCE_COL, errors="ignore").reset_index(drop=True)
 
 
 def _load_and_concat(
@@ -418,10 +517,11 @@ def _load_and_concat(
     ``usecols`` is explicitly supplied).
 
     When ``dedupe_key`` is set (default ``GEO_ID``) and present in the combined
-    frame, rows repeating that key are collapsed to the first occurrence so a
-    topic that gathered several files for the same geography (multiple ACS
-    vintages, or race-iteration tables matched by the same signature) cannot fan
-    out through the downstream merges. Pass ``dedupe_key=None`` to disable.
+    frame, rows repeating that key with identical data are collapsed and rows
+    repeating it with conflicting data raise ``ValueError`` (see
+    ``_dedupe_topic_rows``), so a topic that gathered several files for the same
+    geography cannot fan out through the downstream merges or silently pick a
+    vintage. Pass ``dedupe_key=None`` to disable.
     """
     frames: list[pd.DataFrame] = []
     for path in files:
@@ -444,24 +544,25 @@ def _load_and_concat(
                 keep = {GEO_ID_COL, "NAME", *rename.values()}
                 df = df.loc[:, df.columns.intersection(keep)]
 
+        df[_SOURCE_COL] = str(path)
         frames.append(df)
 
     if not frames:
         return pd.DataFrame()
     combined = pd.concat(frames, ignore_index=True)
     if dedupe_key is not None:
-        combined = _dedupe_topic_rows(combined, dedupe_key, source=f"{len(files)} file(s)")
-    return combined
+        combined = _dedupe_topic_rows(combined, dedupe_key)
+    return combined.drop(columns=_SOURCE_COL, errors="ignore")
 
 
 def _merge_on_geo_id(left: pd.DataFrame, right: pd.DataFrame) -> pd.DataFrame:
-    """Outer-merge two frames on GEO_ID, dropping duplicate columns."""
+    """Outer-merge two frames on GEO_ID (one row per key each), dropping duplicate columns."""
     if left.empty:
         return right.copy()
     if right.empty:
         return left.copy()
     dup = (set(left.columns) & set(right.columns)) - {GEO_ID_COL}
-    return left.merge(right.drop(columns=dup), on=GEO_ID_COL, how="outer")
+    return left.merge(right.drop(columns=dup), on=GEO_ID_COL, how="outer", validate="1:1")
 
 
 def _drop_unfriendly_cols(df: pd.DataFrame) -> pd.DataFrame:
@@ -622,8 +723,15 @@ def _derive_commute(df: pd.DataFrame) -> pd.DataFrame:
     travel time is a mean in minutes), so they can ride along verbatim per tract
     but must never be area-weighted. The additive worker *counts* derived here
     (``workers * pct / 100``) plus person-minutes are what TRACT_COUNT_DISAGG
-    splits down to blocks; a catchment mean travel time is then recoverable as
-    ``sum(commute_person_min) / sum(commute_workers)``.
+    splits down to blocks.
+
+    The mean travel time (S0801_C01_046E) is over workers who did NOT work from
+    home, so person-minutes are ``(workers - wfh) * mean``. Their denominator,
+    ``commute_timed``, holds those same commuters, but only where the tract
+    publishes both the mean and the work-from-home share: a suppressed value drops
+    the tract from numerator and denominator alike instead of counting as zero
+    minutes. A catchment mean travel time is then
+    ``sum(commute_person_min) / sum(commute_timed)``.
     """
     perc_cols = ["perc_drove_alone", "perc_carpool", "perc_transit", "perc_wfh"]
     for col in ["commute_workers", "mean_travel_time", *perc_cols]:
@@ -635,10 +743,13 @@ def _derive_commute(df: pd.DataFrame) -> pd.DataFrame:
     df["commute_drove"] = workers * df["perc_drove_alone"] / 100.0
     df["commute_carpool"] = workers * df["perc_carpool"] / 100.0
     df["commute_wfh"] = workers * df["perc_wfh"] / 100.0
-    df["commute_person_min"] = workers * df["mean_travel_time"]
+    commuters = (workers - df["commute_wfh"]).clip(lower=0)
+    timed = commuters.notna() & df["mean_travel_time"].notna()
+    df["commute_timed"] = commuters.where(timed, 0.0)
+    df["commute_person_min"] = (commuters * df["mean_travel_time"]).where(timed, 0.0)
     # ``mean_travel_time`` is a non-additive mean: drop it from this block-bound path
     # (build_tract_attributes sums count columns) — it is recoverable downstream as
-    # commute_person_min / commute_workers. The flat uscensus_table_build keeps it.
+    # commute_person_min / commute_timed. The flat uscensus_table_build keeps it.
     df = df.drop(columns="mean_travel_time")
     return df
 
@@ -709,9 +820,10 @@ def _build_tract_df(inp: _TractInputs) -> pd.DataFrame:
                 "C16001_020E": "korean_engnwell",
                 "C16001_023E": "chineseetc_engnwell",
                 "C16001_026E": "vietnamese_engnwell",
+                "C16001_029E": "tagalog_engnwell",
                 "C16001_032E": "asiapacetc_engnwell",
                 "C16001_035E": "arabic_engnwell",
-                "C16001_037E": "otheretc_engnwell",
+                "C16001_038E": "otheretc_engnwell",
             },
         )
         dfs.append(_derive_language(language))
@@ -837,31 +949,56 @@ def disaggregate_tract_counts_to_blocks(
     *,
     tract_key: str = "tract_id_synth",
     field_weights: Mapping[str, tuple[str, str]] = TRACT_COUNT_DISAGG,
+    other_counts: Iterable[str] = (),
 ) -> pd.DataFrame:
     """Split each tract-level count across its blocks in proportion to a block weight.
 
     After the block<->tract merge, every block in a tract carries that tract's totals
     verbatim. For an additive count (households below an income threshold, minority
     residents, ...) that copy-down over-counts: each block claims the whole tract
-    figure. This rewrites each configured count to the block's share —
+    figure. This rewrites each count to the block's share —
     ``tract_total * block_weight / sum(block_weight over the tract)`` — so the parts sum
     back to the tract total and a partial-area clip downstream keeps a proportional
-    slice. Tracts whose weight sums to zero receive zero (no basis to apportion). The
-    result is written under the configured output column (the source column is dropped
-    when the name changes); ``perc_*`` ratio columns are never touched.
+    slice. Tracts whose weight sums to zero receive zero (no basis to apportion).
+
+    Configured counts (*field_weights*) are written under their output column (the
+    source column is dropped when the name changes). Each of *other_counts* is split
+    in place, by households when it is in ``HOUSEHOLD_UNIVERSE_COUNTS`` and by
+    population otherwise. When the frame has no household column, household counts
+    are split by population instead, with a warning. ``perc_*`` ratio columns are
+    never touched.
 
     Args:
         df: The merged block+tract frame, keyed per block, with ``tract_key`` present.
         tract_key: Column grouping blocks by their tract (block GEO_ID's tract slice).
         field_weights: ``{source_count: (weight_column, output_column)}``.
+        other_counts: Further tract count columns to split in place.
 
     Returns:
-        ``df`` with each available count column disaggregated and renamed in place.
+        ``df`` with each available count column disaggregated (and renamed) in place.
     """
     if tract_key not in df.columns:
         return df
-    for src, (weight, out) in field_weights.items():
-        if src not in df.columns or weight not in df.columns:
+    specs = [(src, weight, out) for src, (weight, out) in field_weights.items()]
+    specs += [
+        (col, "total_hh" if col in HOUSEHOLD_UNIVERSE_COUNTS else "total_pop", col)
+        for col in other_counts
+        if col not in field_weights
+    ]
+    fallback_cols: list[str] = []
+    for src, weight, out in specs:
+        if src not in df.columns:
+            continue
+        if weight not in df.columns and weight == "total_hh" and "total_pop" in df.columns:
+            fallback_cols.append(src)
+            weight = "total_pop"
+        if weight not in df.columns:
+            logging.warning(
+                "Cannot split tract count '%s' to blocks: no '%s' weight column; it is left "
+                "as a whole-tract figure on every block.",
+                src,
+                weight,
+            )
             continue
         values = pd.to_numeric(df[src], errors="coerce").fillna(0.0)
         weights = pd.to_numeric(df[weight], errors="coerce").fillna(0.0)
@@ -870,6 +1007,12 @@ def disaggregate_tract_counts_to_blocks(
         df[out] = values * share
         if out != src:
             df = df.drop(columns=src)
+    if fallback_cols:
+        logging.warning(
+            "No block household counts (H9) were supplied, so household counts %s were "
+            "split across blocks by population instead of households.",
+            fallback_cols,
+        )
     return df
 
 
@@ -894,9 +1037,10 @@ def build_joined_table(
 
     Legacy path that assumes *block-level* P1/H9 census tables. ``run()`` now builds the
     block layer with ``build_tract_attributes`` + ``build_block_jobs`` +
-    ``attach_demographics_to_blocks``, which sources block population/households from the
-    TIGER blocks' POP20/HOUSING20 and so works with tract-level Census downloads. Kept
-    for callers that genuinely have block-level P1/H9 tables.
+    ``build_block_households`` + ``attach_demographics_to_blocks``, which takes block
+    population from the TIGER blocks' POP20 and so works with tract-level Census
+    downloads. Kept for callers that genuinely have block-level P1/H9 tables. Every tract
+    count is split across its blocks by P1 population or H9 households.
     """
     block_df = _build_block_df(_BlockInputs(pop_files, hh_files, jobs_files))
     tract_df = _build_tract_df(
@@ -933,6 +1077,7 @@ def build_joined_table(
             right_on="tract_id_clean",
             how="outer",
             suffixes=("_blk", "_trt"),
+            validate="m:1",
         )
     )
 
@@ -944,8 +1089,22 @@ def build_joined_table(
     # on the output and drops any tract row the outer merge left unmatched to a block.
     combined = _apply_fips_filter_df(combined, fips=county_fips_filter)
     _fill_numeric_only(combined)
-    combined = disaggregate_tract_counts_to_blocks(combined)
+    combined = disaggregate_tract_counts_to_blocks(
+        combined, other_counts=_tract_count_columns(tract_df)
+    )
     return combined
+
+
+def _tract_count_columns(tract_df: pd.DataFrame) -> list[str]:
+    """Return the additive count columns of a tract table (numeric, not ``perc_*`` or ids)."""
+    ids = {GEO_ID_COL, "tract_id_clean", "tract_fips", "FIPS"}
+    return [
+        str(c)
+        for c in tract_df.columns
+        if c not in ids
+        and not str(c).startswith("perc_")
+        and pd.api.types.is_numeric_dtype(tract_df[c])
+    ]
 
 
 def build_tract_attributes(
@@ -964,10 +1123,11 @@ def build_tract_attributes(
     The income / ethnicity / language / vehicle / age / commute tables are tract-level
     (or coarser), so this collapses them to one row per 11-digit tract (``tract_fips``)
     with the additive count columns summed. Block-level population and households are NOT
-    sourced here: they come from the TIGER blocks' POP20/HOUSING20 in
-    ``attach_demographics_to_blocks``, so a tract-level Census download is sufficient and
-    no block-level P1/H9 table is required. Percent (``perc_*``) ratio columns are
-    dropped — they are not additive and would be meaningless once summed.
+    sourced here: ``attach_demographics_to_blocks`` takes population from the TIGER
+    blocks' POP20 and households from the block-level H9 table (``build_block_households``),
+    falling back to TIGER HOUSING20, so no block-level P1 table is required. Percent
+    (``perc_*``) ratio columns are dropped — they are not additive and would be
+    meaningless once summed.
     """
     tract_df = _build_tract_df(
         _TractInputs(
@@ -1021,6 +1181,44 @@ def build_block_jobs(
         jobs = jobs[jobs["block_fips"].str[:5].isin(wanted)].copy()
     _fill_numeric_only(jobs)
     return jobs
+
+
+def build_block_households(
+    hh_files: list[str],
+    *,
+    county_fips_filter: Iterable[str] | None = None,
+) -> pd.DataFrame:
+    """Build a block-keyed household table from block-level H9 downloads.
+
+    ``H9_001N`` (2020 DHC table H9, universe: occupied housing units) is the number of
+    households in each block — unlike TIGER ``HOUSING20``, which counts every housing
+    unit, vacant ones included. Only block rows (``GEO_ID`` prefix ``1000000US``) are
+    kept, so a tract-level H9 download yields an empty table and the caller falls back
+    to ``HOUSING20``.
+
+    Returns:
+        ``block_fips`` (15-digit) and ``households`` columns; empty when no block-level
+        H9 rows were supplied.
+    """
+    hh = _load_and_concat(
+        hh_files, skiprows=[1], rename={"H9_001N": "households"}, usecols=[GEO_ID_COL, "H9_001N"]
+    )
+    if hh.empty:
+        return pd.DataFrame(columns=["block_fips", "households"])
+    blocks = hh[hh[GEO_ID_COL].astype(str).str.startswith("1000000US")].copy()
+    if blocks.empty:
+        logging.warning(
+            "H9 file(s) %s hold no block-level rows (GEO_ID 1000000US...); households "
+            "cannot be taken from them.",
+            hh_files,
+        )
+        return pd.DataFrame(columns=["block_fips", "households"])
+    blocks["block_fips"] = blocks[GEO_ID_COL].astype(str).str[-15:]
+    blocks["households"] = pd.to_numeric(blocks["households"], errors="coerce")
+    if county_fips_filter:
+        wanted = {str(code).zfill(5) for code in county_fips_filter}
+        blocks = blocks[blocks["block_fips"].str[:5].isin(wanted)]
+    return blocks[["block_fips", "households"]].reset_index(drop=True)
 
 
 # =============================================================================
@@ -1212,6 +1410,7 @@ def attach_demographics_to_blocks(
     tract_attrs: DataFrame,
     block_jobs: DataFrame | None = None,
     *,
+    block_households: DataFrame | None = None,
     block_key: str = LEFT_KEY,
     pop_col: str = "POP20",
     hh_col: str = "HOUSING20",
@@ -1221,20 +1420,23 @@ def attach_demographics_to_blocks(
 
     The TIGER block layer is the spine. Each block is matched to its tract
     (``GEOID20[:11]``) and receives that tract's additive counts, which are then
-    apportioned to the block in proportion to its share of the tract's TIGER ``POP20``
-    (person counts) or ``HOUSING20`` (household counts) — the block-level population and
-    housing the 2020 Census already records in the block layer. ``total_pop`` /
-    ``total_hh`` are taken straight from POP20/HOUSING20. LEHD jobs, natively block-level,
-    are joined on the block id. This means tract-level Census tables are sufficient; no
-    block-level P1/H9 download is required.
+    apportioned to the block in proportion to its share of the tract's population
+    (person counts) or households (household counts). ``total_pop`` is TIGER ``POP20``.
+    ``total_hh`` is the block's households (occupied units) from *block_households*
+    (block-level H9); blocks it does not cover — or every block, when no H9 table was
+    supplied — fall back to TIGER ``HOUSING20`` with a warning. ``HOUSING20`` counts all
+    housing units, vacant ones included, so it overstates households wherever units are
+    vacant. LEHD jobs, natively block-level, are joined on the block id.
 
     Args:
         blocks: TIGER block geometry, carrying ``block_key`` plus ``pop_col``/``hh_col``.
         tract_attrs: One row per ``tract_fips`` with the additive count columns.
         block_jobs: Optional block-keyed LEHD jobs (``block_fips`` + job columns).
+        block_households: Optional block-keyed households (``block_fips`` +
+            ``households``), from :func:`build_block_households`.
         block_key: 15-digit block id column on ``blocks`` (``GEOID20``).
         pop_col: Block population column (``POP20``) used as ``total_pop`` and person weight.
-        hh_col: Block housing column (``HOUSING20``) used as ``total_hh`` and household weight.
+        hh_col: Block housing-unit column (``HOUSING20``), the household fallback.
         field_weights: ``{count: (weight_column, output_column)}`` for the split.
 
     Returns:
@@ -1251,17 +1453,42 @@ def attach_demographics_to_blocks(
         0 if block_jobs is None else len(block_jobs),
     )
 
+    tract_counts: list[str] = []
     if tract_attrs is not None and not tract_attrs.empty:
         merged = merged.merge(tract_attrs, on="tract_fips", how="left", validate="m:1")
+        tract_counts = [str(c) for c in tract_attrs.columns if c != "tract_fips"]
 
-    # Block population & households come straight from TIGER; they double as the weights
-    # that split each tract count back down to its blocks.
-    for out_col, src_col in (("total_pop", pop_col), ("total_hh", hh_col)):
+    # Block population and households double as the weights that split each tract
+    # count back down to its blocks.
+    def _block_column(src_col: str, out_col: str) -> pd.Series:
         if src_col in merged.columns:
-            merged[out_col] = pd.to_numeric(merged[src_col], errors="coerce").fillna(0.0)
-        else:
-            logging.warning("TIGER blocks lack '%s'; '%s' set to 0.", src_col, out_col)
-            merged[out_col] = 0.0
+            return pd.to_numeric(merged[src_col], errors="coerce").fillna(0.0)
+        logging.warning("TIGER blocks lack '%s'; '%s' falls back to 0.", src_col, out_col)
+        return pd.Series(0.0, index=merged.index)
+
+    merged["total_pop"] = _block_column(pop_col, "total_pop")
+    housing_units = _block_column(hh_col, "total_hh")
+    if block_households is not None and not block_households.empty:
+        households = merged[block_key].map(block_households.set_index("block_fips")["households"])
+        uncovered = int(households.isna().sum())
+        if uncovered:
+            logging.warning(
+                "%d of %d block(s) have no H9 household count; their total_hh falls back to "
+                "TIGER %s, which counts ALL housing units, vacant ones included.",
+                uncovered,
+                len(merged),
+                hh_col,
+            )
+        merged["total_hh"] = households.fillna(housing_units)
+    else:
+        logging.warning(
+            "No block-level H9 table was supplied, so total_hh is TIGER %s: ALL housing "
+            "units, vacant ones included. It overstates households wherever units are "
+            "vacant, and household counts are split across blocks by housing units. Add the "
+            "block-level 2020 DHC H9 download to use households (occupied units).",
+            hh_col,
+        )
+        merged["total_hh"] = housing_units
 
     if block_jobs is not None and not block_jobs.empty:
         merged = merged.merge(
@@ -1270,7 +1497,7 @@ def attach_demographics_to_blocks(
 
     _fill_numeric_only(merged)
     merged = disaggregate_tract_counts_to_blocks(
-        merged, tract_key="tract_fips", field_weights=field_weights
+        merged, tract_key="tract_fips", field_weights=field_weights, other_counts=tract_counts
     )
     if FORCE_FLOAT:
         _cast_int64_to_float(merged)
@@ -1713,11 +1940,14 @@ def run(
         # -------- Stage 1: CSV merge --------
         logging.info("Stage 1/3: discovering & merging Census CSVs under %s", input_csv_dir)
         discovered = discover_census_files(input_csv_dir)
-        if discovered["POP_FILES"] or discovered["HH_FILES"]:
+        if discovered["POP_FILES"]:
             logging.info(
-                "Population and households are taken from the TIGER blocks' POP20/HOUSING20; "
-                "any P1/H9 tables found are not required and are ignored."
+                "Block population is taken from the TIGER blocks' POP20; the P1 table(s) "
+                "found are not required and are ignored."
             )
+        block_households = build_block_households(
+            discovered["HH_FILES"], county_fips_filter=fips_to_filter
+        )
         tract_attrs = build_tract_attributes(
             income_files=discovered["INCOME_FILES"],
             ethnicity_files=discovered["ETHNICITY_FILES"],
@@ -1749,7 +1979,9 @@ def run(
 
         # -------- Stage 3: attach demographics onto geometry --------
         logging.info("Stage 3/3: attaching demographics onto block geometry")
-        joined = attach_demographics_to_blocks(blocks_gdf, tract_attrs, block_jobs)
+        joined = attach_demographics_to_blocks(
+            blocks_gdf, tract_attrs, block_jobs, block_households=block_households
+        )
 
         # Optional patch: job sites missing from LODES (drop-folder friendly —
         # a configured path whose file was simply not dropped is skipped).

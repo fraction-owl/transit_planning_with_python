@@ -9,7 +9,9 @@ containing Census block geometry joined to a consolidated attribute table
 Stages:
     1) CSV stage (pandas): discover, read, and merge Census + LODES CSV inputs into
        a single attribute table (one row per block). Optional tract-level inputs
-       are merged to blocks on tract ID.
+       are merged to blocks on tract ID, and each tract count is split across the
+       tract's blocks by block population (P1) or households (H9), so block rows
+       sum back to the tract total (the same method as uscensus_tiger_join_gpd).
     2) TIGER stage (ArcPy): discover, merge, and (optionally) FIPS-filter TIGER/Line
        tabblock shapefiles into a single polygon feature class.
     3) Join stage (ArcPy): join the attribute CSV from step 1 to the block polygons
@@ -48,6 +50,7 @@ requires ArcPy).
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import io
 import logging
 import os
@@ -95,6 +98,11 @@ FINAL_JOINED_FEATURES_NAME: str = "blocks_with_attrs.shp"  # or "blocks_with_att
 FINAL_JOINED_FEATURES: str = str(Path(FINAL_OUTPUT_DIR) / FINAL_JOINED_FEATURES_NAME)
 
 # ---- CSV topic signatures ----
+# ALL tokens listed for a topic must appear in the file name (case-insensitive), each
+# as a whole code: "B19001" matches "ACSDT5Y2024.B19001-Data.csv" but not the race
+# iteration "B19001A", and "P1" does not match "P12". Pin a vintage by adding its
+# product code, e.g. ("ACSDT5Y2024", "B19001"). Files that disagree on the same
+# geography (two vintages, say) abort the run rather than one being silently kept.
 TOPIC_SIGNATURES: dict[str, Sequence[str] | str] = {
     "POP_FILES": ("P1",),
     "HH_FILES": ("H9",),
@@ -105,6 +113,46 @@ TOPIC_SIGNATURES: dict[str, Sequence[str] | str] = {
     "VEHICLE_FILES": ("B08201",),
     "AGE_FILES": ("B01001",),
 }
+
+# ---- Tract -> block count allocation ----
+# Tract tables (income, ethnicity, language, vehicles, age) are split across their
+# blocks rather than repeated on each one: households-universe counts listed here by
+# block households (H9), everything else by block population (P1).
+HOUSEHOLD_UNIVERSE_COUNTS: frozenset[str] = frozenset(
+    {
+        # B19001 household income
+        "sub_10k",
+        "10k_15k",
+        "15k_20k",
+        "20k_25k",
+        "25k_30k",
+        "30k_35k",
+        "35k_40k",
+        "40k_45k",
+        "45k_50k",
+        "50k_60k",
+        "low_income",
+        # B08201 household size by vehicles available
+        "all_hhs",
+        "veh_0_all_hh",
+        "veh_1_all_hh",
+        "veh_0_hh_1",
+        "veh_1_hh_1",
+        "veh_0_hh_2",
+        "veh_1_hh_2",
+        "veh_0_hh_3",
+        "veh_1_hh_3",
+        "veh_2_hh_3",
+        "veh_0_hh_4p",
+        "veh_1_hh_4p",
+        "veh_2_hh_4p",
+        "all_lo_veh_hh",
+        "all_lo_veh_hh_mod",
+    }
+)
+# Marker field (value 1) telling gtfs_service_demographics_arcpy that the *_CNT
+# fields hold block-allocated counts, not whole-tract figures.
+COUNT_ALLOCATION_FIELD: Final[str] = "CNT_ALLOC"
 
 # ---- ArcPy/Join settings ----
 FIPS_FIELD_NAME: str = "FIPS"
@@ -152,31 +200,67 @@ def _gp(msg: str, level: str = "info") -> None:
 
 GEO_ID_COL = "GEO_ID"
 _UNFRIENDLY_COL_RE = re.compile(r"^[A-Z]{2,}\d{3,}.*")
+#: Temporary per-row record of the input file, used to name files in duplicate errors.
+_SOURCE_COL: Final[str] = "_source_file"
 
 
 def _token_match(name: str, tokens: Sequence[str] | str) -> bool:
-    """Return True if *all* tokens occur in *name* (case-insensitive)."""
+    """Return True if *all* tokens occur in *name* as whole codes (case-insensitive).
+
+    A token that starts or ends with a letter or digit must sit against a
+    non-alphanumeric boundary there, so a table code matches only itself:
+    ``B19001`` does not match the race-iteration table ``B19001A``, and ``P1`` does
+    not match ``P12`` or ``DP1``. Tokens that begin and end with a separator (the
+    LODES ``_S000_JT00_``) still match anywhere.
+    """
     if isinstance(tokens, str):
         tokens = (tokens,)
     low = name.lower()
-    return all(tok.lower() in low for tok in tokens)
+    for tok in tokens:
+        tok_low = tok.lower()
+        pattern = re.escape(tok_low)
+        if tok_low[:1].isalnum():
+            pattern = r"(?<![a-z0-9])" + pattern
+        if tok_low[-1:].isalnum():
+            pattern += r"(?![a-z0-9])"
+        if re.search(pattern, low) is None:
+            return False
+    return True
 
 
-def _zip_data_member_sizes(zip_path: str | Path) -> dict[str, int]:
-    """Map each '*-Data.csv' member's base name to its uncompressed size in bytes.
+def _zip_data_members(zip_path: str | Path) -> dict[str, list[tuple[str, int]]]:
+    """Map each '*-Data.csv' member's base name to its (member name, size) entries.
 
     Reads only the ZIP central directory (no extraction). Returns an empty map
     when the archive cannot be read, so a corrupt ZIP never suppresses a loose CSV.
     """
+    members: dict[str, list[tuple[str, int]]] = {}
     try:
         with zipfile.ZipFile(zip_path) as zf:
-            return {
-                Path(info.filename).name.lower(): info.file_size
-                for info in zf.infolist()
-                if info.filename.lower().endswith("-data.csv")
-            }
+            for info in zf.infolist():
+                if info.filename.lower().endswith("-data.csv"):
+                    base = Path(info.filename).name.lower()
+                    members.setdefault(base, []).append((info.filename, info.file_size))
     except (zipfile.BadZipFile, OSError):
         return {}
+    return members
+
+
+def _sha256(stream: Any) -> str:
+    """Return the SHA-256 hex digest of a binary stream, read in 1 MiB chunks."""
+    digest = hashlib.sha256()
+    for chunk in iter(lambda: stream.read(1 << 20), b""):
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _same_as_zip_member(loose: Path, zip_path: str, member: str) -> bool:
+    """Return True if *loose* has exactly the bytes of *member* inside *zip_path*."""
+    try:
+        with zipfile.ZipFile(zip_path) as zf, zf.open(member) as packed, loose.open("rb") as fh:
+            return _sha256(packed) == _sha256(fh)
+    except (zipfile.BadZipFile, OSError):
+        return False
 
 
 def _dedupe_extracted_zip_members(paths: Sequence[str]) -> list[str]:
@@ -187,32 +271,37 @@ def _dedupe_extracted_zip_members(paths: Sequence[str]) -> list[str]:
     orchestrator does by default, and a human may do manually — the scanned root
     holds both the ``*.zip`` and the extracted ``*-Data.csv``. Bucketing both
     would concatenate the identical table twice (duplicate GEO_ID rows). A loose
-    CSV is treated as redundant only when its base name AND byte size match a
-    member of a ZIP in the same bucket, so the ZIP is kept and the extracted copy
-    dropped; genuinely distinct downloads (e.g. other geographies, which differ
-    in size) are never removed.
+    CSV is treated as redundant only when its base name matches a member of a ZIP
+    in the same bucket AND its bytes are identical to that member (size first,
+    then a content hash), so the ZIP is kept and the extracted copy dropped.
+    Anything else — another geography, a re-saved or edited copy — is kept, and a
+    real conflict is then caught by the duplicate check in ``_load_and_concat``.
     """
-    member_sizes: dict[str, set[int]] = {}
+    members: dict[str, list[tuple[str, str, int]]] = {}
     for p in paths:
         if p.lower().endswith(".zip"):
-            for name, size in _zip_data_member_sizes(p).items():
-                member_sizes.setdefault(name, set()).add(size)
-    if not member_sizes:
+            for base, entries in _zip_data_members(p).items():
+                members.setdefault(base, []).extend((p, name, size) for name, size in entries)
+    if not members:
         return list(paths)
 
     kept: list[str] = []
     for p in paths:
         base = Path(p).name.lower()
-        if base.endswith("-data.csv") and base in member_sizes:
+        if base.endswith("-data.csv") and base in members:
             try:
-                if Path(p).stat().st_size in member_sizes[base]:
-                    logging.info(
-                        "Skipping '%s'; byte-identical to a ZIP member already in this bucket.",
-                        p,
-                    )
-                    continue
+                size = Path(p).stat().st_size
             except OSError:
-                pass
+                size = -1
+            if any(
+                member_size == size and _same_as_zip_member(Path(p), zip_path, member)
+                for zip_path, member, member_size in members[base]
+            ):
+                logging.info(
+                    "Skipping '%s'; byte-identical to a ZIP member already in this bucket.",
+                    p,
+                )
+                continue
         kept.append(p)
     return kept
 
@@ -274,6 +363,54 @@ def _clean_name_cols(df: pd.DataFrame) -> None:
         df[col] = df[col].astype(str).str.replace(r"[\r\n\t]+", " ", regex=True).str.strip()
 
 
+def _dedupe_topic_rows(df: pd.DataFrame, key: Hashable) -> pd.DataFrame:
+    """Collapse rows that repeat *key* with identical data; reject conflicting repeats.
+
+    A topic bucket can gather more than one input file for the same geography — a
+    copy of the same download, or a second ACS vintage of the table. Concatenated,
+    those files repeat every ``GEO_ID``, and each repeat multiplies through the
+    GEO_ID merges and the one-to-many block<->tract join.
+
+    Rows that repeat a key with the same data (``NAME`` labels aside) are collapsed
+    to one. A key that repeats with *different* data is an ambiguous input — keeping
+    either row would silently pick a vintage — so it raises, naming the files.
+    Inputs keyed on ``GEOID`` instead of ``GEO_ID`` are checked on ``GEOID``. The
+    temporary ``_SOURCE_COL`` added by ``_load_and_concat`` is dropped on return.
+
+    Raises:
+        ValueError: If any key repeats with conflicting values.
+    """
+    if key == GEO_ID_COL and key not in df.columns and "GEOID" in df.columns:
+        key = "GEOID"
+    if key not in df.columns:
+        return df.drop(columns=_SOURCE_COL, errors="ignore")
+    data_cols = [c for c in df.columns if c != _SOURCE_COL and not str(c).startswith("NAME")]
+    unique = df.drop_duplicates(subset=data_cols)
+    conflicts = unique[unique.duplicated(subset=[key], keep=False)]
+    if not conflicts.empty:
+        keys = conflicts[key].astype(str).unique().tolist()
+        files = (
+            sorted(conflicts[_SOURCE_COL].astype(str).unique())
+            if _SOURCE_COL in conflicts.columns
+            else []
+        )
+        raise ValueError(
+            f"{len(keys)} geography key(s) in '{key}' carry conflicting values across input "
+            f"rows (e.g. {', '.join(keys[:3])}); files involved: {files}. Keep one table and "
+            "vintage per topic: remove the extra file, or pin the vintage in TOPIC_SIGNATURES "
+            "(e.g. ('ACSDT5Y2024', 'B19001'))."
+        )
+    dropped = len(df) - len(unique)
+    if dropped:
+        logging.info(
+            "Collapsed %d duplicate row(s) on '%s' carrying identical data (same geography "
+            "supplied more than once).",
+            dropped,
+            key,
+        )
+    return unique.drop(columns=_SOURCE_COL, errors="ignore").reset_index(drop=True)
+
+
 def _load_and_concat(
     files: Sequence[str],
     *,
@@ -282,8 +419,14 @@ def _load_and_concat(
     usecols: Sequence[Hashable] | Callable[[Hashable], bool] | None = None,
     rename: Mapping[str, str] | None = None,
     compression: Literal["infer", "gzip", "bz2", "zip", "xz", "zstd"] | None = None,
+    dedupe_key: Hashable | None = GEO_ID_COL,
 ) -> pd.DataFrame:
-    """Read multiple Census CSV / CSV-GZ / ZIP files and concatenate the results."""
+    """Read multiple Census CSV / CSV-GZ / ZIP files and concatenate the results.
+
+    When ``dedupe_key`` is set (default ``GEO_ID``), rows repeating that key with
+    identical data are collapsed and rows repeating it with conflicting data raise
+    ``ValueError`` (see ``_dedupe_topic_rows``). Pass ``dedupe_key=None`` to disable.
+    """
     from functools import partial
 
     def _col_in_set(col: Hashable, *, wanted: set[Hashable]) -> bool:
@@ -316,9 +459,15 @@ def _load_and_concat(
                 keep = {GEO_ID_COL, "GEOID", "NAME", *rename.values()}
                 df = df.loc[:, df.columns.intersection(keep)]
 
+        df[_SOURCE_COL] = str(path)
         frames.append(df)
 
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if not frames:
+        return pd.DataFrame()
+    combined = pd.concat(frames, ignore_index=True)
+    if dedupe_key is not None:
+        combined = _dedupe_topic_rows(combined, dedupe_key)
+    return combined.drop(columns=_SOURCE_COL, errors="ignore")
 
 
 def _ensure_geo_id(df: pd.DataFrame) -> None:
@@ -351,7 +500,7 @@ def _add_geo_derivatives(df: pd.DataFrame) -> None:
 
 
 def _merge_on_geo_id(left: pd.DataFrame, right: pd.DataFrame) -> pd.DataFrame:
-    """Outer-merge two frames on GEO_ID, dropping duplicate columns."""
+    """Outer-merge two frames on GEO_ID (one row per key each), dropping duplicate columns."""
     if left.empty:
         return right.copy()
     if right.empty:
@@ -364,7 +513,9 @@ def _merge_on_geo_id(left: pd.DataFrame, right: pd.DataFrame) -> pd.DataFrame:
         raise KeyError("Cannot merge: GEO_ID not present in one or both frames.")
 
     dup = (set(left.columns) & set(right.columns)) - {GEO_ID_COL}
-    return left.merge(right.drop(columns=dup, errors="ignore"), on=GEO_ID_COL, how="outer")
+    return left.merge(
+        right.drop(columns=dup, errors="ignore"), on=GEO_ID_COL, how="outer", validate="1:1"
+    )
 
 
 def _drop_unfriendly_cols(df: pd.DataFrame) -> pd.DataFrame:
@@ -404,6 +555,8 @@ def _build_block_df(inp: _BlockInputs) -> pd.DataFrame:
         inp.jobs_files,
         rename={"C000": "tot_empl", "CE01": "low_wage", "CE02": "mid_wage", "CE03": "high_wage"},
         usecols=["w_geocode", "C000", "CE01", "CE02", "CE03"],
+        # LODES is keyed on the block geocode, not GEO_ID; check repeats there.
+        dedupe_key="w_geocode",
     )
     if not jobs.empty:
         geostr = jobs["w_geocode"].astype(str).str.replace(r"\D", "", regex=True).str.zfill(15)
@@ -584,9 +737,10 @@ def _build_tract_df(inp: _TractInputs) -> pd.DataFrame:
                 "C16001_020E": "korean_engnwell",
                 "C16001_023E": "chineseetc_engnwell",
                 "C16001_026E": "vietnamese_engnwell",
+                "C16001_029E": "tagalog_engnwell",
                 "C16001_032E": "asiapacetc_engnwell",
                 "C16001_035E": "arabic_engnwell",
-                "C16001_037E": "otheretc_engnwell",
+                "C16001_038E": "otheretc_engnwell",
             },
         )
         dfs.append(_derive_language(language))
@@ -659,6 +813,74 @@ def _build_tract_df(inp: _TractInputs) -> pd.DataFrame:
     _fill_numeric_only(merged)
     merged["tract_id_clean"] = merged[GEO_ID_COL].astype(str).str[9:]
     return merged
+
+
+def _tract_count_columns(tract_df: pd.DataFrame) -> list[str]:
+    """Return the additive count columns of a tract table (numeric, not ``perc_*`` or ids)."""
+    ids = {GEO_ID_COL, "tract_id_clean", "FIPS"}
+    return [
+        str(c)
+        for c in tract_df.columns
+        if c not in ids
+        and not str(c).startswith("perc_")
+        and pd.api.types.is_numeric_dtype(tract_df[c])
+    ]
+
+
+def allocate_tract_counts_to_blocks(
+    df: pd.DataFrame,
+    count_cols: Iterable[str],
+    *,
+    tract_key: str = "tract_id_synth",
+) -> pd.DataFrame:
+    """Split each tract count across the tract's blocks in proportion to a block weight.
+
+    After the block<->tract merge every block carries its tract's totals verbatim, so
+    summing a count over blocks multiplies it by the number of blocks. Each count is
+    rewritten in place to ``tract_total * block_weight / sum(block_weight over the
+    tract)`` — the count allocation uscensus_tiger_join_gpd uses — so the parts sum
+    back to the tract total. Household-universe counts (``HOUSEHOLD_UNIVERSE_COUNTS``)
+    are weighted by block households (``total_hh``, from H9) and all others by block
+    population (``total_pop``, from P1); without H9, household counts are weighted by
+    population instead, with a warning. Tracts whose weights sum to zero get zero.
+
+    Args:
+        df: The merged block+tract frame, one row per block.
+        count_cols: Tract count columns to split (never ``perc_*`` ratios).
+        tract_key: Column grouping blocks by their tract.
+
+    Returns:
+        ``df`` with each available count column split in place.
+    """
+    if tract_key not in df.columns:
+        return df
+    fallback_cols: list[str] = []
+    for col in count_cols:
+        if col not in df.columns:
+            continue
+        weight = "total_hh" if col in HOUSEHOLD_UNIVERSE_COUNTS else "total_pop"
+        if weight not in df.columns and weight == "total_hh" and "total_pop" in df.columns:
+            fallback_cols.append(col)
+            weight = "total_pop"
+        if weight not in df.columns:
+            logging.warning(
+                "Cannot split tract count '%s' to blocks: no '%s' weight column; it is left "
+                "as a whole-tract figure on every block.",
+                col,
+                weight,
+            )
+            continue
+        values = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+        weights = pd.to_numeric(df[weight], errors="coerce").fillna(0.0)
+        tract_weight = weights.groupby(df[tract_key]).transform("sum")
+        df[col] = values * np.where(tract_weight > 0, weights / tract_weight, 0.0)
+    if fallback_cols:
+        logging.warning(
+            "No block household counts (H9) were supplied, so household counts %s were "
+            "split across blocks by population instead of households.",
+            fallback_cols,
+        )
+    return df
 
 
 def _make_shapefile_safe_columns(
@@ -806,6 +1028,7 @@ def build_joined_table_from_folder(
         "korean_engnwell": "KOR_NWELL",
         "chineseetc_engnwell": "CHN_NWELL",
         "vietnamese_engnwell": "VIE_NWELL",
+        "tagalog_engnwell": "TGL_NWELL",
         "asiapacetc_engnwell": "ASP_NWELL",
         "arabic_engnwell": "ARA_NWELL",
         "otheretc_engnwell": "OTH_NWELL",
@@ -870,6 +1093,7 @@ def build_joined_table_from_folder(
             right_on="tract_id_clean",
             how="outer",
             suffixes=("_blk", "_trt"),
+            validate="m:1",
         )
     )
 
@@ -877,15 +1101,22 @@ def build_joined_table_from_folder(
         combined = _drop_unfriendly_cols(combined)
 
     if county_fips_filter:
-        tmp = combined.copy()
-        if GEO_ID_COL not in tmp.columns and "GEOID" in tmp.columns:
-            tmp["GEOID"] = tmp["GEOID"].astype(str).str.replace(r"\D", "", regex=True).str.zfill(15)
-            tmp[GEO_ID_COL] = "1000000US" + tmp["GEOID"]
-        fips = tmp[GEO_ID_COL].astype(str).str[9:14]
+        # Filter on the block identifier. After the block<->tract merge the Census
+        # GEO_ID column exists only as GEO_ID_blk / GEO_ID_trt, so GEO_ID itself is
+        # gone; block_id_synth (15-digit block FIPS, built from whichever block id the
+        # inputs carried) is unambiguous. Tract rows that matched no block have no
+        # block id and drop out here.
+        fips = combined["block_id_synth"].astype(str).str[:5]
         mask = fips.isin({str(x).zfill(5) for x in county_fips_filter})
         combined = combined.loc[mask].copy()
 
     _fill_numeric_only(combined)
+
+    # Count allocation (as in uscensus_tiger_join_gpd): split every tract count across
+    # the tract's blocks so block rows can be summed and area-weighted, and mark the
+    # table so gtfs_service_demographics_arcpy knows its *_CNT fields are block counts.
+    combined = allocate_tract_counts_to_blocks(combined, _tract_count_columns(tract_df))
+    combined[COUNT_ALLOCATION_FIELD] = 1
 
     # Apply short names LAST (after all joins/filters) to avoid breaking lookups.
     combined = _make_shapefile_safe_columns(

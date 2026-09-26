@@ -6,15 +6,27 @@ employment metrics. Supports whole-network and per-route runs and optional CSV
 and feature exports.
 
 Pipeline:
-  1) Create stops layer (GTFS filter by route_short_name or shapefile).
+  1) Create stops layer (GTFS filter by service_id and route_short_name, or
+     shapefile).
   2) Buffer and dissolve (optional processing CRS for stability).
   3) Clip demographics (SR alignment, PairwiseClip with fallbacks).
-  4) Add areas (`area_ac_cl`, `area_perc`) and synthetic counts
-     (prefer `PCT_* × *_TOT`; fallback to `*_CNT` with safety checks).
+  4) Add areas (`area_ac_cl`, `area_perc`) and synthetic counts: area-weighted
+     block counts (`HH_LOWINC`, `MINOR_CNT`, ...) that uscensus_tiger_join_arcpy
+     split from tract totals by block population/households (marked by its
+     `CNT_ALLOC` field). A layer without that marker predates the split — its
+     `*_CNT` fields repeat whole-tract totals — so it falls back, with a warning,
+     to `PCT_* × *_TOT` (tract rate × block total).
   5) Summarize totals and export.
 
+GTFS trips are limited to the service day(s) in `SERVICE_IDS_TO_INCLUDE` (GTFS
+`service_id`; default `"4"`). Each run logs `calendar.txt` in full so the
+right id can be checked or picked, warns while the default is unchanged, and
+stops with exit code 2 if a listed service_id has no trips in the feed. A
+per-route run skips, with a warning, a route with no trips on that day.
+
 Inputs:
-  - GTFS: stops.txt, routes.txt, trips.txt, stop_times.txt
+  - GTFS: stops.txt, routes.txt, trips.txt, stop_times.txt (calendar.txt, if
+    present, is logged)
   - Demographics FC with HH_LOWINC/PCT_LOWINC/HH_TOT, MINOR_CNT/PCT_MINOR/POP_TOT,
     EMP_LO/EMP_TOT; LEP/YOUTH/ELDER optional.
 
@@ -60,6 +72,14 @@ GTFS_FOLDER: str = r"Path\To\Your\GTFS_Folder"
 # Optional: filter GTFS to the following route_short_name values.
 # Example: ["101", "202"]. Leave as [] or None to include all routes (network run).
 GTFS_ROUTE_SHORT_NAMES: Optional[Sequence[str]] = ["101", "202"]
+
+# Service day(s) to analyze, by GTFS service_id ("gtfs" mode only). The default "4" is
+# the typical weekday service_id in the source agency's GTFS; other feeds use other
+# ids. Each run logs calendar.txt so you can check or pick, warns while this is still
+# the default, and stops (exit code 2) if a listed service_id has no trips. For
+# Saturday or Sunday, rerun with that day's service_id(s) and its own RUN_TAG.
+# Set [] to use every trip (all days combined).
+SERVICE_IDS_TO_INCLUDE: Sequence[str] = ["4"]
 
 # Input demographics (from the census-join pipeline).
 # This may be a FileGDB feature class or a shapefile; both work.
@@ -117,8 +137,9 @@ class _Pref(NamedTuple):
     total: str | None
 
 
-# What we want to produce in the clipped layer → how to source it.
-# Prefer direct counts; otherwise derive via percent * total.
+# What we want to produce in the clipped layer → how to source it: the block count
+# when the layer's counts were split to blocks (COUNT_ALLOCATION_FIELD present),
+# otherwise percent * total.
 _PREFS: dict[str, _Pref] = {
     # Households
     "loinc_hh": _Pref(count="HH_LOWINC", pct="PCT_LOWINC", total="HH_TOT"),
@@ -136,6 +157,12 @@ _PREFS: dict[str, _Pref] = {
 }
 
 
+# Marker field written by uscensus_tiger_join_arcpy (value 1) when its *_CNT fields
+# hold counts split from tract totals to blocks, rather than whole-tract figures.
+COUNT_ALLOCATION_FIELD: str = "CNT_ALLOC"
+_LEGACY_LAYERS_WARNED: set[str] = set()  # warn once per layer, not once per route
+
+
 @dataclass(frozen=True)
 class DemogSchema:
     """Resolved strategies for computing metrics from a demographics layer."""
@@ -145,6 +172,8 @@ class DemogSchema:
     #   ("count", "FIELD") or ("derived", ("PCT_FIELD","TOTAL_FIELD"))
     strategies: dict[str, tuple[str, str | tuple[str, str]]]
     resolved_inputs: Dict[str, str]  # mapping of canonical→resolved name (for diagnostics)
+    # True when the layer's *_CNT fields are block-allocated counts (marker present).
+    counts_allocated: bool = False
 
 
 # =============================================================================
@@ -360,32 +389,165 @@ def load_gtfs_data(
             archive.close()
 
 
+# -----------------------------------------------------------------------------
+# SERVICE-DAY SELECTION
+#
+# Copied verbatim from utils/calendar_helpers.py (the canonical versions) so this
+# script stays self-contained. Keep the copies in sync when updating either.
+# -----------------------------------------------------------------------------
+class ServiceSelectionError(ValueError):
+    """A requested GTFS service_id is not used by any trip in the feed.
+
+    A configuration problem rather than a crash: callers report it without a
+    traceback and exit with code 2.
+    """
+
+
+def log_service_calendar(calendar_df: Optional[pd.DataFrame]) -> None:
+    """Log calendar.txt in full, so the user can see which service_id runs on which days.
+
+    calendar.txt is usually a handful of rows; printing it lets the user check or
+    pick the service_id(s) to analyze without opening the feed.
+
+    Args:
+        calendar_df: Parsed ``calendar.txt``, or ``None`` when the feed has none.
+    """
+    if calendar_df is None or calendar_df.empty:
+        logging.info("calendar.txt is absent or empty; see trips.txt for the feed's service_ids.")
+        return
+    logging.info(
+        "calendar.txt (%d service_id row(s)):\n%s",
+        len(calendar_df),
+        calendar_df.to_string(index=False),
+    )
+
+
+def select_trips_by_service(
+    trips_df: pd.DataFrame,
+    service_ids: Sequence[str],
+    *,
+    default_service_ids: Sequence[str] = (),
+) -> pd.DataFrame:
+    """Return the trips that run on *service_ids*; every trip when it is empty.
+
+    Warns when *service_ids* still equals *default_service_ids* (the calling
+    script's shipped default), so an unedited default is noticed, and warns that an
+    empty selection combines every service day.
+
+    Args:
+        trips_df: Parsed ``trips.txt`` (needs a ``service_id`` column).
+        service_ids: The service_id values to keep. Empty keeps every trip.
+        default_service_ids: The calling script's default, used only for the warning.
+
+    Returns:
+        The trips whose ``service_id`` is in *service_ids*.
+
+    Raises:
+        ServiceSelectionError: If a requested service_id is used by no trip. The
+            message lists the feed's service_ids with their trip counts.
+    """
+    wanted = [str(s).strip() for s in service_ids if str(s).strip()]
+    if not wanted:
+        logging.warning(
+            "No service_id selected: using every trip in the feed, all service days "
+            "combined. Set SERVICE_IDS_TO_INCLUDE to analyze a single service day."
+        )
+        return trips_df
+    defaults = [str(s).strip() for s in default_service_ids]
+    if defaults and wanted == defaults:
+        logging.warning(
+            "SERVICE_IDS_TO_INCLUDE is still the default %s. Check it against calendar.txt "
+            "and change it if this feed uses other service_ids or you want another day.",
+            wanted,
+        )
+    trip_service = trips_df["service_id"].astype(str).str.strip()
+    counts = trip_service.value_counts().sort_index()
+    missing = [s for s in wanted if s not in counts.index]
+    if missing:
+        available = ", ".join(f"{sid} ({n} trips)" for sid, n in counts.items())
+        raise ServiceSelectionError(
+            f"service_id(s) {missing} are not used by any trip in trips.txt. This feed's "
+            f"service_ids: {available}. Set SERVICE_IDS_TO_INCLUDE to the service day to "
+            "analyze (calendar.txt shows which days each service_id runs)."
+        )
+    kept = trips_df[trip_service.isin(wanted)]
+    logging.info("Service filter %s: trips %d -> %d.", wanted, len(trips_df), len(kept))
+    return kept
+
+
+# Shipped default for SERVICE_IDS_TO_INCLUDE, so an unedited value can be flagged.
+_DEFAULT_SERVICE_IDS: Sequence[str] = ["4"]
+
+
+class RoutesNotInServiceError(ServiceSelectionError):
+    """The selected routes run no trips on the selected service day(s).
+
+    A per-route run skips such a route with a warning; for the whole run it is a
+    configuration error, like its parent.
+    """
+
+
+def _check_service_selection(gtfs_folder: str, service_ids: Sequence[str]) -> None:
+    """Log calendar.txt and confirm that every requested service_id has trips.
+
+    Runs once, before any geoprocessing, so a wrong service_id stops the run early.
+
+    Raises:
+        ServiceSelectionError: A requested service_id is used by no trip.
+    """
+    trips = load_gtfs_data(gtfs_folder, files=("trips.txt",), dtype=str)["trips"]
+    calendar: Optional[pd.DataFrame] = None
+    try:
+        calendar = load_gtfs_data(gtfs_folder, files=("calendar.txt",), dtype=str)["calendar"]
+    except (OSError, ValueError):
+        pass  # optional: calendar_dates.txt alone can define every service day
+    log_service_calendar(calendar)
+    select_trips_by_service(trips, service_ids, default_service_ids=_DEFAULT_SERVICE_IDS)
+
+
 def _filter_gtfs_stops_by_route_short_name(
     gtfs: dict[str, pd.DataFrame],
     route_short_names: Optional[Sequence[str]],
+    service_ids: Optional[Sequence[str]] = None,
 ) -> pd.DataFrame:
-    """Return stops DataFrame filtered to those used by routes with given short names."""
+    """Return stops DataFrame filtered to those used by routes with given short names.
+
+    Only trips on *service_ids* count; empty or ``None`` keeps every trip. With
+    neither filter set, every stop in stops.txt is returned.
+
+    Raises:
+        RoutesNotInServiceError: The selected routes run no trips on *service_ids*.
+    """
     stops = gtfs["stops"]
-    if not route_short_names:
+    target = {str(x) for x in route_short_names or ()}
+    service = [str(s).strip() for s in service_ids or () if str(s).strip()]
+    if not target and not service:
         return stops.copy()
 
-    target = {str(x) for x in route_short_names}
     routes = gtfs["routes"]
     trips = gtfs["trips"]
     stop_times = gtfs["stop_times"]
 
-    routes_sel = routes[routes["route_short_name"].astype(str).isin(target)]
-    if routes_sel.empty:
-        raise ValueError(
-            f"No routes matched the provided route_short_name filter: {sorted(target)}"
-        )
+    if target:
+        routes_sel = routes[routes["route_short_name"].astype(str).isin(target)]
+        if routes_sel.empty:
+            raise ValueError(
+                f"No routes matched the provided route_short_name filter: {sorted(target)}"
+            )
 
-    route_ids = set(routes_sel["route_id"].astype(str))
-    trips_sel = trips[trips["route_id"].astype(str).isin(route_ids)]
-    if trips_sel.empty:
-        raise ValueError("Routes matched, but no trips found for the selected routes.")
+        route_ids = set(routes_sel["route_id"].astype(str))
+        trips = trips[trips["route_id"].astype(str).isin(route_ids)]
+        if trips.empty:
+            raise ValueError("Routes matched, but no trips found for the selected routes.")
 
-    trip_ids = set(trips_sel["trip_id"].astype(str))
+    if service:
+        trips = trips[trips["service_id"].astype(str).str.strip().isin(service)]
+        if trips.empty:
+            raise RoutesNotInServiceError(
+                f"Route(s) {sorted(target)} run no trips on service_id(s) {service}."
+            )
+
+    trip_ids = set(trips["trip_id"].astype(str))
     st_sel = stop_times[stop_times["trip_id"].astype(str).isin(trip_ids)]
     if st_sel.empty:
         raise ValueError("Trips matched, but no stop_times rows found.")
@@ -465,9 +627,14 @@ def make_stops_layer(
     shapefile_fc: Optional[str] = None,
     gtfs_folder: Optional[str] = None,
     route_short_names: Optional[Sequence[str]] = None,
+    service_ids: Optional[Sequence[str]] = None,
     layer_name: str = "stops",
 ) -> str:
-    """Create a feature layer of stops for downstream processing."""
+    """Create a feature layer of stops for downstream processing.
+
+    In "gtfs" mode, keeps the stops served by *route_short_names* on *service_ids*
+    (either empty or ``None``: no filter on it).
+    """
     m = mode.strip().lower()
     if m not in {"shapefile", "gtfs"}:
         raise ValueError("STOPS_INPUT_MODE must be 'shapefile' or 'gtfs'.")
@@ -486,7 +653,7 @@ def make_stops_layer(
         files=("stops.txt", "routes.txt", "trips.txt", "stop_times.txt"),
         dtype=str,
     )
-    stops_df = _filter_gtfs_stops_by_route_short_name(gtfs, route_short_names)
+    stops_df = _filter_gtfs_stops_by_route_short_name(gtfs, route_short_names, service_ids)
     return _points_layer_from_stops_df(stops_df, layer_name=layer_name)
 
 
@@ -500,18 +667,30 @@ def _has(dataset: str, field: Optional[str]) -> bool:
 def detect_demog_schema(demographics_fc: str) -> DemogSchema:
     """Inspect the demographics layer and decide how to compute each metric.
 
-    Preference (safer order):
-      1) If percent + total exist (e.g., PCT_MINOR + POP_TOT), derive.
-      2) Otherwise, use a direct count field if present (e.g., MINOR_CNT).
-      3) Otherwise, skip that metric.
+    Layers from the current uscensus_tiger_join_arcpy carry ``COUNT_ALLOCATION_FIELD``:
+    their ``*_CNT`` fields are tract counts split to blocks by block population or
+    households, the same count allocation uscensus_tiger_join_gpd uses. For those:
+      1) Use the direct count field if present (e.g., MINOR_CNT).
+      2) Otherwise derive from percent + total (e.g., PCT_MINOR × POP_TOT).
 
-    Rationale: joined pipelines sometimes duplicate or mislabel *_CNT fields
-    across geographies; deriving from PCT_* × POP_TOT is monotonic and avoids
-    over-counting relative to the total.
+    Older layers lack the marker; their ``*_CNT`` fields repeat each tract's whole
+    total on every block, so the order flips (derive first, count as a last resort)
+    and a warning asks for the join to be re-run. Metrics with neither are skipped.
     """
     strategies: dict[str, tuple[str, str | tuple[str, str]]] = {}
     outputs: list[str] = []
     resolved_inputs: Dict[str, str] = {}
+    counts_allocated = _resolve_field(demographics_fc, COUNT_ALLOCATION_FIELD) is not None
+    if not counts_allocated and demographics_fc not in _LEGACY_LAYERS_WARNED:
+        _LEGACY_LAYERS_WARNED.add(demographics_fc)
+        logging.warning(
+            "Demographics layer '%s' has no %s field: it predates the block count split in "
+            "uscensus_tiger_join_arcpy, so its *_CNT fields are whole-tract totals. Using "
+            "PCT_* x block totals instead (tract rate x 2020 block population/households). "
+            "Re-run uscensus_tiger_join_arcpy to use block-allocated counts.",
+            demographics_fc,
+            COUNT_ALLOCATION_FIELD,
+        )
 
     # Pre-resolve all canonical names that might be referenced
     all_needed: set[str] = set()
@@ -522,28 +701,30 @@ def detect_demog_schema(demographics_fc: str) -> DemogSchema:
     resolved = _resolve_many(demographics_fc, sorted(all_needed))
 
     for out_name, pref in _PREFS.items():
-        # 1) Prefer derived if possible
-        if pref.pct and pref.total:
-            rpct = resolved.get(pref.pct)
-            rtot = resolved.get(pref.total)
-            if rpct and rtot and _has(demographics_fc, rpct) and _has(demographics_fc, rtot):
-                strategies[out_name] = ("derived", (rpct, rtot))  # type: ignore[arg-type]
-                outputs.append(out_name)
-                resolved_inputs[pref.pct] = rpct
-                resolved_inputs[pref.total] = rtot
-                continue
-
-        # 2) Fallback to direct count
-        if pref.count:
-            rcount = resolved.get(pref.count)
-            if rcount and _has(demographics_fc, rcount):
-                strategies[out_name] = ("count", rcount)  # type: ignore[arg-type]
-                outputs.append(out_name)
-                resolved_inputs[pref.count] = rcount
-                continue
+        rcount = resolved.get(pref.count) if pref.count else None
+        rpct = resolved.get(pref.pct) if pref.pct else None
+        rtot = resolved.get(pref.total) if pref.total else None
+        count_ok = bool(rcount) and _has(demographics_fc, rcount)
+        derived_ok = (
+            bool(rpct and rtot) and _has(demographics_fc, rpct) and _has(demographics_fc, rtot)
+        )
+        # Allocated layers: count first. Legacy layers: derived first, count last.
+        if count_ok and (counts_allocated or not derived_ok):
+            strategies[out_name] = ("count", str(rcount))
+            resolved_inputs[str(pref.count)] = str(rcount)
+        elif derived_ok:
+            strategies[out_name] = ("derived", (str(rpct), str(rtot)))
+            resolved_inputs[str(pref.pct)] = str(rpct)
+            resolved_inputs[str(pref.total)] = str(rtot)
+        else:
+            continue
+        outputs.append(out_name)
 
     return DemogSchema(
-        outputs=tuple(outputs), strategies=strategies, resolved_inputs=resolved_inputs
+        outputs=tuple(outputs),
+        strategies=strategies,
+        resolved_inputs=resolved_inputs,
+        counts_allocated=counts_allocated,
     )
 
 
@@ -607,10 +788,12 @@ def add_synthetic_fields(
     If a direct count field exists, we scale it by area_perc.
     If only a percent exists (with its appropriate total), we scale (pct * total) by area_perc.
 
-    Safety:
-      - When a metric resolves to a direct count but the corresponding pct+total
-        pair is also present on the clipped data, use the derived value if the
-        raw count would exceed the implied total for that row.
+    Safety (legacy layers only, see ``detect_demog_schema``):
+      - When a metric on a layer without block-allocated counts resolves to a direct
+        count but the pct+total pair is also present on the clipped data, use the
+        derived value if the raw count would exceed the implied total for that row.
+        Layers with allocated counts use the counts as-is, so every row follows the
+        same method.
     """
     if not field_exists(clipped_fc, area_pct_field):
         raise ValueError(
@@ -641,10 +824,11 @@ def add_synthetic_fields(
             needed_inputs.add(str(pct_field))
             needed_inputs.add(str(tot_field))
 
-    # Also try to fetch pct/total for count-based metrics (for sanity fallback)
+    # Also try to fetch pct/total for count-based metrics (for the legacy sanity
+    # fallback; allocated counts are used as-is)
     derived_helpers: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
     for out_name, (mode, _spec) in strategies.items():
-        if mode == "count":
+        if mode == "count" and not schema.counts_allocated:
             # Look up matching pct/total names from _PREFS (canonical), then resolve on clipped FC
             pref = _PREFS.get(out_name)
             if pref and pref.pct and pref.total:
@@ -1083,6 +1267,9 @@ def calc_original_area_for_intersecting(
     expanded by `insurance_distance_ft`. Non-intersecting features are left
     untouched, avoiding a full-table CalculateField over ~40k rows.
 
+    Call this before clipping: the clip copies `area_ac_og` from the source,
+    so values written afterwards never reach the clipped features.
+
     Args:
         demographics_fc: Input demographics polygon feature class to update.
         buffers_fc: Dissolved service-area polygons.
@@ -1179,17 +1366,20 @@ def _process_service_area_from_stops_layer(
     if area_m2 is not None:
         logging.info("Diagnostics: dissolved geodesic area = %.2f sq.m", area_m2)
 
-    # 3) Clip demographics
-    logging.info("Clipping demographics (%s)…", run_tag)
-    clipped = clip_demographics_to_buffers(DEMOGRAPHICS_FC, dissolved, clipped_path)
-
-    # 4) Precompute original area ONLY for demographics that matter (near the buffer)
+    # 3) Precompute original area ONLY for demographics that matter (near the buffer).
+    # This must run BEFORE the clip: the clip copies area_ac_og from the source
+    # rows, and a later update to the source never reaches the clipped copy (it
+    # would carry a missing value on a fresh input, or a stale one from a prior run).
     calc_original_area_for_intersecting(
         demographics_fc=DEMOGRAPHICS_FC,
         buffers_fc=dissolved,
         insurance_distance_ft=100.0,
         field_name="area_ac_og",
     )
+
+    # 4) Clip demographics (inherits the fresh area_ac_og computed above)
+    logging.info("Clipping demographics (%s)…", run_tag)
+    clipped = clip_demographics_to_buffers(DEMOGRAPHICS_FC, dissolved, clipped_path)
 
     # 5) Areas and percentages on the clipped output
     add_clipped_area_and_percentage(clipped)
@@ -1242,11 +1432,17 @@ def _run_network_total(stops_layer: str) -> None:
         logging.info("Final export: %s", exported)
 
 
-def _run_by_route(gtfs_folder: str, route_short_names: Sequence[str]) -> pd.DataFrame:
+def _run_by_route(
+    gtfs_folder: str,
+    route_short_names: Sequence[str],
+    service_ids: Optional[Sequence[str]] = None,
+) -> pd.DataFrame:
     """Per-route summaries (GTFS only). Returns a DataFrame of results.
 
-    For each route_short_name, rebuilds its own stops layer from GTFS,
-    runs the service-area pipeline (in_memory by default), and collects totals.
+    For each route_short_name, rebuilds its own stops layer from GTFS (trips on
+    *service_ids* only), runs the service-area pipeline (in_memory by default),
+    and collects totals. A route with no trips on *service_ids* is skipped with a
+    warning.
     """
     results: List[Dict[str, int | str]] = []
     for route_sn in route_short_names:
@@ -1254,12 +1450,17 @@ def _run_by_route(gtfs_folder: str, route_short_names: Sequence[str]) -> pd.Data
         logging.info("Processing route %s", route_sn)
 
         # Build a route-scoped stops layer directly from GTFS
-        stops_layer = make_stops_layer(
-            mode="gtfs",
-            gtfs_folder=gtfs_folder,
-            route_short_names=[route_sn],
-            layer_name=f"stops_{_sanitize_name(route_sn)}",
-        )
+        try:
+            stops_layer = make_stops_layer(
+                mode="gtfs",
+                gtfs_folder=gtfs_folder,
+                route_short_names=[route_sn],
+                service_ids=service_ids,
+                layer_name=f"stops_{_sanitize_name(route_sn)}",
+            )
+        except RoutesNotInServiceError as exc:
+            logging.warning("Skipping route %s: %s", route_sn, exc)
+            continue
 
         totals, exported = _process_service_area_from_stops_layer(
             stops_layer=stops_layer,
@@ -1308,7 +1509,8 @@ def main() -> int:
 
     Returns:
         Process exit code: 0 on success, 1 on failure, 2 if required
-        CONFIGURATION values are still placeholders.
+        CONFIGURATION values are still placeholders, a requested service_id has
+        no trips in the feed, or the selected routes have none on that day.
     """
     logging.basicConfig(
         level=LOG_LEVEL,
@@ -1340,13 +1542,23 @@ def main() -> int:
 
     # Prepare stops layer (network scope) once
     logging.info("Preparing stops layer...")
-    stops_layer = make_stops_layer(
-        mode=STOPS_INPUT_MODE,
-        shapefile_fc=STOPS_FEATURE_CLASS,
-        gtfs_folder=GTFS_FOLDER,
-        route_short_names=GTFS_ROUTE_SHORT_NAMES,
-        layer_name="stops_for_buffering",
-    )
+    try:
+        if m == "gtfs":
+            # calendar.txt is logged in full so the user can confirm (or pick) the
+            # service_id; a requested service_id with no trips stops the run here.
+            _check_service_selection(GTFS_FOLDER, SERVICE_IDS_TO_INCLUDE)
+        stops_layer = make_stops_layer(
+            mode=STOPS_INPUT_MODE,
+            shapefile_fc=STOPS_FEATURE_CLASS,
+            gtfs_folder=GTFS_FOLDER,
+            route_short_names=GTFS_ROUTE_SHORT_NAMES,
+            service_ids=SERVICE_IDS_TO_INCLUDE,
+            layer_name="stops_for_buffering",
+        )
+    except ServiceSelectionError as exc:
+        # A configuration problem, not a crash: report the fix without a traceback.
+        logging.error("%s", exc)
+        return 2
 
     mode = OUTPUT_MODE.lower().strip()
     if mode not in {"network", "by_route", "both"}:
@@ -1370,7 +1582,7 @@ def main() -> int:
             raise ValueError(
                 "GTFS_ROUTE_SHORT_NAMES is empty; populate it to enable per-route processing."
             )
-        _ = _run_by_route(GTFS_FOLDER, route_list)
+        _ = _run_by_route(GTFS_FOLDER, route_list, SERVICE_IDS_TO_INCLUDE)
 
     logging.info("Processing completed successfully.")
     return 0

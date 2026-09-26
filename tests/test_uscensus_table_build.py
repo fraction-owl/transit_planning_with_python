@@ -12,6 +12,7 @@ import pytest
 from scripts.national_data_tools.uscensus_table_build import (
     GEO_ID_COL,
     _apply_fips_filter,
+    _build_tract_df,
     _clean_name_cols,
     _derive_age,
     _derive_commute,
@@ -26,6 +27,7 @@ from scripts.national_data_tools.uscensus_table_build import (
     _merge_on_geo_id,
     _read_csv_any,
     _token_match,
+    _TractInputs,
     build_joined_table,
     discover_census_files,
 )
@@ -450,6 +452,52 @@ def test_derive_language_zero_lang_pop_yields_zero_lep() -> None:
     assert result["perc_lep"].iloc[0] == pytest.approx(0.0)
 
 
+# Every C16001 "Speak English less than 'very well'" estimate -- the LEP rows. The
+# "very well" rows (e.g. _037E, other languages) must never be counted as LEP.
+_C16001_LEP_CODES = [f"C16001_{n:03d}E" for n in (5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35, 38)]
+
+
+def test_build_tract_df_lep_counts_every_less_than_very_well_row(tmp_path: Path) -> None:
+    # Each estimate column holds a distinct value, so a missing LEP row or a stray
+    # "very well" row changes the total.
+    codes = [f"C16001_{n:03d}E" for n in range(1, 39)]
+    values = {code: n for n, code in enumerate(codes, start=1)}
+    path = tmp_path / "ACSDT5Y2024.C16001-Data.csv"
+    _write_plain_csv(
+        path,
+        _census_csv(
+            "GEO_ID,NAME," + ",".join(codes),
+            "Geo,Name," + ",".join(["l"] * len(codes)),
+            f"{_TRACT_GEO_ID},Tract," + ",".join(str(values[c]) for c in codes),
+        ),
+    )
+    inputs = _TractInputs(
+        income_files=[],
+        ethnicity_files=[],
+        language_files=[str(path)],
+        vehicle_files=[],
+        age_files=[],
+        commute_files=[],
+    )
+    result = _build_tract_df(inputs)
+    assert result["all_nwell"].iloc[0] == sum(values[c] for c in _C16001_LEP_CODES)
+
+
+def test_build_tract_df_lep_matches_real_fixture() -> None:
+    zip_path = next(FIXTURE_DIR.glob("ACSDT5Y2024.C16001_*.zip"))
+    raw = _read_csv_any(zip_path, skiprows=[1])
+    expected = raw[_C16001_LEP_CODES].apply(pd.to_numeric, errors="coerce").fillna(0).sum().sum()
+    inputs = _TractInputs(
+        income_files=[],
+        ethnicity_files=[],
+        language_files=[str(zip_path)],
+        vehicle_files=[],
+        age_files=[],
+        commute_files=[],
+    )
+    assert _build_tract_df(inputs)["all_nwell"].sum() == pytest.approx(expected)
+
+
 def test_derive_vehicle_computes_low_vehicle_metrics() -> None:
     df = pd.DataFrame(
         {
@@ -551,8 +599,10 @@ def test_derive_commute_reconstructs_counts_from_percentages() -> None:
     assert result["commute_carpool"].iloc[0] == pytest.approx(100.0)
     assert result["commute_transit"].iloc[0] == pytest.approx(50.0)
     assert result["commute_wfh"].iloc[0] == pytest.approx(40.0)
-    # person-minutes = workers * mean; the additive form of a mean
-    assert result["commute_person_min"].iloc[0] == pytest.approx(22_500.0)
+    # person-minutes = commuters * mean, where the Census mean excludes the 40 home
+    # workers; commute_timed is the matching denominator
+    assert result["commute_timed"].iloc[0] == pytest.approx(960.0)
+    assert result["commute_person_min"].iloc[0] == pytest.approx(21_600.0)
     # the readable percentages survive for the flat table
     assert result["perc_transit"].iloc[0] == pytest.approx(5.0)
 
@@ -575,6 +625,9 @@ def test_derive_commute_coerces_jam_values_to_nan() -> None:
     # not zero); build_joined_table's _fill_numeric_only zero-fills it downstream.
     assert pd.isna(result["commute_transit"].iloc[0])
     assert pd.isna(result["mean_travel_time"].iloc[0])
+    # A suppressed mean contributes neither minutes nor commuters to the mean.
+    assert result["commute_timed"].iloc[0] == 0
+    assert result["commute_person_min"].iloc[0] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -620,6 +673,23 @@ def test_load_and_concat_reads_zip_transparently(tmp_path: Path) -> None:
     _write_zip_csv(zip_path, "P1-Data.csv", csv_content)
     result = _load_and_concat([str(zip_path)])
     assert result["P1_001N"].iloc[0] == 99
+
+
+def test_load_and_concat_rejects_conflicting_duplicate_geo_ids(tmp_path: Path) -> None:
+    a = tmp_path / "ACSDT5Y2023.B19001-Data.csv"
+    b = tmp_path / "ACSDT5Y2024.B19001-Data.csv"
+    _write_plain_csv(a, f"GEO_ID,val\n{_TRACT_GEO_ID},10\n")
+    _write_plain_csv(b, f"GEO_ID,val\n{_TRACT_GEO_ID},99\n")
+    with pytest.raises(ValueError, match="conflicting") as excinfo:
+        _load_and_concat([str(a), str(b)])
+    assert a.name in str(excinfo.value)
+    assert b.name in str(excinfo.value)
+
+
+def test_token_match_requires_whole_table_code() -> None:
+    assert _token_match("ACSDT5Y2024.B19001A-Data.csv", ("B19001",)) is False
+    assert _token_match("DECENNIALDHC2020.P12-Data.csv", ("P1",)) is False
+    assert _token_match("ACSDT5Y2023.B19001-Data.csv", ("ACSDT5Y2024", "B19001")) is False
 
 
 # ---------------------------------------------------------------------------
@@ -741,6 +811,80 @@ def test_build_joined_table_with_tract_income(tmp_path: Path) -> None:
     assert "perc_low_income" in df.columns
 
 
+def test_build_joined_table_splits_tract_counts_across_blocks(tmp_path: Path) -> None:
+    # Count allocation: household counts split by block households (H9), person counts
+    # by block population (P1); both sum back to the tract total, rates stay per tract.
+    blocks = [("1000000US110010001001001", 100, 10), ("1000000US110010001001002", 300, 30)]
+    pop_path = tmp_path / "P1-Data.csv"
+    hh_path = tmp_path / "H9-Data.csv"
+    _write_plain_csv(
+        pop_path,
+        _census_csv(
+            "GEO_ID,NAME,P1_001N", "Geo,Name,Total", *[f"{g},Block,{p}" for g, p, _ in blocks]
+        ),
+    )
+    _write_plain_csv(
+        hh_path, _census_csv("GEO_ID,H9_001N", "Geo,Total", *[f"{g},{h}" for g, _, h in blocks])
+    )
+    bands = ",".join(f"B19001_{n:03d}E" for n in range(1, 12))
+    income_path = tmp_path / "B19001-Data.csv"
+    _write_plain_csv(
+        income_path,
+        _census_csv(
+            f"GEO_ID,NAME,{bands}",
+            "Geo,Name," + ",".join(["l"] * 11),
+            f"{_TRACT_GEO_ID},Tract,100," + ",".join(["8"] * 10),
+        ),
+    )
+    eth_cols = "P9_001N,P9_002N,P9_005N,P9_006N,P9_007N,P9_008N,P9_009N,P9_010N,P9_011N"
+    eth_path = tmp_path / "P9-Data.csv"
+    _write_plain_csv(
+        eth_path,
+        _census_csv(
+            f"GEO_ID,NAME,{eth_cols}",
+            "Geo,Name," + ",".join(["l"] * 9),
+            f"{_TRACT_GEO_ID},Tract,200,0,160,40,0,0,0,0,0",
+        ),
+    )
+    df = build_joined_table(
+        pop_files=[str(pop_path)],
+        hh_files=[str(hh_path)],
+        jobs_files=[],
+        income_files=[str(income_path)],
+        ethnicity_files=[str(eth_path)],
+    ).sort_values("total_pop")
+    assert df["low_income"].tolist() == pytest.approx([20.0, 60.0])  # 80 split 10:30
+    assert df["minority"].tolist() == pytest.approx([10.0, 30.0])  # 40 split 100:300
+    assert df["white"].sum() == pytest.approx(160.0)
+    assert df["perc_low_income"].tolist() == pytest.approx([0.8, 0.8])
+
+
+def test_build_joined_table_duplicated_inputs_do_not_multiply_rows(tmp_path: Path) -> None:
+    # The same block row and the same tract row each supplied twice used to fan out
+    # to 2 x 2 = 4 rows for the one block; identical repeats now collapse first.
+    pop_paths = [tmp_path / "a" / "P1-Data.csv", tmp_path / "b" / "P1-Data.csv"]
+    inc_paths = [tmp_path / "a" / "B19001-Data.csv", tmp_path / "b" / "B19001-Data.csv"]
+    bands = ",".join(f"B19001_{n:03d}E" for n in range(1, 12))
+    for pop_path, inc_path in zip(pop_paths, inc_paths):
+        pop_path.parent.mkdir(exist_ok=True)
+        _write_plain_csv(pop_path, _make_block_pop_csv())
+        _write_plain_csv(
+            inc_path,
+            _census_csv(
+                f"GEO_ID,NAME,{bands}",
+                "Geography,Geographic Area Name," + ",".join(["label"] * 11),
+                f"{_TRACT_GEO_ID},Test Tract," + ",".join(["10"] * 11),
+            ),
+        )
+    df = build_joined_table(
+        pop_files=[str(p) for p in pop_paths],
+        hh_files=[],
+        jobs_files=[],
+        income_files=[str(p) for p in inc_paths],
+    )
+    assert len(df) == 1
+
+
 def test_build_joined_table_with_tract_commute(tmp_path: Path) -> None:
     """Adding S0801 files yields readable percentages and additive worker counts."""
     pop_path = tmp_path / "P1-Data.csv"
@@ -773,7 +917,8 @@ def test_build_joined_table_with_tract_commute(tmp_path: Path) -> None:
     assert "commute_transit" in df.columns
     assert "commute_person_min" in df.columns
     assert df["commute_transit"].iloc[0] == pytest.approx(50.0)
-    assert df["commute_person_min"].iloc[0] == pytest.approx(22_500.0)
+    assert df["commute_person_min"].iloc[0] == pytest.approx(21_600.0)
+    assert df["commute_timed"].iloc[0] == pytest.approx(960.0)
 
 
 # ---------------------------------------------------------------------------

@@ -359,15 +359,29 @@ def test_load_and_concat_applies_column_rename(tmp_path: Path) -> None:
     assert result["total_pop"].iloc[0] == 42
 
 
-def test_load_and_concat_dedupes_repeated_geo_id_keep_first(tmp_path: Path) -> None:
-    # Two "vintages" of one table repeat a GEO_ID; only the first file's row survives.
+def test_load_and_concat_rejects_conflicting_duplicate_geo_ids(tmp_path: Path) -> None:
+    # Two vintages of one table disagree on a GEO_ID: keeping either would silently
+    # pick a vintage, so the load fails and names both files.
     a = tmp_path / "ACSDT5Y2023.B19001-Data.csv"
     b = tmp_path / "ACSDT5Y2024.B19001-Data.csv"
     _write_plain_csv(a, "GEO_ID,val\n1400000US11001000100,10\n")
     _write_plain_csv(b, "GEO_ID,val\n1400000US11001000100,99\n")
+    with pytest.raises(ValueError, match="conflicting") as excinfo:
+        mod._load_and_concat([str(a), str(b)])
+    assert a.name in str(excinfo.value)
+    assert b.name in str(excinfo.value)
+
+
+def test_load_and_concat_collapses_identical_duplicate_rows(tmp_path: Path) -> None:
+    # The same data supplied twice (NAME label aside) is harmless: one row survives.
+    a = tmp_path / "copy1.B19001-Data.csv"
+    b = tmp_path / "copy2.B19001-Data.csv"
+    _write_plain_csv(a, "GEO_ID,NAME,val\n1400000US11001000100,Tract 1; DC,10\n")
+    _write_plain_csv(b, "GEO_ID,NAME,val\n1400000US11001000100,Census Tract 1 (DC),10\n")
     result = mod._load_and_concat([str(a), str(b)])
     assert len(result) == 1
     assert result["val"].iloc[0] == 10
+    assert mod._SOURCE_COL not in result.columns
 
 
 def test_load_and_concat_keeps_distinct_geo_ids(tmp_path: Path) -> None:
@@ -384,15 +398,48 @@ def test_load_and_concat_dedupe_key_none_disables(tmp_path: Path) -> None:
     assert len(mod._load_and_concat([str(a)], dedupe_key=None)) == 2
 
 
-def test_load_and_concat_dedupes_on_alternate_key(tmp_path: Path) -> None:
-    # LODES files key on w_geocode, not GEO_ID, so several WAC vintages must dedupe there.
+def test_load_and_concat_checks_duplicates_on_alternate_key(tmp_path: Path) -> None:
+    # LODES files key on w_geocode, not GEO_ID: two WAC vintages that disagree on a
+    # block are rejected there, while an identical repeat collapses.
     a = tmp_path / "wac_2021.csv"
     b = tmp_path / "wac_2022.csv"
     _write_plain_csv(a, "w_geocode,C000\n110010001001001,50\n")
     _write_plain_csv(b, "w_geocode,C000\n110010001001001,77\n")
+    with pytest.raises(ValueError, match="w_geocode"):
+        mod._load_and_concat([str(a), str(b)], dedupe_key="w_geocode")
+
+    _write_plain_csv(b, "w_geocode,C000\n110010001001001,50\n")
     result = mod._load_and_concat([str(a), str(b)], dedupe_key="w_geocode")
-    assert len(result) == 1
-    assert result["C000"].iloc[0] == 50
+    assert result["C000"].tolist() == [50]
+
+
+def test_token_match_requires_whole_table_code() -> None:
+    # Race-iteration tables and longer codes sharing a prefix are different tables.
+    assert mod._token_match("ACSDT5Y2024.B19001A-Data.csv", ("B19001",)) is False
+    assert mod._token_match("DECENNIALDHC2020.P12-Data.csv", ("P1",)) is False
+    assert mod._token_match("DECENNIALDP2020.DP1-Data.csv", ("P1",)) is False
+    assert mod._token_match("ACSDT5Y2024.B19001_2026-05-23T135307.zip", ("B19001",)) is True
+
+
+def test_token_match_pins_vintage_with_product_code() -> None:
+    sig = ("ACSDT5Y2024", "B19001")
+    assert mod._token_match("ACSDT5Y2024.B19001-Data.csv", sig) is True
+    assert mod._token_match("ACSDT5Y2023.B19001-Data.csv", sig) is False
+
+
+def test_discover_census_files_keeps_same_size_csv_with_different_content(
+    tmp_path: Path,
+) -> None:
+    # Same base name and byte size as the ZIP member, but different bytes: not a
+    # copy of the archive, so it must not be dropped as one.
+    zip_path = tmp_path / "ACSST5Y2024.S0801_a.zip"
+    _write_zip_csv(zip_path, "ACSST5Y2024.S0801-Data.csv", "GEO_ID,val\n1400000US11001,5\n")
+    loose = tmp_path / "other" / "ACSST5Y2024.S0801-Data.csv"
+    loose.parent.mkdir()
+    loose.write_text("GEO_ID,val\n1400000US11001,7\n", encoding="utf-8")
+
+    result = mod.discover_census_files(tmp_path, {"COMMUTE": ("S0801",)})
+    assert len(result["COMMUTE"]) == 2
 
 
 # =============================================================================
@@ -528,6 +575,67 @@ def test_derive_language_zero_lang_pop_yields_zero_lep() -> None:
     assert result["perc_lep"].iloc[0] == pytest.approx(0.0)
 
 
+# Every C16001 "Speak English less than 'very well'" estimate -- the LEP rows. The
+# "very well" rows (e.g. _037E, other languages) must never be counted as LEP.
+_C16001_LEP_CODES = [f"C16001_{n:03d}E" for n in (5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35, 38)]
+
+
+def _c16001_fixture() -> Path:
+    return next(FIXTURE_DIR.glob("ACSDT5Y2024.C16001_*.zip"))
+
+
+def test_c16001_lep_codes_match_fixture_metadata() -> None:
+    with zipfile.ZipFile(_c16001_fixture()) as zf:
+        meta = zf.read("ACSDT5Y2024.C16001-Column-Metadata.csv").decode("utf-8-sig")
+    # The metadata does not escape the quotes around "very well", so match on text.
+    lep_codes = [
+        line.split(",", 1)[0].strip('"')
+        for line in meta.splitlines()
+        if line.startswith('"C16001_') and "Estimate!!" in line and "less than" in line
+    ]
+    assert lep_codes == _C16001_LEP_CODES
+
+
+def test_build_tract_df_lep_counts_every_less_than_very_well_row(tmp_path: Path) -> None:
+    # Each estimate column holds a distinct value, so a missing LEP row or a stray
+    # "very well" row changes the total.
+    codes = [f"C16001_{n:03d}E" for n in range(1, 39)]
+    values = {code: n for n, code in enumerate(codes, start=1)}
+    path = tmp_path / "ACSDT5Y2024.C16001-Data.csv"
+    _write_plain_csv(
+        path,
+        _census_csv(
+            "GEO_ID,NAME," + ",".join(codes),
+            "Geo,Name," + ",".join(["l"] * len(codes)),
+            f"{_TRACT_GEO_ID},Tract," + ",".join(str(values[c]) for c in codes),
+        ),
+    )
+    inputs = mod._TractInputs(
+        income_files=[],
+        ethnicity_files=[],
+        language_files=[str(path)],
+        vehicle_files=[],
+        age_files=[],
+        commute_files=[],
+    )
+    result = mod._build_tract_df(inputs)
+    assert result["all_nwell"].iloc[0] == sum(values[c] for c in _C16001_LEP_CODES)
+
+
+def test_build_tract_df_lep_matches_real_fixture() -> None:
+    raw = mod._read_csv_any(_c16001_fixture(), skiprows=[1])
+    expected = raw[_C16001_LEP_CODES].apply(pd.to_numeric, errors="coerce").fillna(0).sum().sum()
+    inputs = mod._TractInputs(
+        income_files=[],
+        ethnicity_files=[],
+        language_files=[str(_c16001_fixture())],
+        vehicle_files=[],
+        age_files=[],
+        commute_files=[],
+    )
+    assert mod._build_tract_df(inputs)["all_nwell"].sum() == pytest.approx(expected)
+
+
 def test_derive_vehicle_computes_low_vehicle_metrics() -> None:
     df = pd.DataFrame(
         {
@@ -561,11 +669,34 @@ def test_derive_commute_reconstructs_counts_and_drops_mean() -> None:
     result = mod._derive_commute(df)
     assert result["commute_transit"].iloc[0] == pytest.approx(50.0)
     assert result["commute_drove"].iloc[0] == pytest.approx(800.0)
-    assert result["commute_person_min"].iloc[0] == pytest.approx(22_500.0)
+    # The Census mean excludes the 40 home workers: 960 commuters x 22.5 min.
+    assert result["commute_timed"].iloc[0] == pytest.approx(960.0)
+    assert result["commute_person_min"].iloc[0] == pytest.approx(21_600.0)
     # Non-additive mean is dropped from this block-bound path (recoverable as
-    # commute_person_min / commute_workers); the percentages ride along.
+    # commute_person_min / commute_timed); the percentages ride along.
     assert "mean_travel_time" not in result.columns
     assert "perc_transit" in result.columns
+
+
+def test_derive_commute_suppressed_mean_leaves_numerator_and_denominator() -> None:
+    # Tract B's mean is suppressed: it must drop out of the minutes AND their
+    # denominator, so the pooled mean still equals tract A's published 20 minutes.
+    df = pd.DataFrame(
+        {
+            "GEO_ID": [_TRACT_GEO_ID, "1400000US11001000200"],
+            "commute_workers": [1000, 500],
+            "perc_drove_alone": [80.0, 80.0],
+            "perc_carpool": [10.0, 10.0],
+            "perc_transit": [5.0, 5.0],
+            "perc_wfh": [10.0, 20.0],
+            "mean_travel_time": ["20.0", "(X)"],
+        }
+    )
+    result = mod._derive_commute(df)
+    assert result["commute_timed"].tolist() == pytest.approx([900.0, 0.0])
+    assert result["commute_person_min"].tolist() == pytest.approx([18_000.0, 0.0])
+    pooled = result["commute_person_min"].sum() / result["commute_timed"].sum()
+    assert pooled == pytest.approx(20.0)
 
 
 def test_derive_age_computes_youth_and_elderly() -> None:
@@ -920,6 +1051,166 @@ def test_attach_demographics_uses_pop20_and_disaggregates() -> None:
     assert result["total_hh"].tolist() == [0.0, 40.0, 120.0]
     assert result["minority"].tolist() == pytest.approx([0.0, 10.0, 30.0])  # 40 split by POP20
     assert result["low_income"].tolist() == pytest.approx([0.0, 4.0, 12.0])  # 16 split by HOUSING20
+
+
+def _three_blocks(housing_units: list[int], population: list[int]) -> gpd.GeoDataFrame:
+    return gpd.GeoDataFrame(
+        {
+            "GEOID20": ["110010001001001", "110010001001002", "110010001001003"],
+            "POP20": population,
+            "HOUSING20": housing_units,
+            "geometry": [Point(0, 0), Point(1, 1), Point(2, 2)],
+        },
+        crs="EPSG:4326",
+    )
+
+
+def test_build_block_households_keeps_block_rows(tmp_path: Path) -> None:
+    path = tmp_path / "DECENNIALDHC2020.H9-Data.csv"
+    _write_plain_csv(
+        path,
+        _census_csv(
+            "GEO_ID,NAME,H9_001N",
+            "Geography,Geographic Area Name,!!Total:",
+            "1000000US110010001001001,Block 1001,30",
+            "1000000US240310001001001,Block 1001 (MD),12",
+            f"{_TRACT_GEO_ID},Tract 1,500",
+        ),
+    )
+    out = mod.build_block_households([str(path)], county_fips_filter=["11001"])
+    assert out["block_fips"].tolist() == ["110010001001001"]
+    assert out["households"].tolist() == [30]
+
+
+def test_attach_demographics_uses_h9_households_over_housing_units(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # H9 covers two of three blocks: those take households (occupied units); the third
+    # falls back to HOUSING20 with a warning. Household counts split by total_hh.
+    blocks = _three_blocks(housing_units=[40, 120, 10], population=[100, 300, 20])
+    households = pd.DataFrame(
+        {"block_fips": ["110010001001001", "110010001001002"], "households": [30, 90]}
+    )
+    tract_attrs = pd.DataFrame({"tract_fips": ["11001000100"], "low_income": [26.0]})
+    with caplog.at_level(logging.WARNING):
+        result = mod.attach_demographics_to_blocks(
+            blocks, tract_attrs, None, block_households=households
+        ).sort_values("GEOID20")
+    assert result["total_hh"].tolist() == [30.0, 90.0, 10.0]
+    assert result["low_income"].tolist() == pytest.approx([6.0, 18.0, 2.0])
+    assert "1 of 3 block(s) have no H9 household count" in caplog.text
+
+
+def test_attach_demographics_warns_on_housing_unit_proxy(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    blocks = _three_blocks(housing_units=[40, 120, 0], population=[100, 300, 0])
+    with caplog.at_level(logging.WARNING):
+        result = mod.attach_demographics_to_blocks(blocks, pd.DataFrame(), None)
+    assert sorted(result["total_hh"]) == [0.0, 40.0, 120.0]
+    assert "vacant ones included" in caplog.text
+
+
+def test_attach_demographics_full_tract_recovers_acs_total() -> None:
+    # Review example: 400 low-income households of 1,000 ACS households, but 800
+    # households in the 2020 block counts. Count allocation keeps the ACS figure.
+    blocks = _three_blocks(housing_units=[250, 350, 300], population=[500, 700, 600])
+    households = pd.DataFrame(
+        {
+            "block_fips": ["110010001001001", "110010001001002", "110010001001003"],
+            "households": [200, 300, 300],
+        }
+    )
+    tract_attrs = pd.DataFrame({"tract_fips": ["11001000100"], "low_income": [400.0]})
+    result = mod.attach_demographics_to_blocks(
+        blocks, tract_attrs, None, block_households=households
+    )
+    assert result["low_income"].sum() == pytest.approx(400.0)
+
+
+def test_attach_demographics_splits_every_tract_count() -> None:
+    # Component counts (race groups, income bands) are split too, by the universe of
+    # their table: people by population, households by households.
+    blocks = _three_blocks(housing_units=[40, 120, 0], population=[100, 300, 0])
+    tract_attrs = pd.DataFrame(
+        {"tract_fips": ["11001000100"], "white": [80.0], "sub_10k": [16.0], "all_hhs": [160.0]}
+    )
+    result = mod.attach_demographics_to_blocks(blocks, tract_attrs, None).sort_values("POP20")
+    assert result["white"].tolist() == pytest.approx([0.0, 20.0, 60.0])
+    assert result["sub_10k"].tolist() == pytest.approx([0.0, 4.0, 12.0])
+    assert result["all_hhs"].sum() == pytest.approx(160.0)
+
+
+def test_build_joined_table_splits_household_counts_by_population_without_h9(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Legacy block-level path with no H9 table: household counts cannot be split by
+    # households, so they are split by population (warned) instead of being repeated.
+    pop_path = tmp_path / "P1-Data.csv"
+    _write_plain_csv(
+        pop_path,
+        _census_csv(
+            "GEO_ID,NAME,P1_001N",
+            "Geo,Name,!!Total:",
+            "1000000US110010001001001,Block,100",
+            "1000000US110010001001002,Block,300",
+        ),
+    )
+    bands = ",".join(f"B19001_{n:03d}E" for n in range(1, 12))
+    income_path = tmp_path / "B19001-Data.csv"
+    _write_plain_csv(
+        income_path,
+        _census_csv(
+            f"GEO_ID,NAME,{bands}",
+            "Geo,Name," + ",".join(["l"] * 11),
+            f"{_TRACT_GEO_ID},Tract," + ",".join(["4"] * 11),
+        ),
+    )
+    with caplog.at_level(logging.WARNING):
+        df = mod.build_joined_table(
+            pop_files=[str(pop_path)],
+            hh_files=[],
+            jobs_files=[],
+            income_files=[str(income_path)],
+        ).sort_values("total_pop")
+    assert df["low_income"].tolist() == pytest.approx([10.0, 30.0])  # 40 split 1:3
+    assert df["sub_10k"].sum() == pytest.approx(4.0)
+    assert "split across blocks by population" in caplog.text
+
+
+def test_run_takes_households_from_block_h9(tmp_path: Path) -> None:
+    csv_dir = tmp_path / "census"
+    csv_dir.mkdir()
+    shp_dir = tmp_path / "tiger"
+    shp_dir.mkdir()
+    shutil.copy(FIXTURE_DIR / FIXTURE_ZIPS[0], shp_dir / FIXTURE_ZIPS[0])
+    # Two of the DC fixture blocks, with fewer households than housing units.
+    _write_plain_csv(
+        csv_dir / "DECENNIALDHC2020.H9-Data.csv",
+        _census_csv(
+            "GEO_ID,NAME,H9_001N",
+            "Geography,Geographic Area Name,!!Total:",
+            "1000000US110010022021001,Block A,200",
+            "1000000US110010076032005,Block B,120",
+        ),
+    )
+    out = tmp_path / "out" / "blocks.gpkg"
+    assert (
+        mod.run(
+            input_csv_dir=str(csv_dir),
+            input_shp_dir=str(shp_dir),
+            final_joined_features=str(out),
+            tiger_input_glob="tl_*_*_*.shp",  # the fixture archives carry a _sample suffix
+            fips_to_filter=["11001"],
+            intermediate_combined_csv="",
+            intermediate_merged_shp="",
+        )
+        == 0
+    )
+    result = gpd.read_file(out).set_index("GEOID20")
+    assert result.loc["110010022021001", "total_hh"] == 200  # H9, not HOUSING20 (233)
+    assert result.loc["110010076032005", "total_hh"] == 120  # H9, not HOUSING20 (125)
+    assert result.loc["110010049013000", "total_hh"] == 46  # no H9 row: HOUSING20
 
 
 def test_attach_demographics_joins_block_jobs_and_fills_unmatched() -> None:

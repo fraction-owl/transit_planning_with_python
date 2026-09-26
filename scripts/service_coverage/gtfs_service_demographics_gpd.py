@@ -12,8 +12,9 @@ independent choices:
       optional wider drive-access buffer for express origin (park-and-ride) stops.
     - ``"route_buffer"``: a fixed-radius buffer around the route-line geometry
       taken from GTFS ``shapes.txt``.
-    - ``"isochrone"``: a walk-time isochrone (walkshed) around each stop,
-      traced over a pedestrian centerline network.
+    - ``"isochrone"``: a walk-time isochrone (walkshed) around each stop: the
+      pedestrian-network segments reachable within the walk-time budget,
+      buffered by ``ISOCHRONE_EDGE_BUFFER_FT``.
 
 In ``"route"`` mode each route is labeled by ``service_type``
 (``"express"``/``"local"``) and ``express_direction``
@@ -26,9 +27,19 @@ origin employment and destination population — which can be zeroed
 independently; bidirectional routes keep both ends. See the express settings in
 the CONFIGURATION block.
 
+Trips are limited to the service day(s) in ``SERVICE_IDS_TO_INCLUDE`` (GTFS
+``service_id``; default ``"4"``). Each run logs ``calendar.txt`` in full so the
+right id can be checked or picked, warns while the default is unchanged, and
+stops with exit code 2 if a listed service_id has no trips in the feed.
+
 Intended for use in Jupyter notebooks with appropriate EPSG settings. The
-projected CRS (``CRS_EPSG_CODE``) is assumed to use **metres** as its linear
-unit, matching the miles-to-metres conversions used throughout.
+projected CRS (``CRS_EPSG_CODE``, default NAD83 / Maryland in US survey feet)
+may use any linear unit: buffer distances (miles), walk speed, isochrone
+settings (feet), and acreage are converted with the CRS's own unit. A CRS that
+is not projected is rejected at startup, and one that distorts distances by
+more than 2% at the feed's location (e.g. World Mercator away from the equator)
+triggers a warning. Stops, route shapes, and demographics are all built in that
+one CRS.
 
 Typical inputs:
     - GTFS folder containing: trips.txt, stop_times.txt, routes.txt,
@@ -50,6 +61,7 @@ Typical usage:
 """
 
 import argparse
+import heapq
 import logging
 import os
 import sys
@@ -61,11 +73,11 @@ from typing import Any, Final, List, Optional, Tuple
 import geopandas as gpd
 import matplotlib.pyplot as plt
 import networkx as nx
-import numpy as np
 import pandas as pd
-from scipy.spatial import cKDTree
+from pyproj import CRS, Proj
+from shapely import STRtree
 from shapely.geometry import LineString, Point
-from shapely.ops import unary_union
+from shapely.ops import substring, unary_union
 
 # =============================================================================
 # CONFIGURATION
@@ -81,8 +93,9 @@ ANALYSIS_MODE = "network"  # Options: "network", "route", "stop"
 #   "route_buffer" → fixed-radius buffer around the route-line geometry from
 #                    shapes.txt (uses BUFFER_DISTANCE). Falls back to
 #                    "stop_buffer" when route geometry is unavailable.
-#   "isochrone"    → walk-time isochrone around each stop traced over the
-#                    pedestrian network (uses the ISOCHRONE_* settings below).
+#   "isochrone"    → walk-time isochrone around each stop: the pedestrian-network
+#                    segments reachable in the time budget, buffered (uses the
+#                    ISOCHRONE_* settings below).
 SERVICE_AREA_METHOD = "stop_buffer"  # Options: "stop_buffer", "route_buffer", "isochrone"
 
 # Paths
@@ -95,10 +108,13 @@ OUTPUT_DIRECTORY = r"Path\To\Output"
 # intersections) for best results.
 PEDESTRIAN_NETWORK_PATH = r"Path\To\centerlines.shp"
 
-# Calendar / service-pattern filter. Leave empty to auto-select the full Monday–Friday
-# service(s) straight from calendar.txt (recommended — robust to feed-specific service_id
-# values); set explicit ids (e.g. ["2"]) to force a particular service pattern.
-SERVICE_IDS_TO_INCLUDE: Final[list[str]] = []
+# Service day(s) to analyze, by GTFS service_id. The default "4" is the typical weekday
+# service_id in the source agency's GTFS; other feeds use other ids. Each run logs
+# calendar.txt so you can check or pick, warns while this is still the default, and
+# stops (exit code 2) if a listed service_id has no trips. For Saturday or Sunday,
+# rerun with that day's service_id(s) and another OUTPUT_DIRECTORY (output file names
+# are fixed). Set [] to use every trip (all days combined).
+SERVICE_IDS_TO_INCLUDE: Final[list[str]] = ["4"]
 
 # Route filters:
 # 1) ROUTES_TO_INCLUDE: If non-empty, only these routes are considered.
@@ -224,6 +240,14 @@ EXPRESS_EMPLOYMENT_FIELDS: list[str] = ["tot_empl", "low_wage", "mid_wage", "hig
 # Isochrone settings (only used when SERVICE_AREA_METHOD == "isochrone")
 ISOCHRONE_WALK_TIME_MIN = 10.0  # Walk-time budget in minutes
 WALK_SPEED_MPH = 3.0  # Assumed pedestrian walking speed
+# The walkshed is the pedestrian-network segments reachable within the walk-time
+# budget, buffered by ISOCHRONE_EDGE_BUFFER_FT feet to take in the land fronting
+# them (roughly a lot depth). Larger values widen the walkshed along every street.
+ISOCHRONE_EDGE_BUFFER_FT = 150.0
+# Farthest (feet) a stop may sit from the pedestrian network. A stop with no
+# network segment this close is skipped with a warning rather than snapped across
+# a gap; the straight-line walk onto the network is charged against the budget.
+ISOCHRONE_MAX_SNAP_FT = 300.0
 
 # Optional FIPS filter (list of codes). Empty list = no filter.
 FIPS_FILTER: list[str] = []  # Replace with FIPS code(s) for desired jurisdictions (e.g. "11001")
@@ -250,17 +274,21 @@ SYNTHETIC_FIELDS = [
     "elderly",  # residents age 65+
     # Commuting (ACS S0801) worker counts, disaggregated to blocks by
     # uscensus_tiger_join_gpd. All additive, so they area-weight cleanly. A catchment
-    # transit share is cmt_trnst / cmt_wrkrs; mean travel time is cmt_pmin / cmt_wrkrs.
+    # transit share is cmt_trnst / cmt_wrkrs; mean travel time is cmt_pmin / cmt_timed
+    # (the Census mean excludes people who work from home).
     "cmt_wrkrs",  # workers 16+
     "cmt_trnst",  # commute by public transit
     "cmt_drove",  # drove alone
     "cmt_carpl",  # carpooled
     "cmt_wfh",  # worked from home
-    "cmt_pmin",  # worker-minutes (mean travel time = cmt_pmin / cmt_wrkrs)
+    "cmt_pmin",  # commuter-minutes, excluding work-from-home
+    "cmt_timed",  # commuters behind cmt_pmin (mean travel time = cmt_pmin / cmt_timed)
 ]
 
-# EPSG code for projected coordinate system used in area calculations
-CRS_EPSG_CODE = 3395  # Replace with EPSG for your study area
+# EPSG code of the projected CRS used for buffers and areas. Any linear unit works:
+# distances are converted with the CRS's own unit. Default: NAD83 / Maryland (ftUS),
+# the state plane zone Washington, DC uses. Replace with one for your study area.
+CRS_EPSG_CODE = 2248
 
 # GTFS files always required
 REQUIRED_GTFS_FILES = [
@@ -275,30 +303,204 @@ REQUIRED_GTFS_FILES = [
 # Loaded opportunistically; if absent the method falls back to "stop_buffer".
 ROUTE_GEOMETRY_GTFS_FILE = "shapes.txt"
 
-# Conversion factor: metres per mile (the projected CRS is assumed metric).
+# Conversion factors to metres; each CRS's own unit is then derived from pyproj.
 METERS_PER_MILE: Final[float] = 1609.34
+METERS_PER_FOOT: Final[float] = 0.3048
+SQ_METERS_PER_ACRE: Final[float] = 4046.86
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
+
+# Shipped default for SERVICE_IDS_TO_INCLUDE, so an unedited value can be flagged.
+_DEFAULT_SERVICE_IDS: Final[list[str]] = ["4"]
 
 # =============================================================================
 # FUNCTIONS
 # =============================================================================
 
+# -----------------------------------------------------------------------------
+# CRS CHECKS
+# -----------------------------------------------------------------------------
 
-def filter_weekday_service(calendar_df: pd.DataFrame) -> pd.Series:
-    """Return service_ids that run every weekday (Monday through Friday).
+# Largest ground-to-map distance scale error tolerated before warning (0.02 = 2%).
+# World Mercator (EPSG:3395) stretches distances by ~28% at 39°N, so a "0.25-mile"
+# buffer there spans only ~0.19 miles on the ground.
+MAX_CRS_SCALE_ERROR: Final[float] = 0.02
 
-    calendar.txt is frequently loaded with every column as a string, so the day flags
-    are coerced to numeric before the ``== 1`` comparison; a service must run on all
-    five weekdays to qualify.
 
-    :param calendar_df: DataFrame from calendar.txt.
-    :return: Series of service_id values available on all weekdays.
+def validate_projected_crs(crs_epsg_code: int) -> CRS:
+    """Return the CRS for *crs_epsg_code*, rejecting any that is not projected.
+
+    Buffer radii, the isochrone walk distance, and acreage are converted with the
+    CRS's own linear unit (see :func:`crs_metres_per_unit`), so feet and metres both
+    work; a geographic CRS (degrees) cannot be used for either.
+
+    Args:
+        crs_epsg_code: EPSG code of the analysis CRS.
+
+    Returns:
+        The parsed :class:`pyproj.CRS`.
+
+    Raises:
+        ValueError: If the CRS is not projected or has no linear axis unit.
     """
-    days = ["monday", "tuesday", "wednesday", "thursday", "friday"]
-    flags = calendar_df[days].apply(pd.to_numeric, errors="coerce").fillna(0)
-    weekday_filter = (flags == 1).all(axis=1)
-    return calendar_df.loc[weekday_filter, "service_id"]
+    crs = CRS.from_epsg(crs_epsg_code)
+    if not crs.is_projected or not crs.axis_info:
+        raise ValueError(
+            f"CRS_EPSG_CODE EPSG:{crs_epsg_code} ({crs.name}) is not a projected CRS; "
+            "buffers and areas need one (e.g. a state plane zone or a UTM zone)."
+        )
+    logging.info(
+        "Analysis CRS: EPSG:%s (%s), linear unit '%s'.",
+        crs_epsg_code,
+        crs.name,
+        crs.axis_info[0].unit_name,
+    )
+    return crs
+
+
+def crs_metres_per_unit(crs: Any) -> float:
+    """Return metres per linear unit of *crs* (1.0 for metres, ~0.3048 for feet).
+
+    A missing CRS (``None``) is treated as metres, the historical assumption.
+
+    Raises:
+        ValueError: If *crs* is set but is not a projected CRS.
+    """
+    if crs is None:
+        return 1.0
+    parsed = CRS.from_user_input(crs)
+    if not parsed.is_projected or not parsed.axis_info:
+        raise ValueError(f"{parsed.name} is not a projected CRS; distances need one.")
+    return float(parsed.axis_info[0].unit_conversion_factor)
+
+
+def crs_units_per_mile(crs: Any) -> float:
+    """Return how many linear units of *crs* make one mile."""
+    return METERS_PER_MILE / crs_metres_per_unit(crs)
+
+
+def crs_acres_per_square_unit(crs: Any) -> float:
+    """Return the acreage of one square linear unit of *crs*."""
+    return crs_metres_per_unit(crs) ** 2 / SQ_METERS_PER_ACRE
+
+
+def warn_if_distorted_crs(
+    crs: CRS, lon: float, lat: float, *, tolerance: float = MAX_CRS_SCALE_ERROR
+) -> float:
+    """Warn when *crs* noticeably distorts distances at (*lon*, *lat*).
+
+    Args:
+        crs: Analysis CRS (projected).
+        lon: Longitude (WGS 84) of a representative study-area point.
+        lat: Latitude (WGS 84) of the same point.
+        tolerance: Largest relative scale error accepted silently.
+
+    Returns:
+        The worst relative scale error of *crs* at that point (0.0 = true scale).
+    """
+    factors = Proj(crs).get_factors(lon, lat)
+    worst = max(abs(factors.tissot_semimajor - 1.0), abs(factors.tissot_semiminor - 1.0))
+    if worst > tolerance:
+        logging.warning(
+            "%s distorts distances by up to %.1f%% (areas by %.1f%%) at the study area "
+            "(lat %.3f, lon %.3f), so buffer radii and walk distances measured in it are off "
+            "by that much on the ground. Set CRS_EPSG_CODE / --crs-epsg to a local projected "
+            "CRS (e.g. a state plane zone or a UTM zone).",
+            crs.name,
+            worst * 100.0,
+            abs(factors.areal_scale - 1.0) * 100.0,
+            lat,
+            lon,
+        )
+    return worst
+
+
+# -----------------------------------------------------------------------------
+# SERVICE-DAY SELECTION
+#
+# Copied verbatim from utils/calendar_helpers.py (the canonical versions) so this
+# script stays self-contained. Keep the copies in sync when updating either.
+# -----------------------------------------------------------------------------
+
+
+class ServiceSelectionError(ValueError):
+    """A requested GTFS service_id is not used by any trip in the feed.
+
+    A configuration problem rather than a crash: callers report it without a
+    traceback and exit with code 2.
+    """
+
+
+def log_service_calendar(calendar_df: Optional[pd.DataFrame]) -> None:
+    """Log calendar.txt in full, so the user can see which service_id runs on which days.
+
+    calendar.txt is usually a handful of rows; printing it lets the user check or
+    pick the service_id(s) to analyze without opening the feed.
+
+    Args:
+        calendar_df: Parsed ``calendar.txt``, or ``None`` when the feed has none.
+    """
+    if calendar_df is None or calendar_df.empty:
+        logging.info("calendar.txt is absent or empty; see trips.txt for the feed's service_ids.")
+        return
+    logging.info(
+        "calendar.txt (%d service_id row(s)):\n%s",
+        len(calendar_df),
+        calendar_df.to_string(index=False),
+    )
+
+
+def select_trips_by_service(
+    trips_df: pd.DataFrame,
+    service_ids: Sequence[str],
+    *,
+    default_service_ids: Sequence[str] = (),
+) -> pd.DataFrame:
+    """Return the trips that run on *service_ids*; every trip when it is empty.
+
+    Warns when *service_ids* still equals *default_service_ids* (the calling
+    script's shipped default), so an unedited default is noticed, and warns that an
+    empty selection combines every service day.
+
+    Args:
+        trips_df: Parsed ``trips.txt`` (needs a ``service_id`` column).
+        service_ids: The service_id values to keep. Empty keeps every trip.
+        default_service_ids: The calling script's default, used only for the warning.
+
+    Returns:
+        The trips whose ``service_id`` is in *service_ids*.
+
+    Raises:
+        ServiceSelectionError: If a requested service_id is used by no trip. The
+            message lists the feed's service_ids with their trip counts.
+    """
+    wanted = [str(s).strip() for s in service_ids if str(s).strip()]
+    if not wanted:
+        logging.warning(
+            "No service_id selected: using every trip in the feed, all service days "
+            "combined. Set SERVICE_IDS_TO_INCLUDE to analyze a single service day."
+        )
+        return trips_df
+    defaults = [str(s).strip() for s in default_service_ids]
+    if defaults and wanted == defaults:
+        logging.warning(
+            "SERVICE_IDS_TO_INCLUDE is still the default %s. Check it against calendar.txt "
+            "and change it if this feed uses other service_ids or you want another day.",
+            wanted,
+        )
+    trip_service = trips_df["service_id"].astype(str).str.strip()
+    counts = trip_service.value_counts().sort_index()
+    missing = [s for s in wanted if s not in counts.index]
+    if missing:
+        available = ", ".join(f"{sid} ({n} trips)" for sid, n in counts.items())
+        raise ServiceSelectionError(
+            f"service_id(s) {missing} are not used by any trip in trips.txt. This feed's "
+            f"service_ids: {available}. Set SERVICE_IDS_TO_INCLUDE to the service day to "
+            "analyze (calendar.txt shows which days each service_id runs)."
+        )
+    kept = trips_df[trip_service.isin(wanted)]
+    logging.info("Service filter %s: trips %d -> %d.", wanted, len(trips_df), len(kept))
+    return kept
 
 
 def get_included_stops(
@@ -516,7 +718,7 @@ def build_route_shapes_gdf(
     shapes_df: Optional[pd.DataFrame],
     trips: pd.DataFrame,
     final_routes_df: pd.DataFrame,
-    crs_epsg_code: int,
+    crs: Any,
 ) -> gpd.GeoDataFrame:
     """Build dissolved route-line geometry, keyed by ``route_short_name``.
 
@@ -529,7 +731,8 @@ def build_route_shapes_gdf(
         trips: GTFS ``trips`` table (must include ``route_id`` and ``shape_id``).
         final_routes_df: Already-filtered routes (``route_id``,
             ``route_short_name``).
-        crs_epsg_code: EPSG code of the projected CRS to return geometry in.
+        crs: Projected CRS to return geometry in (EPSG code or CRS object) —
+            the analysis CRS, so route buffers line up with the demographics.
 
     Returns:
         A GeoDataFrame with columns ``route_short_name`` and ``geometry``.
@@ -537,7 +740,7 @@ def build_route_shapes_gdf(
     """
     empty = gpd.GeoDataFrame(
         {"route_short_name": pd.Series(dtype=str)},
-        geometry=gpd.GeoSeries([], crs=f"EPSG:{crs_epsg_code}"),
+        geometry=gpd.GeoSeries([], crs=crs),
     )
 
     needed = {"shape_id", "shape_pt_lat", "shape_pt_lon", "shape_pt_sequence"}
@@ -583,9 +786,7 @@ def build_route_shapes_gdf(
         logging.warning("No usable line geometry reconstructed from shapes.txt.")
         return empty
 
-    shapes_gdf = gpd.GeoDataFrame(lines, geometry="geometry", crs="EPSG:4326").to_crs(
-        epsg=crs_epsg_code
-    )
+    shapes_gdf = gpd.GeoDataFrame(lines, geometry="geometry", crs="EPSG:4326").to_crs(crs)
     shapes_gdf = shapes_gdf.merge(shape_to_route, on="shape_id", how="inner")
     if shapes_gdf.empty:
         logging.warning("No route shapes remain after joining shapes to routes.")
@@ -595,67 +796,174 @@ def build_route_shapes_gdf(
     return dissolved[["route_short_name", "geometry"]]
 
 
+def _edge_ends(graph: nx.MultiGraph, line: LineString, a: Any, b: Any) -> Tuple[Any, Any]:
+    """Return the (node at ``line``'s first vertex, node at its last) for edge a–b.
+
+    Graph edges are undirected, so the stored geometry may run either way between
+    its two nodes; the node nearer the first vertex is the start.
+    """
+    x0, y0 = line.coords[0]
+    dist_a = (graph.nodes[a]["x"] - x0) ** 2 + (graph.nodes[a]["y"] - y0) ** 2
+    dist_b = (graph.nodes[b]["x"] - x0) ** 2 + (graph.nodes[b]["y"] - y0) ** 2
+    return (a, b) if dist_a <= dist_b else (b, a)
+
+
+def _network_distances(
+    graph: nx.MultiGraph, seeds: Mapping[Any, float], budget: float
+) -> dict[Any, float]:
+    """Shortest walking distance (edge ``length``) to every node within *budget*.
+
+    Dijkstra from several seed nodes at once, each starting at its own distance —
+    the walk already spent reaching it from the stop — so the search begins at the
+    stop's snap point rather than at a whole node.
+    """
+    heap = [(d, i, node) for i, (node, d) in enumerate(seeds.items()) if d <= budget]
+    heapq.heapify(heap)
+    order = len(heap)
+    dist: dict[Any, float] = {}
+    while heap:
+        d, _, node = heapq.heappop(heap)
+        if node in dist:
+            continue
+        dist[node] = d
+        for nbr, keyed in graph[node].items():
+            if nbr in dist:
+                continue
+            step = min(float(data["length"]) for data in keyed.values())
+            if d + step <= budget:
+                order += 1
+                heapq.heappush(heap, (d + step, order, nbr))
+    return dist
+
+
+def _reachable_segments(
+    graph: nx.MultiGraph, dist: Mapping[Any, float], budget: float
+) -> list[Any]:
+    """Return the parts of every edge walkable within *budget* from the reached nodes.
+
+    An edge is walked in from each reached end for whatever budget remains there,
+    so it contributes in full, as one or two partial pieces, or not at all.
+    """
+    pieces: list[Any] = []
+    seen: set[Any] = set()
+    for node in dist:
+        for nbr, keyed in graph[node].items():
+            for key, data in keyed.items():
+                edge_key = data.get("edge_id", (node, nbr, key))
+                if edge_key in seen:
+                    continue
+                seen.add(edge_key)
+                line = data["geometry"]
+                length = float(data["length"])
+                first, last = _edge_ends(graph, line, node, nbr)
+                reach_first = budget - dist[first] if first in dist else 0.0
+                reach_last = budget - dist[last] if last in dist else 0.0
+                if reach_first + reach_last >= length:
+                    pieces.append(line)
+                    continue
+                if reach_first > 0:
+                    pieces.append(substring(line, 0.0, reach_first))
+                if reach_last > 0:
+                    pieces.append(substring(line, length - reach_last, length))
+    return pieces
+
+
 def build_walk_isochrone(
     stop_points_gdf: gpd.GeoDataFrame,
     ped_graph: nx.MultiGraph,
     *,
     walk_time_min: float,
     walk_speed_units_per_s: float,
+    edge_buffer_ft: Optional[float] = None,
+    max_snap_ft: Optional[float] = None,
 ) -> Optional[gpd.GeoDataFrame]:
-    """Build a walk-time isochrone (walkshed) around the given stop points.
+    """Build a network walkshed (walk-time isochrone) around the given stop points.
 
-    Each stop is snapped to the nearest pedestrian-network node, and Dijkstra
-    expands outward up to ``walk_time_min`` minutes. Every reachable node is
-    buffered by the distance still walkable with its leftover time budget, and
-    the union of those buffers forms the walkshed. Stops without a reachable
-    node (e.g. an empty graph) are skipped.
+    The walkshed is made of the pedestrian-network segments reachable within the
+    budget, so it cannot cross a barrier or reach a disconnected street:
+
+    1. Each stop snaps to the nearest network segment within *max_snap_ft*;
+       stops farther than that from any segment are skipped with a warning. The
+       straight-line walk onto the network is charged against the budget.
+    2. Dijkstra runs over segment lengths from the snap point, out to the budget
+       distance ``walk_time_min * 60 * walk_speed_units_per_s``.
+    3. Every segment is kept in full when walkable end to end, or cut to the
+       portion walkable from each reached end with the budget left there.
+    4. The kept segments (plus each stop's access walk) are buffered by
+       *edge_buffer_ft* to take in the land fronting them, and dissolved.
 
     Args:
         stop_points_gdf: Stop *point* geometry in the projected CRS.
         ped_graph: Walking graph from :func:`build_pedestrian_time_network`
-            (edges weighted by ``time_s``; nodes carry ``x``/``y``).
+            (edges carry ``geometry`` and ``length``; nodes carry ``x``/``y``).
         walk_time_min: Walk-time budget in minutes.
-        walk_speed_units_per_s: Walking speed in projected-CRS units per second
-            (must match the speed used to build ``ped_graph``).
+        walk_speed_units_per_s: Walking speed in projected-CRS units per second.
+        edge_buffer_ft: Buffer around reachable segments, in feet. ``None`` uses
+            ``ISOCHRONE_EDGE_BUFFER_FT``.
+        max_snap_ft: Farthest a stop may sit from the network, in feet. ``None``
+            uses ``ISOCHRONE_MAX_SNAP_FT``.
 
     Returns:
         A single-row GeoDataFrame holding the dissolved walkshed polygon, or
         ``None`` if nothing was reachable.
     """
-    if ped_graph.number_of_nodes() == 0:
+    units_per_ft = METERS_PER_FOOT / crs_metres_per_unit(stop_points_gdf.crs)
+    edge_buffer = units_per_ft * (
+        ISOCHRONE_EDGE_BUFFER_FT if edge_buffer_ft is None else edge_buffer_ft
+    )
+    max_snap_distance = units_per_ft * (
+        ISOCHRONE_MAX_SNAP_FT if max_snap_ft is None else max_snap_ft
+    )
+    if ped_graph.number_of_edges() == 0:
         logging.warning("Pedestrian network is empty; cannot build an isochrone.")
         return None
 
-    cutoff_s = walk_time_min * 60.0
-    node_keys = list(ped_graph.nodes)
-    node_xy = np.array([(ped_graph.nodes[n]["x"], ped_graph.nodes[n]["y"]) for n in node_keys])
-    tree = cKDTree(node_xy)
+    budget = walk_time_min * 60.0 * walk_speed_units_per_s
+    edges = list(ped_graph.edges(data=True))
+    tree = STRtree([data["geometry"] for _, _, data in edges])
 
-    polygons: list[Any] = []
+    pieces: list[Any] = []
+    unsnapped = 0
     for geom in stop_points_gdf.geometry:
         if geom is None or geom.is_empty:
             continue
-        _, idx = tree.query((geom.x, geom.y))
-        source = node_keys[int(idx)]
-
-        # Reachable nodes (and their walk time) within the budget.
-        lengths = nx.single_source_dijkstra_path_length(
-            ped_graph, source, cutoff=cutoff_s, weight="time_s"
+        hits, gaps = tree.query_nearest(geom, max_distance=max_snap_distance, return_distance=True)
+        if len(hits) == 0:
+            unsnapped += 1
+            continue
+        access = float(gaps[0])
+        remaining = budget - access
+        if remaining <= 0:
+            continue
+        a, b, data = edges[int(hits[0])]
+        line = data["geometry"]
+        length = float(data["length"])
+        along = line.project(geom)
+        if access > 0:
+            pieces.append(LineString([geom, line.interpolate(along)]))
+        lo, hi = max(0.0, along - remaining), min(length, along + remaining)
+        if hi > lo:
+            pieces.append(substring(line, lo, hi))
+        first, last = _edge_ends(ped_graph, line, a, b)
+        dist = _network_distances(
+            ped_graph, {first: access + along, last: access + (length - along)}, budget
         )
-        for node, time_s in lengths.items():
-            residual_units = (cutoff_s - time_s) * walk_speed_units_per_s
-            if residual_units <= 0:
-                continue
-            node_x = ped_graph.nodes[node]["x"]
-            node_y = ped_graph.nodes[node]["y"]
-            polygons.append(Point(node_x, node_y).buffer(residual_units))
+        pieces.extend(_reachable_segments(ped_graph, dist, budget))
 
-    if not polygons:
-        logging.warning("No pedestrian-network nodes were reachable from the stops.")
+    if unsnapped:
+        logging.warning(
+            "%d stop(s) are more than %.0f ft from the pedestrian network and were left "
+            "out of the isochrone (raise ISOCHRONE_MAX_SNAP_FT if the network is offset "
+            "from the stops).",
+            unsnapped,
+            max_snap_distance / units_per_ft,
+        )
+    if not pieces:
+        logging.warning("No pedestrian-network segments were reachable from the stops.")
         return None
 
-    iso = unary_union(polygons)
-    return gpd.GeoDataFrame(geometry=[iso], crs=stop_points_gdf.crs)
+    walkshed = unary_union(pieces).buffer(edge_buffer)
+    return gpd.GeoDataFrame(geometry=[walkshed], crs=stop_points_gdf.crs)
 
 
 def build_service_area_polygon(
@@ -669,6 +977,8 @@ def build_service_area_polygon(
     ped_graph: Optional[nx.MultiGraph] = None,
     walk_time_min: float = 0.0,
     walk_speed_units_per_s: float = 0.0,
+    isochrone_edge_buffer_ft: Optional[float] = None,
+    isochrone_max_snap_ft: Optional[float] = None,
 ) -> Optional[gpd.GeoDataFrame]:
     """Build a single dissolved service-area polygon for a set of stops.
 
@@ -690,6 +1000,10 @@ def build_service_area_polygon(
         ped_graph: Pedestrian graph for the ``"isochrone"`` method.
         walk_time_min: Walk-time budget (minutes) for the ``"isochrone"`` method.
         walk_speed_units_per_s: Walking speed (CRS units/s) for the isochrone.
+        isochrone_edge_buffer_ft: Buffer around reachable network segments (ft);
+            ``None`` uses ``ISOCHRONE_EDGE_BUFFER_FT``.
+        isochrone_max_snap_ft: Farthest a stop may sit from the network (ft);
+            ``None`` uses ``ISOCHRONE_MAX_SNAP_FT``.
 
     Returns:
         A single-row GeoDataFrame with the dissolved service area, or ``None``
@@ -707,6 +1021,8 @@ def build_service_area_polygon(
                 ped_graph,
                 walk_time_min=walk_time_min,
                 walk_speed_units_per_s=walk_speed_units_per_s,
+                edge_buffer_ft=isochrone_edge_buffer_ft,
+                max_snap_ft=isochrone_max_snap_ft,
             )
 
     if method == "route_buffer":
@@ -716,14 +1032,17 @@ def build_service_area_polygon(
                 "falling back to stop buffers."
             )
         else:
-            buffered = route_shapes_gdf.geometry.buffer(buffer_distance_mi * METERS_PER_MILE)
+            buffered = route_shapes_gdf.geometry.buffer(
+                buffer_distance_mi * crs_units_per_mile(route_shapes_gdf.crs)
+            )
             area = unary_union(list(buffered.values))
             return gpd.GeoDataFrame(geometry=[area], crs=stop_points_gdf.crs)
 
     # Default / fallback: per-stop buffers, dissolved into one polygon.
     if stop_points_gdf.empty:
         return None
-    buffer_m = stop_points_gdf["stop_id"].map(
+    units_per_mile = crs_units_per_mile(stop_points_gdf.crs)
+    buffer_units = stop_points_gdf["stop_id"].map(
         lambda sid: (
             pick_buffer_distance(
                 sid,
@@ -731,10 +1050,10 @@ def build_service_area_polygon(
                 large_buffer=large_buffer_distance_mi,
                 large_buffer_ids=stop_ids_large_buffer,
             )
-            * METERS_PER_MILE
+            * units_per_mile
         )
     )
-    buffered = stop_points_gdf.geometry.buffer(buffer_m)
+    buffered = stop_points_gdf.geometry.buffer(buffer_units)
     area = unary_union(list(buffered.values))
     return gpd.GeoDataFrame(geometry=[area], crs=stop_points_gdf.crs)
 
@@ -758,8 +1077,9 @@ def clip_and_calculate_synthetic_fields(
     # ---------------------------------------------------------------
     # 1. Original area (acres) — if not already present
     # ---------------------------------------------------------------
+    acres_per_sq_unit = crs_acres_per_square_unit(demographics_gdf.crs)
     if "area_ac_og" not in demographics_gdf.columns:
-        demographics_gdf["area_ac_og"] = demographics_gdf.geometry.area / 4046.86
+        demographics_gdf["area_ac_og"] = demographics_gdf.geometry.area * acres_per_sq_unit
 
     # ---------------------------------------------------------------
     # 2. Clip to buffer
@@ -769,7 +1089,7 @@ def clip_and_calculate_synthetic_fields(
     # ---------------------------------------------------------------
     # 3. Clipped area + percentage
     # ---------------------------------------------------------------
-    clipped_gdf["area_ac_cl"] = clipped_gdf.geometry.area / 4046.86
+    clipped_gdf["area_ac_cl"] = clipped_gdf.geometry.area * acres_per_sq_unit
     clipped_gdf["area_perc"] = clipped_gdf["area_ac_cl"] / clipped_gdf["area_ac_og"]
 
     # Handle divide-by-zero and NaN without chained-assignment warnings
@@ -821,6 +1141,20 @@ def export_summary_to_excel(totals_dict: dict, output_path: str) -> None:
     logging.info("Exported Excel summary: %s", output_path)
 
 
+def _analysis_crs(demographics_gdf: gpd.GeoDataFrame) -> Any:
+    """Return the CRS every analysis geometry is built in: the demographics layer's.
+
+    ``run()`` projects the demographics into the validated ``crs_epsg_code`` before
+    any analysis, so taking stops and route shapes from that one layer keeps every
+    geometry in a single coordinate system even when the CRS is overridden via
+    ``run(crs_epsg_code=...)`` or ``--crs-epsg``. A layer without a CRS falls back
+    to ``CRS_EPSG_CODE``.
+    """
+    if demographics_gdf.crs is not None:
+        return demographics_gdf.crs
+    return f"EPSG:{CRS_EPSG_CODE}"
+
+
 def _stops_to_points_gdf(
     trips: pd.DataFrame,
     stop_times: pd.DataFrame,
@@ -828,6 +1162,7 @@ def _stops_to_points_gdf(
     final_routes_df: pd.DataFrame,
     stop_ids_to_include: list[str],
     stop_ids_to_exclude: list[str],
+    crs: Any = None,
 ) -> Optional[gpd.GeoDataFrame]:
     """Merge GTFS tables and return filtered stop *points* in the projected CRS.
 
@@ -839,6 +1174,10 @@ def _stops_to_points_gdf(
             ``route_short_name``).
         stop_ids_to_include: Stop IDs to include (empty = no include filter).
         stop_ids_to_exclude: Stop IDs to exclude (empty = no exclude filter).
+        crs: Projected CRS to return the points in (EPSG code or CRS object).
+            Pass the analysis CRS — the demographics layer's — so stops, buffers,
+            and demographics share one coordinate system. ``None`` falls back to
+            ``CRS_EPSG_CODE``.
 
     Returns:
         A GeoDataFrame of stop points with ``route_short_name`` and ``stop_id``
@@ -856,9 +1195,8 @@ def _stops_to_points_gdf(
         lambda row: Point(float(row["stop_lon"]), float(row["stop_lat"])),
         axis=1,
     )
-    return gpd.GeoDataFrame(final_stops_df, geometry="geometry", crs="EPSG:4326").to_crs(
-        epsg=CRS_EPSG_CODE
-    )
+    target_crs = f"EPSG:{CRS_EPSG_CODE}" if crs is None else crs
+    return gpd.GeoDataFrame(final_stops_df, geometry="geometry", crs="EPSG:4326").to_crs(target_crs)
 
 
 def flag_express_origin_candidates(stop_jobs: pd.DataFrame, threshold: float) -> pd.DataFrame:
@@ -950,7 +1288,9 @@ def suggest_express_origin_stops(
         logging.info("Express-origin advisory: no express route_id matched routes.txt; skipping.")
         return None
 
-    stops_gdf = _stops_to_points_gdf(trips, stop_times, stops_df, express_routes_df, [], [])
+    stops_gdf = _stops_to_points_gdf(
+        trips, stop_times, stops_df, express_routes_df, [], [], crs=_analysis_crs(demographics_gdf)
+    )
     if stops_gdf is None or stops_gdf.empty:
         logging.info("Express-origin advisory: no stops on the express routes; skipping.")
         return None
@@ -1028,6 +1368,8 @@ def do_network_analysis(
     ped_graph: Optional[nx.MultiGraph] = None,
     walk_time_min: float = 0.0,
     walk_speed_units_per_s: float = 0.0,
+    isochrone_edge_buffer_ft: Optional[float] = None,
+    isochrone_max_snap_ft: Optional[float] = None,
     express_route_ids: Optional[set[str]] = None,
 ) -> None:
     """Run a single network-wide service-area/clip analysis.
@@ -1057,6 +1399,8 @@ def do_network_analysis(
         ped_graph: Pedestrian network (for the ``isochrone`` method).
         walk_time_min: Walk-time budget in minutes (isochrone method).
         walk_speed_units_per_s: Walking speed in CRS units/s (isochrone method).
+        isochrone_edge_buffer_ft: Buffer around reachable segments (isochrone method).
+        isochrone_max_snap_ft: Farthest stop-to-network snap (isochrone method).
         express_route_ids: Express ``route_id`` values. Accepted for a uniform
             dispatch signature but unused here — the ``service_type`` label is a
             per-route output, emitted only by ``do_route_by_route_analysis``.
@@ -1072,15 +1416,22 @@ def do_network_analysis(
         logging.info("No routes remain after route filters. Aborting network analysis.")
         return
 
+    crs = _analysis_crs(demographics_gdf)
     stops_gdf = _stops_to_points_gdf(
-        trips, stop_times, stops_df, final_routes_df, stop_ids_to_include, stop_ids_to_exclude
+        trips,
+        stop_times,
+        stops_df,
+        final_routes_df,
+        stop_ids_to_include,
+        stop_ids_to_exclude,
+        crs=crs,
     )
     if stops_gdf is None:
         logging.info("No stops remain after stop filters. Aborting network analysis.")
         return
     unique_stops_gdf = stops_gdf.drop_duplicates(subset="stop_id")
 
-    route_shapes_gdf = build_route_shapes_gdf(shapes_df, trips, final_routes_df, CRS_EPSG_CODE)
+    route_shapes_gdf = build_route_shapes_gdf(shapes_df, trips, final_routes_df, crs)
 
     service_area_gdf = build_service_area_polygon(
         unique_stops_gdf,
@@ -1092,6 +1443,8 @@ def do_network_analysis(
         ped_graph=ped_graph,
         walk_time_min=walk_time_min,
         walk_speed_units_per_s=walk_speed_units_per_s,
+        isochrone_edge_buffer_ft=isochrone_edge_buffer_ft,
+        isochrone_max_snap_ft=isochrone_max_snap_ft,
     )
     if service_area_gdf is None or service_area_gdf.empty:
         logging.info("Could not build a network service area. Aborting network analysis.")
@@ -1180,6 +1533,10 @@ def express_route_totals(
         catchment for the per-route shapefile; or ``(None, None)`` when a required
         catchment is empty (e.g. a unidirectional route with no origin stop or no
         non-origin stop), so the caller can fall back to symmetric accounting.
+        *combined_clip* covers population area ∪ employment area once per block;
+        each ``synthetic_<field>`` on it is weighted by the block's share inside
+        that field's own catchment (``aperc_pop`` / ``aperc_emp``), so summing the
+        exported layer reproduces *route_totals*.
     """
     sid = route_stops_gdf["stop_id"].astype(str)
     origin_ids = {str(s) for s in origin_stop_ids}
@@ -1227,45 +1584,47 @@ def express_route_totals(
     ):
         return None, None
 
-    pop_clip = clip_and_calculate_synthetic_fields(
-        demographics_gdf, population_area, synthetic_fields
-    )
-    empl_clip = clip_and_calculate_synthetic_fields(
-        demographics_gdf, employment_area, synthetic_fields
-    )
-
-    # Only emit fields that materialized, matching the symmetric path (a field
-    # missing from the layer is omitted, not zeroed).
-    present = {
-        col.replace("synthetic_", "")
-        for col in (
-            *_present_synthetic_cols(pop_clip, synthetic_fields),
-            *_present_synthetic_cols(empl_clip, synthetic_fields),
-        )
-    }
-    employment = set(employment_fields)
-
-    def _total(clipped: gpd.GeoDataFrame, field: str) -> float:
-        col = f"synthetic_{field}"
-        return float(clipped[col].sum()) if col in clipped.columns else 0.0
-
-    # Iterate synthetic_fields to preserve the symmetric path's column order;
-    # employment fields come from the walk catchment, the rest from population.
-    route_totals: dict[str, int] = {}
-    for field in synthetic_fields:
-        if field not in present:
-            continue
-        source = empl_clip if field in employment else pop_clip
-        route_totals[field] = int(round(_total(source, field)))
-
     # One dissolved catchment (population area ∪ employment area) for the
-    # per-route shapefile, so overlapping blocks are not written twice.
+    # per-route shapefile, so overlapping blocks are not written twice. Each
+    # synthetic field is then re-weighted by the share of its block inside the
+    # catchment that field is counted in — the walk (employment) area for job
+    # fields, the population area for everything else — so the exported layer and
+    # the route totals are the same numbers.
     combined_geom = unary_union(list(population_area.geometry) + list(employment_area.geometry))
     combined_area = gpd.GeoDataFrame(geometry=[combined_geom], crs=population_area.crs)
     combined_clip = clip_and_calculate_synthetic_fields(
         demographics_gdf, combined_area, synthetic_fields
     )
+    combined_clip["aperc_pop"] = _catchment_area_share(combined_clip, population_area)
+    combined_clip["aperc_emp"] = _catchment_area_share(combined_clip, employment_area)
+
+    # Iterate synthetic_fields to preserve the symmetric path's column order. Only
+    # fields that materialized are emitted, matching the symmetric path (a field
+    # missing from the layer is omitted, not zeroed).
+    employment = set(employment_fields)
+    route_totals: dict[str, int] = {}
+    for field in synthetic_fields:
+        col = f"synthetic_{field}"
+        if col not in combined_clip.columns:
+            continue
+        share = combined_clip["aperc_emp" if field in employment else "aperc_pop"]
+        numeric = pd.to_numeric(combined_clip[field], errors="coerce").fillna(0)
+        combined_clip[col] = share * numeric
+        route_totals[field] = int(round(float(combined_clip[col].sum())))
     return route_totals, combined_clip
+
+
+def _catchment_area_share(clipped: gpd.GeoDataFrame, catchment: gpd.GeoDataFrame) -> pd.Series:
+    """Share of each clipped block's ORIGINAL area (``area_ac_og``) inside *catchment*.
+
+    *clipped* rows are blocks already cut to a larger area containing *catchment*,
+    so intersecting each piece with *catchment* gives the block's full overlap with
+    it — the same ``area_perc`` a clip to *catchment* alone would produce.
+    """
+    geom = unary_union(list(catchment.geometry))
+    inside_ac = clipped.geometry.intersection(geom).area * crs_acres_per_square_unit(clipped.crs)
+    share = inside_ac / clipped["area_ac_og"]
+    return share.replace([float("inf"), -float("inf")], 0).fillna(0)
 
 
 def do_route_by_route_analysis(
@@ -1289,6 +1648,8 @@ def do_route_by_route_analysis(
     ped_graph: Optional[nx.MultiGraph] = None,
     walk_time_min: float = 0.0,
     walk_speed_units_per_s: float = 0.0,
+    isochrone_edge_buffer_ft: Optional[float] = None,
+    isochrone_max_snap_ft: Optional[float] = None,
     express_route_ids: Optional[set[str]] = None,
     unidirectional_route_ids: Optional[set[str]] = None,
     employment_fields: Optional[Sequence[str]] = None,
@@ -1330,15 +1691,22 @@ def do_route_by_route_analysis(
         logging.info("No routes remain after route filters. Aborting route-by-route analysis.")
         return
 
+    crs = _analysis_crs(demographics_gdf)
     stops_gdf = _stops_to_points_gdf(
-        trips, stop_times, stops_df, final_routes_df, stop_ids_to_include, stop_ids_to_exclude
+        trips,
+        stop_times,
+        stops_df,
+        final_routes_df,
+        stop_ids_to_include,
+        stop_ids_to_exclude,
+        crs=crs,
     )
     if stops_gdf is None:
         logging.info("No stops remain after stop filters. Aborting route-by-route analysis.")
         return
 
     # Route-line geometry (used only by the "route_buffer" method).
-    route_shapes_gdf = build_route_shapes_gdf(shapes_df, trips, final_routes_df, CRS_EPSG_CODE)
+    route_shapes_gdf = build_route_shapes_gdf(shapes_df, trips, final_routes_df, crs)
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -1434,6 +1802,8 @@ def do_route_by_route_analysis(
                 ped_graph=ped_graph,
                 walk_time_min=walk_time_min,
                 walk_speed_units_per_s=walk_speed_units_per_s,
+                isochrone_edge_buffer_ft=isochrone_edge_buffer_ft,
+                isochrone_max_snap_ft=isochrone_max_snap_ft,
             )
             if service_area_gdf is None or service_area_gdf.empty:
                 logging.info(
@@ -1516,6 +1886,8 @@ def do_stop_by_stop_analysis(
     ped_graph: Optional[nx.MultiGraph] = None,
     walk_time_min: float = 0.0,
     walk_speed_units_per_s: float = 0.0,
+    isochrone_edge_buffer_ft: Optional[float] = None,
+    isochrone_max_snap_ft: Optional[float] = None,
     express_route_ids: Optional[set[str]] = None,
 ) -> None:
     """Compute a service area and demographic catchment for each stop.
@@ -1545,8 +1917,15 @@ def do_stop_by_stop_analysis(
         logging.info("No routes remain after route filters. Aborting stop-by-stop analysis.")
         return
 
+    crs = _analysis_crs(demographics_gdf)
     stops_gdf = _stops_to_points_gdf(
-        trips, stop_times, stops_df, final_routes_df, stop_ids_to_include, stop_ids_to_exclude
+        trips,
+        stop_times,
+        stops_df,
+        final_routes_df,
+        stop_ids_to_include,
+        stop_ids_to_exclude,
+        crs=crs,
     )
     if stops_gdf is None:
         logging.info("No stops remain after stop filters. Aborting stop-by-stop analysis.")
@@ -1568,6 +1947,8 @@ def do_stop_by_stop_analysis(
             ped_graph=ped_graph,
             walk_time_min=walk_time_min,
             walk_speed_units_per_s=walk_speed_units_per_s,
+            isochrone_edge_buffer_ft=isochrone_edge_buffer_ft,
+            isochrone_max_snap_ft=isochrone_max_snap_ft,
         )
         if service_area_gdf is None or service_area_gdf.empty:
             logging.info("Could not build a service area for stop %s - skipping.", stop_id_str)
@@ -1861,6 +2242,8 @@ def run(
     express_origin_stops_file: str | Path | None = None,
     isochrone_walk_time_min: float | None = None,
     walk_speed_mph: float | None = None,
+    isochrone_edge_buffer_ft: float | None = None,
+    isochrone_max_snap_ft: float | None = None,
     fips_filter: Sequence[str] | None = None,
     crs_epsg_code: int | None = None,
     express_route_ids: Sequence[str] | None = None,
@@ -1924,6 +2307,12 @@ def run(
         ISOCHRONE_WALK_TIME_MIN if isochrone_walk_time_min is None else isochrone_walk_time_min
     )
     walk_speed_mph = WALK_SPEED_MPH if walk_speed_mph is None else walk_speed_mph
+    isochrone_edge_buffer_ft = (
+        ISOCHRONE_EDGE_BUFFER_FT if isochrone_edge_buffer_ft is None else isochrone_edge_buffer_ft
+    )
+    isochrone_max_snap_ft = (
+        ISOCHRONE_MAX_SNAP_FT if isochrone_max_snap_ft is None else isochrone_max_snap_ft
+    )
     fips_filter = list(FIPS_FILTER if fips_filter is None else fips_filter)
     crs_epsg_code = CRS_EPSG_CODE if crs_epsg_code is None else crs_epsg_code
     express_route_ids = list(EXPRESS_ROUTE_IDS if express_route_ids is None else express_route_ids)
@@ -2016,7 +2405,7 @@ def run(
 
     try:
         # --------------------------------------------------------------
-        # 0) VALIDATE SERVICE-AREA METHOD
+        # 0) VALIDATE SERVICE-AREA METHOD AND CRS
         # --------------------------------------------------------------
         service_area_method = service_area_method.lower()
         valid_methods = {"stop_buffer", "route_buffer", "isochrone"}
@@ -2025,6 +2414,7 @@ def run(
                 f"Invalid SERVICE_AREA_METHOD: {service_area_method!r}. "
                 f"Choose one of {sorted(valid_methods)}."
             )
+        analysis_crs = validate_projected_crs(crs_epsg_code)
 
         # --------------------------------------------------------------
         # 1) LOAD GTFS
@@ -2038,6 +2428,13 @@ def run(
         stop_times = gtfs_raw["stop_times"]
         routes_df = gtfs_raw["routes"]
         stops_df = gtfs_raw["stops"]
+
+        # Distance distortion of the analysis CRS at the feed's own location.
+        if {"stop_lat", "stop_lon"} <= set(stops_df.columns):
+            stop_lon = pd.to_numeric(stops_df["stop_lon"], errors="coerce").median()
+            stop_lat = pd.to_numeric(stops_df["stop_lat"], errors="coerce").median()
+            if pd.notna(stop_lon) and pd.notna(stop_lat):
+                warn_if_distorted_crs(analysis_crs, float(stop_lon), float(stop_lat))
 
         # Route geometry from shapes.txt — required for the "route_buffer"
         # method, optional otherwise. Loaded opportunistically.
@@ -2058,9 +2455,8 @@ def run(
         # 1b) PEDESTRIAN NETWORK (only for the "isochrone" method)
         # --------------------------------------------------------------
         ped_graph: Optional[nx.MultiGraph] = None
-        # Walking speed expressed in projected-CRS units per second (metres/s,
-        # since CRS_EPSG_CODE is assumed metric).
-        walk_speed_units_per_s = walk_speed_mph * METERS_PER_MILE / 3_600.0
+        # Walking speed expressed in projected-CRS units per second.
+        walk_speed_units_per_s = walk_speed_mph * crs_units_per_mile(analysis_crs) / 3_600.0
         if service_area_method == "isochrone":
             ped_path = Path(pedestrian_network_path)
             if not ped_path.is_file():
@@ -2074,34 +2470,14 @@ def run(
             )
 
         # --------------------------------------------------------------
-        # 2) OPTIONAL CALENDAR FILTER
+        # 2) SERVICE-DAY FILTER
         # --------------------------------------------------------------
-        if not service_ids_to_include:
-            # Empty -> auto-select the full Monday–Friday service(s) straight from
-            # calendar.txt, so weekday service is chosen for any feed instead of a
-            # hardcoded id (service_id values differ per agency/feed).
-            service_ids_to_include = [
-                str(s) for s in filter_weekday_service(gtfs_raw["calendar"]).tolist()
-            ]
-            if service_ids_to_include:
-                logging.info(
-                    "Auto-selected weekday service_id(s) from calendar.txt: %s",
-                    service_ids_to_include,
-                )
-            else:
-                logging.warning("No Monday–Friday service found in calendar.txt; using all trips.")
-
-        if service_ids_to_include:  # explicit ids or the auto-selected weekday set
-            before = len(trips)
-            trips = trips[trips["service_id"].isin(service_ids_to_include)]
-            logging.info(
-                "Applied calendar filter %s — trips: %d → %d",
-                service_ids_to_include,
-                before,
-                len(trips),
-            )
-        else:
-            logging.info("No calendar filter applied; using all %d trips.", len(trips))
+        # calendar.txt is logged in full so the user can confirm (or pick) the
+        # service_id; a requested service_id with no trips stops the run cleanly.
+        log_service_calendar(gtfs_raw["calendar"])
+        trips = select_trips_by_service(
+            trips, service_ids_to_include, default_service_ids=_DEFAULT_SERVICE_IDS
+        )
 
         # --------------------------------------------------------------
         # 3) DEMOGRAPHICS LAYER
@@ -2168,6 +2544,8 @@ def run(
                 ped_graph=ped_graph,
                 walk_time_min=isochrone_walk_time_min,
                 walk_speed_units_per_s=walk_speed_units_per_s,
+                isochrone_edge_buffer_ft=isochrone_edge_buffer_ft,
+                isochrone_max_snap_ft=isochrone_max_snap_ft,
                 express_route_ids=express_route_id_set,
                 unidirectional_route_ids=unidirectional_route_id_set,
                 employment_fields=express_employment_fields,
@@ -2183,6 +2561,8 @@ def run(
                 ped_graph=ped_graph,
                 walk_time_min=isochrone_walk_time_min,
                 walk_speed_units_per_s=walk_speed_units_per_s,
+                isochrone_edge_buffer_ft=isochrone_edge_buffer_ft,
+                isochrone_max_snap_ft=isochrone_max_snap_ft,
                 express_route_ids=express_route_id_set,
             )
         else:
@@ -2190,6 +2570,10 @@ def run(
 
         logging.info("\nAnalysis completed successfully.")
 
+    except ServiceSelectionError as exc:
+        # A configuration problem, not a crash: report the fix without a traceback.
+        logging.error("%s", exc)
+        raise
     except Exception:
         # Re-raise after logging: a swallowed error here exits 0 and looks
         # identical to "legitimately produced nothing" to the prep_features_public
@@ -2266,7 +2650,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         nargs="*",
         default=SERVICE_IDS_TO_INCLUDE,
         metavar="SERVICE_ID",
-        help="Calendar service_id values to keep (empty = auto-select weekday service).",
+        help="GTFS service_id(s) of the service day to analyze; the flag with no values "
+        "uses every trip.",
     )
     parser.add_argument(
         "--routes-include",
@@ -2351,6 +2736,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Assumed pedestrian walking speed.",
     )
     parser.add_argument(
+        "--isochrone-edge-buffer",
+        type=float,
+        default=ISOCHRONE_EDGE_BUFFER_FT,
+        help="Buffer (feet) around reachable pedestrian segments (isochrone method).",
+    )
+    parser.add_argument(
+        "--isochrone-max-snap",
+        type=float,
+        default=ISOCHRONE_MAX_SNAP_FT,
+        help="Farthest (feet) a stop may sit from the pedestrian network (isochrone method).",
+    )
+    parser.add_argument(
         "--fips",
         nargs="*",
         default=FIPS_FILTER,
@@ -2361,7 +2758,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--crs-epsg",
         type=int,
         default=CRS_EPSG_CODE,
-        help="Projected (metric) EPSG code for area calculations.",
+        help="Projected EPSG code (any linear unit) for buffers and areas.",
     )
     parser.add_argument(
         "--express-routes",
@@ -2436,7 +2833,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     Returns:
         Process exit code: 0 on success, 1 on failure, 2 if required
-        CONFIGURATION values are still placeholders.
+        CONFIGURATION values are still placeholders or a requested service_id
+        has no trips in the feed.
     """
     args = parse_args(argv)
     logging.basicConfig(
@@ -2474,6 +2872,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             express_origin_stops_file=args.express_origin_stops_file,
             isochrone_walk_time_min=args.isochrone_walk_time,
             walk_speed_mph=args.walk_speed_mph,
+            isochrone_edge_buffer_ft=args.isochrone_edge_buffer,
+            isochrone_max_snap_ft=args.isochrone_max_snap,
             fips_filter=args.fips,
             crs_epsg_code=args.crs_epsg,
             express_route_ids=args.express_routes,
@@ -2489,6 +2889,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             express_zero_destination_population=args.express_zero_destination_population,
             express_employment_fields=args.express_employment_fields,
         )
+    except ServiceSelectionError:
+        # run() already logged which service_ids exist; a configuration error.
+        return 2
     except Exception:
         # run() already logged the traceback; exit non-zero so the orchestrator
         # records a real failure instead of "produced no tables".
