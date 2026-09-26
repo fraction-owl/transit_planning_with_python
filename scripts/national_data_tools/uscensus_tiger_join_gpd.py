@@ -59,6 +59,7 @@ run from a shell or a Jupyter notebook.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import io
 import logging
 import re
@@ -170,7 +171,11 @@ MAX_FIELD_LEN: Final[int] = 10  # DBF column-name limit
 
 # ---- CSV topic signatures ---------------------------------------------------
 #: File-name token signatures used to bucket CSV/GZ/ZIP inputs by topic.
-#: ALL tokens listed for a topic must appear in the file name (case-insensitive).
+#: ALL tokens listed for a topic must appear in the file name (case-insensitive), each
+#: as a whole code: "B19001" matches "ACSDT5Y2024.B19001-Data.csv" but not the race
+#: iteration "B19001A", and "P1" does not match "P12". Pin a vintage by adding its
+#: product code, e.g. ("ACSDT5Y2024", "B19001"). Files that disagree on the same
+#: geography (two vintages, say) abort the run rather than one being silently kept.
 TOPIC_SIGNATURES: dict[str, Sequence[str] | str] = {
     "POP_FILES": ("P1",),
     "HH_FILES": ("H9",),
@@ -211,7 +216,8 @@ TRACT_COUNT_DISAGG: dict[str, tuple[str, str]] = {
     "commute_drove": ("total_pop", "cmt_drove"),  # drove alone
     "commute_carpool": ("total_pop", "cmt_carpl"),  # carpooled
     "commute_wfh": ("total_pop", "cmt_wfh"),  # worked from home
-    "commute_person_min": ("total_pop", "cmt_pmin"),  # worker-minutes (mean = /workers)
+    "commute_person_min": ("total_pop", "cmt_pmin"),  # commuter-minutes (excl. WFH)
+    "commute_timed": ("total_pop", "cmt_timed"),  # their commuters (mean = cmt_pmin / this)
 }
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
@@ -242,31 +248,67 @@ _UNSET: Final[_Unset] = _Unset()
 
 GEO_ID_COL: Final[str] = "GEO_ID"
 _UNFRIENDLY_COL_RE = re.compile(r"^[A-Z]{2,}\d{3,}.*")
+#: Temporary per-row record of the input file, used to name files in duplicate errors.
+_SOURCE_COL: Final[str] = "_source_file"
 
 
 def _token_match(name: str, tokens: Sequence[str] | str) -> bool:
-    """Return True if *all* tokens occur in *name* (case-insensitive)."""
+    """Return True if *all* tokens occur in *name* as whole codes (case-insensitive).
+
+    A token that starts or ends with a letter or digit must sit against a
+    non-alphanumeric boundary there, so a table code matches only itself:
+    ``B19001`` does not match the race-iteration table ``B19001A``, and ``P1`` does
+    not match ``P12`` or ``DP1``. Tokens that begin and end with a separator (the
+    LODES ``_S000_JT00_``) still match anywhere.
+    """
     if isinstance(tokens, str):
         tokens = (tokens,)
     low = name.lower()
-    return all(tok.lower() in low for tok in tokens)
+    for tok in tokens:
+        tok_low = tok.lower()
+        pattern = re.escape(tok_low)
+        if tok_low[:1].isalnum():
+            pattern = r"(?<![a-z0-9])" + pattern
+        if tok_low[-1:].isalnum():
+            pattern += r"(?![a-z0-9])"
+        if re.search(pattern, low) is None:
+            return False
+    return True
 
 
-def _zip_data_member_sizes(zip_path: str | Path) -> dict[str, int]:
-    """Map each '*-Data.csv' member's base name to its uncompressed size in bytes.
+def _zip_data_members(zip_path: str | Path) -> dict[str, list[tuple[str, int]]]:
+    """Map each '*-Data.csv' member's base name to its (member name, size) entries.
 
     Reads only the ZIP central directory (no extraction). Returns an empty map
     when the archive cannot be read, so a corrupt ZIP never suppresses a loose CSV.
     """
+    members: dict[str, list[tuple[str, int]]] = {}
     try:
         with zipfile.ZipFile(zip_path) as zf:
-            return {
-                Path(info.filename).name.lower(): info.file_size
-                for info in zf.infolist()
-                if info.filename.lower().endswith("-data.csv")
-            }
+            for info in zf.infolist():
+                if info.filename.lower().endswith("-data.csv"):
+                    base = Path(info.filename).name.lower()
+                    members.setdefault(base, []).append((info.filename, info.file_size))
     except (zipfile.BadZipFile, OSError):
         return {}
+    return members
+
+
+def _sha256(stream: Any) -> str:
+    """Return the SHA-256 hex digest of a binary stream, read in 1 MiB chunks."""
+    digest = hashlib.sha256()
+    for chunk in iter(lambda: stream.read(1 << 20), b""):
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _same_as_zip_member(loose: Path, zip_path: str, member: str) -> bool:
+    """Return True if *loose* has exactly the bytes of *member* inside *zip_path*."""
+    try:
+        with zipfile.ZipFile(zip_path) as zf, zf.open(member) as packed, loose.open("rb") as fh:
+            return _sha256(packed) == _sha256(fh)
+    except (zipfile.BadZipFile, OSError):
+        return False
 
 
 def _dedupe_extracted_zip_members(paths: Sequence[str]) -> list[str]:
@@ -277,32 +319,37 @@ def _dedupe_extracted_zip_members(paths: Sequence[str]) -> list[str]:
     orchestrator does by default, and a human may do manually — the scanned root
     holds both the ``*.zip`` and the extracted ``*-Data.csv``. Bucketing both
     would concatenate the identical table twice (duplicate GEO_ID rows). A loose
-    CSV is treated as redundant only when its base name AND byte size match a
-    member of a ZIP in the same bucket, so the ZIP is kept and the extracted copy
-    dropped; genuinely distinct downloads (e.g. other geographies, which differ
-    in size) are never removed.
+    CSV is treated as redundant only when its base name matches a member of a ZIP
+    in the same bucket AND its bytes are identical to that member (size first,
+    then a content hash), so the ZIP is kept and the extracted copy dropped.
+    Anything else — another geography, a re-saved or edited copy — is kept, and a
+    real conflict is then caught by the duplicate check in ``_load_and_concat``.
     """
-    member_sizes: dict[str, set[int]] = {}
+    members: dict[str, list[tuple[str, str, int]]] = {}
     for p in paths:
         if p.lower().endswith(".zip"):
-            for name, size in _zip_data_member_sizes(p).items():
-                member_sizes.setdefault(name, set()).add(size)
-    if not member_sizes:
+            for base, entries in _zip_data_members(p).items():
+                members.setdefault(base, []).extend((p, name, size) for name, size in entries)
+    if not members:
         return list(paths)
 
     kept: list[str] = []
     for p in paths:
         base = Path(p).name.lower()
-        if base.endswith("-data.csv") and base in member_sizes:
+        if base.endswith("-data.csv") and base in members:
             try:
-                if Path(p).stat().st_size in member_sizes[base]:
-                    logging.info(
-                        "Skipping '%s'; byte-identical to a ZIP member already in this bucket.",
-                        p,
-                    )
-                    continue
+                size = Path(p).stat().st_size
             except OSError:
-                pass
+                size = -1
+            if any(
+                member_size == size and _same_as_zip_member(Path(p), zip_path, member)
+                for zip_path, member, member_size in members[base]
+            ):
+                logging.info(
+                    "Skipping '%s'; byte-identical to a ZIP member already in this bucket.",
+                    p,
+                )
+                continue
         kept.append(p)
     return kept
 
@@ -363,39 +410,50 @@ def _clean_name_cols(df: pd.DataFrame) -> None:
         df[col] = df[col].astype(str).str.replace(r"[\r\n\t]+", " ", regex=True).str.strip()
 
 
-def _dedupe_topic_rows(df: pd.DataFrame, key: Hashable, *, source: str) -> pd.DataFrame:
-    """Collapse rows that repeat *key* to the first occurrence, logging any drops.
+def _dedupe_topic_rows(df: pd.DataFrame, key: Hashable) -> pd.DataFrame:
+    """Collapse rows that repeat *key* with identical data; reject conflicting repeats.
 
-    A topic bucket can legitimately gather more than one input file for the same
-    geography: multiple ACS vintages of a table, or race/ethnicity iteration
-    tables (e.g. ``B19001A``..``B19001I``, ``B01001A``..``B01001I``) whose codes
-    contain the base topic's token and so match the same signature. Concatenated,
-    those files repeat every ``GEO_ID``, and because the later GEO_ID merges and
-    the one-to-many block<->tract join both fan out on the key, each repeat becomes
-    a *multiplicative* row explosion — enough to violate the Stage 3 ``1:1`` join
-    and abort the whole pipeline.
+    A topic bucket can gather more than one input file for the same geography — a
+    copy of the same download, or a second ACS vintage of the table. Concatenated,
+    those files repeat every ``GEO_ID``, and because the later GEO_ID merges and the
+    one-to-many block<->tract join both fan out on the key, each repeat becomes a
+    *multiplicative* row explosion.
 
-    Collapsing here, at load time and before any merge, keeps each geography to a
-    single row. Files are read in sorted order, so ``keep="first"`` deterministically
-    prefers the base table over its race iterations (``B19001`` sorts before
-    ``B19001A``) and, for true vintage duplicates, the earliest file.
+    Rows that repeat a key with the same data (``NAME`` labels aside) are collapsed
+    to one. A key that repeats with *different* data is an ambiguous input — keeping
+    either row would silently pick a vintage — so it raises, naming the files. The
+    temporary ``_SOURCE_COL`` added by ``_load_and_concat`` is dropped on return.
+
+    Raises:
+        ValueError: If any key repeats with conflicting values.
     """
     if key not in df.columns:
-        return df
-    before = len(df)
-    deduped = df.drop_duplicates(subset=[key], keep="first")
-    dropped = before - len(deduped)
+        return df.drop(columns=_SOURCE_COL, errors="ignore")
+    data_cols = [c for c in df.columns if c != _SOURCE_COL and not str(c).startswith("NAME")]
+    unique = df.drop_duplicates(subset=data_cols)
+    conflicts = unique[unique.duplicated(subset=[key], keep=False)]
+    if not conflicts.empty:
+        keys = conflicts[key].astype(str).unique().tolist()
+        files = (
+            sorted(conflicts[_SOURCE_COL].astype(str).unique())
+            if _SOURCE_COL in conflicts.columns
+            else []
+        )
+        raise ValueError(
+            f"{len(keys)} geography key(s) in '{key}' carry conflicting values across input "
+            f"rows (e.g. {', '.join(keys[:3])}); files involved: {files}. Keep one table and "
+            "vintage per topic: remove the extra file, or pin the vintage in TOPIC_SIGNATURES "
+            "(e.g. ('ACSDT5Y2024', 'B19001'))."
+        )
+    dropped = len(df) - len(unique)
     if dropped:
-        logging.warning(
-            "Dropped %d row(s) repeating '%s' while loading %s (kept the first of each). "
-            "More than one input file covered the same geography — typically multiple ACS "
-            "vintages of a table, or race-iteration tables sharing the topic's token. Keep "
-            "one file per topic per geography to avoid this.",
+        logging.info(
+            "Collapsed %d duplicate row(s) on '%s' carrying identical data (same geography "
+            "supplied more than once).",
             dropped,
             key,
-            source,
         )
-    return deduped.reset_index(drop=True)
+    return unique.drop(columns=_SOURCE_COL, errors="ignore").reset_index(drop=True)
 
 
 def _load_and_concat(
@@ -418,10 +476,11 @@ def _load_and_concat(
     ``usecols`` is explicitly supplied).
 
     When ``dedupe_key`` is set (default ``GEO_ID``) and present in the combined
-    frame, rows repeating that key are collapsed to the first occurrence so a
-    topic that gathered several files for the same geography (multiple ACS
-    vintages, or race-iteration tables matched by the same signature) cannot fan
-    out through the downstream merges. Pass ``dedupe_key=None`` to disable.
+    frame, rows repeating that key with identical data are collapsed and rows
+    repeating it with conflicting data raise ``ValueError`` (see
+    ``_dedupe_topic_rows``), so a topic that gathered several files for the same
+    geography cannot fan out through the downstream merges or silently pick a
+    vintage. Pass ``dedupe_key=None`` to disable.
     """
     frames: list[pd.DataFrame] = []
     for path in files:
@@ -444,24 +503,25 @@ def _load_and_concat(
                 keep = {GEO_ID_COL, "NAME", *rename.values()}
                 df = df.loc[:, df.columns.intersection(keep)]
 
+        df[_SOURCE_COL] = str(path)
         frames.append(df)
 
     if not frames:
         return pd.DataFrame()
     combined = pd.concat(frames, ignore_index=True)
     if dedupe_key is not None:
-        combined = _dedupe_topic_rows(combined, dedupe_key, source=f"{len(files)} file(s)")
-    return combined
+        combined = _dedupe_topic_rows(combined, dedupe_key)
+    return combined.drop(columns=_SOURCE_COL, errors="ignore")
 
 
 def _merge_on_geo_id(left: pd.DataFrame, right: pd.DataFrame) -> pd.DataFrame:
-    """Outer-merge two frames on GEO_ID, dropping duplicate columns."""
+    """Outer-merge two frames on GEO_ID (one row per key each), dropping duplicate columns."""
     if left.empty:
         return right.copy()
     if right.empty:
         return left.copy()
     dup = (set(left.columns) & set(right.columns)) - {GEO_ID_COL}
-    return left.merge(right.drop(columns=dup), on=GEO_ID_COL, how="outer")
+    return left.merge(right.drop(columns=dup), on=GEO_ID_COL, how="outer", validate="1:1")
 
 
 def _drop_unfriendly_cols(df: pd.DataFrame) -> pd.DataFrame:
@@ -622,8 +682,15 @@ def _derive_commute(df: pd.DataFrame) -> pd.DataFrame:
     travel time is a mean in minutes), so they can ride along verbatim per tract
     but must never be area-weighted. The additive worker *counts* derived here
     (``workers * pct / 100``) plus person-minutes are what TRACT_COUNT_DISAGG
-    splits down to blocks; a catchment mean travel time is then recoverable as
-    ``sum(commute_person_min) / sum(commute_workers)``.
+    splits down to blocks.
+
+    The mean travel time (S0801_C01_046E) is over workers who did NOT work from
+    home, so person-minutes are ``(workers - wfh) * mean``. Their denominator,
+    ``commute_timed``, holds those same commuters, but only where the tract
+    publishes both the mean and the work-from-home share: a suppressed value drops
+    the tract from numerator and denominator alike instead of counting as zero
+    minutes. A catchment mean travel time is then
+    ``sum(commute_person_min) / sum(commute_timed)``.
     """
     perc_cols = ["perc_drove_alone", "perc_carpool", "perc_transit", "perc_wfh"]
     for col in ["commute_workers", "mean_travel_time", *perc_cols]:
@@ -635,10 +702,13 @@ def _derive_commute(df: pd.DataFrame) -> pd.DataFrame:
     df["commute_drove"] = workers * df["perc_drove_alone"] / 100.0
     df["commute_carpool"] = workers * df["perc_carpool"] / 100.0
     df["commute_wfh"] = workers * df["perc_wfh"] / 100.0
-    df["commute_person_min"] = workers * df["mean_travel_time"]
+    commuters = (workers - df["commute_wfh"]).clip(lower=0)
+    timed = commuters.notna() & df["mean_travel_time"].notna()
+    df["commute_timed"] = commuters.where(timed, 0.0)
+    df["commute_person_min"] = (commuters * df["mean_travel_time"]).where(timed, 0.0)
     # ``mean_travel_time`` is a non-additive mean: drop it from this block-bound path
     # (build_tract_attributes sums count columns) — it is recoverable downstream as
-    # commute_person_min / commute_workers. The flat uscensus_table_build keeps it.
+    # commute_person_min / commute_timed. The flat uscensus_table_build keeps it.
     df = df.drop(columns="mean_travel_time")
     return df
 
@@ -709,9 +779,10 @@ def _build_tract_df(inp: _TractInputs) -> pd.DataFrame:
                 "C16001_020E": "korean_engnwell",
                 "C16001_023E": "chineseetc_engnwell",
                 "C16001_026E": "vietnamese_engnwell",
+                "C16001_029E": "tagalog_engnwell",
                 "C16001_032E": "asiapacetc_engnwell",
                 "C16001_035E": "arabic_engnwell",
-                "C16001_037E": "otheretc_engnwell",
+                "C16001_038E": "otheretc_engnwell",
             },
         )
         dfs.append(_derive_language(language))
@@ -933,6 +1004,7 @@ def build_joined_table(
             right_on="tract_id_clean",
             how="outer",
             suffixes=("_blk", "_trt"),
+            validate="m:1",
         )
     )
 
