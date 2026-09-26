@@ -811,6 +811,54 @@ def test_build_joined_table_with_tract_income(tmp_path: Path) -> None:
     assert "perc_low_income" in df.columns
 
 
+def test_build_joined_table_splits_tract_counts_across_blocks(tmp_path: Path) -> None:
+    # Count allocation: household counts split by block households (H9), person counts
+    # by block population (P1); both sum back to the tract total, rates stay per tract.
+    blocks = [("1000000US110010001001001", 100, 10), ("1000000US110010001001002", 300, 30)]
+    pop_path = tmp_path / "P1-Data.csv"
+    hh_path = tmp_path / "H9-Data.csv"
+    _write_plain_csv(
+        pop_path,
+        _census_csv(
+            "GEO_ID,NAME,P1_001N", "Geo,Name,Total", *[f"{g},Block,{p}" for g, p, _ in blocks]
+        ),
+    )
+    _write_plain_csv(
+        hh_path, _census_csv("GEO_ID,H9_001N", "Geo,Total", *[f"{g},{h}" for g, _, h in blocks])
+    )
+    bands = ",".join(f"B19001_{n:03d}E" for n in range(1, 12))
+    income_path = tmp_path / "B19001-Data.csv"
+    _write_plain_csv(
+        income_path,
+        _census_csv(
+            f"GEO_ID,NAME,{bands}",
+            "Geo,Name," + ",".join(["l"] * 11),
+            f"{_TRACT_GEO_ID},Tract,100," + ",".join(["8"] * 10),
+        ),
+    )
+    eth_cols = "P9_001N,P9_002N,P9_005N,P9_006N,P9_007N,P9_008N,P9_009N,P9_010N,P9_011N"
+    eth_path = tmp_path / "P9-Data.csv"
+    _write_plain_csv(
+        eth_path,
+        _census_csv(
+            f"GEO_ID,NAME,{eth_cols}",
+            "Geo,Name," + ",".join(["l"] * 9),
+            f"{_TRACT_GEO_ID},Tract,200,0,160,40,0,0,0,0,0",
+        ),
+    )
+    df = build_joined_table(
+        pop_files=[str(pop_path)],
+        hh_files=[str(hh_path)],
+        jobs_files=[],
+        income_files=[str(income_path)],
+        ethnicity_files=[str(eth_path)],
+    ).sort_values("total_pop")
+    assert df["low_income"].tolist() == pytest.approx([20.0, 60.0])  # 80 split 10:30
+    assert df["minority"].tolist() == pytest.approx([10.0, 30.0])  # 40 split 100:300
+    assert df["white"].sum() == pytest.approx(160.0)
+    assert df["perc_low_income"].tolist() == pytest.approx([0.8, 0.8])
+
+
 def test_build_joined_table_duplicated_inputs_do_not_multiply_rows(tmp_path: Path) -> None:
     # The same block row and the same tract row each supplied twice used to fan out
     # to 2 x 2 = 4 rows for the one block; identical repeats now collapse first.

@@ -9,8 +9,12 @@ Pipeline:
   1) Create stops layer (GTFS filter by route_short_name or shapefile).
   2) Buffer and dissolve (optional processing CRS for stability).
   3) Clip demographics (SR alignment, PairwiseClip with fallbacks).
-  4) Add areas (`area_ac_cl`, `area_perc`) and synthetic counts
-     (prefer `PCT_* × *_TOT`; fallback to `*_CNT` with safety checks).
+  4) Add areas (`area_ac_cl`, `area_perc`) and synthetic counts: area-weighted
+     block counts (`HH_LOWINC`, `MINOR_CNT`, ...) that uscensus_tiger_join_arcpy
+     split from tract totals by block population/households (marked by its
+     `CNT_ALLOC` field). A layer without that marker predates the split — its
+     `*_CNT` fields repeat whole-tract totals — so it falls back, with a warning,
+     to `PCT_* × *_TOT` (tract rate × block total).
   5) Summarize totals and export.
 
 Inputs:
@@ -117,8 +121,9 @@ class _Pref(NamedTuple):
     total: str | None
 
 
-# What we want to produce in the clipped layer → how to source it.
-# Prefer direct counts; otherwise derive via percent * total.
+# What we want to produce in the clipped layer → how to source it: the block count
+# when the layer's counts were split to blocks (COUNT_ALLOCATION_FIELD present),
+# otherwise percent * total.
 _PREFS: dict[str, _Pref] = {
     # Households
     "loinc_hh": _Pref(count="HH_LOWINC", pct="PCT_LOWINC", total="HH_TOT"),
@@ -136,6 +141,12 @@ _PREFS: dict[str, _Pref] = {
 }
 
 
+# Marker field written by uscensus_tiger_join_arcpy (value 1) when its *_CNT fields
+# hold counts split from tract totals to blocks, rather than whole-tract figures.
+COUNT_ALLOCATION_FIELD: str = "CNT_ALLOC"
+_LEGACY_LAYERS_WARNED: set[str] = set()  # warn once per layer, not once per route
+
+
 @dataclass(frozen=True)
 class DemogSchema:
     """Resolved strategies for computing metrics from a demographics layer."""
@@ -145,6 +156,8 @@ class DemogSchema:
     #   ("count", "FIELD") or ("derived", ("PCT_FIELD","TOTAL_FIELD"))
     strategies: dict[str, tuple[str, str | tuple[str, str]]]
     resolved_inputs: Dict[str, str]  # mapping of canonical→resolved name (for diagnostics)
+    # True when the layer's *_CNT fields are block-allocated counts (marker present).
+    counts_allocated: bool = False
 
 
 # =============================================================================
@@ -500,18 +513,30 @@ def _has(dataset: str, field: Optional[str]) -> bool:
 def detect_demog_schema(demographics_fc: str) -> DemogSchema:
     """Inspect the demographics layer and decide how to compute each metric.
 
-    Preference (safer order):
-      1) If percent + total exist (e.g., PCT_MINOR + POP_TOT), derive.
-      2) Otherwise, use a direct count field if present (e.g., MINOR_CNT).
-      3) Otherwise, skip that metric.
+    Layers from the current uscensus_tiger_join_arcpy carry ``COUNT_ALLOCATION_FIELD``:
+    their ``*_CNT`` fields are tract counts split to blocks by block population or
+    households, the same count allocation uscensus_tiger_join_gpd uses. For those:
+      1) Use the direct count field if present (e.g., MINOR_CNT).
+      2) Otherwise derive from percent + total (e.g., PCT_MINOR × POP_TOT).
 
-    Rationale: joined pipelines sometimes duplicate or mislabel *_CNT fields
-    across geographies; deriving from PCT_* × POP_TOT is monotonic and avoids
-    over-counting relative to the total.
+    Older layers lack the marker; their ``*_CNT`` fields repeat each tract's whole
+    total on every block, so the order flips (derive first, count as a last resort)
+    and a warning asks for the join to be re-run. Metrics with neither are skipped.
     """
     strategies: dict[str, tuple[str, str | tuple[str, str]]] = {}
     outputs: list[str] = []
     resolved_inputs: Dict[str, str] = {}
+    counts_allocated = _resolve_field(demographics_fc, COUNT_ALLOCATION_FIELD) is not None
+    if not counts_allocated and demographics_fc not in _LEGACY_LAYERS_WARNED:
+        _LEGACY_LAYERS_WARNED.add(demographics_fc)
+        logging.warning(
+            "Demographics layer '%s' has no %s field: it predates the block count split in "
+            "uscensus_tiger_join_arcpy, so its *_CNT fields are whole-tract totals. Using "
+            "PCT_* x block totals instead (tract rate x 2020 block population/households). "
+            "Re-run uscensus_tiger_join_arcpy to use block-allocated counts.",
+            demographics_fc,
+            COUNT_ALLOCATION_FIELD,
+        )
 
     # Pre-resolve all canonical names that might be referenced
     all_needed: set[str] = set()
@@ -522,28 +547,30 @@ def detect_demog_schema(demographics_fc: str) -> DemogSchema:
     resolved = _resolve_many(demographics_fc, sorted(all_needed))
 
     for out_name, pref in _PREFS.items():
-        # 1) Prefer derived if possible
-        if pref.pct and pref.total:
-            rpct = resolved.get(pref.pct)
-            rtot = resolved.get(pref.total)
-            if rpct and rtot and _has(demographics_fc, rpct) and _has(demographics_fc, rtot):
-                strategies[out_name] = ("derived", (rpct, rtot))  # type: ignore[arg-type]
-                outputs.append(out_name)
-                resolved_inputs[pref.pct] = rpct
-                resolved_inputs[pref.total] = rtot
-                continue
-
-        # 2) Fallback to direct count
-        if pref.count:
-            rcount = resolved.get(pref.count)
-            if rcount and _has(demographics_fc, rcount):
-                strategies[out_name] = ("count", rcount)  # type: ignore[arg-type]
-                outputs.append(out_name)
-                resolved_inputs[pref.count] = rcount
-                continue
+        rcount = resolved.get(pref.count) if pref.count else None
+        rpct = resolved.get(pref.pct) if pref.pct else None
+        rtot = resolved.get(pref.total) if pref.total else None
+        count_ok = bool(rcount) and _has(demographics_fc, rcount)
+        derived_ok = (
+            bool(rpct and rtot) and _has(demographics_fc, rpct) and _has(demographics_fc, rtot)
+        )
+        # Allocated layers: count first. Legacy layers: derived first, count last.
+        if count_ok and (counts_allocated or not derived_ok):
+            strategies[out_name] = ("count", str(rcount))
+            resolved_inputs[str(pref.count)] = str(rcount)
+        elif derived_ok:
+            strategies[out_name] = ("derived", (str(rpct), str(rtot)))
+            resolved_inputs[str(pref.pct)] = str(rpct)
+            resolved_inputs[str(pref.total)] = str(rtot)
+        else:
+            continue
+        outputs.append(out_name)
 
     return DemogSchema(
-        outputs=tuple(outputs), strategies=strategies, resolved_inputs=resolved_inputs
+        outputs=tuple(outputs),
+        strategies=strategies,
+        resolved_inputs=resolved_inputs,
+        counts_allocated=counts_allocated,
     )
 
 
@@ -607,10 +634,12 @@ def add_synthetic_fields(
     If a direct count field exists, we scale it by area_perc.
     If only a percent exists (with its appropriate total), we scale (pct * total) by area_perc.
 
-    Safety:
-      - When a metric resolves to a direct count but the corresponding pct+total
-        pair is also present on the clipped data, use the derived value if the
-        raw count would exceed the implied total for that row.
+    Safety (legacy layers only, see ``detect_demog_schema``):
+      - When a metric on a layer without block-allocated counts resolves to a direct
+        count but the pct+total pair is also present on the clipped data, use the
+        derived value if the raw count would exceed the implied total for that row.
+        Layers with allocated counts use the counts as-is, so every row follows the
+        same method.
     """
     if not field_exists(clipped_fc, area_pct_field):
         raise ValueError(
@@ -641,10 +670,11 @@ def add_synthetic_fields(
             needed_inputs.add(str(pct_field))
             needed_inputs.add(str(tot_field))
 
-    # Also try to fetch pct/total for count-based metrics (for sanity fallback)
+    # Also try to fetch pct/total for count-based metrics (for the legacy sanity
+    # fallback; allocated counts are used as-is)
     derived_helpers: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
     for out_name, (mode, _spec) in strategies.items():
-        if mode == "count":
+        if mode == "count" and not schema.counts_allocated:
             # Look up matching pct/total names from _PREFS (canonical), then resolve on clipped FC
             pref = _PREFS.get(out_name)
             if pref and pref.pct and pref.total:

@@ -7,7 +7,10 @@ proficiency, vehicle availability, age group, and commuting (journey-to-work)
 statistics.
 
 Supports input as CSV, GZ, or ZIP files (containing '-Data.csv'), and can filter
-by county FIPS codes. Output may be saved as a flat CSV.
+by county FIPS codes. Output may be saved as a flat CSV. Tract counts are split
+across each tract's blocks by block population (P1) or households (H9), the same
+count allocation uscensus_tiger_join_gpd uses, so every count column can be
+summed over blocks; tract percentages ride along unchanged.
 
 Outputs:
     - joined_blocks.csv (OUTPUT_CSV_NAME, written into OUTPUT_DIR): the joined
@@ -86,6 +89,42 @@ TOPIC_SIGNATURES: dict[str, Sequence[str] | str] = {
     "AGE_FILES": ("B01001",),
     "COMMUTE_FILES": ("S0801",),
 }
+
+# Tract tables (income, ethnicity, language, vehicles, age, commuting) are split across
+# their blocks rather than repeated on each one: household-universe counts listed here
+# by block households (H9), everything else by block population (P1).
+HOUSEHOLD_UNIVERSE_COUNTS: frozenset[str] = frozenset(
+    {
+        # B19001 household income
+        "sub_10k",
+        "10k_15k",
+        "15k_20k",
+        "20k_25k",
+        "25k_30k",
+        "30k_35k",
+        "35k_40k",
+        "40k_45k",
+        "45k_50k",
+        "50k_60k",
+        "low_income",
+        # B08201 household size by vehicles available
+        "all_hhs",
+        "veh_0_all_hh",
+        "veh_1_all_hh",
+        "veh_0_hh_1",
+        "veh_1_hh_1",
+        "veh_0_hh_2",
+        "veh_1_hh_2",
+        "veh_0_hh_3",
+        "veh_1_hh_3",
+        "veh_2_hh_3",
+        "veh_0_hh_4p",
+        "veh_1_hh_4p",
+        "veh_2_hh_4p",
+        "all_lo_veh_hh",
+        "all_lo_veh_hh_mod",
+    }
+)
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
 
@@ -795,6 +834,74 @@ def _apply_fips_filter(
     return df[df[dst_col].isin(wanted)].copy()
 
 
+def _tract_count_columns(tract_df: pd.DataFrame) -> list[str]:
+    """Return the additive count columns of a tract table (numeric, not ``perc_*`` or ids)."""
+    ids = {GEO_ID_COL, "tract_id_clean", "FIPS"}
+    return [
+        str(c)
+        for c in tract_df.columns
+        if c not in ids
+        and not str(c).startswith("perc_")
+        and pd.api.types.is_numeric_dtype(tract_df[c])
+    ]
+
+
+def allocate_tract_counts_to_blocks(
+    df: pd.DataFrame,
+    count_cols: Iterable[str],
+    *,
+    tract_key: str = "tract_id_synth",
+) -> pd.DataFrame:
+    """Split each tract count across the tract's blocks in proportion to a block weight.
+
+    After the block<->tract merge every block carries its tract's totals verbatim, so
+    summing a count over blocks multiplies it by the number of blocks. Each count is
+    rewritten in place to ``tract_total * block_weight / sum(block_weight over the
+    tract)`` — the count allocation uscensus_tiger_join_gpd uses — so the parts sum
+    back to the tract total. Household-universe counts (``HOUSEHOLD_UNIVERSE_COUNTS``)
+    are weighted by block households (``total_hh``, from H9) and all others by block
+    population (``total_pop``, from P1); without H9, household counts are weighted by
+    population instead, with a warning. Tracts whose weights sum to zero get zero.
+
+    Args:
+        df: The merged block+tract frame, one row per block.
+        count_cols: Tract count columns to split (never ``perc_*`` ratios).
+        tract_key: Column grouping blocks by their tract.
+
+    Returns:
+        ``df`` with each available count column split in place.
+    """
+    if tract_key not in df.columns:
+        return df
+    fallback_cols: list[str] = []
+    for col in count_cols:
+        if col not in df.columns:
+            continue
+        weight = "total_hh" if col in HOUSEHOLD_UNIVERSE_COUNTS else "total_pop"
+        if weight not in df.columns and weight == "total_hh" and "total_pop" in df.columns:
+            fallback_cols.append(col)
+            weight = "total_pop"
+        if weight not in df.columns:
+            logging.warning(
+                "Cannot split tract count '%s' to blocks: no '%s' weight column; it is left "
+                "as a whole-tract figure on every block.",
+                col,
+                weight,
+            )
+            continue
+        values = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+        weights = pd.to_numeric(df[weight], errors="coerce").fillna(0.0)
+        tract_weight = weights.groupby(df[tract_key]).transform("sum")
+        df[col] = values * np.where(tract_weight > 0, weights / tract_weight, 0.0)
+    if fallback_cols:
+        logging.warning(
+            "No block household counts (H9) were supplied, so household counts %s were "
+            "split across blocks by population instead of households.",
+            fallback_cols,
+        )
+    return df
+
+
 # -----------------------------------------------------------------------------
 # PUBLIC API
 # -----------------------------------------------------------------------------
@@ -812,7 +919,12 @@ def build_joined_table(
     county_fips_filter: Iterable[str] | None = None,
     _clean_columns: bool = True,
 ) -> pd.DataFrame:
-    """Return a fully joined block + tract DataFrame with optional FIPS filter."""
+    """Return a fully joined block + tract DataFrame with optional FIPS filter.
+
+    Tract percentages (``perc_*``) ride along per block unchanged; tract counts are
+    split across each tract's blocks by block population (P1) or households (H9), so
+    every count column sums over blocks to the tract total.
+    """
     block_df = _build_block_df(_BlockInputs(pop_files, hh_files, jobs_files))
     tract_df = _build_tract_df(
         _TractInputs(
@@ -843,7 +955,9 @@ def build_joined_table(
 
     combined = _apply_fips_filter(combined, fips=county_fips_filter)
     _fill_numeric_only(combined)
-    return combined
+    # Count allocation (as in uscensus_tiger_join_gpd): split every tract count across
+    # the tract's blocks, so block rows can be summed without multiplying tract totals.
+    return allocate_tract_counts_to_blocks(combined, _tract_count_columns(tract_df))
 
 
 __all__ = ["build_joined_table"]

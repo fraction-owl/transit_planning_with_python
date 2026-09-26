@@ -109,5 +109,32 @@ def test_lep_counts_every_less_than_very_well_row(mod: types.ModuleType, tmp_pat
     )
     df = mod.build_joined_table_from_folder(tmp_path, county_fips_filter=["11001"])
     lep_rows = (5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35, 38)
-    assert set(df["LEP_CNT"]) == {sum(lep_rows)}
+    # The tract's LEP total, split across its two blocks by population (100 vs 200).
+    assert df["LEP_CNT"].sum() == pytest.approx(sum(lep_rows))
+    assert sorted(df["LEP_CNT"]) == pytest.approx([sum(lep_rows) / 3, sum(lep_rows) * 2 / 3])
     assert "TGL_NWELL" in df.columns
+
+
+def test_tract_counts_are_split_across_blocks(mod: types.ModuleType, tmp_path: Path) -> None:
+    # Count allocation: a tract count is split by block households (income) or block
+    # population (everything else), summing back to the tract total, and the table
+    # is marked so the demographics script reads the counts as block counts.
+    _write_pop(tmp_path)
+    _write_csv(
+        tmp_path / "DECENNIALDHC2020.H9-Data.csv",
+        "GEO_ID,H9_001N",
+        f"{_BLOCKS[0]},10",
+        f"{_BLOCKS[1]},30",
+        f"{_BLOCKS[2]},50",
+    )
+    bands = ",".join(f"B19001_{n:03d}E" for n in range(1, 12))
+    _write_csv(
+        tmp_path / "ACSDT5Y2024.B19001-Data.csv",
+        f"GEO_ID,NAME,{bands}",
+        f"{_TRACTS[0]},Tract,100," + ",".join(["8"] * 10),
+    )
+    df = mod.build_joined_table_from_folder(tmp_path, county_fips_filter=["11001"])
+    df = df.sort_values("GEO_ID_blk")
+    assert df["HH_LOWINC"].tolist() == pytest.approx([20.0, 60.0])  # 80 split 10:30
+    assert df["PCT_LOWINC"].tolist() == pytest.approx([0.8, 0.8])  # tract rate kept
+    assert set(df[mod.COUNT_ALLOCATION_FIELD]) == {1}
