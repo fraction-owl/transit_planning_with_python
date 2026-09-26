@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -13,6 +15,8 @@ from scripts.gtfs_exports.route_transfer_calculator import (
     parse_gtfs_time,
     service_ids_active_on_day,
 )
+
+GTFS_BASIC = Path(__file__).parent / "fixtures" / "gtfs_basic"
 
 # ---------------------------------------------------------------------------
 # parse_gtfs_time
@@ -240,3 +244,27 @@ def test_parse_args_rejects_unknown_tokens() -> None:
     with pytest.raises(SystemExit) as excinfo:
         rtc.parse_args(["--input-dir", "somewhere", "--gtfs-dirs", "feed_a"])
     assert excinfo.value.code == 2
+
+
+# ---------------------------------------------------------------------------
+# main — full pipeline against gtfs_basic
+# ---------------------------------------------------------------------------
+
+
+def test_main_end_to_end_on_gtfs_basic(tmp_path: Path) -> None:
+    assert rtc.main(["--gtfs-dirs", str(GTFS_BASIC), "--output-dir", str(tmp_path)]) == 0
+
+    # Only shared stops fall inside the 0.25-mile walk. At them, R2 leaves
+    # S3-S5 25 minutes after R1 arrives; every other pairing waits 35+ minutes.
+    summary = pd.read_csv(tmp_path / "route_transfers_summary.csv", keep_default_na=False)
+    assert summary["route_id"].tolist() == ["R1", "R2", "R3"]
+    assert summary["transfer_route_count"].tolist() == [1, 0, 0]
+    assert summary["transfer_routes"].tolist() == ["R2", "", ""]
+
+    detail = pd.read_csv(tmp_path / "route_transfers_detail.csv")
+    assert len(detail) == 1
+    row = detail.iloc[0]
+    assert (row["target_route_id"], row["connector_route_id"]) == ("R1", "R2")
+    assert row["qualifying_stop_pairs"] == 3  # S3, S4, S5
+    assert row["nearest_walk_distance_m"] == 0.0
+    assert row["min_transfer_wait_min"] == 25.0

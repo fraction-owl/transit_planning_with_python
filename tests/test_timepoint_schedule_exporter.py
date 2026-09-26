@@ -4,6 +4,7 @@ from pathlib import Path
 
 import openpyxl
 import pandas as pd
+import pytest
 
 from scripts.gtfs_exports.timepoint_schedule_exporter import (
     MAX_COLUMN_WIDTH,
@@ -19,6 +20,8 @@ from scripts.gtfs_exports.timepoint_schedule_exporter import (
     remove_empty_schedule_columns,
     time_to_minutes,
 )
+
+GTFS_BASIC = Path(__file__).parent / "fixtures" / "gtfs_basic"
 
 # ---------------------------------------------------------------------------
 # time_to_minutes
@@ -346,3 +349,45 @@ def test_export_to_excel_multiple_sheets_empty_dict_writes_nothing(tmp_path: Pat
     out = tmp_path / "schedule.xlsx"
     export_to_excel_multiple_sheets({}, str(out))
     assert not out.exists()
+
+
+# ---------------------------------------------------------------------------
+# main — full pipeline against gtfs_basic, real xlsx output
+# ---------------------------------------------------------------------------
+
+
+def test_main_writes_real_schedule_workbooks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import scripts.gtfs_exports.timepoint_schedule_exporter as mod
+
+    monkeypatch.setattr(mod, "GTFS_FOLDER_PATH", str(GTFS_BASIC))
+    monkeypatch.setattr(mod, "BASE_OUTPUT_PATH", str(tmp_path))
+    monkeypatch.setattr(mod, "FILTER_SERVICE_IDS", ["WKDY"])
+    monkeypatch.setattr(mod, "FILTER_IN_ROUTES", [])
+
+    assert mod.main() == 0
+
+    # WKDY has no label override; its Monday-Friday calendar row makes it "Weekday".
+    folder = tmp_path / "weekday_sid_WKDY"
+    assert sorted(p.name for p in folder.glob("*.xlsx")) == [
+        f"route_R{n}_schedule_weekday.xlsx" for n in (1, 2, 3)
+    ]
+
+    wb = openpyxl.load_workbook(folder / "route_R3_schedule_weekday.xlsx")
+    assert wb.sheetnames == ["Direction_0"]
+    header, *rows = wb["Direction_0"].iter_rows(values_only=True)
+    # gtfs_basic has no timepoint column, so every stop gets a schedule column.
+    assert header[3:] == (
+        "Robin Hood Rd & Old Mill Rd Schedule",
+        "Main St & Robin Hood Rd Schedule",
+        "Main St & Doe St Schedule",
+        "Doe St & Fordson Rd Schedule",
+    )
+    # One row per trip, in time order.
+    assert [row[:2] for row in rows] == [("R3", "0")] * 3
+    assert [row[3:] for row in rows] == [
+        ("08:00", "08:05", "08:10", "08:15"),
+        ("14:00", "14:05", "14:10", "14:15"),
+        ("18:00", "18:05", "18:10", "18:15"),
+    ]

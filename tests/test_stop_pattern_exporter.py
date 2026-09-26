@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 import openpyxl
@@ -323,3 +324,63 @@ def test_export_patterns_to_excel_writes_real_workbooks(
     # R1's three trips collapse into one pattern starting at 07:00.
     assert len(rows) == 2
     assert rows[1][:6] == ("R1", "0", "WKDY", 1, 3, "07:00")
+
+
+# ---------------------------------------------------------------------------
+# main — full pipeline against gtfs_basic, real xlsx output
+# ---------------------------------------------------------------------------
+
+
+def _gtfs_basic_with_shape_dist(tmp_path: Path) -> Path:
+    """Copy gtfs_basic with stop_times.shape_dist_traveled filled in from shapes.txt.
+
+    gtfs_basic's stop_times carries no distances. Each trip's k-th stop sits on
+    the k-th point of its shape, so that point's shape_dist_traveled (meters) is
+    the stop's distance along the trip.
+    """
+    feed = tmp_path / "gtfs_basic_with_dist"
+    shutil.copytree(FIXTURES / "gtfs_basic", feed)
+    stop_times = pd.read_csv(feed / "stop_times.txt", dtype=str)
+    trips = pd.read_csv(feed / "trips.txt", dtype=str)
+    shapes = pd.read_csv(feed / "shapes.txt", dtype=str).rename(
+        columns={"shape_pt_sequence": "stop_sequence"}
+    )
+    with_dist = stop_times.merge(trips[["trip_id", "shape_id"]], on="trip_id").merge(
+        shapes[["shape_id", "stop_sequence", "shape_dist_traveled"]],
+        on=["shape_id", "stop_sequence"],
+    )
+    assert len(with_dist) == len(stop_times)
+    with_dist.drop(columns="shape_id").to_csv(feed / "stop_times.txt", index=False)
+    return feed
+
+
+def test_main_writes_real_pattern_workbooks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import scripts.gtfs_exports.stop_pattern_exporter as mod
+
+    out_dir = tmp_path / "out"
+    monkeypatch.setattr(mod, "INPUT_DIR", _gtfs_basic_with_shape_dist(tmp_path))
+    monkeypatch.setattr(mod, "OUTPUT_DIR", out_dir)
+
+    assert mod.main() == 0
+
+    # main() reads calendar.txt, so the subfolder names WKDY's service days.
+    folder = out_dir / "calendar_WKDY_mon_tue_wed_thu_fri"
+    signup = mod.SIGNUP_NAME
+    assert sorted(p.name for p in folder.glob("*.xlsx")) == [
+        f"R{n}_WKDY_{signup}.xlsx" for n in (1, 2, 3)
+    ]
+
+    wb = openpyxl.load_workbook(folder / f"R2_WKDY_{signup}.xlsx")
+    header, *rows = wb["Dir0"].iter_rows(values_only=True)
+    assert header[6:] == (
+        "Doe St & Beulah St",
+        "Main St & Doe St",
+        "Main St & Lockheed Blvd",
+        "Main St & Ox Rd",
+        "Lighthouse Blvd & Old Mill Rd",
+    )
+    # One pattern of three trips. Segment distances are 960 / 690 / 690 / 900 m
+    # of shape_dist_traveled, converted to miles.
+    assert rows == [("R2", "0", "WKDY", 1, 3, "07:30", "-", "0.60", "0.43", "0.43", "0.56")]

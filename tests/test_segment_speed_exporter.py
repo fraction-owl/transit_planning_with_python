@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 import openpyxl
@@ -309,3 +310,64 @@ def test_export_excel_writes_real_workbook(tmp_path: Path, monkeypatch: pytest.M
     assert rows[1][1] == "07:00"
     assert rows[1][2] == "07:00"
     assert rows[1][3] == pytest.approx(6.0, rel=0.01)
+
+
+# ---------------------------------------------------------------------------
+# main — full pipeline against gtfs_basic, real xlsx output
+# ---------------------------------------------------------------------------
+
+
+def _gtfs_basic_with_shape_dist(tmp_path: Path) -> Path:
+    """Copy gtfs_basic with stop_times.shape_dist_traveled filled in from shapes.txt.
+
+    gtfs_basic's stop_times carries no distances. Each trip's k-th stop sits on
+    the k-th point of its shape, so that point's shape_dist_traveled (meters) is
+    the stop's distance along the trip.
+    """
+    feed = tmp_path / "gtfs_basic_with_dist"
+    shutil.copytree(FIXTURES / "gtfs_basic", feed)
+    stop_times = pd.read_csv(feed / "stop_times.txt", dtype=str)
+    trips = pd.read_csv(feed / "trips.txt", dtype=str)
+    shapes = pd.read_csv(feed / "shapes.txt", dtype=str).rename(
+        columns={"shape_pt_sequence": "stop_sequence"}
+    )
+    with_dist = stop_times.merge(trips[["trip_id", "shape_id"]], on="trip_id").merge(
+        shapes[["shape_id", "stop_sequence", "shape_dist_traveled"]],
+        on=["shape_id", "stop_sequence"],
+    )
+    assert len(with_dist) == len(stop_times)
+    with_dist.drop(columns="shape_id").to_csv(feed / "stop_times.txt", index=False)
+    return feed
+
+
+def test_main_writes_real_speed_workbooks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import scripts.gtfs_exports.segment_speed_exporter as mod
+
+    out_dir = tmp_path / "out"
+    monkeypatch.setattr(mod, "GTFS_FOLDER", _gtfs_basic_with_shape_dist(tmp_path))
+    monkeypatch.setattr(mod, "OUTPUT_FOLDER", out_dir)
+    monkeypatch.setattr(mod, "FILTER_IN_ROUTE_SHORT_NAMES", [])
+    monkeypatch.setattr(mod, "FILTER_IN_SERVICE_IDS", ["WKDY"])
+
+    assert mod.main() == 0
+
+    names = sorted(p.name for p in out_dir.glob("*.xlsx"))
+    assert names == [f"route_R{n}_calWKDY_speed_table.xlsx" for n in (1, 2, 3)]
+
+    wb = openpyxl.load_workbook(out_dir / "route_R2_calWKDY_speed_table.xlsx")
+    assert wb.sheetnames == ["Dir_0"]
+    header, *rows = wb["Dir_0"].iter_rows(values_only=True)
+    assert header[4:] == (
+        "Doe St & Beulah St (1007)",
+        "Main St & Doe St (1003)",
+        "Main St & Lockheed Blvd (1004)",
+        "Main St & Ox Rd (1005)",
+        "Lighthouse Blvd & Old Mill Rd (1008)",
+    )
+    # R2's three trips share one pattern and speed profile, so they form one band.
+    assert len(rows) == 1
+    assert rows[0][1:3] == ("07:30", "17:30")
+    # Every segment takes 5 minutes, so the 960 m and 900 m end segments run
+    # faster than the 690 m middle ones. (Column 0, the pattern hash, varies by
+    # process.)
+    assert rows[0][3:] == (6.0, MISSING_VAL, 7.2, 5.1, 5.1, 6.7)

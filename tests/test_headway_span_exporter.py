@@ -9,6 +9,8 @@ import pytest
 
 import scripts.gtfs_exports.headway_span_exporter as target
 
+GTFS_BASIC = Path(__file__).parent / "fixtures" / "gtfs_basic"
+
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
@@ -311,3 +313,22 @@ def test_resolve_service_ids_rejects_malformed_service_date() -> None:
     calendar = _calendar_df()
     with pytest.raises(ValueError, match="SERVICE_DATE"):
         target.resolve_service_ids(calendar, None, "weekday", "2026-09-07")
+
+
+# ---------------------------------------------------------------------------
+# main — full pipeline against gtfs_basic
+# ---------------------------------------------------------------------------
+
+
+def test_main_end_to_end_on_gtfs_basic(tmp_path: Path) -> None:
+    out_csv = tmp_path / "headway_span_by_route.csv"
+    argv = ["--gtfs-folder", str(GTFS_BASIC), "--output", str(out_csv), "--service-day", "weekday"]
+    assert target.main(argv) == 0
+
+    result = pd.read_csv(out_csv).set_index("route_id")
+    assert result.index.tolist() == ["R1", "R2", "R3"]
+    assert result["trip_count"].tolist() == [3, 3, 3]
+    # Every route's first and last trips start 10 hours apart. R3's uneven
+    # 6 h and 4 h gaps (08:00, 14:00, 18:00) still average 300 minutes.
+    assert result["span_hrs"].tolist() == [10.0, 10.0, 10.0]
+    assert result["avg_headway_min"].tolist() == [300.0, 300.0, 300.0]
