@@ -1053,6 +1053,166 @@ def test_attach_demographics_uses_pop20_and_disaggregates() -> None:
     assert result["low_income"].tolist() == pytest.approx([0.0, 4.0, 12.0])  # 16 split by HOUSING20
 
 
+def _three_blocks(housing_units: list[int], population: list[int]) -> gpd.GeoDataFrame:
+    return gpd.GeoDataFrame(
+        {
+            "GEOID20": ["110010001001001", "110010001001002", "110010001001003"],
+            "POP20": population,
+            "HOUSING20": housing_units,
+            "geometry": [Point(0, 0), Point(1, 1), Point(2, 2)],
+        },
+        crs="EPSG:4326",
+    )
+
+
+def test_build_block_households_keeps_block_rows(tmp_path: Path) -> None:
+    path = tmp_path / "DECENNIALDHC2020.H9-Data.csv"
+    _write_plain_csv(
+        path,
+        _census_csv(
+            "GEO_ID,NAME,H9_001N",
+            "Geography,Geographic Area Name,!!Total:",
+            "1000000US110010001001001,Block 1001,30",
+            "1000000US240310001001001,Block 1001 (MD),12",
+            f"{_TRACT_GEO_ID},Tract 1,500",
+        ),
+    )
+    out = mod.build_block_households([str(path)], county_fips_filter=["11001"])
+    assert out["block_fips"].tolist() == ["110010001001001"]
+    assert out["households"].tolist() == [30]
+
+
+def test_attach_demographics_uses_h9_households_over_housing_units(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # H9 covers two of three blocks: those take households (occupied units); the third
+    # falls back to HOUSING20 with a warning. Household counts split by total_hh.
+    blocks = _three_blocks(housing_units=[40, 120, 10], population=[100, 300, 20])
+    households = pd.DataFrame(
+        {"block_fips": ["110010001001001", "110010001001002"], "households": [30, 90]}
+    )
+    tract_attrs = pd.DataFrame({"tract_fips": ["11001000100"], "low_income": [26.0]})
+    with caplog.at_level(logging.WARNING):
+        result = mod.attach_demographics_to_blocks(
+            blocks, tract_attrs, None, block_households=households
+        ).sort_values("GEOID20")
+    assert result["total_hh"].tolist() == [30.0, 90.0, 10.0]
+    assert result["low_income"].tolist() == pytest.approx([6.0, 18.0, 2.0])
+    assert "1 of 3 block(s) have no H9 household count" in caplog.text
+
+
+def test_attach_demographics_warns_on_housing_unit_proxy(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    blocks = _three_blocks(housing_units=[40, 120, 0], population=[100, 300, 0])
+    with caplog.at_level(logging.WARNING):
+        result = mod.attach_demographics_to_blocks(blocks, pd.DataFrame(), None)
+    assert sorted(result["total_hh"]) == [0.0, 40.0, 120.0]
+    assert "vacant ones included" in caplog.text
+
+
+def test_attach_demographics_full_tract_recovers_acs_total() -> None:
+    # Review example: 400 low-income households of 1,000 ACS households, but 800
+    # households in the 2020 block counts. Count allocation keeps the ACS figure.
+    blocks = _three_blocks(housing_units=[250, 350, 300], population=[500, 700, 600])
+    households = pd.DataFrame(
+        {
+            "block_fips": ["110010001001001", "110010001001002", "110010001001003"],
+            "households": [200, 300, 300],
+        }
+    )
+    tract_attrs = pd.DataFrame({"tract_fips": ["11001000100"], "low_income": [400.0]})
+    result = mod.attach_demographics_to_blocks(
+        blocks, tract_attrs, None, block_households=households
+    )
+    assert result["low_income"].sum() == pytest.approx(400.0)
+
+
+def test_attach_demographics_splits_every_tract_count() -> None:
+    # Component counts (race groups, income bands) are split too, by the universe of
+    # their table: people by population, households by households.
+    blocks = _three_blocks(housing_units=[40, 120, 0], population=[100, 300, 0])
+    tract_attrs = pd.DataFrame(
+        {"tract_fips": ["11001000100"], "white": [80.0], "sub_10k": [16.0], "all_hhs": [160.0]}
+    )
+    result = mod.attach_demographics_to_blocks(blocks, tract_attrs, None).sort_values("POP20")
+    assert result["white"].tolist() == pytest.approx([0.0, 20.0, 60.0])
+    assert result["sub_10k"].tolist() == pytest.approx([0.0, 4.0, 12.0])
+    assert result["all_hhs"].sum() == pytest.approx(160.0)
+
+
+def test_build_joined_table_splits_household_counts_by_population_without_h9(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Legacy block-level path with no H9 table: household counts cannot be split by
+    # households, so they are split by population (warned) instead of being repeated.
+    pop_path = tmp_path / "P1-Data.csv"
+    _write_plain_csv(
+        pop_path,
+        _census_csv(
+            "GEO_ID,NAME,P1_001N",
+            "Geo,Name,!!Total:",
+            "1000000US110010001001001,Block,100",
+            "1000000US110010001001002,Block,300",
+        ),
+    )
+    bands = ",".join(f"B19001_{n:03d}E" for n in range(1, 12))
+    income_path = tmp_path / "B19001-Data.csv"
+    _write_plain_csv(
+        income_path,
+        _census_csv(
+            f"GEO_ID,NAME,{bands}",
+            "Geo,Name," + ",".join(["l"] * 11),
+            f"{_TRACT_GEO_ID},Tract," + ",".join(["4"] * 11),
+        ),
+    )
+    with caplog.at_level(logging.WARNING):
+        df = mod.build_joined_table(
+            pop_files=[str(pop_path)],
+            hh_files=[],
+            jobs_files=[],
+            income_files=[str(income_path)],
+        ).sort_values("total_pop")
+    assert df["low_income"].tolist() == pytest.approx([10.0, 30.0])  # 40 split 1:3
+    assert df["sub_10k"].sum() == pytest.approx(4.0)
+    assert "split across blocks by population" in caplog.text
+
+
+def test_run_takes_households_from_block_h9(tmp_path: Path) -> None:
+    csv_dir = tmp_path / "census"
+    csv_dir.mkdir()
+    shp_dir = tmp_path / "tiger"
+    shp_dir.mkdir()
+    shutil.copy(FIXTURE_DIR / FIXTURE_ZIPS[0], shp_dir / FIXTURE_ZIPS[0])
+    # Two of the DC fixture blocks, with fewer households than housing units.
+    _write_plain_csv(
+        csv_dir / "DECENNIALDHC2020.H9-Data.csv",
+        _census_csv(
+            "GEO_ID,NAME,H9_001N",
+            "Geography,Geographic Area Name,!!Total:",
+            "1000000US110010022021001,Block A,200",
+            "1000000US110010076032005,Block B,120",
+        ),
+    )
+    out = tmp_path / "out" / "blocks.gpkg"
+    assert (
+        mod.run(
+            input_csv_dir=str(csv_dir),
+            input_shp_dir=str(shp_dir),
+            final_joined_features=str(out),
+            tiger_input_glob="tl_*_*_*.shp",  # the fixture archives carry a _sample suffix
+            fips_to_filter=["11001"],
+            intermediate_combined_csv="",
+            intermediate_merged_shp="",
+        )
+        == 0
+    )
+    result = gpd.read_file(out).set_index("GEOID20")
+    assert result.loc["110010022021001", "total_hh"] == 200  # H9, not HOUSING20 (233)
+    assert result.loc["110010076032005", "total_hh"] == 120  # H9, not HOUSING20 (125)
+    assert result.loc["110010049013000", "total_hh"] == 46  # no H9 row: HOUSING20
+
+
 def test_attach_demographics_joins_block_jobs_and_fills_unmatched() -> None:
     blocks = gpd.GeoDataFrame(
         {
