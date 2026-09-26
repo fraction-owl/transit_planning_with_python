@@ -22,6 +22,7 @@ downloads with ``dev_tools/build_schools_fixtures.py``.
 from __future__ import annotations
 
 import shutil
+import zipfile
 from pathlib import Path
 
 import geopandas as gpd
@@ -120,6 +121,35 @@ def test_slug_empty_falls_back_to_unknown() -> None:
 
 
 # =============================================================================
+# _find_one
+# =============================================================================
+
+
+def test_find_one_raises_when_nothing_matches(tmp_path: Path) -> None:
+    (tmp_path / "unrelated.csv").touch()
+    with pytest.raises(FileNotFoundError, match="ccd_sch_052"):
+        mod._find_one(tmp_path, "ccd_sch_052_*.zip")
+
+
+def test_find_one_raises_on_multiple_matches(tmp_path: Path) -> None:
+    # Two vintages staged side by side is ambiguous, so refuse to pick one.
+    for year in ("1920", "2021"):
+        (tmp_path / f"ccd_sch_052_{year}.zip").touch()
+    with pytest.raises(ValueError, match="Multiple files"):
+        mod._find_one(tmp_path, "ccd_sch_052_*.zip")
+
+
+def test_find_one_searches_subfolders_only_when_recursive(tmp_path: Path) -> None:
+    nested = tmp_path / "EDGE_GEOCODE_PUBLICSCH_1920"
+    nested.mkdir()
+    shp = nested / "EDGE_GEOCODE_PUBLICSCH_1920.shp"
+    shp.touch()
+    with pytest.raises(FileNotFoundError):
+        mod._find_one(tmp_path, "*.shp")
+    assert mod._find_one(tmp_path, "*.shp", recursive=True) == shp
+
+
+# =============================================================================
 # _match_col
 # =============================================================================
 
@@ -206,6 +236,45 @@ def test_load_elsi_wide_private_uses_ppin_key(elsi_only_dir: Path) -> None:
 
 
 # =============================================================================
+# _load_ccd_long
+# =============================================================================
+
+
+def _write_ccd_zip(path: Path, rows: list[tuple[str, str, str, str]]) -> Path:
+    """Write a ``ccd_sch_052`` zip from (NCESSCH, TOTAL_INDICATOR, GRADE, STUDENT_COUNT) rows."""
+    header = "SCHOOL_YEAR,FIPST,NCESSCH,TOTAL_INDICATOR,GRADE,STUDENT_COUNT\n"
+    body = "".join(f"2019-2020,51,{','.join(row)}\n" for row in rows)
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("ccd_sch_052_1920_l_1a_test.csv", header + body)
+    return path
+
+
+def test_load_ccd_long_nulls_letter_flags_and_sentinels(tmp_path: Path) -> None:
+    zip_path = _write_ccd_zip(
+        tmp_path / "ccd_sch_052_1920_test.zip",
+        [
+            ("510000000001", "Education Unit Total", "No Category Codes", "300"),
+            ("510000000001", "Subtotal 4 - By Grade", "Grade 1", "140"),
+            ("510000000001", "Subtotal 4 - By Grade", "Grade 2", "M"),  # letter flag
+            # Detail categories are not totals and must not be summed in.
+            ("510000000001", "Category Set A - By Race/Ethnicity; Sex; Grade", "Grade 1", "70"),
+            ("510000000002", "Education Unit Total", "No Category Codes", "-9"),  # sentinel
+            ("510000000002", "Subtotal 4 - By Grade", "Grade 1", "90"),
+            ("510000000002", "Subtotal 4 - By Grade", "Grade 2", "85"),
+        ],
+    )
+    df = mod._load_ccd_long(zip_path, "NCESSCH").set_index("NCESSCH")
+
+    assert set(df.columns) == {"enroll_total", "g_grade_1", "g_grade_2"}
+    assert df.loc["510000000001", "enroll_total"] == 300
+    assert df.loc["510000000001", "g_grade_1"] == 140
+    assert df.loc["510000000002", "g_grade_2"] == 85
+    # Flags and sentinels are unknown counts: NaN, never 0.
+    assert pd.isna(df.loc["510000000001", "g_grade_2"])
+    assert pd.isna(df.loc["510000000002", "enroll_total"])
+
+
+# =============================================================================
 # _find_elsi_csv
 # =============================================================================
 
@@ -268,7 +337,7 @@ def test_enrollment_ccd_nulls_negative_sentinel(staged_dir: Path) -> None:
     # The CCD fixture has a Grade 5 row of -2 for 510267002843; it must not count.
     df = mod.load_enrollment_wide(staged_dir, "public", source="ccd")
     val = df.set_index("NCESSCH").loc["510267002843", "g_grade_5"]
-    assert pd.isna(val) or val == 0  # sentinel nulled, not summed as -2
+    assert pd.isna(val)  # sentinel nulled, not summed as -2 or reported as 0
 
 
 def test_enrollment_ccd_for_private_raises(staged_dir: Path) -> None:
@@ -290,6 +359,16 @@ def test_enrollment_invalid_source_raises(staged_dir: Path) -> None:
 def test_enrollment_missing_source_raises(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
         mod.load_enrollment_wide(tmp_path, "public")
+
+
+@pytest.mark.parametrize("source", ["auto", "ccd"])
+def test_enrollment_district_file_only_raises_with_hint(tmp_path: Path, source: str) -> None:
+    # ccd_lea_052 is the district-level membership file, keyed on LEAID; it cannot
+    # join to school points, so the error should name the school-level file.
+    (tmp_path / "ccd_lea_052_1920_l_1a_083120.zip").touch()
+    with pytest.raises(FileNotFoundError, match="district-level file") as excinfo:
+        mod.load_enrollment_wide(tmp_path, "public", source=source)
+    assert "ccd_sch_052" in str(excinfo.value)
 
 
 # =============================================================================
@@ -378,8 +457,6 @@ def test_load_school_points_handles_nested_geocode_zip(tmp_path: Path) -> None:
     # archive, so the .shp sits one level below the extraction root. Repack the
     # public geocode that way and confirm the (recursive) shp search still finds
     # it instead of raising FileNotFoundError.
-    import zipfile
-
     flat = FIXTURE_DIR / "EDGE_GEOCODE_PUBLICSCH_1920_sample.zip"
     staged = tmp_path / "schools_in"
     staged.mkdir()
@@ -390,6 +467,23 @@ def test_load_school_points_handles_nested_geocode_zip(tmp_path: Path) -> None:
 
     gdf = mod.load_school_points(staged, "public")
     assert set(gdf["NCESSCH"]) == PUBLIC_POINT_IDS
+
+
+def test_load_school_points_assumes_nad83_without_prj(staged_dir: Path, tmp_path: Path) -> None:
+    # A geocode shipped without its .prj reads as CRS-less; the loader assumes
+    # NAD83 (EPSG:4269), so the points must land where the NAD83 .prj puts them.
+    flat = FIXTURE_DIR / "EDGE_GEOCODE_PUBLICSCH_1920_sample.zip"
+    no_prj = tmp_path / "no_prj_in"
+    no_prj.mkdir()
+    with zipfile.ZipFile(flat) as src, zipfile.ZipFile(no_prj / flat.name, "w") as dst:
+        for name in src.namelist():
+            if not name.endswith(".prj"):
+                dst.writestr(name, src.read(name))
+
+    got = mod.load_school_points(no_prj, "public")
+    expected = mod.load_school_points(staged_dir, "public")
+    assert got.crs.to_epsg() == mod.OUTPUT_CRS
+    assert got.geometry.geom_equals_exact(expected.geometry, tolerance=1e-6).all()
 
 
 def test_load_school_points_no_matching_states_raises(staged_dir: Path) -> None:
@@ -423,8 +517,9 @@ def test_join_left_keeps_all_points_and_flags_matches(
         out = mod.join_and_validate(points, enroll, id_col="NCESSCH")
     assert len(out) == 3
     assert out["enroll_total"].notna().sum() == 2  # A, B matched; C not
-    assert any("no enrollment row" in r.getMessage() for r in caplog.records)
-    assert any("no matching point" in r.getMessage() for r in caplog.records)
+    messages = [r.getMessage() for r in caplog.records]
+    assert any(m.startswith("1 points have no enrollment row") for m in messages)  # C
+    assert any(m.startswith("1 enrollment rows have no matching point") for m in messages)  # Z
 
 
 def test_join_real_public_elsi_overlap(staged_dir: Path) -> None:
@@ -447,8 +542,11 @@ def test_run_public_elsi_writes_outputs(staged_dir: Path, tmp_path: Path) -> Non
     csv_path = out_dir / "va_md_dc_public_schools_enrollment.csv"
     assert gpkg.exists() and csv_path.exists()
     assert isinstance(gdf, gpd.GeoDataFrame)
-    assert len(gpd.read_file(gpkg)) == len(PUBLIC_POINT_IDS)
-    assert "geometry" not in pd.read_csv(csv_path).columns
+    assert gpd.list_layers(gpkg)["name"].tolist() == [mod.OUTPUT_LAYER]
+    assert len(gpd.read_file(gpkg, layer=mod.OUTPUT_LAYER)) == len(PUBLIC_POINT_IDS)
+    csv_cols = set(pd.read_csv(csv_path).columns)
+    assert {"NCESSCH", "enroll_total", "g_grades_1_8", "g_grades_9_12"} <= csv_cols
+    assert "geometry" not in csv_cols
 
 
 def test_run_private_writes_separate_layer(staged_dir: Path, tmp_path: Path) -> None:

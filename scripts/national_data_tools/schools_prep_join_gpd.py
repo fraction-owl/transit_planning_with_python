@@ -359,14 +359,16 @@ def _load_ccd_long(zip_path: Path, id_col: str) -> pd.DataFrame:
     mem["count"] = pd.to_numeric(mem["STUDENT_COUNT"], errors="coerce")
     mem.loc[mem["count"] < 0, "count"] = pd.NA  # null -1/-2/-9 sentinels
 
+    # min_count=1 keeps an all-missing total NaN; a plain sum would report it as 0.
     totals = (
         mem.loc[mem["TOTAL_INDICATOR"] == EDU_TOTAL]
         .groupby(id_col, as_index=False)["count"]
-        .sum()
+        .sum(min_count=1)
         .rename(columns={"count": "enroll_total"})
     )
 
-    by_grade = mem.loc[mem["TOTAL_INDICATOR"] == GRADE_SUBTOTAL]
+    # Same reason: drop unknown counts first so they pivot to NaN, not 0.
+    by_grade = mem.loc[(mem["TOTAL_INDICATOR"] == GRADE_SUBTOTAL) & mem["count"].notna()]
     wide = (
         by_grade.pivot_table(index=id_col, columns="GRADE", values="count", aggfunc="sum")
         .rename(columns=lambda c: f"g_{_slug(c)}")
