@@ -14,7 +14,7 @@ independent choices:
       taken from GTFS ``shapes.txt``.
     - ``"isochrone"``: a walk-time isochrone (walkshed) around each stop: the
       pedestrian-network segments reachable within the walk-time budget,
-      buffered by ``ISOCHRONE_EDGE_BUFFER_M``.
+      buffered by ``ISOCHRONE_EDGE_BUFFER_FT``.
 
 In ``"route"`` mode each route is labeled by ``service_type``
 (``"express"``/``"local"``) and ``express_direction``
@@ -28,11 +28,13 @@ independently; bidirectional routes keep both ends. See the express settings in
 the CONFIGURATION block.
 
 Intended for use in Jupyter notebooks with appropriate EPSG settings. The
-projected CRS (``CRS_EPSG_CODE``) must use **metres** as its linear unit,
-matching the miles-to-metres conversions used throughout; this is checked at
-startup, and a CRS that distorts distances by more than 2% at the feed's
-location (e.g. World Mercator away from the equator) triggers a warning. Stops,
-route shapes, and demographics are all built in that one CRS.
+projected CRS (``CRS_EPSG_CODE``, default NAD83 / Maryland in US survey feet)
+may use any linear unit: buffer distances (miles), walk speed, isochrone
+settings (feet), and acreage are converted with the CRS's own unit. A CRS that
+is not projected is rejected at startup, and one that distorts distances by
+more than 2% at the feed's location (e.g. World Mercator away from the equator)
+triggers a warning. Stops, route shapes, and demographics are all built in that
+one CRS.
 
 Typical inputs:
     - GTFS folder containing: trips.txt, stop_times.txt, routes.txt,
@@ -231,13 +233,13 @@ EXPRESS_EMPLOYMENT_FIELDS: list[str] = ["tot_empl", "low_wage", "mid_wage", "hig
 ISOCHRONE_WALK_TIME_MIN = 10.0  # Walk-time budget in minutes
 WALK_SPEED_MPH = 3.0  # Assumed pedestrian walking speed
 # The walkshed is the pedestrian-network segments reachable within the walk-time
-# budget, buffered by ISOCHRONE_EDGE_BUFFER_M metres to take in the land fronting
+# budget, buffered by ISOCHRONE_EDGE_BUFFER_FT feet to take in the land fronting
 # them (roughly a lot depth). Larger values widen the walkshed along every street.
-ISOCHRONE_EDGE_BUFFER_M = 50.0
-# Farthest (metres) a stop may sit from the pedestrian network. A stop with no
+ISOCHRONE_EDGE_BUFFER_FT = 150.0
+# Farthest (feet) a stop may sit from the pedestrian network. A stop with no
 # network segment this close is skipped with a warning rather than snapped across
 # a gap; the straight-line walk onto the network is charged against the budget.
-ISOCHRONE_MAX_SNAP_M = 100.0
+ISOCHRONE_MAX_SNAP_FT = 300.0
 
 # Optional FIPS filter (list of codes). Empty list = no filter.
 FIPS_FILTER: list[str] = []  # Replace with FIPS code(s) for desired jurisdictions (e.g. "11001")
@@ -275,8 +277,10 @@ SYNTHETIC_FIELDS = [
     "cmt_timed",  # commuters behind cmt_pmin (mean travel time = cmt_pmin / cmt_timed)
 ]
 
-# EPSG code for projected coordinate system used in area calculations
-CRS_EPSG_CODE = 3395  # Replace with EPSG for your study area
+# EPSG code of the projected CRS used for buffers and areas. Any linear unit works:
+# distances are converted with the CRS's own unit. Default: NAD83 / Maryland (ftUS),
+# the state plane zone Washington, DC uses. Replace with one for your study area.
+CRS_EPSG_CODE = 2248
 
 # GTFS files always required
 REQUIRED_GTFS_FILES = [
@@ -291,8 +295,10 @@ REQUIRED_GTFS_FILES = [
 # Loaded opportunistically; if absent the method falls back to "stop_buffer".
 ROUTE_GEOMETRY_GTFS_FILE = "shapes.txt"
 
-# Conversion factor: metres per mile (the projected CRS is assumed metric).
+# Conversion factors to metres; each CRS's own unit is then derived from pyproj.
 METERS_PER_MILE: Final[float] = 1609.34
+METERS_PER_FOOT: Final[float] = 0.3048
+SQ_METERS_PER_ACRE: Final[float] = 4046.86
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
 
@@ -310,11 +316,12 @@ LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
 MAX_CRS_SCALE_ERROR: Final[float] = 0.02
 
 
-def validate_metric_crs(crs_epsg_code: int) -> CRS:
-    """Return the CRS for *crs_epsg_code*, rejecting any not projected in metres.
+def validate_projected_crs(crs_epsg_code: int) -> CRS:
+    """Return the CRS for *crs_epsg_code*, rejecting any that is not projected.
 
-    Buffer radii (``miles * METERS_PER_MILE``), the isochrone walk distance, and
-    the acre conversion (``area / 4046.86``) all treat one CRS unit as one metre.
+    Buffer radii, the isochrone walk distance, and acreage are converted with the
+    CRS's own linear unit (see :func:`crs_metres_per_unit`), so feet and metres both
+    work; a geographic CRS (degrees) cannot be used for either.
 
     Args:
         crs_epsg_code: EPSG code of the analysis CRS.
@@ -323,24 +330,47 @@ def validate_metric_crs(crs_epsg_code: int) -> CRS:
         The parsed :class:`pyproj.CRS`.
 
     Raises:
-        ValueError: If the CRS is geographic, or its linear unit is not the metre
-            (e.g. a US-foot state plane zone).
+        ValueError: If the CRS is not projected or has no linear axis unit.
     """
     crs = CRS.from_epsg(crs_epsg_code)
-    if not crs.is_projected:
+    if not crs.is_projected or not crs.axis_info:
         raise ValueError(
             f"CRS_EPSG_CODE EPSG:{crs_epsg_code} ({crs.name}) is not a projected CRS; "
-            "buffers and areas need a projected CRS in metres."
+            "buffers and areas need one (e.g. a state plane zone or a UTM zone)."
         )
-    axis = crs.axis_info[0] if crs.axis_info else None
-    if axis is None or abs(axis.unit_conversion_factor - 1.0) > 1e-9:
-        unit = axis.unit_name if axis is not None else "unknown"
-        raise ValueError(
-            f"CRS_EPSG_CODE EPSG:{crs_epsg_code} ({crs.name}) is in '{unit}' units, but "
-            "this script's buffer distances and area conversions assume metres. Choose a "
-            "metre-based projected CRS (e.g. a UTM zone or a metric state plane zone)."
-        )
+    logging.info(
+        "Analysis CRS: EPSG:%s (%s), linear unit '%s'.",
+        crs_epsg_code,
+        crs.name,
+        crs.axis_info[0].unit_name,
+    )
     return crs
+
+
+def crs_metres_per_unit(crs: Any) -> float:
+    """Return metres per linear unit of *crs* (1.0 for metres, ~0.3048 for feet).
+
+    A missing CRS (``None``) is treated as metres, the historical assumption.
+
+    Raises:
+        ValueError: If *crs* is set but is not a projected CRS.
+    """
+    if crs is None:
+        return 1.0
+    parsed = CRS.from_user_input(crs)
+    if not parsed.is_projected or not parsed.axis_info:
+        raise ValueError(f"{parsed.name} is not a projected CRS; distances need one.")
+    return float(parsed.axis_info[0].unit_conversion_factor)
+
+
+def crs_units_per_mile(crs: Any) -> float:
+    """Return how many linear units of *crs* make one mile."""
+    return METERS_PER_MILE / crs_metres_per_unit(crs)
+
+
+def crs_acres_per_square_unit(crs: Any) -> float:
+    """Return the acreage of one square linear unit of *crs*."""
+    return crs_metres_per_unit(crs) ** 2 / SQ_METERS_PER_ACRE
 
 
 def warn_if_distorted_crs(
@@ -349,7 +379,7 @@ def warn_if_distorted_crs(
     """Warn when *crs* noticeably distorts distances at (*lon*, *lat*).
 
     Args:
-        crs: Analysis CRS (projected, metres).
+        crs: Analysis CRS (projected).
         lon: Longitude (WGS 84) of a representative study-area point.
         lat: Latitude (WGS 84) of the same point.
         tolerance: Largest relative scale error accepted silently.
@@ -364,7 +394,7 @@ def warn_if_distorted_crs(
             "%s distorts distances by up to %.1f%% (areas by %.1f%%) at the study area "
             "(lat %.3f, lon %.3f), so buffer radii and walk distances measured in it are off "
             "by that much on the ground. Set CRS_EPSG_CODE / --crs-epsg to a local projected "
-            "CRS in metres (a UTM zone or a metric state plane zone).",
+            "CRS (e.g. a state plane zone or a UTM zone).",
             crs.name,
             worst * 100.0,
             abs(factors.areal_scale - 1.0) * 100.0,
@@ -761,15 +791,15 @@ def build_walk_isochrone(
     *,
     walk_time_min: float,
     walk_speed_units_per_s: float,
-    edge_buffer: Optional[float] = None,
-    max_snap_distance: Optional[float] = None,
+    edge_buffer_ft: Optional[float] = None,
+    max_snap_ft: Optional[float] = None,
 ) -> Optional[gpd.GeoDataFrame]:
     """Build a network walkshed (walk-time isochrone) around the given stop points.
 
     The walkshed is made of the pedestrian-network segments reachable within the
     budget, so it cannot cross a barrier or reach a disconnected street:
 
-    1. Each stop snaps to the nearest network segment within *max_snap_distance*;
+    1. Each stop snaps to the nearest network segment within *max_snap_ft*;
        stops farther than that from any segment are skipped with a warning. The
        straight-line walk onto the network is charged against the budget.
     2. Dijkstra runs over segment lengths from the snap point, out to the budget
@@ -777,7 +807,7 @@ def build_walk_isochrone(
     3. Every segment is kept in full when walkable end to end, or cut to the
        portion walkable from each reached end with the budget left there.
     4. The kept segments (plus each stop's access walk) are buffered by
-       *edge_buffer* to take in the land fronting them, and dissolved.
+       *edge_buffer_ft* to take in the land fronting them, and dissolved.
 
     Args:
         stop_points_gdf: Stop *point* geometry in the projected CRS.
@@ -785,17 +815,22 @@ def build_walk_isochrone(
             (edges carry ``geometry`` and ``length``; nodes carry ``x``/``y``).
         walk_time_min: Walk-time budget in minutes.
         walk_speed_units_per_s: Walking speed in projected-CRS units per second.
-        edge_buffer: Buffer around reachable segments, in CRS units. ``None``
-            uses ``ISOCHRONE_EDGE_BUFFER_M``.
-        max_snap_distance: Farthest a stop may sit from the network, in CRS
-            units. ``None`` uses ``ISOCHRONE_MAX_SNAP_M``.
+        edge_buffer_ft: Buffer around reachable segments, in feet. ``None`` uses
+            ``ISOCHRONE_EDGE_BUFFER_FT``.
+        max_snap_ft: Farthest a stop may sit from the network, in feet. ``None``
+            uses ``ISOCHRONE_MAX_SNAP_FT``.
 
     Returns:
         A single-row GeoDataFrame holding the dissolved walkshed polygon, or
         ``None`` if nothing was reachable.
     """
-    edge_buffer = ISOCHRONE_EDGE_BUFFER_M if edge_buffer is None else edge_buffer
-    max_snap_distance = ISOCHRONE_MAX_SNAP_M if max_snap_distance is None else max_snap_distance
+    units_per_ft = METERS_PER_FOOT / crs_metres_per_unit(stop_points_gdf.crs)
+    edge_buffer = units_per_ft * (
+        ISOCHRONE_EDGE_BUFFER_FT if edge_buffer_ft is None else edge_buffer_ft
+    )
+    max_snap_distance = units_per_ft * (
+        ISOCHRONE_MAX_SNAP_FT if max_snap_ft is None else max_snap_ft
+    )
     if ped_graph.number_of_edges() == 0:
         logging.warning("Pedestrian network is empty; cannot build an isochrone.")
         return None
@@ -834,11 +869,11 @@ def build_walk_isochrone(
 
     if unsnapped:
         logging.warning(
-            "%d stop(s) are more than %.0f CRS units from the pedestrian network and were "
-            "left out of the isochrone (raise ISOCHRONE_MAX_SNAP_M if the network is "
-            "offset from the stops).",
+            "%d stop(s) are more than %.0f ft from the pedestrian network and were left "
+            "out of the isochrone (raise ISOCHRONE_MAX_SNAP_FT if the network is offset "
+            "from the stops).",
             unsnapped,
-            max_snap_distance,
+            max_snap_distance / units_per_ft,
         )
     if not pieces:
         logging.warning("No pedestrian-network segments were reachable from the stops.")
@@ -859,8 +894,8 @@ def build_service_area_polygon(
     ped_graph: Optional[nx.MultiGraph] = None,
     walk_time_min: float = 0.0,
     walk_speed_units_per_s: float = 0.0,
-    isochrone_edge_buffer_m: Optional[float] = None,
-    isochrone_max_snap_m: Optional[float] = None,
+    isochrone_edge_buffer_ft: Optional[float] = None,
+    isochrone_max_snap_ft: Optional[float] = None,
 ) -> Optional[gpd.GeoDataFrame]:
     """Build a single dissolved service-area polygon for a set of stops.
 
@@ -882,10 +917,10 @@ def build_service_area_polygon(
         ped_graph: Pedestrian graph for the ``"isochrone"`` method.
         walk_time_min: Walk-time budget (minutes) for the ``"isochrone"`` method.
         walk_speed_units_per_s: Walking speed (CRS units/s) for the isochrone.
-        isochrone_edge_buffer_m: Buffer around reachable network segments (m);
-            ``None`` uses ``ISOCHRONE_EDGE_BUFFER_M``.
-        isochrone_max_snap_m: Farthest a stop may sit from the network (m);
-            ``None`` uses ``ISOCHRONE_MAX_SNAP_M``.
+        isochrone_edge_buffer_ft: Buffer around reachable network segments (ft);
+            ``None`` uses ``ISOCHRONE_EDGE_BUFFER_FT``.
+        isochrone_max_snap_ft: Farthest a stop may sit from the network (ft);
+            ``None`` uses ``ISOCHRONE_MAX_SNAP_FT``.
 
     Returns:
         A single-row GeoDataFrame with the dissolved service area, or ``None``
@@ -903,8 +938,8 @@ def build_service_area_polygon(
                 ped_graph,
                 walk_time_min=walk_time_min,
                 walk_speed_units_per_s=walk_speed_units_per_s,
-                edge_buffer=isochrone_edge_buffer_m,
-                max_snap_distance=isochrone_max_snap_m,
+                edge_buffer_ft=isochrone_edge_buffer_ft,
+                max_snap_ft=isochrone_max_snap_ft,
             )
 
     if method == "route_buffer":
@@ -914,14 +949,17 @@ def build_service_area_polygon(
                 "falling back to stop buffers."
             )
         else:
-            buffered = route_shapes_gdf.geometry.buffer(buffer_distance_mi * METERS_PER_MILE)
+            buffered = route_shapes_gdf.geometry.buffer(
+                buffer_distance_mi * crs_units_per_mile(route_shapes_gdf.crs)
+            )
             area = unary_union(list(buffered.values))
             return gpd.GeoDataFrame(geometry=[area], crs=stop_points_gdf.crs)
 
     # Default / fallback: per-stop buffers, dissolved into one polygon.
     if stop_points_gdf.empty:
         return None
-    buffer_m = stop_points_gdf["stop_id"].map(
+    units_per_mile = crs_units_per_mile(stop_points_gdf.crs)
+    buffer_units = stop_points_gdf["stop_id"].map(
         lambda sid: (
             pick_buffer_distance(
                 sid,
@@ -929,10 +967,10 @@ def build_service_area_polygon(
                 large_buffer=large_buffer_distance_mi,
                 large_buffer_ids=stop_ids_large_buffer,
             )
-            * METERS_PER_MILE
+            * units_per_mile
         )
     )
-    buffered = stop_points_gdf.geometry.buffer(buffer_m)
+    buffered = stop_points_gdf.geometry.buffer(buffer_units)
     area = unary_union(list(buffered.values))
     return gpd.GeoDataFrame(geometry=[area], crs=stop_points_gdf.crs)
 
@@ -956,8 +994,9 @@ def clip_and_calculate_synthetic_fields(
     # ---------------------------------------------------------------
     # 1. Original area (acres) — if not already present
     # ---------------------------------------------------------------
+    acres_per_sq_unit = crs_acres_per_square_unit(demographics_gdf.crs)
     if "area_ac_og" not in demographics_gdf.columns:
-        demographics_gdf["area_ac_og"] = demographics_gdf.geometry.area / 4046.86
+        demographics_gdf["area_ac_og"] = demographics_gdf.geometry.area * acres_per_sq_unit
 
     # ---------------------------------------------------------------
     # 2. Clip to buffer
@@ -967,7 +1006,7 @@ def clip_and_calculate_synthetic_fields(
     # ---------------------------------------------------------------
     # 3. Clipped area + percentage
     # ---------------------------------------------------------------
-    clipped_gdf["area_ac_cl"] = clipped_gdf.geometry.area / 4046.86
+    clipped_gdf["area_ac_cl"] = clipped_gdf.geometry.area * acres_per_sq_unit
     clipped_gdf["area_perc"] = clipped_gdf["area_ac_cl"] / clipped_gdf["area_ac_og"]
 
     # Handle divide-by-zero and NaN without chained-assignment warnings
@@ -1246,8 +1285,8 @@ def do_network_analysis(
     ped_graph: Optional[nx.MultiGraph] = None,
     walk_time_min: float = 0.0,
     walk_speed_units_per_s: float = 0.0,
-    isochrone_edge_buffer_m: Optional[float] = None,
-    isochrone_max_snap_m: Optional[float] = None,
+    isochrone_edge_buffer_ft: Optional[float] = None,
+    isochrone_max_snap_ft: Optional[float] = None,
     express_route_ids: Optional[set[str]] = None,
 ) -> None:
     """Run a single network-wide service-area/clip analysis.
@@ -1277,8 +1316,8 @@ def do_network_analysis(
         ped_graph: Pedestrian network (for the ``isochrone`` method).
         walk_time_min: Walk-time budget in minutes (isochrone method).
         walk_speed_units_per_s: Walking speed in CRS units/s (isochrone method).
-        isochrone_edge_buffer_m: Buffer around reachable segments (isochrone method).
-        isochrone_max_snap_m: Farthest stop-to-network snap (isochrone method).
+        isochrone_edge_buffer_ft: Buffer around reachable segments (isochrone method).
+        isochrone_max_snap_ft: Farthest stop-to-network snap (isochrone method).
         express_route_ids: Express ``route_id`` values. Accepted for a uniform
             dispatch signature but unused here — the ``service_type`` label is a
             per-route output, emitted only by ``do_route_by_route_analysis``.
@@ -1321,8 +1360,8 @@ def do_network_analysis(
         ped_graph=ped_graph,
         walk_time_min=walk_time_min,
         walk_speed_units_per_s=walk_speed_units_per_s,
-        isochrone_edge_buffer_m=isochrone_edge_buffer_m,
-        isochrone_max_snap_m=isochrone_max_snap_m,
+        isochrone_edge_buffer_ft=isochrone_edge_buffer_ft,
+        isochrone_max_snap_ft=isochrone_max_snap_ft,
     )
     if service_area_gdf is None or service_area_gdf.empty:
         logging.info("Could not build a network service area. Aborting network analysis.")
@@ -1500,7 +1539,7 @@ def _catchment_area_share(clipped: gpd.GeoDataFrame, catchment: gpd.GeoDataFrame
     it — the same ``area_perc`` a clip to *catchment* alone would produce.
     """
     geom = unary_union(list(catchment.geometry))
-    inside_ac = clipped.geometry.intersection(geom).area / 4046.86
+    inside_ac = clipped.geometry.intersection(geom).area * crs_acres_per_square_unit(clipped.crs)
     share = inside_ac / clipped["area_ac_og"]
     return share.replace([float("inf"), -float("inf")], 0).fillna(0)
 
@@ -1526,8 +1565,8 @@ def do_route_by_route_analysis(
     ped_graph: Optional[nx.MultiGraph] = None,
     walk_time_min: float = 0.0,
     walk_speed_units_per_s: float = 0.0,
-    isochrone_edge_buffer_m: Optional[float] = None,
-    isochrone_max_snap_m: Optional[float] = None,
+    isochrone_edge_buffer_ft: Optional[float] = None,
+    isochrone_max_snap_ft: Optional[float] = None,
     express_route_ids: Optional[set[str]] = None,
     unidirectional_route_ids: Optional[set[str]] = None,
     employment_fields: Optional[Sequence[str]] = None,
@@ -1680,8 +1719,8 @@ def do_route_by_route_analysis(
                 ped_graph=ped_graph,
                 walk_time_min=walk_time_min,
                 walk_speed_units_per_s=walk_speed_units_per_s,
-                isochrone_edge_buffer_m=isochrone_edge_buffer_m,
-                isochrone_max_snap_m=isochrone_max_snap_m,
+                isochrone_edge_buffer_ft=isochrone_edge_buffer_ft,
+                isochrone_max_snap_ft=isochrone_max_snap_ft,
             )
             if service_area_gdf is None or service_area_gdf.empty:
                 logging.info(
@@ -1764,8 +1803,8 @@ def do_stop_by_stop_analysis(
     ped_graph: Optional[nx.MultiGraph] = None,
     walk_time_min: float = 0.0,
     walk_speed_units_per_s: float = 0.0,
-    isochrone_edge_buffer_m: Optional[float] = None,
-    isochrone_max_snap_m: Optional[float] = None,
+    isochrone_edge_buffer_ft: Optional[float] = None,
+    isochrone_max_snap_ft: Optional[float] = None,
     express_route_ids: Optional[set[str]] = None,
 ) -> None:
     """Compute a service area and demographic catchment for each stop.
@@ -1825,8 +1864,8 @@ def do_stop_by_stop_analysis(
             ped_graph=ped_graph,
             walk_time_min=walk_time_min,
             walk_speed_units_per_s=walk_speed_units_per_s,
-            isochrone_edge_buffer_m=isochrone_edge_buffer_m,
-            isochrone_max_snap_m=isochrone_max_snap_m,
+            isochrone_edge_buffer_ft=isochrone_edge_buffer_ft,
+            isochrone_max_snap_ft=isochrone_max_snap_ft,
         )
         if service_area_gdf is None or service_area_gdf.empty:
             logging.info("Could not build a service area for stop %s - skipping.", stop_id_str)
@@ -2120,8 +2159,8 @@ def run(
     express_origin_stops_file: str | Path | None = None,
     isochrone_walk_time_min: float | None = None,
     walk_speed_mph: float | None = None,
-    isochrone_edge_buffer_m: float | None = None,
-    isochrone_max_snap_m: float | None = None,
+    isochrone_edge_buffer_ft: float | None = None,
+    isochrone_max_snap_ft: float | None = None,
     fips_filter: Sequence[str] | None = None,
     crs_epsg_code: int | None = None,
     express_route_ids: Sequence[str] | None = None,
@@ -2185,11 +2224,11 @@ def run(
         ISOCHRONE_WALK_TIME_MIN if isochrone_walk_time_min is None else isochrone_walk_time_min
     )
     walk_speed_mph = WALK_SPEED_MPH if walk_speed_mph is None else walk_speed_mph
-    isochrone_edge_buffer_m = (
-        ISOCHRONE_EDGE_BUFFER_M if isochrone_edge_buffer_m is None else isochrone_edge_buffer_m
+    isochrone_edge_buffer_ft = (
+        ISOCHRONE_EDGE_BUFFER_FT if isochrone_edge_buffer_ft is None else isochrone_edge_buffer_ft
     )
-    isochrone_max_snap_m = (
-        ISOCHRONE_MAX_SNAP_M if isochrone_max_snap_m is None else isochrone_max_snap_m
+    isochrone_max_snap_ft = (
+        ISOCHRONE_MAX_SNAP_FT if isochrone_max_snap_ft is None else isochrone_max_snap_ft
     )
     fips_filter = list(FIPS_FILTER if fips_filter is None else fips_filter)
     crs_epsg_code = CRS_EPSG_CODE if crs_epsg_code is None else crs_epsg_code
@@ -2292,7 +2331,7 @@ def run(
                 f"Invalid SERVICE_AREA_METHOD: {service_area_method!r}. "
                 f"Choose one of {sorted(valid_methods)}."
             )
-        analysis_crs = validate_metric_crs(crs_epsg_code)
+        analysis_crs = validate_projected_crs(crs_epsg_code)
 
         # --------------------------------------------------------------
         # 1) LOAD GTFS
@@ -2308,10 +2347,11 @@ def run(
         stops_df = gtfs_raw["stops"]
 
         # Distance distortion of the analysis CRS at the feed's own location.
-        stop_lon = pd.to_numeric(stops_df.get("stop_lon"), errors="coerce").median()
-        stop_lat = pd.to_numeric(stops_df.get("stop_lat"), errors="coerce").median()
-        if pd.notna(stop_lon) and pd.notna(stop_lat):
-            warn_if_distorted_crs(analysis_crs, float(stop_lon), float(stop_lat))
+        if {"stop_lat", "stop_lon"} <= set(stops_df.columns):
+            stop_lon = pd.to_numeric(stops_df["stop_lon"], errors="coerce").median()
+            stop_lat = pd.to_numeric(stops_df["stop_lat"], errors="coerce").median()
+            if pd.notna(stop_lon) and pd.notna(stop_lat):
+                warn_if_distorted_crs(analysis_crs, float(stop_lon), float(stop_lat))
 
         # Route geometry from shapes.txt — required for the "route_buffer"
         # method, optional otherwise. Loaded opportunistically.
@@ -2332,9 +2372,8 @@ def run(
         # 1b) PEDESTRIAN NETWORK (only for the "isochrone" method)
         # --------------------------------------------------------------
         ped_graph: Optional[nx.MultiGraph] = None
-        # Walking speed expressed in projected-CRS units per second (metres/s,
-        # since CRS_EPSG_CODE is assumed metric).
-        walk_speed_units_per_s = walk_speed_mph * METERS_PER_MILE / 3_600.0
+        # Walking speed expressed in projected-CRS units per second.
+        walk_speed_units_per_s = walk_speed_mph * crs_units_per_mile(analysis_crs) / 3_600.0
         if service_area_method == "isochrone":
             ped_path = Path(pedestrian_network_path)
             if not ped_path.is_file():
@@ -2442,8 +2481,8 @@ def run(
                 ped_graph=ped_graph,
                 walk_time_min=isochrone_walk_time_min,
                 walk_speed_units_per_s=walk_speed_units_per_s,
-                isochrone_edge_buffer_m=isochrone_edge_buffer_m,
-                isochrone_max_snap_m=isochrone_max_snap_m,
+                isochrone_edge_buffer_ft=isochrone_edge_buffer_ft,
+                isochrone_max_snap_ft=isochrone_max_snap_ft,
                 express_route_ids=express_route_id_set,
                 unidirectional_route_ids=unidirectional_route_id_set,
                 employment_fields=express_employment_fields,
@@ -2459,8 +2498,8 @@ def run(
                 ped_graph=ped_graph,
                 walk_time_min=isochrone_walk_time_min,
                 walk_speed_units_per_s=walk_speed_units_per_s,
-                isochrone_edge_buffer_m=isochrone_edge_buffer_m,
-                isochrone_max_snap_m=isochrone_max_snap_m,
+                isochrone_edge_buffer_ft=isochrone_edge_buffer_ft,
+                isochrone_max_snap_ft=isochrone_max_snap_ft,
                 express_route_ids=express_route_id_set,
             )
         else:
@@ -2631,14 +2670,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--isochrone-edge-buffer",
         type=float,
-        default=ISOCHRONE_EDGE_BUFFER_M,
-        help="Buffer (metres) around reachable pedestrian segments (isochrone method).",
+        default=ISOCHRONE_EDGE_BUFFER_FT,
+        help="Buffer (feet) around reachable pedestrian segments (isochrone method).",
     )
     parser.add_argument(
         "--isochrone-max-snap",
         type=float,
-        default=ISOCHRONE_MAX_SNAP_M,
-        help="Farthest (metres) a stop may sit from the pedestrian network (isochrone method).",
+        default=ISOCHRONE_MAX_SNAP_FT,
+        help="Farthest (feet) a stop may sit from the pedestrian network (isochrone method).",
     )
     parser.add_argument(
         "--fips",
@@ -2651,7 +2690,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--crs-epsg",
         type=int,
         default=CRS_EPSG_CODE,
-        help="Projected (metric) EPSG code for area calculations.",
+        help="Projected EPSG code (any linear unit) for buffers and areas.",
     )
     parser.add_argument(
         "--express-routes",
@@ -2764,8 +2803,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             express_origin_stops_file=args.express_origin_stops_file,
             isochrone_walk_time_min=args.isochrone_walk_time,
             walk_speed_mph=args.walk_speed_mph,
-            isochrone_edge_buffer_m=args.isochrone_edge_buffer,
-            isochrone_max_snap_m=args.isochrone_max_snap,
+            isochrone_edge_buffer_ft=args.isochrone_edge_buffer,
+            isochrone_max_snap_ft=args.isochrone_max_snap,
             fips_filter=args.fips,
             crs_epsg_code=args.crs_epsg,
             express_route_ids=args.express_routes,

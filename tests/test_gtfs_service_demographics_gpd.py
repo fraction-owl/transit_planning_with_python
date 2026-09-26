@@ -10,6 +10,7 @@ import matplotlib
 import networkx as nx
 import pandas as pd
 import pytest
+from pyproj import CRS
 from shapely.geometry import LineString, Point, Polygon, box
 
 matplotlib.use("Agg")  # headless backend; the module imports matplotlib.pyplot
@@ -26,6 +27,7 @@ from scripts.service_coverage.gtfs_service_demographics_gpd import (
     build_service_area_polygon,
     build_walk_isochrone,
     clip_and_calculate_synthetic_fields,
+    crs_acres_per_square_unit,
     export_summary_to_excel,
     express_route_totals,
     filter_weekday_service,
@@ -39,11 +41,18 @@ from scripts.service_coverage.gtfs_service_demographics_gpd import (
     quantize_node,
     run,
     suggest_express_origin_stops,
-    validate_metric_crs,
+    validate_projected_crs,
     warn_if_distorted_crs,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
+
+# Synthetic geometry below is laid out in metres. Offsets placed in the default
+# CRS (US survey feet by default) are scaled by this factor so each test keeps its
+# physical layout whatever CRS_EPSG_CODE is set to.
+_UNITS_PER_M = 1.0 / CRS.from_epsg(CRS_EPSG_CODE).axis_info[0].unit_conversion_factor
+# Express accounting tests build their own layers directly in a metric CRS.
+_METRIC_CRS = "EPSG:32618"  # WGS 84 / UTM zone 18N
 
 # GTFS text files this script relies on (plus shapes.txt for route geometry).
 _REQUIRED_GTFS = ["trips.txt", "stop_times.txt", "routes.txt", "stops.txt", "calendar.txt"]
@@ -412,17 +421,20 @@ def test_build_walk_isochrone_empty_graph_returns_none() -> None:
     assert iso is None
 
 
-# Metres: 10 minutes at 1 m/s gives a 600 m network budget.
-_ISO_KW = dict(walk_time_min=10.0, walk_speed_units_per_s=1.0, edge_buffer=50.0)
+# US survey feet (EPSG:2248): 10 minutes at 1 ft/s gives a 600 ft network budget.
+_ISO_CRS = "EPSG:2248"
+_ISO_KW = dict(walk_time_min=10.0, walk_speed_units_per_s=1.0, edge_buffer_ft=50.0)
 
 
 def _iso_graph(lines: list[LineString]) -> nx.MultiGraph:
-    graph, _ = build_pedestrian_time_network(_centerlines(lines), walk_speed=1.0, node_grid=1.0)
+    graph, _ = build_pedestrian_time_network(
+        _centerlines(lines, crs=_ISO_CRS), walk_speed=1.0, node_grid=1.0
+    )
     return graph
 
 
 def _iso_stop(x: float, y: float) -> gpd.GeoDataFrame:
-    return gpd.GeoDataFrame(geometry=[Point(x, y)], crs="EPSG:3395")
+    return gpd.GeoDataFrame(geometry=[Point(x, y)], crs=_ISO_CRS)
 
 
 def test_build_walk_isochrone_does_not_cross_to_disconnected_street() -> None:
@@ -473,7 +485,7 @@ def test_build_walk_isochrone_skips_stops_beyond_snap_distance(
 ) -> None:
     graph = _iso_graph([LineString([(0, 0), (1000, 0)])])
     with caplog.at_level(logging.WARNING):
-        iso = build_walk_isochrone(_iso_stop(500, 500), graph, max_snap_distance=100.0, **_ISO_KW)
+        iso = build_walk_isochrone(_iso_stop(500, 500), graph, max_snap_ft=100.0, **_ISO_KW)
     assert iso is None
     assert "from the pedestrian network" in caplog.text
 
@@ -799,25 +811,58 @@ def test_stops_to_points_gdf_uses_requested_crs(dc_gtfs: dict[str, pd.DataFrame]
     assert result.crs.to_epsg() == 32618
 
 
-def test_validate_metric_crs_accepts_metre_projection() -> None:
-    assert validate_metric_crs(26985).is_projected
+@pytest.mark.parametrize("code", [2248, 26985])
+def test_validate_projected_crs_accepts_feet_and_metres(code: int) -> None:
+    assert validate_projected_crs(code).is_projected
 
 
-@pytest.mark.parametrize(("code", "match"), [(4326, "not a projected"), (2248, "foot")])
-def test_validate_metric_crs_rejects_non_metric(code: int, match: str) -> None:
-    with pytest.raises(ValueError, match=match):
-        validate_metric_crs(code)
+def test_default_crs_is_projected_in_feet() -> None:
+    assert "foot" in validate_projected_crs(CRS_EPSG_CODE).axis_info[0].unit_name
+
+
+def test_crs_acres_per_square_unit_follows_the_crs_unit() -> None:
+    assert crs_acres_per_square_unit("EPSG:3395") == pytest.approx(1 / 4046.86)
+    assert crs_acres_per_square_unit("EPSG:2248") == pytest.approx(1 / 43_560, rel=1e-4)
+
+
+def test_build_service_area_polygon_buffers_in_feet() -> None:
+    # A quarter mile is 1,320 ft: the buffer must use the CRS's feet, not metres.
+    pts = gpd.GeoDataFrame({"stop_id": ["S1"]}, geometry=[Point(0.0, 0.0)], crs="EPSG:2248")
+    result = build_service_area_polygon(
+        pts,
+        method="stop_buffer",
+        buffer_distance_mi=0.25,
+        large_buffer_distance_mi=2.0,
+        stop_ids_large_buffer=[],
+    )
+    assert result is not None
+    assert result.geometry.iloc[0].area == pytest.approx(math.pi * 1_320.0**2, rel=0.02)
+
+
+def test_clip_and_calculate_synthetic_fields_acres_in_feet() -> None:
+    side = 43_560**0.5  # one acre, in feet
+    block = gpd.GeoDataFrame({"total_pop": [10]}, geometry=[box(0, 0, side, side)], crs="EPSG:2248")
+    half = gpd.GeoDataFrame(geometry=[box(0, 0, side / 2, side)], crs="EPSG:2248")
+    result = clip_and_calculate_synthetic_fields(block, half, ["total_pop"])
+    assert result["area_ac_og"].iloc[0] == pytest.approx(1.0, rel=1e-4)
+    assert result["area_ac_cl"].iloc[0] == pytest.approx(0.5, rel=1e-4)
+    assert result["synthetic_total_pop"].iloc[0] == pytest.approx(5.0, rel=1e-4)
+
+
+def test_validate_projected_crs_rejects_geographic() -> None:
+    with pytest.raises(ValueError, match="not a projected"):
+        validate_projected_crs(4326)
 
 
 def test_warn_if_distorted_crs_flags_world_mercator(caplog: pytest.LogCaptureFixture) -> None:
     with caplog.at_level(logging.WARNING):
-        mercator = warn_if_distorted_crs(validate_metric_crs(3395), -77.03, 38.9)
+        mercator = warn_if_distorted_crs(validate_projected_crs(3395), -77.03, 38.9)
     assert mercator == pytest.approx(0.283, abs=0.01)  # sec(38.9°) - 1
     assert "distorts distances" in caplog.text
 
     caplog.clear()
     with caplog.at_level(logging.WARNING):
-        local = warn_if_distorted_crs(validate_metric_crs(26985), -77.03, 38.9)
+        local = warn_if_distorted_crs(validate_projected_crs(26985), -77.03, 38.9)
     assert local < 0.001
     assert "distorts distances" not in caplog.text
 
@@ -916,7 +961,7 @@ def test_load_express_route_ids_reads_repo_fixture() -> None:
 def _covering_demographics(stops_gdf: gpd.GeoDataFrame, tmp_path: Path) -> Path:
     """Write a demographics shapefile whose single square covers every stop."""
     minx, miny, maxx, maxy = stops_gdf.total_bounds
-    pad = 5_000.0  # metres, comfortably larger than the 0.25-mile stop buffer
+    pad = 5_000.0 * _UNITS_PER_M  # 5 km, comfortably larger than the 0.25-mile stop buffer
     demo = gpd.GeoDataFrame(
         {"total_pop": [1_000]},
         geometry=[box(minx - pad, miny - pad, maxx + pad, maxy + pad)],
@@ -1057,9 +1102,10 @@ def test_run_route_mode_express_origin_widens_catchment(
     origin_route = str(stops_gdf.loc[origin_idx, "route_short_name"])
     oy = stops_gdf.loc[origin_idx].geometry.y
 
-    background = box(minx - 450, miny - 450, maxx + 450, maxy + 450)
-    far_cx = maxx + 1_000.0  # ≥ 1 km from every stop (all stops have x ≤ maxx)
-    far_block = box(far_cx - 100, oy - 100, far_cx + 100, oy + 100)
+    m = _UNITS_PER_M
+    background = box(minx - 450 * m, miny - 450 * m, maxx + 450 * m, maxy + 450 * m)
+    far_cx = maxx + 1_000.0 * m  # ≥ 1 km from every stop (all stops have x ≤ maxx)
+    far_block = box(far_cx - 100 * m, oy - 100 * m, far_cx + 100 * m, oy + 100 * m)
     demo = gpd.GeoDataFrame(
         {"total_pop": [5_000, 1_000]},
         geometry=[background, far_block],
@@ -1167,7 +1213,8 @@ def test_suggest_express_origin_stops_writes_candidates(
     anchor = route_stops.drop_duplicates("stop_id").iloc[0]
     anchor_stop_id = str(anchor["stop_id"])
     ax, ay = anchor.geometry.x, anchor.geometry.y
-    jobs_block = box(ax - 200, ay - 200, ax + 200, ay + 200)
+    half = 200 * _UNITS_PER_M
+    jobs_block = box(ax - half, ay - half, ax + half, ay + half)
     demo = gpd.GeoDataFrame(
         {"tot_empl": [1_000]}, geometry=[jobs_block], crs=f"EPSG:{CRS_EPSG_CODE}"
     )
@@ -1229,7 +1276,7 @@ def test_suggest_express_origin_stops_no_jobs_field_is_noop(
 # express_route_totals — access-mode accounting math (Phase 4)
 # ---------------------------------------------------------------------------
 
-# Projected metres (EPSG:CRS_EPSG_CODE). Origin and destination sit 50 km apart,
+# Projected metres (_METRIC_CRS). Origin and destination sit 50 km apart,
 # far beyond either buffer, so the two end catchments never overlap.
 _ORIGIN_XY = (0.0, 0.0)
 _DEST_XY = (50_000.0, 0.0)
@@ -1242,7 +1289,7 @@ def _express_stops() -> gpd.GeoDataFrame:
     return gpd.GeoDataFrame(
         {"stop_id": ["O", "D"], "route_short_name": ["X", "X"]},
         geometry=[Point(*_ORIGIN_XY), Point(*_DEST_XY)],
-        crs=f"EPSG:{CRS_EPSG_CODE}",
+        crs=_METRIC_CRS,
     )
 
 
@@ -1263,7 +1310,7 @@ def _express_demographics() -> gpd.GeoDataFrame:
             "tot_empl": [5, 2_000],  # origin park-and-ride jobs, destination jobs
         },
         geometry=[home, job],
-        crs=f"EPSG:{CRS_EPSG_CODE}",
+        crs=_METRIC_CRS,
     )
 
 
@@ -1355,7 +1402,7 @@ def test_express_route_totals_employment_is_walk_scaled_at_origin() -> None:
             "tot_empl": [0, 500, 2_000],  # -, far origin jobs, destination jobs
         },
         geometry=[home, origin_far, job],
-        crs=f"EPSG:{CRS_EPSG_CODE}",
+        crs=_METRIC_CRS,
     )
     totals, _ = express_route_totals(
         _express_stops(),
@@ -1470,11 +1517,12 @@ def test_run_route_mode_bidirectional_employment_walk_scaled(
         .tolist()
     )
 
-    background = box(minx - 450, miny - 450, maxx + 450, maxy + 450)
+    m = _UNITS_PER_M
+    background = box(minx - 450 * m, miny - 450 * m, maxx + 450 * m, maxy + 450 * m)
     # A block 1 km east of the origin stop: inside the 2.0-mi drive buffer but
     # beyond every 0.25-mi walk buffer, carrying both population and employment.
-    far_cx = maxx + 1_000.0
-    far_block = box(far_cx - 100, oy - 100, far_cx + 100, oy + 100)
+    far_cx = maxx + 1_000.0 * m
+    far_block = box(far_cx - 100 * m, oy - 100 * m, far_cx + 100 * m, oy + 100 * m)
 
     def _row(name: str, demo: gpd.GeoDataFrame) -> pd.Series:
         demo_path = tmp_path / f"{name}_demo.shp"
@@ -1537,7 +1585,8 @@ def test_run_route_mode_origin_employment_knob_changes_total(
 
     # Uniform employment everywhere; the origin is the easternmost stop, so its
     # walk buffer covers area no other stop's does.
-    background = box(minx - 450, miny - 450, maxx + 450, maxy + 450)
+    m = _UNITS_PER_M
+    background = box(minx - 450 * m, miny - 450 * m, maxx + 450 * m, maxy + 450 * m)
     demo = gpd.GeoDataFrame(
         {"total_pop": [5_000], "tot_empl": [4_000]},
         geometry=[background],
