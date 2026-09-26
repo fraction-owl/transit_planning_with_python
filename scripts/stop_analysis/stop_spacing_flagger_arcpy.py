@@ -52,8 +52,12 @@ INCLUDE_ROUTE_IDS: list[str] = ["101", "202", "303"]  # empty list → all route
 ROUTE_UNION: bool = False
 
 # Projected CRS – should be feet-based if you want spacing_ft directly in feet.
-# Example: 2240 = NAD83 / Maryland (ftUS)
-PROJECTED_WKID: int = 2240
+# Example: 2248 = NAD83 / Maryland (ftUS)
+PROJECTED_WKID: int = 2248
+
+# A route's own stops count as served by one of its shapes only within this
+# distance of it; 100 m (328 ft) is the GTFS Best Practices stop-to-shape limit.
+SERVED_STOP_MAX_OFFSET_FT: float = 328.0
 
 # Short-spacing QA – “too close” consecutive served stops along a route
 MIN_SPACING_FT: float = 400.0
@@ -526,9 +530,11 @@ def _ordered_route_stops(
     route_index: Dict[Tuple[str, int], np.ndarray],
     stop_geoms: Dict[str, arcpy.PointGeometry],
     line: arcpy.Polyline,
+    max_offset: float,
 ) -> List[RouteStop]:
     """Return unique, ordered stops along a route polyline.
 
+    Only the route's stops within max_offset (SR units) of the polyline count.
     The result is sorted by measureOnLine and de-duplicates equal measures.
     """
     rid = rec["route_id"]
@@ -547,7 +553,7 @@ def _ordered_route_stops(
     for _, row in served.iterrows():
         sid = str(row.stop_id)
         pt_geom = stop_geoms.get(sid)
-        if pt_geom is None:
+        if pt_geom is None or line.distanceTo(pt_geom) > max_offset:
             continue
 
         m = line.measureOnLine(pt_geom, use_percentage=False)
@@ -718,8 +724,13 @@ def _export_segments_shapefile(
     stop_geoms: Dict[str, arcpy.PointGeometry],
     sr: arcpy.SpatialReference,
     out_folder: Path,
+    max_offset_ft: float = SERVED_STOP_MAX_OFFSET_FT,
 ) -> None:
-    """Split each route polyline at its own stops and write segments.shp."""
+    """Split each route polyline at its own stops and write segments.shp.
+
+    The route's stops farther than max_offset_ft from the polyline are not
+    counted as served by it.
+    """
     arcpy.env.overwriteOutput = True
 
     out_name = "segments"
@@ -753,6 +764,7 @@ def _export_segments_shapefile(
     insert_fields = ["route_id", "dir", "rshort", "len_ft", "SHAPE@"]
 
     ft_factor = _feet_factor(sr)
+    max_offset = max_offset_ft / ft_factor
     rows_written = 0
 
     with arcpy.da.InsertCursor(fc_path, insert_fields) as cursor:
@@ -765,7 +777,7 @@ def _export_segments_shapefile(
             drn = int(rec["direction_id"])
             rshort = rec.get("route_short")
 
-            stops = _ordered_route_stops(rec, stops_df, route_index, stop_geoms, line)
+            stops = _ordered_route_stops(rec, stops_df, route_index, stop_geoms, line, max_offset)
             if len(stops) < 2:
                 logging.debug(
                     "Route %s dir=%s has fewer than 2 ordered stops; skipping segments.",
@@ -804,9 +816,15 @@ def _flag_short_spacing(
     sr: arcpy.SpatialReference,
     threshold_ft: float,
     log_path: Path,
+    max_offset_ft: float = SERVED_STOP_MAX_OFFSET_FT,
 ) -> None:
-    """Write a log of consecutive stops spaced closer than threshold_ft."""
+    """Write a log of consecutive stops spaced closer than threshold_ft.
+
+    The route's stops farther than max_offset_ft from the polyline are not
+    counted as served by it.
+    """
     ft_factor = _feet_factor(sr)
+    max_offset = max_offset_ft / ft_factor
     count = 0
 
     with log_path.open("w", encoding="utf-8", newline="") as fh:
@@ -823,7 +841,7 @@ def _flag_short_spacing(
             rid = rec["route_id"]
             drn = int(rec["direction_id"])
 
-            stops = _ordered_route_stops(rec, stops_df, route_index, stop_geoms, line)
+            stops = _ordered_route_stops(rec, stops_df, route_index, stop_geoms, line, max_offset)
             if len(stops) < 2:
                 continue
 
@@ -855,15 +873,20 @@ def _flag_long_spacing_csv(
     near_buffer_ft: float,
     csv_path: Path,
     summary: bool = True,
+    max_offset_ft: float = SERVED_STOP_MAX_OFFSET_FT,
 ) -> None:
     """Export a CSV of “missed” stops that fill unusually long gaps.
 
     A long gap is any consecutive pair of served stops on a given
     (route_id, direction_id) whose spacing exceeds threshold_ft. For every
     other-route stop that lies inside the gap and within near_buffer_ft of
-    the route polyline, a row is written to the CSV.
+    the route polyline, a row is written to the CSV. The route's stops
+    farther than max_offset_ft from the polyline are not counted as served
+    by it.
     """
     ft_factor = _feet_factor(sr)
+    near_buffer = near_buffer_ft / ft_factor  # SR units
+    max_offset = max_offset_ft / ft_factor
     records: List[Dict[str, Any]] = []
 
     # Optional precomputation of stop coordinates (not strictly required, but cheap).
@@ -881,7 +904,9 @@ def _flag_long_spacing_csv(
         drn = int(rec["direction_id"])
         rshort = rec.get("route_short")
 
-        stops = _ordered_route_stops(rec, all_stops_df, all_route_index, stop_geoms, line)
+        stops = _ordered_route_stops(
+            rec, all_stops_df, all_route_index, stop_geoms, line, max_offset
+        )
         if len(stops) < 2:
             continue
 
@@ -892,14 +917,12 @@ def _flag_long_spacing_csv(
             if seg_len_ft <= threshold_ft:
                 continue
 
-            # Endpoints of the long segment
-            start_pt = line.positionAlongLine(start_m, use_percentage=False)
-            end_pt = line.positionAlongLine(end_m, use_percentage=False)
-
-            minx = min(start_pt.firstPoint.X, end_pt.firstPoint.X) - near_buffer_ft
-            miny = min(start_pt.firstPoint.Y, end_pt.firstPoint.Y) - near_buffer_ft
-            maxx = max(start_pt.firstPoint.X, end_pt.firstPoint.X) + near_buffer_ft
-            maxy = max(start_pt.firstPoint.Y, end_pt.firstPoint.Y) + near_buffer_ft
+            # Extent of the whole gap, so stops beside a curve are also examined
+            gap = line.segmentAlongLine(start_m, end_m, use_percentage=False).extent
+            minx = gap.XMin - near_buffer
+            miny = gap.YMin - near_buffer
+            maxx = gap.XMax + near_buffer
+            maxy = gap.YMax + near_buffer
 
             start_sid = stops[i].stop_id
             end_sid = stops[i + 1].stop_id
@@ -1059,7 +1082,15 @@ def main() -> int:  # noqa: D401
     _export_routes_shapefile(routes, sr, out_dir)
 
     logging.info("STEP 5  Building stop-to-stop segment shapefile …")
-    _export_segments_shapefile(routes, sel_stops_df, sel_route_index, stop_geoms, sr, out_dir)
+    _export_segments_shapefile(
+        routes,
+        sel_stops_df,
+        sel_route_index,
+        stop_geoms,
+        sr,
+        out_dir,
+        max_offset_ft=SERVED_STOP_MAX_OFFSET_FT,
+    )
 
     logging.info("STEP 6  Short-spacing QA …")
     _flag_short_spacing(
@@ -1070,6 +1101,7 @@ def main() -> int:  # noqa: D401
         sr,
         MIN_SPACING_FT,
         out_dir / SPACING_LOG_FILE,
+        max_offset_ft=SERVED_STOP_MAX_OFFSET_FT,
     )
 
     logging.info("STEP 7  Long-spacing QA …")
@@ -1082,6 +1114,7 @@ def main() -> int:  # noqa: D401
         LONG_SPACING_FT,
         NEAR_BUFFER_FT,
         out_dir / LONG_SPACING_CSV_FILE,
+        max_offset_ft=SERVED_STOP_MAX_OFFSET_FT,
     )
 
     logging.info("All done! Outputs in: %s", out_dir)
