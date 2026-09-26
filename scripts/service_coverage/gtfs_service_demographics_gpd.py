@@ -27,6 +27,11 @@ origin employment and destination population — which can be zeroed
 independently; bidirectional routes keep both ends. See the express settings in
 the CONFIGURATION block.
 
+Trips are limited to the service day(s) in ``SERVICE_IDS_TO_INCLUDE`` (GTFS
+``service_id``; default ``"4"``). Each run logs ``calendar.txt`` in full so the
+right id can be checked or picked, warns while the default is unchanged, and
+stops with exit code 2 if a listed service_id has no trips in the feed.
+
 Intended for use in Jupyter notebooks with appropriate EPSG settings. The
 projected CRS (``CRS_EPSG_CODE``, default NAD83 / Maryland in US survey feet)
 may use any linear unit: buffer distances (miles), walk speed, isochrone
@@ -103,10 +108,13 @@ OUTPUT_DIRECTORY = r"Path\To\Output"
 # intersections) for best results.
 PEDESTRIAN_NETWORK_PATH = r"Path\To\centerlines.shp"
 
-# Calendar / service-pattern filter. Leave empty to auto-select the full Monday–Friday
-# service(s) straight from calendar.txt (recommended — robust to feed-specific service_id
-# values); set explicit ids (e.g. ["2"]) to force a particular service pattern.
-SERVICE_IDS_TO_INCLUDE: Final[list[str]] = []
+# Service day(s) to analyze, by GTFS service_id. The default "4" is the typical weekday
+# service_id in the source agency's GTFS; other feeds use other ids. Each run logs
+# calendar.txt so you can check or pick, warns while this is still the default, and
+# stops (exit code 2) if a listed service_id has no trips. For Saturday or Sunday,
+# rerun with that day's service_id(s) and another OUTPUT_DIRECTORY (output file names
+# are fixed). Set [] to use every trip (all days combined).
+SERVICE_IDS_TO_INCLUDE: Final[list[str]] = ["4"]
 
 # Route filters:
 # 1) ROUTES_TO_INCLUDE: If non-empty, only these routes are considered.
@@ -302,6 +310,9 @@ SQ_METERS_PER_ACRE: Final[float] = 4046.86
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
 
+# Shipped default for SERVICE_IDS_TO_INCLUDE, so an unedited value can be flagged.
+_DEFAULT_SERVICE_IDS: Final[list[str]] = ["4"]
+
 # =============================================================================
 # FUNCTIONS
 # =============================================================================
@@ -404,20 +415,92 @@ def warn_if_distorted_crs(
     return worst
 
 
-def filter_weekday_service(calendar_df: pd.DataFrame) -> pd.Series:
-    """Return service_ids that run every weekday (Monday through Friday).
+# -----------------------------------------------------------------------------
+# SERVICE-DAY SELECTION
+#
+# Copied verbatim from utils/calendar_helpers.py (the canonical versions) so this
+# script stays self-contained. Keep the copies in sync when updating either.
+# -----------------------------------------------------------------------------
 
-    calendar.txt is frequently loaded with every column as a string, so the day flags
-    are coerced to numeric before the ``== 1`` comparison; a service must run on all
-    five weekdays to qualify.
 
-    :param calendar_df: DataFrame from calendar.txt.
-    :return: Series of service_id values available on all weekdays.
+class ServiceSelectionError(ValueError):
+    """A requested GTFS service_id is not used by any trip in the feed.
+
+    A configuration problem rather than a crash: callers report it without a
+    traceback and exit with code 2.
     """
-    days = ["monday", "tuesday", "wednesday", "thursday", "friday"]
-    flags = calendar_df[days].apply(pd.to_numeric, errors="coerce").fillna(0)
-    weekday_filter = (flags == 1).all(axis=1)
-    return calendar_df.loc[weekday_filter, "service_id"]
+
+
+def log_service_calendar(calendar_df: Optional[pd.DataFrame]) -> None:
+    """Log calendar.txt in full, so the user can see which service_id runs on which days.
+
+    calendar.txt is usually a handful of rows; printing it lets the user check or
+    pick the service_id(s) to analyze without opening the feed.
+
+    Args:
+        calendar_df: Parsed ``calendar.txt``, or ``None`` when the feed has none.
+    """
+    if calendar_df is None or calendar_df.empty:
+        logging.info("calendar.txt is absent or empty; see trips.txt for the feed's service_ids.")
+        return
+    logging.info(
+        "calendar.txt (%d service_id row(s)):\n%s",
+        len(calendar_df),
+        calendar_df.to_string(index=False),
+    )
+
+
+def select_trips_by_service(
+    trips_df: pd.DataFrame,
+    service_ids: Sequence[str],
+    *,
+    default_service_ids: Sequence[str] = (),
+) -> pd.DataFrame:
+    """Return the trips that run on *service_ids*; every trip when it is empty.
+
+    Warns when *service_ids* still equals *default_service_ids* (the calling
+    script's shipped default), so an unedited default is noticed, and warns that an
+    empty selection combines every service day.
+
+    Args:
+        trips_df: Parsed ``trips.txt`` (needs a ``service_id`` column).
+        service_ids: The service_id values to keep. Empty keeps every trip.
+        default_service_ids: The calling script's default, used only for the warning.
+
+    Returns:
+        The trips whose ``service_id`` is in *service_ids*.
+
+    Raises:
+        ServiceSelectionError: If a requested service_id is used by no trip. The
+            message lists the feed's service_ids with their trip counts.
+    """
+    wanted = [str(s).strip() for s in service_ids if str(s).strip()]
+    if not wanted:
+        logging.warning(
+            "No service_id selected: using every trip in the feed, all service days "
+            "combined. Set SERVICE_IDS_TO_INCLUDE to analyze a single service day."
+        )
+        return trips_df
+    defaults = [str(s).strip() for s in default_service_ids]
+    if defaults and wanted == defaults:
+        logging.warning(
+            "SERVICE_IDS_TO_INCLUDE is still the default %s. Check it against calendar.txt "
+            "and change it if this feed uses other service_ids or you want another day.",
+            wanted,
+        )
+    trip_service = trips_df["service_id"].astype(str).str.strip()
+    counts = trip_service.value_counts().sort_index()
+    missing = [s for s in wanted if s not in counts.index]
+    if missing:
+        available = ", ".join(f"{sid} ({n} trips)" for sid, n in counts.items())
+        raise ServiceSelectionError(
+            f"service_id(s) {missing} are not used by any trip in trips.txt. This feed's "
+            f"service_ids: {available}. Set SERVICE_IDS_TO_INCLUDE to the service day to "
+            "analyze (calendar.txt shows which days each service_id runs)."
+        )
+    kept = trips_df[trip_service.isin(wanted)]
+    logging.info("Service filter %s: trips %d -> %d.", wanted, len(trips_df), len(kept))
+    return kept
 
 
 def get_included_stops(
@@ -2387,34 +2470,14 @@ def run(
             )
 
         # --------------------------------------------------------------
-        # 2) OPTIONAL CALENDAR FILTER
+        # 2) SERVICE-DAY FILTER
         # --------------------------------------------------------------
-        if not service_ids_to_include:
-            # Empty -> auto-select the full Monday–Friday service(s) straight from
-            # calendar.txt, so weekday service is chosen for any feed instead of a
-            # hardcoded id (service_id values differ per agency/feed).
-            service_ids_to_include = [
-                str(s) for s in filter_weekday_service(gtfs_raw["calendar"]).tolist()
-            ]
-            if service_ids_to_include:
-                logging.info(
-                    "Auto-selected weekday service_id(s) from calendar.txt: %s",
-                    service_ids_to_include,
-                )
-            else:
-                logging.warning("No Monday–Friday service found in calendar.txt; using all trips.")
-
-        if service_ids_to_include:  # explicit ids or the auto-selected weekday set
-            before = len(trips)
-            trips = trips[trips["service_id"].isin(service_ids_to_include)]
-            logging.info(
-                "Applied calendar filter %s — trips: %d → %d",
-                service_ids_to_include,
-                before,
-                len(trips),
-            )
-        else:
-            logging.info("No calendar filter applied; using all %d trips.", len(trips))
+        # calendar.txt is logged in full so the user can confirm (or pick) the
+        # service_id; a requested service_id with no trips stops the run cleanly.
+        log_service_calendar(gtfs_raw["calendar"])
+        trips = select_trips_by_service(
+            trips, service_ids_to_include, default_service_ids=_DEFAULT_SERVICE_IDS
+        )
 
         # --------------------------------------------------------------
         # 3) DEMOGRAPHICS LAYER
@@ -2507,6 +2570,10 @@ def run(
 
         logging.info("\nAnalysis completed successfully.")
 
+    except ServiceSelectionError as exc:
+        # A configuration problem, not a crash: report the fix without a traceback.
+        logging.error("%s", exc)
+        raise
     except Exception:
         # Re-raise after logging: a swallowed error here exits 0 and looks
         # identical to "legitimately produced nothing" to the prep_features_public
@@ -2583,7 +2650,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         nargs="*",
         default=SERVICE_IDS_TO_INCLUDE,
         metavar="SERVICE_ID",
-        help="Calendar service_id values to keep (empty = auto-select weekday service).",
+        help="GTFS service_id(s) of the service day to analyze; the flag with no values "
+        "uses every trip.",
     )
     parser.add_argument(
         "--routes-include",
@@ -2765,7 +2833,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     Returns:
         Process exit code: 0 on success, 1 on failure, 2 if required
-        CONFIGURATION values are still placeholders.
+        CONFIGURATION values are still placeholders or a requested service_id
+        has no trips in the feed.
     """
     args = parse_args(argv)
     logging.basicConfig(
@@ -2820,6 +2889,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             express_zero_destination_population=args.express_zero_destination_population,
             express_employment_fields=args.express_employment_fields,
         )
+    except ServiceSelectionError:
+        # run() already logged which service_ids exist; a configuration error.
+        return 2
     except Exception:
         # run() already logged the traceback; exit non-zero so the orchestrator
         # records a real failure instead of "produced no tables".

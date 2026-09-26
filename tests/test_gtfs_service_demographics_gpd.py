@@ -19,6 +19,7 @@ from scripts.service_coverage.gtfs_service_demographics_gpd import (
     CRS_EPSG_CODE,
     METERS_PER_MILE,
     SYNTHETIC_FIELDS,
+    ServiceSelectionError,
     _present_synthetic_cols,
     _stops_to_points_gdf,
     apply_fips_filter,
@@ -30,13 +31,14 @@ from scripts.service_coverage.gtfs_service_demographics_gpd import (
     crs_acres_per_square_unit,
     export_summary_to_excel,
     express_route_totals,
-    filter_weekday_service,
     flag_express_origin_candidates,
     get_included_routes,
     get_included_stops,
     load_express_route_ids,
     load_gtfs_data,
     load_id_set,
+    main,
+    parse_args,
     pick_buffer_distance,
     quantize_node,
     run,
@@ -56,6 +58,10 @@ _METRIC_CRS = "EPSG:32618"  # WGS 84 / UTM zone 18N
 
 # GTFS text files this script relies on (plus shapes.txt for route geometry).
 _REQUIRED_GTFS = ["trips.txt", "stop_times.txt", "routes.txt", "stops.txt", "calendar.txt"]
+
+# The mock feed's Monday–Friday service_id. run() defaults to "4", which the
+# fixture does not use, so every run() call names this one.
+_FIXTURE_SERVICE_IDS = ["weekday"]
 
 
 def _extract_zip(zip_path: Path, dest: Path) -> Path:
@@ -84,121 +90,6 @@ def dc_gtfs(dc_gtfs_dir: Path) -> dict[str, pd.DataFrame]:
 def dc_shapes(dc_gtfs_dir: Path) -> pd.DataFrame:
     """The DC feed's shapes.txt table (route geometry)."""
     return pd.read_csv(dc_gtfs_dir / "shapes.txt", dtype=str, low_memory=False)
-
-
-# ---------------------------------------------------------------------------
-# filter_weekday_service
-# ---------------------------------------------------------------------------
-
-
-def _calendar(rows: list[dict]) -> pd.DataFrame:
-    return pd.DataFrame(rows)
-
-
-def test_filter_weekday_service_keeps_full_week() -> None:
-    cal = _calendar(
-        [
-            {
-                "service_id": "WK",
-                "monday": 1,
-                "tuesday": 1,
-                "wednesday": 1,
-                "thursday": 1,
-                "friday": 1,
-                "saturday": 0,
-                "sunday": 0,
-            },
-            {
-                "service_id": "SAT",
-                "monday": 0,
-                "tuesday": 0,
-                "wednesday": 0,
-                "thursday": 0,
-                "friday": 0,
-                "saturday": 1,
-                "sunday": 0,
-            },
-        ]
-    )
-    result = filter_weekday_service(cal)
-    assert list(result) == ["WK"]
-
-
-def test_filter_weekday_service_drops_partial_week() -> None:
-    # Runs every weekday except Wednesday → should be excluded.
-    cal = _calendar(
-        [
-            {
-                "service_id": "PARTIAL",
-                "monday": 1,
-                "tuesday": 1,
-                "wednesday": 0,
-                "thursday": 1,
-                "friday": 1,
-                "saturday": 0,
-                "sunday": 0,
-            },
-        ]
-    )
-    assert filter_weekday_service(cal).empty
-
-
-def test_filter_weekday_service_handles_string_flags() -> None:
-    # Real feeds load calendar.txt with every column as a string. Service "2" runs the
-    # full Mon–Fri week; "1" skips Thursday; "3" is Saturday — only "2" should qualify.
-    cal = _calendar(
-        [
-            {
-                k: v
-                for k, v in zip(
-                    [
-                        "service_id",
-                        "monday",
-                        "tuesday",
-                        "wednesday",
-                        "thursday",
-                        "friday",
-                        "saturday",
-                        "sunday",
-                    ],
-                    ["1", "1", "1", "1", "0", "1", "0", "0"],
-                )
-            },
-            {
-                k: v
-                for k, v in zip(
-                    [
-                        "service_id",
-                        "monday",
-                        "tuesday",
-                        "wednesday",
-                        "thursday",
-                        "friday",
-                        "saturday",
-                        "sunday",
-                    ],
-                    ["2", "1", "1", "1", "1", "1", "0", "0"],
-                )
-            },
-            {
-                k: v
-                for k, v in zip(
-                    [
-                        "service_id",
-                        "monday",
-                        "tuesday",
-                        "wednesday",
-                        "thursday",
-                        "friday",
-                        "saturday",
-                        "sunday",
-                    ],
-                    ["3", "0", "0", "0", "0", "0", "1", "0"],
-                )
-            },
-        ]
-    )
-    assert list(filter_weekday_service(cal)) == ["2"]
 
 
 # ---------------------------------------------------------------------------
@@ -771,9 +662,55 @@ def test_run_raises_on_missing_demographics(tmp_path: Path, dc_gtfs_dir: Path) -
             analysis_mode="route",
             service_area_method="stop_buffer",
             gtfs_data_path=str(dc_gtfs_dir),
+            service_ids_to_include=_FIXTURE_SERVICE_IDS,
             demographics_shp_path=str(tmp_path / "does_not_exist.shp"),
             output_directory=str(tmp_path / "out"),
         )
+
+
+def test_run_stops_when_service_id_not_in_feed(
+    tmp_path: Path, dc_gtfs_dir: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The default "4" is not a service_id in the mock feed. The run logs
+    # calendar.txt, flags the unchanged default, and stops with the feed's
+    # service_ids before reading the demographics, without a traceback.
+    with (
+        caplog.at_level(logging.INFO),
+        pytest.raises(ServiceSelectionError, match=r"weekday \(203 trips\)"),
+    ):
+        run(
+            analysis_mode="route",
+            service_area_method="stop_buffer",
+            gtfs_data_path=str(dc_gtfs_dir),
+            demographics_shp_path=str(tmp_path / "does_not_exist.shp"),
+            output_directory=str(tmp_path / "out"),
+        )
+    assert "calendar.txt (4 service_id row(s))" in caplog.text
+    assert "still the default ['4']" in caplog.text
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert errors
+    assert all(r.exc_info is None for r in errors)
+
+
+def test_main_exit_code_for_service_id(tmp_path: Path, dc_gtfs_dir: Path) -> None:
+    argv = [
+        "--gtfs-path",
+        str(dc_gtfs_dir),
+        "--demographics-shp",
+        str(tmp_path / "does_not_exist.shp"),
+        "--output-dir",
+        str(tmp_path / "out"),
+    ]
+    # A service_id the feed lacks is a configuration error (2); a present one gets
+    # past the check and fails later on the missing demographics input (1).
+    assert main(argv) == 2
+    assert main([*argv, "--service-ids", "saturday"]) == 1
+
+
+def test_parse_args_service_ids() -> None:
+    assert parse_args([]).service_ids == ["4"]
+    assert parse_args(["--service-ids", "4", "5"]).service_ids == ["4", "5"]
+    assert parse_args(["--service-ids"]).service_ids == []  # every trip
 
 
 # ---------------------------------------------------------------------------
@@ -891,6 +828,7 @@ def test_run_crs_override_keeps_stops_and_demographics_aligned(
         analysis_mode="route",
         service_area_method="stop_buffer",
         gtfs_data_path=str(dc_gtfs_dir),
+        service_ids_to_include=_FIXTURE_SERVICE_IDS,
         demographics_shp_path=str(demo_path),
         output_directory=str(out_dir),
         crs_epsg_code=32618,
@@ -988,6 +926,7 @@ def test_run_route_mode_labels_express_routes(
         analysis_mode="route",
         service_area_method="stop_buffer",
         gtfs_data_path=str(dc_gtfs_dir),
+        service_ids_to_include=_FIXTURE_SERVICE_IDS,
         demographics_shp_path=str(demo_path),
         output_directory=str(out_dir),
         express_route_ids=[express_id],
@@ -1019,6 +958,7 @@ def test_run_route_mode_all_local_without_express_list(
         analysis_mode="route",
         service_area_method="stop_buffer",
         gtfs_data_path=str(dc_gtfs_dir),
+        service_ids_to_include=_FIXTURE_SERVICE_IDS,
         demographics_shp_path=str(demo_path),
         output_directory=str(out_dir),
         express_route_ids=[],
@@ -1119,6 +1059,7 @@ def test_run_route_mode_express_origin_widens_catchment(
             analysis_mode="route",
             service_area_method="stop_buffer",
             gtfs_data_path=str(dc_gtfs_dir),
+            service_ids_to_include=_FIXTURE_SERVICE_IDS,
             demographics_shp_path=str(demo_path),
             output_directory=str(out_dir),
             express_origin_buffer_distance=2.0,
@@ -1474,6 +1415,7 @@ def test_run_route_mode_express_direction_labels(
         analysis_mode="route",
         service_area_method="stop_buffer",
         gtfs_data_path=str(dc_gtfs_dir),
+        service_ids_to_include=_FIXTURE_SERVICE_IDS,
         demographics_shp_path=str(demo_path),
         output_directory=str(out_dir),
         express_unidirectional_route_ids=_ids_for(uni_short),
@@ -1532,6 +1474,7 @@ def test_run_route_mode_bidirectional_employment_walk_scaled(
             analysis_mode="route",
             service_area_method="stop_buffer",
             gtfs_data_path=str(dc_gtfs_dir),
+            service_ids_to_include=_FIXTURE_SERVICE_IDS,
             demographics_shp_path=str(demo_path),
             output_directory=str(out_dir),
             express_origin_buffer_distance=2.0,
@@ -1600,6 +1543,7 @@ def test_run_route_mode_origin_employment_knob_changes_total(
             analysis_mode="route",
             service_area_method="stop_buffer",
             gtfs_data_path=str(dc_gtfs_dir),
+            service_ids_to_include=_FIXTURE_SERVICE_IDS,
             demographics_shp_path=str(demo_path),
             output_directory=str(out_dir),
             express_origin_buffer_distance=2.0,

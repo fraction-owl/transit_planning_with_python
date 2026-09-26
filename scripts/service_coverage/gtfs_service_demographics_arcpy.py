@@ -6,7 +6,8 @@ employment metrics. Supports whole-network and per-route runs and optional CSV
 and feature exports.
 
 Pipeline:
-  1) Create stops layer (GTFS filter by route_short_name or shapefile).
+  1) Create stops layer (GTFS filter by service_id and route_short_name, or
+     shapefile).
   2) Buffer and dissolve (optional processing CRS for stability).
   3) Clip demographics (SR alignment, PairwiseClip with fallbacks).
   4) Add areas (`area_ac_cl`, `area_perc`) and synthetic counts: area-weighted
@@ -17,8 +18,15 @@ Pipeline:
      to `PCT_* × *_TOT` (tract rate × block total).
   5) Summarize totals and export.
 
+GTFS trips are limited to the service day(s) in `SERVICE_IDS_TO_INCLUDE` (GTFS
+`service_id`; default `"4"`). Each run logs `calendar.txt` in full so the
+right id can be checked or picked, warns while the default is unchanged, and
+stops with exit code 2 if a listed service_id has no trips in the feed. A
+per-route run skips, with a warning, a route with no trips on that day.
+
 Inputs:
-  - GTFS: stops.txt, routes.txt, trips.txt, stop_times.txt
+  - GTFS: stops.txt, routes.txt, trips.txt, stop_times.txt (calendar.txt, if
+    present, is logged)
   - Demographics FC with HH_LOWINC/PCT_LOWINC/HH_TOT, MINOR_CNT/PCT_MINOR/POP_TOT,
     EMP_LO/EMP_TOT; LEP/YOUTH/ELDER optional.
 
@@ -64,6 +72,14 @@ GTFS_FOLDER: str = r"Path\To\Your\GTFS_Folder"
 # Optional: filter GTFS to the following route_short_name values.
 # Example: ["101", "202"]. Leave as [] or None to include all routes (network run).
 GTFS_ROUTE_SHORT_NAMES: Optional[Sequence[str]] = ["101", "202"]
+
+# Service day(s) to analyze, by GTFS service_id ("gtfs" mode only). The default "4" is
+# the typical weekday service_id in the source agency's GTFS; other feeds use other
+# ids. Each run logs calendar.txt so you can check or pick, warns while this is still
+# the default, and stops (exit code 2) if a listed service_id has no trips. For
+# Saturday or Sunday, rerun with that day's service_id(s) and its own RUN_TAG.
+# Set [] to use every trip (all days combined).
+SERVICE_IDS_TO_INCLUDE: Sequence[str] = ["4"]
 
 # Input demographics (from the census-join pipeline).
 # This may be a FileGDB feature class or a shapefile; both work.
@@ -373,32 +389,165 @@ def load_gtfs_data(
             archive.close()
 
 
+# -----------------------------------------------------------------------------
+# SERVICE-DAY SELECTION
+#
+# Copied verbatim from utils/calendar_helpers.py (the canonical versions) so this
+# script stays self-contained. Keep the copies in sync when updating either.
+# -----------------------------------------------------------------------------
+class ServiceSelectionError(ValueError):
+    """A requested GTFS service_id is not used by any trip in the feed.
+
+    A configuration problem rather than a crash: callers report it without a
+    traceback and exit with code 2.
+    """
+
+
+def log_service_calendar(calendar_df: Optional[pd.DataFrame]) -> None:
+    """Log calendar.txt in full, so the user can see which service_id runs on which days.
+
+    calendar.txt is usually a handful of rows; printing it lets the user check or
+    pick the service_id(s) to analyze without opening the feed.
+
+    Args:
+        calendar_df: Parsed ``calendar.txt``, or ``None`` when the feed has none.
+    """
+    if calendar_df is None or calendar_df.empty:
+        logging.info("calendar.txt is absent or empty; see trips.txt for the feed's service_ids.")
+        return
+    logging.info(
+        "calendar.txt (%d service_id row(s)):\n%s",
+        len(calendar_df),
+        calendar_df.to_string(index=False),
+    )
+
+
+def select_trips_by_service(
+    trips_df: pd.DataFrame,
+    service_ids: Sequence[str],
+    *,
+    default_service_ids: Sequence[str] = (),
+) -> pd.DataFrame:
+    """Return the trips that run on *service_ids*; every trip when it is empty.
+
+    Warns when *service_ids* still equals *default_service_ids* (the calling
+    script's shipped default), so an unedited default is noticed, and warns that an
+    empty selection combines every service day.
+
+    Args:
+        trips_df: Parsed ``trips.txt`` (needs a ``service_id`` column).
+        service_ids: The service_id values to keep. Empty keeps every trip.
+        default_service_ids: The calling script's default, used only for the warning.
+
+    Returns:
+        The trips whose ``service_id`` is in *service_ids*.
+
+    Raises:
+        ServiceSelectionError: If a requested service_id is used by no trip. The
+            message lists the feed's service_ids with their trip counts.
+    """
+    wanted = [str(s).strip() for s in service_ids if str(s).strip()]
+    if not wanted:
+        logging.warning(
+            "No service_id selected: using every trip in the feed, all service days "
+            "combined. Set SERVICE_IDS_TO_INCLUDE to analyze a single service day."
+        )
+        return trips_df
+    defaults = [str(s).strip() for s in default_service_ids]
+    if defaults and wanted == defaults:
+        logging.warning(
+            "SERVICE_IDS_TO_INCLUDE is still the default %s. Check it against calendar.txt "
+            "and change it if this feed uses other service_ids or you want another day.",
+            wanted,
+        )
+    trip_service = trips_df["service_id"].astype(str).str.strip()
+    counts = trip_service.value_counts().sort_index()
+    missing = [s for s in wanted if s not in counts.index]
+    if missing:
+        available = ", ".join(f"{sid} ({n} trips)" for sid, n in counts.items())
+        raise ServiceSelectionError(
+            f"service_id(s) {missing} are not used by any trip in trips.txt. This feed's "
+            f"service_ids: {available}. Set SERVICE_IDS_TO_INCLUDE to the service day to "
+            "analyze (calendar.txt shows which days each service_id runs)."
+        )
+    kept = trips_df[trip_service.isin(wanted)]
+    logging.info("Service filter %s: trips %d -> %d.", wanted, len(trips_df), len(kept))
+    return kept
+
+
+# Shipped default for SERVICE_IDS_TO_INCLUDE, so an unedited value can be flagged.
+_DEFAULT_SERVICE_IDS: Sequence[str] = ["4"]
+
+
+class RoutesNotInServiceError(ServiceSelectionError):
+    """The selected routes run no trips on the selected service day(s).
+
+    A per-route run skips such a route with a warning; for the whole run it is a
+    configuration error, like its parent.
+    """
+
+
+def _check_service_selection(gtfs_folder: str, service_ids: Sequence[str]) -> None:
+    """Log calendar.txt and confirm that every requested service_id has trips.
+
+    Runs once, before any geoprocessing, so a wrong service_id stops the run early.
+
+    Raises:
+        ServiceSelectionError: A requested service_id is used by no trip.
+    """
+    trips = load_gtfs_data(gtfs_folder, files=("trips.txt",), dtype=str)["trips"]
+    calendar: Optional[pd.DataFrame] = None
+    try:
+        calendar = load_gtfs_data(gtfs_folder, files=("calendar.txt",), dtype=str)["calendar"]
+    except (OSError, ValueError):
+        pass  # optional: calendar_dates.txt alone can define every service day
+    log_service_calendar(calendar)
+    select_trips_by_service(trips, service_ids, default_service_ids=_DEFAULT_SERVICE_IDS)
+
+
 def _filter_gtfs_stops_by_route_short_name(
     gtfs: dict[str, pd.DataFrame],
     route_short_names: Optional[Sequence[str]],
+    service_ids: Optional[Sequence[str]] = None,
 ) -> pd.DataFrame:
-    """Return stops DataFrame filtered to those used by routes with given short names."""
+    """Return stops DataFrame filtered to those used by routes with given short names.
+
+    Only trips on *service_ids* count; empty or ``None`` keeps every trip. With
+    neither filter set, every stop in stops.txt is returned.
+
+    Raises:
+        RoutesNotInServiceError: The selected routes run no trips on *service_ids*.
+    """
     stops = gtfs["stops"]
-    if not route_short_names:
+    target = {str(x) for x in route_short_names or ()}
+    service = [str(s).strip() for s in service_ids or () if str(s).strip()]
+    if not target and not service:
         return stops.copy()
 
-    target = {str(x) for x in route_short_names}
     routes = gtfs["routes"]
     trips = gtfs["trips"]
     stop_times = gtfs["stop_times"]
 
-    routes_sel = routes[routes["route_short_name"].astype(str).isin(target)]
-    if routes_sel.empty:
-        raise ValueError(
-            f"No routes matched the provided route_short_name filter: {sorted(target)}"
-        )
+    if target:
+        routes_sel = routes[routes["route_short_name"].astype(str).isin(target)]
+        if routes_sel.empty:
+            raise ValueError(
+                f"No routes matched the provided route_short_name filter: {sorted(target)}"
+            )
 
-    route_ids = set(routes_sel["route_id"].astype(str))
-    trips_sel = trips[trips["route_id"].astype(str).isin(route_ids)]
-    if trips_sel.empty:
-        raise ValueError("Routes matched, but no trips found for the selected routes.")
+        route_ids = set(routes_sel["route_id"].astype(str))
+        trips = trips[trips["route_id"].astype(str).isin(route_ids)]
+        if trips.empty:
+            raise ValueError("Routes matched, but no trips found for the selected routes.")
 
-    trip_ids = set(trips_sel["trip_id"].astype(str))
+    if service:
+        trips = trips[trips["service_id"].astype(str).str.strip().isin(service)]
+        if trips.empty:
+            raise RoutesNotInServiceError(
+                f"Route(s) {sorted(target)} run no trips on service_id(s) {service}."
+            )
+
+    trip_ids = set(trips["trip_id"].astype(str))
     st_sel = stop_times[stop_times["trip_id"].astype(str).isin(trip_ids)]
     if st_sel.empty:
         raise ValueError("Trips matched, but no stop_times rows found.")
@@ -478,9 +627,14 @@ def make_stops_layer(
     shapefile_fc: Optional[str] = None,
     gtfs_folder: Optional[str] = None,
     route_short_names: Optional[Sequence[str]] = None,
+    service_ids: Optional[Sequence[str]] = None,
     layer_name: str = "stops",
 ) -> str:
-    """Create a feature layer of stops for downstream processing."""
+    """Create a feature layer of stops for downstream processing.
+
+    In "gtfs" mode, keeps the stops served by *route_short_names* on *service_ids*
+    (either empty or ``None``: no filter on it).
+    """
     m = mode.strip().lower()
     if m not in {"shapefile", "gtfs"}:
         raise ValueError("STOPS_INPUT_MODE must be 'shapefile' or 'gtfs'.")
@@ -499,7 +653,7 @@ def make_stops_layer(
         files=("stops.txt", "routes.txt", "trips.txt", "stop_times.txt"),
         dtype=str,
     )
-    stops_df = _filter_gtfs_stops_by_route_short_name(gtfs, route_short_names)
+    stops_df = _filter_gtfs_stops_by_route_short_name(gtfs, route_short_names, service_ids)
     return _points_layer_from_stops_df(stops_df, layer_name=layer_name)
 
 
@@ -1278,11 +1432,17 @@ def _run_network_total(stops_layer: str) -> None:
         logging.info("Final export: %s", exported)
 
 
-def _run_by_route(gtfs_folder: str, route_short_names: Sequence[str]) -> pd.DataFrame:
+def _run_by_route(
+    gtfs_folder: str,
+    route_short_names: Sequence[str],
+    service_ids: Optional[Sequence[str]] = None,
+) -> pd.DataFrame:
     """Per-route summaries (GTFS only). Returns a DataFrame of results.
 
-    For each route_short_name, rebuilds its own stops layer from GTFS,
-    runs the service-area pipeline (in_memory by default), and collects totals.
+    For each route_short_name, rebuilds its own stops layer from GTFS (trips on
+    *service_ids* only), runs the service-area pipeline (in_memory by default),
+    and collects totals. A route with no trips on *service_ids* is skipped with a
+    warning.
     """
     results: List[Dict[str, int | str]] = []
     for route_sn in route_short_names:
@@ -1290,12 +1450,17 @@ def _run_by_route(gtfs_folder: str, route_short_names: Sequence[str]) -> pd.Data
         logging.info("Processing route %s", route_sn)
 
         # Build a route-scoped stops layer directly from GTFS
-        stops_layer = make_stops_layer(
-            mode="gtfs",
-            gtfs_folder=gtfs_folder,
-            route_short_names=[route_sn],
-            layer_name=f"stops_{_sanitize_name(route_sn)}",
-        )
+        try:
+            stops_layer = make_stops_layer(
+                mode="gtfs",
+                gtfs_folder=gtfs_folder,
+                route_short_names=[route_sn],
+                service_ids=service_ids,
+                layer_name=f"stops_{_sanitize_name(route_sn)}",
+            )
+        except RoutesNotInServiceError as exc:
+            logging.warning("Skipping route %s: %s", route_sn, exc)
+            continue
 
         totals, exported = _process_service_area_from_stops_layer(
             stops_layer=stops_layer,
@@ -1344,7 +1509,8 @@ def main() -> int:
 
     Returns:
         Process exit code: 0 on success, 1 on failure, 2 if required
-        CONFIGURATION values are still placeholders.
+        CONFIGURATION values are still placeholders, a requested service_id has
+        no trips in the feed, or the selected routes have none on that day.
     """
     logging.basicConfig(
         level=LOG_LEVEL,
@@ -1376,13 +1542,23 @@ def main() -> int:
 
     # Prepare stops layer (network scope) once
     logging.info("Preparing stops layer...")
-    stops_layer = make_stops_layer(
-        mode=STOPS_INPUT_MODE,
-        shapefile_fc=STOPS_FEATURE_CLASS,
-        gtfs_folder=GTFS_FOLDER,
-        route_short_names=GTFS_ROUTE_SHORT_NAMES,
-        layer_name="stops_for_buffering",
-    )
+    try:
+        if m == "gtfs":
+            # calendar.txt is logged in full so the user can confirm (or pick) the
+            # service_id; a requested service_id with no trips stops the run here.
+            _check_service_selection(GTFS_FOLDER, SERVICE_IDS_TO_INCLUDE)
+        stops_layer = make_stops_layer(
+            mode=STOPS_INPUT_MODE,
+            shapefile_fc=STOPS_FEATURE_CLASS,
+            gtfs_folder=GTFS_FOLDER,
+            route_short_names=GTFS_ROUTE_SHORT_NAMES,
+            service_ids=SERVICE_IDS_TO_INCLUDE,
+            layer_name="stops_for_buffering",
+        )
+    except ServiceSelectionError as exc:
+        # A configuration problem, not a crash: report the fix without a traceback.
+        logging.error("%s", exc)
+        return 2
 
     mode = OUTPUT_MODE.lower().strip()
     if mode not in {"network", "by_route", "both"}:
@@ -1406,7 +1582,7 @@ def main() -> int:
             raise ValueError(
                 "GTFS_ROUTE_SHORT_NAMES is empty; populate it to enable per-route processing."
             )
-        _ = _run_by_route(GTFS_FOLDER, route_list)
+        _ = _run_by_route(GTFS_FOLDER, route_list, SERVICE_IDS_TO_INCLUDE)
 
     logging.info("Processing completed successfully.")
     return 0

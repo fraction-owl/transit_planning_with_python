@@ -8,9 +8,12 @@ import pandas as pd
 import pytest
 
 from utils.calendar_helpers import (
+    ServiceSelectionError,
     classify_service_ids,
     expand_service_active_dates,
+    log_service_calendar,
     representative_service_date,
+    select_trips_by_service,
     service_ids_active_on,
 )
 
@@ -230,3 +233,57 @@ def test_representative_rejects_bad_day_and_empty_candidates() -> None:
         representative_service_date(active, "weekend")
     with pytest.raises(ValueError, match="No active dates"):
         representative_service_date(active, "sunday")
+
+
+# ---------------------------------------------------------------------------
+# log_service_calendar / select_trips_by_service
+# ---------------------------------------------------------------------------
+
+
+def _trips() -> pd.DataFrame:
+    return pd.DataFrame({"trip_id": ["t1", "t2", "t3", "t4"], "service_id": ["4", "4", "5", "6"]})
+
+
+def test_log_service_calendar_logs_every_row(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.INFO):
+        log_service_calendar(_simple_calendar())
+    assert "calendar.txt (2 service_id row(s))" in caplog.text
+    assert "WK" in caplog.text and "SAT" in caplog.text
+
+
+def test_log_service_calendar_handles_missing_calendar(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.INFO):
+        log_service_calendar(None)
+    assert "absent or empty" in caplog.text
+
+
+def test_select_trips_by_service_keeps_requested_ids() -> None:
+    kept = select_trips_by_service(_trips(), ["4", " 6 "])
+    assert kept["trip_id"].tolist() == ["t1", "t2", "t4"]
+
+
+def test_select_trips_by_service_empty_keeps_all_and_warns(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.WARNING):
+        kept = select_trips_by_service(_trips(), [])
+    assert len(kept) == 4
+    assert "all service days" in caplog.text
+
+
+def test_select_trips_by_service_warns_on_unchanged_default(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.WARNING):
+        select_trips_by_service(_trips(), ["4"], default_service_ids=["4"])
+    assert "still the default" in caplog.text
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        select_trips_by_service(_trips(), ["5"], default_service_ids=["4"])
+    assert "still the default" not in caplog.text
+
+
+def test_select_trips_by_service_missing_id_lists_the_feed() -> None:
+    with pytest.raises(ServiceSelectionError, match="4 \\(2 trips\\), 5 \\(1 trips\\)"):
+        select_trips_by_service(_trips(), ["4", "9"])
