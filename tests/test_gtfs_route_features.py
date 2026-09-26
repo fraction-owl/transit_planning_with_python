@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pandas as pd
 import pytest
 
@@ -7,7 +9,10 @@ from scripts.gtfs_exports.gtfs_route_features import (
     _service_day_coverage,
     collapse_to_route_number,
     compute_route_supply_metrics,
+    main,
 )
+
+GTFS_BASIC = Path(__file__).parent / "fixtures" / "gtfs_basic"
 
 
 def _two_stop_times(spec: list[tuple[str, str, str]]) -> pd.DataFrame:
@@ -250,3 +255,33 @@ def test_no_collision_passes_new_columns_through() -> None:
     assert collapsed.loc["100", "pct_day_with_service"] == pytest.approx(50.0)
     assert collapsed.loc["100", "route_length_modal_mi"] == pytest.approx(4.0)
     assert collapsed.loc["100", "n_directions"] == 1
+
+
+# ---------------------------------------------------------------------------
+# main — full pipeline against gtfs_basic
+# ---------------------------------------------------------------------------
+
+
+def test_main_end_to_end_on_gtfs_basic(tmp_path: Path) -> None:
+    assert main(["--gtfs-dir", str(GTFS_BASIC), "--output-dir", str(tmp_path)]) == 0
+    assert (tmp_path / "gtfs_route_features_runlog.txt").exists()
+
+    features = pd.read_csv(tmp_path / "gtfs_route_features.csv").set_index("route_id")
+    assert features.index.tolist() == ["R1", "R2", "R3"]
+    assert features["trips_per_day"].tolist() == [3, 3, 3]
+    # Each route runs three trips of 25 / 20 / 15 minutes.
+    assert features["revenue_hours"].tolist() == pytest.approx([1.25, 1.0, 0.75])
+    # R1's first departure is 07:00 and its last arrival 17:25.
+    assert features.loc["R1", "span_hours"] == pytest.approx(10 + 25 / 60, abs=1e-4)
+    # Trip starts are 4+ hours apart, which the headway median ignores; each
+    # route departs in three one-hour bins.
+    assert features["median_headway_min"].isna().all()
+    assert features["pct_day_with_service"].tolist() == [12.5, 12.5, 12.5]
+    # SHP_R1 is 3,450 m end to end (its shape_dist_traveled).
+    assert features.loc["R1", "route_length_mi"] == pytest.approx(3450 / 1609.344, rel=0.01)
+    assert features["n_stops"].tolist() == [6, 5, 4]
+    # R1 shares S2-S5 with R2 and R3. R2 spreads 3 trips over 5 stops and R3 3
+    # over 4, putting 3.3 competitor trips at those stops: 1.1 per R1 trip.
+    assert features.loc["R1", "shared_stop_share"] == pytest.approx(4 / 6, abs=1e-4)
+    assert features["n_competitor_routes"].tolist() == [2, 2, 2]
+    assert features.loc["R1", "competition_intensity"] == pytest.approx(1.1)
