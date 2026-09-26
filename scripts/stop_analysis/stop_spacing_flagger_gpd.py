@@ -46,7 +46,7 @@ FILTER_OUT_LIST: list[str] = ["9999A", "9999B", "9999C"]
 INCLUDE_ROUTE_IDS: list[str] = ["101", "202"]
 
 ROUTE_UNION: bool = False
-PROJECTED_CRS: str = "EPSG:2263"  # projected CRS in feet or metres
+PROJECTED_CRS: str = "EPSG:2248"  # NAD83 / Maryland (ftUS); any projected CRS in feet or metres
 
 # A route's own stops count as served by one of its shapes only within this
 # distance of it; 100 m (328 ft) is the GTFS Best Practices stop-to-shape limit.
