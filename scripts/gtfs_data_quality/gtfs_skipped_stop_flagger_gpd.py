@@ -7,7 +7,7 @@ At a high level, the script:
 
   - Loads stops.txt, trips.txt, and stop_times.txt from a GTFS directory.
   - For each (route_id, direction_id), selects the trip with the most distinct
-    stops as the representative pattern.
+    stops as the representative pattern (its stop sequence and its shape).
   - Builds ordered logical stop sequences using a configurable stop key
     (stop_id or stop_code).
   - Treats a configurable set of base routes as references and compares each
@@ -448,15 +448,22 @@ def build_stops_gdf(
     return stops_gdf
 
 
-def select_representative_shapes(trips_df: pd.DataFrame) -> pd.DataFrame:
+def select_representative_shapes(
+    trips_df: pd.DataFrame,
+    rep_trip_ids: Mapping[RouteKey, str],
+) -> pd.DataFrame:
     """Select a representative shape_id for each (route_id, direction_id).
 
-    The representative shape_id is chosen as the one with the highest trip count
-    for that route/direction.
+    The representative shape_id is the shape of the representative trip, so a
+    route's shape and its stop sequence always describe the same trip. (The
+    route's most common shape can belong to a shorter pattern than its
+    longest trip, which would misplace segment measures and the
+    stop-to-shape tests.)
 
     Args:
-        trips_df: DataFrame from trips.txt, including route_id, shape_id,
-            and normalized direction_id.
+        trips_df: DataFrame from trips.txt, including trip_id and shape_id.
+        rep_trip_ids: Mapping from (route_id, direction_id) to representative
+            trip_id, e.g., from choose_representative_trip_ids_max_stops.
 
     Returns:
         DataFrame with columns: route_id, direction_id, shape_id.
@@ -464,24 +471,22 @@ def select_representative_shapes(trips_df: pd.DataFrame) -> pd.DataFrame:
     Raises:
         ValueError: If required columns are missing.
     """
-    required_cols = {"route_id", "shape_id", "direction_id"}
+    required_cols = {"trip_id", "shape_id"}
     missing = required_cols - set(trips_df.columns)
     if missing:
         msg = f"trips.txt is missing required columns: {sorted(missing)}"
         raise ValueError(msg)
 
-    df = trips_df.copy()
-    df["route_id"] = df["route_id"].astype(str)
-    df["shape_id"] = df["shape_id"].astype(str)
-    df["direction_id"] = df["direction_id"].astype(str)
-
-    counts = (
-        df.groupby(["route_id", "direction_id", "shape_id"]).size().reset_index(name="trip_count")
-    )
-    counts = counts.sort_values("trip_count", ascending=False)
-    reps = counts.drop_duplicates(subset=["route_id", "direction_id"])
-    reps = reps[["route_id", "direction_id", "shape_id"]].reset_index(drop=True)
-    return reps
+    shape_by_trip = dict(zip(trips_df["trip_id"].astype(str), trips_df["shape_id"].astype(str)))
+    rows = [
+        {
+            "route_id": route_id,
+            "direction_id": direction_id,
+            "shape_id": shape_by_trip.get(str(trip_id), ""),
+        }
+        for (route_id, direction_id), trip_id in rep_trip_ids.items()
+    ]
+    return pd.DataFrame(rows, columns=["route_id", "direction_id", "shape_id"])
 
 
 def build_route_shapes_from_reps(
@@ -1768,9 +1773,6 @@ def prepare_gtfs_context() -> GTFSContext:
     shapes_gdf_geo = build_shapes_gdf(shapes_df, GTFS_CRS)
     shapes_gdf_proj = shapes_gdf_geo.to_crs(PROJECTED_CRS)
 
-    logging.info("Selecting representative shapes per (route, direction)...")
-    reps = select_representative_shapes(trips_df)
-
     logging.info(
         "Choosing representative trip_ids per (route, direction) based on "
         "trips with the most stops..."
@@ -1779,6 +1781,9 @@ def prepare_gtfs_context() -> GTFSContext:
         trips_df=trips_df,
         stop_times_df=stop_times_df,
     )
+
+    logging.info("Selecting the representative trips' shapes...")
+    reps = select_representative_shapes(trips_df, rep_trip_ids)
 
     logging.info("Building stop key and name lookups...")
     stop_key_lookup = build_stop_key_lookup(stops_df, STOP_KEY_FIELD)

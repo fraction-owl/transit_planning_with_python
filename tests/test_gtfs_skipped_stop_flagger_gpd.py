@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
+from pyproj import Transformer
 from shapely.geometry import LineString
 
 import scripts.gtfs_data_quality.gtfs_skipped_stop_flagger_gpd as target
@@ -441,3 +442,129 @@ def test_find_segment_indices_missing_stop_raises_keyerror() -> None:
         target._find_segment_indices(["A", "B"], "Z", "B")
     with pytest.raises(KeyError):
         target._find_segment_indices(["A", "B"], "B", "A")
+
+
+# ---------------------------------------------------------------------------
+# select_representative_shapes / prepare_gtfs_context (synthetic feed)
+# ---------------------------------------------------------------------------
+
+_TO_LONLAT = Transformer.from_crs(target.PROJECTED_CRS, target.GTFS_CRS, always_xy=True)
+_ORIGIN_X, _ORIGIN_Y = 323_000.0, 4_307_000.0  # Washington, DC in UTM 18N
+
+
+def _lonlat(x: float, y: float) -> tuple[float, float]:
+    return _TO_LONLAT.transform(_ORIGIN_X + x, _ORIGIN_Y + y)
+
+
+def _write_feed(
+    gtfs_dir: Path,
+    stops: dict[str, tuple[str, float, float]],
+    trips: list[tuple[str, str, str, str, list[str]]],
+    shapes: dict[str, list[tuple[float, float]]],
+) -> None:
+    """Write a feed from metre offsets.
+
+    stops: stop_id -> (stop_code, x, y); trips: (route_id, direction_id,
+    trip_id, shape_id, stop_ids); shapes: shape_id -> [(x, y), ...].
+    """
+    stop_rows = []
+    for stop_id, (code, x, y) in stops.items():
+        lon, lat = _lonlat(x, y)
+        stop_rows.append(
+            {
+                "stop_id": stop_id,
+                "stop_code": code,
+                "stop_name": f"Stop {stop_id}",
+                "stop_lat": lat,
+                "stop_lon": lon,
+            }
+        )
+    trip_rows = []
+    stop_time_rows = []
+    for route_id, direction_id, trip_id, shape_id, stop_ids in trips:
+        trip_rows.append(
+            {
+                "route_id": route_id,
+                "service_id": "WK",
+                "trip_id": trip_id,
+                "direction_id": direction_id,
+                "shape_id": shape_id,
+            }
+        )
+        stop_time_rows += [
+            {"trip_id": trip_id, "stop_id": stop_id, "stop_sequence": seq}
+            for seq, stop_id in enumerate(stop_ids, start=1)
+        ]
+    shape_rows = []
+    for shape_id, points in shapes.items():
+        for seq, (x, y) in enumerate(points, start=1):
+            lon, lat = _lonlat(x, y)
+            shape_rows.append(
+                {
+                    "shape_id": shape_id,
+                    "shape_pt_lat": lat,
+                    "shape_pt_lon": lon,
+                    "shape_pt_sequence": seq,
+                }
+            )
+    route_ids = sorted({trip[0] for trip in trips})
+    pd.DataFrame(stop_rows).to_csv(gtfs_dir / "stops.txt", index=False)
+    pd.DataFrame(trip_rows).to_csv(gtfs_dir / "trips.txt", index=False)
+    pd.DataFrame(stop_time_rows).to_csv(gtfs_dir / "stop_times.txt", index=False)
+    pd.DataFrame(shape_rows).to_csv(gtfs_dir / "shapes.txt", index=False)
+    pd.DataFrame({"route_id": route_ids, "route_short_name": route_ids}).to_csv(
+        gtfs_dir / "routes.txt", index=False
+    )
+
+
+# Stops along one street: A=001 (0 m), B=002 (100 m), C=003 (200 m),
+# D=004 (300 m), X=006 (350 m), E=005 (400 m, no stop_code).
+FEED_STOPS = {
+    "001": ("0101", 0, 0),
+    "002": ("0102", 100, 0),
+    "003": ("0103", 200, 0),
+    "004": ("0104", 300, 0),
+    "006": ("0106", 350, 0),
+    "005": ("", 400, 0),
+}
+FEED_TRIPS = [
+    # R1 skips D; its most common shape belongs to the A-C short turns.
+    ("R1", "0", "T1a", "10", ["001", "002", "003", "006", "005"]),
+    ("R1", "0", "T1b", "11", ["001", "002", "003"]),
+    ("R1", "0", "T1c", "11", ["001", "002", "003"]),
+    ("R2", "0", "T2a", "20", ["001", "002", "003", "004", "005"]),
+    # R3's third trip omits B.
+    ("R3", "0", "T3a", "30", ["001", "002", "003", "004"]),
+    ("R3", "0", "T3b", "30", ["001", "002", "003", "004"]),
+    ("R3", "0", "T3c", "30", ["001", "003", "004"]),
+]
+FEED_SHAPES = {
+    "10": [(0, 0), (400, 0)],
+    "11": [(0, 0), (200, 0)],
+    "20": [(0, 0), (400, 0)],
+    "30": [(0, 0), (300, 0)],
+}
+
+
+def test_select_representative_shapes_uses_representative_trip() -> None:
+    trips = pd.DataFrame(
+        {
+            "route_id": ["R1"] * 3,
+            "direction_id": ["0"] * 3,
+            "trip_id": ["short1", "short2", "long"],
+            "shape_id": ["S", "S", "L"],
+        }
+    )
+    reps = target.select_representative_shapes(trips, {("R1", "0"): "long"})
+    assert reps.to_dict("records") == [{"route_id": "R1", "direction_id": "0", "shape_id": "L"}]
+
+
+def test_prepare_gtfs_context_takes_shape_from_representative_trip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_feed(tmp_path, FEED_STOPS, FEED_TRIPS, FEED_SHAPES)
+    monkeypatch.setattr(target, "GTFS_DIR", tmp_path)
+    ctx = target.prepare_gtfs_context()
+    assert ctx.route_sequences[("R1", "0")] == ["0101", "0102", "0103", "0106", "stop_id=005"]
+    # T1a's own 400 m shape, not the more common 200 m short-turn shape.
+    assert ctx.route_shapes_proj[("R1", "0")].length == pytest.approx(400.0, abs=0.5)
