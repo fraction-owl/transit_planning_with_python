@@ -33,6 +33,15 @@ def test_normalize_direction_id_parses_text_values() -> None:
     assert list(target.normalize_direction_id(s)) == ["0", "1", "<NA>"]
 
 
+def test_normalize_direction_id_warns_on_non_numeric_values(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.WARNING):
+        out = target.normalize_direction_id(pd.Series(["0", "N", "S", ""]))
+    assert list(out) == ["0", "<NA>", "<NA>", "<NA>"]
+    assert "2 direction_id value(s) are not numbers (e.g., N, S)" in caplog.text
+
+
 # ---------------------------------------------------------------------------
 # load_gtfs_tables
 # ---------------------------------------------------------------------------

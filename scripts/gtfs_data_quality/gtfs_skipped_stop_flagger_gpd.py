@@ -268,7 +268,17 @@ def normalize_direction_id(series: pd.Series) -> pd.Series:
         Series of strings representing direction_id values; blank or
         non-numeric values become "<NA>".
     """
-    return pd.to_numeric(series, errors="coerce").astype("Int64").astype(str)
+    numeric = pd.to_numeric(series, errors="coerce")
+    text = series.astype(str).str.strip()
+    invalid = numeric.isna() & series.notna() & (text != "")
+    if invalid.any():
+        logging.warning(
+            "%d direction_id value(s) are not numbers (e.g., %s); those trips "
+            "are grouped under direction '<NA>'.",
+            int(invalid.sum()),
+            ", ".join(text[invalid].drop_duplicates().head(3)),
+        )
+    return numeric.astype("Int64").astype(str)
 
 
 def load_gtfs_tables(gtfs_dir: Path) -> Dict[str, pd.DataFrame]:
