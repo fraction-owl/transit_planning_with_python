@@ -280,6 +280,21 @@ def test_find_aligned_common_stops_no_overlap() -> None:
     assert target.find_aligned_common_stops(["A"], ["B"]) == []
 
 
+def test_find_aligned_common_stops_uses_later_occurrences() -> None:
+    # The reference visits B and C before looping back through A; only their
+    # later occurrences keep all three stops in order.
+    base = ["A", "B", "C"]
+    other = ["B", "C", "A", "B", "X", "C"]
+    assert target.find_aligned_common_stops(base, other) == [(0, 2), (1, 3), (2, 5)]
+
+
+def test_find_aligned_common_stops_keeps_most_stops_in_order() -> None:
+    # Pairing B with the reference's last stop would strand C and D.
+    base = ["A", "B", "C", "D"]
+    other = ["A", "C", "D", "B"]
+    assert target.find_aligned_common_stops(base, other) == [(0, 0), (2, 1), (3, 2)]
+
+
 # ---------------------------------------------------------------------------
 # compare_segments_for_route_pair (coordinates in projected metres)
 # ---------------------------------------------------------------------------
@@ -346,6 +361,15 @@ def test_compare_segments_tests_proximity_against_the_segment(
     ref_shape = LineString([(0, 0), (100, offset_m), (200, 0), (400, 0), (400, 60), (0, 60)])
     flags = _compare_pair(["A", "E", "C", "D"], ["A", "B", "C", "D"], coords, base_shape, ref_shape)
     assert flags == expected
+
+
+def test_compare_segments_ignores_reference_revisiting_a_boundary_stop() -> None:
+    # The reference runs out to L and back through X before continuing to B.
+    coords = {"A": (0, 0), "X": (100, 0), "L": (150, 10), "B": (300, 0)}
+    base_shape = LineString([(0, 0), (300, 0)])
+    ref_shape = LineString([(0, 0), (100, 0), (150, 10), (100, 0), (300, 0)])
+    flags = _compare_pair(["A", "X", "B"], ["A", "X", "L", "X", "B"], coords, base_shape, ref_shape)
+    assert flags == [("X", "B", "L")]
 
 
 # ---------------------------------------------------------------------------

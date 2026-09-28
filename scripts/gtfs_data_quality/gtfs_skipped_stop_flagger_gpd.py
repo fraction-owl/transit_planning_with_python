@@ -860,10 +860,12 @@ def find_aligned_common_stops(
 ) -> List[Tuple[int, int]]:
     """Find common stops with consistent direction between two sequences.
 
-    The algorithm:
-      - For each stop in base_seq, find its first occurrence in other_seq.
-      - Keep only those matches.
-      - Enforce strictly increasing indices in other_seq to preserve direction.
+    Returns the longest list of (base_index, other_index) pairs that serve the
+    same stop in the same order on both routes (a longest common subsequence
+    of the two stop sequences). Every occurrence of a repeated stop is
+    eligible, so a loop that revisits a stop can align on whichever visit
+    keeps the most stops in order. Ties go to the earliest usable occurrence
+    in other_seq.
 
     Args:
         base_seq: Ordered list of stop keys for the base route.
@@ -872,23 +874,31 @@ def find_aligned_common_stops(
     Returns:
         List of (base_index, other_index) for aligned common stops in order.
     """
-    other_pos: Dict[str, int] = {}
-    for idx, s in enumerate(other_seq):
-        if s not in other_pos:
-            other_pos[s] = idx
+    shared = set(base_seq).intersection(other_seq)
+    base_idx = [i for i, s in enumerate(base_seq) if s in shared]
+    other_idx = [j for j, s in enumerate(other_seq) if s in shared]
+    n_base, n_other = len(base_idx), len(other_idx)
 
-    raw_pairs: List[Tuple[int, int]] = []
-    for i, stop in enumerate(base_seq):
-        j = other_pos.get(stop)
-        if j is not None:
-            raw_pairs.append((i, j))
+    # lcs[a][b]: most pairs alignable between base_idx[a:] and other_idx[b:].
+    lcs = [[0] * (n_other + 1) for _ in range(n_base + 1)]
+    for a in range(n_base - 1, -1, -1):
+        for b in range(n_other - 1, -1, -1):
+            if base_seq[base_idx[a]] == other_seq[other_idx[b]]:
+                lcs[a][b] = lcs[a + 1][b + 1] + 1
+            else:
+                lcs[a][b] = max(lcs[a + 1][b], lcs[a][b + 1])
 
     aligned: List[Tuple[int, int]] = []
-    last_other_idx = -1
-    for i, j in raw_pairs:
-        if j > last_other_idx:
-            aligned.append((i, j))
-            last_other_idx = j
+    a = b = 0
+    while a < n_base and b < n_other:
+        if base_seq[base_idx[a]] == other_seq[other_idx[b]]:
+            aligned.append((base_idx[a], other_idx[b]))
+            a += 1
+            b += 1
+        elif lcs[a][b + 1] >= lcs[a + 1][b]:
+            b += 1
+        else:
+            a += 1
 
     return aligned
 
@@ -1061,9 +1071,12 @@ def compare_segments_for_route_pair(
             if seg_hd is not None and seg_hd > max_shape_hausdorff_m:
                 continue
 
-        # Interior subsequences between the boundary stops.
-        base_interior = list(base_seq[i0 + 1 : i1])
-        other_interior = list(other_seq[j0 + 1 : j1])
+        # Interior subsequences between the boundary stops. A loop can revisit
+        # a boundary stop inside the segment; the base serves that stop at the
+        # boundary, so it is never a candidate.
+        boundary = (start_key, end_key)
+        base_interior = [s for s in base_seq[i0 + 1 : i1] if s not in boundary]
+        other_interior = [s for s in other_seq[j0 + 1 : j1] if s not in boundary]
 
         # Deduplicate while preserving order.
         def _unique_preserve_order(seq: Sequence[str]) -> List[str]:
