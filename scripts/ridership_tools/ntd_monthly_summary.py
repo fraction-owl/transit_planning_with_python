@@ -42,6 +42,7 @@ from typing import Any, Final, Iterable
 
 import matplotlib.pyplot as plt
 import pandas as pd
+from matplotlib.ticker import FixedFormatter, FixedLocator
 
 # Sentinel markers used by extract_config_block / write_run_log to identify
 # the configuration block within this file's source. Each string must appear
@@ -720,6 +721,11 @@ def plot_metric_over_time(df_time: pd.DataFrame, metric: str) -> None:
 
     df_m = df_time[["period", "route", metric]].copy()
     df_m[metric] = pd.to_numeric(df_m[metric], errors="coerce")
+    # Month strings passed as x-values become Matplotlib categories, which logs
+    # INFO messages for every chart. Plot against positions instead and label them
+    # with a fixed locator/formatter; plt.xticks(ticks, labels) would also stretch
+    # the x-axis to every month, even for a route with no data at the start or end.
+    x_pos = range(len(ORDERED_PERIODS))
 
     for route in sorted(df_m["route"].unique()):
         df_r = df_m[df_m["route"] == route]
@@ -734,11 +740,13 @@ def plot_metric_over_time(df_time: pd.DataFrame, metric: str) -> None:
 
         plt.figure(figsize=PLOT_STYLE["figsize"])
         plt.plot(
-            ORDERED_PERIODS,
+            x_pos,
             y_vals,
             marker=PLOT_STYLE["marker"],
             linestyle=PLOT_STYLE["linestyle"],
         )
+        plt.gca().xaxis.set_major_locator(FixedLocator(x_pos))
+        plt.gca().xaxis.set_major_formatter(FixedFormatter(ORDERED_PERIODS))
         plt.title(f"{metric.replace('_', ' ').title()} – Route {route}")
         plt.xlabel("Month")
         plt.ylabel(metric.replace("_", " ").title())
