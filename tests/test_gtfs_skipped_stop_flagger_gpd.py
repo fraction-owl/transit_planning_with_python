@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pandas as pd
 import pytest
 
@@ -20,6 +22,76 @@ def test_normalize_direction_id_preserves_na_token() -> None:
     out = target.normalize_direction_id(s)
     assert out.iloc[0] == "0"
     assert out.iloc[1] == "<NA>"
+
+
+def test_normalize_direction_id_parses_text_values() -> None:
+    s = pd.Series(["0", "1", ""])
+    assert list(target.normalize_direction_id(s)) == ["0", "1", "<NA>"]
+
+
+# ---------------------------------------------------------------------------
+# load_gtfs_tables
+# ---------------------------------------------------------------------------
+
+
+def _write_text_feed(gtfs_dir: Path, trips_txt: str) -> None:
+    (gtfs_dir / "stops.txt").write_text(
+        "stop_id,stop_code,stop_name,stop_lat,stop_lon\n"
+        "001,0101,First,38.90,-77.03\n"
+        "002,,Second,38.91,-77.03\n"
+    )
+    # "X2" keeps this column text under type inference while stops.txt's
+    # stop_id column would be inferred as integers.
+    (gtfs_dir / "stop_times.txt").write_text("trip_id,stop_id,stop_sequence\nT1,X2,10\nT1,001,9\n")
+    (gtfs_dir / "trips.txt").write_text(trips_txt)
+    (gtfs_dir / "shapes.txt").write_text(
+        "shape_id,shape_pt_lat,shape_pt_lon,shape_pt_sequence\n"
+        "10,38.90,-77.03,1\n"
+        "10,38.91,-77.03,2\n"
+    )
+    (gtfs_dir / "routes.txt").write_text("route_id,route_short_name\nR1,NA\n")
+
+
+def test_load_gtfs_tables_keeps_identifiers_as_text(tmp_path: Path) -> None:
+    _write_text_feed(
+        tmp_path,
+        "route_id,service_id,trip_id,direction_id,shape_id\nR1,WK,T1,0,10\nR1,WK,T2,1,\n",
+    )
+    tables = target.load_gtfs_tables(tmp_path)
+    assert list(tables["stops"]["stop_id"]) == ["001", "002"]
+    assert list(tables["stops"]["stop_code"]) == ["0101", ""]
+    assert set(tables["stop_times"]["stop_id"]) == {"001", "X2"}
+    # A blank shape_id no longer turns "10" into "10.0" in trips.txt only.
+    assert list(tables["trips"]["shape_id"]) == ["10", ""]
+    assert list(tables["shapes"]["shape_id"]) == ["10", "10"]
+    assert list(tables["routes"]["route_short_name"]) == ["NA"]
+    assert list(tables["trips"]["direction_id"]) == ["0", "1"]
+
+
+def test_load_gtfs_tables_parses_coordinates_and_sequences(tmp_path: Path) -> None:
+    _write_text_feed(
+        tmp_path,
+        "route_id,service_id,trip_id,direction_id,shape_id\nR1,WK,T1,0,10\n",
+    )
+    tables = target.load_gtfs_tables(tmp_path)
+    assert tables["stops"]["stop_lat"].tolist() == [38.90, 38.91]
+    assert tables["shapes"]["shape_pt_sequence"].tolist() == [1, 2]
+    # Numeric order, not text order ("10" < "9").
+    ordered = tables["stop_times"].sort_values("stop_sequence")
+    assert ordered["stop_id"].tolist() == ["001", "X2"]
+
+
+def test_load_gtfs_tables_accepts_feed_without_direction_id(tmp_path: Path) -> None:
+    _write_text_feed(tmp_path, "route_id,service_id,trip_id,shape_id\nR1,WK,T1,10\n")
+    tables = target.load_gtfs_tables(tmp_path)
+    assert list(tables["trips"]["direction_id"]) == ["<NA>"]
+
+
+def test_sanitize_token_makes_labels_filename_safe() -> None:
+    assert target._sanitize_token("<NA>") == "NA"
+    assert target._sanitize_token("stop_id=12/B") == "stop_id_12_B"
+    assert target._sanitize_token("Blue Line") == "Blue_Line"
+    assert target._sanitize_token("") == "unnamed"
 
 
 # ---------------------------------------------------------------------------

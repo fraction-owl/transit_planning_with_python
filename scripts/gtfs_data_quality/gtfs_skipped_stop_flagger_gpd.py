@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import itertools
 import logging
+import re
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -228,16 +229,24 @@ def normalize_direction_id(series: pd.Series) -> pd.Series:
     """Normalize GTFS direction_id to string labels.
 
     Args:
-        series: Series containing direction_id values (typically 0/1 or NaN).
+        series: Series containing direction_id values (typically 0/1, blank,
+            or NaN).
 
     Returns:
-        Series of strings representing direction_id values.
+        Series of strings representing direction_id values; blank or
+        non-numeric values become "<NA>".
     """
-    return series.astype("Int64").astype(str)
+    return pd.to_numeric(series, errors="coerce").astype("Int64").astype(str)
 
 
 def load_gtfs_tables(gtfs_dir: Path) -> Dict[str, pd.DataFrame]:
     """Load required GTFS tables from the specified directory.
+
+    Every column is read as text, so identifiers keep their exact spelling in
+    every table ("001" stays "001", "10" never becomes "10.0", and "NA" is not
+    treated as missing). Coordinate and sequence fields are then converted to
+    numbers explicitly. direction_id is optional; when trips.txt lacks it,
+    each route's trips are treated as a single direction.
 
     Args:
         gtfs_dir: Directory containing GTFS CSV files.
@@ -247,7 +256,7 @@ def load_gtfs_tables(gtfs_dir: Path) -> Dict[str, pd.DataFrame]:
 
     Raises:
         FileNotFoundError: If required GTFS files are missing.
-        ValueError: If required columns are missing.
+        ValueError: If a file cannot be parsed as CSV.
     """
     required_files = {
         "stops": "stops.txt",
@@ -256,6 +265,11 @@ def load_gtfs_tables(gtfs_dir: Path) -> Dict[str, pd.DataFrame]:
         "shapes": "shapes.txt",
         "routes": "routes.txt",
     }
+    numeric_fields = {
+        "stops": ("stop_lat", "stop_lon"),
+        "stop_times": ("stop_sequence",),
+        "shapes": ("shape_pt_lat", "shape_pt_lon", "shape_pt_sequence"),
+    }
 
     tables: Dict[str, pd.DataFrame] = {}
     for key, filename in required_files.items():
@@ -263,12 +277,19 @@ def load_gtfs_tables(gtfs_dir: Path) -> Dict[str, pd.DataFrame]:
         if not path.exists():
             msg = f"Required GTFS file not found: {path}"
             raise FileNotFoundError(msg)
-        tables[key] = pd.read_csv(path)
+        table = pd.read_csv(path, dtype=str, keep_default_na=False)
+        for column in numeric_fields.get(key, ()):
+            if column in table.columns:
+                table[column] = pd.to_numeric(table[column], errors="coerce")
+        tables[key] = table
 
     trips = tables["trips"].copy()
     if "direction_id" not in trips.columns:
-        msg = "trips.txt must contain a 'direction_id' column."
-        raise ValueError(msg)
+        logging.warning(
+            "trips.txt has no direction_id column; each route's trips are "
+            "analyzed as a single direction."
+        )
+        trips["direction_id"] = ""
 
     trips["direction_id"] = normalize_direction_id(trips["direction_id"])
     trips["route_id"] = trips["route_id"].astype(str)
@@ -1205,6 +1226,12 @@ def _parse_semicolon_list(value: str) -> List[str]:
     return [token for token in value.split(";") if token]
 
 
+def _sanitize_token(name: str) -> str:
+    """Reduce a route/direction/stop label to a filesystem-safe token."""
+    token = re.sub(r"[^A-Za-z0-9_-]+", "_", str(name).strip()).strip("_")
+    return token or "unnamed"
+
+
 def plot_mismatch_segment(
     row: pd.Series,
     route_sequences: Mapping[RouteKey, Sequence[str]],
@@ -1343,12 +1370,11 @@ def plot_mismatch_segment(
     ax.set_aspect("equal", adjustable="datalim")
     ax.grid(True, linewidth=0.3, zorder=GRID_ZORDER)
 
-    safe_start = start_key.replace(" ", "_")
-    safe_end = end_key.replace(" ", "_")
-    filename = (
-        f"seg_{base_route_id}_{base_dir}_vs_{other_route_id}_{other_dir}_"
-        f"{safe_start}_{safe_end}.png"
-    )
+    safe_base = f"{_sanitize_token(base_route_id)}_{_sanitize_token(base_dir)}"
+    safe_other = f"{_sanitize_token(other_route_id)}_{_sanitize_token(other_dir)}"
+    safe_start = _sanitize_token(start_key)
+    safe_end = _sanitize_token(end_key)
+    filename = f"seg_{safe_base}_vs_{safe_other}_{safe_start}_{safe_end}.png"
     PLOT_DIR.mkdir(parents=True, exist_ok=True)
     out_path = PLOT_DIR / filename
 
@@ -1564,8 +1590,8 @@ def plot_route_pair_overview(
     ax.grid(True, linewidth=0.3, zorder=GRID_ZORDER)
     ax.legend(loc="best", fontsize=8)
 
-    safe_base = f"{base_route_id}_{base_dir}".replace(" ", "_")
-    safe_other = f"{other_route_id}_{other_dir}".replace(" ", "_")
+    safe_base = f"{_sanitize_token(base_route_id)}_{_sanitize_token(base_dir)}"
+    safe_other = f"{_sanitize_token(other_route_id)}_{_sanitize_token(other_dir)}"
     filename_combined = f"overview_{safe_base}_vs_{safe_other}.png"
 
     PLOT_DIR.mkdir(parents=True, exist_ok=True)
