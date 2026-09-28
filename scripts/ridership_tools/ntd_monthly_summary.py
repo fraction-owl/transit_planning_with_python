@@ -42,6 +42,7 @@ from typing import Any, Final, Iterable
 
 import matplotlib.pyplot as plt
 import pandas as pd
+from matplotlib.ticker import FixedFormatter, FixedLocator
 
 # Sentinel markers used by extract_config_block / write_run_log to identify
 # the configuration block within this file's source. Each string must appear
@@ -589,8 +590,9 @@ def summarize_service_days(
 
     The Weekday/Saturday/Sunday columns hold the representative (most common)
     ``DAYS`` value reported across routes for that service period — i.e. the
-    number of service days filed for the month. ``Holidays`` is the number of
-    weekday holidays configured for that month.
+    number of service days filed for the month. They are also the denominators
+    of the SYSTEMWIDE daily averages in :func:`build_monthly_timeseries`.
+    ``Holidays`` is the number of weekday holidays configured for that month.
     """
     rows: list[dict[str, Any]] = []
     for period in ORDERED_PERIODS:
@@ -598,9 +600,12 @@ def summarize_service_days(
         row: dict[str, Any] = {"period": period}
         for service_period in SERVICE_PERIODS:
             days = dfp.loc[dfp["SERVICE_PERIOD"] == service_period, "DAYS"].dropna()
-            # value_counts().idxmax() returns the most frequently reported count,
-            # which ignores routes with partial-month or no service.
-            row[service_period] = int(days.value_counts().idxmax()) if not days.empty else 0
+            # The most frequently reported count ignores routes with partial-month
+            # or no service. A tie goes to the larger (full-month) count rather than
+            # to whichever route happens to be listed first.
+            counts = days.value_counts()
+            modal = counts[counts == counts.max()].index
+            row[service_period] = int(modal.max()) if not days.empty else 0
         row["Holidays"] = int((holiday_counts or {}).get(period, 0))
         rows.append(row)
     return pd.DataFrame(rows, columns=["period", *SERVICE_PERIODS, "Holidays"])
@@ -615,6 +620,11 @@ def build_monthly_timeseries(all_data: pd.DataFrame) -> pd.DataFrame:
         period | route | total_ridership | weekday_avg | saturday_avg |
         sunday_avg | revenue_hours | trips | revenue_miles |
         pph | ppt | ppm
+
+    SYSTEMWIDE daily averages divide each day type's total boardings by the
+    month's service days from :func:`summarize_service_days`. Summing ``DAYS``
+    across routes would instead give boardings per route-day, because every
+    route reports the same calendar days.
     """
     # 1. Aggregate to (period, route, service_period)
     group_cols = ["period", "ROUTE_NAME", "SERVICE_PERIOD"]
@@ -670,6 +680,7 @@ def build_monthly_timeseries(all_data: pd.DataFrame) -> pd.DataFrame:
     df_time = pd.DataFrame(rows)
 
     # 2. Add systemwide rows
+    service_days = summarize_service_days(all_data).set_index("period").to_dict("index")
     sys_rows: list[dict[str, Any]] = []
     for period in ORDERED_PERIODS:
         dfp = df_time[df_time["period"] == period]
@@ -677,6 +688,7 @@ def build_monthly_timeseries(all_data: pd.DataFrame) -> pd.DataFrame:
         hrs = dfp["revenue_hours"].sum()
         trips = dfp["trips"].sum()
         miles = dfp["revenue_miles"].sum()
+        days = service_days[period]
 
         agg_wd = agg[(agg["period"] == period) & (agg["SERVICE_PERIOD"] == "Weekday")]
         agg_sa = agg[(agg["period"] == period) & (agg["SERVICE_PERIOD"] == "Saturday")]
@@ -687,9 +699,9 @@ def build_monthly_timeseries(all_data: pd.DataFrame) -> pd.DataFrame:
                 "period": period,
                 "route": "SYSTEMWIDE",
                 "total_ridership": tr,
-                "weekday_avg": safe_div(agg_wd["MTH_BOARD"].sum(), agg_wd["DAYS"].sum()),
-                "saturday_avg": safe_div(agg_sa["MTH_BOARD"].sum(), agg_sa["DAYS"].sum()),
-                "sunday_avg": safe_div(agg_su["MTH_BOARD"].sum(), agg_su["DAYS"].sum()),
+                "weekday_avg": safe_div(agg_wd["MTH_BOARD"].sum(), days["Weekday"]),
+                "saturday_avg": safe_div(agg_sa["MTH_BOARD"].sum(), days["Saturday"]),
+                "sunday_avg": safe_div(agg_su["MTH_BOARD"].sum(), days["Sunday"]),
                 "revenue_hours": hrs,
                 "trips": trips,
                 "revenue_miles": miles,
@@ -709,6 +721,11 @@ def plot_metric_over_time(df_time: pd.DataFrame, metric: str) -> None:
 
     df_m = df_time[["period", "route", metric]].copy()
     df_m[metric] = pd.to_numeric(df_m[metric], errors="coerce")
+    # Month strings passed as x-values become Matplotlib categories, which logs
+    # INFO messages for every chart. Plot against positions instead and label them
+    # with a fixed locator/formatter; plt.xticks(ticks, labels) would also stretch
+    # the x-axis to every month, even for a route with no data at the start or end.
+    x_pos = range(len(ORDERED_PERIODS))
 
     for route in sorted(df_m["route"].unique()):
         df_r = df_m[df_m["route"] == route]
@@ -723,11 +740,13 @@ def plot_metric_over_time(df_time: pd.DataFrame, metric: str) -> None:
 
         plt.figure(figsize=PLOT_STYLE["figsize"])
         plt.plot(
-            ORDERED_PERIODS,
+            x_pos,
             y_vals,
             marker=PLOT_STYLE["marker"],
             linestyle=PLOT_STYLE["linestyle"],
         )
+        plt.gca().xaxis.set_major_locator(FixedLocator(x_pos))
+        plt.gca().xaxis.set_major_formatter(FixedFormatter(ORDERED_PERIODS))
         plt.title(f"{metric.replace('_', ' ').title()} – Route {route}")
         plt.xlabel("Month")
         plt.ylabel(metric.replace("_", " ").title())
