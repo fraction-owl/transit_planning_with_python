@@ -3,10 +3,11 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+import geopandas as gpd
 import pandas as pd
 import pytest
 from pyproj import Transformer
-from shapely.geometry import LineString
+from shapely.geometry import LineString, Point
 
 import scripts.gtfs_data_quality.gtfs_skipped_stop_flagger_gpd as target
 
@@ -277,6 +278,74 @@ def test_find_aligned_common_stops_enforces_direction() -> None:
 
 def test_find_aligned_common_stops_no_overlap() -> None:
     assert target.find_aligned_common_stops(["A"], ["B"]) == []
+
+
+# ---------------------------------------------------------------------------
+# compare_segments_for_route_pair (coordinates in projected metres)
+# ---------------------------------------------------------------------------
+
+
+def _stops_proj(coords: dict[str, tuple[float, float]]) -> gpd.GeoDataFrame:
+    return gpd.GeoDataFrame(
+        geometry=[Point(xy) for xy in coords.values()],
+        index=pd.Index(list(coords), name="stop_code"),
+        crs=target.PROJECTED_CRS,
+    )
+
+
+def _compare_pair(
+    base_seq: list[str],
+    ref_seq: list[str],
+    coords: dict[str, tuple[float, float]],
+    base_shape: LineString,
+    ref_shape: LineString | None = None,
+) -> list[tuple[str, str, str]]:
+    """Compare two routes with the default thresholds.
+
+    Returns (segment start, segment end, candidate keys) per finding.
+    """
+    base, ref = ("BASE", "0"), ("REF", "0")
+    results = target.compare_segments_for_route_pair(
+        base_key=base,
+        other_key=ref,
+        sequences={base: base_seq, ref: ref_seq},
+        stop_names={},
+        shapes_proj={base: base_shape, ref: ref_shape or base_shape},
+        stops_gdf_proj=_stops_proj(coords),
+        max_shape_hausdorff_m=target.MAX_SHAPE_HAUSDORFF_M,
+        max_stop_to_shape_m=target.MAX_STOP_TO_SHAPE_M,
+        segment_measure_padding_m=target.SEGMENT_MEASURE_PADDING_M,
+    )
+    return [
+        (
+            str(r["segment_start_stop_key"]),
+            str(r["segment_end_stop_key"]),
+            str(r["candidate_missing_stop_keys"]),
+        )
+        for r in results
+    ]
+
+
+def test_compare_segments_flags_single_skipped_stop() -> None:
+    # The base runs A -> C directly; the reference serves B in between.
+    coords = {"P": (0, 0), "A": (100, 0), "B": (200, 0), "C": (300, 0), "Q": (400, 0)}
+    line = LineString([(0, 0), (400, 0)])
+    flags = _compare_pair(["P", "A", "C", "Q"], ["P", "A", "B", "C", "Q"], coords, line)
+    assert flags == [("A", "C", "B")]
+
+
+@pytest.mark.parametrize(("offset_m", "expected"), [(20, [("A", "C", "B")]), (60, [])])
+def test_compare_segments_tests_proximity_against_the_segment(
+    offset_m: float, expected: list[tuple[str, str, str]]
+) -> None:
+    # The base doubles back 60 m north of its A-C stretch. At a 60 m offset,
+    # B sits on that later stretch: 0 m from the base shape as a whole, but
+    # 60 m from the part between A and C.
+    coords = {"A": (0, 0), "E": (150, 0), "B": (100, offset_m), "C": (200, 0), "D": (0, 60)}
+    base_shape = LineString([(0, 0), (400, 0), (400, 60), (0, 60)])
+    ref_shape = LineString([(0, 0), (100, offset_m), (200, 0), (400, 0), (400, 60), (0, 60)])
+    flags = _compare_pair(["A", "E", "C", "D"], ["A", "B", "C", "D"], coords, base_shape, ref_shape)
+    assert flags == expected
 
 
 # ---------------------------------------------------------------------------

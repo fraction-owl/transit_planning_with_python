@@ -54,6 +54,7 @@ import pandas as pd
 from matplotlib.axes import Axes
 from shapely.errors import GEOSException
 from shapely.geometry import LineString, Point
+from shapely.geometry.base import BaseGeometry
 from shapely.ops import substring
 
 # =============================================================================
@@ -113,7 +114,8 @@ MIN_SEGMENT_SPAN_STOPS = 2
 MAX_SHAPE_HAUSDORFF_M: Optional[float] = 80.0
 
 # Maximum perpendicular distance (meters) from a stop to a route's shape to consider
-# the stop as lying on that route's path.
+# the stop as lying on that route's path. Measured against the part of the shape
+# between the segment's boundary stops (padded by SEGMENT_MEASURE_PADDING_M).
 MAX_STOP_TO_SHAPE_M = 30.0
 
 # Padding (meters) around the segment extent along each shape for the "within path"
@@ -912,7 +914,7 @@ def unique_preserve_order(items: Iterable[str]) -> List[str]:
 
 def _stop_near_shape(
     stop_key: str,
-    shape: Optional[LineString],
+    shape: Optional[BaseGeometry],
     stops_gdf_proj: gpd.GeoDataFrame,
     max_dist_m: float,
 ) -> bool:
@@ -921,6 +923,44 @@ def _stop_near_shape(
         return False
     stop_geom = cast("Point", stops_gdf_proj.loc[stop_key, "geometry"])
     return float(stop_geom.distance(shape)) <= max_dist_m
+
+
+def _shape_between_stops(
+    shape: Optional[LineString],
+    start_key: str,
+    end_key: str,
+    stops_gdf_proj: gpd.GeoDataFrame,
+    padding_m: float,
+) -> Optional[BaseGeometry]:
+    """Return the part of a shape between two stops, padded along the line.
+
+    Both stops are projected onto the shape, and the substring between those
+    measures is extended by padding_m on each side (clipped to the shape).
+
+    Args:
+        shape: Projected route shape, or None.
+        start_key: Logical stop key for the segment start.
+        end_key: Logical stop key for the segment end.
+        stops_gdf_proj: Stops GeoDataFrame in PROJECTED_CRS, indexed by stop key.
+        padding_m: Distance (meters) to extend the substring past each stop.
+
+    Returns:
+        The substring geometry, or None if the shape or either stop is missing
+        or the substring cannot be built.
+    """
+    if shape is None:
+        return None
+    if start_key not in stops_gdf_proj.index or end_key not in stops_gdf_proj.index:
+        return None
+
+    m0 = float(shape.project(stops_gdf_proj.loc[start_key, "geometry"]))
+    m1 = float(shape.project(stops_gdf_proj.loc[end_key, "geometry"]))
+    lo, hi = min(m0, m1), max(m0, m1)
+    try:
+        segment = substring(shape, max(0.0, lo - padding_m), min(shape.length, hi + padding_m))
+    except (GEOSException, ValueError, TypeError):  # defensive: geometries can be weird
+        return None
+    return None if segment.is_empty else segment
 
 
 def compare_segments_for_route_pair(
@@ -947,9 +987,10 @@ def compare_segments_for_route_pair(
       - For segments that pass gating, compare interior subsequences:
           * base_interior = stops between boundaries on the base.
           * other_interior = stops between boundaries on the other.
-          * Any stop present only on one side's interior is flagged, but only
-            if it physically lies near the other route's projected shape
-            (within max_stop_to_shape_m meters).
+          * Any stop present only on the other route's interior is flagged,
+            but only if it lies within max_stop_to_shape_m meters of the base
+            route's shape between the segment's boundary stops (padded by
+            segment_measure_padding_m along the shape).
 
     This generalizes the 2-1-2 pattern to arbitrary interior lengths.
 
@@ -964,9 +1005,11 @@ def compare_segments_for_route_pair(
             between the two route substrings for a segment to be considered
             "same corridor". If None, geometry gating is disabled.
         max_stop_to_shape_m: Maximum distance (meters) from a stop to the
-            other route's shape for it to be retained as a "missing" candidate.
+            base route's shape, between the segment's boundary stops, for it
+            to be retained as a "missing" candidate.
         segment_measure_padding_m: Padding (meters) to extend the segment on
-            both sides along each shape when computing the substring.
+            both sides along each shape when computing the substrings for the
+            Hausdorff gate and the proximity test.
 
     Returns:
         List of dictionaries describing segment-level stop mismatches.
@@ -993,7 +1036,9 @@ def compare_segments_for_route_pair(
     other_route_id, other_dir = other_key
 
     for (i0, j0), (i1, j1) in zip(aligned_pairs[:-1], aligned_pairs[1:]):
-        if i1 - i0 < MIN_SEGMENT_SPAN_STOPS:
+        # The span test applies to either route: a base that runs A -> C
+        # directly (span 1) still has a segment if the other runs A -> B -> C.
+        if max(i1 - i0, j1 - j0) < MIN_SEGMENT_SPAN_STOPS:
             continue
 
         start_key = base_seq[i0]
@@ -1049,13 +1094,20 @@ def compare_segments_for_route_pair(
             continue
 
         # Filter false-positive candidates: a stop is only a real "miss" if it
-        # physically lies near the other route's corridor.
-        base_shape_proj = shapes_proj.get(base_key)
+        # physically lies near the base route's path through this segment,
+        # not merely near some other part of the base's shape.
+        base_segment_proj = _shape_between_stops(
+            shapes_proj.get(base_key),
+            start_key,
+            end_key,
+            stops_gdf_proj,
+            segment_measure_padding_m,
+        )
 
         stops_only_on_other = [
             s
             for s in stops_only_on_other
-            if _stop_near_shape(s, base_shape_proj, stops_gdf_proj, max_stop_to_shape_m)
+            if _stop_near_shape(s, base_segment_proj, stops_gdf_proj, max_stop_to_shape_m)
         ]
 
         if not stops_only_on_other:  # nothing missing from base in this segment
