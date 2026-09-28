@@ -86,7 +86,9 @@ PLOT_DIR = OUTPUT_DIR / "segment_plots"
 GTFS_CRS = "EPSG:4326"
 PROJECTED_CRS = "EPSG:26918"  # NAD83 / UTM 18N (Mid-Atlantic US).
 
-# Use stop_code vs stop_id as the logical key for stops.
+# Use stop_code vs stop_id as the logical key for stops. With stop_code, a stop
+# whose stop_code is blank is keyed as "stop_id=<its stop_id>", and stops that
+# share a stop_code are treated as one stop at the mean of their coordinates.
 USE_STOP_CODE = True
 STOP_KEY_FIELD = "stop_code" if USE_STOP_CODE else "stop_id"
 
