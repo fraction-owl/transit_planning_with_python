@@ -513,6 +513,40 @@ def test_find_intra_route_skipped_stops_ignores_short_turns() -> None:
     assert out.empty
 
 
+@pytest.mark.parametrize(
+    "variant",
+    [["S1", "SX", "S3", "S4", "S5"], ["S1", "S4", "S3", "S5"]],
+    ids=["adds-stop", "reorders-stops"],
+)
+def test_find_intra_route_skipped_stops_ignores_variants_that_are_not_omissions(
+    variant: list[str],
+) -> None:
+    trips = pd.DataFrame(
+        {
+            "trip_id": ["T1", "T2", "T3"],
+            "route_id": ["R1"] * 3,
+            "direction_id": ["0"] * 3,
+        }
+    )
+    rows = []
+    for tid, seq in [
+        ("T1", ["S1", "S2", "S3", "S4", "S5"]),
+        ("T2", ["S1", "S2", "S3", "S4", "S5"]),
+        ("T3", variant),  # same endpoints, but not the canonical minus some stops
+    ]:
+        rows += [{"trip_id": tid, "stop_id": s, "stop_sequence": i} for i, s in enumerate(seq)]
+    lookup = {s: s for s in ["S1", "S2", "S3", "S4", "S5", "SX"]}
+    out = target.find_intra_route_skipped_stops(trips, pd.DataFrame(rows), lookup)
+    assert out.empty
+
+
+def test_is_ordered_subsequence() -> None:
+    assert target.is_ordered_subsequence(["A", "C"], ["A", "B", "C"]) is True
+    assert target.is_ordered_subsequence(["A", "B", "B"], ["A", "B", "C", "B"]) is True
+    assert target.is_ordered_subsequence(["C", "A"], ["A", "B", "C"]) is False
+    assert target.is_ordered_subsequence(["A", "X"], ["A", "B", "C"]) is False
+
+
 # ---------------------------------------------------------------------------
 # hausdorff_distance_safe / _find_segment_indices
 # ---------------------------------------------------------------------------
@@ -661,3 +695,50 @@ def test_prepare_gtfs_context_takes_shape_from_representative_trip(
     assert ctx.route_sequences[("R1", "0")] == ["0101", "0102", "0103", "0106", "stop_id=005"]
     # T1a's own 400 m shape, not the more common 200 m short-turn shape.
     assert ctx.route_shapes_proj[("R1", "0")].length == pytest.approx(400.0, abs=0.5)
+
+
+# ---------------------------------------------------------------------------
+# main (synthetic feed)
+# ---------------------------------------------------------------------------
+
+
+def _run_main(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target_routes: set[str],
+    excluded_routes: set[str],
+) -> Path:
+    """Run main() on the synthetic feed and return the output directory."""
+    gtfs_dir = tmp_path / "gtfs"
+    gtfs_dir.mkdir()
+    _write_feed(gtfs_dir, FEED_STOPS, FEED_TRIPS, FEED_SHAPES)
+    out_dir = tmp_path / "out"
+    monkeypatch.setattr(target, "GTFS_DIR", gtfs_dir)
+    monkeypatch.setattr(target, "OUTPUT_DIR", out_dir)
+    monkeypatch.setattr(target, "PLOT_DIR", out_dir / "segment_plots")
+    monkeypatch.setattr(target, "TARGET_ROUTE_IDS", target_routes)
+    monkeypatch.setattr(target, "ROUTE_ID_WHITELIST", excluded_routes)
+    assert target.main() == 0
+    return out_dir
+
+
+@pytest.mark.parametrize(
+    ("target_routes", "excluded_routes", "r3_reported"),
+    [(set(), set(), True), ({"R1"}, set(), False), (set(), {"R3"}, False)],
+    ids=["all-routes", "target-routes", "route-whitelist"],
+)
+def test_main_limits_intra_route_check_to_analyzed_routes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target_routes: set[str],
+    excluded_routes: set[str],
+    r3_reported: bool,
+) -> None:
+    out_dir = _run_main(tmp_path, monkeypatch, target_routes, excluded_routes)
+
+    segments = pd.read_csv(out_dir / target.OUTPUT_FILENAME, dtype=str, keep_default_na=False)
+    flagged = set(zip(segments["missing_route_id"], segments["candidate_missing_stop_keys"]))
+    assert ("R1", "0104") in flagged  # R1 skips D, which R2 serves
+    # R3's trip T3c omits B; it is reported only when R3 is analyzed.
+    intra_text = (out_dir / target.INTRA_ROUTE_FILENAME).read_text()
+    assert ("T3c" in intra_text) is r3_reported

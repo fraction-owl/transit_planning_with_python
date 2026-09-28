@@ -1220,6 +1220,25 @@ def aggregate_candidates(df: pd.DataFrame) -> pd.DataFrame:
     return agg
 
 
+def is_ordered_subsequence(sub: Sequence[str], full: Sequence[str]) -> bool:
+    """Return True if sub can be obtained from full by deleting items only.
+
+    Args:
+        sub: Candidate subsequence.
+        full: Sequence that may contain sub's items in the same order.
+
+    Returns:
+        True if every item of sub appears in full, in order.
+    """
+    pos = 0
+    for item in sub:
+        try:
+            pos = full.index(item, pos) + 1
+        except ValueError:
+            return False
+    return True
+
+
 def find_intra_route_skipped_stops(
     trips_df: pd.DataFrame,
     stop_times_df: pd.DataFrame,
@@ -1229,10 +1248,12 @@ def find_intra_route_skipped_stops(
 
     For each (route_id, direction_id) the modal stop sequence (most common
     ordered tuple of stop keys) is treated as canonical.  Any trip whose
-    sequence is a strict subset of the canonical sequence — and whose first
-    and last stops match the canonical first and last — is flagged for the
-    stops it omits.  Genuine short-turn or branched patterns are excluded by
-    the first/last stop guard.
+    sequence is an ordered subsequence of the canonical sequence (it omits
+    stops but adds or reorders none) — and whose first and last stops match
+    the canonical first and last — is flagged for the stops it omits.
+    Genuine short-turn or branched patterns are excluded by the first/last
+    stop guard, and variants that add or reorder stops (e.g., a deviation)
+    by the subsequence test.
 
     Args:
         trips_df: DataFrame from trips.txt (must include route_id, direction_id,
@@ -1269,6 +1290,8 @@ def find_intra_route_skipped_stops(
                 continue
             if not seq or seq[0] != canonical[0] or seq[-1] != canonical[-1]:
                 continue  # genuine short-turn or branch
+            if not is_ordered_subsequence(seq, canonical):
+                continue  # adds or reorders stops: a different pattern, not an omission
             missing = canonical_set - set(seq)
             if missing:
                 rows.append(
@@ -2149,8 +2172,11 @@ def main() -> int:
     logging.info("Stop suspicion scores exported to: %s", agg_path)
 
     # Fix 5: intra-route trip-level skipped-stop check, written to a third CSV.
+    # Limited to the base routes, so TARGET_ROUTE_IDS and the route whitelist
+    # apply here exactly as they do to the segment comparison.
+    base_route_ids = {route_id for route_id, _ in ctx.base_route_keys}
     intra_route_df = find_intra_route_skipped_stops(
-        trips_df=ctx.trips_df,
+        trips_df=ctx.trips_df[ctx.trips_df["route_id"].isin(base_route_ids)],
         stop_times_df=ctx.stop_times_df,
         stop_key_lookup=ctx.stop_key_lookup,
     )
