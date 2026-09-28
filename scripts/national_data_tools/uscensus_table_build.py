@@ -495,7 +495,8 @@ def _build_block_df(inp: _BlockInputs) -> pd.DataFrame:
         dedupe_key="w_geocode",
     )
     if not jobs.empty:
-        jobs[GEO_ID_COL] = "1000000US" + jobs["w_geocode"].astype(str)
+        # w_geocode reads as an integer, which drops the leading 0 of state FIPS 01-09.
+        jobs[GEO_ID_COL] = "1000000US" + jobs["w_geocode"].astype(str).str.zfill(15)
         jobs = jobs.drop(columns="w_geocode")
 
     df = _merge_on_geo_id(pop, hh)

@@ -767,6 +767,20 @@ def test_build_joined_table_fips_filter_removes_other_counties(
     assert all(df["FIPS"] == _COUNTY_FIPS)
 
 
+def test_build_joined_table_keeps_leading_zero_in_lodes_geocode(tmp_path: Path) -> None:
+    # Alabama (state FIPS 01): pandas reads w_geocode as an integer and drops the 0.
+    pop_path = tmp_path / "P1-Data.csv"
+    wac_path = tmp_path / "al_wac_S000_JT00_2023.csv.gz"
+    _write_plain_csv(pop_path, _make_block_pop_csv(geo_id="1000000US010010201001000", pop=100))
+    _write_gz_csv(wac_path, _make_wac_csv(geocode="010010201001000", jobs=50))
+
+    df = build_joined_table(pop_files=[str(pop_path)], hh_files=[], jobs_files=[str(wac_path)])
+
+    assert df[GEO_ID_COL].tolist() == ["1000000US010010201001000"]
+    assert df["total_pop"].iloc[0] == 100
+    assert df["tot_empl"].iloc[0] == 50
+
+
 def test_build_joined_table_with_tract_income(tmp_path: Path) -> None:
     """Adding income files produces low_income and perc_low_income columns."""
     pop_path = tmp_path / "P1-Data.csv"

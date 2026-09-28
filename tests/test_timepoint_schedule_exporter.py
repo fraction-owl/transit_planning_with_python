@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 import openpyxl
@@ -390,4 +391,42 @@ def test_main_writes_real_schedule_workbooks(
         ("08:00", "08:05", "08:10", "08:15"),
         ("14:00", "14:05", "14:10", "14:15"),
         ("18:00", "18:05", "18:10", "18:15"),
+    ]
+
+
+def test_main_drops_stop_with_no_scheduled_times(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import scripts.gtfs_exports.timepoint_schedule_exporter as mod
+
+    # Blank S2's times on every R1 trip, as GTFS allows at non-timepoint stops.
+    feed = tmp_path / "gtfs"
+    shutil.copytree(GTFS_BASIC, feed)
+    stop_times = pd.read_csv(feed / "stop_times.txt", dtype=str)
+    blank = stop_times["trip_id"].isin(["T1", "T2", "T3"]) & (stop_times["stop_id"] == "S2")
+    stop_times.loc[blank, ["arrival_time", "departure_time"]] = ""
+    stop_times.to_csv(feed / "stop_times.txt", index=False)
+
+    monkeypatch.setattr(mod, "GTFS_FOLDER_PATH", str(feed))
+    monkeypatch.setattr(mod, "BASE_OUTPUT_PATH", str(tmp_path / "out"))
+    monkeypatch.setattr(mod, "FILTER_SERVICE_IDS", ["WKDY"])
+    monkeypatch.setattr(mod, "FILTER_IN_ROUTES", ["R1"])
+
+    assert mod.main() == 0
+
+    folder = tmp_path / "out" / "weekday_sid_WKDY"
+    wb = openpyxl.load_workbook(folder / "route_R1_schedule_weekday.xlsx")
+    header, *rows = wb["Direction_0"].iter_rows(values_only=True)
+    # S2 (Main St & Robin Hood Rd) has no time on any trip, so its column is dropped.
+    assert header[3:] == (
+        "Main St & Mt Vernon Ln Schedule",
+        "Main St & Doe St Schedule",
+        "Main St & Lockheed Blvd Schedule",
+        "Main St & Ox Rd Schedule",
+        "Main St & Beacon Hill Rd Schedule",
+    )
+    assert [row[3:] for row in rows] == [
+        ("07:00", "07:10", "07:15", "07:20", "07:25"),
+        ("12:00", "12:10", "12:15", "12:20", "12:25"),
+        ("17:00", "17:10", "17:15", "17:20", "17:25"),
     ]
