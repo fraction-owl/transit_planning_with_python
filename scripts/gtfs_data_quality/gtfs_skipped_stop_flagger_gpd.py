@@ -355,6 +355,41 @@ def build_shapes_gdf(shapes_df: pd.DataFrame, crs: str) -> gpd.GeoDataFrame:
     return shapes_gdf
 
 
+# Stop key given to a stop whose stop key field is blank. The prefix keeps these
+# keys from merging with one another or colliding with a real stop_code.
+STOP_ID_FALLBACK_PREFIX = "stop_id="
+
+
+def resolve_stop_keys(stops_df: pd.DataFrame, stop_key_field: str) -> pd.Series:
+    """Return the logical stop key for each row of stops.txt.
+
+    Stops whose stop key field is blank (common for stop_code) fall back to
+    STOP_ID_FALLBACK_PREFIX + stop_id, so they neither merge into one shared
+    key nor collide with another stop's real stop_code.
+
+    Args:
+        stops_df: DataFrame from stops.txt.
+        stop_key_field: Logical stop key field, e.g., "stop_id" or "stop_code".
+
+    Returns:
+        Series of string stop keys aligned with stops_df's index.
+
+    Raises:
+        ValueError: If stop_key_field is not a column of stops_df.
+    """
+    if stop_key_field not in stops_df.columns:
+        msg = f"stops.txt is missing the stop key field '{stop_key_field}'."
+        raise ValueError(msg)
+
+    stop_ids = stops_df["stop_id"].astype(str)
+    if stop_key_field == "stop_id":
+        return stop_ids
+
+    keys = stops_df[stop_key_field].fillna("").astype(str)
+    blank = keys.str.strip() == ""
+    return keys.where(~blank, STOP_ID_FALLBACK_PREFIX + stop_ids)
+
+
 def build_stops_gdf(
     stops_df: pd.DataFrame,
     crs: str,
@@ -362,8 +397,10 @@ def build_stops_gdf(
 ) -> gpd.GeoDataFrame:
     """Build a Point GeoDataFrame from GTFS stops.txt.
 
-    The GeoDataFrame index is set to the chosen stop key field
-    (stop_id or stop_code), as configured via stop_key_field.
+    The GeoDataFrame index is the logical stop key from resolve_stop_keys
+    (stop_id or stop_code, as configured via stop_key_field). When several
+    stop_ids share a key, the key is placed at the mean of their coordinates,
+    so every key has exactly one geometry.
 
     Args:
         stops_df: DataFrame containing stops.txt.
@@ -391,12 +428,23 @@ def build_stops_gdf(
         raise ValueError(msg)
 
     stops_df = stops_df.copy()
-    stops_df["stop_id"] = stops_df["stop_id"].astype(str)
-    stops_df[stop_key_field] = stops_df[stop_key_field].astype(str)
+    stops_df["stop_key"] = resolve_stop_keys(stops_df, stop_key_field)
 
-    geometry = gpd.points_from_xy(stops_df["stop_lon"], stops_df["stop_lat"])
-    stops_gdf = gpd.GeoDataFrame(stops_df, geometry=geometry, crs=crs)
-    stops_gdf = stops_gdf.set_index(stop_key_field)
+    key_counts = stops_df["stop_key"].value_counts()
+    shared_keys = [str(key) for key in key_counts[key_counts > 1].index]
+    if shared_keys:
+        logging.warning(
+            "%d %s value(s) are shared by more than one stop_id (e.g., %s); "
+            "each is located at the mean of its stops' coordinates.",
+            len(shared_keys),
+            stop_key_field,
+            ", ".join(shared_keys[:5]),
+        )
+
+    coords = stops_df.groupby("stop_key", sort=False)[["stop_lon", "stop_lat"]].mean()
+    geometry = gpd.points_from_xy(coords["stop_lon"], coords["stop_lat"])
+    stops_gdf = gpd.GeoDataFrame(coords, geometry=geometry, crs=crs)
+    stops_gdf.index.name = stop_key_field
     return stops_gdf
 
 
@@ -518,17 +566,14 @@ def build_stop_key_lookup(
         stop_key_field: Logical stop key field, e.g., "stop_id" or "stop_code".
 
     Returns:
-        Dictionary mapping stop_id -> logical stop key as string.
+        Dictionary mapping stop_id -> logical stop key as string (see
+        resolve_stop_keys for stops with a blank key).
     """
-    if stop_key_field not in stops_df.columns:
-        msg = f"stops.txt is missing the stop key field '{stop_key_field}'."
-        raise ValueError(msg)
+    keys = resolve_stop_keys(stops_df, stop_key_field)
+    df = pd.DataFrame({"stop_id": stops_df["stop_id"].astype(str), "stop_key": keys})
+    df = df.drop_duplicates("stop_id")
 
-    df = stops_df[["stop_id", stop_key_field]].drop_duplicates("stop_id").copy()
-    df["stop_id"] = df["stop_id"].astype(str)
-    df[stop_key_field] = df[stop_key_field].astype(str)
-
-    return dict(zip(df["stop_id"], df[stop_key_field]))
+    return dict(zip(df["stop_id"], df["stop_key"]))
 
 
 def build_stop_names_lookup(
@@ -548,13 +593,10 @@ def build_stop_names_lookup(
         msg = "stops.txt is missing the 'stop_name' column."
         raise ValueError(msg)
 
-    df = stops_df[[stop_key_field, "stop_name"]].copy()
-    df = df[pd.notna(df[stop_key_field])]
+    keys = resolve_stop_keys(stops_df, stop_key_field)
+    names = stops_df["stop_name"].astype(str)
 
-    df[stop_key_field] = df[stop_key_field].astype(str)
-    df["stop_name"] = df["stop_name"].astype(str)
-
-    return dict(zip(df[stop_key_field], df["stop_name"]))
+    return dict(zip(keys, names))
 
 
 def choose_representative_trip_ids(

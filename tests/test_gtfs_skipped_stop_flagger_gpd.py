@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pandas as pd
 import pytest
+from shapely.geometry import LineString
 
 import scripts.gtfs_data_quality.gtfs_skipped_stop_flagger_gpd as target
 
@@ -168,6 +170,60 @@ def test_build_stop_names_lookup_keyed_by_stop_key() -> None:
 def test_build_stop_names_lookup_missing_name_column_raises() -> None:
     with pytest.raises(ValueError, match="stop_name"):
         target.build_stop_names_lookup(_stops_df().drop(columns=["stop_name"]), "stop_code")
+
+
+def test_build_stop_key_lookup_stop_id_mode_maps_ids_to_themselves() -> None:
+    lookup = target.build_stop_key_lookup(_stops_df(), "stop_id")
+    assert lookup == {"S1": "S1", "S2": "S2"}
+
+
+def test_build_stop_key_lookup_blank_codes_fall_back_to_stop_id() -> None:
+    stops = pd.DataFrame(
+        {
+            "stop_id": ["S1", "S2", "S3", "S4"],
+            # S3's stop_id equals S4's real code: the fallback must not collide.
+            "stop_code": ["100", "", " ", "S3"],
+            "stop_name": ["a", "b", "c", "d"],
+        }
+    )
+    lookup = target.build_stop_key_lookup(stops, "stop_code")
+    assert lookup == {"S1": "100", "S2": "stop_id=S2", "S3": "stop_id=S3", "S4": "S3"}
+    names = target.build_stop_names_lookup(stops, "stop_code")
+    assert names["stop_id=S2"] == "b"
+
+
+def _shared_code_stops() -> pd.DataFrame:
+    """Two platforms sharing stop_code "1" (~4 m apart) and one stop "2"."""
+    return pd.DataFrame(
+        {
+            "stop_id": ["S1a", "S1b", "S2"],
+            "stop_code": ["1", "1", "2"],
+            "stop_name": ["One NB", "One SB", "Two"],
+            "stop_lat": [38.90000, 38.90004, 38.90000],
+            "stop_lon": [-77.03000, -77.03000, -77.02770],
+        }
+    )
+
+
+def test_build_stops_gdf_places_shared_code_at_mean(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.WARNING):
+        gdf = target.build_stops_gdf(_shared_code_stops(), "EPSG:4326", "stop_code")
+    assert gdf.index.is_unique
+    assert list(gdf.index) == ["1", "2"]
+    point = gdf.loc["1", "geometry"]
+    assert (point.x, point.y) == pytest.approx((-77.03, 38.90002))
+    assert "shared by more than one stop_id" in caplog.text
+
+
+def test_segment_hausdorff_distance_handles_shared_stop_code() -> None:
+    gdf = target.build_stops_gdf(_shared_code_stops(), "EPSG:4326", "stop_code")
+    gdf_proj = gdf.to_crs("EPSG:26918")
+    line = LineString([gdf_proj.loc["1", "geometry"], gdf_proj.loc["2", "geometry"]])
+    shapes = {("A", "0"): line, ("B", "0"): line}
+    distance = target.segment_hausdorff_distance(
+        ("A", "0"), ("B", "0"), "1", "2", shapes, gdf_proj, padding_m=50.0
+    )
+    assert distance == pytest.approx(0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -369,8 +425,6 @@ def test_find_intra_route_skipped_stops_ignores_short_turns() -> None:
 
 
 def test_hausdorff_distance_safe_none_inputs() -> None:
-    from shapely.geometry import LineString
-
     line = LineString([(0, 0), (1, 0)])
     assert target.hausdorff_distance_safe(None, line) is None
     assert target.hausdorff_distance_safe(line, None) is None
