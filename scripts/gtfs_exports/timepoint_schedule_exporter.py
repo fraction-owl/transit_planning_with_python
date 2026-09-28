@@ -529,8 +529,11 @@ def process_single_trip(
         if sid not in master_dict:
             continue
 
-        arr_val = (row_2.get("arrival_time") or "").strip()
-        dep_val = (row_2.get("departure_time") or "").strip()
+        # A stop with no scheduled time (allowed at non-timepoints) reads as NaN.
+        arr_raw = row_2.get("arrival_time")
+        dep_raw = row_2.get("departure_time")
+        arr_val = "" if pd.isna(arr_raw) else str(arr_raw).strip()
+        dep_val = "" if pd.isna(dep_raw) else str(dep_raw).strip()
         time_val = dep_val
 
         arr_m = time_to_minutes(arr_val)
@@ -663,7 +666,7 @@ def process_trips_for_direction(params: dict[str, Any]) -> pd.DataFrame:
     out_df = out_df.drop(columns=["sort_time"])
 
     safe_check_schedule_order(out_df, stop_names_ordered, route_short, sched_type, dir_id)
-    remove_empty_schedule_columns(out_df)
+    out_df = remove_empty_schedule_columns(out_df)
     return out_df
 
 
