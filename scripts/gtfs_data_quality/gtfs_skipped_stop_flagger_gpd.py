@@ -168,6 +168,36 @@ class GTFSContext:
     route_id_whitelist: Set[str]
 
 
+# Output columns, so that an empty result still writes a CSV header.
+SEGMENT_COLUMNS: List[str] = [
+    "missing_route_id",
+    "missing_route_direction_id",
+    "reference_route_id",
+    "reference_route_direction_id",
+    "segment_start_stop_key",
+    "segment_start_stop_name",
+    "segment_end_stop_key",
+    "segment_end_stop_name",
+    "candidate_missing_stop_keys",
+    "candidate_missing_stop_names",
+]
+AGGREGATE_COLUMNS: List[str] = [
+    "missing_route_id",
+    "missing_route_direction_id",
+    "stop_key",
+    "n_reference_routes",
+    "reference_route_ids",
+    "example_segments",
+]
+INTRA_ROUTE_COLUMNS: List[str] = [
+    "route_id",
+    "direction_id",
+    "trip_id",
+    "n_canonical_trips",
+    "missing_stop_keys",
+]
+
+
 # =============================================================================
 # GTFS helpers
 # =============================================================================
@@ -1193,11 +1223,11 @@ def aggregate_candidates(df: pd.DataFrame) -> pd.DataFrame:
         df: Segment-level mismatch DataFrame produced by run_segment_comparison.
 
     Returns:
-        Aggregated DataFrame sorted by n_reference_routes descending, or the
-        original (empty) DataFrame if input is empty.
+        Aggregated DataFrame sorted by n_reference_routes descending, or an
+        empty DataFrame with the aggregate columns if input is empty.
     """
     if df.empty:
-        return df
+        return pd.DataFrame(columns=AGGREGATE_COLUMNS)
     exploded = df.assign(stop_key=df["candidate_missing_stop_keys"].str.split(";")).explode(
         "stop_key"
     )
@@ -1303,7 +1333,7 @@ def find_intra_route_skipped_stops(
                         "missing_stop_keys": ";".join(sorted(missing)),
                     }
                 )
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows, columns=INTRA_ROUTE_COLUMNS)
 
 
 # =============================================================================
@@ -1408,6 +1438,11 @@ def plot_mismatch_segment(
     if base_geom is None or other_geom is None:
         logging.info("Skipping plot: missing shapes for %s or %s.", base_key, other_key)
         return None
+
+    # run_segment_comparison() compares against a reversed reference when it
+    # runs the corridor the opposite way; use the same order here.
+    if sequences_are_reversed(base_seq, other_seq):
+        other_seq = list(reversed(other_seq))
 
     try:
         i0, i1 = _find_segment_indices(base_seq, start_key, end_key)
@@ -1966,7 +2001,7 @@ def run_segment_comparison(ctx: GTFSContext) -> pd.DataFrame:
         DataFrame of segment-level mismatches between routes.
     """
     if not ctx.route_sequences:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=SEGMENT_COLUMNS)
 
     logging.info(
         "Comparing segments for %d base route/direction pairs out of %d total.",
@@ -2039,7 +2074,7 @@ def run_segment_comparison(ctx: GTFSContext) -> pd.DataFrame:
 
     if not results:
         logging.info("No segment-level stop mismatches were identified.")
-        return pd.DataFrame()
+        return pd.DataFrame(columns=SEGMENT_COLUMNS)
 
     df = pd.DataFrame(results)
     df = df.sort_values(

@@ -458,6 +458,17 @@ def test_aggregate_candidates_empty_input_passthrough() -> None:
     assert target.aggregate_candidates(df).empty
 
 
+def test_empty_results_keep_their_columns() -> None:
+    assert list(target.aggregate_candidates(pd.DataFrame()).columns) == target.AGGREGATE_COLUMNS
+    trips = pd.DataFrame({"trip_id": ["T1"], "route_id": ["R1"], "direction_id": ["0"]})
+    stop_times = pd.DataFrame(
+        {"trip_id": ["T1", "T1"], "stop_id": ["S1", "S2"], "stop_sequence": [1, 2]}
+    )
+    intra = target.find_intra_route_skipped_stops(trips, stop_times, {"S1": "S1", "S2": "S2"})
+    assert intra.empty
+    assert list(intra.columns) == target.INTRA_ROUTE_COLUMNS
+
+
 # ---------------------------------------------------------------------------
 # find_intra_route_skipped_stops
 # ---------------------------------------------------------------------------
@@ -569,6 +580,39 @@ def test_find_segment_indices_missing_stop_raises_keyerror() -> None:
         target._find_segment_indices(["A", "B"], "Z", "B")
     with pytest.raises(KeyError):
         target._find_segment_indices(["A", "B"], "B", "A")
+
+
+def test_plot_mismatch_segment_plots_reversed_reference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The reference runs D -> A; the comparison reversed it, so the finding's
+    # A -> C segment only exists in the reversed order.
+    monkeypatch.setattr(target, "PLOT_DIR", tmp_path)
+    base, ref = ("R1", "0"), ("R2", "1")
+    sequences = {base: ["A", "C", "D"], ref: ["D", "C", "B", "A"]}
+    shapes_geo = {
+        base: LineString([(-77.030, 38.9), (-77.027, 38.9)]),
+        ref: LineString([(-77.027, 38.9), (-77.030, 38.9)]),
+    }
+    stops_geo = gpd.GeoDataFrame(
+        geometry=[Point(-77.030 + 0.001 * i, 38.9) for i in range(4)],
+        index=pd.Index(["A", "B", "C", "D"]),
+        crs=target.GTFS_CRS,
+    )
+    row = pd.Series(
+        {
+            "missing_route_id": "R1",
+            "missing_route_direction_id": "0",
+            "reference_route_id": "R2",
+            "reference_route_direction_id": "1",
+            "segment_start_stop_key": "A",
+            "segment_end_stop_key": "C",
+            "candidate_missing_stop_keys": "B",
+        }
+    )
+    out_path = target.plot_mismatch_segment(row, sequences, shapes_geo, stops_geo, {})
+    assert out_path is not None
+    assert out_path.exists()
 
 
 # ---------------------------------------------------------------------------
@@ -740,5 +784,19 @@ def test_main_limits_intra_route_check_to_analyzed_routes(
     flagged = set(zip(segments["missing_route_id"], segments["candidate_missing_stop_keys"]))
     assert ("R1", "0104") in flagged  # R1 skips D, which R2 serves
     # R3's trip T3c omits B; it is reported only when R3 is analyzed.
-    intra_text = (out_dir / target.INTRA_ROUTE_FILENAME).read_text()
-    assert ("T3c" in intra_text) is r3_reported
+    intra = pd.read_csv(out_dir / target.INTRA_ROUTE_FILENAME, dtype=str)
+    assert ("T3c" in set(intra["trip_id"])) is r3_reported
+
+
+def test_main_writes_csv_headers_when_nothing_is_found(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out_dir = _run_main(tmp_path, monkeypatch, {"NO_SUCH_ROUTE"}, set())
+    for filename, columns in [
+        (target.OUTPUT_FILENAME, target.SEGMENT_COLUMNS),
+        (target.AGGREGATE_FILENAME, target.AGGREGATE_COLUMNS),
+        (target.INTRA_ROUTE_FILENAME, target.INTRA_ROUTE_COLUMNS),
+    ]:
+        written = pd.read_csv(out_dir / filename)
+        assert written.empty
+        assert list(written.columns) == columns
