@@ -501,6 +501,51 @@ def test_build_monthly_timeseries_pph() -> None:
     assert row["pph"].iloc[0] == pytest.approx(round(1000 / 100, 1))
 
 
+def _systemwide_row(df: pd.DataFrame) -> pd.Series:
+    with patch.object(mod, "ORDERED_PERIODS", ["Jul-2024"]):
+        result = mod.build_monthly_timeseries(df)
+    return result[result["route"] == "SYSTEMWIDE"].iloc[0]
+
+
+def test_build_monthly_timeseries_systemwide_avgs_divide_by_month_service_days() -> None:
+    # Both routes run the same 20 weekdays, 4 Saturdays and 4 Sundays, so the
+    # systemwide averages divide by those counts, not by the summed route-days.
+    df = pd.DataFrame(
+        {
+            "period": ["Jul-2024"] * 6,
+            "ROUTE_NAME": ["101", "202"] * 3,
+            "SERVICE_PERIOD": ["Weekday"] * 2 + ["Saturday"] * 2 + ["Sunday"] * 2,
+            "MTH_BOARD": [2000.0, 4000.0, 400.0, 800.0, 300.0, 500.0],
+            "DAYS": [20.0, 20.0, 4.0, 4.0, 4.0, 4.0],
+            "MTH_REV_HOURS": [100.0] * 6,
+            "TOTAL_TRIPS": [200.0] * 6,
+            "MTH_REV_MILES": [400.0] * 6,
+        }
+    )
+    row = _systemwide_row(df)
+    assert row["weekday_avg"] == pytest.approx(6000 / 20)
+    assert row["saturday_avg"] == pytest.approx(1200 / 4)
+    assert row["sunday_avg"] == pytest.approx(800 / 4)
+
+
+def test_build_monthly_timeseries_systemwide_avg_with_partial_month_route() -> None:
+    # Route 303 ran 10 of the month's 20 weekdays: its boardings count toward the
+    # 20-day month instead of adding 10 route-days to the denominator.
+    df = pd.DataFrame(
+        {
+            "period": ["Jul-2024"] * 3,
+            "ROUTE_NAME": ["101", "202", "303"],
+            "SERVICE_PERIOD": ["Weekday"] * 3,
+            "MTH_BOARD": [4000.0, 2000.0, 1000.0],
+            "DAYS": [20.0, 20.0, 10.0],
+            "MTH_REV_HOURS": [100.0] * 3,
+            "TOTAL_TRIPS": [200.0] * 3,
+            "MTH_REV_MILES": [400.0] * 3,
+        }
+    )
+    assert _systemwide_row(df)["weekday_avg"] == pytest.approx(7000 / 20)
+
+
 # ---------------------------------------------------------------------------
 # weekday_holiday_counts
 # ---------------------------------------------------------------------------
@@ -546,6 +591,14 @@ def test_summarize_service_days_no_holidays_defaults_zero(minimal_ntd_df: pd.Dat
     with patch.object(mod, "ORDERED_PERIODS", ["Jul-2024"]):
         result = mod.summarize_service_days(minimal_ntd_df)
     assert result["Holidays"].iloc[0] == 0
+
+
+@pytest.mark.parametrize("days", [[10.0, 20.0], [20.0, 10.0]])
+def test_summarize_service_days_tie_goes_to_larger_count(days: list[float]) -> None:
+    df = pd.DataFrame({"period": ["Jul-2024"] * 2, "SERVICE_PERIOD": ["Weekday"] * 2, "DAYS": days})
+    with patch.object(mod, "ORDERED_PERIODS", ["Jul-2024"]):
+        result = mod.summarize_service_days(df)
+    assert result["Weekday"].iloc[0] == 20
 
 
 def test_summarize_service_days_columns() -> None:
