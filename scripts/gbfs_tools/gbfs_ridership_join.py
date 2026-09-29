@@ -14,7 +14,17 @@ are ready to drop into a GIS for ridership maps (proportional symbols,
 choropleths, and so on).
 
 Both inputs and outputs use EPSG:4326 (WGS 84), inherited from the source
-geometries. The join key defaults to ``station_id``.
+geometries.
+
+Join keys: Capital Bikeshare trip histories identify stations by the number
+that GBFS publishes as ``short_name`` (e.g. ``31000``); the GBFS
+``station_id`` is a different, opaque identifier. The geometry side therefore
+joins on ``GEOMETRY_ID_FIELD`` (default ``short_name``) and the ridership side
+on ``RIDERSHIP_ID_FIELD`` (default ``station_id``, the column written by
+``bikeshare_ridership_trends``). Identifiers are compared as strings exactly as
+written (only surrounding whitespace is trimmed), unmatched ids are logged
+before stations are zero-filled, and a join that matches no ids at all is an
+error rather than an all-zero output.
 
 Outputs:
     - ``<stem>_ridership.geojson`` / ``<stem>_ridership.shp`` in ``OUTPUT_DIR``
@@ -38,7 +48,7 @@ import argparse
 import logging
 import sys
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import Iterable, List, Optional, Sequence
 
 import geopandas as gpd
 import pandas as pd
@@ -48,7 +58,11 @@ RIDERSHIP_INPUT: str = "output/monthly_station_ridership.csv"
 GEOJSON_INPUT: Optional[str] = "output/gbfs_stations.geojson"
 SHAPEFILE_INPUT: Optional[str] = "output/gbfs_stations.shp"
 OUTPUT_DIR: str = "output"
-STATION_ID_FIELD: str = "station_id"
+# Station key on the geometry layer. Capital Bikeshare trip station numbers
+# match the GBFS ``short_name``, not the GBFS ``station_id``.
+GEOMETRY_ID_FIELD: str = "short_name"
+# Station key in the ridership CSV (``bikeshare_ridership_trends`` output).
+RIDERSHIP_ID_FIELD: str = "station_id"
 # === END CONFIG ===
 
 logging.basicConfig(level=logging.INFO)
@@ -59,27 +73,78 @@ logger = logging.getLogger(__name__)
 RIDERSHIP_MEASURES: tuple[str, ...] = ("departures", "arrivals", "total")
 
 
-def _safe_to_str(value: object) -> str:
-    """Return a trimmed string form of an identifier value.
+#: How many unmatched ids to list in a log message before truncating.
+_MAX_IDS_LOGGED = 20
+
+
+def _normalize_id(value: object) -> str | None:
+    """Return the string join key for one identifier value.
+
+    Strings are kept exactly as written apart from surrounding whitespace, so
+    ``"001"``, ``"NA"`` and ``"1.0"`` all stay distinct. Integers (and
+    integral floats, which is how a numeric attribute column with gaps comes
+    back from a GIS file) are rendered without a decimal part. Missing and
+    blank values return ``None`` and never match.
 
     Args:
         value: Any identifier-like value.
 
     Returns:
-        A stripped string, with trailing ``.0`` removed for float-like ids.
+        The normalized key, or ``None`` for a missing/blank id.
     """
-    return str(value).strip().removesuffix(".0")
+    if value is None or (not isinstance(value, str) and pd.isna(value)):
+        return None
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    text = str(value).strip()
+    return text or None
+
+
+def _join_keys(values: pd.Series, label: str) -> pd.Series:
+    """Normalize a column of ids and verify distinct ids stay distinct.
+
+    Args:
+        values: Raw identifier column.
+        label: Description of the column, used in error messages.
+
+    Returns:
+        The normalized keys (``None`` for missing ids), aligned to *values*.
+
+    Raises:
+        ValueError: If two different raw ids normalize to the same key.
+    """
+    keys = values.map(_normalize_id)
+    pairs = pd.DataFrame({"raw": values.astype(str), "key": keys}).dropna(subset=["key"])
+    raw_per_key = pairs.drop_duplicates().groupby("key")["raw"].agg(list)
+    collisions = raw_per_key[raw_per_key.map(len) > 1]
+    if not collisions.empty:
+        detail = "; ".join(f"{key!r} <- {raws}" for key, raws in collisions.head(5).items())
+        raise ValueError(f"Distinct ids in {label} normalize to the same join key: {detail}")
+    return keys
+
+
+def _format_ids(ids: Iterable[str]) -> str:
+    """Return a short, sorted, comma-separated listing of ids for logging."""
+    ordered = sorted(ids)
+    listing = ", ".join(ordered[:_MAX_IDS_LOGGED])
+    if len(ordered) > _MAX_IDS_LOGGED:
+        listing += f", ... ({len(ordered) - _MAX_IDS_LOGGED} more)"
+    return listing
 
 
 def aggregate_station_totals(
-    ridership: pd.DataFrame, id_field: str = STATION_ID_FIELD
+    ridership: pd.DataFrame, id_field: str = RIDERSHIP_ID_FIELD
 ) -> pd.DataFrame:
     """Collapse per-month station ridership to per-station totals.
 
     Rows are grouped by ``id_field`` and the ridership measures
     (:data:`RIDERSHIP_MEASURES`) are summed. A ``station_name`` column, if
-    present, is carried through using its first value per station. Input that is
-    already aggregated (no ``month`` column) passes through unchanged in shape.
+    present, is carried through using its first nonblank value per station.
+    Input that is already aggregated (no ``month`` column) passes through
+    unchanged in shape. Ids are grouped exactly as they appear, so ids should
+    be read as strings (see :func:`load_station_ridership`).
 
     Args:
         ridership: Station ridership table, e.g. ``monthly_station_ridership``.
@@ -94,17 +159,29 @@ def aggregate_station_totals(
             f"found columns: {list(ridership.columns)}"
         )
     measures = [c for c in RIDERSHIP_MEASURES if c in ridership.columns]
+    ridership = ridership.copy()
+    for measure in measures:
+        ridership[measure] = pd.to_numeric(ridership[measure], errors="raise")
     aggregations: dict[str, str] = {measure: "sum" for measure in measures}
     if "station_name" in ridership.columns:
+        # "first" skips missing values only, so treat blank names as missing.
+        names = ridership["station_name"].astype("string").str.strip()
+        ridership["station_name"] = names.mask(names == "")
         aggregations["station_name"] = "first"
-    totals = ridership.groupby(id_field, as_index=False).agg(aggregations)
+    # dropna=False so rows with a missing id are not silently discarded here;
+    # join_ridership reports them as unjoinable instead.
+    totals = ridership.groupby(id_field, as_index=False, dropna=False).agg(aggregations)
     for measure in measures:
         totals[measure] = totals[measure].fillna(0).astype(int)
     return totals
 
 
-def load_station_ridership(path: str | Path, id_field: str = STATION_ID_FIELD) -> pd.DataFrame:
+def load_station_ridership(path: str | Path, id_field: str = RIDERSHIP_ID_FIELD) -> pd.DataFrame:
     """Load a station ridership CSV and aggregate it to per-station totals.
+
+    Every column is read as text with NA detection off, so ids such as
+    ``"001"`` or ``"NA"`` survive intact; ridership measures are converted to
+    numbers afterwards.
 
     Args:
         path: Path to ``monthly_station_ridership.csv`` (or an already
@@ -114,45 +191,117 @@ def load_station_ridership(path: str | Path, id_field: str = STATION_ID_FIELD) -
     Returns:
         A DataFrame with one row per station, ready to join onto geometries.
     """
-    ridership = pd.read_csv(path)
+    ridership = pd.read_csv(path, dtype=str, keep_default_na=False, na_filter=False)
+    for measure in RIDERSHIP_MEASURES:
+        if measure in ridership.columns:
+            ridership[measure] = pd.to_numeric(ridership[measure].replace("", "0"))
     return aggregate_station_totals(ridership, id_field)
 
 
 def join_ridership(
     stations: gpd.GeoDataFrame,
     ridership: pd.DataFrame,
-    id_field: str = STATION_ID_FIELD,
+    geometry_id_field: str = GEOMETRY_ID_FIELD,
+    ridership_id_field: str = RIDERSHIP_ID_FIELD,
 ) -> gpd.GeoDataFrame:
     """Join per-station ridership totals onto station geometries.
 
-    The join key is normalized on both sides with :func:`_safe_to_str` so that
-    string ids from GBFS match numeric-looking ids parsed from CSV. The merge is
-    a left join: every station geometry is kept, and stations with no recorded
-    ridership get zero-filled measures.
+    Keys on both sides are normalized with :func:`_normalize_id`, which keeps
+    string ids as written and refuses normalizations that would merge distinct
+    ids. The merge is a left join validated as many-to-one against unique
+    ridership keys, so a station feature can never be duplicated. Every station
+    geometry is kept; unmatched ids on either side are logged, and stations
+    with no ridership get zero-filled measures.
 
     Args:
         stations: Station point geometries (from ``gbfs_stations_exporter``).
         ridership: Per-station ridership totals.
-        id_field: Column/property identifying the station on both sides.
+        geometry_id_field: Station key column on the geometry layer.
+        ridership_id_field: Station key column in the ridership table.
 
     Returns:
         A GeoDataFrame of stations enriched with ridership attributes.
+
+    Raises:
+        KeyError: If either side lacks its join column.
+        ValueError: If ids collide after normalization, geometry keys are
+            duplicated, or no ridership id matches any station.
     """
-    if id_field not in stations.columns:
+    if geometry_id_field not in stations.columns:
         raise KeyError(
-            f"Station layer is missing the join column {id_field!r}; "
+            f"Station layer is missing the join column {geometry_id_field!r}; "
             f"found columns: {list(stations.columns)}"
+        )
+    if ridership_id_field not in ridership.columns:
+        raise KeyError(
+            f"Ridership table is missing the join column {ridership_id_field!r}; "
+            f"found columns: {list(ridership.columns)}"
         )
     stations = stations.copy()
     ridership = ridership.copy()
-    stations["_join_key"] = stations[id_field].map(_safe_to_str)
-    ridership["_join_key"] = ridership[id_field].map(_safe_to_str)
-    # Drop the duplicate id column from the right side; keep the geometry's.
-    ridership = ridership.drop(columns=[id_field])
+    stations["_join_key"] = _join_keys(
+        stations[geometry_id_field], f"station layer column {geometry_id_field!r}"
+    )
+    ridership["_join_key"] = _join_keys(
+        ridership[ridership_id_field], f"ridership column {ridership_id_field!r}"
+    )
+
+    duplicated_geometry = stations["_join_key"].dropna()
+    duplicated_geometry = duplicated_geometry[duplicated_geometry.duplicated()]
+    if not duplicated_geometry.empty:
+        raise ValueError(
+            f"Station layer has duplicate {geometry_id_field!r} values, so ridership "
+            f"would be counted on several features: {_format_ids(set(duplicated_geometry))}"
+        )
+    missing_geometry_keys = int(stations["_join_key"].isna().sum())
+    if missing_geometry_keys:
+        logger.warning(
+            "%d station feature(s) have a blank %r and cannot receive ridership.",
+            missing_geometry_keys,
+            geometry_id_field,
+        )
+    ridership = ridership.dropna(subset=["_join_key"])
+    if ridership["_join_key"].duplicated().any():
+        raise ValueError(
+            f"Ridership table has more than one row per {ridership_id_field!r}; "
+            "aggregate it to per-station totals before joining."
+        )
+
+    geometry_keys = set(stations["_join_key"].dropna())
+    ridership_keys = set(ridership["_join_key"])
+    matched = geometry_keys & ridership_keys
+    unmatched_ridership = ridership_keys - geometry_keys
+    if ridership_keys and not matched:
+        raise ValueError(
+            f"No ridership {ridership_id_field!r} value matches any station "
+            f"{geometry_id_field!r} value. For Capital Bikeshare, trip station numbers "
+            "match the GBFS 'short_name', not 'station_id'. Ridership ids: "
+            f"{_format_ids(ridership_keys)}; station ids: {_format_ids(geometry_keys)}"
+        )
+    if unmatched_ridership:
+        lost = ridership["_join_key"].isin(unmatched_ridership)
+        lost_trips = int(ridership.loc[lost, "total"].sum()) if "total" in ridership else 0
+        logger.warning(
+            "%d ridership station id(s) (%d total trips) have no matching station "
+            "feature and are left off the map: %s",
+            len(unmatched_ridership),
+            lost_trips,
+            _format_ids(unmatched_ridership),
+        )
+    unmatched_geometry = geometry_keys - ridership_keys
+    if unmatched_geometry:
+        logger.info(
+            "%d station feature(s) have no ridership and are zero-filled: %s",
+            len(unmatched_geometry),
+            _format_ids(unmatched_geometry),
+        )
+
+    # Drop the id column from the right side; keep the geometry's.
+    ridership = ridership.drop(columns=[ridership_id_field])
     # Let ridership win for any other overlapping non-key column (e.g. name).
     overlap = [c for c in ridership.columns if c != "_join_key" and c in stations.columns]
     stations = stations.drop(columns=overlap)
-    merged = stations.merge(ridership, on="_join_key", how="left")
+    merged = stations.merge(ridership, on="_join_key", how="left", validate="many_to_one")
     merged = merged.drop(columns=["_join_key"])
     measures = [c for c in RIDERSHIP_MEASURES if c in merged.columns]
     for measure in measures:
@@ -193,7 +342,8 @@ def run(
     geojson_input: str | None = None,
     shapefile_input: str | None = None,
     output_dir: str | Path | None = None,
-    station_id_field: str | None = None,
+    geometry_id_field: str | None = None,
+    ridership_id_field: str | None = None,
 ) -> None:
     """Run the ridership-to-geometry join end to end.
 
@@ -206,17 +356,18 @@ def run(
     geojson_input = GEOJSON_INPUT if geojson_input is None else geojson_input
     shapefile_input = SHAPEFILE_INPUT if shapefile_input is None else shapefile_input
     output_dir = OUTPUT_DIR if output_dir is None else output_dir
-    station_id_field = STATION_ID_FIELD if station_id_field is None else station_id_field
+    geometry_id_field = GEOMETRY_ID_FIELD if geometry_id_field is None else geometry_id_field
+    ridership_id_field = RIDERSHIP_ID_FIELD if ridership_id_field is None else ridership_id_field
 
     if not geojson_input and not shapefile_input:
         raise ValueError("Set GEOJSON_INPUT and/or SHAPEFILE_INPUT in the CONFIG block.")
-    ridership = load_station_ridership(ridership_input, station_id_field)
+    ridership = load_station_ridership(ridership_input, ridership_id_field)
     output_dir = Path(output_dir)
     for geometry_input in (geojson_input, shapefile_input):
         if not geometry_input:
             continue
         stations = gpd.read_file(geometry_input)
-        joined = join_ridership(stations, ridership, station_id_field)
+        joined = join_ridership(stations, ridership, geometry_id_field, ridership_id_field)
         output_path = _joined_output_path(geometry_input, output_dir)
         export_layer(joined, output_path)
         logger.info("Joined ridership onto %d stations -> %s", len(joined), output_path)
@@ -275,7 +426,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", default=OUTPUT_DIR, help="Directory for joined outputs.")
     parser.add_argument(
-        "--station-id-field", default=STATION_ID_FIELD, help="Join column on both sides."
+        "--geometry-id-field",
+        default=GEOMETRY_ID_FIELD,
+        help="Station key on the geometry layer (GBFS short_name for Capital Bikeshare).",
+    )
+    parser.add_argument(
+        "--ridership-id-field",
+        default=RIDERSHIP_ID_FIELD,
+        help="Station key column in the ridership CSV.",
     )
     return parser.parse_args(notebook_safe_argv(argv))
 
@@ -293,7 +451,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             geojson_input=args.geojson_input,
             shapefile_input=args.shapefile_input,
             output_dir=args.output_dir,
-            station_id_field=args.station_id_field,
+            geometry_id_field=args.geometry_id_field,
+            ridership_id_field=args.ridership_id_field,
         )
     except (OSError, KeyError, ValueError) as exc:
         logger.error("%s", exc)

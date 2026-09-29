@@ -6,8 +6,10 @@ be a GBFS auto-discovery URL (``gbfs.json``), a direct
 ``station_information.json`` URL, or a path to a local JSON file already
 downloaded from a feed.
 
-Both GBFS 2.x (where ``name`` is a plain string) and GBFS 3.x (where ``name``
-is an array of localized ``{"text", "language"}`` objects) are supported.
+Both GBFS 2.x (where ``name`` and ``short_name`` are plain strings) and GBFS
+3.x (where they are arrays of localized ``{"text", "language"}`` objects) are
+supported. ``short_name`` is kept because it carries the station number used
+in Capital Bikeshare trip histories (see ``gbfs_ridership_join``).
 
 Inputs:
     - GBFS source: ``gbfs.json`` URL, ``station_information.json`` URL, or a
@@ -23,6 +25,8 @@ Typical usage:
     flags, e.g. ``--source``, ``--output-dir``, ``--format``) and run from a
     shell or a Jupyter notebook.
 """
+
+from __future__ import annotations
 
 import argparse
 import json
@@ -108,48 +112,49 @@ def fetch_json(source: str) -> dict[str, Any]:
         raise ValueError(f"File '{source}' is not valid JSON: {exc}") from exc
 
 
-def resolve_station_information_url(source: str) -> str:
-    """Resolves a GBFS source to a ``station_information`` URL or file path.
+def _is_station_document(doc: Any) -> bool:
+    """Returns True if ``doc`` is a ``station_information`` document.
 
-    If ``source`` is a GBFS auto-discovery document (``gbfs.json``), the feed
-    list is searched for the ``station_information`` feed. Otherwise the source
-    is assumed to already point at ``station_information.json`` (URL or file)
-    and is returned unchanged.
+    Recognition is by content (a ``data.stations`` list), not by file name,
+    so a station file saved as e.g. ``stations.json`` is still accepted.
+    """
+    if not isinstance(doc, dict):
+        return False
+    data = doc.get("data")
+    return isinstance(data, dict) and isinstance(data.get("stations"), list)
+
+
+def _discovery_station_feed(source: str, doc: dict[str, Any]) -> Optional[str]:
+    """Returns the ``station_information`` URL listed in a discovery document.
 
     Args:
-        source: A GBFS auto-discovery URL/path, or a direct
-            ``station_information.json`` URL/path.
+        source: Where ``doc`` came from, used in error messages.
+        doc: A parsed JSON document.
 
     Returns:
-        A URL or file path to the ``station_information`` feed.
+        The feed URL, or None if ``doc`` is not a discovery document (it has no
+        feed catalog under ``data``).
 
     Raises:
-        IOError: If the auto-discovery document cannot be retrieved.
-        ValueError: If a discovery document is supplied but contains no
+        ValueError: If ``doc`` is a discovery document without a
             ``station_information`` feed.
     """
-    # Direct station_information references are used as-is.
-    if "station_information" in source:
-        return source
-
-    doc = fetch_json(source)
-
-    # Only auto-discovery documents expose a feed catalog under "data".
     data = doc.get("data")
     if not isinstance(data, dict):
-        # Not a discovery document; assume the caller already has the right URL.
-        return source
+        return None
 
     # GBFS 2.x nests feeds per language: data[<lang>]["feeds"].
     # GBFS 3.x flattens them: data["feeds"].
-    feeds: list[dict[str, Any]] = []
-    if "feeds" in data and isinstance(data["feeds"], list):
+    feeds: Optional[list[dict[str, Any]]] = None
+    if isinstance(data.get("feeds"), list):
         feeds = data["feeds"]
     else:
         for lang_block in data.values():
             if isinstance(lang_block, dict) and isinstance(lang_block.get("feeds"), list):
                 feeds = lang_block["feeds"]
                 break
+    if feeds is None:
+        return None
 
     for feed in feeds:
         if feed.get("name") == "station_information" and feed.get("url"):
@@ -159,31 +164,92 @@ def resolve_station_information_url(source: str) -> str:
     raise ValueError(f"No 'station_information' feed found in GBFS discovery document '{source}'.")
 
 
-def _extract_name(raw_name: Any) -> Optional[str]:
-    """Normalizes a GBFS station name to a plain string.
+def resolve_station_information_url(source: str) -> str:
+    """Resolves a GBFS source to a ``station_information`` URL or file path.
 
-    Handles GBFS 2.x string names and GBFS 3.x localized arrays of
-    ``{"text", "language"}`` objects.
+    The source is fetched and inspected. A document with a ``data.stations``
+    list is already station information and is returned unchanged, whatever
+    its name. A GBFS auto-discovery document (``gbfs.json``) is searched for
+    its ``station_information`` feed. Anything else is returned unchanged.
 
     Args:
-        raw_name: The ``name`` value from a station record.
+        source: A GBFS auto-discovery URL/path, or a direct station
+            information URL/path.
 
     Returns:
-        A station name string, or None if no usable value is present.
-    """
-    if isinstance(raw_name, str):
-        return raw_name
+        A URL or file path to the ``station_information`` feed.
 
-    if isinstance(raw_name, list) and raw_name:
+    Raises:
+        IOError: If the source cannot be retrieved.
+        ValueError: If a discovery document is supplied but contains no
+            ``station_information`` feed.
+    """
+    doc = fetch_json(source)
+    if _is_station_document(doc):
+        return source
+    return _discovery_station_feed(source, doc) or source
+
+
+def load_station_information(source: str) -> dict[str, Any]:
+    """Loads the ``station_information`` document for a GBFS source.
+
+    Like :func:`resolve_station_information_url`, but returns the parsed
+    document and fetches a direct station file only once.
+
+    Args:
+        source: A GBFS auto-discovery URL/path, or a direct station
+            information URL/path.
+
+    Returns:
+        The parsed ``station_information`` document (or the source document
+        itself if it is neither, for :func:`build_stations_gdf` to reject).
+
+    Raises:
+        IOError: If a document cannot be retrieved.
+        ValueError: If a discovery document has no ``station_information``
+            feed, or a document is not valid JSON.
+    """
+    doc = fetch_json(source)
+    if _is_station_document(doc):
+        return doc
+    feed_url = _discovery_station_feed(source, doc)
+    return doc if feed_url is None else fetch_json(feed_url)
+
+
+#: Station fields that GBFS 3.x localizes as ``[{"text", "language"}]`` arrays.
+LOCALIZED_TEXT_FIELDS: tuple[str, ...] = ("name", "short_name")
+
+
+def _extract_text(raw_value: Any) -> Optional[str]:
+    """Normalizes a GBFS text field (e.g. ``name``, ``short_name``) to a string.
+
+    Handles GBFS 2.x plain values and GBFS 3.x localized arrays of
+    ``{"text", "language"}`` objects. Integer values (some feeds publish
+    ``short_name`` as a JSON number) are converted to their string form so the
+    column stays textual.
+
+    Args:
+        raw_value: The field value from a station record.
+
+    Returns:
+        A string, or None if no usable value is present.
+    """
+    if isinstance(raw_value, str):
+        return raw_value
+
+    if isinstance(raw_value, int) and not isinstance(raw_value, bool):
+        return str(raw_value)
+
+    if isinstance(raw_value, list) and raw_value:
         preferred = [
             entry.get("text")
-            for entry in raw_name
+            for entry in raw_value
             if isinstance(entry, dict) and entry.get("language") == PREFERRED_LANGUAGE
         ]
         if preferred and preferred[0]:
             return str(preferred[0])
         # Fall back to the first entry that carries text.
-        for entry in raw_name:
+        for entry in raw_value:
             if isinstance(entry, dict) and entry.get("text"):
                 return str(entry["text"])
 
@@ -207,6 +273,17 @@ def build_stations_gdf(station_info: dict[str, Any]) -> gpd.GeoDataFrame:
     if not isinstance(stations, list):
         raise ValueError("GBFS document does not contain 'data.stations' list.")
 
+    # Normalize localized text (GBFS 3.x) to plain strings before building the
+    # frame, so numeric short_names cannot turn into floats alongside gaps.
+    stations = [
+        {
+            key: _extract_text(value) if key in LOCALIZED_TEXT_FIELDS else value
+            for key, value in station.items()
+        }
+        if isinstance(station, dict)
+        else station
+        for station in stations
+    ]
     df = pd.DataFrame(stations)
     if df.empty:
         logging.warning("Warning: station_information contains no stations.")
@@ -221,15 +298,12 @@ def build_stations_gdf(station_info: dict[str, Any]) -> gpd.GeoDataFrame:
         missing = sorted(required.difference(df.columns))
         raise ValueError(f"Missing required station fields: {', '.join(missing)}")
 
-    # Normalize localized names (GBFS 3.x) to plain strings.
-    if "name" in df.columns:
-        df["name"] = df["name"].apply(_extract_name)
-
     # Validate and clean coordinates.
     original_count = len(df)
     for col in ("lat", "lon"):
         df[col] = pd.to_numeric(df[col], errors="coerce")
-    df = df.dropna(subset=["lat", "lon"])
+    in_range = df["lat"].between(-90, 90) & df["lon"].between(-180, 180)
+    df = df[in_range]
     if len(df) < original_count:
         logging.warning(
             "Warning: Dropped %d stations due to invalid coordinates.",
@@ -339,8 +413,7 @@ def gbfs_stations_to_files(
     logging.info("Export Type: %s", kind)
     logging.info("-" * 50)
 
-    station_info_ref = resolve_station_information_url(resolved_source)
-    station_info = fetch_json(station_info_ref)
+    station_info = load_station_information(resolved_source)
     stations_gdf = build_stations_gdf(station_info)
 
     if stations_gdf.empty:

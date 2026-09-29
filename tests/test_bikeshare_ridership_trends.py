@@ -270,3 +270,113 @@ def test_generate_and_write_produces_daytype_table(tmp_path: Path) -> None:
         "sunday_days",
     ]
     assert len(written) == result["station_daytype"]["station_id"].nunique()
+
+
+# ---------------------------------------------------------------------------
+# Edge cases: timestamps, duplicate extracts, empty / dockless data, names
+# ---------------------------------------------------------------------------
+
+_HEADER = (
+    "ride_id,rideable_type,started_at,ended_at,start_station_name,start_station_id,"
+    "end_station_name,end_station_id,start_lat,start_lng,end_lat,end_lng,member_casual\n"
+)
+
+
+def _write_extract(path: Path, rows: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_HEADER + "".join(f"{row}\n" for row in rows), encoding="utf-8")
+
+
+def test_load_trips_parses_mixed_timestamp_precision(tmp_path: Path) -> None:
+    _write_extract(
+        tmp_path / "202601-capitalbikeshare-tripdata.csv",
+        [
+            "A,classic_bike,2026-01-05 10:00:00,2026-01-05 10:10:00,Dupont,31200,"
+            "Eastern,31201,38.9,-77.0,38.9,-77.0,member"
+        ],
+    )
+    _write_extract(
+        tmp_path / "202602-capitalbikeshare-tripdata.csv",
+        [
+            "B,classic_bike,2026-02-05 10:00:00.123,2026-02-05 10:10:00.456,Dupont,31200,"
+            "Eastern,31201,38.9,-77.0,38.9,-77.0,member"
+        ],
+    )
+    loaded = mod.load_trips(tmp_path)
+    assert list(loaded["month"]) == ["2026-01", "2026-02"]
+    daytype = mod.build_station_daytype_averages(loaded)
+    assert set(daytype["station_id"]) == {"31200", "31201"}
+
+
+def test_parse_timestamps_rejects_unknown_format() -> None:
+    with pytest.raises(ValueError, match="Unrecognized trip timestamp"):
+        mod.parse_timestamps(pd.Series(["01/05/2026 10:00"]))
+
+
+def test_load_trips_drops_identical_duplicate_extract(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    row = (
+        "A,classic_bike,2026-01-05 10:00:00,2026-01-05 10:10:00,Dupont,31200,"
+        "Eastern,31201,38.9,-77.0,38.9,-77.0,member"
+    )
+    _write_extract(tmp_path / "original" / "202601-capitalbikeshare-tripdata.csv", [row])
+    _write_extract(tmp_path / "backup" / "202601-capitalbikeshare-tripdata.csv", [row])
+    with caplog.at_level("WARNING"):
+        loaded = mod.load_trips(tmp_path)
+    assert len(loaded) == 1
+    assert "duplicate" in caplog.text
+
+
+def test_load_trips_rejects_conflicting_ride_ids(tmp_path: Path) -> None:
+    row = (
+        "A,classic_bike,2026-01-05 10:00:00,2026-01-05 10:10:00,Dupont,31200,"
+        "Eastern,31201,38.9,-77.0,38.9,-77.0,{}"
+    )
+    _write_extract(tmp_path / "a" / "202601-capitalbikeshare-tripdata.csv", [row.format("member")])
+    _write_extract(tmp_path / "b" / "202601-capitalbikeshare-tripdata.csv", [row.format("casual")])
+    with pytest.raises(ValueError, match="conflicting"):
+        mod.load_trips(tmp_path)
+
+
+def test_all_dockless_data_produces_empty_station_tables(tmp_path: Path) -> None:
+    _write_extract(
+        tmp_path / "in" / "202601-capitalbikeshare-tripdata.csv",
+        [
+            "A,electric_bike,2026-01-05 10:00:00,2026-01-05 10:10:00,,,,,"
+            "38.9,-77.0,38.9,-77.0,casual"
+        ],
+    )
+    result = mod.generate_and_write(
+        input_path=str(tmp_path / "in"), output_dir=str(tmp_path / "out"), max_station_plots=0
+    )
+    assert result["station_daytype"].empty
+    assert "avg_weekday_riders" in result["station_daytype"].columns
+    assert result["station"].empty
+    assert result["system"]["dockless_start_trips"].tolist() == [1]
+
+
+def test_header_only_extract_produces_empty_tables(tmp_path: Path) -> None:
+    _write_extract(tmp_path / "in" / "202601-capitalbikeshare-tripdata.csv", [])
+    result = mod.generate_and_write(
+        input_path=str(tmp_path / "in"), output_dir=str(tmp_path / "out"), max_station_plots=0
+    )
+    assert result["station_daytype"].empty
+    assert result["system"].empty
+
+
+def test_station_name_is_first_nonblank(tmp_path: Path) -> None:
+    _write_extract(
+        tmp_path / "202601-capitalbikeshare-tripdata.csv",
+        [
+            "A,classic_bike,2026-01-05 10:00:00,2026-01-05 10:10:00,,31200,"
+            "Eastern,31201,38.9,-77.0,38.9,-77.0,member",
+            "B,classic_bike,2026-01-06 10:00:00,2026-01-06 10:10:00,Dupont,31200,"
+            "Eastern,31201,38.9,-77.0,38.9,-77.0,member",
+        ],
+    )
+    loaded = mod.load_trips(tmp_path)
+    station = mod.build_station_monthly(loaded).set_index("station_id")
+    daytype = mod.build_station_daytype_averages(loaded).set_index("station_id")
+    assert station.loc["31200", "station_name"] == "Dupont"
+    assert daytype.loc["31200", "station_name"] == "Dupont"
