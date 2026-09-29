@@ -4,7 +4,10 @@ Uses GeoPandas and pandas to identify GTFS stops that directly INTERSECT
 (spatially overlap) with roadway, driveway, or building footprint layers.
 
 This script performs a simple overlap check and does not use any buffers
-or proximity analysis. It includes an optional pandas-based deduplication
+or proximity analysis. Because a point only "overlaps" an area, every enabled
+context layer must contain polygon geometries: use road-surface (edge-of-
+pavement) polygons for roadways, not centerlines, since a stop point almost
+never lies exactly on a centerline. It includes an optional pandas-based deduplication
 step (by key fields or XY tolerance) before the spatial analysis.
 
 All configuration is set in the 'Configuration' section below.
@@ -17,7 +20,8 @@ stops flagged for one or more conflicts:
 - ``stop_conflicts.csv`` / ``stop_conflicts.xlsx`` (``OUTPUT_BASENAME`` in
   ``OUTPUT_DIR``): flagged stops with conflict attributes.
 - ``stops_conflicts`` layer (``OUTPUT_LAYER_NAME``) in ``stop_conflicts.gpkg``
-  (``OUTPUT_GPKG``).
+  (``OUTPUT_GPKG``). Only that layer is replaced; other layers in the
+  GeoPackage are left untouched.
 - ``stop_conflicts.shp``: optional shapefile copy of the flagged stops.
 
 Typical usage
@@ -46,16 +50,26 @@ OUTPUT_DIR: str = r"projects\my_stop_analysis\output"
 OUTPUT_GPKG: str = "./stop_conflicts.gpkg"  # created if missing
 OUTPUT_LAYER_NAME: str = "stops_conflicts"
 OUTPUT_BASENAME: str = "stop_conflicts"
-OVERWRITE_OUTPUT: bool = True
+OVERWRITE_OUTPUT: bool = True  # False: abort if any enabled output already exists
 
 # --- Input: specify exactly ONE of the following for stops ---
 STOPS_TXT_PATH: str = r""  # e.g., r"C:\data\gtfs\stops.txt"
 GTFS_DIR: str = r"data\gtfs_feed_2025_10_30"  # must hold stops.txt
 
-# --- Optional context layers (any may be empty). Any vector format readable by GeoPandas/Fiona.
-ROADWAYS_PATH: str = r"data\gis_layers\roads\road_centerlines.shp"
+# --- Context layers. Any vector format readable by GeoPandas. Each layer must
+# contain POLYGON geometries (road surface, driveway, building footprint);
+# line layers such as road centerlines are rejected. A layer whose FLAG_* toggle
+# is True must be set and must exist; set the toggle to False to skip a layer.
+ROADWAYS_PATH: str = r"data\gis_layers\roads\road_surface_polygons.shp"
 DRIVEWAYS_PATH: str = r"data\gis_layers\parcels\driveways.shp"
 BUILDINGS_PATH: str = r"data\gis_layers\buildings\building_footprints.shp"
+
+# --- Source CRS for context layers WITHOUT CRS metadata (e.g., a shapefile
+# missing its .prj). Ignored when the layer declares its own CRS. Leave empty
+# to abort instead of guessing.
+ROADWAYS_SOURCE_CRS: str = ""
+DRIVEWAYS_SOURCE_CRS: str = ""
+BUILDINGS_SOURCE_CRS: str = ""
 
 # --- CRS for analysis (use a local projected CRS, units = meters) ---
 ANALYSIS_CRS: str = "EPSG:32618"  # e.g., WGS 84 / UTM zone 18N (m)
@@ -94,6 +108,17 @@ def _validate_config() -> None:
     if not any([EXPORT_CSV, EXPORT_XLSX, EXPORT_GPKG, EXPORT_SHP]):
         raise ValueError("Enable at least one export format.")
 
+    for flag_name, enabled, path in (
+        ("FLAG_ROADWAYS", FLAG_ROADWAYS, ROADWAYS_PATH),
+        ("FLAG_DRIVEWAYS", FLAG_DRIVEWAYS, DRIVEWAYS_PATH),
+        ("FLAG_BUILDINGS", FLAG_BUILDINGS, BUILDINGS_PATH),
+    ):
+        if enabled and not path.strip():
+            raise ValueError(
+                f"{flag_name} is True but its layer path is empty. "
+                f"Set the path or set {flag_name} = False."
+            )
+
 
 def _resolve_stops_path() -> str:
     """Return a filesystem path to stops.txt based on configuration."""
@@ -127,6 +152,35 @@ def _deg_tolerance_for_meters(lat_deg: float, tol_m: float) -> tuple[float, floa
     return (tol_lon_deg, tol_lat_deg)
 
 
+def _read_stops(src_stops: str) -> pd.DataFrame:
+    """Read stops.txt as literal strings and return rows with usable coordinates.
+
+    ``keep_default_na=False`` keeps identifier values such as ``"NA"`` or
+    ``"null"`` as literal strings instead of converting them to missing
+    values. Blank or non-numeric coordinates are then handled explicitly:
+    those rows are dropped with a warning (GTFS permits blank coordinates
+    for some location types).
+
+    Args:
+        src_stops: Path to GTFS stops.txt.
+
+    Returns:
+        Stops DataFrame with numeric stop_lat / stop_lon columns.
+    """
+    df = pd.read_csv(src_stops, dtype=str, keep_default_na=False)
+
+    if "stop_lat" not in df.columns or "stop_lon" not in df.columns:
+        raise ValueError("stops.txt must include 'stop_lat' and 'stop_lon' columns.")
+    df["stop_lat"] = pd.to_numeric(df["stop_lat"].str.strip(), errors="coerce")
+    df["stop_lon"] = pd.to_numeric(df["stop_lon"].str.strip(), errors="coerce")
+    missing = df["stop_lat"].isna() | df["stop_lon"].isna()
+    if missing.any():
+        logging.warning(
+            "Dropping %d stop(s) with blank or non-numeric coordinates.", int(missing.sum())
+        )
+    return df.loc[~missing].copy()
+
+
 def _pandas_dedupe_stops(src_stops: str, keys: Sequence[str], xy_tol_m: float) -> pd.DataFrame:
     """Read stops.txt with pandas and return a deduplicated DataFrame.
 
@@ -138,13 +192,7 @@ def _pandas_dedupe_stops(src_stops: str, keys: Sequence[str], xy_tol_m: float) -
     Returns:
         Deduplicated stops DataFrame with numeric stop_lat / stop_lon columns.
     """
-    df = pd.read_csv(src_stops, dtype=str)
-
-    if "stop_lat" not in df.columns or "stop_lon" not in df.columns:
-        raise ValueError("stops.txt must include 'stop_lat' and 'stop_lon' columns.")
-    df["stop_lat"] = pd.to_numeric(df["stop_lat"], errors="coerce")
-    df["stop_lon"] = pd.to_numeric(df["stop_lon"], errors="coerce")
-    df = df.dropna(subset=["stop_lat", "stop_lon"])
+    df = _read_stops(src_stops)
 
     existing_keys: list[str] = [k for k in keys if k in df.columns]
 
@@ -180,19 +228,49 @@ def _stops_to_gdf(stops_df: pd.DataFrame, analysis_crs: str) -> gpd.GeoDataFrame
     return gdf.to_crs(analysis_crs)
 
 
-def _load_context(path: str, analysis_crs: str) -> Optional[gpd.GeoDataFrame]:
-    """Load a context layer if a path is provided, projected to the analysis CRS."""
+def _load_context(path: str, analysis_crs: str, source_crs: str = "") -> Optional[gpd.GeoDataFrame]:
+    """Load a polygon context layer, projected to the analysis CRS.
+
+    Args:
+        path: Path to the layer. An empty path returns ``None``.
+        analysis_crs: CRS to project the layer to.
+        source_crs: CRS to assign if the layer has no CRS metadata. Ignored
+            when the layer declares its own CRS.
+
+    Returns:
+        The projected layer, or ``None`` if ``path`` is empty.
+
+    Raises:
+        FileNotFoundError: ``path`` is set but does not exist.
+        ValueError: The layer has no CRS metadata and ``source_crs`` is
+            empty, or the layer contains non-polygon geometries.
+    """
     if not path or not path.strip():
         return None
     if not Path(path).exists():
-        logging.warning("Context layer not found, skipping: %s", path)
-        return None
+        raise FileNotFoundError(f"Context layer not found: {path}")
     gdf = gpd.read_file(path)
     if gdf.crs is None:
-        logging.warning("Context layer has no CRS; assuming it matches the analysis CRS: %s", path)
-        gdf = gdf.set_crs(analysis_crs)
-    elif str(gdf.crs) != str(analysis_crs):
+        if not source_crs.strip():
+            raise ValueError(
+                f"Context layer has no CRS metadata: {path}. Set its *_SOURCE_CRS "
+                "value in the CONFIGURATION section to the layer's actual CRS."
+            )
+        logging.info("Context layer has no CRS metadata; using %s: %s", source_crs, path)
+        gdf = gdf.set_crs(source_crs)
+    if gdf.crs != analysis_crs:
         gdf = gdf.to_crs(analysis_crs)
+
+    geom_types = set(gdf.geometry.dropna().geom_type.unique())
+    non_polygon = geom_types - {"Polygon", "MultiPolygon"}
+    if non_polygon:
+        raise ValueError(
+            f"Context layer must contain only polygons, found {sorted(non_polygon)}: {path}. "
+            "A stop point rarely lies exactly on a line; use road-surface polygons "
+            "rather than centerlines."
+        )
+    if gdf.empty:
+        logging.warning("Context layer has no features: %s", path)
     return gdf
 
 
@@ -249,21 +327,40 @@ def _export_conflicts(
     geom_col = conflicts_gdf.geometry.name
     attr_df = pd.DataFrame(conflicts_gdf.drop(columns=[geom_col]))
 
+    shp_exts = (".shp", ".shx", ".dbf", ".prj", ".cpg")
+    if not overwrite:
+        # Check every target before writing anything, so a refusal never
+        # leaves a partial set of outputs behind.
+        existing: list[str] = []
+        if gpkg_path and layer_name and Path(gpkg_path).exists():
+            if layer_name in set(gpd.list_layers(gpkg_path)["name"]):
+                existing.append(f"{gpkg_path} (layer '{layer_name}')")
+        if shp_path:
+            existing += [
+                str(Path(shp_path).with_suffix(ext))
+                for ext in shp_exts
+                if Path(shp_path).with_suffix(ext).exists()
+            ]
+        existing += [p for p in (csv_path, xlsx_path) if p and Path(p).exists()]
+        if existing:
+            raise FileExistsError(
+                "OVERWRITE_OUTPUT is False and these outputs already exist: " + ", ".join(existing)
+            )
+
     if gpkg_path and layer_name:
         gpkg_p = Path(gpkg_path)
         gpkg_p.parent.mkdir(parents=True, exist_ok=True)
-        if overwrite and gpkg_p.exists():
-            gpkg_p.unlink()
+        # Writing a named layer replaces only that layer; other layers in an
+        # existing GeoPackage are preserved.
         conflicts_gdf.to_file(gpkg_p, layer=layer_name, driver="GPKG")
 
     if shp_path:
         shp_p = Path(shp_path)
         shp_p.parent.mkdir(parents=True, exist_ok=True)
-        if overwrite:
-            for ext in (".shp", ".shx", ".dbf", ".prj", ".cpg"):
-                sib = shp_p.with_suffix(ext)
-                if sib.exists():
-                    sib.unlink()
+        for ext in shp_exts:
+            sib = shp_p.with_suffix(ext)
+            if sib.exists():
+                sib.unlink()
         conflicts_gdf.to_file(shp_p, driver="ESRI Shapefile")
 
     if csv_path:
@@ -312,22 +409,24 @@ def main() -> int:
             src_stops=src_stops, keys=DEDUPE_KEYS, xy_tol_m=DEDUPE_XY_TOL_M
         )
     else:
-        stops_df = pd.read_csv(src_stops, dtype=str)
-        stops_df["stop_lat"] = pd.to_numeric(stops_df["stop_lat"], errors="coerce")
-        stops_df["stop_lon"] = pd.to_numeric(stops_df["stop_lon"], errors="coerce")
-        stops_df = stops_df.dropna(subset=["stop_lat", "stop_lon"])
+        stops_df = _read_stops(src_stops)
 
     stops_gdf = _stops_to_gdf(stops_df, ANALYSIS_CRS)
 
-    road_gdf = _load_context(ROADWAYS_PATH, ANALYSIS_CRS) if ROADWAYS_PATH.strip() else None
-    drv_gdf = _load_context(DRIVEWAYS_PATH, ANALYSIS_CRS) if DRIVEWAYS_PATH.strip() else None
-    bld_gdf = _load_context(BUILDINGS_PATH, ANALYSIS_CRS) if BUILDINGS_PATH.strip() else None
+    # Only enabled layers are loaded; _validate_config() guarantees each has a path.
+    road_gdf = drv_gdf = bld_gdf = None
+    if FLAG_ROADWAYS:
+        road_gdf = _load_context(ROADWAYS_PATH, ANALYSIS_CRS, ROADWAYS_SOURCE_CRS)
+    if FLAG_DRIVEWAYS:
+        drv_gdf = _load_context(DRIVEWAYS_PATH, ANALYSIS_CRS, DRIVEWAYS_SOURCE_CRS)
+    if FLAG_BUILDINGS:
+        bld_gdf = _load_context(BUILDINGS_PATH, ANALYSIS_CRS, BUILDINGS_SOURCE_CRS)
 
     work_gdf = stops_gdf.copy()
 
-    work_gdf = _flag_intersections(work_gdf, road_gdf if FLAG_ROADWAYS else None, "in_roadway")
-    work_gdf = _flag_intersections(work_gdf, drv_gdf if FLAG_DRIVEWAYS else None, "in_driveway")
-    work_gdf = _flag_intersections(work_gdf, bld_gdf if FLAG_BUILDINGS else None, "in_building")
+    work_gdf = _flag_intersections(work_gdf, road_gdf, "in_roadway")
+    work_gdf = _flag_intersections(work_gdf, drv_gdf, "in_driveway")
+    work_gdf = _flag_intersections(work_gdf, bld_gdf, "in_building")
 
     flags: list[str] = ["in_roadway", "in_driveway", "in_building"]
     work_gdf = _add_conflict_summary(work_gdf, flags)

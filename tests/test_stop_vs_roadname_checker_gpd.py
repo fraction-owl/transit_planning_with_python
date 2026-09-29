@@ -84,25 +84,36 @@ def test_get_crs_unit_returns_string_for_geographic_crs() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_convert_feet_to_meters() -> None:
-    result = target.convert_buffer_distance(1.0, "feet", "meters")
-    assert result == pytest.approx(0.3048, rel=1e-4)
+def test_convert_feet_to_utm_metres() -> None:
+    # PyProj reports UTM units as "metre"; the conversion must still work.
+    result = target.convert_buffer_distance(1.0, "feet", "EPSG:32618")
+    assert result == pytest.approx(0.3048, rel=1e-9)
 
 
-def test_convert_meters_to_feet() -> None:
-    result = target.convert_buffer_distance(1.0, "meters", "feet")
-    assert result == pytest.approx(3.28084, rel=1e-4)
+def test_convert_meters_to_utm_metres_is_identity() -> None:
+    result = target.convert_buffer_distance(15.0, "meters", "EPSG:32618")
+    assert result == pytest.approx(15.0, rel=1e-12)
 
 
-def test_convert_unsupported_raises() -> None:
+def test_convert_meters_to_us_survey_feet() -> None:
+    # EPSG:2248 (NAD83 / Maryland (ftUS)) uses US survey feet.
+    result = target.convert_buffer_distance(1.0, "meters", "EPSG:2248")
+    assert result == pytest.approx(3937 / 1200, rel=1e-9)
+
+
+def test_convert_feet_to_us_survey_feet_is_near_identity() -> None:
+    result = target.convert_buffer_distance(100.0, "feet", "EPSG:2248")
+    assert result == pytest.approx(100.0, rel=1e-5)
+
+
+def test_convert_unsupported_unit_raises() -> None:
     with pytest.raises(ValueError, match="not supported"):
-        target.convert_buffer_distance(1.0, "miles", "meters")
+        target.convert_buffer_distance(1.0, "miles", "EPSG:32618")
 
 
-def test_convert_same_unit_returns_identity() -> None:
-    # feet -> us survey foot is a supported near-identity conversion
-    result = target.convert_buffer_distance(100.0, "feet", "us survey foot")
-    assert result == pytest.approx(100.0, rel=0.01)
+def test_convert_geographic_crs_raises() -> None:
+    with pytest.raises(ValueError, match="not a projected CRS"):
+        target.convert_buffer_distance(1.0, "meters", "EPSG:4326")
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +152,25 @@ def test_load_stops_raises_on_missing_stop_name() -> None:
 def test_load_stops_raises_on_missing_lat_lon() -> None:
     df = _make_stops_df([{"stop_id": "S1", "stop_name": "Main"}])
     with pytest.raises(ValueError, match="stop_lat"):
+        target.load_stops(df)
+
+
+def test_load_stops_drops_blank_coordinates() -> None:
+    df = _make_stops_df(
+        [
+            {"stop_id": "S1", "stop_name": "Main", "stop_lat": "38.9", "stop_lon": "-77.0"},
+            {"stop_id": "P1", "stop_name": "Station", "stop_lat": "", "stop_lon": ""},
+        ]
+    )
+    gdf = target.load_stops(df)
+    assert list(gdf["stop_id"]) == ["S1"]
+
+
+def test_load_stops_raises_on_non_numeric_coordinates() -> None:
+    df = _make_stops_df(
+        [{"stop_id": "S1", "stop_name": "Main", "stop_lat": "abc", "stop_lon": "-77.0"}]
+    )
+    with pytest.raises(ValueError):
         target.load_stops(df)
 
 
@@ -200,6 +230,24 @@ def test_extract_modifiers_skips_missing_column() -> None:
     mapping: dict[str, str] = {}
     modifiers = target.extract_modifiers(roads, mapping)
     assert isinstance(modifiers, set)
+
+
+# ---------------------------------------------------------------------------
+# apply_roadway_column_mapping
+# ---------------------------------------------------------------------------
+
+
+def test_apply_roadway_column_mapping_exposes_expected_names() -> None:
+    roads = gpd.GeoDataFrame(
+        {"STREET_NAME": ["Main St"], "ST_TYPE": ["St"]},
+        geometry=[LineString([(0, 0), (1, 0)])],
+        crs=TARGET_CRS,
+    )
+    mapping = {"FULLNAME": "STREET_NAME", "RW_TYPE_US": "ST_TYPE"}  # expected -> actual
+    mapped = target.apply_roadway_column_mapping(roads, mapping)
+    assert list(mapped["FULLNAME"]) == ["Main St"]
+    modifiers = target.extract_modifiers(mapped, {col: col for col in mapping})
+    assert modifiers == {"st"}
 
 
 # ---------------------------------------------------------------------------
@@ -263,40 +311,42 @@ def test_create_buffered_stops_buffer_larger_than_point() -> None:
 
 
 def test_compare_stop_to_roads_detects_typo() -> None:
-    roads = _make_roads_gdf(["Washington Boulevard"])
-    roads["FULLNAME_clean"] = roads["FULLNAME"].str.lower()
-    road_names: set[str] = {"washington boulevard"}
+    road_names = {"washington": {"Washington Blvd"}}
     results = target.compare_stop_to_roads(
         "S1",
         "Washingtn Blvd @ Oak",
-        ["washingtn blvd"],
+        ["washingtn"],
         road_names,
-        roads,
-        threshold=70,
+        threshold=80,
     )
-    assert len(results) >= 0  # may find a match or not depending on fuzzy score
+    assert [r["similar_road_name_original"] for r in results] == ["Washington Blvd"]
 
 
 def test_compare_stop_to_roads_exact_match_skipped() -> None:
-    roads = _make_roads_gdf(["Main Street"])
-    roads["FULLNAME_clean"] = roads["FULLNAME"].str.lower()
-    road_names: set[str] = {"main street"}
+    road_names = {"main street": {"Main Street"}}
     results = target.compare_stop_to_roads(
         "S1",
         "Main Street @ Oak",
         ["main street"],
         road_names,
-        roads,
         threshold=80,
     )
     # Exact matches should be skipped (no typo)
     assert results == []
 
 
+def test_compare_stop_to_roads_flags_unequal_names_scoring_100() -> None:
+    # token_set_ratio scores a subset as 100; the names still differ.
+    road_names = {"old mill": {"Old Mill Rd"}}
+    results = target.compare_stop_to_roads("S1", "Mill @ Oak", ["mill"], road_names, 80)
+    assert len(results) == 1
+    assert results[0]["similarity_score"] == 100
+
+
 def test_compare_stop_to_roads_returns_list() -> None:
-    roads = _make_roads_gdf(["Main Street"])
-    roads["FULLNAME_clean"] = roads["FULLNAME"].str.lower()
-    results = target.compare_stop_to_roads("S1", "Oak Ave", ["oak ave"], {"main street"}, roads, 80)
+    results = target.compare_stop_to_roads(
+        "S1", "Oak Ave", ["oak ave"], {"main street": {"Main Street"}}, 80
+    )
     assert isinstance(results, list)
 
 
@@ -316,9 +366,13 @@ def test_process_typos_returns_dataframe() -> None:
     )
     # Both roads fall inside this stop's buffer.
     join_gdf = pd.DataFrame(
-        {"stop_id": ["S1", "S1"], "FULLNAME_clean": list(roads["FULLNAME_clean"])}
+        {
+            "stop_id": ["S1", "S1"],
+            "FULLNAME": list(roads["FULLNAME"]),
+            "FULLNAME_clean": list(roads["FULLNAME_clean"]),
+        }
     )
-    result = target.process_typos(stops_gdf, roads, set(), join_gdf, 80)
+    result = target.process_typos(stops_gdf, set(), join_gdf, 80)
     assert isinstance(result, pd.DataFrame)
 
 
@@ -332,8 +386,8 @@ def test_process_typos_empty_when_no_nearby_roads() -> None:
 
     # Pass an empty join DataFrame so that each stop gets no local roads
     # process_typos only calls dropna/groupby on join_gdf, no geometry ops needed
-    empty_join = pd.DataFrame(columns=["stop_id", "FULLNAME_clean"])
-    result = target.process_typos(stops_gdf, roads, set(), empty_join, 80)
+    empty_join = pd.DataFrame(columns=["stop_id", "FULLNAME", "FULLNAME_clean"])
+    result = target.process_typos(stops_gdf, set(), empty_join, 80)
     assert result.empty
 
 
@@ -372,11 +426,36 @@ def test_process_typos_respects_buffer_scoping() -> None:
 
     buffered = target.create_buffered_stops(stops, buffer_distance=100.0)
     join_gdf = target.spatial_join_stops_roadways(buffered, roads)
-    result = target.process_typos(stops, roads, {"blvd"}, join_gdf, threshold=80)
+    result = target.process_typos(stops, {"blvd"}, join_gdf, threshold=80)
 
     matched = set(result["similar_road_name_original"])
     assert "Washington Blvd" in matched  # near road IS a candidate
     assert "Washingten Blvd" not in matched  # far road is OUT of the buffer
+
+
+def test_process_typos_reports_only_originals_inside_buffer() -> None:
+    """Distant roads sharing a normalized name must not appear as suggestions."""
+    roads = gpd.GeoDataFrame(
+        {"FULLNAME": ["Main Rd", "Main St"], "RW_TYPE_US": ["Rd", "St"]},
+        geometry=[
+            LineString([(0, 0), (100, 0)]),  # near the stop
+            LineString([(10_000, 0), (10_100, 0)]),  # 10 km away
+        ],
+        crs=TARGET_CRS,
+    )
+    modifiers = {"rd", "st"}
+    roads["FULLNAME_clean"] = roads["FULLNAME"].apply(
+        lambda x: target.normalize_street_name(x, modifiers)
+    )
+    stops = gpd.GeoDataFrame(
+        {"stop_id": ["S1"], "stop_name": ["Mainn Rd"]},
+        geometry=[Point(50, 0)],
+        crs=TARGET_CRS,
+    )
+    buffered = target.create_buffered_stops(stops, buffer_distance=100.0)
+    join_gdf = target.spatial_join_stops_roadways(buffered, roads)
+    result = target.process_typos(stops, modifiers, join_gdf, threshold=80)
+    assert list(result["similar_road_name_original"]) == ["Main Rd"]
 
 
 # ---------------------------------------------------------------------------
@@ -436,5 +515,81 @@ def test_integration_dc_load_and_process(tmp_path: Path) -> None:
 
     buffered = target.create_buffered_stops(stops_gdf, buffer_distance=50.0)
     join_gdf = target.spatial_join_stops_roadways(buffered, roads_gdf)
-    result = target.process_typos(stops_gdf, roads_gdf, modifiers, join_gdf, threshold=80)
+    result = target.process_typos(stops_gdf, modifiers, join_gdf, threshold=80)
     assert isinstance(result, pd.DataFrame)
+
+
+# ---------------------------------------------------------------------------
+# main (end to end)
+# ---------------------------------------------------------------------------
+
+
+def _run_main(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stop_name: str) -> pd.DataFrame:
+    gtfs = tmp_path / "gtfs"
+    gtfs.mkdir(exist_ok=True)
+    # Stop sits on the road below, ~50 m north of the UTM 18N origin line.
+    stops = gpd.GeoDataFrame(
+        {"stop_id": ["NA"], "stop_name": [stop_name]},
+        geometry=[Point(500_000, 4_300_000)],
+        crs=TARGET_CRS,
+    ).to_crs("EPSG:4326")
+    pd.DataFrame(
+        {
+            "stop_id": stops["stop_id"],
+            "stop_name": stops["stop_name"],
+            "stop_lat": stops.geometry.y,
+            "stop_lon": stops.geometry.x,
+        }
+    ).to_csv(gtfs / "stops.txt", index=False)
+
+    roads = gpd.GeoDataFrame(
+        {"STREET_NAME": ["Main Rd"], "ST_TYPE": ["Rd"]},
+        geometry=[LineString([(499_900, 4_300_000), (500_100, 4_300_000)])],
+        crs=TARGET_CRS,
+    )
+    roads_path = tmp_path / "roads.gpkg"
+    roads.to_file(roads_path, driver="GPKG")
+
+    answers = {"FULLNAME": "STREET_NAME", "RW_TYPE_US": "ST_TYPE"}
+
+    def fake_input(prompt: str) -> str:
+        return next((v for k, v in answers.items() if f"'{k}'" in prompt), "")
+
+    out_dir = tmp_path / "out"
+    monkeypatch.setattr("builtins.input", fake_input)
+    monkeypatch.setattr(target, "GTFS_FOLDER", str(gtfs))
+    monkeypatch.setattr(target, "ROADWAYS_PATH", str(roads_path))
+    monkeypatch.setattr(target, "OUTPUT_DIR", str(out_dir))
+    monkeypatch.setattr(target, "TARGET_CRS", TARGET_CRS)
+    monkeypatch.setattr(target, "BUFFER_DISTANCE_VALUE", 50)
+    monkeypatch.setattr(target, "BUFFER_DISTANCE_UNIT", "feet")
+    assert target.main() == 0
+    return pd.read_csv(out_dir / target.OUTPUT_CSV_NAME, dtype=str, keep_default_na=False)
+
+
+def test_main_custom_mapping_utm_na_id_and_clean_rerun(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Custom column mapping, a "metre" CRS, and a literal "NA" stop_id.
+    first = _run_main(tmp_path, monkeypatch, "Mainn Rd")
+    assert list(first["stop_id"]) == ["NA"]
+    assert list(first["similar_road_name_original"]) == ["Main Rd"]
+
+    # Fixing the name and rerunning must replace the stale finding.
+    second = _run_main(tmp_path, monkeypatch, "Main Rd")
+    assert second.empty
+    assert "stop_id" in second.columns
+
+
+# ---------------------------------------------------------------------------
+# load_gtfs_data: literal NA identifiers
+# ---------------------------------------------------------------------------
+
+
+def test_load_gtfs_data_keeps_literal_na(tmp_path: Path) -> None:
+    (tmp_path / "stops.txt").write_text(
+        "stop_id,stop_name,stop_lat,stop_lon\nNA,Main,38.9,-77.0\n",
+        encoding="utf-8",
+    )
+    data = target.load_gtfs_data(str(tmp_path), files=["stops.txt"])
+    assert data["stops"]["stop_id"].tolist() == ["NA"]
