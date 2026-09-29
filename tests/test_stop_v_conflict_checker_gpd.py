@@ -41,12 +41,12 @@ def _dc_stops_txt(tmp_path: Path) -> Path:
     return dirs[0] / "stops.txt"
 
 
-def _dc_road_shp(tmp_path: Path) -> Path:
+def _dc_road_shp(tmp_path: Path, stem: str = "dc_road_asphalt") -> Path:
     road_dir = tmp_path / "roads"
     road_dir.mkdir(exist_ok=True)
     with zipfile.ZipFile(FIXTURES / "output_road_shps_dc.zip") as zf:
         zf.extractall(road_dir)
-    return road_dir / "dc_road_centerlines.shp"
+    return road_dir / f"{stem}.shp"
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +114,16 @@ def test_pandas_dedupe_stops_raises_on_missing_lat_lon(tmp_path: Path) -> None:
         target._pandas_dedupe_stops(str(txt), keys=["stop_id"], xy_tol_m=0.0)
 
 
+def test_pandas_dedupe_stops_keeps_literal_na_and_drops_blank_coords(tmp_path: Path) -> None:
+    txt = tmp_path / "stops.txt"
+    txt.write_text(
+        "stop_id,stop_name,stop_lat,stop_lon\nNA,Main,38.9,-77.0\nP1,Station,,\n",
+        encoding="utf-8",
+    )
+    df = target._pandas_dedupe_stops(str(txt), keys=["stop_id"], xy_tol_m=0.0)
+    assert df["stop_id"].tolist() == ["NA"]
+
+
 def test_pandas_dedupe_stops_xy_tolerance_merges_close(tmp_path: Path) -> None:
     # Two stops ~0.7 m apart (0.000005° offset) fall in the same 10 m grid bin → merged
     txt = _make_stops_txt(
@@ -162,9 +172,29 @@ def test_load_context_returns_none_for_empty_path() -> None:
     assert result is None
 
 
-def test_load_context_returns_none_for_missing_file() -> None:
-    result = target._load_context("/nonexistent/path/roads.shp", ANALYSIS_CRS)
-    assert result is None
+def test_load_context_raises_for_missing_file() -> None:
+    with pytest.raises(FileNotFoundError):
+        target._load_context("/nonexistent/path/roads.shp", ANALYSIS_CRS)
+
+
+def test_load_context_rejects_line_layer(tmp_path: Path) -> None:
+    shp = _dc_road_shp(tmp_path, "dc_road_centerlines")
+    with pytest.raises(ValueError, match="polygons"):
+        target._load_context(str(shp), ANALYSIS_CRS)
+
+
+def test_load_context_without_crs_requires_source_crs(tmp_path: Path) -> None:
+    # Polygon authored in EPSG:4326 but saved without CRS metadata.
+    poly = Point(-77.0, 38.9).buffer(0.001)
+    path = tmp_path / "nocrs.shp"
+    gpd.GeoDataFrame(geometry=[poly]).to_file(path)
+    with pytest.raises(ValueError, match="no CRS"):
+        target._load_context(str(path), ANALYSIS_CRS)
+
+    gdf = target._load_context(str(path), ANALYSIS_CRS, source_crs=WGS84_CRS)
+    assert gdf is not None
+    stops = _make_stops_gdf([(38.9, -77.0)])
+    assert target._flag_intersections(stops, gdf, "in_roadway")["in_roadway"].iloc[0] == 1
 
 
 def test_load_context_loads_real_shapefile(tmp_path: Path) -> None:
@@ -308,6 +338,58 @@ def test_export_conflicts_gpkg(tmp_path: Path) -> None:
     assert Path(gpkg_path).exists()
 
 
+def test_export_conflicts_gpkg_preserves_other_layers(tmp_path: Path) -> None:
+    gdf = _make_stops_gdf([(38.9, -77.0)])
+    gdf["has_conflict"] = 1
+    gpkg_path = tmp_path / "out.gpkg"
+    gdf.to_file(gpkg_path, layer="unrelated_layer", driver="GPKG")
+    gdf.to_file(gpkg_path, layer="stops_conflicts", driver="GPKG")
+    two = _make_stops_gdf([(38.9, -77.0), (38.91, -77.0)])
+    target._export_conflicts(
+        two,
+        csv_path=None,
+        xlsx_path=None,
+        shp_path=None,
+        gpkg_path=str(gpkg_path),
+        layer_name="stops_conflicts",
+        overwrite=True,
+    )
+    assert set(gpd.list_layers(gpkg_path)["name"]) == {"unrelated_layer", "stops_conflicts"}
+    assert len(gpd.read_file(gpkg_path, layer="stops_conflicts")) == 2
+    assert len(gpd.read_file(gpkg_path, layer="unrelated_layer")) == 1
+
+
+def test_export_conflicts_no_overwrite_refuses_existing_csv(tmp_path: Path) -> None:
+    gdf = _make_stops_gdf([(38.9, -77.0)])
+    csv_path = tmp_path / "out.csv"
+    csv_path.write_text("keep me\n", encoding="utf-8")
+    with pytest.raises(FileExistsError):
+        target._export_conflicts(
+            gdf,
+            csv_path=str(csv_path),
+            xlsx_path=None,
+            shp_path=None,
+            gpkg_path=None,
+            layer_name=None,
+            overwrite=False,
+        )
+    assert csv_path.read_text(encoding="utf-8") == "keep me\n"
+
+
+def test_export_conflicts_no_overwrite_refuses_existing_gpkg_layer(tmp_path: Path) -> None:
+    gdf = _make_stops_gdf([(38.9, -77.0)])
+    gpkg_path = tmp_path / "out.gpkg"
+    gdf.to_file(gpkg_path, layer="stops_conflicts", driver="GPKG")
+    kwargs = {"csv_path": None, "xlsx_path": None, "shp_path": None, "overwrite": False}
+    with pytest.raises(FileExistsError):
+        target._export_conflicts(
+            gdf, gpkg_path=str(gpkg_path), layer_name="stops_conflicts", **kwargs
+        )
+    # A new layer in the same GeoPackage is not a conflict.
+    target._export_conflicts(gdf, gpkg_path=str(gpkg_path), layer_name="other", **kwargs)
+    assert set(gpd.list_layers(gpkg_path)["name"]) == {"stops_conflicts", "other"}
+
+
 def test_export_conflicts_overwrite_replaces_existing(tmp_path: Path) -> None:
     gdf = _make_stops_gdf([(38.9, -77.0)])
     gdf["has_conflict"] = 1
@@ -348,3 +430,17 @@ def test_integration_dc_no_crash(tmp_path: Path) -> None:
     assert "has_conflict" in work.columns
     assert "conflict_types" in work.columns
     assert len(work) > 0
+
+
+# ---------------------------------------------------------------------------
+# _validate_config
+# ---------------------------------------------------------------------------
+
+
+def test_validate_config_rejects_enabled_layer_without_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(target, "FLAG_DRIVEWAYS", True)
+    monkeypatch.setattr(target, "DRIVEWAYS_PATH", "")
+    with pytest.raises(ValueError, match="FLAG_DRIVEWAYS"):
+        target._validate_config()
