@@ -67,9 +67,29 @@ def test_fetch_json_invalid_json_raises_valueerror(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_resolve_direct_station_information_source_unchanged() -> None:
-    src = "https://example.com/gbfs/station_information.json"
-    assert target.resolve_station_information_url(src) == src
+def test_resolve_direct_station_information_source_unchanged(tmp_path: Path) -> None:
+    path = tmp_path / "station_information.json"
+    path.write_text(json.dumps(_station_info(_valid_stations())), encoding="utf-8")
+    assert target.resolve_station_information_url(str(path)) == str(path)
+
+
+def test_resolve_station_file_recognized_by_content_not_name(tmp_path: Path) -> None:
+    # A station file saved under an ordinary name must not be mistaken for a
+    # discovery document.
+    path = tmp_path / "stations.json"
+    path.write_text(json.dumps(_station_info(_valid_stations())), encoding="utf-8")
+    assert target.resolve_station_information_url(str(path)) == str(path)
+    assert target.load_station_information(str(path))["data"]["stations"][0]["station_id"] == "A"
+
+
+def test_load_station_information_follows_discovery(tmp_path: Path) -> None:
+    stations_path = tmp_path / "si.json"
+    stations_path.write_text(json.dumps(_station_info(_valid_stations())), encoding="utf-8")
+    doc = {"data": {"feeds": [{"name": "station_information", "url": str(stations_path)}]}}
+    path = tmp_path / "gbfs.json"
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    loaded = target.load_station_information(str(path))
+    assert len(loaded["data"]["stations"]) == 2
 
 
 def test_resolve_gbfs_2x_language_nested_feeds(tmp_path: Path) -> None:
@@ -110,31 +130,31 @@ def test_resolve_non_discovery_document_returned_as_is(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# _extract_name
+# _extract_text
 # ---------------------------------------------------------------------------
 
 
-def test_extract_name_plain_string_passthrough() -> None:
-    assert target._extract_name("Union Station") == "Union Station"
+def test_extract_text_plain_string_passthrough() -> None:
+    assert target._extract_text("Union Station") == "Union Station"
 
 
-def test_extract_name_prefers_configured_language() -> None:
+def test_extract_text_prefers_configured_language() -> None:
     localized = [
         {"text": "Gare Union", "language": "fr"},
         {"text": "Union Station", "language": "en"},
     ]
-    assert target._extract_name(localized) == "Union Station"
+    assert target._extract_text(localized) == "Union Station"
 
 
-def test_extract_name_falls_back_to_first_text() -> None:
+def test_extract_text_falls_back_to_first_text() -> None:
     localized = [{"text": "Gare Union", "language": "fr"}]
-    assert target._extract_name(localized) == "Gare Union"
+    assert target._extract_text(localized) == "Gare Union"
 
 
-def test_extract_name_unusable_values_return_none() -> None:
-    assert target._extract_name(None) is None
-    assert target._extract_name([]) is None
-    assert target._extract_name([{"language": "en"}]) is None
+def test_extract_text_unusable_values_return_none() -> None:
+    assert target._extract_text(None) is None
+    assert target._extract_text([]) is None
+    assert target._extract_text([{"language": "en"}]) is None
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +193,37 @@ def test_build_stations_gdf_drops_invalid_coordinates() -> None:
     gdf = target.build_stations_gdf(_station_info(stations))
     assert len(gdf) == 2
     assert "C" not in set(gdf["station_id"])
+
+
+def test_build_stations_gdf_drops_out_of_range_coordinates() -> None:
+    stations = _valid_stations()
+    stations.append({"station_id": "C", "name": "Off map", "lat": 138.9, "lon": -77.0})
+    stations.append({"station_id": "D", "name": "Off map", "lat": 38.9, "lon": -277.0})
+    gdf = target.build_stations_gdf(_station_info(stations))
+    assert set(gdf["station_id"]) == {"A", "B"}
+
+
+def test_build_stations_gdf_keeps_localized_short_name() -> None:
+    # GBFS 3.x localizes short_name; it must survive as a flat string column
+    # because it is the Capital Bikeshare trip-history station number.
+    stations = [
+        {
+            "station_id": "08263b1f",
+            "name": [{"text": "Union Station", "language": "en"}],
+            "short_name": [{"text": "31623", "language": "en"}],
+            "lat": 38.9,
+            "lon": -77.0,
+        }
+    ]
+    gdf = target.build_stations_gdf(_station_info(stations))
+    assert gdf["short_name"].iloc[0] == "31623"
+
+
+def test_build_stations_gdf_numeric_short_name_stays_text() -> None:
+    stations = _valid_stations()
+    stations[0]["short_name"] = 31000
+    gdf = target.build_stations_gdf(_station_info(stations))
+    assert gdf["short_name"].iloc[0] == "31000"
 
 
 def test_build_stations_gdf_normalises_localized_names() -> None:

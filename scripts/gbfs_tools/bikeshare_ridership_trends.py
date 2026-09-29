@@ -167,6 +167,89 @@ def _read_one(data: bytes, source_name: str) -> pd.DataFrame:
     return frame
 
 
+# Trip timestamps come with or without fractional seconds depending on the
+# extract period, sometimes mixed within a combined run. Each form is parsed
+# with its own explicit format, which behaves the same on every pandas version.
+_TIMESTAMP_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f")
+
+
+def parse_timestamps(values: pd.Series) -> pd.Series:
+    """Parse trip timestamps written with or without fractional seconds.
+
+    Args:
+        values: Timestamp text such as ``2026-01-05 10:00:00`` or
+            ``2026-02-05 10:00:00.123``. Already-parsed datetimes pass through.
+
+    Returns:
+        A ``datetime64`` Series aligned to *values*.
+
+    Raises:
+        ValueError: If a value matches neither supported format.
+    """
+    if pd.api.types.is_datetime64_any_dtype(values):
+        return values
+    text = values.astype(str).str.strip()
+    has_fraction = text.str.contains(".", regex=False)
+    parsed = pd.Series(pd.NaT, index=values.index, dtype="datetime64[ns]")
+    for mask, fmt in (
+        (~has_fraction, _TIMESTAMP_FORMATS[0]),
+        (has_fraction, _TIMESTAMP_FORMATS[1]),
+    ):
+        if not mask.any():
+            continue
+        try:
+            parsed[mask] = pd.to_datetime(text[mask], format=fmt)
+        except ValueError as exc:
+            raise ValueError(
+                f"Unrecognized trip timestamp ({exc}); expected one of {_TIMESTAMP_FORMATS}"
+            ) from exc
+    return parsed
+
+
+def _drop_duplicate_rides(trips: pd.DataFrame) -> pd.DataFrame:
+    """Remove repeated copies of the same ride, rejecting conflicting ones.
+
+    The same monthly extract saved in two folders (e.g. an original and a
+    backup) would otherwise count every ride twice. Rows sharing a
+    ``ride_id`` whose trip fields are all identical are treated as copies:
+    one is kept and the files involved are logged. Rows sharing a ``ride_id``
+    but differing in any trip field are a conflict and abort the run.
+
+    Args:
+        trips: Concatenated trips with a ``source_file`` column.
+
+    Returns:
+        *trips* with duplicate copies removed.
+
+    Raises:
+        ValueError: If one ``ride_id`` has conflicting records.
+    """
+    if "ride_id" not in trips.columns:
+        logger.warning("No ride_id column; duplicate extracts cannot be detected.")
+        return trips
+    repeated = trips["ride_id"].duplicated(keep=False)
+    if not repeated.any():
+        return trips
+    fields = [c for c in trips.columns if c != "source_file"]
+    candidates = trips[repeated]
+    variants = candidates.drop_duplicates(subset=fields).groupby("ride_id").size()
+    conflicting = variants[variants > 1]
+    if not conflicting.empty:
+        sample = candidates[candidates["ride_id"].isin(conflicting.index[:5])]
+        raise ValueError(
+            f"{len(conflicting)} ride_id(s) appear with conflicting trip details, e.g. "
+            f"{list(conflicting.index[:5])} in files {sorted(sample['source_file'].unique())}"
+        )
+    deduped = trips.drop_duplicates(subset=fields, keep="first")
+    logger.warning(
+        "Dropped %d duplicate ride(s) repeated across or within extracts: %s. "
+        "Check INPUT for copied files.",
+        len(trips) - len(deduped),
+        ", ".join(sorted(candidates["source_file"].unique())),
+    )
+    return deduped
+
+
 def load_trips(input_path: Path) -> pd.DataFrame:
     """Concatenate every monthly trip extract under ``input_path``.
 
@@ -176,11 +259,14 @@ def load_trips(input_path: Path) -> pd.DataFrame:
 
     Returns:
         All trips stacked into one frame with added ``month`` (``YYYY-MM``) and
-        ``source_file`` columns, sorted by start time.
+        ``source_file`` columns, sorted by start time. ``started_at`` is parsed
+        to datetimes (see :func:`parse_timestamps`), and repeated copies of the
+        same ride are dropped (see :func:`_drop_duplicate_rides`).
 
     Raises:
         FileNotFoundError: If ``input_path`` does not exist.
-        ValueError: If no matching trip files are found.
+        ValueError: If no matching trip files are found, a timestamp cannot be
+            parsed, or a ``ride_id`` has conflicting records.
     """
     if not input_path.exists():
         raise FileNotFoundError(f"INPUT not found: {input_path}")
@@ -206,9 +292,9 @@ def load_trips(input_path: Path) -> pd.DataFrame:
     if not frames:
         raise ValueError(f"No '{TRIP_FILE_GLOB}' files found under {input_path}")
 
-    trips = pd.concat(frames, ignore_index=True)
-    started = pd.to_datetime(trips["started_at"])
-    trips.insert(0, "month", started.dt.strftime("%Y-%m"))
+    trips = _drop_duplicate_rides(pd.concat(frames, ignore_index=True))
+    trips["started_at"] = parse_timestamps(trips["started_at"])
+    trips.insert(0, "month", trips["started_at"].dt.strftime("%Y-%m"))
     trips = trips.sort_values("started_at", kind="stable").reset_index(drop=True)
     logger.info("Loaded %d trips from %d file(s).", len(trips), len(frames))
     return trips
@@ -229,22 +315,43 @@ def build_system_monthly(trips: pd.DataFrame) -> pd.DataFrame:
         One row per month (sorted) with ``total_trips``, member/casual and
         electric/classic splits, and the dockless (blank start station) count.
     """
-    grouped = trips.groupby("month", sort=True)
-    summary = pd.DataFrame({"total_trips": grouped.size()})
-    summary["member_trips"] = grouped.apply(
-        lambda g: int((g["member_casual"] == "member").sum()), include_groups=False
+    flags = pd.DataFrame(
+        {
+            "month": trips["month"],
+            "member_trips": trips["member_casual"] == "member",
+            "electric_trips": trips["rideable_type"] == "electric_bike",
+            "dockless_start_trips": trips["start_station_id"].str.len() == 0,
+        }
     )
+    counts = flags.groupby("month", sort=True).sum().astype(int)
+    summary = pd.DataFrame({"total_trips": flags.groupby("month", sort=True).size()})
+    summary["member_trips"] = counts["member_trips"]
     summary["casual_trips"] = summary["total_trips"] - summary["member_trips"]
-    summary["electric_trips"] = grouped.apply(
-        lambda g: int((g["rideable_type"] == "electric_bike").sum()),
-        include_groups=False,
-    )
+    summary["electric_trips"] = counts["electric_trips"]
     summary["classic_trips"] = summary["total_trips"] - summary["electric_trips"]
-    summary["dockless_start_trips"] = grouped.apply(
-        lambda g: int((g["start_station_id"].str.len() == 0).sum()),
-        include_groups=False,
-    )
+    summary["dockless_start_trips"] = counts["dockless_start_trips"]
+    summary.index.name = "month"
     return summary.reset_index()
+
+
+def _station_names(name_frames: Sequence[pd.DataFrame]) -> pd.Series:
+    """Return one name per station id: the first nonblank name seen.
+
+    Stations seen only with blank names keep a blank name. Names are kept as
+    written (including any trailing whitespace).
+
+    Args:
+        name_frames: Frames with ``station_id`` and ``station_name`` columns,
+            in priority order.
+
+    Returns:
+        Station names indexed by ``station_id``.
+    """
+    names = pd.concat(name_frames, ignore_index=True)
+    blank = names["station_name"].fillna("").str.strip() == ""
+    # Stable sort puts every nonblank name ahead of blank ones, keeping order.
+    names = names.assign(_blank=blank).sort_values("_blank", kind="stable")
+    return names.drop_duplicates("station_id", keep="first").set_index("station_id")["station_name"]
 
 
 def build_station_monthly(trips: pd.DataFrame) -> pd.DataFrame:
@@ -280,12 +387,7 @@ def build_station_monthly(trips: pd.DataFrame) -> pd.DataFrame:
     departures, dep_names = _counts("start_station_id", "start_station_name", "departures")
     arrivals, arr_names = _counts("end_station_id", "end_station_name", "arrivals")
 
-    # One name per id (first non-blank seen), preserving any trailing whitespace.
-    names = (
-        pd.concat([dep_names, arr_names], ignore_index=True)
-        .drop_duplicates("station_id", keep="first")
-        .set_index("station_id")["station_name"]
-    )
+    names = _station_names([dep_names, arr_names])
     station_ids = sorted(names.index)
 
     grid = pd.MultiIndex.from_product([months, station_ids], names=["month", "station_id"])
@@ -406,13 +508,22 @@ def build_station_daytype_averages(trips: pd.DataFrame) -> pd.DataFrame:
         (rounded to 4 decimals), and the ``weekday_days`` / ``saturday_days``
         / ``sunday_days`` denominators (identical on every row).
     """
+    columns = [
+        "station_id",
+        "station_name",
+        *(f"avg_{day_type}_riders" for day_type in DAY_TYPES),
+        *(f"{day_type}_days" for day_type in DAY_TYPES),
+    ]
+    if trips.empty:
+        return pd.DataFrame(columns=pd.Index(columns))
+
     dates = _calendar_dates(sorted(trips["month"].unique()))
     years = range(dates[0].year, dates[-1].year + 2)
     holidays = set().union(*(federal_holidays_observed(year) for year in years))
     day_counts = Counter(_day_type(day, holidays) for day in dates)
 
     type_by_date = {day: _day_type(day, holidays) for day in dates}
-    trips = trips.assign(day_type=pd.to_datetime(trips["started_at"]).dt.date.map(type_by_date))
+    trips = trips.assign(day_type=parse_timestamps(trips["started_at"]).dt.date.map(type_by_date))
 
     def _counts(id_col: str, name_col: str, label: str) -> tuple[pd.DataFrame, pd.DataFrame]:
         docked = trips[trips[id_col].str.len() > 0]
@@ -430,11 +541,7 @@ def build_station_daytype_averages(trips: pd.DataFrame) -> pd.DataFrame:
     departures, dep_names = _counts("start_station_id", "start_station_name", "departures")
     arrivals, arr_names = _counts("end_station_id", "end_station_name", "arrivals")
 
-    names = (
-        pd.concat([dep_names, arr_names], ignore_index=True)
-        .drop_duplicates("station_id", keep="first")
-        .set_index("station_id")["station_name"]
-    )
+    names = _station_names([dep_names, arr_names])
     station_ids = sorted(names.index)
 
     grid = pd.MultiIndex.from_product([DAY_TYPES, station_ids], names=["day_type", "station_id"])
@@ -446,16 +553,18 @@ def build_station_daytype_averages(trips: pd.DataFrame) -> pd.DataFrame:
     )
     activity["total"] = activity["departures"].fillna(0) + activity["arrivals"].fillna(0)
 
+    # reindex so an all-dockless extract (no stations) still yields every
+    # day-type column instead of an empty pivot without them.
     wide = activity.pivot_table(
         index="station_id", columns="day_type", values="total", aggfunc="sum"
-    )
+    ).reindex(index=station_ids, columns=list(DAY_TYPES), fill_value=0)
     summary = pd.DataFrame(index=pd.Index(station_ids, name="station_id"))
     summary["station_name"] = names
     for day_type in DAY_TYPES:
         summary[f"avg_{day_type}_riders"] = (wide[day_type] / day_counts[day_type]).round(4)
     for day_type in DAY_TYPES:
         summary[f"{day_type}_days"] = day_counts[day_type]
-    return summary.reset_index()
+    return summary.reset_index()[columns]
 
 
 # ---------------------------------------------------------------------------
