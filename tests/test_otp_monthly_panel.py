@@ -95,7 +95,9 @@ def test_compute_trip_coverage_counts_unobserved_trips() -> None:
             "trip_type": ["In service"] * 4,
         }
     )
-    scored = pd.DataFrame({"trip_id_performed": ["T1", "T1", "T2"]})
+    scored = pd.DataFrame(
+        {"service_date": ["2025-01-02"] * 3, "trip_id_performed": ["T1", "T1", "T2"]}
+    )
     cov = target.compute_trip_coverage(trips, scored)
 
     route = cov.loc[(cov["level"] == "route") & (cov["route_id"] == "101")]
@@ -111,6 +113,43 @@ def test_compute_trip_coverage_counts_unobserved_trips() -> None:
     overall = cov.loc[cov["level"] == "overall"]
     assert set(overall["route_id"].unique()) == {"ALL"}
     assert overall.iloc[0]["trips_scheduled"] == 3
+
+
+def test_compute_trip_coverage_counts_each_date_of_a_reused_trip_id() -> None:
+    """The same trip_id_performed on two dates is two scheduled trips."""
+    trips = pd.DataFrame(
+        {
+            "trip_id_performed": ["T1", "T1"],
+            "route_id": ["101", "101"],
+            "service_date": ["2025-01-06", "2025-01-07"],
+        }
+    )
+    scored = pd.DataFrame({"service_date": ["2025-01-06"], "trip_id_performed": ["T1"]})
+    cov = target.compute_trip_coverage(trips, scored)
+    row = cov.loc[cov["level"] == "route"].iloc[0]
+    assert row["trips_scheduled"] == 2
+    assert row["trips_observed"] == 1
+    assert row["pct_trips_observed"] == pytest.approx(50.0)
+
+
+def test_join_drops_visits_from_the_canceled_date_only() -> None:
+    """A trip ID canceled on one date keeps only the other date's visits."""
+    trips = pd.DataFrame(
+        {
+            "service_date": ["2025-01-06", "2025-01-07"],
+            "trip_id_performed": ["T1", "T1"],
+            "route_id": ["101", "101"],
+            "schedule_relationship": ["Scheduled", "Canceled"],
+        }
+    )
+    visits = pd.DataFrame(
+        {
+            "service_date": pd.to_datetime(["2025-01-06", "2025-01-07"]),
+            "trip_id_performed": ["T1", "T1"],
+        }
+    )
+    joined = target.join_trip_attributes(visits, trips)
+    assert joined["service_date"].tolist() == [pd.Timestamp("2025-01-06")]
 
 
 def test_compute_trip_coverage_on_fixtures(scored: pd.DataFrame) -> None:

@@ -38,6 +38,48 @@ def test_join_adds_route_and_dow(joined: pd.DataFrame) -> None:
     assert set(joined["dow"].unique()) <= set(target.DOW_ORDER)
 
 
+def _visits(rows: list[tuple[str, int, str, str]]) -> pd.DataFrame:
+    """Stop visits for trip T1 from (date, seq, arrival HH:MM, departure HH:MM)."""
+    return pd.DataFrame(
+        {
+            "service_date": pd.to_datetime([r[0] for r in rows]),
+            "trip_id_performed": ["T1"] * len(rows),
+            "trip_stop_sequence": [r[1] for r in rows],
+            "actual_arrival_time": pd.to_datetime([f"{r[0]} {r[2]}" for r in rows]),
+            "actual_departure_time": pd.to_datetime([f"{r[0]} {r[3]}" for r in rows]),
+        }
+    )
+
+
+def test_runtimes_are_per_service_date_for_a_reused_trip_id() -> None:
+    """Two daily 20-minute runs of T1 are two runtimes, not one 1,460-minute trip."""
+    sv = _visits(
+        [
+            ("2025-01-06", 1, "06:00", "06:00"),
+            ("2025-01-06", 2, "06:20", "06:20"),
+            ("2025-01-07", 1, "06:00", "06:00"),
+            ("2025-01-07", 2, "06:20", "06:20"),
+        ]
+    )
+    trips = pd.DataFrame(
+        {
+            "service_date": ["2025-01-06", "2025-01-07"],
+            "trip_id_performed": ["T1", "T1"],
+            "route_id": ["101", "101"],
+            "direction_id": ["0", "0"],
+        }
+    )
+    joined = target.join_trip_attributes(target.compute_trip_runtimes(sv), trips)
+    assert joined["actual_runtime_min"].tolist() == [20.0, 20.0]
+    assert joined["dow"].tolist() == ["Monday", "Tuesday"]
+
+
+def test_single_observed_stop_is_not_a_runtime() -> None:
+    """One stop with dwell has no distinct endpoints, so no runtime is recorded."""
+    sv = _visits([("2025-01-06", 1, "06:00", "06:02")])
+    assert target.compute_trip_runtimes(sv).empty
+
+
 def test_trim_outliers_partitions_rows() -> None:
     """Trimming removes the extreme tails and conserves total rows."""
     df = pd.DataFrame(

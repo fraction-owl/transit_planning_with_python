@@ -162,6 +162,15 @@ LEVELS: Dict[str, List[str]] = {
 # LOADING & JOINING
 # =============================================================================
 
+# TIDES identifies a performed trip by (service_date, trip_id_performed): the same
+# trip_id_performed may recur on other dates, so every join, dedup, and count uses both.
+TRIP_KEY: List[str] = ["service_date", "trip_id_performed"]
+
+
+def _parse_service_date(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy of *df* with ``service_date`` parsed, so both tables key alike."""
+    return df.assign(service_date=pd.to_datetime(df["service_date"], errors="coerce"))
+
 
 def load_stop_visits(path: Path) -> pd.DataFrame:
     """Read a TIDES ``stop_visits`` CSV and parse its timestamp columns.
@@ -216,8 +225,9 @@ def join_trip_attributes(
     """Attach route/direction/service-type attributes to each stop visit.
 
     Trips that were Canceled in ``trips_performed`` are dropped (their stop
-    visits are not meaningful for OTP). The join key is ``trip_id_performed``,
-    which is unique per performed trip in TIDES.
+    visits are not meaningful for OTP). The join key is ``TRIP_KEY``
+    (``service_date`` + ``trip_id_performed``), which identifies one performed
+    trip in TIDES.
 
     Args:
         stop_visits: Output of :func:`load_stop_visits`.
@@ -226,16 +236,16 @@ def join_trip_attributes(
     Returns:
         Stop visits with the ``_TRIP_ATTR_COLS`` attributes joined on.
     """
-    trips = trips_performed.copy()
+    trips = _parse_service_date(trips_performed)
     if "schedule_relationship" in trips.columns:
         trips = trips.loc[trips["schedule_relationship"].fillna("Scheduled") != "Canceled"]
     if "trip_type" in trips.columns:
         trips = trips.loc[trips["trip_type"].fillna("In service") == "In service"]
 
     attr_cols = [c for c in _TRIP_ATTR_COLS if c in trips.columns]
-    trips = trips[["trip_id_performed", *attr_cols]].drop_duplicates("trip_id_performed")
+    trips = trips[[*TRIP_KEY, *attr_cols]].drop_duplicates(TRIP_KEY)
 
-    merged = stop_visits.merge(trips, on="trip_id_performed", how="inner")
+    merged = _parse_service_date(stop_visits).merge(trips, on=TRIP_KEY, how="inner")
     return merged
 
 
@@ -461,7 +471,7 @@ def compute_trip_coverage(
         trips_performed: Output of :func:`load_trips_performed`, after any
             route include/exclude filtering.
         scored: Fully scored visits (post :func:`filter_for_otp`), whose
-            ``trip_id_performed`` values mark a trip as observed.
+            ``TRIP_KEY`` values mark a trip as observed on that date.
 
     Returns:
         Tidy DataFrame with one row per (``level``, ``route_id``, ``month``)
@@ -470,19 +480,22 @@ def compute_trip_coverage(
         ``pct_trips_observed``, ``evaluated_visits``, and
         ``visits_per_observed_trip``.
     """
-    trips = trips_performed.copy()
+    trips = _parse_service_date(trips_performed)
     if "schedule_relationship" in trips.columns:
         trips = trips.loc[trips["schedule_relationship"].fillna("Scheduled") != "Canceled"]
     if "trip_type" in trips.columns:
         trips = trips.loc[trips["trip_type"].fillna("In service") == "In service"]
-    trips = trips.drop_duplicates("trip_id_performed").copy()
-    trips["month"] = pd.to_datetime(trips["service_date"], errors="coerce").dt.strftime("%Y-%m")
+    trips = trips.drop_duplicates(TRIP_KEY).copy()
+    trips["month"] = trips["service_date"].dt.strftime("%Y-%m")
 
     if scored.empty:
-        visit_counts = pd.Series(dtype="int64")
+        trips["evaluated_visits"] = 0
     else:
-        visit_counts = scored.groupby("trip_id_performed").size()
-    trips["evaluated_visits"] = trips["trip_id_performed"].map(visit_counts).fillna(0).astype(int)
+        visit_counts = (
+            _parse_service_date(scored).groupby(TRIP_KEY).size().rename("evaluated_visits")
+        )
+        trips = trips.merge(visit_counts.reset_index(), on=TRIP_KEY, how="left")
+        trips["evaluated_visits"] = trips["evaluated_visits"].fillna(0).astype(int)
     trips["_observed"] = trips["evaluated_visits"] > 0
 
     def _reduce(frame: pd.DataFrame, keys: List[str]) -> pd.DataFrame:

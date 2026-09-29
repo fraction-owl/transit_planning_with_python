@@ -4,6 +4,7 @@ import pandas as pd
 import pytest
 
 import scripts.operations_tools.convert_to_tides_stop_visits as target
+import scripts.operations_tools.convert_to_tides_trips_performed as trips_target
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -122,8 +123,30 @@ def test_normalize_timepoint_order_parses_integers() -> None:
 
 
 def test_normalize_timepoint_order_zero_shifts_to_one() -> None:
-    out = target.normalize_timepoint_order(pd.Series(["0", "1"]))
-    assert list(out) == [1, 1]
+    """A zero-based trip shifts as a whole, so no two stops collide on 1."""
+    out = target.normalize_timepoint_order(pd.Series(["0", "1", "2"]))
+    assert list(out) == [1, 2, 3]
+
+
+def test_normalize_timepoint_order_shifts_only_zero_based_trips() -> None:
+    trip_key = pd.DataFrame(
+        {"service_date": ["2025-01-15"] * 4, "trip_id_performed": ["A", "A", "B", "B"]}
+    )
+    out = target.normalize_timepoint_order(pd.Series(["0", "1", "1", "2"]), trip_key)
+    assert list(out) == [1, 2, 1, 2]
+
+
+def test_warn_duplicate_sequences_flags_repeats(caplog) -> None:
+    df = pd.DataFrame(
+        {
+            "service_date": ["2025-01-15"] * 3,
+            "trip_id_performed": ["A"] * 3,
+            "trip_stop_sequence": [1, 1, 2],
+        }
+    )
+    with caplog.at_level("WARNING"):
+        target.warn_duplicate_sequences(df)
+    assert "1 trip(s) repeat" in caplog.text
 
 
 def test_normalize_timepoint_order_negative_becomes_na() -> None:
@@ -227,3 +250,79 @@ def test_convert_to_tides_unsupported_fields_left_blank() -> None:
     out = target.convert_to_tides(_input_df())
     assert out["boarding_1"].isna().all()
     assert out["revenue"].isna().all()
+
+
+# ---------------------------------------------------------------------------
+# trip_id_performed contract with convert_to_tides_trips_performed
+# ---------------------------------------------------------------------------
+
+
+def _split_trip_exports() -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Trip 1550064 run by two vehicles on one date, in both AVL exports."""
+    trips = pd.DataFrame(
+        {
+            "Vehicle": ["7906", "7907"],
+            "Route": ["101 - Fort Hunt"] * 2,
+            "Direction": ["NORTHBOUND"] * 2,
+            "Block": ["B1"] * 2,
+            "TripID": ["1550064"] * 2,
+            "Trip Type": ["Revenue"] * 2,
+            "Scheduled Start Time": ["1/15/2025 4:02:00 AM"] * 2,
+            "Scheduled Finish Time": ["1/15/2025 4:18:00 AM"] * 2,
+            "Actual Start Time": ["1/15/2025 4:05:00 AM", "1/15/2025 4:12:00 AM"],
+            "Actual Finish Time": ["1/15/2025 4:12:00 AM", "1/15/2025 4:20:00 AM"],
+            "Operator": ["OP1", "OP2"],
+            "Last Stop": ["TP2", "TP2"],
+        }
+    )
+    visits = _input_df()
+    visits["Vehicle"] = ["7906.0", "7907"]
+    return trips, visits
+
+
+@pytest.mark.parametrize("mode", ["token", "hashed"])
+def test_trip_ids_match_trips_performed_converter(monkeypatch, mode: str) -> None:
+    trips_raw, visits_raw = _split_trip_exports()
+    monkeypatch.setattr(target, "TRIP_ID_MODE", mode)
+    monkeypatch.setattr(trips_target, "TRIP_ID_MODE", mode)
+
+    trip_ids = set(trips_target.convert_to_tides(trips_raw)["trip_id_performed"])
+    visit_ids = set(target.convert_to_tides(visits_raw)["trip_id_performed"])
+    assert len(trip_ids) == 2
+    assert visit_ids == trip_ids
+
+
+def test_single_vehicle_trip_keeps_token_in_both_converters() -> None:
+    trips_raw, visits_raw = _split_trip_exports()
+    trip_ids = trips_target.convert_to_tides(trips_raw.iloc[[0]])["trip_id_performed"]
+    visit_ids = target.convert_to_tides(visits_raw.assign(Vehicle="7906"))["trip_id_performed"]
+    assert set(trip_ids) == set(visit_ids) == {"1550064"}
+
+
+def test_convert_to_tides_zero_based_order_stays_unique() -> None:
+    df = _input_df()
+    df["Timepoint Order"] = ["0", "1"]
+    out = target.convert_to_tides(df)
+    assert list(out["trip_stop_sequence"]) == [1, 2]
+
+
+# ---------------------------------------------------------------------------
+# main (CSV entry point)
+# ---------------------------------------------------------------------------
+
+
+def test_main_reads_identifiers_as_text(tmp_path, monkeypatch) -> None:
+    """Leading zeros in IDs survive the CSV round trip."""
+    input_csv = tmp_path / "Stop Visit Events.csv"
+    df = _input_df()
+    df["Trip"] = ["04:02 00123", "04:02 00123"]
+    df["Timepoint ID"] = ["0042", "0043"]
+    df.to_csv(input_csv, index=False)
+    monkeypatch.setattr(target, "INPUT_CSV", input_csv)
+    monkeypatch.setattr(target, "OUTPUT_DIR", tmp_path)
+    monkeypatch.setattr(target, "OUTPUT_CSV", tmp_path / "stop_visits.csv")
+
+    assert target.main() == 0
+    out = pd.read_csv(tmp_path / "stop_visits.csv", dtype=str)
+    assert list(out["trip_id_performed"]) == ["00123", "00123"]
+    assert list(out["stop_id"]) == ["0042", "0043"]

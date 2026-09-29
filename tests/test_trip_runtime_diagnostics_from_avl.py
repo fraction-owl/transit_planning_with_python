@@ -2,6 +2,7 @@ import sys
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 # Add the script directory to path to import the module
 # We need to make sure we point to the directory containing the script
@@ -65,3 +66,76 @@ def test_extract_trip_start_time_skip() -> None:
     df = pd.DataFrame({"trip_start_time": ["10:00"], "Trip": ["TRIP_1000"]})
     res = target.extract_trip_start_time(df)
     pd.testing.assert_frame_equal(df, res)
+
+
+def _route_trips() -> pd.DataFrame:
+    """Twenty days of two start times, each with one extreme runtime on day 20."""
+    rows = []
+    for day in range(1, 21):
+        for hhmm, runtime in (("06:00", 30), ("07:00", 40)):
+            start = pd.Timestamp(f"2025-03-{day:02d} {hhmm}")
+            extra = 60 if day == 20 else 0
+            rows.append(
+                {
+                    "Route": "101",
+                    "Direction": "NORTHBOUND",
+                    "TripID": f"T{hhmm}",
+                    "trip_start_time": hhmm,
+                    "Scheduled Start Time": start,
+                    "Scheduled Finish Time": start + pd.Timedelta(minutes=runtime),
+                    "Actual Start Time": start,
+                    "Actual Finish Time": start + pd.Timedelta(minutes=runtime + day % 3 + extra),
+                }
+            )
+    return pd.DataFrame(rows).pipe(target.add_deviation_cols).pipe(target.add_otp_flag)
+
+
+@pytest.fixture()
+def output_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    monkeypatch.setattr(target, "OUTPUT_DIR", tmp_path)
+    monkeypatch.setattr(target, "PLOTS_DIR", tmp_path / "plots")
+    return tmp_path
+
+
+def test_write_summary_table_has_runtime_stats(output_dir: Path) -> None:
+    summary = target.write_summary_table(_route_trips())
+    assert summary["trip_start_time"].tolist() == ["06:00", "07:00"]
+    for col in ("runtime_mean_min", "runtime_median_min", "runtime_p85_min"):
+        assert summary[col].notna().all()
+    assert (output_dir / f"trip_summary_{target._day_tag()}.xlsx").exists()
+
+
+def test_retained_and_excluded_exports_do_not_overlap(output_dir: Path) -> None:
+    df = _route_trips()
+    target.export_trimmed_outliers(df)
+    target.write_row_level(df)
+    tag = target._day_tag()
+    excluded = pd.read_csv(output_dir / f"events_excluded_{tag}.csv")
+    retained = pd.read_csv(output_dir / f"events_retained_{tag}.csv")
+    key = ["TripID", "Scheduled Start Time"]
+    assert not excluded.empty
+    assert excluded[key].merge(retained[key], on=key).empty
+    assert len(excluded) + len(retained) == len(df)
+
+
+def test_filter_date_range_keeps_all_of_date_end() -> None:
+    df = pd.DataFrame(
+        {
+            "Scheduled Start Time": [
+                target.DATE_START - pd.Timedelta(minutes=1),
+                target.DATE_END + pd.Timedelta(hours=18),
+                target.DATE_END + pd.Timedelta(days=1),
+            ]
+        }
+    )
+    kept = target.filter_date_range(df)
+    assert kept["Scheduled Start Time"].tolist() == [target.DATE_END + pd.Timedelta(hours=18)]
+
+
+def test_suggest_time_bands_handles_fewer_than_two_start_times() -> None:
+    one = pd.DataFrame({"trip_start_time": ["06:00"], "runtime_p85_min": [30.0]})
+    bands = target.suggest_time_bands(one)
+    assert bands[["band_id", "start_time", "end_time", "n_tokens"]].to_numpy().tolist() == [
+        [1, "06:00", "06:00", 1]
+    ]
+    assert target.suggest_time_bands(one.iloc[0:0]).empty

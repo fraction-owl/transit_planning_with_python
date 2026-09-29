@@ -98,6 +98,7 @@ def test_detail_splits_visit_failure_causes() -> None:
     """Skipped, missing-actual, and missing-schedule visits are told apart."""
     ts = pd.Timestamp("2025-01-02T06:00:00")
     base = {
+        "service_date": "2025-01-02",
         "trip_id_performed": "T1",
         "pattern_key": "P1",
         "route_id": "A",
@@ -142,7 +143,14 @@ def test_detail_splits_visit_failure_causes() -> None:
         )
     )
     scored = candidates.pipe(target.filter_for_otp, False).pipe(target.classify_otp)
-    trips = pd.DataFrame({"trip_id_performed": ["T1"], "pattern_key": ["P1"], "route_id": ["A"]})
+    trips = pd.DataFrame(
+        {
+            "service_date": ["2025-01-02"],
+            "trip_id_performed": ["T1"],
+            "pattern_key": ["P1"],
+            "route_id": ["A"],
+        }
+    )
     detail = target.build_stop_route_detail(candidates, scored, trips)
     row = detail.iloc[0]
     assert row["visits_emitted"] == 4
@@ -152,6 +160,56 @@ def test_detail_splits_visit_failure_causes() -> None:
     assert row["evaluated"] == 1
     assert row["expected_trips"] == 1
     assert row["observed_trips"] == 1
+
+
+def _reused_trip_id_tables() -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Trip T1 scheduled on two dates under one trip_id_performed; AVL saw one date."""
+    trips = pd.DataFrame(
+        {
+            "service_date": ["2025-01-06", "2025-01-07"],
+            "trip_id_performed": ["T1", "T1"],
+            "route_id": ["101", "101"],
+            "direction_id": ["0", "0"],
+            "trip_type": ["In service", "In service"],
+            "schedule_relationship": ["Scheduled", "Scheduled"],
+        }
+    )
+    visits = pd.DataFrame(
+        {
+            "service_date": pd.to_datetime(["2025-01-06", "2025-01-06"]),
+            "trip_id_performed": ["T1", "T1"],
+            "stop_id": ["A", "B"],
+            "timepoint": ["TRUE", "TRUE"],
+            "schedule_relationship": ["Scheduled", "Scheduled"],
+            "schedule_departure_time": pd.to_datetime(["2025-01-06 06:00", "2025-01-06 06:20"]),
+            "schedule_arrival_time": pd.to_datetime(["2025-01-06 06:00", "2025-01-06 06:20"]),
+            "actual_departure_time": pd.to_datetime(["2025-01-06 06:01", "2025-01-06 06:22"]),
+            "actual_arrival_time": pd.to_datetime(["2025-01-06 06:01", "2025-01-06 06:22"]),
+        }
+    )
+    return trips, visits
+
+
+def test_coverage_counts_each_date_of_a_reused_trip_id() -> None:
+    """One of two scheduled dates observed is 50% coverage, not 100%."""
+    trips_raw, visits = _reused_trip_id_tables()
+    trips = target.add_pattern_key(target.filter_in_service(trips_raw))
+    candidates = target.filter_candidate_visits(
+        target.compute_stop_deviations(target.join_trip_attributes(visits, trips)), True
+    )
+    scored = candidates.pipe(target.filter_for_otp, True).pipe(target.classify_otp)
+    detail = target.build_stop_route_detail(candidates, scored, trips)
+    assert detail["expected_trips"].tolist() == [2, 2]
+    assert detail["observed_trips"].tolist() == [1, 1]
+    assert detail["pct_trips_observed"].tolist() == [50.0, 50.0]
+
+
+def test_join_drops_visits_from_the_canceled_date_only() -> None:
+    """A trip ID canceled on one date must not admit that date's visits."""
+    trips_raw, visits = _reused_trip_id_tables()
+    trips_raw.loc[0, "schedule_relationship"] = "Canceled"
+    trips = target.add_pattern_key(target.filter_in_service(trips_raw))
+    assert target.join_trip_attributes(visits, trips).empty
 
 
 def test_route_baselines_pool_the_route() -> None:

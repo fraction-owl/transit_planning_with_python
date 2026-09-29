@@ -75,3 +75,48 @@ def test_tides_data_processing(tides_input_csv: Path, tmp_path: Path) -> None:
     df_pct = pd.read_csv(expected_pct_file)
     assert "Year-Month" in df_pct.columns
     assert "2025-03" in df_pct["Year-Month"].to_numpy()
+
+
+# ---------------------------------------------------------------------------
+# add_year_month_column
+# ---------------------------------------------------------------------------
+
+
+def _months(**cols: list) -> pd.DataFrame:
+    n = len(next(iter(cols.values())))
+    return pd.DataFrame({"Route": ["101"] * n, "Direction": ["NORTHBOUND"] * n, **cols})
+
+
+def test_year_month_from_date_without_month_column() -> None:
+    df = _months(Date=["2025-03-04", "2025-04-09"])
+    out = otp_by_timepoint_from_avl.add_year_month_column(df)
+    assert out["Year-Month"].tolist() == ["2025-03", "2025-04"]
+
+
+def test_partial_year_month_is_filled_from_date() -> None:
+    df = _months(**{"Year-Month": ["2025-03", ""], "Date": ["", "2025-04-09"]})
+    out = otp_by_timepoint_from_avl.add_year_month_column(df)
+    assert out["Year-Month"].tolist() == ["2025-03", "2025-04"]
+
+
+def test_month_backfill_uses_the_one_year_that_month_was_seen() -> None:
+    df = _months(Date=["2025-03-04", "", "2025-04-01"], Month=["Mar", "March", "Apr"])
+    out = otp_by_timepoint_from_avl.add_year_month_column(df)
+    assert out["Year-Month"].tolist() == ["2025-03", "2025-03", "2025-04"]
+
+
+@pytest.mark.parametrize(
+    ("dates", "months", "reason"),
+    [
+        # April never appears on a dated row: no year to take.
+        (["2025-03-04", ""], ["Mar", "Apr"], "no dated row"),
+        # March appears in two years: the undated March row is ambiguous.
+        (["2024-03-04", "2025-03-04", ""], ["Mar", "Mar", "Mar"], "more than one year"),
+    ],
+)
+def test_month_backfill_rejects_unsupported_or_ambiguous_years(
+    dates: list, months: list, reason: str
+) -> None:
+    df = _months(Date=dates, Month=months)
+    with pytest.raises(SystemExit, match=reason):
+        otp_by_timepoint_from_avl.add_year_month_column(df)

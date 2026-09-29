@@ -16,8 +16,9 @@ Written per route (and per direction when ``SPLIT_BY_DIRECTION`` is True) under
 ``OUTPUT_ROOT_DIR/<route>/[<direction>/]``, where ``<day>`` is the service-day
 tag (e.g. ``WEEKDAY``):
 
-- ``events_retained_<day>.csv`` - trips kept for analysis, with deviations and
-  OTP compliance flags.
+- ``events_retained_<day>.csv`` - trips kept for analysis (minus trimmed
+  outliers when ``TRIM_OUTLIERS`` is True), with deviations and OTP compliance
+  flags.
 - ``events_excluded_<day>.csv`` - outlier trips trimmed from the analysis
   (only when ``WRITE_EXCLUSIONS`` is True).
 - ``trip_summary_<day>.xlsx`` - summarized runtime and OTP statistics per trip.
@@ -369,9 +370,12 @@ def filter_date_range(df: pd.DataFrame) -> pd.DataFrame:
         df: Trip records with 'Scheduled Start Time' as datetime.
 
     Returns:
-        Filtered DataFrame with rows inside DATE_START and DATE_END.
+        Filtered DataFrame with rows whose scheduled start falls on a date from
+        DATE_START through DATE_END, inclusive (all of DATE_END's trips are kept,
+        not just those at midnight).
     """
-    return df.loc[df["Scheduled Start Time"].between(DATE_START, DATE_END)].copy()
+    start_date = df["Scheduled Start Time"].dt.normalize()
+    return df.loc[start_date.between(DATE_START.normalize(), DATE_END.normalize())].copy()
 
 
 def filter_routes(df: pd.DataFrame, wanted: set[str]) -> pd.DataFrame:
@@ -563,7 +567,13 @@ def _day_tag() -> str:
 
 
 def write_row_level(df: pd.DataFrame) -> None:
-    """CSV of events retained for analysis (after all filters)."""
+    """CSV of events retained for analysis (after all filters and outlier trimming).
+
+    Rows trimmed as outliers go to ``events_excluded_*.csv`` (see
+    :func:`export_trimmed_outliers`) instead, so the two files never overlap.
+    """
+    if TRIM_OUTLIERS:
+        df = df.loc[~flag_trimmed_outliers(df)]
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     lead = ["Route", "Direction", "TripID", TIME_COL_NAME]
     ordered = df[lead + [c for c in df.columns if c not in lead]].sort_values(
@@ -615,12 +625,11 @@ def write_summary_table(df: pd.DataFrame) -> pd.DataFrame:
             }
         )
 
+    # SeriesGroupBy.apply stacks each group's stats into a (start time, stat)
+    # MultiIndex Series; unstack turns the stat level back into columns.
     _runtime_df = trip_grp["actual_runtime_min"].apply(_runtime_stats)
     if isinstance(_runtime_df.index, pd.MultiIndex):
-        _runtime_df = _runtime_df.pivot_table(
-            index=_runtime_df.index.get_level_values(0),
-            aggfunc="first",
-        )
+        _runtime_df = _runtime_df.unstack()  # noqa: PD010 - pivot_table fails on a Series
     summary = summary.join(_runtime_df)
 
     # New, clearer columns kept in parallel for one cycle
@@ -763,6 +772,29 @@ def _dir_slug(value: str | int | float | None) -> str:
     return clean or "unknown"
 
 
+def flag_trimmed_outliers(
+    df: pd.DataFrame,
+    *,
+    group_key: str = TIME_COL_NAME,
+    runtime_col: str = "actual_runtime_min",
+    frac: float = TRIM_FRAC,
+) -> pd.Series:
+    """Flag rows outside the ±*frac* runtime quantiles of their start time.
+
+    Returns:
+        Boolean Series aligned with *df*; ``True`` marks a trimmed outlier.
+    """
+    mask = pd.Series(False, index=df.index)
+    if df.empty or frac <= 0:
+        return mask
+
+    for _, sub in df.groupby(group_key, sort=False):
+        runtimes = sub[runtime_col]
+        lo, hi = runtimes.quantile([frac, 1 - frac])
+        mask.loc[sub.index] = (runtimes < lo) | (runtimes > hi)
+    return mask
+
+
 def export_trimmed_outliers(
     df: pd.DataFrame,
     *,
@@ -774,21 +806,11 @@ def export_trimmed_outliers(
     if df.empty or frac <= 0 or not WRITE_EXCLUSIONS:
         return
 
-    keep_frames: list[pd.DataFrame] = []
-
-    for _, sub in df.groupby(group_key, sort=False):
-        runtimes = sub[runtime_col]
-        if runtimes.empty:
-            continue
-        lo, hi = runtimes.quantile([frac, 1 - frac])
-        mask = (runtimes < lo) | (runtimes > hi)
-        if mask.any():
-            keep_frames.append(sub.loc[mask])
-
-    if not keep_frames:
+    mask = flag_trimmed_outliers(df, group_key=group_key, runtime_col=runtime_col, frac=frac)
+    if not mask.any():
         return
 
-    outliers = pd.concat(keep_frames, ignore_index=True)
+    outliers = df.loc[mask].reset_index(drop=True)
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     fname = OUTPUT_DIR / f"{_EXCLUDED_STEM}_{_day_tag()}.csv"
@@ -970,6 +992,10 @@ def suggest_time_bands(
     if miss:
         raise KeyError(f"summary missing columns {miss}")
 
+    band_cols = ["band_id", "start_time", "end_time", "n_tokens", "p85_mean_min"]
+    if summary.empty:
+        return pd.DataFrame(columns=band_cols)
+
     # ── 1. prepare ordered DF with numeric surrogate _t ──────────────
     df = (
         summary[["trip_start_time", "runtime_p85_min"]]
@@ -981,14 +1007,17 @@ def suggest_time_bands(
 
     # ── 2. Fisher–Jenks segmentation ─────────────────────────────────
     n = len(df)
+    if n == 0:
+        return pd.DataFrame(columns=band_cols)
     k0 = max(int(np.ceil(np.sqrt(n))), 2)
     k = k0 if max_bands is None or max_bands <= 0 else min(k0, max_bands)
-
-    breaks = _fisher_jenks(df["runtime_p85_min"].to_numpy(), k=k)
+    k = min(k, n)  # cannot form more bands than start times
 
     labels = np.zeros(n, dtype=int)
-    for _i, b in enumerate(breaks, start=1):
-        labels[b:] += 1
+    if k >= 2:
+        breaks = _fisher_jenks(df["runtime_p85_min"].to_numpy(), k=k)
+        for _i, b in enumerate(breaks, start=1):
+            labels[b:] += 1
     df["_band"] = labels
 
     # ── 3. optional merge of undersized bands ─────────────────────────
@@ -997,7 +1026,7 @@ def suggest_time_bands(
         while changed:
             sizes = df["_band"].value_counts().sort_index()
             small = sizes[sizes < min_band_size].index
-            if small.empty:
+            if small.empty or len(sizes) < 2:  # a lone band has no neighbour to join
                 changed = False
                 continue
             for bid in small:

@@ -145,8 +145,7 @@ def test_choose_trip_id_performed_unique_ids_pass_through() -> None:
     service_date = pd.Series(["2025-01-15", "2025-01-15"], dtype="string")
     scheduled = pd.Series(["A", "B"], dtype="string")
     vehicle = pd.Series(["V1", "V2"], dtype="string")
-    start = pd.to_datetime(pd.Series(["2025-01-15 04:00", "2025-01-15 05:00"]))
-    perf, n_dupes = target.choose_trip_id_performed(service_date, scheduled, vehicle, start)
+    perf, n_dupes = target.choose_trip_id_performed(service_date, scheduled, vehicle)
     assert list(perf) == ["A", "B"]
     assert n_dupes == 0
 
@@ -155,12 +154,30 @@ def test_choose_trip_id_performed_hashes_duplicates() -> None:
     service_date = pd.Series(["2025-01-15", "2025-01-15"], dtype="string")
     scheduled = pd.Series(["A", "A"], dtype="string")
     vehicle = pd.Series(["V1", "V2"], dtype="string")
-    start = pd.to_datetime(pd.Series(["2025-01-15 04:00", "2025-01-15 05:00"]))
-    perf, n_dupes = target.choose_trip_id_performed(service_date, scheduled, vehicle, start)
+    perf, n_dupes = target.choose_trip_id_performed(service_date, scheduled, vehicle)
     assert n_dupes == 2
     assert perf.iloc[0].startswith("perf_")
     assert perf.iloc[1].startswith("perf_")
     assert perf.iloc[0] != perf.iloc[1]
+
+
+def test_choose_trip_id_performed_same_id_on_other_dates_passes_through() -> None:
+    """Trip IDs recur daily by design; only a repeat within one date is hashed."""
+    service_date = pd.Series(["2025-01-15", "2025-01-16"], dtype="string")
+    scheduled = pd.Series(["A", "A"], dtype="string")
+    vehicle = pd.Series(["V1", "V2"], dtype="string")
+    perf, n_dupes = target.choose_trip_id_performed(service_date, scheduled, vehicle)
+    assert list(perf) == ["A", "A"]
+    assert n_dupes == 0
+
+
+def test_choose_trip_id_performed_hashed_mode_hashes_every_trip() -> None:
+    service_date = pd.Series(["2025-01-15", "2025-01-15"], dtype="string")
+    scheduled = pd.Series(["A", "B"], dtype="string")
+    vehicle = pd.Series(["V1", "V2"], dtype="string")
+    perf, _ = target.choose_trip_id_performed(service_date, scheduled, vehicle, mode="hashed")
+    assert perf.iloc[0] == f"perf_{target.stable_id('2025-01-15', 'A', 'V1')}"
+    assert perf.iloc[1] == f"perf_{target.stable_id('2025-01-15', 'B', 'V2')}"
 
 
 # ---------------------------------------------------------------------------
@@ -225,3 +242,34 @@ def test_convert_to_tides_falls_back_to_actual_start_for_dating() -> None:
     df.loc[0, "Scheduled Start Time"] = ""
     out = target.convert_to_tides(df)
     assert out.iloc[0]["service_date"] == "2025-01-15"
+
+
+def test_convert_to_tides_warns_on_repeated_trip_and_vehicle(caplog) -> None:
+    """Two rows with the same date, TripID, and vehicle cannot get distinct IDs."""
+    df = pd.concat([_input_df().iloc[[0]]] * 2, ignore_index=True)
+    with caplog.at_level("WARNING"):
+        out = target.convert_to_tides(df)
+    assert list(out["trip_id_performed"]) == ["1550064", "1550064"]
+    assert "likely duplicate export rows" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# main (CSV entry point)
+# ---------------------------------------------------------------------------
+
+
+def test_main_reads_identifiers_as_text(tmp_path, monkeypatch) -> None:
+    """Leading zeros survive the CSV round trip instead of being parsed as numbers."""
+    input_csv = tmp_path / "Event Runtime Analysis.csv"
+    df = _input_df()
+    df["TripID"] = ["00123", "0456", "0789"]
+    df["Block"] = ["007", "008", ""]
+    df.to_csv(input_csv, index=False)
+    monkeypatch.setattr(target, "INPUT_CSV", input_csv)
+    monkeypatch.setattr(target, "OUTPUT_DIR", tmp_path)
+    monkeypatch.setattr(target, "OUTPUT_CSV", tmp_path / "trips_performed.csv")
+
+    assert target.main() == 0
+    out = pd.read_csv(tmp_path / "trips_performed.csv", dtype=str)
+    assert list(out["trip_id_performed"]) == ["00123", "0456"]
+    assert list(out["block_id"]) == ["007", "008"]

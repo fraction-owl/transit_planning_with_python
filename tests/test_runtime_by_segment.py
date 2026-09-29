@@ -61,12 +61,13 @@ def test_compute_block_recovery() -> None:
     """Recovery is the next trip's scheduled start minus this trip's end."""
     tp = target.load_trips_performed(TRIPS_PERFORMED)
     rec = target.compute_block_recovery(tp)
-    assert {"trip_id_performed", "recovery_after_min"} == set(rec.columns)
+    assert {"service_date", "trip_id_performed", "recovery_after_min"} == set(rec.columns)
     # At least one finite recovery value should exist (blocks chain trips).
     assert rec["recovery_after_min"].notna().any()
     # Build a tiny synthetic block to check the arithmetic exactly.
     synth = pd.DataFrame(
         {
+            "service_date": ["2025-01-02", "2025-01-02"],
             "trip_id_performed": ["A", "B"],
             "block_id": ["BLK", "BLK"],
             "schedule_relationship": ["Scheduled", "Scheduled"],
@@ -77,6 +78,51 @@ def test_compute_block_recovery() -> None:
     rec2 = target.compute_block_recovery(synth).set_index("trip_id_performed")
     assert rec2.loc["A", "recovery_after_min"] == pytest.approx(15.0)
     assert pd.isna(rec2.loc["B", "recovery_after_min"])
+
+
+def _reused_trip_id_tables() -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Trip T1 (stops A -> B, 20 minutes) runs daily under one trip_id_performed."""
+    dates = ["2025-01-06", "2025-01-07"]
+    trips = pd.DataFrame(
+        {
+            "service_date": pd.to_datetime(dates),
+            "trip_id_performed": ["T1", "T1"],
+            "route_id": ["101", "101"],
+            "direction_id": ["0", "0"],
+            "block_id": ["BLK", "BLK"],
+            "schedule_trip_start": pd.to_datetime([f"{d} 06:00" for d in dates]),
+            "schedule_trip_end": pd.to_datetime([f"{d} 06:20" for d in dates]),
+        }
+    )
+    times = pd.to_datetime([f"{d} {t}" for d in dates for t in ("06:00", "06:20")])
+    visits = pd.DataFrame(
+        {
+            "service_date": pd.to_datetime([d for d in dates for _ in range(2)]),
+            "trip_id_performed": ["T1"] * 4,
+            "trip_stop_sequence": [1, 2, 1, 2],
+            "stop_id": ["A", "B", "A", "B"],
+            "timepoint": ["TRUE"] * 4,
+            "schedule_arrival_time": times,
+            "schedule_departure_time": times,
+            "actual_arrival_time": times,
+            "actual_departure_time": times,
+        }
+    )
+    return trips, visits
+
+
+def test_segments_and_recovery_stay_within_a_service_date() -> None:
+    """A reused trip ID yields one A -> B segment per date and no overnight recovery."""
+    trips, visits = _reused_trip_id_tables()
+    seg = target.build_segments(target.join_trip_attributes(visits, trips))
+    assert seg["segment"].tolist() == ["A -> B", "A -> B"]
+    assert seg["actual_runtime_min"].tolist() == [20.0, 20.0]
+
+    rec = target.compute_block_recovery(trips)
+    assert rec["recovery_after_min"].isna().all()
+
+    summary = target.summarize_segments(seg, rec, min_obs=1, percentiles=(85,))
+    assert summary["n_obs"].tolist() == [2]
 
 
 def test_summarize_segments_columns(joined: pd.DataFrame) -> None:
@@ -121,12 +167,13 @@ def test_summarize_segments_percentile_values() -> None:
             "direction_id": ["0"] * 5,
             "segment": ["A -> B"] * 5,
             "seq": [1] * 5,
+            "service_date": ["2025-01-02"] * 5,
             "trip_id_performed": [f"T{i}" for i in range(5)],
             "actual_runtime_min": runtimes,
             "scheduled_runtime_min": [12.0] * 5,
         }
     )
-    rec = pd.DataFrame({"trip_id_performed": [], "recovery_after_min": []})
+    rec = pd.DataFrame({"service_date": [], "trip_id_performed": [], "recovery_after_min": []})
     summary = target.summarize_segments(seg, rec, min_obs=1, percentiles=(85,))
     row = summary.iloc[0]
     s = pd.Series(runtimes)
