@@ -7,7 +7,7 @@ At a high level, the script:
 
   - Loads stops.txt, trips.txt, and stop_times.txt from a GTFS directory.
   - For each (route_id, direction_id), selects the trip with the most distinct
-    stops as the representative pattern.
+    stops as the representative pattern (its stop sequence and its shape).
   - Builds ordered logical stop sequences using a configurable stop key
     (stop_id or stop_code).
   - Treats a configurable set of base routes as references and compares each
@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import itertools
 import logging
+import re
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -53,6 +54,7 @@ import pandas as pd
 from matplotlib.axes import Axes
 from shapely.errors import GEOSException
 from shapely.geometry import LineString, Point
+from shapely.geometry.base import BaseGeometry
 from shapely.ops import substring
 
 # =============================================================================
@@ -84,7 +86,9 @@ PLOT_DIR = OUTPUT_DIR / "segment_plots"
 GTFS_CRS = "EPSG:4326"
 PROJECTED_CRS = "EPSG:26918"  # NAD83 / UTM 18N (Mid-Atlantic US).
 
-# Use stop_code vs stop_id as the logical key for stops.
+# Use stop_code vs stop_id as the logical key for stops. With stop_code, a stop
+# whose stop_code is blank is keyed as "stop_id=<its stop_id>", and stops that
+# share a stop_code are treated as one stop at the mean of their coordinates.
 USE_STOP_CODE = True
 STOP_KEY_FIELD = "stop_code" if USE_STOP_CODE else "stop_id"
 
@@ -112,7 +116,8 @@ MIN_SEGMENT_SPAN_STOPS = 2
 MAX_SHAPE_HAUSDORFF_M: Optional[float] = 80.0
 
 # Maximum perpendicular distance (meters) from a stop to a route's shape to consider
-# the stop as lying on that route's path.
+# the stop as lying on that route's path. Measured against the part of the shape
+# between the segment's boundary stops (padded by SEGMENT_MEASURE_PADDING_M).
 MAX_STOP_TO_SHAPE_M = 30.0
 
 # Padding (meters) around the segment extent along each shape for the "within path"
@@ -163,6 +168,36 @@ class GTFSContext:
     all_route_keys: List[RouteKey]
     base_route_keys: List[RouteKey]
     route_id_whitelist: Set[str]
+
+
+# Output columns, so that an empty result still writes a CSV header.
+SEGMENT_COLUMNS: List[str] = [
+    "missing_route_id",
+    "missing_route_direction_id",
+    "reference_route_id",
+    "reference_route_direction_id",
+    "segment_start_stop_key",
+    "segment_start_stop_name",
+    "segment_end_stop_key",
+    "segment_end_stop_name",
+    "candidate_missing_stop_keys",
+    "candidate_missing_stop_names",
+]
+AGGREGATE_COLUMNS: List[str] = [
+    "missing_route_id",
+    "missing_route_direction_id",
+    "stop_key",
+    "n_reference_routes",
+    "reference_route_ids",
+    "example_segments",
+]
+INTRA_ROUTE_COLUMNS: List[str] = [
+    "route_id",
+    "direction_id",
+    "trip_id",
+    "n_canonical_trips",
+    "missing_stop_keys",
+]
 
 
 # =============================================================================
@@ -228,16 +263,34 @@ def normalize_direction_id(series: pd.Series) -> pd.Series:
     """Normalize GTFS direction_id to string labels.
 
     Args:
-        series: Series containing direction_id values (typically 0/1 or NaN).
+        series: Series containing direction_id values (typically 0/1, blank,
+            or NaN).
 
     Returns:
-        Series of strings representing direction_id values.
+        Series of strings representing direction_id values; blank or
+        non-numeric values become "<NA>".
     """
-    return series.astype("Int64").astype(str)
+    numeric = pd.to_numeric(series, errors="coerce")
+    text = series.astype(str).str.strip()
+    invalid = numeric.isna() & series.notna() & (text != "")
+    if invalid.any():
+        logging.warning(
+            "%d direction_id value(s) are not numbers (e.g., %s); those trips "
+            "are grouped under direction '<NA>'.",
+            int(invalid.sum()),
+            ", ".join(text[invalid].drop_duplicates().head(3)),
+        )
+    return numeric.astype("Int64").astype(str)
 
 
 def load_gtfs_tables(gtfs_dir: Path) -> Dict[str, pd.DataFrame]:
     """Load required GTFS tables from the specified directory.
+
+    Every column is read as text, so identifiers keep their exact spelling in
+    every table ("001" stays "001", "10" never becomes "10.0", and "NA" is not
+    treated as missing). Coordinate and sequence fields are then converted to
+    numbers explicitly. direction_id is optional; when trips.txt lacks it,
+    each route's trips are treated as a single direction.
 
     Args:
         gtfs_dir: Directory containing GTFS CSV files.
@@ -247,7 +300,7 @@ def load_gtfs_tables(gtfs_dir: Path) -> Dict[str, pd.DataFrame]:
 
     Raises:
         FileNotFoundError: If required GTFS files are missing.
-        ValueError: If required columns are missing.
+        ValueError: If a file cannot be parsed as CSV.
     """
     required_files = {
         "stops": "stops.txt",
@@ -256,6 +309,11 @@ def load_gtfs_tables(gtfs_dir: Path) -> Dict[str, pd.DataFrame]:
         "shapes": "shapes.txt",
         "routes": "routes.txt",
     }
+    numeric_fields = {
+        "stops": ("stop_lat", "stop_lon"),
+        "stop_times": ("stop_sequence",),
+        "shapes": ("shape_pt_lat", "shape_pt_lon", "shape_pt_sequence"),
+    }
 
     tables: Dict[str, pd.DataFrame] = {}
     for key, filename in required_files.items():
@@ -263,12 +321,19 @@ def load_gtfs_tables(gtfs_dir: Path) -> Dict[str, pd.DataFrame]:
         if not path.exists():
             msg = f"Required GTFS file not found: {path}"
             raise FileNotFoundError(msg)
-        tables[key] = pd.read_csv(path)
+        table = pd.read_csv(path, dtype=str, keep_default_na=False)
+        for column in numeric_fields.get(key, ()):
+            if column in table.columns:
+                table[column] = pd.to_numeric(table[column], errors="coerce")
+        tables[key] = table
 
     trips = tables["trips"].copy()
     if "direction_id" not in trips.columns:
-        msg = "trips.txt must contain a 'direction_id' column."
-        raise ValueError(msg)
+        logging.warning(
+            "trips.txt has no direction_id column; each route's trips are "
+            "analyzed as a single direction."
+        )
+        trips["direction_id"] = ""
 
     trips["direction_id"] = normalize_direction_id(trips["direction_id"])
     trips["route_id"] = trips["route_id"].astype(str)
@@ -334,6 +399,41 @@ def build_shapes_gdf(shapes_df: pd.DataFrame, crs: str) -> gpd.GeoDataFrame:
     return shapes_gdf
 
 
+# Stop key given to a stop whose stop key field is blank. The prefix keeps these
+# keys from merging with one another or colliding with a real stop_code.
+STOP_ID_FALLBACK_PREFIX = "stop_id="
+
+
+def resolve_stop_keys(stops_df: pd.DataFrame, stop_key_field: str) -> pd.Series:
+    """Return the logical stop key for each row of stops.txt.
+
+    Stops whose stop key field is blank (common for stop_code) fall back to
+    STOP_ID_FALLBACK_PREFIX + stop_id, so they neither merge into one shared
+    key nor collide with another stop's real stop_code.
+
+    Args:
+        stops_df: DataFrame from stops.txt.
+        stop_key_field: Logical stop key field, e.g., "stop_id" or "stop_code".
+
+    Returns:
+        Series of string stop keys aligned with stops_df's index.
+
+    Raises:
+        ValueError: If stop_key_field is not a column of stops_df.
+    """
+    if stop_key_field not in stops_df.columns:
+        msg = f"stops.txt is missing the stop key field '{stop_key_field}'."
+        raise ValueError(msg)
+
+    stop_ids = stops_df["stop_id"].astype(str)
+    if stop_key_field == "stop_id":
+        return stop_ids
+
+    keys = stops_df[stop_key_field].fillna("").astype(str)
+    blank = keys.str.strip() == ""
+    return keys.where(~blank, STOP_ID_FALLBACK_PREFIX + stop_ids)
+
+
 def build_stops_gdf(
     stops_df: pd.DataFrame,
     crs: str,
@@ -341,8 +441,10 @@ def build_stops_gdf(
 ) -> gpd.GeoDataFrame:
     """Build a Point GeoDataFrame from GTFS stops.txt.
 
-    The GeoDataFrame index is set to the chosen stop key field
-    (stop_id or stop_code), as configured via stop_key_field.
+    The GeoDataFrame index is the logical stop key from resolve_stop_keys
+    (stop_id or stop_code, as configured via stop_key_field). When several
+    stop_ids share a key, the key is placed at the mean of their coordinates,
+    so every key has exactly one geometry.
 
     Args:
         stops_df: DataFrame containing stops.txt.
@@ -370,24 +472,42 @@ def build_stops_gdf(
         raise ValueError(msg)
 
     stops_df = stops_df.copy()
-    stops_df["stop_id"] = stops_df["stop_id"].astype(str)
-    stops_df[stop_key_field] = stops_df[stop_key_field].astype(str)
+    stops_df["stop_key"] = resolve_stop_keys(stops_df, stop_key_field)
 
-    geometry = gpd.points_from_xy(stops_df["stop_lon"], stops_df["stop_lat"])
-    stops_gdf = gpd.GeoDataFrame(stops_df, geometry=geometry, crs=crs)
-    stops_gdf = stops_gdf.set_index(stop_key_field)
+    key_counts = stops_df["stop_key"].value_counts()
+    shared_keys = [str(key) for key in key_counts[key_counts > 1].index]
+    if shared_keys:
+        logging.warning(
+            "%d %s value(s) are shared by more than one stop_id (e.g., %s); "
+            "each is located at the mean of its stops' coordinates.",
+            len(shared_keys),
+            stop_key_field,
+            ", ".join(shared_keys[:5]),
+        )
+
+    coords = stops_df.groupby("stop_key", sort=False)[["stop_lon", "stop_lat"]].mean()
+    geometry = gpd.points_from_xy(coords["stop_lon"], coords["stop_lat"])
+    stops_gdf = gpd.GeoDataFrame(coords, geometry=geometry, crs=crs)
+    stops_gdf.index.name = stop_key_field
     return stops_gdf
 
 
-def select_representative_shapes(trips_df: pd.DataFrame) -> pd.DataFrame:
+def select_representative_shapes(
+    trips_df: pd.DataFrame,
+    rep_trip_ids: Mapping[RouteKey, str],
+) -> pd.DataFrame:
     """Select a representative shape_id for each (route_id, direction_id).
 
-    The representative shape_id is chosen as the one with the highest trip count
-    for that route/direction.
+    The representative shape_id is the shape of the representative trip, so a
+    route's shape and its stop sequence always describe the same trip. (The
+    route's most common shape can belong to a shorter pattern than its
+    longest trip, which would misplace segment measures and the
+    stop-to-shape tests.)
 
     Args:
-        trips_df: DataFrame from trips.txt, including route_id, shape_id,
-            and normalized direction_id.
+        trips_df: DataFrame from trips.txt, including trip_id and shape_id.
+        rep_trip_ids: Mapping from (route_id, direction_id) to representative
+            trip_id, e.g., from choose_representative_trip_ids_max_stops.
 
     Returns:
         DataFrame with columns: route_id, direction_id, shape_id.
@@ -395,24 +515,22 @@ def select_representative_shapes(trips_df: pd.DataFrame) -> pd.DataFrame:
     Raises:
         ValueError: If required columns are missing.
     """
-    required_cols = {"route_id", "shape_id", "direction_id"}
+    required_cols = {"trip_id", "shape_id"}
     missing = required_cols - set(trips_df.columns)
     if missing:
         msg = f"trips.txt is missing required columns: {sorted(missing)}"
         raise ValueError(msg)
 
-    df = trips_df.copy()
-    df["route_id"] = df["route_id"].astype(str)
-    df["shape_id"] = df["shape_id"].astype(str)
-    df["direction_id"] = df["direction_id"].astype(str)
-
-    counts = (
-        df.groupby(["route_id", "direction_id", "shape_id"]).size().reset_index(name="trip_count")
-    )
-    counts = counts.sort_values("trip_count", ascending=False)
-    reps = counts.drop_duplicates(subset=["route_id", "direction_id"])
-    reps = reps[["route_id", "direction_id", "shape_id"]].reset_index(drop=True)
-    return reps
+    shape_by_trip = dict(zip(trips_df["trip_id"].astype(str), trips_df["shape_id"].astype(str)))
+    rows = [
+        {
+            "route_id": route_id,
+            "direction_id": direction_id,
+            "shape_id": shape_by_trip.get(str(trip_id), ""),
+        }
+        for (route_id, direction_id), trip_id in rep_trip_ids.items()
+    ]
+    return pd.DataFrame(rows, columns=["route_id", "direction_id", "shape_id"])
 
 
 def build_route_shapes_from_reps(
@@ -497,17 +615,14 @@ def build_stop_key_lookup(
         stop_key_field: Logical stop key field, e.g., "stop_id" or "stop_code".
 
     Returns:
-        Dictionary mapping stop_id -> logical stop key as string.
+        Dictionary mapping stop_id -> logical stop key as string (see
+        resolve_stop_keys for stops with a blank key).
     """
-    if stop_key_field not in stops_df.columns:
-        msg = f"stops.txt is missing the stop key field '{stop_key_field}'."
-        raise ValueError(msg)
+    keys = resolve_stop_keys(stops_df, stop_key_field)
+    df = pd.DataFrame({"stop_id": stops_df["stop_id"].astype(str), "stop_key": keys})
+    df = df.drop_duplicates("stop_id")
 
-    df = stops_df[["stop_id", stop_key_field]].drop_duplicates("stop_id").copy()
-    df["stop_id"] = df["stop_id"].astype(str)
-    df[stop_key_field] = df[stop_key_field].astype(str)
-
-    return dict(zip(df["stop_id"], df[stop_key_field]))
+    return dict(zip(df["stop_id"], df["stop_key"]))
 
 
 def build_stop_names_lookup(
@@ -527,13 +642,10 @@ def build_stop_names_lookup(
         msg = "stops.txt is missing the 'stop_name' column."
         raise ValueError(msg)
 
-    df = stops_df[[stop_key_field, "stop_name"]].copy()
-    df = df[pd.notna(df[stop_key_field])]
+    keys = resolve_stop_keys(stops_df, stop_key_field)
+    names = stops_df["stop_name"].astype(str)
 
-    df[stop_key_field] = df[stop_key_field].astype(str)
-    df["stop_name"] = df["stop_name"].astype(str)
-
-    return dict(zip(df[stop_key_field], df["stop_name"]))
+    return dict(zip(keys, names))
 
 
 def choose_representative_trip_ids(
@@ -790,10 +902,12 @@ def find_aligned_common_stops(
 ) -> List[Tuple[int, int]]:
     """Find common stops with consistent direction between two sequences.
 
-    The algorithm:
-      - For each stop in base_seq, find its first occurrence in other_seq.
-      - Keep only those matches.
-      - Enforce strictly increasing indices in other_seq to preserve direction.
+    Returns the longest list of (base_index, other_index) pairs that serve the
+    same stop in the same order on both routes (a longest common subsequence
+    of the two stop sequences). Every occurrence of a repeated stop is
+    eligible, so a loop that revisits a stop can align on whichever visit
+    keeps the most stops in order. Ties go to the earliest usable occurrence
+    in other_seq.
 
     Args:
         base_seq: Ordered list of stop keys for the base route.
@@ -802,23 +916,31 @@ def find_aligned_common_stops(
     Returns:
         List of (base_index, other_index) for aligned common stops in order.
     """
-    other_pos: Dict[str, int] = {}
-    for idx, s in enumerate(other_seq):
-        if s not in other_pos:
-            other_pos[s] = idx
+    shared = set(base_seq).intersection(other_seq)
+    base_idx = [i for i, s in enumerate(base_seq) if s in shared]
+    other_idx = [j for j, s in enumerate(other_seq) if s in shared]
+    n_base, n_other = len(base_idx), len(other_idx)
 
-    raw_pairs: List[Tuple[int, int]] = []
-    for i, stop in enumerate(base_seq):
-        j = other_pos.get(stop)
-        if j is not None:
-            raw_pairs.append((i, j))
+    # lcs[a][b]: most pairs alignable between base_idx[a:] and other_idx[b:].
+    lcs = [[0] * (n_other + 1) for _ in range(n_base + 1)]
+    for a in range(n_base - 1, -1, -1):
+        for b in range(n_other - 1, -1, -1):
+            if base_seq[base_idx[a]] == other_seq[other_idx[b]]:
+                lcs[a][b] = lcs[a + 1][b + 1] + 1
+            else:
+                lcs[a][b] = max(lcs[a + 1][b], lcs[a][b + 1])
 
     aligned: List[Tuple[int, int]] = []
-    last_other_idx = -1
-    for i, j in raw_pairs:
-        if j > last_other_idx:
-            aligned.append((i, j))
-            last_other_idx = j
+    a = b = 0
+    while a < n_base and b < n_other:
+        if base_seq[base_idx[a]] == other_seq[other_idx[b]]:
+            aligned.append((base_idx[a], other_idx[b]))
+            a += 1
+            b += 1
+        elif lcs[a][b + 1] >= lcs[a + 1][b]:
+            b += 1
+        else:
+            a += 1
 
     return aligned
 
@@ -844,7 +966,7 @@ def unique_preserve_order(items: Iterable[str]) -> List[str]:
 
 def _stop_near_shape(
     stop_key: str,
-    shape: Optional[LineString],
+    shape: Optional[BaseGeometry],
     stops_gdf_proj: gpd.GeoDataFrame,
     max_dist_m: float,
 ) -> bool:
@@ -853,6 +975,44 @@ def _stop_near_shape(
         return False
     stop_geom = cast("Point", stops_gdf_proj.loc[stop_key, "geometry"])
     return float(stop_geom.distance(shape)) <= max_dist_m
+
+
+def _shape_between_stops(
+    shape: Optional[LineString],
+    start_key: str,
+    end_key: str,
+    stops_gdf_proj: gpd.GeoDataFrame,
+    padding_m: float,
+) -> Optional[BaseGeometry]:
+    """Return the part of a shape between two stops, padded along the line.
+
+    Both stops are projected onto the shape, and the substring between those
+    measures is extended by padding_m on each side (clipped to the shape).
+
+    Args:
+        shape: Projected route shape, or None.
+        start_key: Logical stop key for the segment start.
+        end_key: Logical stop key for the segment end.
+        stops_gdf_proj: Stops GeoDataFrame in PROJECTED_CRS, indexed by stop key.
+        padding_m: Distance (meters) to extend the substring past each stop.
+
+    Returns:
+        The substring geometry, or None if the shape or either stop is missing
+        or the substring cannot be built.
+    """
+    if shape is None:
+        return None
+    if start_key not in stops_gdf_proj.index or end_key not in stops_gdf_proj.index:
+        return None
+
+    m0 = float(shape.project(stops_gdf_proj.loc[start_key, "geometry"]))
+    m1 = float(shape.project(stops_gdf_proj.loc[end_key, "geometry"]))
+    lo, hi = min(m0, m1), max(m0, m1)
+    try:
+        segment = substring(shape, max(0.0, lo - padding_m), min(shape.length, hi + padding_m))
+    except (GEOSException, ValueError, TypeError):  # defensive: geometries can be weird
+        return None
+    return None if segment.is_empty else segment
 
 
 def compare_segments_for_route_pair(
@@ -879,9 +1039,10 @@ def compare_segments_for_route_pair(
       - For segments that pass gating, compare interior subsequences:
           * base_interior = stops between boundaries on the base.
           * other_interior = stops between boundaries on the other.
-          * Any stop present only on one side's interior is flagged, but only
-            if it physically lies near the other route's projected shape
-            (within max_stop_to_shape_m meters).
+          * Any stop present only on the other route's interior is flagged,
+            but only if it lies within max_stop_to_shape_m meters of the base
+            route's shape between the segment's boundary stops (padded by
+            segment_measure_padding_m along the shape).
 
     This generalizes the 2-1-2 pattern to arbitrary interior lengths.
 
@@ -896,9 +1057,11 @@ def compare_segments_for_route_pair(
             between the two route substrings for a segment to be considered
             "same corridor". If None, geometry gating is disabled.
         max_stop_to_shape_m: Maximum distance (meters) from a stop to the
-            other route's shape for it to be retained as a "missing" candidate.
+            base route's shape, between the segment's boundary stops, for it
+            to be retained as a "missing" candidate.
         segment_measure_padding_m: Padding (meters) to extend the segment on
-            both sides along each shape when computing the substring.
+            both sides along each shape when computing the substrings for the
+            Hausdorff gate and the proximity test.
 
     Returns:
         List of dictionaries describing segment-level stop mismatches.
@@ -925,7 +1088,9 @@ def compare_segments_for_route_pair(
     other_route_id, other_dir = other_key
 
     for (i0, j0), (i1, j1) in zip(aligned_pairs[:-1], aligned_pairs[1:]):
-        if i1 - i0 < MIN_SEGMENT_SPAN_STOPS:
+        # The span test applies to either route: a base that runs A -> C
+        # directly (span 1) still has a segment if the other runs A -> B -> C.
+        if max(i1 - i0, j1 - j0) < MIN_SEGMENT_SPAN_STOPS:
             continue
 
         start_key = base_seq[i0]
@@ -948,9 +1113,12 @@ def compare_segments_for_route_pair(
             if seg_hd is not None and seg_hd > max_shape_hausdorff_m:
                 continue
 
-        # Interior subsequences between the boundary stops.
-        base_interior = list(base_seq[i0 + 1 : i1])
-        other_interior = list(other_seq[j0 + 1 : j1])
+        # Interior subsequences between the boundary stops. A loop can revisit
+        # a boundary stop inside the segment; the base serves that stop at the
+        # boundary, so it is never a candidate.
+        boundary = (start_key, end_key)
+        base_interior = [s for s in base_seq[i0 + 1 : i1] if s not in boundary]
+        other_interior = [s for s in other_seq[j0 + 1 : j1] if s not in boundary]
 
         # Deduplicate while preserving order.
         def _unique_preserve_order(seq: Sequence[str]) -> List[str]:
@@ -981,13 +1149,20 @@ def compare_segments_for_route_pair(
             continue
 
         # Filter false-positive candidates: a stop is only a real "miss" if it
-        # physically lies near the other route's corridor.
-        base_shape_proj = shapes_proj.get(base_key)
+        # physically lies near the base route's path through this segment,
+        # not merely near some other part of the base's shape.
+        base_segment_proj = _shape_between_stops(
+            shapes_proj.get(base_key),
+            start_key,
+            end_key,
+            stops_gdf_proj,
+            segment_measure_padding_m,
+        )
 
         stops_only_on_other = [
             s
             for s in stops_only_on_other
-            if _stop_near_shape(s, base_shape_proj, stops_gdf_proj, max_stop_to_shape_m)
+            if _stop_near_shape(s, base_segment_proj, stops_gdf_proj, max_stop_to_shape_m)
         ]
 
         if not stops_only_on_other:  # nothing missing from base in this segment
@@ -1060,11 +1235,11 @@ def aggregate_candidates(df: pd.DataFrame) -> pd.DataFrame:
         df: Segment-level mismatch DataFrame produced by run_segment_comparison.
 
     Returns:
-        Aggregated DataFrame sorted by n_reference_routes descending, or the
-        original (empty) DataFrame if input is empty.
+        Aggregated DataFrame sorted by n_reference_routes descending, or an
+        empty DataFrame with the aggregate columns if input is empty.
     """
     if df.empty:
-        return df
+        return pd.DataFrame(columns=AGGREGATE_COLUMNS)
     exploded = df.assign(stop_key=df["candidate_missing_stop_keys"].str.split(";")).explode(
         "stop_key"
     )
@@ -1087,6 +1262,25 @@ def aggregate_candidates(df: pd.DataFrame) -> pd.DataFrame:
     return agg
 
 
+def is_ordered_subsequence(sub: Sequence[str], full: Sequence[str]) -> bool:
+    """Return True if sub can be obtained from full by deleting items only.
+
+    Args:
+        sub: Candidate subsequence.
+        full: Sequence that may contain sub's items in the same order.
+
+    Returns:
+        True if every item of sub appears in full, in order.
+    """
+    pos = 0
+    for item in sub:
+        try:
+            pos = full.index(item, pos) + 1
+        except ValueError:
+            return False
+    return True
+
+
 def find_intra_route_skipped_stops(
     trips_df: pd.DataFrame,
     stop_times_df: pd.DataFrame,
@@ -1096,10 +1290,12 @@ def find_intra_route_skipped_stops(
 
     For each (route_id, direction_id) the modal stop sequence (most common
     ordered tuple of stop keys) is treated as canonical.  Any trip whose
-    sequence is a strict subset of the canonical sequence — and whose first
-    and last stops match the canonical first and last — is flagged for the
-    stops it omits.  Genuine short-turn or branched patterns are excluded by
-    the first/last stop guard.
+    sequence is an ordered subsequence of the canonical sequence (it omits
+    stops but adds or reorders none) — and whose first and last stops match
+    the canonical first and last — is flagged for the stops it omits.
+    Genuine short-turn or branched patterns are excluded by the first/last
+    stop guard, and variants that add or reorder stops (e.g., a deviation)
+    by the subsequence test.
 
     Args:
         trips_df: DataFrame from trips.txt (must include route_id, direction_id,
@@ -1136,6 +1332,8 @@ def find_intra_route_skipped_stops(
                 continue
             if not seq or seq[0] != canonical[0] or seq[-1] != canonical[-1]:
                 continue  # genuine short-turn or branch
+            if not is_ordered_subsequence(seq, canonical):
+                continue  # adds or reorders stops: a different pattern, not an omission
             missing = canonical_set - set(seq)
             if missing:
                 rows.append(
@@ -1147,7 +1345,7 @@ def find_intra_route_skipped_stops(
                         "missing_stop_keys": ";".join(sorted(missing)),
                     }
                 )
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows, columns=INTRA_ROUTE_COLUMNS)
 
 
 # =============================================================================
@@ -1205,6 +1403,12 @@ def _parse_semicolon_list(value: str) -> List[str]:
     return [token for token in value.split(";") if token]
 
 
+def _sanitize_token(name: str) -> str:
+    """Reduce a route/direction/stop label to a filesystem-safe token."""
+    token = re.sub(r"[^A-Za-z0-9_-]+", "_", str(name).strip()).strip("_")
+    return token or "unnamed"
+
+
 def plot_mismatch_segment(
     row: pd.Series,
     route_sequences: Mapping[RouteKey, Sequence[str]],
@@ -1246,6 +1450,11 @@ def plot_mismatch_segment(
     if base_geom is None or other_geom is None:
         logging.info("Skipping plot: missing shapes for %s or %s.", base_key, other_key)
         return None
+
+    # run_segment_comparison() compares against a reversed reference when it
+    # runs the corridor the opposite way; use the same order here.
+    if sequences_are_reversed(base_seq, other_seq):
+        other_seq = list(reversed(other_seq))
 
     try:
         i0, i1 = _find_segment_indices(base_seq, start_key, end_key)
@@ -1343,12 +1552,11 @@ def plot_mismatch_segment(
     ax.set_aspect("equal", adjustable="datalim")
     ax.grid(True, linewidth=0.3, zorder=GRID_ZORDER)
 
-    safe_start = start_key.replace(" ", "_")
-    safe_end = end_key.replace(" ", "_")
-    filename = (
-        f"seg_{base_route_id}_{base_dir}_vs_{other_route_id}_{other_dir}_"
-        f"{safe_start}_{safe_end}.png"
-    )
+    safe_base = f"{_sanitize_token(base_route_id)}_{_sanitize_token(base_dir)}"
+    safe_other = f"{_sanitize_token(other_route_id)}_{_sanitize_token(other_dir)}"
+    safe_start = _sanitize_token(start_key)
+    safe_end = _sanitize_token(end_key)
+    filename = f"seg_{safe_base}_vs_{safe_other}_{safe_start}_{safe_end}.png"
     PLOT_DIR.mkdir(parents=True, exist_ok=True)
     out_path = PLOT_DIR / filename
 
@@ -1564,8 +1772,8 @@ def plot_route_pair_overview(
     ax.grid(True, linewidth=0.3, zorder=GRID_ZORDER)
     ax.legend(loc="best", fontsize=8)
 
-    safe_base = f"{base_route_id}_{base_dir}".replace(" ", "_")
-    safe_other = f"{other_route_id}_{other_dir}".replace(" ", "_")
+    safe_base = f"{_sanitize_token(base_route_id)}_{_sanitize_token(base_dir)}"
+    safe_other = f"{_sanitize_token(other_route_id)}_{_sanitize_token(other_dir)}"
     filename_combined = f"overview_{safe_base}_vs_{safe_other}.png"
 
     PLOT_DIR.mkdir(parents=True, exist_ok=True)
@@ -1700,9 +1908,6 @@ def prepare_gtfs_context() -> GTFSContext:
     shapes_gdf_geo = build_shapes_gdf(shapes_df, GTFS_CRS)
     shapes_gdf_proj = shapes_gdf_geo.to_crs(PROJECTED_CRS)
 
-    logging.info("Selecting representative shapes per (route, direction)...")
-    reps = select_representative_shapes(trips_df)
-
     logging.info(
         "Choosing representative trip_ids per (route, direction) based on "
         "trips with the most stops..."
@@ -1711,6 +1916,9 @@ def prepare_gtfs_context() -> GTFSContext:
         trips_df=trips_df,
         stop_times_df=stop_times_df,
     )
+
+    logging.info("Selecting the representative trips' shapes...")
+    reps = select_representative_shapes(trips_df, rep_trip_ids)
 
     logging.info("Building stop key and name lookups...")
     stop_key_lookup = build_stop_key_lookup(stops_df, STOP_KEY_FIELD)
@@ -1805,7 +2013,7 @@ def run_segment_comparison(ctx: GTFSContext) -> pd.DataFrame:
         DataFrame of segment-level mismatches between routes.
     """
     if not ctx.route_sequences:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=SEGMENT_COLUMNS)
 
     logging.info(
         "Comparing segments for %d base route/direction pairs out of %d total.",
@@ -1878,7 +2086,7 @@ def run_segment_comparison(ctx: GTFSContext) -> pd.DataFrame:
 
     if not results:
         logging.info("No segment-level stop mismatches were identified.")
-        return pd.DataFrame()
+        return pd.DataFrame(columns=SEGMENT_COLUMNS)
 
     df = pd.DataFrame(results)
     df = df.sort_values(
@@ -2011,8 +2219,11 @@ def main() -> int:
     logging.info("Stop suspicion scores exported to: %s", agg_path)
 
     # Fix 5: intra-route trip-level skipped-stop check, written to a third CSV.
+    # Limited to the base routes, so TARGET_ROUTE_IDS and the route whitelist
+    # apply here exactly as they do to the segment comparison.
+    base_route_ids = {route_id for route_id, _ in ctx.base_route_keys}
     intra_route_df = find_intra_route_skipped_stops(
-        trips_df=ctx.trips_df,
+        trips_df=ctx.trips_df[ctx.trips_df["route_id"].isin(base_route_ids)],
         stop_times_df=ctx.stop_times_df,
         stop_key_lookup=ctx.stop_key_lookup,
     )
