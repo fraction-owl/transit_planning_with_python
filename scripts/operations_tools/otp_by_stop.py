@@ -192,6 +192,15 @@ class Config:
 # LOADING & JOINING
 # =============================================================================
 
+# TIDES identifies a performed trip by (service_date, trip_id_performed): the same
+# trip_id_performed may recur on other dates, so every join, dedup, and count uses both.
+TRIP_KEY: List[str] = ["service_date", "trip_id_performed"]
+
+
+def _parse_service_date(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy of *df* with ``service_date`` parsed, so both tables key alike."""
+    return df.assign(service_date=pd.to_datetime(df["service_date"], errors="coerce"))
+
 
 def load_stop_visits(path: Path) -> pd.DataFrame:
     """Read a TIDES ``stop_visits`` CSV and parse its timestamp columns.
@@ -241,14 +250,14 @@ def filter_in_service(trips_performed: pd.DataFrame) -> pd.DataFrame:
         trips_performed: Output of :func:`load_trips_performed`.
 
     Returns:
-        Filtered copy, deduplicated on ``trip_id_performed``.
+        Filtered copy with ``service_date`` parsed, deduplicated on ``TRIP_KEY``.
     """
-    out = trips_performed
+    out = _parse_service_date(trips_performed)
     if "schedule_relationship" in out.columns:
         out = out.loc[out["schedule_relationship"].fillna("Scheduled") != "Canceled"]
     if "trip_type" in out.columns:
         out = out.loc[out["trip_type"].fillna("In service") == "In service"]
-    return out.drop_duplicates("trip_id_performed").copy()
+    return out.drop_duplicates(TRIP_KEY).copy()
 
 
 def add_pattern_key(trips_performed: pd.DataFrame) -> pd.DataFrame:
@@ -299,9 +308,10 @@ def join_trip_attributes(
 ) -> pd.DataFrame:
     """Attach route/direction/pattern attributes to each stop visit.
 
-    The join key is ``trip_id_performed``, unique per performed trip in TIDES.
-    The visit table's own ``pattern_id`` (when present) is dropped in favor of
-    the trip-level ``pattern_key`` so one pattern definition is used throughout.
+    The join key is ``TRIP_KEY`` (``service_date`` + ``trip_id_performed``),
+    which identifies one performed trip in TIDES. The visit table's own
+    ``pattern_id`` (when present) is dropped in favor of the trip-level
+    ``pattern_key`` so one pattern definition is used throughout.
 
     Args:
         stop_visits: Output of :func:`load_stop_visits`.
@@ -313,9 +323,9 @@ def join_trip_attributes(
         join, so visits from canceled/non-revenue trips are dropped).
     """
     attr_cols = [c for c in _TRIP_ATTR_COLS if c in trips_performed.columns]
-    trips = trips_performed[["trip_id_performed", *attr_cols]]
-    visits = stop_visits.drop(columns=["pattern_id"], errors="ignore")
-    return visits.merge(trips, on="trip_id_performed", how="inner")
+    trips = _parse_service_date(trips_performed)[[*TRIP_KEY, *attr_cols]].drop_duplicates(TRIP_KEY)
+    visits = _parse_service_date(stop_visits).drop(columns=["pattern_id"], errors="ignore")
+    return visits.merge(trips, on=TRIP_KEY, how="inner")
 
 
 # =============================================================================
@@ -434,11 +444,15 @@ def count_pattern_trips(trips_performed: pd.DataFrame) -> pd.DataFrame:
         trips_performed: In-service trips with a ``pattern_key`` column.
 
     Returns:
-        One row per (``pattern_key``, ``route_id``) with its ``n_trips`` count.
+        One row per (``pattern_key``, ``route_id``) with its ``n_trips`` count
+        of distinct performed trips (``TRIP_KEY``).
     """
     return (
-        trips_performed.groupby(["pattern_key", "route_id"])
-        .agg(n_trips=("trip_id_performed", "nunique"))
+        _parse_service_date(trips_performed)
+        .drop_duplicates(TRIP_KEY)
+        .groupby(["pattern_key", "route_id"])
+        .size()
+        .rename("n_trips")
         .reset_index()
     )
 
@@ -532,23 +546,22 @@ def _aggregate_stop_route_otp(scored: pd.DataFrame) -> pd.DataFrame:
             :func:`classify_otp`).
 
     Returns:
-        One row per (``stop_id``, ``route_id``) with ``observed_trips``,
-        ``evaluated``, and ``early``/``on_time``/``late`` counts.
+        One row per (``stop_id``, ``route_id``) with ``observed_trips``
+        (distinct ``TRIP_KEY`` values), ``evaluated``, and
+        ``early``/``on_time``/``late`` counts.
     """
-    df = scored.copy()
+    df = _parse_service_date(scored)
     for cls in ("early", "on_time", "late"):
         df[f"_{cls}"] = df["otp_class"].eq(cls)
-    return (
-        df.groupby(["stop_id", "route_id"])
-        .agg(
-            observed_trips=("trip_id_performed", "nunique"),
-            evaluated=("otp_class", "size"),
-            early=("_early", "sum"),
-            on_time=("_on_time", "sum"),
-            late=("_late", "sum"),
-        )
-        .reset_index()
+    keys = ["stop_id", "route_id"]
+    observed = df.drop_duplicates([*keys, *TRIP_KEY]).groupby(keys).size().rename("observed_trips")
+    counts = df.groupby(keys).agg(
+        evaluated=("otp_class", "size"),
+        early=("_early", "sum"),
+        on_time=("_on_time", "sum"),
+        late=("_late", "sum"),
     )
+    return counts.join(observed)[["observed_trips", *counts.columns]].reset_index()
 
 
 def build_stop_route_detail(

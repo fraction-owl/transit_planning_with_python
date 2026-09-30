@@ -26,7 +26,7 @@ Two views are exported:
 
 Recovery time is derived from ``trips_performed`` block chaining: for each trip
 the gap between its scheduled end and the next trip's scheduled start on the
-same ``block_id`` is the scheduled recovery. It is attached to every segment of
+same ``block_id`` and ``service_date`` is the scheduled recovery. It is attached to every segment of
 the trip so planners can see, per corridor leg, how much downstream slack is
 available to absorb overruns.
 
@@ -111,6 +111,15 @@ class Config:
 # LOADING & JOINING
 # =============================================================================
 
+# TIDES identifies a performed trip by (service_date, trip_id_performed): the same
+# trip_id_performed may recur on other dates, so joins and grouping use both.
+TRIP_KEY: List[str] = ["service_date", "trip_id_performed"]
+
+
+def _parse_service_date(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy of *df* with ``service_date`` parsed, so both tables key alike."""
+    return df.assign(service_date=pd.to_datetime(df["service_date"], errors="coerce"))
+
 
 def load_stop_visits(path: Path) -> pd.DataFrame:
     """Read ``stop_visits`` and parse timestamps + numeric sequence.
@@ -149,9 +158,10 @@ def load_trips_performed(path: Path) -> pd.DataFrame:
 def join_trip_attributes(stop_visits: pd.DataFrame, trips_performed: pd.DataFrame) -> pd.DataFrame:
     """Attach route/direction/block attributes to each stop visit.
 
-    Canceled / non-in-service trips are dropped. Joins on ``trip_id_performed``.
+    Canceled / non-in-service trips are dropped. Joins on ``TRIP_KEY``
+    (``service_date`` + ``trip_id_performed``).
     """
-    trips = trips_performed.copy()
+    trips = _parse_service_date(trips_performed)
     if "schedule_relationship" in trips.columns:
         trips = trips.loc[trips["schedule_relationship"].fillna("Scheduled") != "Canceled"]
     if "trip_type" in trips.columns:
@@ -162,8 +172,8 @@ def join_trip_attributes(stop_visits: pd.DataFrame, trips_performed: pd.DataFram
         for c in ("route_id", "direction_id", "route_type_agency", "block_id")
         if c in trips.columns
     ]
-    trips_small = trips[["trip_id_performed", *attr_cols]].drop_duplicates("trip_id_performed")
-    return stop_visits.merge(trips_small, on="trip_id_performed", how="inner")
+    trips_small = trips[[*TRIP_KEY, *attr_cols]].drop_duplicates(TRIP_KEY)
+    return _parse_service_date(stop_visits).merge(trips_small, on=TRIP_KEY, how="inner")
 
 
 # =============================================================================
@@ -201,10 +211,10 @@ def build_segments(df: pd.DataFrame, timepoints_only: bool = TIMEPOINTS_ONLY) ->
     if timepoints_only and "timepoint" in work.columns:
         work = work.loc[work["timepoint"].astype(str).str.upper() == "TRUE"]
 
-    work = work.sort_values(["trip_id_performed", "trip_stop_sequence"])
+    work = work.sort_values([*TRIP_KEY, "trip_stop_sequence"])
 
     rows: List[Dict[str, object]] = []
-    for trip_id, g in work.groupby("trip_id_performed", sort=False):
+    for (_service_date, trip_id), g in work.groupby(TRIP_KEY, sort=False):
         g = g.reset_index(drop=True)
         if len(g) < 2:
             continue
@@ -250,29 +260,35 @@ def build_segments(df: pd.DataFrame, timepoints_only: bool = TIMEPOINTS_ONLY) ->
 def compute_block_recovery(trips_performed: pd.DataFrame) -> pd.DataFrame:
     """Compute scheduled recovery time after each trip within its block.
 
-    For each ``block_id`` the trips are ordered by scheduled start; the recovery
-    after a trip is the next trip's scheduled start minus this trip's scheduled
-    end. The final trip in a block has no successor and gets NaN.
+    A block runs within one service day, so trips are chained per
+    (``service_date``, ``block_id``) and ordered by scheduled start; the
+    recovery after a trip is the next trip's scheduled start minus this trip's
+    scheduled end. The final trip in a block has no successor and gets NaN
+    (the overnight gap to the next day's block is not recovery).
 
     Args:
         trips_performed: Output of :func:`load_trips_performed` (Canceled rows
             are dropped here).
 
     Returns:
-        DataFrame with ``trip_id_performed`` and ``recovery_after_min``.
+        DataFrame with the ``TRIP_KEY`` columns and ``recovery_after_min``, one
+        row per performed trip.
     """
-    trips = trips_performed.copy()
+    trips = _parse_service_date(trips_performed)
     if "schedule_relationship" in trips.columns:
         trips = trips.loc[trips["schedule_relationship"].fillna("Scheduled") != "Canceled"]
 
     trips = trips.dropna(subset=["schedule_trip_start", "schedule_trip_end"])
-    trips = trips.sort_values(["block_id", "schedule_trip_start"])
+    trips = trips.drop_duplicates(TRIP_KEY)
+    block_key = ["service_date", "block_id"]
+    trips = trips.sort_values([*block_key, "schedule_trip_start"])
 
-    next_start = trips.groupby("block_id")["schedule_trip_start"].shift(-1)
+    next_start = trips.groupby(block_key)["schedule_trip_start"].shift(-1)
     recovery = (next_start - trips["schedule_trip_end"]).dt.total_seconds() / 60.0
 
     return pd.DataFrame(
         {
+            "service_date": trips["service_date"].to_numpy(),
             "trip_id_performed": trips["trip_id_performed"].to_numpy(),
             "recovery_after_min": recovery.to_numpy(),
         }
@@ -336,7 +352,9 @@ def summarize_segments(
     if segments.empty:
         return segments
 
-    seg = segments.merge(recovery, on="trip_id_performed", how="left")
+    seg = _parse_service_date(segments).merge(
+        _parse_service_date(recovery), on=TRIP_KEY, how="left", validate="many_to_one"
+    )
 
     pct_cols = [percentile_column(p) for p in percentiles]
     agg_specs = {

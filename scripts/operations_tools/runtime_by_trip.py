@@ -124,6 +124,15 @@ class Config:
 # LOADING & JOINING
 # =============================================================================
 
+# TIDES identifies a performed trip by (service_date, trip_id_performed): the same
+# trip_id_performed may recur on other dates, so grouping and the join use both.
+TRIP_KEY: List[str] = ["service_date", "trip_id_performed"]
+
+
+def _parse_service_date(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy of *df* with ``service_date`` parsed, so both tables key alike."""
+    return df.assign(service_date=pd.to_datetime(df["service_date"], errors="coerce"))
+
 
 def load_stop_visits(path: Path) -> pd.DataFrame:
     """Read ``stop_visits`` and parse timestamps + numeric sequence."""
@@ -150,41 +159,59 @@ def compute_trip_runtimes(stop_visits: pd.DataFrame) -> pd.DataFrame:
     The running time is the last usable actual arrival minus the first usable
     actual departure on the trip. Skipped stop visits (no actual time) are
     excluded before picking the endpoints, so a trip's runtime spans its first
-    to last *served* stop.
+    to last *served* stop. A trip is grouped by ``TRIP_KEY``, so the same
+    ``trip_id_performed`` on two dates yields two runtimes.
+
+    A trip is omitted (and counted in a warning) unless its arrival endpoint is
+    a later stop than its departure endpoint and arrives after that departure:
+    a single observed stop would otherwise read as a zero (or, with dwell,
+    negative) runtime.
 
     Args:
         stop_visits: Output of :func:`load_stop_visits`.
 
     Returns:
-        DataFrame with one row per ``trip_id_performed`` and columns
-        ``service_date``, ``start_time`` (first actual departure), and
-        ``actual_runtime_min`` (NaN when fewer than two usable stops exist).
+        DataFrame with one row per performed trip (``TRIP_KEY``) and columns
+        ``service_date``, ``trip_id_performed``, ``start_time`` (first actual
+        departure), and ``actual_runtime_min``.
     """
     work = stop_visits
     if "schedule_relationship" in work.columns:
         work = work.loc[work["schedule_relationship"].fillna("Scheduled") != "Skipped"]
     work = work.dropna(subset=["actual_arrival_time", "actual_departure_time"], how="all")
-    work = work.sort_values(["trip_id_performed", "trip_stop_sequence"])
+    work = work.sort_values([*TRIP_KEY, "trip_stop_sequence"])
 
     rows: List[Dict[str, object]] = []
-    for trip_id, g in work.groupby("trip_id_performed", sort=False):
-        deps = g["actual_departure_time"].dropna()
-        arrs = g["actual_arrival_time"].dropna()
-        if deps.empty or arrs.empty:
+    n_unusable = 0
+    for (service_date, trip_id), g in work.groupby(TRIP_KEY, sort=False):
+        dep_pos = np.flatnonzero(g["actual_departure_time"].notna().to_numpy())
+        arr_pos = np.flatnonzero(g["actual_arrival_time"].notna().to_numpy())
+        if not len(dep_pos) or not len(arr_pos) or arr_pos[-1] <= dep_pos[0]:
+            n_unusable += 1
             continue
-        start = deps.iloc[0]
-        end = arrs.iloc[-1]
-        runtime = (end - start).total_seconds() / 60.0
+        start = g["actual_departure_time"].iloc[dep_pos[0]]
+        end = g["actual_arrival_time"].iloc[arr_pos[-1]]
+        if end <= start:
+            n_unusable += 1
+            continue
         rows.append(
             {
                 "trip_id_performed": trip_id,
-                "service_date": g["service_date"].iloc[0],
+                "service_date": service_date,
                 "start_time": start,
-                "actual_runtime_min": runtime,
+                "actual_runtime_min": (end - start).total_seconds() / 60.0,
             }
         )
 
-    return pd.DataFrame(rows)
+    if n_unusable:
+        logging.warning(
+            "%d performed trip(s) lack a departure followed by a later stop's arrival "
+            "(e.g. only one observed stop); no runtime is recorded for them.",
+            n_unusable,
+        )
+    return pd.DataFrame(
+        rows, columns=["trip_id_performed", "service_date", "start_time", "actual_runtime_min"]
+    )
 
 
 def join_trip_attributes(
@@ -192,7 +219,8 @@ def join_trip_attributes(
 ) -> pd.DataFrame:
     """Attach route/direction/scheduled-trip context and a day-of-week column.
 
-    Canceled / non-in-service trips are dropped via the join. Adds:
+    Canceled / non-in-service trips are dropped via the join, which is keyed on
+    ``TRIP_KEY`` (``service_date`` + ``trip_id_performed``). Adds:
     ``route_id``, ``direction_id``, ``trip_id_scheduled``, ``start_hhmm`` (the
     *scheduled* start label, stable across dates, used to order trips), and
     ``dow`` (day name).
@@ -201,7 +229,7 @@ def join_trip_attributes(
     observed departure, so the same recurring trip carries one consistent label
     on every date it ran (the actual departure jitters by seconds day to day).
     """
-    trips = trips_performed.copy()
+    trips = _parse_service_date(trips_performed)
     if "schedule_relationship" in trips.columns:
         trips = trips.loc[trips["schedule_relationship"].fillna("Scheduled") != "Canceled"]
     if "trip_type" in trips.columns:
@@ -218,9 +246,9 @@ def join_trip_attributes(
         )
         if c in trips.columns
     ]
-    trips_small = trips[["trip_id_performed", *attr_cols]].drop_duplicates("trip_id_performed")
+    trips_small = trips[[*TRIP_KEY, *attr_cols]].drop_duplicates(TRIP_KEY)
 
-    merged = trip_runtimes.merge(trips_small, on="trip_id_performed", how="inner")
+    merged = _parse_service_date(trip_runtimes).merge(trips_small, on=TRIP_KEY, how="inner")
     merged["dow"] = merged["service_date"].dt.day_name()
 
     # Prefer the scheduled start for the (stable) label; fall back to actual.

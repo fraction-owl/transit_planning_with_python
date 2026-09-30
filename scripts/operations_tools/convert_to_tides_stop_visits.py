@@ -22,9 +22,13 @@ Key behaviors:
   fallback to Actual Time when needed.
 - Computes `dwell` in seconds when actual arrival and departure are present
   and non-negative; invalid dwell values are left blank and logged.
-- Derives `service_date` from the Date field and extracts `trip_id_performed`
-  from the Trip token (or a stable derived identifier when configured to match
-  a hashed `trips_performed` strategy).
+- Derives `service_date` from the Date field and sets `trip_id_performed` by
+  `TRIP_ID_MODE`, the same rule `convert_to_tides_trips_performed.py` applies:
+  the Trip token, except that a token run by more than one vehicle on a date
+  gets a stable hash of (service_date, trip token, vehicle_id) per vehicle.
+- Shifts a trip whose Timepoint Order starts at 0 up by one as a whole, and
+  warns when a trip repeats a sequence value.
+- Reads every input column as text, so identifiers keep leading zeros.
 - Extracts `stop_id` from Timepoint ID, marks all records as
   `timepoint = True`, and synthesizes `pattern_id` from available route,
   direction, and variation fields.
@@ -68,11 +72,13 @@ OUTPUT_DIR: Path = Path(r"Path\To\Your\Output_Folder")
 OUTPUT_FILENAME: str = "stop_visits.csv"
 OUTPUT_CSV: Path = OUTPUT_DIR / OUTPUT_FILENAME
 
-# Trip ID strategy:
-# - "token": trip_id_performed = second token in Trip field (default)
+# Trip ID strategy. Set the same value as TRIP_ID_MODE in
+# convert_to_tides_trips_performed.py so the two outputs join:
+# - "token": trip_id_performed = second token in Trip field, except that a token
+#   run by more than one vehicle on a service_date gets a stable hash of
+#   (service_date, trip_token, vehicle_id) for each vehicle (default)
 # - "hashed": trip_id_performed = stable hash of (service_date, trip_token, vehicle_id)
-#
-# If you already generate trip_id_performed in trips_performed.csv as a hash, use "hashed" here too.
+#   for every trip
 TRIP_ID_MODE: str = "token"  # "token" | "hashed"
 
 # Map generic field roles to actual column names in your input file.
@@ -261,14 +267,23 @@ def warn_missing_columns(df: pd.DataFrame) -> None:
         logging.warning("Missing optional input columns (will continue): %s", missing_opt)
 
 
-def normalize_timepoint_order(series: pd.Series) -> pd.Series:
+def normalize_timepoint_order(series: pd.Series, trip_key: pd.DataFrame | None = None) -> pd.Series:
     """Parse Timepoint Order as integer-ish sequence.
 
     Policy:
     - If values parse as numeric:
-        - if any are 0, we shift those by +1 and warn (schema expects min 1).
         - if any are < 0, we drop them to NA and warn.
+        - a trip whose smallest value is 0 is zero-based, so its whole
+          sequence is shifted by +1 and we warn (schema expects min 1).
+          Shifting only the zero would collide with the trip's existing 1
+          ([0, 1, 2] -> [1, 1, 2]).
     - If unparseable, NA with warning elsewhere.
+
+    Args:
+        series: Raw Timepoint Order values.
+        trip_key: Columns identifying each trip (e.g. ``service_date`` and
+            ``trip_id_performed``), aligned with *series*. When omitted, the
+            whole series is treated as one trip.
     """
     seq = pd.to_numeric(series, errors="coerce")
 
@@ -281,14 +296,19 @@ def normalize_timepoint_order(series: pd.Series) -> pd.Series:
         )
         seq = seq.mask(neg)
 
-    zeros = seq.notna() & (seq == 0)
-    if zeros.any():
+    if trip_key is None:
+        trip_key = pd.DataFrame({"_trip": 0}, index=seq.index)
+    groups = [trip_key[c] for c in trip_key.columns]
+    zero_based = seq.groupby(groups, dropna=False).transform("min").eq(0)
+    if zero_based.any():
         logging.warning(
-            "Found %d rows with %r == 0; shifting those to 1 (adding +1).",
-            int(zeros.sum()),
+            "Found %d trip(s) whose %r starts at 0; shifting each such trip's "
+            "sequence by +1 (%d rows).",
+            len(trip_key.loc[zero_based].drop_duplicates()),
             COLUMN_MAP["timepoint_order"],
+            int(zero_based.sum()),
         )
-        seq = seq.mask(zeros, 1)
+        seq = seq.mask(zero_based, seq + 1)
 
     # Keep as nullable Int64
     return seq.round(0).astype("Int64")
@@ -337,6 +357,33 @@ def warn_nonconsecutive_sequences(
         )
 
 
+def warn_duplicate_sequences(
+    df_out: pd.DataFrame,
+    *,
+    service_date_col: str = "service_date",
+    trip_id_col: str = "trip_id_performed",
+    seq_col: str = "trip_stop_sequence",
+) -> None:
+    """Warn if a sequence value repeats within (service_date, trip_id_performed).
+
+    The consecutiveness check above looks at distinct values only, so it cannot
+    see a repeated value; a repeat makes stop order within the trip ambiguous.
+    """
+    key_cols = [service_date_col, trip_id_col, seq_col]
+    if df_out.empty or any(c not in df_out.columns for c in key_cols):
+        return
+
+    tmp = df_out[key_cols].dropna(subset=[seq_col])
+    dup = tmp.duplicated(keep=False)
+    if dup.any():
+        logging.warning(
+            "%d trip(s) repeat a %r value (%d rows); stop order within those trips is ambiguous.",
+            len(tmp.loc[dup, [service_date_col, trip_id_col]].drop_duplicates()),
+            seq_col,
+            int(dup.sum()),
+        )
+
+
 # =============================================================================
 # CORE CONVERSION
 # =============================================================================
@@ -352,7 +399,7 @@ def convert_to_tides(df: pd.DataFrame) -> pd.DataFrame:
     # service_date
     out["service_date"] = parse_service_date(df[COLUMN_MAP["date"]])
 
-    # Trip token + vehicle_id (needed for optional hashed ID mode)
+    # Trip token + vehicle_id (both feed trip_id_performed below)
     trip_token = split_trip_token(df[COLUMN_MAP["trip"]])
 
     if COLUMN_MAP["vehicle"] in df.columns:
@@ -366,25 +413,41 @@ def convert_to_tides(df: pd.DataFrame) -> pd.DataFrame:
         logging.warning("TRIP_ID_MODE=%r is invalid; defaulting to 'token'.", TRIP_ID_MODE)
         trip_id_mode = "token"
 
-    if trip_id_mode == "token":
-        out["trip_id_performed"] = trip_token
-    else:
-        # Hash inputs to align with a hashed trips_performed strategy
-        # Note: if your trips_performed hash uses different fields, change this to match exactly.
-        service_date_str = out["service_date"].fillna("").astype("string")
-        trip_tok_str = trip_token.fillna("").astype("string")
-        veh_str = vehicle_id.fillna("").astype("string")
-
-        out["trip_id_performed"] = [
+    # Hash inputs match convert_to_tides_trips_performed.choose_trip_id_performed
+    # exactly; change both together or the two outputs stop joining.
+    hashed = pd.Series(
+        [
             f"perf_{stable_id(str(sd), str(tt), str(vv))}"
-            for sd, tt, vv in zip(service_date_str, trip_tok_str, veh_str)
-        ]
-        out["trip_id_performed"] = pd.Series(
-            out["trip_id_performed"], index=df.index, dtype="string"
-        ).replace({"perf_" + stable_id("", "", ""): pd.NA})
+            for sd, tt, vv in zip(
+                out["service_date"].fillna(""), trip_token.fillna(""), vehicle_id.fillna("")
+            )
+        ],
+        index=df.index,
+        dtype="string",
+    ).replace({"perf_" + stable_id("", "", ""): pd.NA})
+
+    if trip_id_mode == "token":
+        # A token run by more than one vehicle on a date is a split or doubled
+        # trip; hash each vehicle's instance, as the trips_performed converter does.
+        n_vehicles = vehicle_id.groupby([out["service_date"], trip_token], dropna=False).transform(
+            "nunique"
+        )
+        multi = (n_vehicles > 1) & trip_token.notna()
+        if multi.any():
+            logging.warning(
+                "%d rows belong to trip tokens run by more than one vehicle on a "
+                "service_date; used hashed trip_id_performed (service_date, trip token, "
+                "vehicle_id) for those rows.",
+                int(multi.sum()),
+            )
+        out["trip_id_performed"] = trip_token.where(~multi, hashed)
+    else:
+        out["trip_id_performed"] = hashed
 
     # sequences + stop_id
-    seq = normalize_timepoint_order(df[COLUMN_MAP["timepoint_order"]])
+    seq = normalize_timepoint_order(
+        df[COLUMN_MAP["timepoint_order"]], out[["service_date", "trip_id_performed"]]
+    )
     bad_seq = int(seq.isna().sum())
     if bad_seq:
         logging.warning(
@@ -512,6 +575,7 @@ def convert_to_tides(df: pd.DataFrame) -> pd.DataFrame:
 
     # Warn about strict-schema expectations we are knowingly violating / risking
     warn_nonconsecutive_sequences(out)
+    warn_duplicate_sequences(out)
 
     # Minimal sanity warnings
     if out["service_date"].isna().any():
@@ -576,7 +640,9 @@ def main() -> int:
         logging.info("Completed (no data processed — update INPUT_CSV to proceed).")
         return 1
 
-    df = pd.read_csv(INPUT_CSV, low_memory=False)
+    # Read as text: type inference would turn IDs like "00123" into 123 (or
+    # "123.0" in a column with blanks) and break joins to trips_performed.
+    df = pd.read_csv(INPUT_CSV, dtype=str, low_memory=False)
     logging.info("Read %d rows, %d columns", len(df), df.shape[1])
 
     out = convert_to_tides(df)

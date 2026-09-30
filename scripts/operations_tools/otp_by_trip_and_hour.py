@@ -384,6 +384,15 @@ _TRIP_ATTR_COLS: List[str] = [
     "route_type_agency",
 ]
 
+# TIDES identifies a performed trip by (service_date, trip_id_performed): the same
+# trip_id_performed may recur on other dates, so the join and its dedup use both.
+TRIP_KEY: List[str] = ["service_date", "trip_id_performed"]
+
+
+def _parse_service_date(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy of *df* with ``service_date`` parsed, so both tables key alike."""
+    return df.assign(service_date=pd.to_datetime(df["service_date"], errors="coerce"))
+
 
 def join_trip_attributes(
     stop_visits: pd.DataFrame,
@@ -393,11 +402,12 @@ def join_trip_attributes(
 
     Trips that were Canceled (or not in revenue service) in ``trips_performed``
     are dropped, since their stop visits are not meaningful for OTP. The join
-    key is ``trip_id_performed``, unique per performed trip in TIDES.
+    key is ``TRIP_KEY`` (``service_date`` + ``trip_id_performed``), which
+    identifies one performed trip in TIDES.
 
     The inner join discards stop visits for two very different reasons, so they
     are logged apart: a visit whose trip was filtered out above is an intended
-    drop (INFO), while a visit whose ``trip_id_performed`` is absent from
+    drop (INFO), while a visit whose ``TRIP_KEY`` is absent from
     ``trips_performed`` altogether is an orphan (WARNING) -- usually two exports
     covering different date ranges, which silently shrinks the denominator of
     every percentage downstream.
@@ -409,27 +419,29 @@ def join_trip_attributes(
     Returns:
         Stop visits with the ``_TRIP_ATTR_COLS`` attributes joined on.
     """
-    trips = trips_performed.copy()
-    known_trip_ids = set(trips["trip_id_performed"].dropna())
+    stop_visits = _parse_service_date(stop_visits)
+    trips = _parse_service_date(trips_performed)
+    known_trips = trips[TRIP_KEY].drop_duplicates()
     if "schedule_relationship" in trips.columns:
         trips = trips.loc[trips["schedule_relationship"].fillna("Scheduled") != "Canceled"]
     if "trip_type" in trips.columns:
         trips = trips.loc[trips["trip_type"].fillna("In service") == "In service"]
 
     attr_cols = [c for c in _TRIP_ATTR_COLS if c in trips.columns]
-    trips = trips[["trip_id_performed", *attr_cols]].drop_duplicates("trip_id_performed")
+    trips = trips[[*TRIP_KEY, *attr_cols]].drop_duplicates(TRIP_KEY)
 
-    merged = stop_visits.merge(trips, on="trip_id_performed", how="inner")
+    merged = stop_visits.merge(trips, on=TRIP_KEY, how="inner")
 
     # trips is deduplicated on the join key, so the merge is many-to-one and
     # every dropped row is one stop visit -- the two causes therefore add up.
-    n_orphans = int((~stop_visits["trip_id_performed"].isin(known_trip_ids)).sum())
+    matched = stop_visits[TRIP_KEY].merge(known_trips, on=TRIP_KEY, how="left", indicator=True)
+    n_orphans = int((matched["_merge"] == "left_only").sum())
     n_filtered = len(stop_visits) - len(merged) - n_orphans
     if n_orphans:
         logging.warning(
-            "%d of %d stop visits reference a trip_id_performed that is absent from "
-            "trips_performed and were dropped by the join -- check that both exports "
-            "cover the same date range.",
+            "%d of %d stop visits reference a (service_date, trip_id_performed) pair "
+            "that is absent from trips_performed and were dropped by the join -- check "
+            "that both exports cover the same date range.",
             n_orphans,
             len(stop_visits),
         )

@@ -33,6 +33,30 @@ def test_join_adds_route_and_trip_key(joined: pd.DataFrame) -> None:
     assert set(joined["route_id"].unique()) <= {"101", "202", "303"}
 
 
+def test_runtimes_are_per_service_date_for_a_reused_trip_id() -> None:
+    """Two daily 20-minute runs of T1 are two runtimes; a lone stop is none."""
+    dates = ["2025-01-06", "2025-01-06", "2025-01-07", "2025-01-07", "2025-01-08"]
+    times = ["06:00", "06:20", "06:00", "06:20", "06:00"]
+    sv = pd.DataFrame(
+        {
+            "service_date": pd.to_datetime(dates),
+            "trip_id_performed": ["T1"] * 5,
+            "trip_stop_sequence": [1, 2, 1, 2, 1],
+            "actual_arrival_time": pd.to_datetime([f"{d} {t}" for d, t in zip(dates, times)]),
+            "actual_departure_time": pd.to_datetime([f"{d} {t}" for d, t in zip(dates, times)]),
+        }
+    )
+    trips = pd.DataFrame(
+        {
+            "service_date": ["2025-01-06", "2025-01-07", "2025-01-08"],
+            "trip_id_performed": ["T1"] * 3,
+            "route_id": ["101"] * 3,
+        }
+    )
+    joined = target.join_route_attributes(target.compute_trip_runtimes(sv), trips)
+    assert joined["actual_runtime_min"].tolist() == [20.0, 20.0]
+
+
 def test_aggregate_route_month_schema(joined: pd.DataFrame) -> None:
     """Panel is one row per (route, month) with the runtime statistics."""
     panel = target.aggregate_route_month(target.add_month(joined))

@@ -92,12 +92,14 @@ def test_join_trip_attributes_separates_orphans_from_filtered_trips(
     """Orphan visits warn; trips filtered out as non-revenue only inform."""
     stop_visits = pd.DataFrame(
         {
+            "service_date": ["2025-01-06"] * 3,
             "trip_id_performed": ["TP1", "TP2", "TP_MISSING"],
             "trip_stop_sequence": ["1", "1", "1"],
         }
     )
     trips_performed = pd.DataFrame(
         {
+            "service_date": ["2025-01-06"] * 2,
             "trip_id_performed": ["TP1", "TP2"],
             "trip_type": ["In service", "Deadhead"],
             "route_id": ["101", "101"],
@@ -123,15 +125,46 @@ def test_join_trip_attributes_is_quiet_when_nothing_is_dropped(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A clean join logs no drop diagnostics at all."""
-    stop_visits = pd.DataFrame({"trip_id_performed": ["TP1", "TP2"]})
+    stop_visits = pd.DataFrame(
+        {"service_date": ["2025-01-06"] * 2, "trip_id_performed": ["TP1", "TP2"]}
+    )
     trips_performed = pd.DataFrame(
-        {"trip_id_performed": ["TP1", "TP2"], "route_id": ["101", "202"]}
+        {
+            "service_date": ["2025-01-06"] * 2,
+            "trip_id_performed": ["TP1", "TP2"],
+            "route_id": ["101", "202"],
+        }
     )
     with caplog.at_level("INFO"):
         merged = target.join_trip_attributes(stop_visits, trips_performed)
 
     assert len(merged) == 2
     assert not caplog.records
+
+
+def test_join_trip_attributes_keys_on_service_date(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A trip ID canceled on one date drops that date's visits, not the other's."""
+    stop_visits = pd.DataFrame(
+        {
+            "service_date": ["2025-01-06", "2025-01-07", "2025-01-08"],
+            "trip_id_performed": ["TP1", "TP1", "TP1"],
+        }
+    )
+    trips_performed = pd.DataFrame(
+        {
+            "service_date": ["2025-01-06", "2025-01-07"],
+            "trip_id_performed": ["TP1", "TP1"],
+            "schedule_relationship": ["Scheduled", "Canceled"],
+        }
+    )
+    with caplog.at_level("INFO"):
+        merged = target.join_trip_attributes(stop_visits, trips_performed)
+
+    assert merged["service_date"].tolist() == [pd.Timestamp("2025-01-06")]
+    # 01-08 has no trips_performed row for TP1 on that date: an orphan.
+    assert "1 of 3 stop visits" in caplog.text
 
 
 # =============================================================================

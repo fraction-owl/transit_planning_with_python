@@ -17,8 +17,12 @@ Key behaviors:
 - Extracts `route_id` from the human-readable Route field by taking the token to
   the left of "-" and trimming whitespace (e.g., "301 - Telegraph Rd" -> "301").
 - Preserves the source TripID as `trip_id_scheduled` when it matches the GTFS
-  `trip_id`. `trip_id_performed` is chosen to remain unique within `service_date`
-  (using the scheduled trip id when safe, otherwise a stable derived identifier).
+  `trip_id`. `trip_id_performed` follows `TRIP_ID_MODE`, the same rule
+  `convert_to_tides_stop_visits.py` applies, so the two outputs join: the TripID
+  itself, except that a TripID run by more than one vehicle on a `service_date`
+  gets a stable hash of (service_date, TripID, vehicle_id) per vehicle.
+- Reads every input column as text, so identifiers keep leading zeros
+  (e.g. "00123") and never pick up a float suffix (e.g. "123.0").
 - Optionally filters to a single Trip Type (e.g., "Revenue"). When enabled, the
   module logs how many rows were removed by each other trip type.
 - Maps source Trip Type values into the schema-constrained TIDES `trip_type`
@@ -63,6 +67,15 @@ OUTPUT_CSV: Path = OUTPUT_DIR / OUTPUT_FILENAME
 # If set (e.g., "Revenue"), keeps only Trip Type == this value.
 # If None/blank, keeps everything and logs nothing about filtering.
 KEEP_TRIP_TYPE: str | None = "Revenue"
+
+# Trip ID strategy. Set the same value as TRIP_ID_MODE in
+# convert_to_tides_stop_visits.py so the two outputs join:
+# - "token": trip_id_performed = TripID, except that a TripID run by more than one
+#   vehicle on a service_date gets a stable hash of (service_date, TripID,
+#   vehicle_id) for each vehicle (default)
+# - "hashed": trip_id_performed = stable hash of (service_date, TripID, vehicle_id)
+#   for every trip
+TRIP_ID_MODE: str = "token"  # "token" | "hashed"
 
 # Map generic field roles to actual column names in your input file.
 # Defaults are set for CLEVER "Event Runtime Analysis" exports.
@@ -253,39 +266,39 @@ def choose_trip_id_performed(
     service_date: pd.Series,
     trip_id_scheduled: pd.Series,
     vehicle_id: pd.Series,
-    best_start_dt: pd.Series,
+    *,
+    mode: str = "token",
 ) -> tuple[pd.Series, int]:
-    """Use GTFS trip_id as trip_id_performed when unique within service_date; else hash.
+    """Assign trip_id_performed using the rule shared with the stop visit converter.
+
+    A (service_date, trip ID) pair run by more than one vehicle is a split or
+    doubled trip; each vehicle's instance gets ``perf_`` + a stable hash of
+    (service_date, trip ID, vehicle_id). Those three fields exist in both AVL
+    exports, so ``convert_to_tides_stop_visits.py`` derives identical IDs. In
+    ``"token"`` mode every other trip keeps its trip ID; ``"hashed"`` mode hashes
+    every trip.
 
     Returns:
-        (trip_id_performed_series, n_dupe_rows)
+        (trip_id_performed_series, n_rows_in_multi_vehicle_trips)
     """
-    base = pd.DataFrame(
-        {
-            "service_date": service_date.astype("string"),
-            "trip_id_scheduled": trip_id_scheduled.astype("string"),
-        }
-    )
+    sd = service_date.astype("string")
+    tid = trip_id_scheduled.astype("string")
+    veh = vehicle_id.astype("string")
 
-    dup = base.duplicated(keep=False) & trip_id_scheduled.notna()
+    n_vehicles = veh.groupby([sd, tid], dropna=False).transform("nunique")
+    multi = (n_vehicles > 1) & tid.notna()
 
-    best_start_str = best_start_dt.astype("datetime64[ns]").astype("string").fillna("")
     hashed = pd.Series(
         [
-            f"perf_{stable_id(str(sd), str(tid), str(veh), str(bs))}"
-            for sd, tid, veh, bs in zip(
-                service_date.fillna(""),
-                trip_id_scheduled.fillna(""),
-                vehicle_id.fillna(""),
-                best_start_str,
-            )
+            f"perf_{stable_id(str(s), str(t), str(v))}"
+            for s, t, v in zip(sd.fillna(""), tid.fillna(""), veh.fillna(""))
         ],
         index=service_date.index,
         dtype="string",
     )
 
-    perf = trip_id_scheduled.where(~dup, other=hashed)
-    return perf, int(dup.sum())
+    perf = hashed if mode == "hashed" else tid.where(~multi, other=hashed)
+    return perf, int(multi.sum())
 
 
 # =============================================================================
@@ -388,17 +401,28 @@ def convert_to_tides(df: pd.DataFrame) -> pd.DataFrame:
     )
 
     # Per schema: trip_id_performed must be unique within service_date
-    out["trip_id_performed"], n_dupe_rows = choose_trip_id_performed(
+    trip_id_mode = str(TRIP_ID_MODE).strip().lower()
+    if trip_id_mode not in {"token", "hashed"}:
+        logging.warning("TRIP_ID_MODE=%r is invalid; defaulting to 'token'.", TRIP_ID_MODE)
+        trip_id_mode = "token"
+    out["trip_id_performed"], n_multi_rows = choose_trip_id_performed(
         out["service_date"],
         out["trip_id_scheduled"],
         out["vehicle_id"],
-        best_start_dt,
+        mode=trip_id_mode,
     )
-    if n_dupe_rows:
+    if n_multi_rows and trip_id_mode == "token":
         logging.warning(
-            "trip_id_scheduled duplicates within service_date for %d rows; "
-            "used hashed trip_id_performed for those rows.",
-            n_dupe_rows,
+            "%d rows belong to TripIDs run by more than one vehicle on a service_date; "
+            "used hashed trip_id_performed (service_date, TripID, vehicle_id) for those rows.",
+            n_multi_rows,
+        )
+    n_repeat = int(out.duplicated(["service_date", "trip_id_performed"], keep=False).sum())
+    if n_repeat:
+        logging.warning(
+            "%d rows repeat a service_date, TripID, and vehicle, so they share a "
+            "trip_id_performed (likely duplicate export rows).",
+            n_repeat,
         )
 
     # Optional schema fields we can populate
@@ -505,7 +529,9 @@ def main() -> int:
         logging.info("Completed (no data processed — update INPUT_CSV to proceed).")
         return 1
 
-    df = pd.read_csv(INPUT_CSV, low_memory=False)
+    # Read as text: type inference would turn TripID "00123" into 123 (or "123.0"
+    # in a column with blanks) and break joins to the stop visit export.
+    df = pd.read_csv(INPUT_CSV, dtype=str, low_memory=False)
     logging.info("Read %d rows, %d columns", len(df), df.shape[1])
 
     out = convert_to_tides(df)

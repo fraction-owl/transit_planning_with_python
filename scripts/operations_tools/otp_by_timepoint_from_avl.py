@@ -8,10 +8,10 @@ export.
 Core steps
 ----------
 - Normalize key fields (Short Route, Direction, Variation, Timepoint Order).
-- Construct a canonical Year-Month (YYYY-MM) field:
-  - Prefer an existing YYYY-MM column if present.
-  - Otherwise derive from Date where parseable, and optionally backfill using Month when the year
-    can be inferred from other dated rows.
+- Construct a canonical Year-Month (YYYY-MM) field, row by row:
+  - Prefer an existing YYYY-MM column where it is populated.
+  - Otherwise derive from Date where parseable, and backfill remaining rows using Month when
+    the other dated rows show that month in exactly one year.
 - Aggregate to monthly totals per stop (Timepoint Order) and recompute OTP, early, and late
   percentages from the aggregated counts.
 - Generate per-variation outputs:
@@ -381,129 +381,69 @@ def month_name_to_number(value: str) -> int | None:
 def add_year_month_column(df: pd.DataFrame) -> pd.DataFrame:
     """Add a stable monthly grain column 'Year-Month' (string 'YYYY-MM').
 
-    Preference order:
-      1) Existing 'Year-Month' / 'YearMonth' / 'YYYY-MM' (already in YYYY-MM)
-      2) Parseable 'Date' → Year-Month
-      3) If Date is sparse but Month exists, fill Year-Month for missing-date rows by:
-         - inferring the year per Month from the rows that *do* have Date values
+    Each row takes its month from the first source that has one:
+      1) An existing 'Year-Month' / 'YearMonth' / 'YYYY-MM' value (already in YYYY-MM)
+      2) A parseable 'Date' → Year-Month
+      3) 'Month' plus a year inferred from the rows that already have a month --
+         only when those rows show that month in exactly one year
 
-    If the script cannot construct Year-Month safely, it fails loudly.
+    If any row is still without a month, the script fails loudly rather than
+    guessing a year.
     """
+    ym = pd.Series(pd.NA, index=df.index, dtype="string")
+
     candidates = ["Year-Month", "YearMonth", "YYYY-MM", "year_month", "yearmonth"]
     for c in candidates:
         if c in df.columns:
-            ym = df[c].astype("string").fillna("").str.strip()
-            if (ym != "").any():
-                parsed = ym.map(lambda s: parse_month_yyyy_mm(str(s)) if s else pd.NaT)
-                if parsed.isna().all():
-                    sys.exit(
-                        f"ERROR: Found {c!r} but none of its values parse as 'YYYY-MM'. "
-                        "Fix the export."
-                    )
-                df["Year-Month"] = parsed.astype("period[M]").astype(str)
-                return df
+            raw = df[c].astype("string").str.strip()
+            raw = raw.mask(raw.isin(["", "NaT", "nan", "<NA>"]))
+            if raw.notna().any():
+                ym = raw.map(
+                    lambda s: str(parse_month_yyyy_mm(s)) if pd.notna(s) else pd.NA
+                ).astype("string")
+                break
 
-    date_parsed = None
-    if "Date" in df.columns:
+    if "Date" in df.columns and ym.isna().any():
         date_parsed = pd.to_datetime(df["Date"], errors="coerce")
-        if date_parsed.notna().any():
-            df["Year-Month"] = date_parsed.dt.to_period("M").astype(str)
-        else:
-            date_parsed = None
+        ym = ym.fillna(date_parsed.dt.strftime("%Y-%m").astype("string"))
 
-    # If Year-Month created and contains only real months, we're done.
-    if "Year-Month" in df.columns and (df["Year-Month"] != "NaT").any():
-        # But we may have many NaT rows; try to fill using Month if available.
-        pass
-    else:
-        # No usable Date-derived Year-Month; try Month-based (requires some year source).
-        df["Year-Month"] = "NaT"
+    missing = ym.isna()
+    no_year: List[int] = []
+    many_years: List[int] = []
+    if missing.any() and "Month" in df.columns:
+        years_by_month: Dict[int, set] = {}
+        for period in ym.dropna().map(parse_month_yyyy_mm).unique():
+            years_by_month.setdefault(int(period.month), set()).add(int(period.year))
 
-    if "Month" not in df.columns:
+        month_num = df.loc[missing, "Month"].map(month_name_to_number)
+        for idx, mnum in month_num.items():
+            if mnum is None or pd.isna(mnum):
+                continue
+            years = years_by_month.get(int(mnum), set())
+            if len(years) == 1:
+                ym.loc[idx] = f"{next(iter(years)):04d}-{int(mnum):02d}"
+            elif years:
+                many_years.append(int(mnum))
+            else:
+                no_year.append(int(mnum))
+
+    unresolved = ym.isna()
+    if unresolved.any():
+        cols = [c for c in ("Date", "Month", "Route", "Direction", "Variation") if c in df.columns]
+        bad = df.loc[unresolved, cols].head(10)
+        detail = ""
+        if no_year:
+            detail += f" Month(s) with no dated row to take a year from: {sorted(set(no_year))}."
+        if many_years:
+            detail += f" Month(s) seen in more than one year: {sorted(set(many_years))}."
         sys.exit(
-            "ERROR: Could not derive 'Year-Month'. Provide a YYYY-MM field (recommended) or "
-            "a usable 'Date' column, or include 'Month' plus at least one dated row per month."
-        )
-
-    # Attempt fill for missing Year-Month using Month + inferred year per month.
-    # Step 1: Build a Month→Year lookup from rows that have a real Year-Month already.
-    has_ym = df["Year-Month"].astype(str).ne("NaT")
-    if not has_ym.any():
-        sys.exit(
-            "ERROR: Could not derive any Year-Month from Date. Add a 'Year-Month' column "
-            "(YYYY-MM) to the export, or ensure Date is populated for at least some rows."
-        )
-
-    # Map Month tokens to month number
-    month_num = (
-        df["Month"].map(month_name_to_number)
-        if "Month" in df.columns
-        else pd.Series([None] * len(df), index=df.index)
-    )
-
-    # Extract year + month number from existing Year-Month
-    ym_period = df.loc[has_ym, "Year-Month"].map(lambda s: parse_month_yyyy_mm(str(s)))
-    ym_year = ym_period.map(lambda p: int(p.year))
-    ym_mon = ym_period.map(lambda p: int(p.month))
-
-    ref = pd.DataFrame(
-        {
-            "MonthNum": month_num.loc[has_ym].astype("Int64"),
-            "Year": ym_year.astype("Int64"),
-            "Mon": ym_mon.astype("Int64"),
-        }
-    ).dropna()
-
-    if ref.empty:
-        sys.exit(
-            "ERROR: Year-Month exists but cannot be interpreted to backfill missing months. "
-            "Add a proper YYYY-MM field upstream."
-        )
-
-    # Prefer year inferred from matching month number (Month column) where possible;
-    # else fall back to most common year.
-    most_common_year = int(ref["Year"].mode().iloc[0])
-
-    month_to_year: Dict[int, int] = {}
-    for m in sorted(ref["Mon"].unique()):
-        # use the most common year observed for that month number
-        y_mode = ref.loc[ref["Mon"] == m, "Year"].mode()
-        if not y_mode.empty:
-            month_to_year[int(m)] = int(y_mode.iloc[0])
-
-    # Fill missing Year-Month where MonthNum is known
-    missing_ym = df["Year-Month"].astype(str).eq("NaT")
-    fill_monthnum = month_num.astype("Int64")
-
-    fill_vals: List[str] = []
-    for idx in df.index:
-        if not missing_ym.loc[idx]:
-            fill_vals.append(str(df.loc[idx, "Year-Month"]))
-            continue
-
-        mnum = fill_monthnum.loc[idx]
-        if pd.isna(mnum):
-            fill_vals.append("NaT")
-            continue
-
-        year = month_to_year.get(int(mnum), most_common_year)
-        fill_vals.append(f"{year:04d}-{int(mnum):02d}")
-
-    df["Year-Month"] = pd.Series(fill_vals, index=df.index)
-
-    # Final validation: any remaining NaT means we could not safely assign.
-    if df["Year-Month"].astype(str).eq("NaT").any():
-        bad_mask = df["Year-Month"].astype(str).eq("NaT")
-        bad = df.loc[bad_mask, ["Month", "Route", "Direction", "Variation"]].head(10)
-        sys.exit(
-            "ERROR: Could not infer Year-Month for some rows "
-            "(missing Month and missing Date-derived month). "
-            "Fix the export. Examples:\n"
+            f"ERROR: Could not assign a Year-Month to {int(unresolved.sum())} row(s): no "
+            "YYYY-MM value, no parseable Date, and no Month whose year is unambiguous."
+            f"{detail} Add a YYYY-MM field (recommended) or fix the export. Examples:\n"
             f"{bad.to_string(index=False)}"
         )
 
-    # Canonicalize to YYYY-MM by parsing
-    df["Year-Month"] = df["Year-Month"].map(lambda s: str(parse_month_yyyy_mm(str(s))))
+    df["Year-Month"] = ym.astype(str)
     return df
 
 
