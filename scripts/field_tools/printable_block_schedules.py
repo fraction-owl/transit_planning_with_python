@@ -21,7 +21,9 @@ Key Features
 ------------
 - Loads GTFS text files into ``pandas`` DataFrames with robust error handling.
 - Converts ``HH:MM(:SS)`` time strings to seconds (and back) safely.
-- Applies ergonomic Excel formatting via ``openpyxl`` (column widths, wrapping).
+- Applies ergonomic Excel formatting via ``openpyxl`` (column widths, wrapping)
+  and a print layout that fits every column on one page width (11 x 17
+  landscape by default).
 - Inserts placeholders for handwritten field notes (actual time, boardings, etc.).
 - Widens the Comments column and shades timepoint rows for easier field use.
 - Names each file by block, routes, time span and calendar for easy sorting by hand.
@@ -40,6 +42,7 @@ from typing import Any, Optional, Union
 import pandas as pd
 from openpyxl.styles import Alignment, PatternFill
 from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.properties import PageSetupProperties
 
 # =============================================================================
 # CONFIGURATION
@@ -84,6 +87,11 @@ COMMENTS_COLUMN_WIDTH: int = 60
 # Fill color (hex RGB) for timepoint rows when listing all stops; "" = no highlight.
 # Light gray stays visible on black-and-white printers.
 TIMEPOINT_HIGHLIGHT_COLOR: str = "D9D9D9"
+
+# Print layout saved in each workbook; all columns are scaled to fit one page wide.
+# Excel paper size codes: 1 = Letter, 3 = Tabloid (11 x 17), 5 = Legal.
+PRINT_PAPER_SIZE: int = 3
+PRINT_LANDSCAPE: bool = True
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
 
@@ -141,17 +149,39 @@ def format_hhmm(total_seconds: Union[int, float]) -> str:
 # -----------------------------------------------------------------------------
 
 
+def header_width(header: str) -> int:
+    """Return the shortest line length that fits *header* on at most two lines.
+
+    Args:
+        header: Column header text; it may wrap only between words.
+
+    Returns:
+        Characters in the longer line of the best two-line split (e.g. 10 for
+        ``"Trip Start Time"`` → ``"Trip Start"`` / ``"Time"``), or the full
+        length for a one-word header.
+    """
+    words = str(header).split()
+    if len(words) < 2:
+        return len(str(header))
+    return min(
+        max(len(" ".join(words[:i])), len(" ".join(words[i:]))) for i in range(1, len(words))
+    )
+
+
 def export_to_excel(data_frame: pd.DataFrame, output_file: str) -> None:
     """Write *data_frame* to an Excel file with basic styling.
 
     The sheet is named **Schedule** and receives:
 
     * Left-aligned cells.
-    * Word-wrapped headers.
-    * Column widths sized to longest cell (capped by ``MAX_COLUMN_WIDTH``),
+    * Headers wrapped onto up to two lines, so columns are as narrow as their
+      data allows (see :pyfunc:`header_width`).
+    * Column widths sized to the longest value (capped by ``MAX_COLUMN_WIDTH``),
       except **Comments**, which is set to ``COMMENTS_COLUMN_WIDTH``.
     * Rows with ``Timepoint == 1`` filled with ``TIMEPOINT_HIGHLIGHT_COLOR``
       (skipped when ``TIMEPOINTS_ONLY`` is set, since every row qualifies).
+    * A print layout of ``PRINT_PAPER_SIZE`` / ``PRINT_LANDSCAPE`` with all
+      columns fitted to one page wide and the header row repeated on every page.
 
     Args:
         data_frame: Tidy table to export; must be non-empty.
@@ -185,8 +215,8 @@ def export_to_excel(data_frame: pd.DataFrame, output_file: str) -> None:
                 cell = worksheet[f"{col_letter}{row_i}"]
                 cell.alignment = Alignment(horizontal="left")
 
-            # Set column width based on max content length, capped at MAX_COLUMN_WIDTH
-            max_len = max(len(str(col_name)), 10)  # Minimum width
+            # Size to the longest value (header may wrap), capped at MAX_COLUMN_WIDTH
+            max_len = header_width(col_name)
             for row_i in range(2, worksheet.max_row + 1):
                 val = worksheet[f"{col_letter}{row_i}"].value
                 if val is not None:
@@ -204,6 +234,17 @@ def export_to_excel(data_frame: pd.DataFrame, output_file: str) -> None:
                 if flag:
                     for cell in worksheet[pos + 2]:
                         cell.fill = timepoint_fill
+
+        # Two-line header row (15 pt per line of the default 11 pt font)
+        worksheet.row_dimensions[1].height = 30
+
+        # Print layout: one page wide, as many pages tall as needed, header on every page
+        worksheet.page_setup.paperSize = PRINT_PAPER_SIZE
+        worksheet.page_setup.orientation = "landscape" if PRINT_LANDSCAPE else "portrait"
+        worksheet.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
+        worksheet.page_setup.fitToWidth = 1
+        worksheet.page_setup.fitToHeight = 0
+        worksheet.print_title_rows = "1:1"
 
     logging.info("Exported: %s", output_file)
 

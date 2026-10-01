@@ -17,6 +17,7 @@ from scripts.field_tools.printable_block_schedules import (
     export_to_excel,
     filter_data,
     format_hhmm,
+    header_width,
     load_gtfs_data,
     main,
     prepare_stop_times,
@@ -648,3 +649,37 @@ def test_main_timepoints_only_without_timepoints_returns_1(tmp_path: Path) -> No
     ):
         assert main() == 1
     assert not list(tmp_path.glob("*.xlsx"))
+
+
+@pytest.mark.parametrize(
+    ("header", "width"),
+    [("Trip Start Time", 10), ("Stop Sequence", 8), ("Block ID", 5), ("Timepoint", 9)],
+)
+def test_header_width_is_longest_line_of_best_two_line_split(header: str, width: int) -> None:
+    assert header_width(header) == width
+
+
+def test_export_to_excel_sizes_columns_to_data_not_header(tmp_path: Path) -> None:
+    out = tmp_path / "schedule.xlsx"
+    df = pd.DataFrame({"Trip Start Time": ["07:00"], "Stop ID": ["1234"], "Stop Name": ["X" * 20]})
+    export_to_excel(df, str(out))
+    ws = load_workbook(out)["Schedule"]
+    widths = [ws.column_dimensions[col].width for col in ("A", "B", "C")]
+    assert widths == [12, 6, 22]  # header_width 10 + 2, data 4 + 2, data 20 + 2
+    assert ws.row_dimensions[1].height == 30
+
+
+def test_export_to_excel_sets_print_layout(tmp_path: Path) -> None:
+    out = tmp_path / "schedule.xlsx"
+    with (
+        patch(f"{_MODULE}.PRINT_PAPER_SIZE", 3),
+        patch(f"{_MODULE}.PRINT_LANDSCAPE", True),
+    ):
+        export_to_excel(_make_formatted_df(), str(out))
+    ws = load_workbook(out)["Schedule"]
+    assert ws.page_setup.paperSize == 3
+    assert ws.page_setup.orientation == "landscape"
+    assert ws.sheet_properties.pageSetUpPr.fitToPage is True
+    assert ws.page_setup.fitToWidth == 1
+    assert ws.page_setup.fitToHeight == 0
+    assert ws.print_title_rows == "$1:$1"
