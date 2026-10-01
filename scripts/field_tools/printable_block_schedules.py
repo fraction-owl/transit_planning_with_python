@@ -9,7 +9,8 @@ Outputs
 -------
 - ``block_<block_id>_schedule_printable.xlsx`` (one per surviving block, written
   to ``BASE_OUTPUT_PATH``): the block's stop-by-stop schedule with placeholder
-  columns for handwritten field notes.
+  columns for handwritten field notes. Set ``TIMEPOINTS_ONLY`` to list only
+  timepoint stops; otherwise all stops are listed and timepoint rows are shaded.
 
 Typical usage
 -------------
@@ -21,6 +22,7 @@ Key Features
 - Converts ``HH:MM(:SS)`` time strings to seconds (and back) safely.
 - Applies ergonomic Excel formatting via ``openpyxl`` (column widths, wrapping).
 - Inserts placeholders for handwritten field notes (actual time, boardings, etc.).
+- Widens the Comments column and shades timepoint rows for easier field use.
 """
 
 from __future__ import annotations
@@ -33,7 +35,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any, Optional, Union
 
 import pandas as pd
-from openpyxl.styles import Alignment
+from openpyxl.styles import Alignment, PatternFill
 from openpyxl.utils import get_column_letter
 
 # =============================================================================
@@ -58,12 +60,22 @@ REQUIRED_GTFS_FILES = [
 FILTER_SERVICE_IDS: list[str] = []  # e.g. ["WKD", "SAT"]
 FILTER_ROUTE_SHORT_NAMES: list[str] = []  # e.g. ["101", "202"]
 
+# Stops to list on each block sheet:
+TIMEPOINTS_ONLY: bool = False  # True → timepoint stops only; False → all stops
+
 # Placeholder values for printing:
 MISSING_TIME = "________"
 MISSING_VALUE = "_____"
 
 # Maximum column width for neat Excel formatting:
 MAX_COLUMN_WIDTH = 35
+
+# Width of the Comments column (not capped by MAX_COLUMN_WIDTH), for handwritten notes:
+COMMENTS_COLUMN_WIDTH: int = 60
+
+# Fill color (hex RGB) for timepoint rows when listing all stops; "" = no highlight.
+# Light gray stays visible on black-and-white printers.
+TIMEPOINT_HIGHLIGHT_COLOR: str = "D9D9D9"
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
 
@@ -128,7 +140,10 @@ def export_to_excel(data_frame: pd.DataFrame, output_file: str) -> None:
 
     * Left-aligned cells.
     * Word-wrapped headers.
-    * Column widths sized to longest cell (capped by ``MAX_COLUMN_WIDTH``).
+    * Column widths sized to longest cell (capped by ``MAX_COLUMN_WIDTH``),
+      except **Comments**, which is set to ``COMMENTS_COLUMN_WIDTH``.
+    * Rows with ``Timepoint == 1`` filled with ``TIMEPOINT_HIGHLIGHT_COLOR``
+      (skipped when ``TIMEPOINTS_ONLY`` is set, since every row qualifies).
 
     Args:
         data_frame: Tidy table to export; must be non-empty.
@@ -168,7 +183,19 @@ def export_to_excel(data_frame: pd.DataFrame, output_file: str) -> None:
                 val = worksheet[f"{col_letter}{row_i}"].value
                 if val is not None:
                     max_len = max(max_len, len(str(val)))
-            worksheet.column_dimensions[col_letter].width = min(max_len + 2, MAX_COLUMN_WIDTH)
+            width = min(max_len + 2, MAX_COLUMN_WIDTH)
+            if col_name == "Comments":
+                width = COMMENTS_COLUMN_WIDTH
+            worksheet.column_dimensions[col_letter].width = width
+
+        # Shade timepoint rows (row 1 is the header, so data row N is at N + 2)
+        if TIMEPOINT_HIGHLIGHT_COLOR and not TIMEPOINTS_ONLY and "Timepoint" in data_frame.columns:
+            timepoint_fill = PatternFill("solid", fgColor=TIMEPOINT_HIGHLIGHT_COLOR)
+            is_timepoint = (data_frame["Timepoint"] == 1).tolist()
+            for pos, flag in enumerate(is_timepoint):
+                if flag:
+                    for cell in worksheet[pos + 2]:
+                        cell.fill = timepoint_fill
 
     logging.info("Exported: %s", output_file)
 
@@ -284,7 +311,9 @@ def export_blocks(stop_times_df: pd.DataFrame) -> None:
 
     Side Effects:
         Writes ``block_<id>_schedule_printable.xlsx`` to
-        ``BASE_OUTPUT_PATH``; creates the folder tree if needed.
+        ``BASE_OUTPUT_PATH``; creates the folder tree if needed. When
+        ``TIMEPOINTS_ONLY`` is set, only rows with ``timepoint == 1`` are
+        written, and blocks with no timepoint stops are skipped.
     """
     all_blocks = stop_times_df["block_id"].unique()
     logging.info("Found %d blocks to export.\n", len(all_blocks))
@@ -306,6 +335,13 @@ def export_blocks(stop_times_df: pd.DataFrame) -> None:
         block_subset = block_subset.merge(first_departures, on="trip_id", how="left")
 
         block_subset["Trip Start Time"] = block_subset["trip_start_hhmm"]
+
+        # Filter after computing trip start times so they still reflect the first stop
+        if TIMEPOINTS_ONLY:
+            block_subset = block_subset[block_subset["timepoint"] == 1]
+            if block_subset.empty:
+                logging.info("Block %s has no timepoint stops – skipped.", block_id)
+                continue
 
         # Select and rename columns for clarity
         out_cols = [
@@ -551,6 +587,8 @@ def main() -> int:
         logging.info("Filtering for Routes: %s", FILTER_ROUTE_SHORT_NAMES)
     if FILTER_SERVICE_IDS:
         logging.info("Filtering for Service IDs: %s", FILTER_SERVICE_IDS)
+    if TIMEPOINTS_ONLY:
+        logging.info("Listing timepoint stops only.")
 
     try:
         gtfs_data = load_gtfs_data(
@@ -572,6 +610,12 @@ def main() -> int:
         prepared = prepare_stop_times(trips_df, stop_times_df, stops_df)
         if prepared.empty:
             logging.warning("No data remains after preparation – no files generated.")
+            return 1
+        if TIMEPOINTS_ONLY and not (prepared["timepoint"] == 1).any():
+            logging.warning(
+                "TIMEPOINTS_ONLY is True but no stops have timepoint = 1 in stop_times.txt "
+                "– no files generated. Set TIMEPOINTS_ONLY = False to list all stops."
+            )
             return 1
 
         export_blocks(prepared)

@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 import pandas as pd
 import pytest
+from openpyxl import load_workbook
 
 from scripts.field_tools.printable_block_schedules import (
     export_blocks,
@@ -14,6 +15,7 @@ from scripts.field_tools.printable_block_schedules import (
     filter_data,
     format_hhmm,
     load_gtfs_data,
+    main,
     prepare_stop_times,
     time_to_seconds,
 )
@@ -380,3 +382,136 @@ def test_export_blocks_output_includes_placeholder_columns(tmp_path: Path) -> No
     result = pd.read_excel(tmp_path / "block_B1_schedule_printable.xlsx")
     for col in ("Actual Time", "Boardings", "Alightings", "Comments"):
         assert col in result.columns
+
+
+def test_export_blocks_all_stops_by_default(tmp_path: Path) -> None:
+    with (
+        patch(f"{_MODULE}.BASE_OUTPUT_PATH", str(tmp_path)),
+        patch(f"{_MODULE}.TIMEPOINTS_ONLY", False),
+    ):
+        export_blocks(_make_block_df())
+    result = pd.read_excel(tmp_path / "block_B1_schedule_printable.xlsx")
+    assert len(result) == 2
+
+
+def test_export_blocks_timepoints_only_drops_non_timepoints(tmp_path: Path) -> None:
+    df = _make_block_df()
+    df["timepoint"] = [1, 0, 1]
+    with (
+        patch(f"{_MODULE}.BASE_OUTPUT_PATH", str(tmp_path)),
+        patch(f"{_MODULE}.TIMEPOINTS_ONLY", True),
+    ):
+        export_blocks(df)
+    result = pd.read_excel(tmp_path / "block_B1_schedule_printable.xlsx", dtype=str)
+    assert result["Stop ID"].tolist() == ["S1"]
+
+
+def test_export_blocks_timepoints_only_keeps_trip_start_from_first_stop(tmp_path: Path) -> None:
+    df = _make_block_df()
+    df["timepoint"] = [0, 1, 1]  # First stop of T1 is not a timepoint
+    with (
+        patch(f"{_MODULE}.BASE_OUTPUT_PATH", str(tmp_path)),
+        patch(f"{_MODULE}.TIMEPOINTS_ONLY", True),
+    ):
+        export_blocks(df)
+    result = pd.read_excel(tmp_path / "block_B1_schedule_printable.xlsx", dtype=str)
+    assert result["Trip Start Time"].tolist() == ["07:00"]
+
+
+def test_export_blocks_timepoints_only_skips_block_without_timepoints(tmp_path: Path) -> None:
+    with (
+        patch(f"{_MODULE}.BASE_OUTPUT_PATH", str(tmp_path)),
+        patch(f"{_MODULE}.TIMEPOINTS_ONLY", True),
+    ):
+        export_blocks(_make_block_df())  # Only B2 has a timepoint
+    names = {f.name for f in tmp_path.glob("*.xlsx")}
+    assert names == {"block_B2_schedule_printable.xlsx"}
+
+
+def test_export_blocks_timepoints_only_no_timepoints_writes_nothing(tmp_path: Path) -> None:
+    df = _make_block_df()
+    df["timepoint"] = 0
+    with (
+        patch(f"{_MODULE}.BASE_OUTPUT_PATH", str(tmp_path)),
+        patch(f"{_MODULE}.TIMEPOINTS_ONLY", True),
+    ):
+        export_blocks(df)
+    assert not list(tmp_path.glob("*.xlsx"))
+
+
+# ---------------------------------------------------------------------------
+# export_to_excel formatting
+# ---------------------------------------------------------------------------
+
+
+def _make_formatted_df() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "Stop Name": ["Oak St", "Elm Ave", "Pine Rd"],
+            "Timepoint": [1, 0, 1],
+            "Comments": ["_____"] * 3,
+        }
+    )
+
+
+def test_export_to_excel_comments_column_uses_configured_width(tmp_path: Path) -> None:
+    out = tmp_path / "schedule.xlsx"
+    with patch(f"{_MODULE}.COMMENTS_COLUMN_WIDTH", 72):
+        export_to_excel(_make_formatted_df(), str(out))
+    ws = load_workbook(out)["Schedule"]
+    assert ws.column_dimensions["C"].width == 72
+
+
+def test_export_to_excel_highlights_timepoint_rows(tmp_path: Path) -> None:
+    out = tmp_path / "schedule.xlsx"
+    with (
+        patch(f"{_MODULE}.TIMEPOINT_HIGHLIGHT_COLOR", "D9D9D9"),
+        patch(f"{_MODULE}.TIMEPOINTS_ONLY", False),
+    ):
+        export_to_excel(_make_formatted_df(), str(out))
+    ws = load_workbook(out)["Schedule"]
+    filled_rows = [
+        row_i
+        for row_i in range(2, ws.max_row + 1)
+        if all(cell.fill.fgColor.rgb == "00D9D9D9" for cell in ws[row_i])
+    ]
+    assert filled_rows == [2, 4]
+    assert ws["A3"].fill.fill_type is None
+
+
+def test_export_to_excel_no_highlight_when_color_blank(tmp_path: Path) -> None:
+    out = tmp_path / "schedule.xlsx"
+    with (
+        patch(f"{_MODULE}.TIMEPOINT_HIGHLIGHT_COLOR", ""),
+        patch(f"{_MODULE}.TIMEPOINTS_ONLY", False),
+    ):
+        export_to_excel(_make_formatted_df(), str(out))
+    ws = load_workbook(out)["Schedule"]
+    assert ws["A2"].fill.fill_type is None
+
+
+def test_export_to_excel_no_highlight_in_timepoints_only_mode(tmp_path: Path) -> None:
+    out = tmp_path / "schedule.xlsx"
+    with (
+        patch(f"{_MODULE}.TIMEPOINT_HIGHLIGHT_COLOR", "D9D9D9"),
+        patch(f"{_MODULE}.TIMEPOINTS_ONLY", True),
+    ):
+        export_to_excel(_make_formatted_df(), str(out))
+    ws = load_workbook(out)["Schedule"]
+    assert ws["A2"].fill.fill_type is None
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+
+def test_main_timepoints_only_without_timepoints_returns_1(tmp_path: Path) -> None:
+    # gtfs_basic has no timepoint column, so every stop is treated as timepoint = 0
+    with (
+        patch(f"{_MODULE}.GTFS_FOLDER_PATH", str(GTFS_BASIC)),
+        patch(f"{_MODULE}.BASE_OUTPUT_PATH", str(tmp_path)),
+        patch(f"{_MODULE}.TIMEPOINTS_ONLY", True),
+    ):
+        assert main() == 1
+    assert not list(tmp_path.glob("*.xlsx"))
