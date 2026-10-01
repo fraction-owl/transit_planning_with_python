@@ -7,10 +7,11 @@ produces a nicely-formatted ``.xlsx`` file ready for field auditing.
 
 Outputs
 -------
-- ``block_<block_id>_schedule_printable.xlsx`` (one per surviving block, written
-  to ``BASE_OUTPUT_PATH``): the block's stop-by-stop schedule with placeholder
-  columns for handwritten field notes. Set ``TIMEPOINTS_ONLY`` to list only
-  timepoint stops; otherwise all stops are listed and timepoint rows are shaded.
+- ``block_<block_id>_<routes>_<HHMM>-<HHMM>_<calendar>.xlsx`` (one per surviving
+  block, written to ``BASE_OUTPUT_PATH``; e.g. ``block_101_10_20_0532-1847_Weekday.xlsx``):
+  the block's stop-by-stop schedule with placeholder columns for handwritten
+  field notes. Set ``TIMEPOINTS_ONLY`` to list only timepoint stops; otherwise
+  all stops are listed and timepoint rows are shaded.
 
 Typical usage
 -------------
@@ -23,6 +24,7 @@ Key Features
 - Applies ergonomic Excel formatting via ``openpyxl`` (column widths, wrapping).
 - Inserts placeholders for handwritten field notes (actual time, boardings, etc.).
 - Widens the Comments column and shades timepoint rows for easier field use.
+- Names each file by block, routes, time span and calendar for easy sorting by hand.
 """
 
 from __future__ import annotations
@@ -30,8 +32,9 @@ from __future__ import annotations
 import logging
 import math
 import os
+import re
 import zipfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Hashable, Mapping, Sequence
 from typing import Any, Optional, Union
 
 import pandas as pd
@@ -60,12 +63,17 @@ REQUIRED_GTFS_FILES = [
 FILTER_SERVICE_IDS: list[str] = []  # e.g. ["WKD", "SAT"]
 FILTER_ROUTE_SHORT_NAMES: list[str] = []  # e.g. ["101", "202"]
 
+# Calendar label used in output file names, by service_id. Unlisted service_ids
+# are labeled from their calendar.txt days (e.g. "Weekday", "Saturday", "MonTueWedThu").
+SERVICE_LABEL_OVERRIDES: dict[str, str] = {}  # e.g. {"4": "Weekday", "5": "Saturday"}
+
 # Stops to list on each block sheet:
 TIMEPOINTS_ONLY: bool = False  # True → timepoint stops only; False → all stops
 
 # Placeholder values for printing:
 MISSING_TIME = "________"
 MISSING_VALUE = "_____"
+COMMENTS_PLACEHOLDER = "_" * 50  # Roughly fills COMMENTS_COLUMN_WIDTH; adjust together
 
 # Maximum column width for neat Excel formatting:
 MAX_COLUMN_WIDTH = 35
@@ -256,7 +264,7 @@ def prepare_stop_times(
     Steps
     -----
     1. Ensure a numeric ``timepoint`` column (create if absent).
-    2. Attach ``block_id``, ``route_short_name`` and ``direction_id``.
+    2. Attach ``block_id``, ``route_short_name``, ``direction_id`` and ``service_id``.
     3. Convert arrival/departure times → seconds → ``HH:MM`` format.
     4. Map ``stop_id`` → human-readable stop names.
     5. Sort by ``block_id``, ``trip_id``, ``stop_sequence``.
@@ -279,7 +287,7 @@ def prepare_stop_times(
         )
 
     # Merge essential trip columns into stop_times
-    needed_trip_cols = ["trip_id", "block_id", "route_short_name", "direction_id"]
+    needed_trip_cols = ["trip_id", "block_id", "route_short_name", "direction_id", "service_id"]
     stop_times_df = stop_times_df.merge(trips_df[needed_trip_cols], on="trip_id", how="left")
 
     # Convert arrival/departure times to seconds and format
@@ -300,7 +308,96 @@ def prepare_stop_times(
     return stop_times_df
 
 
-def export_blocks(stop_times_df: pd.DataFrame) -> None:
+def service_day_label(calendar_row: Mapping[Hashable, Any]) -> str:
+    """Summarize the day-of-week flags of one **calendar.txt** row.
+
+    Args:
+        calendar_row: One calendar record with ``monday`` … ``sunday`` flags.
+
+    Returns:
+        ``"Weekday"``, ``"Saturday"``, ``"Sunday"``, ``"Weekend"`` or ``"Daily"``
+        for those common patterns; otherwise the served days abbreviated and
+        joined (e.g. ``"MonTueWedThu"``), or ``""`` if no day is flagged.
+    """
+    days = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+    served = tuple(day for day in days if str(calendar_row.get(day, "")).strip() == "1")
+    named = {
+        days[:5]: "Weekday",
+        ("saturday",): "Saturday",
+        ("sunday",): "Sunday",
+        ("saturday", "sunday"): "Weekend",
+        days: "Daily",
+    }
+    return named.get(served, "".join(day[:3].capitalize() for day in served))
+
+
+def build_service_labels(calendar_df: pd.DataFrame) -> dict[str, str]:
+    """Map each ``service_id`` to the calendar label used in file names.
+
+    ``SERVICE_LABEL_OVERRIDES`` wins; otherwise the label comes from
+    :pyfunc:`service_day_label`, falling back to the ``service_id`` itself
+    when no day is flagged.
+
+    Args:
+        calendar_df: Parsed **calendar.txt** table.
+
+    Returns:
+        Mapping of ``service_id`` → label, e.g. ``{"4": "Weekday"}``.
+    """
+    labels = {
+        str(row["service_id"]): service_day_label(row) or str(row["service_id"])
+        for row in calendar_df.to_dict("records")
+    }
+    labels.update(SERVICE_LABEL_OVERRIDES)
+    return labels
+
+
+def build_block_filename(block_df: pd.DataFrame, service_labels: Mapping[str, str]) -> str:
+    """Build a human-readable ``.xlsx`` file name for one block.
+
+    Format: ``block_<block_id>_<route>_<route>…_<HHMM>-<HHMM>_<calendar>.xlsx``,
+    e.g. ``block_101_10_20_0532-1847_Weekday.xlsx``.
+
+    * Routes are listed in the order the block first serves them.
+    * Times span the block's earliest and latest scheduled times; hours of
+      24 or more are kept for after-midnight service, GTFS-style (``2530``).
+    * Several calendars on one block are joined with ``+``.
+    * Characters not allowed in Windows file names, and spaces, become ``-``.
+
+    Args:
+        block_df: All stop times of one block (before any timepoint filter),
+            with ``block_id``, ``route_short_name``, ``service_id``,
+            ``arrival_time`` and ``departure_time`` columns.
+        service_labels: Output of :pyfunc:`build_service_labels`; service_ids
+            missing from it are shown as-is.
+
+    Returns:
+        The file name (no directory).
+    """
+    departures = pd.to_numeric(block_df["departure_time"].map(parse_time_to_minutes))
+    arrivals = pd.to_numeric(block_df["arrival_time"].map(parse_time_to_minutes))
+    all_minutes = pd.concat([departures, arrivals])
+    start = minutes_to_hhmm(all_minutes.min()).replace(":", "")
+    end = minutes_to_hhmm(all_minutes.max()).replace(":", "")
+
+    routes = departures.groupby(block_df["route_short_name"]).min().sort_values().index
+    service_ids = sorted(block_df["service_id"].dropna().unique())
+    calendars = dict.fromkeys(service_labels.get(sid, sid) for sid in service_ids)
+
+    parts = [
+        "block",
+        str(block_df["block_id"].iloc[0]),
+        *(str(route) for route in routes),
+        f"{start}-{end}" if start else "",
+        "+".join(calendars),
+    ]
+    safe_parts = [re.sub(r'[\\/:*?"<>|\s]+', "-", part.strip()) for part in parts if part.strip()]
+    return "_".join(safe_parts) + ".xlsx"
+
+
+def export_blocks(
+    stop_times_df: pd.DataFrame, service_labels: Optional[Mapping[str, str]] = None
+) -> None:
     """Generate one Excel schedule per vehicle block.
 
     Args:
@@ -308,9 +405,11 @@ def export_blocks(stop_times_df: pd.DataFrame) -> None:
             :pyfunc:`prepare_stop_times`).  Must include the columns
             produced earlier (``block_id``, ``scheduled_time_hhmm``,
             etc.).
+        service_labels: ``service_id`` → calendar label for file names (see
+            :pyfunc:`build_service_labels`). ``None`` shows raw service_ids.
 
     Side Effects:
-        Writes ``block_<id>_schedule_printable.xlsx`` to
+        Writes one file per block, named by :pyfunc:`build_block_filename`, to
         ``BASE_OUTPUT_PATH``; creates the folder tree if needed. When
         ``TIMEPOINTS_ONLY`` is set, only rows with ``timepoint == 1`` are
         written, and blocks with no timepoint stops are skipped.
@@ -335,8 +434,9 @@ def export_blocks(stop_times_df: pd.DataFrame) -> None:
         block_subset = block_subset.merge(first_departures, on="trip_id", how="left")
 
         block_subset["Trip Start Time"] = block_subset["trip_start_hhmm"]
+        filename = build_block_filename(block_subset, service_labels or {})
 
-        # Filter after computing trip start times so they still reflect the first stop
+        # Filter after the trip start times and file name so they still cover every stop
         if TIMEPOINTS_ONLY:
             block_subset = block_subset[block_subset["timepoint"] == 1]
             if block_subset.empty:
@@ -375,7 +475,7 @@ def export_blocks(stop_times_df: pd.DataFrame) -> None:
         final_df["Actual Time"] = MISSING_TIME
         final_df["Boardings"] = MISSING_VALUE
         final_df["Alightings"] = MISSING_VALUE
-        final_df["Comments"] = MISSING_VALUE
+        final_df["Comments"] = COMMENTS_PLACEHOLDER
 
         # Reorder columns to place 'Timepoint' after 'Stop Sequence'
         final_df = final_df[
@@ -399,7 +499,6 @@ def export_blocks(stop_times_df: pd.DataFrame) -> None:
 
         final_df = final_df.sort_values(by=["Trip Start Time", "Trip ID", "Stop Sequence"])
 
-        filename = f"block_{block_id}_schedule_printable.xlsx"
         output_path = os.path.join(BASE_OUTPUT_PATH, filename)
         export_to_excel(final_df, output_path)
 
@@ -407,6 +506,60 @@ def export_blocks(stop_times_df: pd.DataFrame) -> None:
 # -----------------------------------------------------------------------------
 # REUSABLE FUNCTIONS
 # -----------------------------------------------------------------------------
+
+
+def parse_time_to_minutes(time_value: Optional[str]) -> Optional[int]:
+    """Convert an ``HH:MM[:SS]`` time string to integer minutes past midnight.
+
+    GTFS times may exceed 24:00 (e.g. ``"25:30:00"`` for a 1:30 AM trip on
+    the following calendar day); those values are preserved as integers
+    greater than or equal to 1440. Seconds, when present, are rounded to the
+    nearest minute.
+
+    Args:
+        time_value: Time string such as ``"7:05"``, ``"07:05:00"``, or
+            ``"26:30:00"``. Leading/trailing whitespace is ignored.
+            Non-string or malformed values yield ``None``.
+
+    Returns:
+        Minutes since midnight, or ``None`` if the value cannot be parsed.
+    """
+    if not isinstance(time_value, str):
+        return None
+    parts = time_value.strip().split(":")
+    if len(parts) not in (2, 3):
+        return None
+    try:
+        hours = int(parts[0])
+        minutes = int(parts[1])
+        seconds = int(parts[2]) if len(parts) == 3 else 0
+    except ValueError:
+        return None
+    if hours < 0 or not 0 <= minutes < 60 or not 0 <= seconds < 60:
+        return None
+    return hours * 60 + minutes + round(seconds / 60)
+
+
+def minutes_to_hhmm(minutes: Optional[float], missing: str = "") -> str:
+    """Convert minutes past midnight to a zero-padded ``HH:MM`` string.
+
+    GTFS service days may exceed 24 hours, so values of 1440 minutes or more
+    format with hours >= 24 (e.g. ``1590`` -> ``"26:30"``).
+
+    Args:
+        minutes: Minutes since midnight (may be fractional; rounded to the
+            nearest minute). ``None`` and NaN yield ``missing``.
+        missing: String returned for missing values, e.g. ``""`` or a
+            sentinel such as ``"–"``.
+
+    Returns:
+        Zero-padded ``HH:MM`` string, or ``missing`` when *minutes* is
+        ``None``/NaN.
+    """
+    if minutes is None or pd.isna(minutes):
+        return missing
+    hours, mins = divmod(int(round(minutes)), 60)
+    return f"{hours:02d}:{mins:02d}"
 
 
 def load_gtfs_data(
@@ -601,6 +754,7 @@ def main() -> int:
         stop_times_df = gtfs_data["stop_times"]
         stops_df = gtfs_data["stops"]
         routes_df = gtfs_data["routes"]
+        service_labels = build_service_labels(gtfs_data["calendar"])
 
         trips_df, stop_times_df = filter_data(trips_df, stop_times_df, routes_df)
         if trips_df.empty or stop_times_df.empty:
@@ -618,7 +772,7 @@ def main() -> int:
             )
             return 1
 
-        export_blocks(prepared)
+        export_blocks(prepared, service_labels)
         logging.info("Script finished successfully.")
         logging.info("Script completed successfully.")
         return 0
