@@ -20,9 +20,11 @@ only) and by peak/off-peak period; a direct conflict is never charged as likely
 as well. ``OPTIMIZER_OBJECTIVE`` ranks plans by that score, then by changed
 routes, then by changed movements, or minimizes changes under a hard score
 ceiling, subject to route budgets, bays per route, consistent boarding bays
-per passenger direction, same-bay groups and a direct-conflict policy. The same
-renderer rebuilds every returned plan, and its rows must match the solver's
-model before the plan is reported. ``NAMED_PROPOSALS`` (e.g. a consultant's
+per passenger direction, same-bay groups, a direct-conflict policy and, when
+``BAY_TRANSFERS`` is set, the bay-to-bay moves a bus may make between
+consecutive trips of its block (bus circulation). The same renderer rebuilds
+every returned plan, and its rows must match the solver's model before the
+plan is reported. ``NAMED_PROPOSALS`` (e.g. a consultant's
 layout) are scored the same way, with rule breaks flagged. Layover-space and
 facility-wide totals are reported but not optimized; a bay-only change cannot
 alter them.
@@ -37,9 +39,10 @@ Outputs
 -------
 Each run writes a new ``<SCENARIO_LABEL>_<timestamp>`` folder in ``OUTPUT_DIR``:
 - ``<SCENARIO_LABEL>_bay_plans.xlsx``: Read me, Conflict summary, Plan
-  comparison, Assignments, Route bay usage, Boarding bays, Conflict minutes,
-  Route-ends, Interlines, Block chains, Bay options and Configuration. It is rewritten after
-  each route budget, so a long solve leaves results that can be used.
+  comparison, Assignments, Route bay usage, Boarding bays, Bay transfers,
+  Conflict minutes, Route-ends, Interlines, Block chains, Bay options and
+  Configuration. It is rewritten after each route budget, so a long solve
+  leaves results that can be used.
 - ``<SCENARIO_LABEL>_bay_plans_runlog.txt``, the run-log sidecar capturing the
   verbatim CONFIGURATION block and the effective settings.
 - ``solver/``: CBC's log and working files (model, warm start, solution) per
@@ -218,6 +221,25 @@ NAMED_PROPOSALS: Dict[str, Dict[str, str]] = {
     # "Consultant": {"101 arrive": "B", "102 depart": "A"},
 }
 
+# --- Bus circulation ------------------------------------------------------------------------------
+# Moves a bus may make between bays when one trip ends at the facility and the next trip on
+# its block starts there (interlines included): from bay -> {to bay: minutes the move takes}.
+# Staying in one bay is always allowed. Any other move that is not listed is not permitted,
+# and a listed move must fit in the gap between the two trips. Minutes are checked against
+# the gap only; they are not added to bay occupancy. {} sets no rule; the Bay transfers
+# sheet still lists every move. Example: six bays round a one-way loop A-F, where a
+# bus may pull forward three or more bays but never back:
+#   {"A": {"D": 1, "E": 1, "F": 2}, "B": {"E": 1, "F": 1}, "C": {"F": 1}}
+BAY_TRANSFERS: Dict[str, Dict[str, int]] = {}
+# "report": list moves BAY_TRANSFERS does not permit, without restricting plans.
+# "no_new": a plan may not give a connection a move that is not permitted; scheduled moves
+# may stay as they are. "forbid": every move must be permitted, scheduled ones included.
+BAY_TRANSFER_POLICY = "report"
+# Connections with a longer gap (minutes) are exempt. Assumes a bus with a longer gap can
+# reach any bay via the layover area; confirm with operations before setting. None checks
+# every connection.
+BAY_TRANSFER_MAX_GAP_MINUTES: Optional[int] = None
+
 # --- Solver ---------------------------------------------------------------------------------------
 SOLVER_TIME_LIMIT_SECONDS = 1800  # per route budget; CBC is stopped 30 seconds later
 SOLVER_RELATIVE_GAP = 0.0
@@ -248,6 +270,7 @@ OCCUPANCY_KEYS: Tuple[str, ...] = (
 OPTIMIZE_MODES: Tuple[str, ...] = ("never", "if_conflicts", "always")
 OBJECTIVE_MODES: Tuple[str, ...] = ("min_conflicts", "min_changes")
 DIRECT_POLICIES: Tuple[str, ...] = ("weighted", "no_increase", "no_new")
+TRANSFER_POLICIES: Tuple[str, ...] = ("report", "no_new", "forbid")
 CATEGORIES: Tuple[str, ...] = (
     "direct_peak",
     "direct_off_peak",
@@ -311,6 +334,22 @@ MINUTE_COLUMNS = [
     "direct_blocks",
     "likely_buses",
     "likely_blocks",
+]
+TRANSFER_COLUMNS = [
+    "plan",
+    "block",
+    "from_trip",
+    "from_route_end",
+    "arrives",
+    "to_trip",
+    "to_route_end",
+    "departs",
+    "gap_min",
+    "scheduled_move",
+    "plan_move",
+    "changed",
+    "permitted",
+    "check",
 ]
 
 _PLACEHOLDER_MARKERS: Tuple[str, ...] = ("path\\to\\", "path/to/")
@@ -525,6 +564,35 @@ def validate_configuration(cfg: Dict[str, Any]) -> None:
         raise ValueError("MAX_BAYS_PER_ROUTE must be a positive integer or None.")
     if cfg["DIRECT_CONFLICT_POLICY"] not in DIRECT_POLICIES:
         raise ValueError(f"DIRECT_CONFLICT_POLICY must be one of {list(DIRECT_POLICIES)}.")
+    transfers = cfg["BAY_TRANSFERS"]
+    if not isinstance(transfers, dict):
+        raise ValueError("BAY_TRANSFERS must map bays to {other bay: transfer minutes}.")
+    for from_bay, targets in transfers.items():
+        if (
+            from_bay not in labels
+            or not isinstance(targets, dict)
+            or any(
+                to_bay not in labels
+                or to_bay == from_bay
+                or type(minutes) is not int
+                or minutes < 0
+                for to_bay, minutes in targets.items()
+            )
+        ):
+            raise ValueError(
+                f"Invalid BAY_TRANSFERS entry {from_bay!r}: {targets!r}; map a bay label to "
+                "{other bay label: whole minutes, 0 or more}."
+            )
+    if cfg["BAY_TRANSFER_POLICY"] not in TRANSFER_POLICIES:
+        raise ValueError(f"BAY_TRANSFER_POLICY must be one of {list(TRANSFER_POLICIES)}.")
+    if cfg["BAY_TRANSFER_POLICY"] != "report" and not transfers:
+        raise ValueError(
+            f"BAY_TRANSFER_POLICY = {cfg['BAY_TRANSFER_POLICY']!r} needs a BAY_TRANSFERS table "
+            "of permitted moves."
+        )
+    max_gap = cfg["BAY_TRANSFER_MAX_GAP_MINUTES"]
+    if max_gap is not None and (type(max_gap) is not int or max_gap < 0):
+        raise ValueError("BAY_TRANSFER_MAX_GAP_MINUTES must be a nonnegative integer or None.")
     if cfg["OPTIMIZER_OBJECTIVE"] not in OBJECTIVE_MODES:
         raise ValueError(f"OPTIMIZER_OBJECTIVE must be one of {list(OBJECTIVE_MODES)}.")
     score_limit = cfg["WEIGHTED_SCORE_LIMIT"]
@@ -1936,6 +2004,137 @@ def interline_summary(chains: DataFrame) -> DataFrame:
 
 
 # ==================================================================================================
+# BUS CIRCULATION
+# ==================================================================================================
+
+
+class Connection(NamedTuple):
+    """A bus ending one trip at a facility bay and starting its block's next trip at one.
+
+    ``arrive`` and ``depart`` are the movements whose bays the bus uses;
+    ``from_bay`` and ``to_bay`` are the scheduled bays. ``gap`` runs from the
+    first trip's last scheduled time (last-stop departure) to the next trip's
+    first (first-stop arrival): the time the bus has to move between bays.
+    """
+
+    block: str
+    from_trip: str
+    to_trip: str
+    arrive: RouteEnd
+    depart: RouteEnd
+    from_bay: str
+    to_bay: str
+    arrives: int
+    departs: int
+    gap: int
+
+
+class Transfer(NamedTuple):
+    """A connection's bays under one plan, and whether BAY_TRANSFERS permits the move.
+
+    ``permitted`` is None when no BAY_TRANSFERS table is set.
+    """
+
+    connection: Connection
+    from_bay: str
+    to_bay: str
+    permitted: Optional[bool]
+    check: str
+
+    @property
+    def changed(self) -> bool:
+        """Whether the plan moves either end of the connection off its scheduled bay."""
+        return (self.from_bay, self.to_bay) != (self.connection.from_bay, self.connection.to_bay)
+
+    def __str__(self) -> str:
+        """Describe the move for rule messages, e.g. ``"F to A (block 12, 08:05)"``."""
+        timing = f"; {self.check}" if self.check.startswith("needs") else ""
+        return (
+            f"{self.from_bay} to {self.to_bay} (block {self.connection.block}, "
+            f"{minutes_to_hhmm(self.connection.arrives)}{timing})"
+        )
+
+
+def bay_connections(
+    block_trips: Mapping[str, Sequence[Dict[str, Any]]],
+    cluster_stops: Mapping[str, str],
+    names: RouteNames,
+) -> List[Connection]:
+    """List each pair of consecutive trips on a block that ends and starts at the facility.
+
+    Interlines are included. Through visits are not connections: the bus
+    continues along its route.
+
+    Args:
+        block_trips: Each block's trips in running order.
+        cluster_stops: Facility stop_id -> bay label.
+        names: Route labels for the movements.
+    """
+    result = []
+    for block, trips in block_trips.items():
+        for prev, nxt in zip(trips, trips[1:]):
+            last, first = prev["stop_times_sequence"][-1], nxt["stop_times_sequence"][0]
+            if last[2] not in cluster_stops or first[2] not in cluster_stops:
+                continue
+            routes = str(prev["route_id"]), str(nxt["route_id"])
+            result.append(
+                Connection(
+                    block=str(block),
+                    from_trip=str(prev["trip_id"]),
+                    to_trip=str(nxt["trip_id"]),
+                    arrive=RouteEnd(routes[0], stop_role(last), "", names.label[routes[0]]),
+                    depart=RouteEnd(routes[1], stop_role(first), "", names.label[routes[1]]),
+                    from_bay=cluster_stops[last[2]],
+                    to_bay=cluster_stops[first[2]],
+                    arrives=int(prev["arrival"]),
+                    departs=int(nxt["departure"]),
+                    gap=int(nxt["start"] - prev["end"]),
+                )
+            )
+    return result
+
+
+def transfer_check(
+    cfg: Dict[str, Any], connection: Connection, from_bay: str, to_bay: str
+) -> Tuple[Optional[bool], str]:
+    """Whether BAY_TRANSFERS permits a connection's move from *from_bay* to *to_bay*, and why.
+
+    Returns:
+        ``(permitted, check)``: ``permitted`` is None when no table is set.
+    """
+    if from_bay == to_bay:
+        return True, "same bay"
+    table = cfg["BAY_TRANSFERS"]
+    if not table:
+        return None, "no BAY_TRANSFERS table"
+    limit = cfg["BAY_TRANSFER_MAX_GAP_MINUTES"]
+    if limit is not None and connection.gap > limit:
+        return True, f"exempt: {connection.gap}-minute gap exceeds BAY_TRANSFER_MAX_GAP_MINUTES"
+    minutes = table.get(from_bay, {}).get(to_bay)
+    if minutes is None:
+        return False, "not in BAY_TRANSFERS"
+    if minutes > connection.gap:
+        return False, f"needs {minutes} min; the gap is {connection.gap} min"
+    return True, f"permitted ({minutes} min)"
+
+
+def plan_transfers(
+    cfg: Dict[str, Any], connections: Sequence[Connection], change: Change
+) -> List[Transfer]:
+    """Each connection's bays after *change* (a moved movement uses its new bay), checked."""
+    result = []
+    for connection in connections:
+        from_bay = change.moves.get(connection.arrive, connection.from_bay)
+        to_bay = change.moves.get(connection.depart, connection.to_bay)
+        result.append(
+            Transfer(
+                connection, from_bay, to_bay, *transfer_check(cfg, connection, from_bay, to_bay)
+            )
+        )
+    return result
+
+
+# ==================================================================================================
 # OCCUPANCY STANDARDS
 # ==================================================================================================
 
@@ -2011,6 +2210,7 @@ class Standard:
             names,
             require_direction=cfg["REQUIRE_CONSISTENT_BOARDING_BAYS"],
         )
+        self.connections = bay_connections(self.block_trips, self.cluster_stops, names)
         self.rows = self.render(self.block_trips)
         self.occ = self.rows[self.rows["Status"].isin(BAY_STATUSES)].reset_index(drop=True)
         self.cache: OrderedDict[tuple, DataFrame] = OrderedDict()
@@ -2114,6 +2314,19 @@ class Standard:
                         key = (str(trip["route_id"]), str(trip["direction_id"]))
                         result[key].add(self.cluster_stops[stop[2]])
         return dict(result)
+
+    def rebuilt_transfers(self, change: Change) -> List[Tuple[str, str]]:
+        """Each connection's (from bay, to bay), read from the re-targeted trips.
+
+        Like :meth:`rebuilt_boarding_bays`, this is independent of the
+        movement-level assignments the optimizer reasons with.
+        """
+        revised = self.changed_blocks(change)
+        blocks = {block: revised.get(block, trips) for block, trips in self.block_trips.items()}
+        return [
+            (connection.from_bay, connection.to_bay)
+            for connection in bay_connections(blocks, self.cluster_stops, self.names)
+        ]
 
     def score(self, frame: DataFrame) -> Tuple[int, Dict[str, int], np.ndarray]:
         """Count over-capacity bay-minutes; one vehicle has one row per minute."""
@@ -2343,11 +2556,12 @@ def evaluate_plan(
     The model assumes a bay change only relabels the bay of each moved
     movement's vehicle-minutes. Every affected block is re-rendered and its
     facility rows, layovers included, must equal that relabeling exactly.
-    Boarding bays are read from the re-targeted trips and must equal the
-    movement-level inventory's prediction.
+    Boarding bays and each connection's bay-to-bay move are read from the
+    re-targeted trips and must equal the movement-level prediction.
 
     Raises:
-        ValueError: If the rebuilt rows or boarding bays differ from the model's premise.
+        ValueError: If the rebuilt rows, boarding bays or bay moves differ from the
+            model's premise.
     """
     frames = {}
     cells = {}
@@ -2375,6 +2589,12 @@ def evaluate_plan(
             "Rebuilt boarding bays differ from the movement-level model. "
             "No recommendation is accepted; review the schedule's directions and roles."
         )
+    transfers = plan_transfers(cfg, first.connections, change)
+    if first.rebuilt_transfers(change) != [(t.from_bay, t.to_bay) for t in transfers]:
+        raise ValueError(
+            "Rebuilt bay-to-bay moves differ from the movement-level model. "
+            "No recommendation is accepted; review the block chains."
+        )
     direct = cells[cfg["OPTIMIZER_DIRECT_STANDARD"]]
     likely = cells[cfg["OPTIMIZER_LIKELY_STANDARD"]]
     counts = category_counts(direct, likely, peak_mask(cfg["PEAK_WINDOWS"]))
@@ -2389,6 +2609,7 @@ def evaluate_plan(
         "changed_movements": len(change.moves),
         "route_bays": final_route_bays(current, change),
         "boarding_bays": boarding,
+        "transfers": transfers,
     }
 
 
@@ -2405,8 +2626,8 @@ def plan_violations(
     """List the rules a plan breaks.
 
     The rules are permitted bays (when *allowed* is given), the route budget, the
-    score ceiling, bays per route, consistent boarding bays, same-bay groups and
-    the direct-conflict policy.
+    score ceiling, bays per route, consistent boarding bays, same-bay groups,
+    the direct-conflict policy and the bay-transfer policy.
     """
     problems = []
     labels = {end.route: end.label for end in current}
@@ -2452,6 +2673,18 @@ def plan_violations(
     new = evaluation["direct"] - baseline["direct"]
     if policy == "no_new" and new:
         problems.append(f"direct conflicts at {len(new)} bay-minute(s) clear in the baseline")
+    transfer_policy = cfg["BAY_TRANSFER_POLICY"]
+    if transfer_policy != "report":
+        barred = [
+            str(transfer)
+            for transfer in evaluation["transfers"]
+            if transfer.permitted is False and (transfer_policy == "forbid" or transfer.changed)
+        ]
+        if barred:
+            problems.append(
+                f"{len(barred)} bay transfer(s) not permitted by BAY_TRANSFERS: "
+                f"{_listed(barred, 3)}"
+            )
     return problems
 
 
@@ -2472,6 +2705,14 @@ def plan_summary(
         "max_bays_used_by_one_route": max(map(len, evaluation["route_bays"].values()), default=0),
         "max_boarding_bays_per_direction": max(
             map(len, evaluation["boarding_bays"].values()), default=0
+        ),
+        "bay_transfers": sum(t.from_bay != t.to_bay for t in evaluation["transfers"]),
+        "changed_transfers": sum(t.changed for t in evaluation["transfers"]),
+        # Blank when moves were made but no BAY_TRANSFERS table exists to judge them.
+        "unpermitted_transfers": (
+            None
+            if any(t.permitted is None for t in evaluation["transfers"])
+            else sum(t.permitted is False for t in evaluation["transfers"])
         ),
         **evaluation["counts"],
         "weighted_score": evaluation["weighted_score"],
@@ -2585,6 +2826,30 @@ def boarding_rows(
             "rule_required": cfg["REQUIRE_CONSISTENT_BOARDING_BAYS"],
         }
         for (route, direction), bays in sorted(evaluation["boarding_bays"].items())
+    ]
+
+
+def transfer_rows(label: str, evaluation: Dict[str, Any]) -> List[Dict]:
+    """List each connection where the plan moves a bus between bays or changes its bays."""
+    return [
+        {
+            "plan": label,
+            "block": transfer.connection.block,
+            "from_trip": transfer.connection.from_trip,
+            "from_route_end": str(transfer.connection.arrive),
+            "arrives": minutes_to_hhmm(transfer.connection.arrives),
+            "to_trip": transfer.connection.to_trip,
+            "to_route_end": str(transfer.connection.depart),
+            "departs": minutes_to_hhmm(transfer.connection.departs),
+            "gap_min": transfer.connection.gap,
+            "scheduled_move": f"{transfer.connection.from_bay} to {transfer.connection.to_bay}",
+            "plan_move": f"{transfer.from_bay} to {transfer.to_bay}",
+            "changed": transfer.changed,
+            "permitted": transfer.permitted,
+            "check": transfer.check,
+        }
+        for transfer in evaluation["transfers"]
+        if transfer.changed or transfer.from_bay != transfer.to_bay
     ]
 
 
@@ -2887,6 +3152,8 @@ class AssignmentModel:
                     self.add(
                         self.assignment_signal(group[0], bay) == self.assignment_signal(end, bay)
                     )
+        self.connections = next(iter(standards.values())).connections
+        self.add_transfer_rules()
         for name, standard in standards.items():
             self.flags[name] = self.build_conflicts(standard)
         direct = self.flags[cfg["OPTIMIZER_DIRECT_STANDARD"]]
@@ -2988,6 +3255,53 @@ class AssignmentModel:
             self.add(used >= signal)
         self.add(used <= self.pulp.lpSum(signals))
         return used
+
+    def add_transfer_rules(self) -> None:
+        """Forbid each connection's bay-to-bay moves that BAY_TRANSFER_POLICY rules out.
+
+        For a connection and an arrival bay X, the bus may not arrive at X and
+        depart from any bay Y the move X -> Y may not use. Each connection departs
+        from exactly one bay, so one constraint per arrival bay covers every Y:
+        ``arrive_at(X) + sum(depart_from(Y)) <= 1``. Under ``no_new`` the
+        scheduled move stays allowed.
+        """
+        policy = self.cfg["BAY_TRANSFER_POLICY"]
+        if policy == "report":
+            return
+        stuck = []
+        for connection in self.connections:
+            ends = (connection.arrive, connection.depart)
+            if any(end not in self.choices for end in ends):
+                raise ValueError(f"Connection movement has no assignment choice: {ends}")
+            from_bays = {connection.from_bay, *self.choices[connection.arrive][1:]}
+            to_bays = {connection.to_bay, *self.choices[connection.depart][1:]}
+            for from_bay in sorted(from_bays):
+                barred = [
+                    to_bay
+                    for to_bay in sorted(to_bays)
+                    if transfer_check(self.cfg, connection, from_bay, to_bay)[0] is False
+                    and (
+                        policy == "forbid"
+                        or (from_bay, to_bay) != (connection.from_bay, connection.to_bay)
+                    )
+                ]
+                if not barred:
+                    continue
+                pair = self.bay_signal(connection.arrive, from_bay, {connection.from_bay})
+                for to_bay in barred:
+                    pair += self.bay_signal(connection.depart, to_bay, {connection.to_bay})
+                if len(pair) == 0:
+                    if pair.constant <= 1:
+                        continue
+                    stuck.append(f"{from_bay} to {barred[0]} (block {connection.block})")
+                self.add(pair <= 1)
+        if stuck:
+            logging.warning(
+                "%d scheduled bay move(s) are not permitted and neither movement may change "
+                "bay, so no plan meets BAY_TRANSFER_POLICY = 'forbid': %s",
+                len(stuck),
+                _listed(stuck),
+            )
 
     def assignment_signal(self, end: RouteEnd, bay: str) -> Any:
         """Indicate a uniform final bay, including an unchanged uniform assignment."""
@@ -3253,6 +3567,18 @@ READ_ME_NOTES: Tuple[Tuple[str, str], ...] = (
         "for every plan.",
     ),
     (
+        "Bay transfers",
+        "A connection is a bus ending one trip at a bay and starting the next trip on its block "
+        "at a bay, interlines included; through visits are not connections. BAY_TRANSFERS "
+        "lists the permitted moves between bays and their minutes, which must fit in the gap "
+        "(last-stop departure to first-stop arrival); they are checked against the gap only "
+        "and are not added to bay occupancy. Staying in one bay is always permitted. "
+        "'report' only lists moves; 'no_new' keeps a plan from giving a connection a move that "
+        "is not permitted; 'forbid' also rules out scheduled moves. The sheet lists every "
+        "connection where a plan moves between bays or changes a bay, read from the "
+        "re-targeted schedule.",
+    ),
+    (
         "Named proposals",
         "NAMED_PROPOSALS are fixed layouts scored like any plan. Rule breaks, including moves "
         "outside BAY_OPTIONS or locks, are listed in policy_issues rather than rejected.",
@@ -3283,7 +3609,11 @@ READ_ME_NOTES: Tuple[Tuple[str, str], ...] = (
         "Uses the configured priority order. In min_changes mode it is not a conflict-score "
         "gap. Objective values from different modes are not comparable.",
     ),
-    ("Operational review", "Review bay access, bus suitability and inter-bay travel separately."),
+    (
+        "Operational review",
+        "Review bay access, bus suitability and any inter-bay travel BAY_TRANSFERS does not "
+        "describe separately.",
+    ),
 )
 
 
@@ -3305,6 +3635,7 @@ class Report:
         self.assignments: List[Dict[str, Any]] = []
         self.route_usage: List[Dict[str, Any]] = []
         self.boarding: List[Dict[str, Any]] = []
+        self.transfers: List[Dict[str, Any]] = []
         self.boarding_inventory: Dict[RouteEnd, Dict[str, Set[str]]] = {}
         self.minutes: List[Dict[str, Any]] = []
 
@@ -3324,6 +3655,7 @@ class Report:
         self.boarding.extend(
             boarding_rows(row["plan"], self.cfg, self.boarding_inventory, evaluation)
         )
+        self.transfers.extend(transfer_rows(row["plan"], evaluation))
         self.minutes.extend(conflict_rows(row["plan"], self.cfg, evaluation))
 
     def sheets(self) -> List[Tuple[str, DataFrame]]:
@@ -3353,6 +3685,7 @@ class Report:
             ("Assignments", DataFrame(self.assignments)),
             ("Route bay usage", DataFrame(self.route_usage)),
             ("Boarding bays", DataFrame(self.boarding)),
+            ("Bay transfers", DataFrame(self.transfers, columns=TRANSFER_COLUMNS)),
             ("Conflict minutes", DataFrame(self.minutes, columns=MINUTE_COLUMNS)),
             *self.discovery,
             ("Bay options", self.options),
@@ -3477,6 +3810,8 @@ def run_optimizer(
             "changed-movement multiplier": model.movement_scale,
             "discovered routes": len(model.routes),
             "maximum passenger bays per route": cfg["MAX_BAYS_PER_ROUTE"],
+            "same-block connections at the facility": len(model.connections),
+            "bay transfer policy": cfg["BAY_TRANSFER_POLICY"],
         }
     )
     empty = Change()
@@ -3968,6 +4303,7 @@ CLI_SETTINGS: Dict[str, str] = {
     "objective": "OPTIMIZER_OBJECTIVE",
     "score_limit": "WEIGHTED_SCORE_LIMIT",
     "time_limit": "SOLVER_TIME_LIMIT_SECONDS",
+    "transfer_policy": "BAY_TRANSFER_POLICY",
 }
 
 
@@ -3997,6 +4333,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=SOLVER_TIME_LIMIT_SECONDS,
         help="CBC seconds per route budget.",
+    )
+    p.add_argument(
+        "--transfer-policy",
+        choices=TRANSFER_POLICIES,
+        default=BAY_TRANSFER_POLICY,
+        help="BAY_TRANSFER_POLICY: how BAY_TRANSFERS limits moves between bays.",
     )
     p.add_argument(
         "--config",
