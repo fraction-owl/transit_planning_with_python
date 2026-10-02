@@ -19,8 +19,11 @@ bay's capacity. Each conflict minute is weighted by standard (direct, or likely
 only) and by peak/off-peak period; a direct conflict is never charged as likely
 as well. ``OPTIMIZER_OBJECTIVE`` ranks plans by that score, then by changed
 routes, then by changed movements, or minimizes changes under a hard score
-ceiling. The same renderer rebuilds every returned plan, and its rows must
-match the solver's model before the plan is reported. Layover-space and
+ceiling, subject to route budgets, bays per route, consistent boarding bays
+per passenger direction, same-bay groups and a direct-conflict policy. The same
+renderer rebuilds every returned plan, and its rows must match the solver's
+model before the plan is reported. ``NAMED_PROPOSALS`` (e.g. a consultant's
+layout) are scored the same way, with rule breaks flagged. Layover-space and
 facility-wide totals are reported but not optimized; a bay-only change cannot
 alter them.
 
@@ -28,13 +31,14 @@ Inputs
 ------
 - A GTFS folder or ``.zip`` with trips, stop_times, stops and routes, plus
   calendar.txt / calendar_dates.txt when ``SERVICE_DATE`` selects the day.
+  Fields are read as written, so IDs such as ``NA`` stay text.
 
 Outputs
 -------
 Each run writes a new ``<SCENARIO_LABEL>_<timestamp>`` folder in ``OUTPUT_DIR``:
 - ``<SCENARIO_LABEL>_bay_plans.xlsx``: Read me, Conflict summary, Plan
-  comparison, Assignments, Route bay usage, Conflict minutes, Route-ends, Bay
-  options, Interlines, Block chains and Configuration. It is rewritten after
+  comparison, Assignments, Route bay usage, Boarding bays, Conflict minutes,
+  Route-ends, Interlines, Block chains, Bay options and Configuration. It is rewritten after
   each route budget, so a long solve leaves results that can be used.
 - ``<SCENARIO_LABEL>_bay_plans_runlog.txt``, the run-log sidecar capturing the
   verbatim CONFIGURATION block and the effective settings.
@@ -179,6 +183,10 @@ ROUTE_CHANGE_LIMITS: List[Any] = ["all"]
 # Distinct passenger bays a route may use across all its movements, KEEP visits included.
 # 2 forbids a three-bay route; 1 forces one bay per route; None removes the limit.
 MAX_BAYS_PER_ROUTE: Optional[int] = 2
+# True: each route boards at one bay per passenger direction (GTFS direction_id). Its
+# departures from the facility and its through visits in that direction must share a
+# bay. Arrivals (last stops) only set down and are not counted; KEEP visits are.
+REQUIRE_CONSISTENT_BOARDING_BAYS = True
 # "weighted": allow trade-offs; "no_increase": cap total direct minutes at the baseline;
 # "no_new": forbid direct conflicts at any bay-minute that is clear today. This restricts
 # bay-minutes, not bus pairs: different buses may conflict at an existing location.
@@ -202,6 +210,12 @@ SAME_BAY_GROUPS: List[List[str]] = [
 # Optional exact movement -> bay proposal from an earlier run, rebuilt and validated on
 # this run, then used as the solver's starting point. Not a set of locks; {} for none.
 OPTIMIZER_STARTING_ASSIGNMENTS: Dict[str, str] = {}
+# Fixed proposals to compare with the baseline and the solver's plans: name -> {movement:
+# bay}; unlisted movements keep their stops. Each is rebuilt and scored like any plan.
+# Rule breaks, including BAY_OPTIONS and locks, are flagged rather than rejected.
+NAMED_PROPOSALS: Dict[str, Dict[str, str]] = {
+    # "Consultant": {"101 arrive": "B", "102 depart": "A"},
+}
 
 # --- Solver ---------------------------------------------------------------------------------------
 SOLVER_TIME_LIMIT_SECONDS = 1800  # per route budget; CBC is stopped 30 seconds later
@@ -464,7 +478,12 @@ def validate_configuration(cfg: Dict[str, Any]) -> None:
             raise ValueError(f"Invalid dwell or layover thresholds for {name}.")
     if not _positive_int(cfg["DEFAULT_HOURS"]):
         raise ValueError("DEFAULT_HOURS must be a positive integer.")
-    for name in ("INTERPOLATE_UNTIMED_STOPS", "AUTO_BAY_CANDIDATES", "WRITE_SOLVER_MODEL"):
+    for name in (
+        "INTERPOLATE_UNTIMED_STOPS",
+        "AUTO_BAY_CANDIDATES",
+        "WRITE_SOLVER_MODEL",
+        "REQUIRE_CONSISTENT_BOARDING_BAYS",
+    ):
         if type(cfg[name]) is not bool:
             raise ValueError(f"{name} must be True or False.")
     if type(cfg["REQUIRE_RUN_LOG"]) is not bool:
@@ -512,6 +531,29 @@ def validate_configuration(cfg: Dict[str, Any]) -> None:
         raise ValueError("WEIGHTED_SCORE_LIMIT must be a nonnegative integer or None.")
     if cfg["OPTIMIZER_OBJECTIVE"] == "min_changes" and score_limit is None:
         raise ValueError("OPTIMIZER_OBJECTIVE = 'min_changes' requires WEIGHTED_SCORE_LIMIT.")
+    proposals = cfg["NAMED_PROPOSALS"]
+    if not isinstance(proposals, dict):
+        raise ValueError("NAMED_PROPOSALS must map proposal names to {movement: bay} mappings.")
+    for name, assignments in proposals.items():
+        if (
+            not isinstance(name, str)
+            or not name.strip()
+            or name.strip().casefold() in {"baseline", "starting plan"}
+            or re.fullmatch(r"Up to \d+ route\(s\)", name.strip())
+        ):
+            raise ValueError(
+                f"Invalid proposal name {name!r}: use a nonblank name other than 'Baseline', "
+                "'Starting plan' or a route-budget label."
+            )
+        if (
+            not isinstance(assignments, dict)
+            or not assignments
+            or any(
+                not isinstance(end, str) or not end.strip() or bay not in labels
+                for end, bay in assignments.items()
+            )
+        ):
+            raise ValueError(f"Proposal {name!r} must map one or more movements to bay labels.")
     starting = cfg["OPTIMIZER_STARTING_ASSIGNMENTS"]
     if not isinstance(starting, dict) or any(
         not isinstance(end, str) or not end.strip() or bay not in labels
@@ -607,97 +649,38 @@ def timestamp_to_minutes(ts: object) -> Optional[int]:
     return hours * 60 + minute if hours >= 0 and 0 <= minute < 60 else None
 
 
-# Canonical version lives in utils/gtfs_helpers.py -- keep this copy in sync.
-def load_gtfs_data(
-    gtfs_path: str,
-    files: Optional[Sequence[str]] = None,
-    dtype: str | type[str] | Mapping[str, Any] = str,
-    logger: Optional[logging.Logger] = None,
-) -> dict[str, pd.DataFrame]:
-    """Load one or more GTFS text files into memory.
+def read_gtfs_tables(gtfs_path: str, files: Sequence[str]) -> dict[str, pd.DataFrame]:
+    """Read GTFS text files from a folder or ZIP archive, keeping every field as written.
 
-    Args:
-        gtfs_path: Absolute or relative path to the folder containing the
-            GTFS feed, or to a ``.zip`` archive of it — the form GTFS
-            producers and most open-data portals distribute feeds in. Zip
-            members may sit at the archive root or nested one level inside
-            a single wrapper folder; both layouts are handled.
-        files: Explicit sequence of file names to load. If ``None``,
-            the standard 13 GTFS text files are attempted.
-        dtype: Value forwarded to :pyfunc:`pandas.read_csv(dtype=…)` to
-            control column dtypes. Supply a mapping for per-column dtypes.
-        logger: Logger for progress messages. Defaults to this module's
-            logger (``logging.getLogger(__name__)``) rather than the root
-            logger, so callers keep control of handler configuration.
-
-    Returns:
-        Mapping of file stem → :class:`pandas.DataFrame`; for example,
-        ``data["trips"]`` holds the parsed *trips.txt* table.
+    Adapted from ``load_gtfs_data`` in utils/gtfs_helpers.py, with one deliberate
+    difference: pandas' missing-value markers are switched off, so identifiers such
+    as route_id ``"NA"`` or ``"None"`` stay text, and a blank field reads as ``""``
+    (the schedule checks treat blank and missing fields alike). ZIP members may sit
+    at the archive root or one folder deep.
 
     Raises:
-        OSError: Path missing, one of *files* not present in the feed, or
-            an OS-level failure while reading a file.
-        ValueError: *gtfs_path* is neither a directory nor a valid ``.zip``
-            file, a requested file matches more than one location inside
-            the zip, a file is empty, or the CSV parser fails.
-
-    Notes:
-        All columns default to ``str`` to avoid pandas’ type-inference
-        pitfalls (e.g. leading zeros in IDs).
+        OSError: If the path or one of *files* is missing.
+        ValueError: If the path is not a folder or ZIP archive, a file appears more
+            than once inside the archive, a file is empty, or it cannot be parsed.
     """
-    log = logger if logger is not None else logging.getLogger(__name__)
-
     if not os.path.exists(gtfs_path):
         raise OSError(f"The path '{gtfs_path}' does not exist.")
-
-    if files is None:
-        files = (
-            "agency.txt",
-            "stops.txt",
-            "routes.txt",
-            "trips.txt",
-            "stop_times.txt",
-            "calendar.txt",
-            "calendar_dates.txt",
-            "fare_attributes.txt",
-            "fare_rules.txt",
-            "feed_info.txt",
-            "frequencies.txt",
-            "shapes.txt",
-            "transfers.txt",
-        )
-
-    is_zip = os.path.isfile(gtfs_path) and gtfs_path.lower().endswith(".zip")
+    is_zip = os.path.isfile(gtfs_path) and zipfile.is_zipfile(gtfs_path)
     if not is_zip and not os.path.isdir(gtfs_path):
         raise ValueError(f"'{gtfs_path}' is neither a directory nor a .zip file.")
-
-    archive: zipfile.ZipFile | None = None
-    members_by_name: dict[str, list[str]] = {}
-    if is_zip:
-        try:
-            archive = zipfile.ZipFile(gtfs_path)
-        except zipfile.BadZipFile as exc:
-            raise ValueError(f"'{gtfs_path}' is not a valid zip archive.") from exc
-        for name in archive.namelist():
-            members_by_name.setdefault(os.path.basename(name), []).append(name)
-
+    archive: Optional[zipfile.ZipFile] = zipfile.ZipFile(gtfs_path) if is_zip else None
     try:
-        missing: list[str] = []
-        ambiguous: list[str] = []
-        resolved: dict[str, str] = {}
-        for file_name in files:
-            if archive is None:
-                if not os.path.exists(os.path.join(gtfs_path, file_name)):
-                    missing.append(file_name)
-                continue
-            candidates = members_by_name.get(file_name, [])
-            if not candidates:
-                missing.append(file_name)
-            elif len(candidates) > 1:
-                ambiguous.append(file_name)
-            else:
-                resolved[file_name] = candidates[0]
-
+        members: dict[str, list[str]] = {}
+        if archive is not None:
+            for name in archive.namelist():
+                members.setdefault(os.path.basename(name), []).append(name)
+        missing = [
+            name
+            for name in files
+            if (archive is None and not os.path.exists(os.path.join(gtfs_path, name)))
+            or (archive is not None and not members.get(name))
+        ]
+        ambiguous = [name for name in files if len(members.get(name, [])) > 1]
         if ambiguous:
             raise ValueError(
                 f"Ambiguous GTFS files in '{gtfs_path}' (found in multiple "
@@ -705,27 +688,21 @@ def load_gtfs_data(
             )
         if missing:
             raise OSError(f"Missing GTFS files in '{gtfs_path}': {', '.join(missing)}")
-
         data: dict[str, pd.DataFrame] = {}
-        for file_name in files:
-            key = file_name.replace(".txt", "")
+        for name in files:
+            options: dict[str, Any] = {"dtype": str, "keep_default_na": False, "low_memory": False}
             try:
                 if archive is None:
-                    df = pd.read_csv(
-                        os.path.join(gtfs_path, file_name), dtype=dtype, low_memory=False
-                    )
+                    frame = pd.read_csv(os.path.join(gtfs_path, name), **options)
                 else:
-                    with archive.open(resolved[file_name]) as handle:
-                        df = pd.read_csv(handle, dtype=dtype, low_memory=False)
-                data[key] = df
-                log.info("Loaded %s (%d records).", file_name, len(df))
-
+                    with archive.open(members[name][0]) as handle:
+                        frame = pd.read_csv(handle, **options)
             except pd.errors.EmptyDataError as exc:
-                raise ValueError(f"File '{file_name}' in '{gtfs_path}' is empty.") from exc
-
+                raise ValueError(f"File '{name}' in '{gtfs_path}' is empty.") from exc
             except pd.errors.ParserError as exc:
-                raise ValueError(f"Parser error in '{file_name}' in '{gtfs_path}': {exc}") from exc
-
+                raise ValueError(f"Parser error in '{name}' in '{gtfs_path}': {exc}") from exc
+            data[name.replace(".txt", "")] = frame
+            logging.info("Loaded %s (%d records).", name, len(frame))
         return data
     finally:
         if archive is not None:
@@ -1233,10 +1210,8 @@ def load_schedule(cfg: Dict[str, Any]) -> Schedule:
     gtfs = cfg["GTFS_PATH"]
     if not os.path.isdir(gtfs) and not (os.path.isfile(gtfs) and zipfile.is_zipfile(gtfs)):
         raise NotADirectoryError(f"GTFS_PATH must be a GTFS folder or ZIP archive: {gtfs}")
-    data = load_gtfs_data(
-        gtfs,
-        files=REQUIRED_GTFS_FILES + available_gtfs_files(gtfs, OPTIONAL_GTFS_FILES),
-        dtype=str,
+    data = read_gtfs_tables(
+        gtfs, REQUIRED_GTFS_FILES + available_gtfs_files(gtfs, OPTIONAL_GTFS_FILES)
     )
     # GTFS requires a route's short name or its long name, not both.
     route_names = data["routes"].reindex(
@@ -1699,6 +1674,45 @@ def scheduled_bays(
     return dict(result)
 
 
+def scheduled_boarding_bays(
+    trips: Sequence[Dict[str, Any]], cluster_stops: Mapping[str, str], names: RouteNames
+) -> Dict[RouteEnd, Dict[str, Set[str]]]:
+    """Scheduled bays of each boarding movement, split by passenger direction.
+
+    Boarding movements are departures and through visits; arrivals (last stops)
+    only set passengers down. The passenger direction is the trip's
+    direction_id, so a departure movement whose trips leave in both directions
+    is counted in each.
+    """
+    result: Dict[RouteEnd, Dict[str, Set[str]]] = {}
+    for trip in trips:
+        route, direction = str(trip["route_id"]), str(trip["direction_id"])
+        for stop in trip["stop_times_sequence"]:
+            role = stop_role(stop)
+            if stop[2] not in cluster_stops or role == "arrive":
+                continue
+            end = RouteEnd(route, role, direction if role == "through" else "", names.label[route])
+            result.setdefault(end, {}).setdefault(direction, set()).add(cluster_stops[stop[2]])
+    return result
+
+
+def boarding_bays(
+    inventory: Dict[RouteEnd, Dict[str, Set[str]]], change: Change
+) -> Dict[Tuple[str, str], Set[str]]:
+    """Boarding bays per (route_id, direction_id) after *change*, from movement assignments.
+
+    A moved movement boards at its new bay in every direction it serves; KEEP
+    retains each direction's scheduled bays.
+    """
+    result: Dict[Tuple[str, str], Set[str]] = defaultdict(set)
+    for end, directions in inventory.items():
+        for direction, bays in directions.items():
+            result[end.route, direction].update(
+                {change.moves[end]} if end in change.moves else bays
+            )
+    return dict(result)
+
+
 # ==================================================================================================
 # DISCOVERY: TRIPS, BLOCK CHAINS, ROUTE-ENDS
 # ==================================================================================================
@@ -1957,6 +1971,7 @@ class Standard:
         )
         if self.timeline_end >= BIG:
             raise ValueError("The schedule runs beyond the supported service-day range.")
+        self.boarding_inventory = scheduled_boarding_bays(schedule.trips, self.cluster_stops, names)
         self.rows = self.render(self.block_trips)
         self.occ = self.rows[self.rows["Status"].isin(BAY_STATUSES)].reset_index(drop=True)
         self.cache: OrderedDict[tuple, DataFrame] = OrderedDict()
@@ -2044,6 +2059,22 @@ class Standard:
         if len(self.cache) > 4:
             self.cache.popitem(last=False)
         return result
+
+    def rebuilt_boarding_bays(self, change: Change) -> Dict[Tuple[str, str], Set[str]]:
+        """Boarding bays per (route_id, direction_id), read from the re-targeted trips.
+
+        Uses the same edited schedule the renderer rebuilds, independently of the
+        movement-level assignments the optimizer reasons with.
+        """
+        revised = self.changed_blocks(change)
+        result: Dict[Tuple[str, str], Set[str]] = defaultdict(set)
+        for block, originals in self.block_trips.items():
+            for trip in revised.get(block, originals):
+                for stop in trip["stop_times_sequence"]:
+                    if stop[2] in self.cluster_stops and stop_role(stop) != "arrive":
+                        key = (str(trip["route_id"]), str(trip["direction_id"]))
+                        result[key].add(self.cluster_stops[stop[2]])
+        return dict(result)
 
     def score(self, frame: DataFrame) -> Tuple[int, Dict[str, int], np.ndarray]:
         """Count over-capacity bay-minutes; one vehicle has one row per minute."""
@@ -2273,9 +2304,11 @@ def evaluate_plan(
     The model assumes a bay change only relabels the bay of each moved
     movement's vehicle-minutes. Every affected block is re-rendered and its
     facility rows, layovers included, must equal that relabeling exactly.
+    Boarding bays are read from the re-targeted trips and must equal the
+    movement-level inventory's prediction.
 
     Raises:
-        ValueError: If the rebuilt rows differ from the model's premise.
+        ValueError: If the rebuilt rows or boarding bays differ from the model's premise.
     """
     frames = {}
     cells = {}
@@ -2296,6 +2329,13 @@ def evaluate_plan(
             raise ValueError("A proposed plan counts the same physical bus twice in one minute.")
         frames[name] = bay_rows(actual)
         cells[name] = conflict_cells(standard, frames[name])
+    first = next(iter(standards.values()))
+    boarding = first.rebuilt_boarding_bays(change)
+    if boarding != boarding_bays(first.boarding_inventory, change):
+        raise ValueError(
+            "Rebuilt boarding bays differ from the movement-level model. "
+            "No recommendation is accepted; review the schedule's directions and roles."
+        )
     direct = cells[cfg["OPTIMIZER_DIRECT_STANDARD"]]
     likely = cells[cfg["OPTIMIZER_LIKELY_STANDARD"]]
     counts = category_counts(direct, likely, peak_mask(cfg["PEAK_WINDOWS"]))
@@ -2309,6 +2349,7 @@ def evaluate_plan(
         "changed_routes": len({end.route for end in change.moves}),
         "changed_movements": len(change.moves),
         "route_bays": final_route_bays(current, change),
+        "boarding_bays": boarding,
     }
 
 
@@ -2320,10 +2361,22 @@ def plan_violations(
     evaluation: Dict[str, Any],
     baseline: Dict[str, Any],
     limit: Optional[int] = None,
+    allowed: Optional[Dict[RouteEnd, Set[str]]] = None,
 ) -> List[str]:
-    """List the route-budget, score, bay-limit, group and direct-conflict rules a plan breaks."""
+    """List the rules a plan breaks.
+
+    The rules are permitted bays (when *allowed* is given), the route budget, the
+    score ceiling, bays per route, consistent boarding bays, same-bay groups and
+    the direct-conflict policy.
+    """
     problems = []
     labels = {end.route: end.label for end in current}
+    if allowed is not None:
+        outside = sorted(
+            str(end) for end, bay in change.moves.items() if bay not in allowed.get(end, set())
+        )
+        if outside:
+            problems.append(f"moves not permitted by BAY_OPTIONS or locks: {', '.join(outside)}")
     if limit is not None and evaluation["changed_routes"] > limit:
         problems.append(f"changes {evaluation['changed_routes']} routes; the budget is {limit}")
     score_limit = cfg["WEIGHTED_SCORE_LIMIT"]
@@ -2341,6 +2394,15 @@ def plan_violations(
         )
         if over:
             problems.append(f"routes using more than {bay_limit} bays: {', '.join(over)}")
+    if cfg["REQUIRE_CONSISTENT_BOARDING_BAYS"]:
+        split = sorted(
+            f"{labels.get(route, route)} direction {direction or '(blank)'} "
+            f"({', '.join(sorted(bays))})"
+            for (route, direction), bays in evaluation["boarding_bays"].items()
+            if len(bays) > 1
+        )
+        if split:
+            problems.append(f"passengers board at more than one bay: {'; '.join(split)}")
     for group in groups:
         final = [({change.moves[end]} if end in change.moves else current[end]) for end in group]
         if any(len(bays) != 1 or bays != final[0] for bays in final):
@@ -2369,6 +2431,9 @@ def plan_summary(
         "changed_routes": evaluation["changed_routes"],
         "changed_movements": evaluation["changed_movements"],
         "max_bays_used_by_one_route": max(map(len, evaluation["route_bays"].values()), default=0),
+        "max_boarding_bays_per_direction": max(
+            map(len, evaluation["boarding_bays"].values()), default=0
+        ),
         **evaluation["counts"],
         "weighted_score": evaluation["weighted_score"],
         "weighted_improvement": baseline["weighted_score"] - evaluation["weighted_score"],
@@ -2451,6 +2516,36 @@ def route_bay_rows(
             "changed_movements": sum(end.route == route for end in change.moves),
         }
         for route, bays in sorted(final.items())
+    ]
+
+
+def boarding_rows(
+    label: str,
+    cfg: Dict[str, Any],
+    inventory: Dict[RouteEnd, Dict[str, Set[str]]],
+    evaluation: Dict[str, Any],
+) -> List[Dict]:
+    """Show where each route boards in each passenger direction, before and after a plan."""
+    original = boarding_bays(inventory, Change())
+    movements: Dict[Tuple[str, str], List[str]] = defaultdict(list)
+    labels = {end.route: end.label for end in inventory}
+    for end, directions in inventory.items():
+        for direction in directions:
+            movements[end.route, direction].append(str(end))
+    return [
+        {
+            "plan": label,
+            "route_id": route,
+            "route_name": labels[route],
+            "direction": direction,
+            "boarding_movements": "; ".join(sorted(movements[route, direction])),
+            "original_boarding_bays": ", ".join(sorted(original[route, direction])),
+            "final_boarding_bays": ", ".join(sorted(bays)),
+            "final_bay_count": len(bays),
+            "consistent": len(bays) == 1,
+            "rule_required": cfg["REQUIRE_CONSISTENT_BOARDING_BAYS"],
+        }
+        for (route, direction), bays in sorted(evaluation["boarding_bays"].items())
     ]
 
 
@@ -2713,22 +2808,8 @@ class AssignmentModel:
             for route in self.routes:
                 members = [end for end in self.ends if end.route == route]
                 for bay in bays:
-                    signals = []
-                    for end in members:
-                        terms = [self.x[end, bay]] if bay in self.choices[end] else []
-                        if bay in self.current[end]:
-                            terms.append(self.x[end, None])
-                        signals.append(pulp.lpSum(terms))
-                    if any(len(signal) == 0 and signal.constant == 1 for signal in signals):
-                        used = 1
-                    elif all(len(signal) == 0 and signal.constant == 0 for signal in signals):
-                        used = 0
-                    else:
-                        used = self.binary("route_bay_used")
-                        for signal in signals:
-                            self.add(used >= signal)
-                        self.add(used <= pulp.lpSum(signals))
-                    self.route_bay_used[route, bay] = used
+                    signals = [self.bay_signal(end, bay, self.current[end]) for end in members]
+                    self.route_bay_used[route, bay] = self.usage_flag("route_bay_used", signals)
                 self.add(
                     pulp.lpSum(
                         used
@@ -2737,6 +2818,24 @@ class AssignmentModel:
                     )
                     <= self.bay_limit
                 )
+        # Consistent boarding: per route and passenger direction, the departures and
+        # through visits that board there may use one bay between them.
+        self.boarding = next(iter(standards.values())).boarding_inventory
+        self.boarding_used: Dict[Tuple[str, str, str], Any] = {}
+        if cfg["REQUIRE_CONSISTENT_BOARDING_BAYS"]:
+            members_by_pair: Dict[Tuple[str, str], List[Tuple[RouteEnd, Set[str]]]] = defaultdict(
+                list
+            )
+            for end, directions in self.boarding.items():
+                for direction, current_bays in directions.items():
+                    members_by_pair[end.route, direction].append((end, current_bays))
+            for (route, direction), members in sorted(members_by_pair.items()):
+                for bay in bays:
+                    signals = [self.bay_signal(end, bay, current) for end, current in members]
+                    self.boarding_used[route, direction, bay] = self.usage_flag(
+                        "boarding_bay_used", signals
+                    )
+                self.add(pulp.lpSum(self.boarding_used[route, direction, bay] for bay in bays) <= 1)
         self.groups = groups
         for group in self.groups:
             for end in group:
@@ -2829,6 +2928,28 @@ class AssignmentModel:
             )
         self.model += constraint
 
+    def bay_signal(self, end: RouteEnd, bay: str, kept_bays: Set[str]) -> Any:
+        """1 when *end* ends up visiting *bay*: moved there, or kept with a visit there.
+
+        *kept_bays* are the scheduled bays that KEEP retains for the visits counted.
+        """
+        terms = [self.x[end, bay]] if bay in self.choices[end] else []
+        if bay in kept_bays:
+            terms.append(self.x[end, None])
+        return self.pulp.lpSum(terms)
+
+    def usage_flag(self, prefix: str, signals: List[Any]) -> Any:
+        """1 when any signal is on: a constant where the signals settle it, else a binary."""
+        if any(len(signal) == 0 and signal.constant == 1 for signal in signals):
+            return 1
+        if all(len(signal) == 0 and signal.constant == 0 for signal in signals):
+            return 0
+        used = self.binary(prefix)
+        for signal in signals:
+            self.add(used >= signal)
+        self.add(used <= self.pulp.lpSum(signals))
+        return used
+
     def assignment_signal(self, end: RouteEnd, bay: str) -> Any:
         """Indicate a uniform final bay, including an unchanged uniform assignment."""
         terms = [self.x[end, bay]] if bay in self.choices[end] else []
@@ -2908,6 +3029,10 @@ class AssignmentModel:
         for (route, bay), variable in self.route_bay_used.items():
             if type(variable) is not int:
                 variable.setInitialValue(int(bay in route_bays[route]))
+        boarding = boarding_bays(self.boarding, change)
+        for (route, direction, bay), variable in self.boarding_used.items():
+            if type(variable) is not int:
+                variable.setInitialValue(int(bay in boarding[route, direction]))
         for name, flags in self.flags.items():
             cells = conflict_cells(self.standards[name], evaluation["frames"][name])
             for cell, variable in flags.items():
@@ -2980,6 +3105,32 @@ def solver_status(pulp: Any, model: Any, log: str) -> Dict[str, Any]:
     }
 
 
+def resolve_assignments(
+    assignments: Mapping[str, str],
+    names: RouteNames,
+    current: Dict[RouteEnd, Set[str]],
+    setting: str,
+) -> Change:
+    """Read exact movement -> bay assignments; an unchanged uniform bay becomes KEEP.
+
+    Raises:
+        ValueError: If a movement is unknown, incomplete or listed twice.
+    """
+    moves = {}
+    seen = set()
+    for selector, bay in assignments.items():
+        end = names.parse(selector)
+        if end is None or end not in current or end in seen:
+            raise ValueError(
+                f"{setting}: unknown or duplicate movement {selector!r}; use a name from the "
+                "Route-ends sheet, e.g. '101 arrive' or '101 through 0'."
+            )
+        seen.add(end)
+        if current[end] != {bay}:
+            moves[end] = bay
+    return Change(moves)
+
+
 def starting_plan(model: AssignmentModel) -> Optional[Tuple[Change, Dict[str, Any]]]:
     """Rebuild a configured proposal before accepting it as the solver's starting point.
 
@@ -2993,18 +3144,12 @@ def starting_plan(model: AssignmentModel) -> Optional[Tuple[Change, Dict[str, An
     configured = model.cfg["OPTIMIZER_STARTING_ASSIGNMENTS"]
     if not configured:
         return None
-    moves = {}
-    seen = set()
-    for selector, bay in configured.items():
-        end = model.names.parse(selector)
-        if end is None or end not in model.current or end in seen:
-            raise ValueError(f"Unknown or duplicate starting-plan movement: {selector!r}.")
-        seen.add(end)
-        if model.current[end] != {bay}:
-            if bay not in model.choices[end]:
-                raise ValueError(f"Starting-plan bay is not permitted: {selector!r} -> {bay!r}.")
-            moves[end] = bay
-    change = Change(moves)
+    change = resolve_assignments(
+        configured, model.names, model.current, "OPTIMIZER_STARTING_ASSIGNMENTS"
+    )
+    for end, bay in change.moves.items():
+        if bay not in model.choices[end]:
+            raise ValueError(f"Starting-plan bay is not permitted: {end} -> {bay!r}.")
     evaluation = evaluate_plan(model.cfg, model.standards, model.current, change)
     if not model.permitted(change, len(model.routes), evaluation):
         problems = plan_violations(
@@ -3060,6 +3205,18 @@ READ_ME_NOTES: Tuple[Tuple[str, str], ...] = (
         "changed_routes counts route IDs; changed_movements counts reassigned arrival, "
         "departure and through-direction movements. Plans are alternatives.",
     ),
+    (
+        "Boarding bays",
+        "With REQUIRE_CONSISTENT_BOARDING_BAYS, each route boards at one bay per passenger "
+        "direction (GTFS direction_id): its departures and its through visits in that "
+        "direction share a bay. Arrivals only set down and are not counted; KEEP visits are. "
+        "Checked against the re-targeted schedule for every plan.",
+    ),
+    (
+        "Named proposals",
+        "NAMED_PROPOSALS are fixed layouts scored like any plan. Rule breaks, including moves "
+        "outside BAY_OPTIONS or locks, are listed in policy_issues rather than rejected.",
+    ),
     ("Permitted new bays", "Restrict changes; KEEP may preserve a bay outside that list."),
     (
         "Automatic candidates",
@@ -3107,6 +3264,8 @@ class Report:
         self.plans: List[Dict[str, Any]] = []
         self.assignments: List[Dict[str, Any]] = []
         self.route_usage: List[Dict[str, Any]] = []
+        self.boarding: List[Dict[str, Any]] = []
+        self.boarding_inventory: Dict[RouteEnd, Dict[str, Set[str]]] = {}
         self.minutes: List[Dict[str, Any]] = []
 
     def add_plan(
@@ -3122,6 +3281,9 @@ class Report:
             return
         self.assignments.extend(assignment_rows(row["plan"], current, change))
         self.route_usage.extend(route_bay_rows(row["plan"], self.cfg, current, change))
+        self.boarding.extend(
+            boarding_rows(row["plan"], self.cfg, self.boarding_inventory, evaluation)
+        )
         self.minutes.extend(conflict_rows(row["plan"], self.cfg, evaluation))
 
     def sheets(self) -> List[Tuple[str, DataFrame]]:
@@ -3150,6 +3312,7 @@ class Report:
             ("Plan comparison", plans),
             ("Assignments", DataFrame(self.assignments)),
             ("Route bay usage", DataFrame(self.route_usage)),
+            ("Boarding bays", DataFrame(self.boarding)),
             ("Conflict minutes", DataFrame(self.minutes, columns=MINUTE_COLUMNS)),
             *self.discovery,
             ("Bay options", self.options),
@@ -3531,6 +3694,7 @@ def run(cfg: Dict[str, Any]) -> Dict[str, Any]:
     ]
     allowed, groups = resolve_bay_permissions(cfg, current, names)
     report.options = permission_inventory(current, allowed)
+    report.boarding_inventory = next(iter(standards.values())).boarding_inventory
     baseline = evaluate_plan(cfg, standards, current, Change())
     problems = plan_violations(cfg, current, groups, Change(), baseline, baseline)
     report.add_plan(
@@ -3551,6 +3715,31 @@ def run(cfg: Dict[str, Any]) -> Dict[str, Any]:
         Change(),
         baseline,
     )
+    for name, assignments in cfg["NAMED_PROPOSALS"].items():
+        change = resolve_assignments(assignments, names, current, f"NAMED_PROPOSALS[{name!r}]")
+        evaluation = evaluate_plan(cfg, standards, current, change)
+        problems = plan_violations(
+            cfg, current, groups, change, evaluation, baseline, allowed=allowed
+        )
+        info = {
+            "plan_status": "proposal",
+            "proven_optimal": False,
+            "policy_compliant": not problems,
+            "policy_issues": "; ".join(problems),
+        }
+        report.add_plan(
+            plan_summary(name.strip(), None, change, evaluation, baseline, info),
+            current,
+            change,
+            evaluation,
+        )
+        logging.info(
+            "Proposal %s: weighted score %d (baseline %d)%s.",
+            name,
+            evaluation["weighted_score"],
+            baseline["weighted_score"],
+            f"; breaks: {info['policy_issues']}" if problems else "",
+        )
     optimize, reason = optimize_decision(cfg, report.summary)
     report.status = "optimizer_pending" if optimize else "checked"
     report.reason = reason
@@ -3774,7 +3963,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help='JSON file of further CONFIGURATION overrides, e.g. {"BAY_OPTIONS": {...}}. '
-        "Flags given explicitly take precedence.",
+        "Flags given on the command line take precedence over it.",
     )
     return p
 
@@ -3793,7 +3982,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
     parser = build_arg_parser()
-    args = parser.parse_args(notebook_safe_argv(argv))
+    # argparse fills a default only where the namespace lacks the attribute, so a
+    # sentinel marks each flag that was not given; a flag repeating its default counts.
+    not_given = object()
+    args = parser.parse_args(
+        notebook_safe_argv(argv),
+        namespace=argparse.Namespace(**dict.fromkeys(CLI_SETTINGS, not_given)),
+    )
     try:
         cfg = default_config()
         if args.config:
@@ -3801,7 +3996,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if not isinstance(overrides, dict):
                 raise ValueError("--config must contain a JSON object of setting overrides.")
             cfg.update(overrides)
-        given = {dest for dest in CLI_SETTINGS if getattr(args, dest) != parser.get_default(dest)}
+        given = {dest for dest in CLI_SETTINGS if getattr(args, dest) is not not_given}
         for dest in given:
             cfg[CLI_SETTINGS[dest]] = getattr(args, dest)
         # A service day is chosen one way: a date given alone replaces the service_ids.

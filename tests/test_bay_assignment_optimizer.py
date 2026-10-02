@@ -31,16 +31,25 @@ TRIPS: list[tuple[str, str, str, list[tuple[str, ...]]]] = [
 CLUSTER = {"S1": "A", "S2": "B"}
 
 
-def write_gtfs(folder: Path, trips: list[tuple[str, str, str, list[tuple[str, ...]]]]) -> Path:
+def write_gtfs(
+    folder: Path,
+    trips: list[tuple[str, str, str, list[tuple[str, ...]]]],
+    directions: dict[str, str] | None = None,
+    route_ids: dict[str, str] | None = None,
+) -> Path:
+    """Write *trips* as a feed; trips run in direction 0 and route "10" is R10 by default."""
     folder.mkdir(parents=True)
-    stops = ["S1", "S2", "S8", "S9"]
+    stops = sorted(
+        {"S1", "S2", "S8", "S9"} | {visit[0] for *_, visits in trips for visit in visits}
+    )
+    ids = {route: (route_ids or {}).get(route, f"R{route}") for _, route, _, _ in trips}
     pd.DataFrame({"stop_id": stops, "stop_name": [f"Stop {s}" for s in stops]}).to_csv(
         folder / "stops.txt", index=False
     )
     routes = sorted({route for _, route, _, _ in trips})
     pd.DataFrame(
         {
-            "route_id": [f"R{r}" for r in routes],
+            "route_id": [ids[r] for r in routes],
             "route_short_name": routes,
             "route_long_name": "",
             "route_type": 3,
@@ -49,10 +58,10 @@ def write_gtfs(folder: Path, trips: list[tuple[str, str, str, list[tuple[str, ..
     pd.DataFrame(
         [
             {
-                "route_id": f"R{route}",
+                "route_id": ids[route],
                 "service_id": "WKDY",
                 "trip_id": trip_id,
-                "direction_id": "0",
+                "direction_id": (directions or {}).get(trip_id, "0"),
                 "block_id": block,
                 "trip_headsign": f"Route {route} headsign",
             }
@@ -125,6 +134,8 @@ def make_cfg(gtfs: Path, out: Path, **overrides: Any) -> dict[str, Any]:
         ROUTE_CHANGE_LIMITS=["all"],
         MAX_BAYS_PER_ROUTE=2,
         DIRECT_CONFLICT_POLICY="no_new",
+        REQUIRE_CONSISTENT_BOARDING_BAYS=True,
+        NAMED_PROPOSALS={},
         SOLVER_TIME_LIMIT_SECONDS=60,
     )
     cfg.update(overrides)
@@ -333,6 +344,11 @@ def test_peak_mask_half_open_and_overnight(windows: list, peak: list, off_peak: 
         ({"ROUTE_CHANGE_LIMITS": [-1]}, "ROUTE_CHANGE_LIMITS"),
         ({"OPTIMIZER_STARTING_ASSIGNMENTS": {"10 arrive": "Z"}}, "STARTING_ASSIGNMENTS"),
         ({"NOT_A_SETTING": 1}, "Unknown settings"),
+        ({"REQUIRE_CONSISTENT_BOARDING_BAYS": "yes"}, "True or False"),
+        ({"NAMED_PROPOSALS": {"Baseline": {"10 arrive": "B"}}}, "Invalid proposal name"),
+        ({"NAMED_PROPOSALS": {"Up to 3 route(s)": {"10 arrive": "B"}}}, "Invalid proposal"),
+        ({"NAMED_PROPOSALS": {"Mine": {"10 arrive": "Z"}}}, "must map one or more"),
+        ({"NAMED_PROPOSALS": {"Mine": {}}}, "must map one or more"),
     ],
 )
 def test_validate_configuration_rejects(
@@ -352,12 +368,13 @@ def test_check_only_run_writes_workbook_and_run_log(gtfs: Path, tmp_path: Path) 
     assert result["status"] == "checked"
     workbook = Path(result["workbook"])
     names = openpyxl.load_workbook(workbook, read_only=True).sheetnames
-    assert names[:6] == [
+    assert names[:7] == [
         "Read me",
         "Conflict summary",
         "Plan comparison",
         "Assignments",
         "Route bay usage",
+        "Boarding bays",
         "Conflict minutes",
     ]
     assert {"Route-ends", "Interlines", "Block chains", "Bay options", "Configuration"} <= set(
@@ -500,3 +517,183 @@ def test_main_flags_and_json_overrides(gtfs: Path, tmp_path: Path) -> None:
     log = next((tmp_path / "out").glob("*/*_runlog.txt")).read_text(encoding="utf-8")
     # A date given on the command line replaces the service_ids from the JSON file.
     assert '"SERVICE_DATE": "20260915"' in log and '"SERVICE_IDS": []' in log
+
+
+# ---------------------------------------------------------------------------
+# Consistent boarding bays
+# ---------------------------------------------------------------------------
+# Route 10 departs bay A at 08:00 (T1) and passes through bay A at 08:40 (T6), both in
+# direction 0; route 20 departs bay A at 08:00 too (T3). With route 20 locked, freeing
+# bay A at 08:00 means moving route 10's departures, and boarding then splits unless its
+# through visits follow.
+BOARDING_TRIPS: list[tuple[str, str, str, list[tuple[str, ...]]]] = [
+    ("T1", "10", "B1", [("S1", "08:00:00"), ("S9", "08:10:00")]),
+    ("T3", "20", "B2", [("S1", "08:00:00"), ("S8", "08:15:00")]),
+    ("T6", "10", "B3", [("S9", "08:30:00"), ("S1", "08:40:00"), ("S8", "08:50:00")]),
+]
+
+
+@pytest.fixture
+def boarding_gtfs(tmp_path: Path) -> Path:
+    return write_gtfs(tmp_path / "boarding_gtfs", BOARDING_TRIPS)
+
+
+def test_boarding_inventory_splits_departures_by_direction(tmp_path: Path) -> None:
+    trips = [
+        ("T1", "10", "B1", [("S1", "08:00:00"), ("S9", "08:10:00")]),
+        ("T2", "10", "B2", [("S2", "09:00:00"), ("S8", "09:10:00")]),
+        ("T3", "10", "B3", [("S8", "07:00:00"), ("S1", "07:10:00")]),
+    ]
+    gtfs = write_gtfs(tmp_path / "gtfs", trips, directions={"T2": "1"})
+    cfg = make_cfg(gtfs, tmp_path / "out")
+    _, names, current, standards = study(cfg)
+    inventory = standards["Likely conflict"].boarding_inventory
+    # Arrivals set down only; the departure movement boards at A outbound and B inbound.
+    assert {str(end): bays for end, bays in inventory.items()} == {
+        "10 depart": {"0": {"A"}, "1": {"B"}}
+    }
+    baseline = target.evaluate_plan(cfg, standards, current, target.Change())
+    assert baseline["boarding_bays"] == {("R10", "0"): {"A"}, ("R10", "1"): {"B"}}
+    assert target.plan_violations(cfg, current, [], target.Change(), baseline, baseline) == []
+    moved = target.Change({names.parse("10 depart"): "A"})
+    evaluation = target.evaluate_plan(cfg, standards, current, moved)
+    assert evaluation["boarding_bays"] == {("R10", "0"): {"A"}, ("R10", "1"): {"A"}}
+
+
+def test_split_boarding_is_a_rule_break(boarding_gtfs: Path, tmp_path: Path) -> None:
+    cfg = make_cfg(boarding_gtfs, tmp_path / "out")
+    _, names, current, standards = study(cfg)
+    baseline = target.evaluate_plan(cfg, standards, current, target.Change())
+    change = target.Change({names.parse("10 depart"): "B"})
+    evaluation = target.evaluate_plan(cfg, standards, current, change)
+    assert evaluation["boarding_bays"][("R10", "0")] == {"A", "B"}
+    problems = target.plan_violations(cfg, current, [], change, evaluation, baseline)
+    assert problems == ["passengers board at more than one bay: 10 direction 0 (A, B)"]
+    off = {**cfg, "REQUIRE_CONSISTENT_BOARDING_BAYS": False}
+    assert target.plan_violations(off, current, [], change, evaluation, baseline) == []
+
+
+def test_rebuilt_boarding_bays_must_match_the_model(
+    boarding_gtfs: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = make_cfg(boarding_gtfs, tmp_path / "out")
+    _, _, current, standards = study(cfg)
+    monkeypatch.setattr(target.Standard, "rebuilt_boarding_bays", lambda self, change: {})
+    with pytest.raises(ValueError, match="Rebuilt boarding bays differ"):
+        target.evaluate_plan(cfg, standards, current, target.Change())
+
+
+@pytest.mark.parametrize(
+    ("required", "expected"),
+    [(True, "10 depart to Bay B; 10 through 0 to Bay B"), (False, "10 depart to Bay B")],
+)
+def test_optimizer_keeps_boarding_at_one_bay(
+    boarding_gtfs: Path, tmp_path: Path, required: bool, expected: str
+) -> None:
+    pytest.importorskip("pulp")
+    cfg = make_cfg(
+        boarding_gtfs,
+        tmp_path / "out",
+        LOCKED_ROUTES=["20"],
+        REQUIRE_CONSISTENT_BOARDING_BAYS=required,
+    )
+    result = target.run(cfg)
+    assert result["status"] == "optimized"
+    workbook = Path(result["workbook"])
+    plans = sheet(workbook, "Plan comparison").set_index("plan")
+    best = plans.loc["Up to 2 route(s)"]
+    assert (best["changes"], best["weighted_score"]) == (expected, 0)
+    assert best["max_boarding_bays_per_direction"] == (1 if required else 2)
+    boarding = sheet(workbook, "Boarding bays").set_index(["plan", "route_id"])
+    row = boarding.loc[("Up to 2 route(s)", "R10")]
+    assert (bool(row["consistent"]), bool(row["rule_required"])) == (required, required)
+    assert row["boarding_movements"] == "10 depart; 10 through 0"
+
+
+# ---------------------------------------------------------------------------
+# GTFS text identifiers, command-line precedence, named proposals
+# ---------------------------------------------------------------------------
+
+
+def test_text_identifiers_are_not_read_as_missing(tmp_path: Path) -> None:
+    trips = [
+        ("T1", "NA", "null", [("S9", "07:50:00"), ("None", "08:00:00")]),
+        ("T2", "NA", "null", [("None", "08:10:00"), ("S9", "08:20:00")]),
+    ]
+    gtfs = write_gtfs(tmp_path / "gtfs", trips, route_ids={"NA": "NA"})
+    cfg = make_cfg(gtfs, tmp_path / "out", CLUSTER_STOPS={"None": "A", "S2": "B"})
+    schedule, names, current, _ = study(cfg)
+    assert {trip["route_id"] for trip in schedule.trips} == {"NA"}
+    assert {trip["block"] for trip in schedule.trips} == {"null"}
+    assert sorted(map(str, current)) == ["NA arrive", "NA depart"]
+
+
+def test_flag_equal_to_default_still_overrides_json(gtfs: Path, tmp_path: Path) -> None:
+    overrides = tmp_path / "overrides.json"
+    overrides.write_text(
+        json.dumps(
+            {
+                "CLUSTER_NAME": "TC",
+                "CLUSTER_STOPS": CLUSTER,
+                "CLUSTER_CAPACITY": {},
+                "OVERFLOW_ROUTING": {},
+                "SERVICE_IDS": ["WKDY"],
+                "SOLVER_TIME_LIMIT_SECONDS": 5,
+            }
+        ),
+        encoding="utf-8",
+    )
+    argv = [
+        "--gtfs-path",
+        str(gtfs),
+        "--output-dir",
+        str(tmp_path / "out"),
+        "--optimize",
+        "never",
+        "--time-limit",
+        str(target.SOLVER_TIME_LIMIT_SECONDS),  # the CONFIGURATION default
+        "--config",
+        str(overrides),
+    ]
+    assert target.main(argv) == 0
+    log = next((tmp_path / "out").glob("*/*_runlog.txt")).read_text(encoding="utf-8")
+    assert f'"SOLVER_TIME_LIMIT_SECONDS": {target.SOLVER_TIME_LIMIT_SECONDS}' in log
+
+
+def test_named_proposals_are_scored_and_flagged(gtfs: Path, tmp_path: Path) -> None:
+    pytest.importorskip("pulp")
+    proposals = {
+        "Consultant": {"20 arrive": "B"},  # route 20 is locked below
+        "Internal": {"10 arrive": "B", "20 arrive": "B"},  # moves the conflict to bay B
+        "Tidy": {"10 arrive": "B", "21 depart": "A"},  # "21 depart" already uses A: KEEP
+    }
+    cfg = make_cfg(gtfs, tmp_path / "out", LOCKED_ROUTES=["20"], NAMED_PROPOSALS=proposals)
+    result = target.run(cfg)
+    assert result["status"] == "optimized"
+    workbook = Path(result["workbook"])
+    plans = sheet(workbook, "Plan comparison").set_index("plan")
+    assert list(plans.index) == ["Baseline", "Consultant", "Internal", "Tidy", "Up to 3 route(s)"]
+    consultant, internal, tidy = (plans.loc[name] for name in ("Consultant", "Internal", "Tidy"))
+    assert consultant["plan_status"] == "proposal" and consultant["weighted_score"] == 0
+    assert not consultant["policy_compliant"]
+    assert consultant["policy_issues"] == "moves not permitted by BAY_OPTIONS or locks: 20 arrive"
+    assert internal["policy_issues"].endswith(
+        "direct conflicts at 1 bay-minute(s) clear in the baseline"
+    )
+    assert bool(tidy["policy_compliant"]) and tidy["changes"] == "10 arrive to Bay B"
+    assignments = sheet(workbook, "Assignments")
+    assert set(assignments["plan"]) == {
+        "Baseline",
+        "Consultant",
+        "Internal",
+        "Tidy",
+        "Up to 3 route(s)",
+    }
+
+
+def test_named_proposal_with_unknown_movement_fails(gtfs: Path, tmp_path: Path) -> None:
+    cfg = make_cfg(
+        gtfs, tmp_path / "out", OPTIMIZE_MODE="never", NAMED_PROPOSALS={"X": {"99 arrive": "B"}}
+    )
+    with pytest.raises(ValueError, match=r"NAMED_PROPOSALS\['X'\]: unknown or duplicate"):
+        target.run(cfg)
