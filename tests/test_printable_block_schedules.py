@@ -7,14 +7,21 @@ from unittest.mock import patch
 
 import pandas as pd
 import pytest
+from openpyxl import load_workbook
 
 from scripts.field_tools.printable_block_schedules import (
+    COMMENTS_PLACEHOLDER,
+    build_block_filename,
+    build_service_labels,
     export_blocks,
     export_to_excel,
     filter_data,
     format_hhmm,
+    header_width,
     load_gtfs_data,
+    main,
     prepare_stop_times,
+    service_day_label,
     time_to_seconds,
 )
 
@@ -241,6 +248,7 @@ def _make_prep_trips() -> pd.DataFrame:
             "block_id": ["B1", "B2"],
             "route_short_name": ["10", "20"],
             "direction_id": ["0", "1"],
+            "service_id": ["WKDY", "WKDY"],
         }
     )
 
@@ -355,8 +363,16 @@ def _make_block_df() -> pd.DataFrame:
             "stop_name": ["Oak St", "Elm Ave", "Pine Rd"],
             "scheduled_time_hhmm": ["07:00", "07:05", "08:00"],
             "departure_seconds": [25200.0, 25500.0, 28800.0],
+            "service_id": ["WKDY", "WKDY", "WKDY"],
+            "arrival_time": ["07:00:00", "07:05:00", "08:00:00"],
+            "departure_time": ["07:00:00", "07:05:00", "08:00:00"],
         }
     )
+
+
+# File names export_blocks writes for _make_block_df() without service labels
+B1_FILE = "block_B1_10_0700-0705_WKDY.xlsx"
+B2_FILE = "block_B2_20_0800-0800_WKDY.xlsx"
 
 
 def test_export_blocks_creates_one_file_per_block(tmp_path: Path) -> None:
@@ -366,17 +382,304 @@ def test_export_blocks_creates_one_file_per_block(tmp_path: Path) -> None:
     assert len(xlsx_files) == 2
 
 
-def test_export_blocks_filename_contains_block_id(tmp_path: Path) -> None:
+def test_export_blocks_filenames_are_human_readable(tmp_path: Path) -> None:
     with patch(f"{_MODULE}.BASE_OUTPUT_PATH", str(tmp_path)):
         export_blocks(_make_block_df())
     names = {f.name for f in tmp_path.glob("*.xlsx")}
-    assert "block_B1_schedule_printable.xlsx" in names
-    assert "block_B2_schedule_printable.xlsx" in names
+    assert names == {B1_FILE, B2_FILE}
 
 
 def test_export_blocks_output_includes_placeholder_columns(tmp_path: Path) -> None:
     with patch(f"{_MODULE}.BASE_OUTPUT_PATH", str(tmp_path)):
         export_blocks(_make_block_df())
-    result = pd.read_excel(tmp_path / "block_B1_schedule_printable.xlsx")
+    result = pd.read_excel(tmp_path / B1_FILE)
     for col in ("Actual Time", "Boardings", "Alightings", "Comments"):
         assert col in result.columns
+
+
+def test_export_blocks_all_stops_by_default(tmp_path: Path) -> None:
+    with (
+        patch(f"{_MODULE}.BASE_OUTPUT_PATH", str(tmp_path)),
+        patch(f"{_MODULE}.TIMEPOINTS_ONLY", False),
+    ):
+        export_blocks(_make_block_df())
+    result = pd.read_excel(tmp_path / B1_FILE)
+    assert len(result) == 2
+
+
+def test_export_blocks_timepoints_only_drops_non_timepoints(tmp_path: Path) -> None:
+    df = _make_block_df()
+    df["timepoint"] = [1, 0, 1]
+    with (
+        patch(f"{_MODULE}.BASE_OUTPUT_PATH", str(tmp_path)),
+        patch(f"{_MODULE}.TIMEPOINTS_ONLY", True),
+    ):
+        export_blocks(df)
+    result = pd.read_excel(tmp_path / B1_FILE, dtype=str)
+    assert result["Stop ID"].tolist() == ["S1"]
+
+
+def test_export_blocks_timepoints_only_keeps_trip_start_from_first_stop(tmp_path: Path) -> None:
+    df = _make_block_df()
+    df["timepoint"] = [0, 1, 1]  # First stop of T1 is not a timepoint
+    with (
+        patch(f"{_MODULE}.BASE_OUTPUT_PATH", str(tmp_path)),
+        patch(f"{_MODULE}.TIMEPOINTS_ONLY", True),
+    ):
+        export_blocks(df)
+    result = pd.read_excel(tmp_path / B1_FILE, dtype=str)
+    assert result["Trip Start Time"].tolist() == ["07:00"]
+
+
+def test_export_blocks_timepoints_only_skips_block_without_timepoints(tmp_path: Path) -> None:
+    with (
+        patch(f"{_MODULE}.BASE_OUTPUT_PATH", str(tmp_path)),
+        patch(f"{_MODULE}.TIMEPOINTS_ONLY", True),
+    ):
+        export_blocks(_make_block_df())  # Only B2 has a timepoint
+    names = {f.name for f in tmp_path.glob("*.xlsx")}
+    assert names == {B2_FILE}
+
+
+def test_export_blocks_timepoints_only_no_timepoints_writes_nothing(tmp_path: Path) -> None:
+    df = _make_block_df()
+    df["timepoint"] = 0
+    with (
+        patch(f"{_MODULE}.BASE_OUTPUT_PATH", str(tmp_path)),
+        patch(f"{_MODULE}.TIMEPOINTS_ONLY", True),
+    ):
+        export_blocks(df)
+    assert not list(tmp_path.glob("*.xlsx"))
+
+
+def test_export_blocks_comments_use_comments_placeholder(tmp_path: Path) -> None:
+    with patch(f"{_MODULE}.BASE_OUTPUT_PATH", str(tmp_path)):
+        export_blocks(_make_block_df())
+    result = pd.read_excel(tmp_path / B1_FILE, dtype=str)
+    assert (result["Comments"] == COMMENTS_PLACEHOLDER).all()
+    assert len(COMMENTS_PLACEHOLDER) > len(result["Boardings"].iloc[0])
+
+
+def test_export_blocks_uses_service_labels_in_filename(tmp_path: Path) -> None:
+    with patch(f"{_MODULE}.BASE_OUTPUT_PATH", str(tmp_path)):
+        export_blocks(_make_block_df(), {"WKDY": "Weekday"})
+    assert (tmp_path / "block_B1_10_0700-0705_Weekday.xlsx").exists()
+
+
+def test_export_blocks_timepoints_only_filename_spans_whole_block(tmp_path: Path) -> None:
+    df = _make_block_df()
+    df["timepoint"] = [0, 1, 1]  # 07:00 stop is dropped from the sheet
+    with (
+        patch(f"{_MODULE}.BASE_OUTPUT_PATH", str(tmp_path)),
+        patch(f"{_MODULE}.TIMEPOINTS_ONLY", True),
+    ):
+        export_blocks(df)
+    assert (tmp_path / B1_FILE).exists()
+
+
+# ---------------------------------------------------------------------------
+# service_day_label / build_service_labels
+# ---------------------------------------------------------------------------
+
+_DAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+
+
+def _calendar_row(service_id: str, served: str) -> dict[str, str]:
+    """Build a calendar.txt record; *served* is a 7-char string of 0/1 flags (Mon-Sun)."""
+    return {"service_id": service_id, **dict(zip(_DAYS, served))}
+
+
+@pytest.mark.parametrize(
+    ("served", "label"),
+    [
+        ("1111100", "Weekday"),
+        ("0000010", "Saturday"),
+        ("0000001", "Sunday"),
+        ("0000011", "Weekend"),
+        ("1111111", "Daily"),
+        ("1111000", "MonTueWedThu"),
+        ("0000100", "Fri"),
+        ("0000000", ""),
+    ],
+)
+def test_service_day_label(served: str, label: str) -> None:
+    assert service_day_label(_calendar_row("X", served)) == label
+
+
+def test_build_service_labels_from_days_with_service_id_fallback() -> None:
+    calendar = pd.DataFrame([_calendar_row("4", "1111100"), _calendar_row("HOL", "0000000")])
+    with patch(f"{_MODULE}.SERVICE_LABEL_OVERRIDES", {}):
+        assert build_service_labels(calendar) == {"4": "Weekday", "HOL": "HOL"}
+
+
+def test_build_service_labels_overrides_win() -> None:
+    calendar = pd.DataFrame([_calendar_row("4", "1111100")])
+    with patch(f"{_MODULE}.SERVICE_LABEL_OVERRIDES", {"4": "School-Day", "9": "Holiday"}):
+        assert build_service_labels(calendar) == {"4": "School-Day", "9": "Holiday"}
+
+
+# ---------------------------------------------------------------------------
+# build_block_filename
+# ---------------------------------------------------------------------------
+
+
+def _make_filename_block(
+    routes: list[str],
+    times: list[str],
+    service_ids: list[str] | None = None,
+    block_id: str = "101",
+) -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "block_id": [block_id] * len(routes),
+            "route_short_name": routes,
+            "service_id": service_ids or ["4"] * len(routes),
+            "arrival_time": times,
+            "departure_time": times,
+        }
+    )
+
+
+def test_build_block_filename_format() -> None:
+    block = _make_filename_block(["10", "10"], ["05:32:00", "18:47:00"])
+    assert build_block_filename(block, {"4": "Weekday"}) == "block_101_10_0532-1847_Weekday.xlsx"
+
+
+def test_build_block_filename_routes_in_order_first_served() -> None:
+    # Rows deliberately out of time order; route 20 runs first
+    block = _make_filename_block(["10", "20", "10"], ["09:00:00", "06:00:00", "07:00:00"])
+    assert build_block_filename(block, {}) == "block_101_20_10_0600-0900_4.xlsx"
+
+
+def test_build_block_filename_keeps_after_midnight_hours() -> None:
+    block = _make_filename_block(["10", "10"], ["23:10:00", "25:30:00"])
+    assert build_block_filename(block, {}) == "block_101_10_2310-2530_4.xlsx"
+
+
+def test_build_block_filename_uses_arrival_for_latest_time() -> None:
+    block = _make_filename_block(["10", "10"], ["07:00:00", "07:30:00"])
+    block.loc[1, "departure_time"] = None  # Last stop: arrival only
+    assert build_block_filename(block, {}) == "block_101_10_0700-0730_4.xlsx"
+
+
+def test_build_block_filename_joins_multiple_calendars() -> None:
+    block = _make_filename_block(["10", "10"], ["07:00:00", "08:00:00"], ["SAT", "WKDY"])
+    labels = {"WKDY": "Weekday", "SAT": "Saturday"}
+    assert build_block_filename(block, labels) == "block_101_10_0700-0800_Saturday+Weekday.xlsx"
+
+
+def test_build_block_filename_replaces_unsafe_characters() -> None:
+    block = _make_filename_block(["S2/S9"], ["07:00:00"], block_id="A 1")
+    assert build_block_filename(block, {"4": "Mon:Fri"}) == "block_A-1_S2-S9_0700-0700_Mon-Fri.xlsx"
+
+
+# ---------------------------------------------------------------------------
+# export_to_excel formatting
+# ---------------------------------------------------------------------------
+
+
+def _make_formatted_df() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "Stop Name": ["Oak St", "Elm Ave", "Pine Rd"],
+            "Timepoint": [1, 0, 1],
+            "Comments": ["_____"] * 3,
+        }
+    )
+
+
+def test_export_to_excel_comments_column_uses_configured_width(tmp_path: Path) -> None:
+    out = tmp_path / "schedule.xlsx"
+    with patch(f"{_MODULE}.COMMENTS_COLUMN_WIDTH", 72):
+        export_to_excel(_make_formatted_df(), str(out))
+    ws = load_workbook(out)["Schedule"]
+    assert ws.column_dimensions["C"].width == 72
+
+
+def test_export_to_excel_highlights_timepoint_rows(tmp_path: Path) -> None:
+    out = tmp_path / "schedule.xlsx"
+    with (
+        patch(f"{_MODULE}.TIMEPOINT_HIGHLIGHT_COLOR", "D9D9D9"),
+        patch(f"{_MODULE}.TIMEPOINTS_ONLY", False),
+    ):
+        export_to_excel(_make_formatted_df(), str(out))
+    ws = load_workbook(out)["Schedule"]
+    filled_rows = [
+        row_i
+        for row_i in range(2, ws.max_row + 1)
+        if all(cell.fill.fgColor.rgb == "00D9D9D9" for cell in ws[row_i])
+    ]
+    assert filled_rows == [2, 4]
+    assert ws["A3"].fill.fill_type is None
+
+
+def test_export_to_excel_no_highlight_when_color_blank(tmp_path: Path) -> None:
+    out = tmp_path / "schedule.xlsx"
+    with (
+        patch(f"{_MODULE}.TIMEPOINT_HIGHLIGHT_COLOR", ""),
+        patch(f"{_MODULE}.TIMEPOINTS_ONLY", False),
+    ):
+        export_to_excel(_make_formatted_df(), str(out))
+    ws = load_workbook(out)["Schedule"]
+    assert ws["A2"].fill.fill_type is None
+
+
+def test_export_to_excel_no_highlight_in_timepoints_only_mode(tmp_path: Path) -> None:
+    out = tmp_path / "schedule.xlsx"
+    with (
+        patch(f"{_MODULE}.TIMEPOINT_HIGHLIGHT_COLOR", "D9D9D9"),
+        patch(f"{_MODULE}.TIMEPOINTS_ONLY", True),
+    ):
+        export_to_excel(_make_formatted_df(), str(out))
+    ws = load_workbook(out)["Schedule"]
+    assert ws["A2"].fill.fill_type is None
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+
+def test_main_timepoints_only_without_timepoints_returns_1(tmp_path: Path) -> None:
+    # gtfs_basic has no timepoint column, so every stop is treated as timepoint = 0
+    with (
+        patch(f"{_MODULE}.GTFS_FOLDER_PATH", str(GTFS_BASIC)),
+        patch(f"{_MODULE}.BASE_OUTPUT_PATH", str(tmp_path)),
+        patch(f"{_MODULE}.TIMEPOINTS_ONLY", True),
+    ):
+        assert main() == 1
+    assert not list(tmp_path.glob("*.xlsx"))
+
+
+@pytest.mark.parametrize(
+    ("header", "width"),
+    [("Trip Start Time", 10), ("Stop Sequence", 8), ("Block ID", 5), ("Timepoint", 9)],
+)
+def test_header_width_is_longest_line_of_best_two_line_split(header: str, width: int) -> None:
+    assert header_width(header) == width
+
+
+def test_export_to_excel_sizes_columns_to_data_not_header(tmp_path: Path) -> None:
+    out = tmp_path / "schedule.xlsx"
+    df = pd.DataFrame({"Trip Start Time": ["07:00"], "Stop ID": ["1234"], "Stop Name": ["X" * 20]})
+    export_to_excel(df, str(out))
+    ws = load_workbook(out)["Schedule"]
+    widths = [ws.column_dimensions[col].width for col in ("A", "B", "C")]
+    assert widths == [12, 6, 22]  # header_width 10 + 2, data 4 + 2, data 20 + 2
+    assert ws.row_dimensions[1].height == 30
+
+
+def test_export_to_excel_sets_print_layout(tmp_path: Path) -> None:
+    out = tmp_path / "schedule.xlsx"
+    with (
+        patch(f"{_MODULE}.PRINT_PAPER_SIZE", 3),
+        patch(f"{_MODULE}.PRINT_LANDSCAPE", True),
+    ):
+        export_to_excel(_make_formatted_df(), str(out))
+    ws = load_workbook(out)["Schedule"]
+    assert ws.page_setup.paperSize == 3
+    assert ws.page_setup.orientation == "landscape"
+    assert ws.sheet_properties.pageSetUpPr.fitToPage is True
+    assert ws.page_setup.fitToWidth == 1
+    assert ws.page_setup.fitToHeight == 0
+    assert ws.print_title_rows == "$1:$1"
