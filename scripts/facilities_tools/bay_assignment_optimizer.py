@@ -225,8 +225,9 @@ NAMED_PROPOSALS: Dict[str, Dict[str, str]] = {
 # Moves a bus may make between bays when one trip ends at the facility and the next trip on
 # its block starts there (interlines included): from bay -> {to bay: minutes the move takes}.
 # Staying in one bay is always allowed. Any other move that is not listed is not permitted,
-# and a listed move must fit in the gap between the two trips. {} sets no rule; the Bay
-# transfers sheet still lists every move. Example: six bays round a one-way loop A-F, where a
+# and a listed move must fit in the gap between the two trips. Minutes are checked against
+# the gap only; they are not added to bay occupancy. {} sets no rule; the Bay transfers
+# sheet still lists every move. Example: six bays round a one-way loop A-F, where a
 # bus may pull forward three or more bays but never back:
 #   {"A": {"D": 1, "E": 1, "F": 2}, "B": {"E": 1, "F": 1}, "C": {"F": 1}}
 BAY_TRANSFERS: Dict[str, Dict[str, int]] = {}
@@ -234,8 +235,9 @@ BAY_TRANSFERS: Dict[str, Dict[str, int]] = {}
 # "no_new": a plan may not give a connection a move that is not permitted; scheduled moves
 # may stay as they are. "forbid": every move must be permitted, scheduled ones included.
 BAY_TRANSFER_POLICY = "report"
-# Connections with a longer gap (minutes) are exempt: the bus leaves the bays to lay over
-# and comes back, as with IN_BAY_LAYOVER_MAX_MINUTES. None checks every connection.
+# Connections with a longer gap (minutes) are exempt. Assumes a bus with a longer gap can
+# reach any bay via the layover area; confirm with operations before setting. None checks
+# every connection.
 BAY_TRANSFER_MAX_GAP_MINUTES: Optional[int] = None
 
 # --- Solver ---------------------------------------------------------------------------------------
@@ -3569,7 +3571,8 @@ READ_ME_NOTES: Tuple[Tuple[str, str], ...] = (
         "A connection is a bus ending one trip at a bay and starting the next trip on its block "
         "at a bay, interlines included; through visits are not connections. BAY_TRANSFERS "
         "lists the permitted moves between bays and their minutes, which must fit in the gap "
-        "(last-stop departure to first-stop arrival). Staying in one bay is always permitted. "
+        "(last-stop departure to first-stop arrival); they are checked against the gap only "
+        "and are not added to bay occupancy. Staying in one bay is always permitted. "
         "'report' only lists moves; 'no_new' keeps a plan from giving a connection a move that "
         "is not permitted; 'forbid' also rules out scheduled moves. The sheet lists every "
         "connection where a plan moves between bays or changes a bay, read from the "
