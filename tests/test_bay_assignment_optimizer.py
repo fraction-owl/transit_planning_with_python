@@ -37,11 +37,13 @@ def write_gtfs(
     trips: list[tuple[str, str, str, list[tuple[str, ...]]]],
     directions: dict[str, str] | None = None,
     route_ids: dict[str, str] | None = None,
+    extra_stops: tuple[str, ...] = (),
 ) -> Path:
     """Write *trips* as a feed; trips run in direction 0 and route "10" is R10 by default."""
     folder.mkdir(parents=True)
     stops = sorted(
-        {"S1", "S2", "S8", "S9"} | {visit[0] for *_, visits in trips for visit in visits}
+        {"S1", "S2", "S8", "S9", *extra_stops}
+        | {visit[0] for *_, visits in trips for visit in visits}
     )
     ids = {route: (route_ids or {}).get(route, f"R{route}") for _, route, _, _ in trips}
     pd.DataFrame({"stop_id": stops, "stop_name": [f"Stop {s}" for s in stops]}).to_csv(
@@ -350,6 +352,13 @@ def test_peak_mask_half_open_and_overnight(windows: list, peak: list, off_peak: 
         ({"NAMED_PROPOSALS": {"Up to 3 route(s)": {"10 arrive": "B"}}}, "Invalid proposal"),
         ({"NAMED_PROPOSALS": {"Mine": {"10 arrive": "Z"}}}, "must map one or more"),
         ({"NAMED_PROPOSALS": {"Mine": {}}}, "must map one or more"),
+        ({"BAY_TRANSFERS": {"A": {"Z": 1}}}, "Invalid BAY_TRANSFERS entry 'A'"),
+        ({"BAY_TRANSFERS": {"A": {"A": 1}}}, "Invalid BAY_TRANSFERS entry 'A'"),
+        ({"BAY_TRANSFERS": {"A": {"B": -1}}}, "Invalid BAY_TRANSFERS entry 'A'"),
+        ({"BAY_TRANSFERS": {"Z": {"B": 1}}}, "Invalid BAY_TRANSFERS entry 'Z'"),
+        ({"BAY_TRANSFER_POLICY": "strict"}, "BAY_TRANSFER_POLICY must be one of"),
+        ({"BAY_TRANSFER_POLICY": "no_new"}, "needs a BAY_TRANSFERS table"),
+        ({"BAY_TRANSFER_MAX_GAP_MINUTES": -1}, "BAY_TRANSFER_MAX_GAP_MINUTES"),
     ],
 )
 def test_validate_configuration_rejects(
@@ -369,13 +378,14 @@ def test_check_only_run_writes_workbook_and_run_log(gtfs: Path, tmp_path: Path) 
     assert result["status"] == "checked"
     workbook = Path(result["workbook"])
     names = openpyxl.load_workbook(workbook, read_only=True).sheetnames
-    assert names[:7] == [
+    assert names[:8] == [
         "Read me",
         "Conflict summary",
         "Plan comparison",
         "Assignments",
         "Route bay usage",
         "Boarding bays",
+        "Bay transfers",
         "Conflict minutes",
     ]
     assert {"Route-ends", "Interlines", "Block chains", "Bay options", "Configuration"} <= set(
@@ -749,3 +759,220 @@ def test_arrivals_need_no_direction_and_directions_are_normalized(tmp_path: Path
     assert target.plan_violations(cfg, current, [], target.Change(), baseline, baseline) == [
         "passengers board at more than one bay: 10 direction 1 (A, B)"
     ]
+
+
+# ---------------------------------------------------------------------------
+# Bus circulation: permitted moves between bays
+# ---------------------------------------------------------------------------
+# Six bays round a one-way loop, A to F (stops P1-P6). A bus may pull forward three or
+# more bays, never back: A-D, A-E and A-F are permitted; A-B, A-C and F-A are not.
+# Route 10's bus arrives at D at 08:00 and leaves D at 08:10, waiting in its arrival bay;
+# locked route 20 leaves D at 08:03. Freeing D means moving route 10's arrivals, which
+# also moves its bus between bays: only A to D is permitted.
+LOOP = {f"P{i}": bay for i, bay in enumerate("ABCDEF", start=1)}
+LOOP_TRIPS: list[tuple[str, str, str, list[tuple[str, ...]]]] = [
+    ("T1", "10", "B1", [("S9", "07:50:00"), ("P4", "08:00:00")]),
+    ("T2", "10", "B1", [("P4", "08:10:00"), ("S9", "08:20:00")]),
+    ("T3", "20", "B2", [("P4", "08:03:00"), ("S8", "08:20:00")]),
+]
+# Route 30 is scheduled to back up from F to A, a move the loop does not permit.
+BACKWARD_TRIPS: list[tuple[str, str, str, list[tuple[str, ...]]]] = [
+    ("T7", "30", "B4", [("S8", "08:50:00"), ("P6", "09:00:00")]),
+    ("T8", "30", "B4", [("P1", "09:05:00"), ("S9", "09:20:00")]),
+]
+
+
+def one_way_loop(order: str = "ABCDEF", min_ahead: int = 3, minutes: int = 1) -> dict:
+    """BAY_TRANSFERS for a one-way loop: forward *min_ahead* bays or more, never back."""
+    return {
+        bay: {ahead: minutes for ahead in order[i + min_ahead :]}
+        for i, bay in enumerate(order)
+        if order[i + min_ahead :]
+    }
+
+
+def loop_cfg(tmp_path: Path, trips: list = LOOP_TRIPS, **overrides: Any) -> dict[str, Any]:
+    gtfs = write_gtfs(tmp_path / "loop_gtfs", trips, extra_stops=tuple(LOOP))
+    settings: dict[str, Any] = {
+        "CLUSTER_STOPS": dict(LOOP),
+        "LOCKED_ROUTES": ["20"],
+        "BAY_TRANSFERS": one_way_loop(),
+        "BAY_TRANSFER_POLICY": "no_new",
+    }
+    return make_cfg(gtfs, tmp_path / "out", **{**settings, **overrides})
+
+
+def best_plan(result: dict[str, Any]) -> pd.Series:
+    plans = sheet(Path(result["workbook"]), "Plan comparison").set_index("plan")
+    return plans.loc[[name for name in plans.index if str(name).startswith("Up to")][-1]]
+
+
+def test_one_way_loop_table_matches_the_example() -> None:
+    assert one_way_loop() == {
+        "A": {"D": 1, "E": 1, "F": 1},
+        "B": {"E": 1, "F": 1},
+        "C": {"F": 1},
+    }
+
+
+def test_connections_cover_same_block_hand_offs_including_interlines(
+    gtfs: Path, tmp_path: Path
+) -> None:
+    _, _, _, standards = study(make_cfg(gtfs, tmp_path / "out"))
+    found = {
+        (c.block, c.from_trip, c.to_trip, str(c.arrive), str(c.depart), c.from_bay, c.to_bay, c.gap)
+        for c in standards["Likely conflict"].connections
+    }
+    assert found == {
+        ("B1", "T1", "T2", "10 arrive", "10 depart", "A", "A", 10),
+        ("B2", "T3", "T4", "20 arrive", "21 depart", "A", "A", 20),
+    }
+
+
+def test_transfer_check_reasons(tmp_path: Path) -> None:
+    cfg = loop_cfg(tmp_path)
+    _, _, _, standards = study(cfg)
+    (connection,) = standards["Likely conflict"].connections  # D to D, 10-minute gap
+    check = target.transfer_check
+    assert check(cfg, connection, "A", "D") == (True, "permitted (1 min)")
+    assert check(cfg, connection, "C", "D") == (False, "not in BAY_TRANSFERS")
+    assert check(cfg, connection, "F", "A") == (False, "not in BAY_TRANSFERS")
+    assert check(cfg, connection, "D", "D") == (True, "same bay")
+    slow = {**cfg, "BAY_TRANSFERS": one_way_loop(minutes=11)}
+    assert check(slow, connection, "A", "D") == (False, "needs 11 min; the gap is 10 min")
+    exempt = {**cfg, "BAY_TRANSFER_MAX_GAP_MINUTES": 5}
+    assert check(exempt, connection, "C", "D")[0] is True
+    assert check({**cfg, "BAY_TRANSFERS": {}}, connection, "C", "D") == (
+        None,
+        "no BAY_TRANSFERS table",
+    )
+
+
+def test_unpermitted_moves_break_the_rule_by_policy(tmp_path: Path) -> None:
+    cfg = loop_cfg(tmp_path, LOOP_TRIPS + BACKWARD_TRIPS)
+    _, names, current, standards = study(cfg)
+    baseline = target.evaluate_plan(cfg, standards, current, target.Change())
+    # The scheduled F to A move is kept under no_new and breaks the rule under forbid.
+    assert target.plan_violations(cfg, current, [], target.Change(), baseline, baseline) == []
+    forbid = {**cfg, "BAY_TRANSFER_POLICY": "forbid"}
+    assert target.plan_violations(forbid, current, [], target.Change(), baseline, baseline) == [
+        "1 bay transfer(s) not permitted by BAY_TRANSFERS: F to A (block B4, 09:00)"
+    ]
+    change = target.Change({names.parse("10 arrive"): "C"})
+    evaluation = target.evaluate_plan(cfg, standards, current, change)
+    assert target.plan_violations(cfg, current, [], change, evaluation, baseline) == [
+        "1 bay transfer(s) not permitted by BAY_TRANSFERS: C to D (block B1, 08:00)"
+    ]
+    report = {**cfg, "BAY_TRANSFER_POLICY": "report"}
+    assert target.plan_violations(report, current, [], change, evaluation, baseline) == []
+    slow = {**cfg, "BAY_TRANSFERS": one_way_loop(minutes=11)}
+    moved = target.Change({names.parse("10 arrive"): "A"})
+    evaluation = target.evaluate_plan(slow, standards, current, moved)
+    assert target.plan_violations(slow, current, [], moved, evaluation, baseline) == [
+        "1 bay transfer(s) not permitted by BAY_TRANSFERS: "
+        "A to D (block B1, 08:00; needs 11 min; the gap is 10 min)"
+    ]
+
+
+def test_rebuilt_transfers_must_match_the_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = loop_cfg(tmp_path)
+    _, _, current, standards = study(cfg)
+    monkeypatch.setattr(target.Standard, "rebuilt_transfers", lambda self, change: [])
+    with pytest.raises(ValueError, match="Rebuilt bay-to-bay moves differ"):
+        target.evaluate_plan(cfg, standards, current, target.Change())
+
+
+def test_optimizer_moves_buses_forward_only(tmp_path: Path) -> None:
+    pytest.importorskip("pulp")
+    result = target.run(loop_cfg(tmp_path))
+    assert result["status"] == "optimized"
+    best = best_plan(result)
+    assert (best["changes"], best["weighted_score"]) == ("10 arrive to Bay A", 0)
+    assert (best["bay_transfers"], best["unpermitted_transfers"]) == (1, 0)
+    transfers = sheet(Path(result["workbook"]), "Bay transfers").set_index("plan")
+    row = transfers.loc[best.name]
+    assert (row["scheduled_move"], row["plan_move"], row["check"]) == (
+        "D to D",
+        "A to D",
+        "permitted (1 min)",
+    )
+    assert bool(row["changed"]) and bool(row["permitted"])
+
+
+@pytest.mark.parametrize(
+    ("policy", "movements", "unpermitted"), [("report", 1, 1), ("no_new", 2, 0)]
+)
+def test_circulation_policy_trades_moves_for_permitted_transfers(
+    tmp_path: Path, policy: str, movements: int, unpermitted: int
+) -> None:
+    pytest.importorskip("pulp")
+    # Without bay A, a single move leaves route 10's bus pulling forward too few bays or
+    # backing up into D; under no_new its departures must move as well, to the same bay
+    # or to a permitted one (B-E, B-F or C-F).
+    options = {"10 arrive": ["B", "C", "E", "F"]}
+    result = target.run(loop_cfg(tmp_path, BAY_OPTIONS=options, BAY_TRANSFER_POLICY=policy))
+    best = best_plan(result)
+    assert best["weighted_score"] == 0 and bool(best["policy_compliant"])
+    assert (best["changed_movements"], best["unpermitted_transfers"]) == (movements, unpermitted)
+    if policy == "no_new":
+        moves = dict(part.split(" to Bay ") for part in best["changes"].split("; "))
+        start, end = moves["10 arrive"], moves["10 depart"]
+        assert start == end or end in one_way_loop().get(start, {})
+
+
+def test_forbid_also_fixes_scheduled_moves(tmp_path: Path) -> None:
+    pytest.importorskip("pulp")
+    cfg = loop_cfg(tmp_path, LOOP_TRIPS + BACKWARD_TRIPS, BAY_TRANSFER_POLICY="forbid")
+    result = target.run(cfg)
+    assert result["status"] == "optimized"
+    plans = sheet(Path(result["workbook"]), "Plan comparison").set_index("plan")
+    assert not plans.loc["Baseline", "policy_compliant"]
+    assert plans.loc["Baseline", "unpermitted_transfers"] == 1
+    best = best_plan(result)
+    assert best["unpermitted_transfers"] == 0 and best["weighted_score"] == 0
+    assert best["changes"] in {
+        "10 arrive to Bay A; 30 arrive to Bay A",
+        "10 arrive to Bay A; 30 depart to Bay F",
+    }
+
+
+def test_forbid_with_a_locked_backward_move_has_no_plan(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    pytest.importorskip("pulp")
+    cfg = loop_cfg(
+        tmp_path,
+        LOOP_TRIPS + BACKWARD_TRIPS,
+        BAY_TRANSFER_POLICY="forbid",
+        LOCKED_ROUTES=["20", "30"],
+    )
+    result = target.run(cfg)
+    assert result["status"] == "optimizer_no_solution"
+    assert best_plan(result)["plan_status"] == "infeasible"
+    assert "no plan meets BAY_TRANSFER_POLICY = 'forbid': F to A (block B4)" in caplog.text
+
+
+def test_transfer_policy_flag_overrides_json(tmp_path: Path) -> None:
+    gtfs = write_gtfs(tmp_path / "gtfs", LOOP_TRIPS, extra_stops=tuple(LOOP))
+    overrides = tmp_path / "overrides.json"
+    overrides.write_text(
+        json.dumps(
+            {
+                "CLUSTER_NAME": "TC",
+                "CLUSTER_STOPS": LOOP,
+                "CLUSTER_CAPACITY": {},
+                "OVERFLOW_ROUTING": {},
+                "SERVICE_IDS": ["WKDY"],
+                "BAY_TRANSFERS": one_way_loop(),
+                "BAY_TRANSFER_POLICY": "report",
+            }
+        ),
+        encoding="utf-8",
+    )
+    argv = ["--gtfs-path", str(gtfs), "--output-dir", str(tmp_path / "out"), "--optimize"]
+    argv += ["never", "--transfer-policy", "forbid", "--config", str(overrides)]
+    assert target.main(argv) == 0
+    log = next((tmp_path / "out").glob("*/*_runlog.txt")).read_text(encoding="utf-8")
+    assert '"BAY_TRANSFER_POLICY": "forbid"' in log
