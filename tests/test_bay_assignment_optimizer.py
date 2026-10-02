@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -697,3 +698,54 @@ def test_named_proposal_with_unknown_movement_fails(gtfs: Path, tmp_path: Path) 
     )
     with pytest.raises(ValueError, match=r"NAMED_PROPOSALS\['X'\]: unknown or duplicate"):
         target.run(cfg)
+
+
+# ---------------------------------------------------------------------------
+# Boarding directions must be known when the boarding rule is on
+# ---------------------------------------------------------------------------
+# Route 10 departs bay A (T1) and passes through bay B (T6); T7 ends at bay A.
+DIRECTION_TRIPS: list[tuple[str, str, str, list[tuple[str, ...]]]] = [
+    ("T1", "10", "B1", [("S1", "08:00:00"), ("S9", "08:10:00")]),
+    ("T6", "10", "B3", [("S9", "08:30:00"), ("S2", "08:40:00"), ("S8", "08:50:00")]),
+    ("T7", "10", "B4", [("S8", "09:00:00"), ("S1", "09:10:00")]),
+]
+
+
+@pytest.mark.parametrize("value", ["", "2", "north"])
+def test_unknown_boarding_direction_stops_the_run(tmp_path: Path, value: str) -> None:
+    gtfs = write_gtfs(tmp_path / "gtfs", DIRECTION_TRIPS, directions={"T1": value})
+    cfg = make_cfg(gtfs, tmp_path / "out", OPTIMIZE_MODE="never")
+    label = re.escape(value or "(blank)")
+    with pytest.raises(ValueError, match=rf"Unknown directions: 10 direction {label}: 1 trip"):
+        target.run(cfg)
+
+
+def test_unknown_direction_is_reported_when_the_rule_is_off(tmp_path: Path) -> None:
+    gtfs = write_gtfs(tmp_path / "gtfs", DIRECTION_TRIPS, directions={"T1": ""})
+    cfg = make_cfg(
+        gtfs, tmp_path / "out", OPTIMIZE_MODE="never", REQUIRE_CONSISTENT_BOARDING_BAYS=False
+    )
+    workbook = Path(target.run(cfg)["workbook"])
+    boarding = sheet(workbook, "Boarding bays").fillna({"direction": ""})
+    rows = boarding.set_index("direction")
+    assert (rows.loc["", "final_boarding_bays"], rows.loc[0, "final_boarding_bays"]) == ("A", "B")
+    assert not boarding["rule_required"].any()
+
+
+def test_arrivals_need_no_direction_and_directions_are_normalized(tmp_path: Path) -> None:
+    # T7 only terminates here, so its blank direction is exempt; " 1 " and "1.0" mean 1.
+    directions = {"T1": " 1 ", "T6": "1.0", "T7": ""}
+    gtfs = write_gtfs(tmp_path / "gtfs", DIRECTION_TRIPS, directions=directions)
+    cfg = make_cfg(gtfs, tmp_path / "out")
+    schedule, names, current, standards = study(cfg)
+    assert {trip["trip_id"]: trip["direction_id"] for trip in schedule.trips} == {
+        "T1": "1",
+        "T6": "1",
+        "T7": "",
+    }
+    assert sorted(map(str, current)) == ["10 arrive", "10 depart", "10 through 1"]
+    baseline = target.evaluate_plan(cfg, standards, current, target.Change())
+    assert baseline["boarding_bays"] == {("R10", "1"): {"A", "B"}}
+    assert target.plan_violations(cfg, current, [], target.Change(), baseline, baseline) == [
+        "passengers board at more than one bay: 10 direction 1 (A, B)"
+    ]

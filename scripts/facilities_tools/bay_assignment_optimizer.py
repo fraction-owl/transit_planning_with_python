@@ -185,7 +185,8 @@ ROUTE_CHANGE_LIMITS: List[Any] = ["all"]
 MAX_BAYS_PER_ROUTE: Optional[int] = 2
 # True: each route boards at one bay per passenger direction (GTFS direction_id). Its
 # departures from the facility and its through visits in that direction must share a
-# bay. Arrivals (last stops) only set down and are not counted; KEEP visits are.
+# bay. Arrivals (last stops) only set down and are not counted; KEEP visits are. Trips
+# that board at the facility then need direction_id 0 or 1, or the run stops.
 REQUIRE_CONSISTENT_BOARDING_BAYS = True
 # "weighted": allow trade-offs; "no_increase": cap total direct minutes at the baseline;
 # "no_new": forbid direct conflicts at any bay-minute that is clear today. This restricts
@@ -892,6 +893,15 @@ def _text(value: object) -> str:
     return "" if value is None or pd.isna(value) else str(value)
 
 
+def normalize_direction(value: object) -> str:
+    """GTFS direction_id as ``"0"`` or ``"1"`` where it is one, else as written (stripped).
+
+    Surrounding spaces and a spreadsheet's decimal form (``"1.0"``) are tolerated.
+    """
+    text = _text(value).strip()
+    return text[0] if re.fullmatch(r"[01](\.0*)?", text) else text
+
+
 def blank_text(values: pd.Series) -> pd.Series:
     """True where a GTFS text field is missing or only whitespace."""
     return values.isna() | values.astype(str).str.strip().eq("")
@@ -1020,6 +1030,7 @@ def select_facility_blocks(
     stop_times_df = stop_times_df.copy()
     for column in ("direction_id", "block_id", "trip_headsign", "route_short_name"):
         trips_df[column] = trips_df[column].fillna("") if column in trips_df.columns else ""
+    trips_df["direction_id"] = trips_df["direction_id"].map(normalize_direction)
     if "route_long_name" in trips_df.columns:
         trips_df["route_long_name"] = trips_df["route_long_name"].fillna("")
     else:
@@ -1675,7 +1686,10 @@ def scheduled_bays(
 
 
 def scheduled_boarding_bays(
-    trips: Sequence[Dict[str, Any]], cluster_stops: Mapping[str, str], names: RouteNames
+    trips: Sequence[Dict[str, Any]],
+    cluster_stops: Mapping[str, str],
+    names: RouteNames,
+    require_direction: bool = False,
 ) -> Dict[RouteEnd, Dict[str, Set[str]]]:
     """Scheduled bays of each boarding movement, split by passenger direction.
 
@@ -1683,16 +1697,36 @@ def scheduled_boarding_bays(
     only set passengers down. The passenger direction is the trip's
     direction_id, so a departure movement whose trips leave in both directions
     is counted in each.
+
+    Raises:
+        ValueError: With *require_direction*, if a trip that boards at the
+            facility has a direction_id other than ``"0"`` or ``"1"``: whether its
+            passengers travel the same way as another movement's is unknown.
     """
     result: Dict[RouteEnd, Dict[str, Set[str]]] = {}
+    unknown: Dict[str, Set[str]] = defaultdict(set)
     for trip in trips:
         route, direction = str(trip["route_id"]), str(trip["direction_id"])
         for stop in trip["stop_times_sequence"]:
             role = stop_role(stop)
             if stop[2] not in cluster_stops or role == "arrive":
                 continue
+            if direction not in {"0", "1"}:
+                unknown[f"{names.label[route]} direction {direction or '(blank)'}"].add(
+                    str(trip["trip_id"])
+                )
             end = RouteEnd(route, role, direction if role == "through" else "", names.label[route])
             result.setdefault(end, {}).setdefault(direction, set()).add(cluster_stops[stop[2]])
+    if require_direction and unknown:
+        listed = "; ".join(
+            f"{key}: {len(trip_ids)} trip(s), e.g. {_listed(sorted(trip_ids), 3)}"
+            for key, trip_ids in sorted(unknown.items())
+        )
+        raise ValueError(
+            "REQUIRE_CONSISTENT_BOARDING_BAYS needs direction_id 0 or 1 on every trip that "
+            f"departs from or passes through the facility. Unknown directions: {listed}. "
+            "Fill in direction_id upstream, or set REQUIRE_CONSISTENT_BOARDING_BAYS = False."
+        )
     return result
 
 
@@ -1971,7 +2005,12 @@ class Standard:
         )
         if self.timeline_end >= BIG:
             raise ValueError("The schedule runs beyond the supported service-day range.")
-        self.boarding_inventory = scheduled_boarding_bays(schedule.trips, self.cluster_stops, names)
+        self.boarding_inventory = scheduled_boarding_bays(
+            schedule.trips,
+            self.cluster_stops,
+            names,
+            require_direction=cfg["REQUIRE_CONSISTENT_BOARDING_BAYS"],
+        )
         self.rows = self.render(self.block_trips)
         self.occ = self.rows[self.rows["Status"].isin(BAY_STATUSES)].reset_index(drop=True)
         self.cache: OrderedDict[tuple, DataFrame] = OrderedDict()
@@ -3210,7 +3249,8 @@ READ_ME_NOTES: Tuple[Tuple[str, str], ...] = (
         "With REQUIRE_CONSISTENT_BOARDING_BAYS, each route boards at one bay per passenger "
         "direction (GTFS direction_id): its departures and its through visits in that "
         "direction share a bay. Arrivals only set down and are not counted; KEEP visits are. "
-        "Checked against the re-targeted schedule for every plan.",
+        "Trips that board need direction_id 0 or 1. Checked against the re-targeted schedule "
+        "for every plan.",
     ),
     (
         "Named proposals",
