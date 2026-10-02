@@ -54,6 +54,9 @@ COPIES = {
     "scripts/gtfs_exports/block_status_timeline_exporter.py": RENDERER,
     "scripts/facilities_tools/bay_usage_analyzer.py": READERS | REPORTS,
     "scripts/facilities_tools/bay_change_sweep.py": RENDERER | READERS | REPORTS,
+    "scripts/facilities_tools/bay_assignment_optimizer.py": RENDERER
+    | REPORTS
+    | {"timestamp_to_minutes"},
 }
 
 

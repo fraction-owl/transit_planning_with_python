@@ -31,3 +31,8 @@ xlrd==2.0.1                  # Read legacy Excel .xls files (no .xlsx support)
 # String Matching
 # difflib                    # stdlib — use in place of rapidfuzz when pip-installing
 #                            # third-party packages is restricted in ArcGIS Pro
+
+# Optimization
+# pulp==3.2.2                # NOT bundled with ArcGIS Pro. bay_assignment_optimizer.py
+#                            # needs it only to optimize (check-only runs do not); pip-install
+#                            # it into a cloned Pro environment
