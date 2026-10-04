@@ -379,6 +379,95 @@ def test_to_wide_values_match_long(fixture_df: pd.DataFrame) -> None:
 
 
 # ---------------------------------------------------------------------------
+# compute_systemwide_perday_by_sp
+# ---------------------------------------------------------------------------
+
+
+def _raw_rows(period: str, rows: list[tuple[str, str, float, float]]) -> pd.DataFrame:
+    """Build raw_all-shaped rows from (route, service_period, boardings, days)."""
+    df = pd.DataFrame(rows, columns=["ROUTE_NAME", "SERVICE_PERIOD", "MTH_BOARD", "DAYS"])
+    df["period"] = period
+    df["period_dt"] = mod.parse_month(period)
+    return df
+
+
+def test_systemwide_perday_divides_by_month_service_days() -> None:
+    # Four routes carry the same weekday ridership both years; two new low-ridership
+    # routes start in Jul-2025. Systemwide boardings per weekday rise 2,800 -> 3,000,
+    # whereas boardings per route-day would fall 700 -> 500.
+    base = [("101", 1000.0), ("202", 800.0), ("303", 600.0), ("404", 400.0)]
+    jul24 = _raw_rows("Jul-2024", [(r, "Weekday", per_day * 23, 23.0) for r, per_day in base])
+    jul25 = _raw_rows(
+        "Jul-2025",
+        [
+            (r, "Weekday", per_day * 23, 23.0)
+            for r, per_day in [*base, ("505", 100.0), ("606", 100.0)]
+        ],
+    )
+
+    result = mod.compute_systemwide_perday_by_sp(pd.concat([jul24, jul25], ignore_index=True), {})
+
+    weekday = result["Weekday"]
+    assert weekday[datetime(2024, 7, 1)] == pytest.approx(2800.0)
+    assert weekday[datetime(2025, 7, 1)] == pytest.approx(3000.0)
+    months = mod.month_range(datetime(2024, 7, 1), datetime(2025, 7, 1))
+    yoy = mod.monthly_yoy_pct(weekday, months)
+    assert yoy[datetime(2025, 7, 1)] == pytest.approx((3000 / 2800 - 1) * 100)
+
+
+def test_systemwide_perday_counts_partial_month_route_in_proportion() -> None:
+    # Route 303 ran 10 of the month's 20 weekdays: its boardings count toward the
+    # 20-day month instead of adding 10 route-days to the denominator.
+    raw = _raw_rows(
+        "Jul-2024",
+        [
+            ("101", "Weekday", 4000.0, 20.0),
+            ("202", "Weekday", 2000.0, 20.0),
+            ("303", "Weekday", 1000.0, 10.0),
+        ],
+    )
+    result = mod.compute_systemwide_perday_by_sp(raw, {})
+    assert result["Weekday"][datetime(2024, 7, 1)] == pytest.approx(7000 / 20)
+
+
+def test_systemwide_perday_subtracts_weekday_holidays_once() -> None:
+    raw = _raw_rows(
+        "Jul-2024",
+        [
+            ("101", "Weekday", 2300.0, 23.0),
+            ("202", "Weekday", 4600.0, 23.0),
+            ("101", "Saturday", 400.0, 4.0),
+            ("202", "Saturday", 800.0, 4.0),
+        ],
+    )
+    result = mod.compute_systemwide_perday_by_sp(raw, {"Jul-2024": 1})
+    assert result["Weekday"][datetime(2024, 7, 1)] == pytest.approx(6900 / 22)
+    assert result["Saturday"][datetime(2024, 7, 1)] == pytest.approx(1200 / 4)
+
+
+def test_systemwide_perday_tie_in_service_days_goes_to_larger_count() -> None:
+    raw = _raw_rows(
+        "Jul-2024",
+        [("101", "Weekday", 2000.0, 20.0), ("202", "Weekday", 1000.0, 10.0)],
+    )
+    result = mod.compute_systemwide_perday_by_sp(raw, {})
+    assert result["Weekday"][datetime(2024, 7, 1)] == pytest.approx(3000 / 20)
+
+
+def test_systemwide_perday_excludes_total_rows() -> None:
+    raw = _raw_rows(
+        "Jul-2024",
+        [
+            ("101", "Weekday", 2000.0, 20.0),
+            ("202", "Weekday", 4000.0, 20.0),
+            ("TOTAL", "Weekday", 6000.0, 20.0),
+        ],
+    )
+    result = mod.compute_systemwide_perday_by_sp(raw, {})
+    assert result["Weekday"][datetime(2024, 7, 1)] == pytest.approx(6000 / 20)
+
+
+# ---------------------------------------------------------------------------
 # Integration: main() with mocked read_month_workbook
 # ---------------------------------------------------------------------------
 

@@ -782,17 +782,32 @@ def rolling_mean_yoy(yoy: pd.Series) -> pd.Series:
     return yoy.rolling(ROLLING_WINDOW_MONTHS, min_periods=MIN_ROLLING_MONTHS).mean()
 
 
+def month_service_days(days: pd.Series) -> float:
+    """The month's service days for one service period: the most common ``DAYS``.
+
+    Matches ``summarize_service_days`` in ntd_monthly_summary.py. The most
+    frequently reported count ignores routes with partial-month service, and a
+    tie goes to the larger (full-month) count rather than to whichever route
+    happens to be listed first.
+    """
+    counts = days.value_counts()
+    return float(counts[counts == counts.max()].index.max())
+
+
 def compute_systemwide_perday_by_sp(
     raw_all: pd.DataFrame, holiday_counts: dict[str, int]
 ) -> dict[str, pd.Series]:
     """Per-service-period systemwide per-day average over all routes on disk.
 
-    For each service period, sums boardings and service days across every route
-    (after dropping subtotal/aggregate rows per SYSTEMWIDE_EXCLUDE_ROUTES_REGEX)
-    and divides. When ``holiday_counts`` is non-empty, each Weekday row's days are
-    reduced by that month's weekday holidays before summing, so the systemwide
-    Weekday baseline matches the holiday-free route series. Returns
-    ``{service_period: Series indexed by month-start}``.
+    For each service period and month, sums boardings across every route (after
+    dropping subtotal/aggregate rows per SYSTEMWIDE_EXCLUDE_ROUTES_REGEX) and
+    divides by the month's service days from :func:`month_service_days`. Summing
+    ``DAYS`` across routes would instead give boardings per route-day, because
+    every route reports the same calendar days. A route with partial-month
+    service counts in proportion to the days it ran. When ``holiday_counts`` is
+    non-empty, the month's weekday holidays are subtracted once from the Weekday
+    service days, so the systemwide Weekday baseline matches the holiday-free
+    route series. Returns ``{service_period: Series indexed by month-start}``.
     """
     if raw_all.empty:
         return {}
@@ -809,15 +824,18 @@ def compute_systemwide_perday_by_sp(
         d = d[~excluded]
     d["_b"] = pd.to_numeric(d["MTH_BOARD"], errors="coerce")
     d["_d"] = pd.to_numeric(d["DAYS"], errors="coerce")
-    if holiday_counts:
-        is_weekday = d["SERVICE_PERIOD"] == "Weekday"
-        holidays = d["period"].map(holiday_counts).fillna(0).astype(float)
-        d.loc[is_weekday, "_d"] = d.loc[is_weekday, "_d"] - holidays[is_weekday]
     d = d[d["_b"].notna() & d["_d"].notna() & (d["_d"] > 0)]
     if d.empty:
         return {}
-    g = d.groupby(["SERVICE_PERIOD", "period_dt"]).agg(b=("_b", "sum"), dd=("_d", "sum"))
-    perday = g["b"] / g["dd"]
+    g = d.groupby(["SERVICE_PERIOD", "period_dt"]).agg(
+        b=("_b", "sum"), dd=("_d", month_service_days)
+    )
+    if holiday_counts:
+        holidays = [
+            holiday_counts.get(format_month(dt), 0) if sp == "Weekday" else 0 for sp, dt in g.index
+        ]
+        g["dd"] = g["dd"] - holidays
+    perday = g["b"] / g["dd"].where(g["dd"] > 0)
     return {sp: perday.xs(sp, level="SERVICE_PERIOD") for sp in perday.index.levels[0]}
 
 
