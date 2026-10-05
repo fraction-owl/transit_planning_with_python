@@ -31,8 +31,8 @@ from __future__ import annotations
 import logging
 import os
 import re
-import sys
 import tempfile
+import time
 import zipfile
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, Sequence, Set, Tuple
@@ -271,41 +271,52 @@ def _safe_add_field(
     field_is_nullable: Optional[str] = None,
     field_is_required: Optional[str] = None,
     field_domain: Optional[str] = None,
+    attempts: int = 3,
+    delay: float = 1.5,
 ) -> bool:
     """Add a field if it does not already exist.
 
+    Shapefiles on a UNC share intermittently fail AddField with ERROR 000499
+    ("table is not editable") from a transient lock, so failures are retried
+    up to ``attempts`` times, ``delay`` seconds apart.
+
     Returns:
         True if the field exists after this call (already present or added).
-        False if AddField failed.
+        False if AddField failed on every attempt.
     """
     existing = {f.name.lower() for f in arcpy.ListFields(table) or []}
     if name.lower() in existing:
         logging.info("Field %s already exists on %s – skipping AddField.", name, table)
         return True
 
-    try:
-        arcpy.management.AddField(
-            in_table=table,
-            field_name=name,
-            field_type=field_type,
-            field_precision=field_precision,
-            field_scale=field_scale,
-            field_length=field_length,
-            field_alias=field_alias,
-            field_is_nullable=field_is_nullable,
-            field_is_required=field_is_required,
-            field_domain=field_domain,
-        )
-        return True
-    except arcpy.ExecuteError:
-        logging.warning(
-            "AddField failed for %s on %s (type=%s). Messages:\n%s",
-            name,
-            table,
-            field_type,
-            arcpy.GetMessages(2),
-        )
-        return False
+    for attempt in range(1, attempts + 1):
+        try:
+            arcpy.management.AddField(
+                in_table=table,
+                field_name=name,
+                field_type=field_type,
+                field_precision=field_precision,
+                field_scale=field_scale,
+                field_length=field_length,
+                field_alias=field_alias,
+                field_is_nullable=field_is_nullable,
+                field_is_required=field_is_required,
+                field_domain=field_domain,
+            )
+            return True
+        except arcpy.ExecuteError:
+            logging.warning(
+                "AddField failed for %s on %s (type=%s, attempt %d/%d). Messages:\n%s",
+                name,
+                table,
+                field_type,
+                attempt,
+                attempts,
+                arcpy.GetMessages(2),
+            )
+            if attempt < attempts:
+                time.sleep(delay)
+    return False
 
 
 # ============================================================================
@@ -702,10 +713,24 @@ def _export_stops_shapefile(stops_df: pd.DataFrame, out_folder: Path) -> None:
         logging.error("ArcPy error in CreateFeatureclass (stops): %s", arcpy.GetMessages(2))
         raise
 
-    _safe_add_field(fc_path, "stop_id", "TEXT", field_length=STOP_ID_LEN)
-    _safe_add_field(fc_path, "stop_nm", "TEXT", field_length=STOP_NAME_LEN)
-    _safe_add_field(fc_path, "stop_lat", "DOUBLE")
-    _safe_add_field(fc_path, "stop_lon", "DOUBLE")
+    stop_fields = [
+        ("stop_id", "TEXT", STOP_ID_LEN),
+        ("stop_nm", "TEXT", STOP_NAME_LEN),
+        ("stop_lat", "DOUBLE", None),
+        ("stop_lon", "DOUBLE", None),
+    ]
+    missing = [
+        name
+        for name, field_type, length in stop_fields
+        if not _safe_add_field(fc_path, name, field_type, field_length=length)
+    ]
+    if missing:
+        raise RuntimeError(
+            f"Could not add field(s) {', '.join(missing)} to {fc_path} (see the AddField "
+            "warnings above). ERROR 000499 here usually means a lock on the shapefile: "
+            "remove gtfs_stops from any open ArcGIS Pro map, close other sessions using "
+            "the output folder, or point OUTPUT_FOLDER at a local drive, then re-run.",
+        )
 
     fields = ["stop_id", "stop_nm", "stop_lat", "stop_lon", "SHAPE@"]
 
@@ -967,11 +992,14 @@ def main() -> int:  # noqa: D401
 
 
 if __name__ == "__main__":
+    # Exit outside the except block: a SystemExit raised while handling another
+    # exception trips an IPython traceback bug in notebook kernels.
     try:
-        raise SystemExit(main())
+        exit_code = main()
     except arcpy.ExecuteError:
         logging.error("ArcPy ExecuteError:\n%s", arcpy.GetMessages())
         raise
     except Exception:
         logging.exception("UNEXPECTED ERROR")
-        sys.exit(1)
+        exit_code = 1
+    raise SystemExit(exit_code)
