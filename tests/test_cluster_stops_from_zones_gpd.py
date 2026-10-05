@@ -323,6 +323,69 @@ def test_assign_no_stop_in_any_zone_raises() -> None:
 
 
 # ---------------------------------------------------------------------------
+# find_near_misses
+# ---------------------------------------------------------------------------
+
+
+def _near_miss_stops() -> pd.DataFrame:
+    # Park & Ride's east edge is lon -76.90: NEAR is 0.0005 degrees (about 141 ft) east
+    # of it and FAR 0.002 degrees (about 568 ft). INSIDE is in Metro, 0.0005 degrees
+    # from Park & Ride. NORTH is 0.0005 degrees above Metro's top edge (about 182 ft)
+    # and about 338 ft from Park & Ride's corner.
+    return target.prepare_stops(
+        pd.DataFrame(
+            {
+                "stop_id": ["NEAR", "FAR", "INSIDE", "NORTH"],
+                "stop_code": ["", "", "", "4000"],
+                "stop_name": ["Park & Ride East", "", "", "Metro North Lot"],
+                "stop_lat": ["38.90", "38.90", "38.90", "39.0005"],
+                "stop_lon": ["-76.8995", "-76.898", "-76.9505", "-76.951"],
+            }
+        )
+    )
+
+
+def _near_misses(max_feet: float, zones: Optional[gpd.GeoDataFrame] = None) -> pd.DataFrame:
+    zones = _loaded(ZONE_NAMES, ZONE_SHAPES) if zones is None else zones
+    stops = _near_miss_stops()
+    return target.find_near_misses(
+        stops, zones, target.assign_stops_to_zones(stops, zones), max_feet
+    )
+
+
+def test_find_near_misses_lists_stops_just_outside_a_zone(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.WARNING):
+        near = _near_misses(400)
+    # INSIDE is in Metro, so it is no near miss of Park & Ride; FAR is beyond 400 ft;
+    # NORTH is listed once, against Metro, the nearer zone.
+    assert list(zip(near["zone"], near["stop_id"])) == [("Metro", "NORTH"), ("Park & Ride", "NEAR")]
+    assert near["feet"].tolist() == pytest.approx([182, 141], abs=1)
+    assert "2 stop(s) are outside every zone but within 400 ft" in caplog.text
+    assert "NEAR (141 ft from Park & Ride)" in caplog.text
+
+
+def test_find_near_misses_leaves_out_stops_beyond_the_distance() -> None:
+    assert _near_misses(150)["stop_id"].tolist() == ["NEAR"]
+
+
+def test_find_near_misses_measures_a_projected_layer_in_its_own_units() -> None:
+    projected = _loaded(ZONE_NAMES, ZONE_SHAPES).to_crs("EPSG:2248")  # US survey feet
+    near = _near_misses(400, projected)
+    assert near["stop_id"].tolist() == ["NORTH", "NEAR"]
+    assert near["feet"].tolist() == pytest.approx(_near_misses(400)["feet"].tolist(), abs=1)
+
+
+def test_find_near_misses_zero_turns_the_check_off(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.WARNING):
+        near = _near_misses(0)
+    assert near.empty
+    assert list(near.columns) == target.NEAR_MISS_COLUMNS
+    assert "outside every zone" not in caplog.text
+
+
+# ---------------------------------------------------------------------------
 # config text
 # ---------------------------------------------------------------------------
 
@@ -376,6 +439,38 @@ def test_config_text_parses_and_summarizes_zones() -> None:
     assert "#   Metro: 3 stop(s)" in text
     assert "#   No stops, left out: Empty Lot" in text
     assert all(len(line) <= target.MAX_LINE_LENGTH for line in text.splitlines())
+
+
+def test_config_text_lists_near_misses_in_the_header() -> None:
+    near = pd.DataFrame(
+        [
+            ["Park & Ride", "NEAR", "", "Park & Ride East", 142.4],
+            ["Park & Ride", "LONG", "9100", "x" * 300, 1234.6],
+        ],
+        columns=target.NEAR_MISS_COLUMNS,
+    )
+    text = target.build_config_text(
+        _sample_assignments(), ZONE_NAMES, "zones.shp", "gtfs_folder", near, 250
+    )
+    ast.parse(text)
+    lines = text.splitlines()
+    assert (
+        "# Near misses, outside every zone but within 250 ft. Redraw a zone to add any that belong:"
+        in lines
+    )
+    assert "#   Park & Ride: NEAR, 142 ft | Park & Ride East" in lines
+    long_line = next(line for line in lines if "LONG" in line)
+    assert long_line.startswith("#   Park & Ride: LONG, 1,235 ft | 9100 | xxx")
+    assert long_line.endswith("...")
+    assert all(len(line) <= target.MAX_LINE_LENGTH for line in lines)
+
+
+def test_near_miss_lines_say_when_there_are_none_or_the_check_is_off() -> None:
+    no_rows = pd.DataFrame(columns=target.NEAR_MISS_COLUMNS)
+    assert target._near_miss_lines(no_rows, 250) == [
+        "# Near misses, outside every zone but within 250 ft: none."
+    ]
+    assert target._near_miss_lines(None, 0) == ["# Near-miss check off (NEAR_MISS_FEET = 0)."]
 
 
 def test_long_comments_are_shortened_to_the_line_length() -> None:
@@ -447,11 +542,12 @@ def test_main_reads_a_zipped_feed(tmp_path: Path) -> None:
 
 
 def test_main_clusters_the_mock_dc_feed_with_a_zipped_state_plane_shapefile(
-    tmp_path: Path,
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     paths = {"gtfs": str(MOCK_GTFS_DC_ZIP), "zones": str(STOP_CLUSTERS_ZIP)}
     out_dir = tmp_path / "out"
-    assert target.main(_cli(paths, "--output-dir", str(out_dir))) == 0
+    with caplog.at_level(logging.WARNING):
+        assert target.main(_cli(paths, "--output-dir", str(out_dir))) == 0
 
     text = (out_dir / "cluster_stops_from_zones.txt").read_text(encoding="utf-8")
     values = dict(_values(text.split("# Step 2:")[0]))
@@ -460,12 +556,33 @@ def test_main_clusters_the_mock_dc_feed_with_a_zipped_state_plane_shapefile(
         "Mock Transit Center 02": {"stops": ["DC_NS_052", "DC_R50H_L1_007"]},
         "Mock Transit Center 03": {"stops": ["DC_R40_131", "DC_R50H_L0_000", "DC_R50H_L3_007"]},
     }
-    # 24-35 ft outside Centers 01 and 04: near misses, not listed.
-    assert not {"DC_R40_087", "DC_NS_017", "DC_R50H_L3_000"} & set(values["STOP_ID_FILTER"])
     assert "#   No stops, left out: Mock Transit Center 04, Mock Transit Center 05" in text
+    assert "No stops in zone(s) Mock Transit Center 04, Mock Transit Center 05" in caplog.text
+    # Stops within the default 250 ft of a zone; the next closest are 414 ft (Center 01),
+    # 432 ft (03), 643 ft (02), 690 ft (04) and 1,047 ft (05) away.
+    near_miss_lines = [line for line in text.splitlines() if " ft | " in line]
+    assert near_miss_lines == [
+        "#   Mock Transit Center 01: DC_R40_087, 24 ft | MASSACHUSETTS AVE NW @ CAPITOL ST",
+        "#   Mock Transit Center 01: DC_R40_089, 113 ft | MASSACHUSEUTS AVE NW",
+        "#   Mock Transit Center 03: DC_R40_132, 149 ft | MASSACHUSETTS AVE NW",
+        "#   Mock Transit Center 04: DC_NS_017, 34 ft | CAPITOL ST @ VIRGINIA RD",
+        "#   Mock Transit Center 04: DC_R50H_L3_000, 35 ft | VIRGINIA RD @ CAPITOL ST",
+    ]
+    assert not {"DC_R40_087", "DC_NS_017", "DC_R50H_L3_000"} & set(values["STOP_ID_FILTER"])
+    assert "5 stop(s) are outside every zone but within 250 ft" in caplog.text
     runlog = (out_dir / "cluster_stops_from_zones_runlog.txt").read_text(encoding="utf-8")
+    assert "Near-miss feet:   250" in runlog
     assert f"Zone layer: {STOP_CLUSTERS_ZIP}" in runlog
     assert "not fingerprinted" not in runlog  # the archive itself is fingerprinted
+
+
+@pytest.mark.parametrize("near_miss_feet", ["-1", "nan"])
+def test_main_bad_near_miss_feet_exits_1(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, near_miss_feet: str
+) -> None:
+    paths = _write_inputs(tmp_path)
+    assert target.main(_cli(paths, "--near-miss-feet", near_miss_feet)) == 1
+    assert "NEAR_MISS_FEET must be 0 (off) or a positive number of feet" in caplog.text
 
 
 def test_main_overlapping_zones_exit_1(tmp_path: Path) -> None:

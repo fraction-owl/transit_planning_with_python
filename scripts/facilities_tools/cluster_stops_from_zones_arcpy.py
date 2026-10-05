@@ -15,6 +15,11 @@ stops the run: a stop may belong to only one cluster. Polygons that share a
 name form one zone. Every stop (location_type 0 or blank) in a zone is
 listed, whether or not it has scheduled trips.
 
+Zones without stops are reported and left out. Stops outside every zone but
+within ``NEAR_MISS_FEET`` of one (near misses, often a zone drawn a little
+short) are reported against their nearest zone, so they can be added by
+redrawing it.
+
 Inputs
 ------
 - GTFS feed folder or .zip (stops.txt): the feed Step 1 reads, so the
@@ -25,7 +30,8 @@ Inputs
 
 Outputs
 -------
-- The config text, written to the log.
+- The config text, written to the log. Its header lists zones without stops
+  and near misses, which are also logged as warnings.
 - Optionally, the same text as ``OUTPUT_FILENAME`` in ``OUTPUT_DIR`` with a
   ``_runlog.txt`` sidecar capturing the verbatim CONFIGURATION block and
   SHA-256 fingerprints of the inputs.
@@ -83,6 +89,10 @@ ZONES_PATH: str = r"Path\To\Your\Zones.shp"
 # is the first polygon); a polygon with a blank name is numbered the same way.
 ZONE_NAME_FIELD: str = ""
 
+# Report stops outside every zone but within this many feet of one: a zone drawn a
+# little short misses them. 0 turns the check off.
+NEAR_MISS_FEET: float = 250.0
+
 # Optional geographic (datum) transformation for projecting the stops (WGS84)
 # into the zone layer's coordinate system, e.g. "WGS_1984_(ITRF00)_To_NAD_1983".
 # "" applies none; name one if the datum shift matters for stops near a zone edge.
@@ -111,6 +121,9 @@ STEP2_SCRIPT = "scripts/facilities_tools/bay_usage_analyzer.py"
 STEP3_SCRIPT = "scripts/facilities_tools/bay_change_sweep.py"
 
 ASSIGNMENT_COLUMNS = ["zone", "stop_id", "stop_code", "stop_name"]
+NEAR_MISS_COLUMNS = [*ASSIGNMENT_COLUMNS, "feet"]
+
+METERS_PER_FOOT = 0.3048
 
 # stops.txt coordinates are WGS84 longitude/latitude.
 WGS84_WKID = 4326
@@ -604,6 +617,108 @@ def assign_stops_to_zones(
     return assignments
 
 
+def find_near_misses(
+    stops: pd.DataFrame,
+    zones: Zones,
+    assignments: pd.DataFrame,
+    max_feet: float,
+    transformation: str = "",
+) -> pd.DataFrame:
+    """Find the stops outside every zone but within *max_feet* of one, and report them.
+
+    Each stop is listed once, against its nearest zone. Distances are measured
+    in the zone layer's coordinate system when it is projected, otherwise in
+    the WGS84 UTM zone at the zones' center.
+
+    Args:
+        stops: Output of :func:`prepare_stops`.
+        zones: Output of :func:`load_zones`.
+        assignments: Output of :func:`assign_stops_to_zones`.
+        max_feet: How far outside a zone to look, in feet; 0 looks nowhere.
+        transformation: Geographic transformation from WGS84 to the zone
+            layer's datum, or "" for none (as for :func:`assign_stops_to_zones`).
+
+    Returns:
+        One row per near miss (zone, stop_id, stop_code, stop_name, feet),
+        zones in layer order and the closest stop first within each zone.
+
+    Raises:
+        ValueError: The stops or zones cannot be projected for measuring.
+    """
+    outside = stops[~stops["stop_id"].isin(assignments["stop_id"])]
+    if max_feet <= 0 or outside.empty:
+        return pd.DataFrame(columns=NEAR_MISS_COLUMNS)
+    points = _project_stops(outside, zones.spatial_reference, transformation)
+    polygons = list(zones.polygons)
+    sr = zones.spatial_reference
+    if sr.type == "Projected":
+        feet_per_unit = float(sr.metersPerUnit) / METERS_PER_FOOT
+    else:
+        # Longitude/latitude: measure in meters in the UTM zone at the zones' center.
+        sr = _utm_reference(polygons)
+        feet_per_unit = 1 / METERS_PER_FOOT
+        try:
+            points = [point.projectAs(sr) for point in points]
+            polygons = [polygon.projectAs(sr) for polygon in polygons]
+        except (RuntimeError, ValueError) as exc:
+            raise ValueError(
+                f"Could not project the zones and stops into {_sr_label(sr)} to measure "
+                f"near misses ({exc})."
+            ) from exc
+    reach = max_feet / feet_per_unit
+    boxes = [
+        (box.XMin - reach, box.YMin - reach, box.XMax + reach, box.YMax + reach)
+        for box in (polygon.extent for polygon in polygons)
+    ]
+    rows = []
+    for stop, point in zip(
+        outside[["stop_id", "stop_code", "stop_name"]].itertuples(index=False), points
+    ):
+        x, y = point.firstPoint.X, point.firstPoint.Y
+        nearest: Optional[Tuple[float, str]] = None
+        for zone, polygon, (west, south, east, north) in zip(zones.names, polygons, boxes):
+            if not (west <= x <= east and south <= y <= north):
+                continue
+            feet = polygon.distanceTo(point) * feet_per_unit
+            if feet <= max_feet and (nearest is None or feet < nearest[0]):
+                nearest = (feet, zone)
+        if nearest is not None:
+            rows.append((nearest[1], *stop, nearest[0]))
+    order = {zone: i for i, zone in enumerate(dict.fromkeys(zones.names))}
+    records = sorted(
+        pd.DataFrame(rows, columns=NEAR_MISS_COLUMNS).to_dict("records"),
+        key=lambda row: (order[row["zone"]], row["feet"], _natural_key(str(row["stop_id"]))),
+    )
+    near_misses = pd.DataFrame(records, columns=NEAR_MISS_COLUMNS)
+    if not near_misses.empty:
+        found = [
+            f"{row['stop_id']} ({_feet(row['feet'])} ft from {row['zone']})"
+            for row in near_misses.to_dict("records")
+        ]
+        logging.warning(
+            "%d stop(s) are outside every zone but within %s ft of one; redraw a zone to add "
+            "any that belong (all are listed in the config text header): %s",
+            len(near_misses),
+            f"{max_feet:,g}",
+            _preview(found, separator="; "),
+        )
+    return near_misses
+
+
+def _utm_reference(polygons: List[Any]) -> Any:
+    """Return the WGS84 UTM spatial reference for the zone at the center of lon/lat *polygons*."""
+    extents = [polygon.extent for polygon in polygons]
+    lon = (min(box.XMin for box in extents) + max(box.XMax for box in extents)) / 2
+    lat = (min(box.YMin for box in extents) + max(box.YMax for box in extents)) / 2
+    utm_zone = min(int((lon + 180) // 6) + 1, 60)
+    return arcpy.SpatialReference((32600 if lat >= 0 else 32700) + utm_zone)
+
+
+def _feet(value: float) -> str:
+    """Format a stop's distance in whole feet, with a thousands separator."""
+    return f"{value:,.0f}"
+
+
 def _project_stops(stops: pd.DataFrame, sr: Any, transformation: str) -> List[Any]:
     """Project each stop's WGS84 coordinates into *sr*, in *stops* order.
 
@@ -652,7 +767,12 @@ def _natural_key(text: str) -> Tuple[Tuple[int, int, str], ...]:
 
 
 def build_config_text(
-    assignments: pd.DataFrame, zone_order: Sequence[str], zones_path: str, gtfs_path: str
+    assignments: pd.DataFrame,
+    zone_order: Sequence[str],
+    zones_path: str,
+    gtfs_path: str,
+    near_misses: Optional[pd.DataFrame] = None,
+    near_miss_feet: float = 0.0,
 ) -> str:
     """Assemble the text to paste: a header, then one section per step.
 
@@ -661,6 +781,9 @@ def build_config_text(
         zone_order: Every zone name in layer order, including zones without stops.
         zones_path: Zone layer path, quoted in the header.
         gtfs_path: GTFS feed path, quoted in the header.
+        near_misses: Output of :func:`find_near_misses`, listed in the header.
+        near_miss_feet: The distance *near_misses* was found within; 0 means
+            the check was off.
 
     Returns:
         The config text, ending with a newline.
@@ -675,6 +798,7 @@ def build_config_text(
         f"# GTFS:  {gtfs_path}",
         *(f"#   {zone}: {count} stop(s)" for zone, count in counts.items()),
         *([f"#   No stops, left out: {', '.join(empty)}"] if empty else []),
+        *_near_miss_lines(near_misses, near_miss_feet),
         "# Every stop is listed as a single bay. Add capacity by hand after pasting.",
         rule,
     ]
@@ -685,6 +809,22 @@ def build_config_text(
         step3_text(assignments),
     ]
     return "\n\n".join(sections) + "\n"
+
+
+def _near_miss_lines(near_misses: Optional[pd.DataFrame], near_miss_feet: float) -> List[str]:
+    """Header lines listing each near miss with its zone, distance, code and name."""
+    if near_miss_feet <= 0:
+        return ["# Near-miss check off (NEAR_MISS_FEET = 0)."]
+    within = f"outside every zone but within {near_miss_feet:,g} ft"
+    if near_misses is None or near_misses.empty:
+        return [f"# Near misses, {within}: none."]
+    lines = [f"# Near misses, {within}. Redraw a zone to add any that belong:"]
+    for row in near_misses.to_dict("records"):
+        stop = str(row["stop_id"])
+        note = _describe(stop, str(row["stop_code"]), str(row["stop_name"]))
+        line = f"#   {row['zone']}: {stop}, {_feet(row['feet'])} ft"
+        lines.append(_fit(f"{line} | {note}" if note else line))
+    return lines
 
 
 def step1_text(assignments: pd.DataFrame) -> str:
@@ -813,6 +953,13 @@ def _with_comment(code: str, note: str) -> str:
     if len(note) > room:
         note = note[: room - 3].rstrip() + "..."
     return f"{code}  # {note}"
+
+
+def _fit(line: str) -> str:
+    """Shorten *line* to MAX_LINE_LENGTH, marking the cut with "..."."""
+    if len(line) <= MAX_LINE_LENGTH:
+        return line
+    return line[: MAX_LINE_LENGTH - 3].rstrip() + "..."
 
 
 def _one_line(text: str) -> str:
@@ -1030,6 +1177,14 @@ def resolve_output_file(output_dir: str, output_filename: str) -> Optional[Path]
     return Path(output_dir) / output_filename
 
 
+def check_near_miss_feet(near_miss_feet: float) -> None:
+    """Raise ValueError unless *near_miss_feet* is a finite distance of 0 or more."""
+    if not math.isfinite(near_miss_feet) or near_miss_feet < 0:
+        raise ValueError(
+            f"NEAR_MISS_FEET must be 0 (off) or a positive number of feet, got {near_miss_feet}."
+        )
+
+
 def run(args: argparse.Namespace) -> str:
     """Build the config text from the zones and the feed, log it, and optionally save it.
 
@@ -1047,13 +1202,24 @@ def run(args: argparse.Namespace) -> str:
         RunLogError: The run log could not be written and REQUIRE_RUN_LOG
             is True.
     """
+    check_near_miss_feet(args.near_miss_feet)
     output_file = resolve_output_file(args.output_dir, args.output_filename)
     zones = load_zones(args.zones_path, args.zone_name_field)
     check_zone_overlaps(zones)
     stops = prepare_stops(load_gtfs_data(args.gtfs_path, files=("stops.txt",))["stops"])
     assignments = assign_stops_to_zones(stops, zones, args.geo_transformation)
+    near_misses = find_near_misses(
+        stops, zones, assignments, args.near_miss_feet, args.geo_transformation
+    )
     zone_order = list(dict.fromkeys(zones.names))
-    text = build_config_text(assignments, zone_order, args.zones_path, args.gtfs_path)
+    text = build_config_text(
+        assignments,
+        zone_order,
+        args.zones_path,
+        args.gtfs_path,
+        near_misses,
+        args.near_miss_feet,
+    )
     logging.info("Config text to paste:\n\n%s", text)
     if output_file is None:
         return text
@@ -1064,6 +1230,7 @@ def run(args: argparse.Namespace) -> str:
         f"GTFS feed:        {args.gtfs_path}",
         f"Zone layer:       {args.zones_path}",
         f"Zone name field:  {args.zone_name_field or '(none: zones numbered by position)'}",
+        f"Near-miss feet:   {args.near_miss_feet:,g}",
         f"Transformation:   {args.geo_transformation or '(none)'}",
         f"Output file:      {output_file}",
     ]
@@ -1126,6 +1293,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--zone-name-field",
         default=ZONE_NAME_FIELD,
         help='Attribute naming each zone; "" numbers zones by position in the layer.',
+    )
+    parser.add_argument(
+        "--near-miss-feet",
+        type=float,
+        default=NEAR_MISS_FEET,
+        help="Report stops outside every zone but within this many feet of one; 0 turns it off.",
     )
     parser.add_argument(
         "--geo-transformation",
