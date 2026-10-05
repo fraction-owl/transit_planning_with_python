@@ -13,10 +13,10 @@ from shapely.geometry import LineString, Polygon
 
 import scripts.facilities_tools.cluster_stops_from_zones_gpd as target
 
-# Three zones drawn in ArcGIS around transit centers near DC and Arlington: Pentagon,
-# East Falls Church Metro and Huntington Metro North. A zipped shapefile in Virginia
-# North State Plane (US feet, EPSG:2283) with one GEO_NAME field.
+# Three transit-center zones traced in ArcGIS, moved onto junctions in mock_gtfs_dc.zip.
+# A zipped shapefile in Maryland State Plane (US feet, EPSG:2248) with one NAME field.
 STOP_CLUSTERS_ZIP = Path(__file__).parent / "fixtures" / "stop_clusters_sample.zip"
+MOCK_GTFS_DC_ZIP = Path(__file__).parent / "fixtures" / "mock_gtfs_dc.zip"
 
 # Metro and Park & Ride share the lon = -76.95 edge; Empty Lot holds no stop (WGS84).
 _EDGE_LON = -76.95
@@ -445,37 +445,24 @@ def test_main_reads_a_zipped_feed(tmp_path: Path) -> None:
     assert target.main(_cli({**paths, "gtfs": str(feed)})) == 0
 
 
-def test_main_reads_a_zipped_state_plane_shapefile(tmp_path: Path) -> None:
-    gtfs_dir = tmp_path / "gtfs"
-    gtfs_dir.mkdir()
-    # HUN_S is at Huntington Metro South, a zone left out of the fixture.
-    pd.DataFrame(
-        {
-            "stop_id": ["HUN_N", "EFC_1", "PEN_B", "PEN_A", "HUN_S"],
-            "stop_lat": ["38.79526", "38.88690", "38.86850", "38.86900", "38.79246"],
-            "stop_lon": ["-77.07522", "-77.15705", "-77.05400", "-77.05450", "-77.07637"],
-        }
-    ).to_csv(gtfs_dir / "stops.txt", index=False)
+def test_main_clusters_the_mock_dc_feed_with_a_zipped_state_plane_shapefile(
+    tmp_path: Path,
+) -> None:
+    paths = {"gtfs": str(MOCK_GTFS_DC_ZIP), "zones": str(STOP_CLUSTERS_ZIP)}
     out_dir = tmp_path / "out"
-    argv = [
-        "--gtfs-path",
-        str(gtfs_dir),
-        "--zones-path",
-        str(STOP_CLUSTERS_ZIP),
-        "--zone-name-field",
-        "GEO_NAME",
-        "--output-dir",
-        str(out_dir),
-    ]
-    assert target.main(argv) == 0
+    assert target.main(_cli(paths, "--output-dir", str(out_dir))) == 0
 
     text = (out_dir / "cluster_stops_from_zones.txt").read_text(encoding="utf-8")
     values = dict(_values(text.split("# Step 2:")[0]))
     assert values["CLUSTER_DEFINITIONS"] == {
-        "Pentagon": {"stops": ["PEN_A", "PEN_B"]},
-        "East Falls Church Metro": {"stops": ["EFC_1"]},
-        "Huntington Metro North": {"stops": ["HUN_N"]},
+        "Mock Transit Center 01": {
+            "stops": ["DC_NS_034", "DC_R30_044", "DC_R40_087", "DC_R40_088"]
+        },
+        "Mock Transit Center 02": {"stops": ["DC_NS_052", "DC_R50H_L1_007"]},
+        "Mock Transit Center 03": {"stops": ["DC_R40_131", "DC_R50H_L0_000", "DC_R50H_L3_007"]},
     }
+    # The next stops along two of Center 01's routes stay out.
+    assert not {"DC_NS_035", "DC_R30_043"} & set(values["STOP_ID_FILTER"])
     runlog = (out_dir / "cluster_stops_from_zones_runlog.txt").read_text(encoding="utf-8")
     assert f"Zone layer: {STOP_CLUSTERS_ZIP}" in runlog
     assert "not fingerprinted" not in runlog  # the archive itself is fingerprinted
