@@ -13,7 +13,8 @@ from shapely.geometry import LineString, Polygon
 
 import scripts.facilities_tools.cluster_stops_from_zones_gpd as target
 
-# Three transit-center zones traced in ArcGIS, moved onto junctions in mock_gtfs_dc.zip.
+# Five transit-center zones traced in ArcGIS, moved onto mock_gtfs_dc.zip. Centers 01-03
+# hold stops; 01 and the empty 04 have stops just outside; 05 has no stop within 1,000 ft.
 # A zipped shapefile in Maryland State Plane (US feet, EPSG:2248) with one NAME field.
 STOP_CLUSTERS_ZIP = Path(__file__).parent / "fixtures" / "stop_clusters_sample.zip"
 MOCK_GTFS_DC_ZIP = Path(__file__).parent / "fixtures" / "mock_gtfs_dc.zip"
@@ -455,14 +456,13 @@ def test_main_clusters_the_mock_dc_feed_with_a_zipped_state_plane_shapefile(
     text = (out_dir / "cluster_stops_from_zones.txt").read_text(encoding="utf-8")
     values = dict(_values(text.split("# Step 2:")[0]))
     assert values["CLUSTER_DEFINITIONS"] == {
-        "Mock Transit Center 01": {
-            "stops": ["DC_NS_034", "DC_R30_044", "DC_R40_087", "DC_R40_088"]
-        },
+        "Mock Transit Center 01": {"stops": ["DC_NS_034", "DC_R30_044", "DC_R40_088"]},
         "Mock Transit Center 02": {"stops": ["DC_NS_052", "DC_R50H_L1_007"]},
         "Mock Transit Center 03": {"stops": ["DC_R40_131", "DC_R50H_L0_000", "DC_R50H_L3_007"]},
     }
-    # The next stops along two of Center 01's routes stay out.
-    assert not {"DC_NS_035", "DC_R30_043"} & set(values["STOP_ID_FILTER"])
+    # 24-35 ft outside Centers 01 and 04: near misses, not listed.
+    assert not {"DC_R40_087", "DC_NS_017", "DC_R50H_L3_000"} & set(values["STOP_ID_FILTER"])
+    assert "#   No stops, left out: Mock Transit Center 04, Mock Transit Center 05" in text
     runlog = (out_dir / "cluster_stops_from_zones_runlog.txt").read_text(encoding="utf-8")
     assert f"Zone layer: {STOP_CLUSTERS_ZIP}" in runlog
     assert "not fingerprinted" not in runlog  # the archive itself is fingerprinted
