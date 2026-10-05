@@ -28,14 +28,16 @@ Python window or an ArcGIS Pro Python (arcpy) environment.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import re
+import shutil
 import tempfile
 import time
 import zipfile
 from pathlib import Path
-from typing import Dict, List, Literal, Optional, Sequence, Set, Tuple
+from typing import Dict, Iterator, List, Literal, Optional, Sequence, Set, Tuple
 
 import arcpy
 import pandas as pd
@@ -276,9 +278,9 @@ def _safe_add_field(
 ) -> bool:
     """Add a field if it does not already exist.
 
-    Shapefiles on a UNC share intermittently fail AddField with ERROR 000499
-    ("table is not editable") from a transient lock, so failures are retried
-    up to ``attempts`` times, ``delay`` seconds apart.
+    AddField on a just-created shapefile can intermittently fail with ERROR
+    000499 ("table is not editable") from a transient lock, so failures are
+    retried up to ``attempts`` times, ``delay`` seconds apart.
 
     Returns:
         True if the field exists after this call (already present or added).
@@ -317,6 +319,41 @@ def _safe_add_field(
             if attempt < attempts:
                 time.sleep(delay)
     return False
+
+
+@contextlib.contextmanager
+def _local_staging() -> Iterator[str]:
+    """Yield a local temp folder to build a shapefile in, then delete it.
+
+    addOutputsToMap is off meanwhile so an ArcGIS Pro notebook doesn't add the
+    temporary shapefile to the open map, where it would break once deleted.
+    """
+    staging = tempfile.mkdtemp(prefix="gtfs_shp_")
+    try:
+        with arcpy.EnvManager(addOutputsToMap=False):
+            yield staging
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
+def _publish_shapefile(staged_fc: str, out_folder: Path) -> str:
+    """Copy a finished shapefile's component files into *out_folder*.
+
+    Building a shapefile directly on a UNC share means many small rewrites
+    (each AddField rewrites the .dbf, each insertRow appends), and any of them
+    can fail with ERROR 000499 or "General function failure" when the share or
+    another process briefly holds the file. The exports build on local disk and
+    use this to copy the result to the share once, as plain file copies.
+
+    Returns:
+        Path of the published .shp.
+    """
+    staged = Path(staged_fc)
+    for src in staged.parent.glob(staged.stem + ".*"):
+        if src.name.endswith(".lock"):
+            continue
+        shutil.copyfile(src, out_folder / src.name)
+    return str(out_folder / staged.name)
 
 
 # ============================================================================
@@ -698,56 +735,58 @@ def _export_stops_shapefile(stops_df: pd.DataFrame, out_folder: Path) -> None:
         logging.info("Deleting existing %s", existing_fc)
         arcpy.management.Delete(existing_fc)
 
-    try:
-        result = arcpy.management.CreateFeatureclass(
-            out_path=out_folder_str,
-            out_name=out_name,
-            geometry_type="POINT",
-            template="",
-            has_m="DISABLED",
-            has_z="DISABLED",
-            spatial_reference=sr,
-        )
-        fc_path = result[0]
-    except arcpy.ExecuteError:
-        logging.error("ArcPy error in CreateFeatureclass (stops): %s", arcpy.GetMessages(2))
-        raise
+    # Build on local disk, then copy the finished files to out_folder.
+    with _local_staging() as staging:
+        try:
+            result = arcpy.management.CreateFeatureclass(
+                out_path=staging,
+                out_name=out_name,
+                geometry_type="POINT",
+                template="",
+                has_m="DISABLED",
+                has_z="DISABLED",
+                spatial_reference=sr,
+            )
+            fc_path = result[0]
+        except arcpy.ExecuteError:
+            logging.error("ArcPy error in CreateFeatureclass (stops): %s", arcpy.GetMessages(2))
+            raise
 
-    stop_fields = [
-        ("stop_id", "TEXT", STOP_ID_LEN),
-        ("stop_nm", "TEXT", STOP_NAME_LEN),
-        ("stop_lat", "DOUBLE", None),
-        ("stop_lon", "DOUBLE", None),
-    ]
-    missing = [
-        name
-        for name, field_type, length in stop_fields
-        if not _safe_add_field(fc_path, name, field_type, field_length=length)
-    ]
-    if missing:
-        raise RuntimeError(
-            f"Could not add field(s) {', '.join(missing)} to {fc_path} (see the AddField "
-            "warnings above). ERROR 000499 here usually means a lock on the shapefile: "
-            "remove gtfs_stops from any open ArcGIS Pro map, close other sessions using "
-            "the output folder, or point OUTPUT_FOLDER at a local drive, then re-run.",
-        )
+        stop_fields = [
+            ("stop_id", "TEXT", STOP_ID_LEN),
+            ("stop_nm", "TEXT", STOP_NAME_LEN),
+            ("stop_lat", "DOUBLE", None),
+            ("stop_lon", "DOUBLE", None),
+        ]
+        missing = [
+            name
+            for name, field_type, length in stop_fields
+            if not _safe_add_field(fc_path, name, field_type, field_length=length)
+        ]
+        if missing:
+            raise RuntimeError(
+                f"Could not add field(s) {', '.join(missing)} to {fc_path} "
+                "(see the AddField warnings above).",
+            )
 
-    fields = ["stop_id", "stop_nm", "stop_lat", "stop_lon", "SHAPE@"]
+        fields = ["stop_id", "stop_nm", "stop_lat", "stop_lon", "SHAPE@"]
 
-    rows_written = 0
-    with arcpy.da.InsertCursor(fc_path, fields) as cursor:
-        for row in stops_df.itertuples(index=False):
-            stop_id = str(row.stop_id)
-            stop_name = str(row.stop_name)
-            lat = float(row.stop_lat)
-            lon = float(row.stop_lon)
+        rows_written = 0
+        with arcpy.da.InsertCursor(fc_path, fields) as cursor:
+            for row in stops_df.itertuples(index=False):
+                stop_id = str(row.stop_id)
+                stop_name = str(row.stop_name)
+                lat = float(row.stop_lat)
+                lon = float(row.stop_lon)
 
-            pt = arcpy.Point(lon, lat)
-            geom = arcpy.PointGeometry(pt, sr)
-            cursor.insertRow([stop_id, stop_name, lat, lon, geom])
-            rows_written += 1
+                pt = arcpy.Point(lon, lat)
+                geom = arcpy.PointGeometry(pt, sr)
+                cursor.insertRow([stop_id, stop_name, lat, lon, geom])
+                rows_written += 1
 
-    logging.info("Wrote %s (%d features).", fc_path, rows_written)
+        published = _publish_shapefile(fc_path, out_folder)
+
+    logging.info("Wrote %s (%d features).", published, rows_written)
 
 
 def _write_lines_featureclass(
@@ -767,85 +806,89 @@ def _write_lines_featureclass(
         logging.info("Deleting existing %s", existing_fc)
         arcpy.management.Delete(existing_fc)
 
-    try:
-        result = arcpy.management.CreateFeatureclass(
-            out_path=out_folder_str,
-            out_name=out_name,
-            geometry_type="POLYLINE",
-            template="",
-            has_m="DISABLED",
-            has_z="DISABLED",
-            spatial_reference=sr,
-        )
-        fc_path = result[0]
-    except arcpy.ExecuteError:
-        logging.error("ArcPy error in CreateFeatureclass (lines): %s", arcpy.GetMessages(2))
-        raise
+    # Build on local disk, then copy the finished files to out_folder.
+    with _local_staging() as staging:
+        try:
+            result = arcpy.management.CreateFeatureclass(
+                out_path=staging,
+                out_name=out_name,
+                geometry_type="POLYLINE",
+                template="",
+                has_m="DISABLED",
+                has_z="DISABLED",
+                spatial_reference=sr,
+            )
+            fc_path = result[0]
+        except arcpy.ExecuteError:
+            logging.error("ArcPy error in CreateFeatureclass (lines): %s", arcpy.GetMessages(2))
+            raise
 
-    # Try to add fields; track which ones actually exist.
-    added_fields: List[str] = []
+        # Try to add fields; track which ones actually exist.
+        added_fields: List[str] = []
 
-    if _safe_add_field(fc_path, "route_id", "TEXT", field_length=ROUTE_ID_LEN):
-        added_fields.append("route_id")
+        if _safe_add_field(fc_path, "route_id", "TEXT", field_length=ROUTE_ID_LEN):
+            added_fields.append("route_id")
 
-    # Use dir_id instead of dir to avoid 000852 conflicts.
-    if _safe_add_field(fc_path, "dir_id", "SHORT"):
-        added_fields.append("dir_id")
+        # Use dir_id instead of dir to avoid 000852 conflicts.
+        if _safe_add_field(fc_path, "dir_id", "SHORT"):
+            added_fields.append("dir_id")
 
-    if _safe_add_field(fc_path, "shape_id", "TEXT", field_length=SHAPE_ID_LEN):
-        added_fields.append("shape_id")
-    else:
-        logging.error(
-            "Field shape_id could not be added to %s. Continuing without shape_id attribute.",
-            fc_path,
-        )
+        if _safe_add_field(fc_path, "shape_id", "TEXT", field_length=SHAPE_ID_LEN):
+            added_fields.append("shape_id")
+        else:
+            logging.error(
+                "Field shape_id could not be added to %s. Continuing without shape_id attribute.",
+                fc_path,
+            )
 
-    if _safe_add_field(fc_path, "rshort", "TEXT", field_length=ROUTE_SHORT_LEN):
-        added_fields.append("rshort")
+        if _safe_add_field(fc_path, "rshort", "TEXT", field_length=ROUTE_SHORT_LEN):
+            added_fields.append("rshort")
 
-    if _safe_add_field(fc_path, "pmode", "TEXT", field_length=PATTERN_MODE_LEN):
-        added_fields.append("pmode")
+        if _safe_add_field(fc_path, "pmode", "TEXT", field_length=PATTERN_MODE_LEN):
+            added_fields.append("pmode")
 
-    required = {"route_id", "dir_id", "pmode"}
-    missing_required = required - set(added_fields)
-    if missing_required:
-        raise RuntimeError(
-            f"Missing required fields on {out_name}: " + ", ".join(sorted(missing_required)),
-        )
+        required = {"route_id", "dir_id", "pmode"}
+        missing_required = required - set(added_fields)
+        if missing_required:
+            raise RuntimeError(
+                f"Missing required fields on {out_name}: " + ", ".join(sorted(missing_required)),
+            )
 
-    include_shape_id = "shape_id" in added_fields
+        include_shape_id = "shape_id" in added_fields
 
-    fields: List[str] = ["route_id", "dir_id"]
-    if include_shape_id:
-        fields.append("shape_id")
-    fields.extend(["rshort", "pmode", "SHAPE@"])
+        fields: List[str] = ["route_id", "dir_id"]
+        if include_shape_id:
+            fields.append("shape_id")
+        fields.extend(["rshort", "pmode", "SHAPE@"])
 
-    rows_written = 0
-    with arcpy.da.InsertCursor(fc_path, fields) as cursor:
-        for rec in records:
-            geom = rec.get("geometry")
-            if not isinstance(geom, arcpy.Polyline) or geom.length == 0:
-                continue
+        rows_written = 0
+        with arcpy.da.InsertCursor(fc_path, fields) as cursor:
+            for rec in records:
+                geom = rec.get("geometry")
+                if not isinstance(geom, arcpy.Polyline) or geom.length == 0:
+                    continue
 
-            route_id = str(rec.get("route_id"))
-            direction_id = int(rec.get("direction_id"))
+                route_id = str(rec.get("route_id"))
+                direction_id = int(rec.get("direction_id"))
 
-            route_short = rec.get("route_short")
-            route_short_str = str(route_short) if route_short is not None else ""
+                route_short = rec.get("route_short")
+                route_short_str = str(route_short) if route_short is not None else ""
 
-            values: List[object] = [route_id, direction_id]
+                values: List[object] = [route_id, direction_id]
 
-            if include_shape_id:
-                shape_id_val = rec.get("shape_id")
-                shape_id = str(shape_id_val) if shape_id_val is not None else ""
-                values.append(shape_id)
+                if include_shape_id:
+                    shape_id_val = rec.get("shape_id")
+                    shape_id = str(shape_id_val) if shape_id_val is not None else ""
+                    values.append(shape_id)
 
-            values.extend([route_short_str, pattern_mode, geom])
+                values.extend([route_short_str, pattern_mode, geom])
 
-            cursor.insertRow(values)
-            rows_written += 1
+                cursor.insertRow(values)
+                rows_written += 1
 
-    logging.info("Wrote %s (%d features).", fc_path, rows_written)
+        published = _publish_shapefile(fc_path, out_folder)
+
+    logging.info("Wrote %s (%d features).", published, rows_written)
 
 
 def _export_lines_shapefile(
