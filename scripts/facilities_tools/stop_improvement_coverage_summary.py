@@ -97,6 +97,9 @@ DETAIL_CSV_NAME: str = "stop_improvement_detail.csv"
 # ---- Logging
 LOG_LEVEL: str = "INFO"
 
+# GTFS files this script reads; any other files in the feed are optional.
+REQUIRED_GTFS_FILES: Tuple[str, ...] = ("stops.txt", "routes.txt", "trips.txt", "stop_times.txt")
+
 # =============================================================================
 # REUSABLE HELPERS (copied from utils/gtfs_helpers.py)
 # =============================================================================
@@ -595,8 +598,8 @@ def main() -> int:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     # 1. Load GTFS.
-    validate_gtfs_files_exist(str(GTFS_DIR))
-    g = load_gtfs_data(str(GTFS_DIR))
+    validate_gtfs_files_exist(str(GTFS_DIR), REQUIRED_GTFS_FILES)
+    g = load_gtfs_data(str(GTFS_DIR), files=REQUIRED_GTFS_FILES)
     stops = g["stops"]
     routes = g["routes"]
     trips = g["trips"]

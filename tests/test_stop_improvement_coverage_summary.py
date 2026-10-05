@@ -345,3 +345,32 @@ def test_write_summary_txt_without_improvements(tmp_path: Path) -> None:
     target.write_summary_txt(summary, set(), out)
     content = out.read_text(encoding="utf-8")
     assert "no improvements CSV supplied" in content
+
+
+# ---------------------------------------------------------------------------
+# main — feed without optional GTFS files
+# ---------------------------------------------------------------------------
+
+
+def test_main_runs_on_feed_without_optional_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Only the four core files: no agency, calendar, fares, transfers, shapes, ...
+    gtfs = tmp_path / "gtfs"
+    gtfs.mkdir()
+    _stops_df().assign(stop_lat="38.8", stop_lon="-77.0").to_csv(gtfs / "stops.txt", index=False)
+    _routes_df().to_csv(gtfs / "routes.txt", index=False)
+    _trips_df().to_csv(gtfs / "trips.txt", index=False)
+    _stop_times_df().to_csv(gtfs / "stop_times.txt", index=False)
+    out = tmp_path / "out"
+    monkeypatch.setattr(target, "GTFS_DIR", gtfs)
+    monkeypatch.setattr(target, "OUTPUT_DIR", out)
+    monkeypatch.setattr(target, "IMPROVEMENTS_CSV", None)
+    monkeypatch.setattr(target, "ROUTE_WHITELIST", {"101"})
+    monkeypatch.setattr(target, "ROUTE_BLACKLIST", set())
+
+    assert target.main() == 0
+
+    detail = pd.read_csv(out / target.DETAIL_CSV_NAME, dtype=str)
+    assert sorted(detail["stop_code"]) == ["C1", "C2"]
+    assert (out / target.SUMMARY_TXT_NAME).exists()

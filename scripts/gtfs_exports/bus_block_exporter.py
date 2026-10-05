@@ -66,6 +66,9 @@ MAX_TRIPS_PER_BLOCK: int = 150
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
 
+# GTFS files this script reads; any other files in the feed are optional.
+REQUIRED_GTFS_FILES: tuple[str, ...] = ("trips.txt", "stop_times.txt", "stops.txt", "routes.txt")
+
 # ==============================================================================
 # FUNCTIONS
 # ==============================================================================
@@ -280,13 +283,12 @@ def find_cluster(stop_id: str, clusters: list[dict[str, Any]]) -> Optional[str]:
 
 
 def mark_first_and_last_stops(df_in: pd.DataFrame) -> pd.DataFrame:
-    """Mark first and last stops per trip using boolean flags."""
+    """Mark each stop in the trip as the first or last using boolean columns."""
     df_out = df_in.sort_values(["trip_id", "stop_sequence"]).copy()
-    df_out["is_first_stop"] = False
-    df_out["is_last_stop"] = False
-    for _trip_id, group in df_out.groupby("trip_id"):
-        df_out.loc[group.index.min(), "is_first_stop"] = True
-        df_out.loc[group.index.max(), "is_last_stop"] = True
+    seq_min = df_out.groupby("trip_id")["stop_sequence"].transform("min")
+    seq_max = df_out.groupby("trip_id")["stop_sequence"].transform("max")
+    df_out["is_first_stop"] = df_out["stop_sequence"] == seq_min
+    df_out["is_last_stop"] = df_out["stop_sequence"] == seq_max
     return df_out
 
 
@@ -765,7 +767,18 @@ def _merge_and_filter_data(
     stop_times_df["arrival_min"] = stop_times_df["arrival_time"].apply(parse_time_to_minutes)
     stop_times_df["departure_min"] = stop_times_df["departure_time"].apply(parse_time_to_minutes)
 
-    stop_times_df = stop_times_df[stop_times_df["trip_id"].isin(trips_df["trip_id"])]
+    stop_times_df = stop_times_df[stop_times_df["trip_id"].isin(trips_df["trip_id"])].copy()
+
+    # stop_sequence must be numeric so first/last detection and stop ordering
+    # compare 10 > 9 rather than "10" < "9"
+    stop_times_df["stop_sequence"] = pd.to_numeric(stop_times_df["stop_sequence"], errors="coerce")
+    bad_seq = int(stop_times_df["stop_sequence"].isna().sum())
+    if bad_seq:
+        logging.warning(
+            "Dropped %d stop_times row(s) with a missing or non-numeric stop_sequence.", bad_seq
+        )
+        stop_times_df = stop_times_df.dropna(subset=["stop_sequence"])
+    stop_times_df["stop_sequence"] = stop_times_df["stop_sequence"].astype(int)
 
     if "stop_code" not in stops_df.columns:
         stops_df["stop_code"] = None
@@ -884,7 +897,7 @@ def run() -> int:
     validate_folders(gtfs_path, out_path)
 
     logging.info("Loading GTFS …")
-    gtfs = load_gtfs_data(str(gtfs_path))
+    gtfs = load_gtfs_data(str(gtfs_path), files=REQUIRED_GTFS_FILES)
 
     # ── Merge, mark, filter ────────────────────────────────────────────────────
     trips = gtfs["trips"]

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pandas as pd
 import pytest
 
+import scripts.stop_analysis.stop_impacts_target_routes as stop_impacts
 from scripts.stop_analysis.stop_impacts_target_routes import (
     _apply_service_id_filter_to_trips,
     _dow_code_from_calendar_row,
@@ -11,6 +14,7 @@ from scripts.stop_analysis.stop_impacts_target_routes import (
     build_stop_service_routes,
     classify_impacts,
     identify_target_route_ids,
+    load_gtfs_tables,
 )
 
 # ---------------------------------------------------------------------------
@@ -278,3 +282,58 @@ def test_add_stop_level_summary_columns_eliminated_category(
     only_s2 = classified[classified["stop_id"] == "S2"].copy()
     result = add_stop_level_summary_columns(only_s2, svc_to_dow={})
     assert (result["impact_category"] == "eliminated").all()
+
+
+# ---------------------------------------------------------------------------
+# load_gtfs_tables + main — minimal valid feed without optional columns
+# ---------------------------------------------------------------------------
+
+
+def _write_minimal_feed(folder: Path) -> Path:
+    """Write a valid feed with no stop_code, location_type, route_long_name or calendar."""
+    folder.mkdir()
+    (folder / "stops.txt").write_text(
+        "stop_id,stop_name,stop_lat,stop_lon\nS1,Stop One,38.70,-77.00\nS2,Stop Two,38.80,-77.10\n"
+    )
+    (folder / "routes.txt").write_text("route_id,route_short_name,route_type\nR1,101,3\nR2,202,3\n")
+    (folder / "trips.txt").write_text("route_id,service_id,trip_id\nR1,WD,T1\nR2,WD,T2\n")
+    (folder / "stop_times.txt").write_text(
+        "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+        "T1,07:00:00,07:00:00,S1,1\n"
+        "T1,07:05:00,07:05:00,S2,2\n"
+        "T2,08:00:00,08:00:00,S1,1\n"
+    )
+    return folder
+
+
+def test_load_gtfs_tables_tolerates_missing_optional_columns(tmp_path: Path) -> None:
+    tables = load_gtfs_tables(_write_minimal_feed(tmp_path / "gtfs"))
+    stops = tables["stops"]
+    routes = tables["routes"]
+    assert stops is not None and routes is not None
+    assert stops["stop_code"].isna().all()
+    assert stops["location_type"].isna().all()
+    assert routes["route_long_name"].isna().all()
+    assert routes["route_short_name"].tolist() == ["101", "202"]
+    assert tables["calendar"] is None
+
+
+def test_load_gtfs_tables_missing_required_column_raises(tmp_path: Path) -> None:
+    feed = _write_minimal_feed(tmp_path / "gtfs")
+    (feed / "stops.txt").write_text("stop_id,stop_name,stop_lon\nS1,Stop One,-77.00\n")
+    with pytest.raises(ValueError, match="stop_lat"):
+        load_gtfs_tables(feed)
+
+
+def test_main_runs_on_feed_without_optional_columns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(stop_impacts, "GTFS_DIR", _write_minimal_feed(tmp_path / "gtfs"))
+    monkeypatch.setattr(stop_impacts, "OUTPUT_DIR", tmp_path / "out")
+    monkeypatch.setattr(stop_impacts, "TARGET_ROUTE_TOKENS", {"101"})
+
+    assert stop_impacts.main() == 0
+
+    out = pd.read_csv(tmp_path / "out" / stop_impacts.OUTPUT_FILENAME, dtype=str)
+    category = dict(zip(out["stop_id"], out["impact_category"]))
+    assert category == {"S1": "route_loss_only", "S2": "eliminated"}

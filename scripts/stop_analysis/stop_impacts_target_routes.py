@@ -63,10 +63,31 @@ def _require_file(path: Path) -> None:
         raise FileNotFoundError(f"Missing GTFS file: {path}")
 
 
-def _read_gtfs_csv(gtfs_dir: Path, filename: str, usecols: list[str]) -> pd.DataFrame:
+def _read_gtfs_csv(
+    gtfs_dir: Path,
+    filename: str,
+    usecols: list[str],
+    optional: Iterable[str] = (),
+) -> pd.DataFrame:
+    """Read *usecols* from one GTFS file, allowing the *optional* ones to be absent.
+
+    GTFS leaves columns such as stop_code and location_type optional, and requires
+    only one of route_short_name / route_long_name, so a valid feed may lack them.
+    An absent optional column comes back blank; an absent required one raises.
+    """
     path = gtfs_dir / filename
     _require_file(path)
-    return pd.read_csv(path, dtype=str, usecols=usecols, low_memory=False)
+    wanted = set(usecols)
+    df = pd.read_csv(path, dtype=str, usecols=lambda col: col in wanted, low_memory=False)
+    optional_cols = set(optional)
+    missing = [c for c in usecols if c not in df.columns and c not in optional_cols]
+    if missing:
+        raise ValueError(f"{filename} is missing required column(s): {', '.join(missing)}")
+    for col in usecols:
+        if col not in df.columns:
+            logging.info("%s has no %s column; treating it as blank.", filename, col)
+            df[col] = pd.Series(np.nan, index=df.index, dtype=object)
+    return df[usecols]
 
 
 def _as_sorted_csv(values: Iterable[str]) -> str:
@@ -154,12 +175,14 @@ def load_gtfs_tables(gtfs_dir: Path) -> dict[str, Optional[pd.DataFrame]]:
             "stop_lon",
             "location_type",
         ],
+        optional=["stop_code", "location_type"],
     ).drop_duplicates(subset=["stop_id"])
 
     routes = _read_gtfs_csv(
         gtfs_dir,
         "routes.txt",
         usecols=["route_id", "route_short_name", "route_long_name"],
+        optional=["route_short_name", "route_long_name"],
     ).drop_duplicates(subset=["route_id"])
 
     trips = _read_gtfs_csv(

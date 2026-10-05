@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 import openpyxl
@@ -111,6 +112,49 @@ def test_mark_first_last_sets_last_flag() -> None:
     df = mark_first_and_last_stops(_two_trip_df())
     assert df.loc[df["stop_id"] == "S2", "is_last_stop"].all()
     assert df.loc[df["stop_id"] == "S4", "is_last_stop"].all()
+
+
+def test_mark_first_last_follows_sequence_not_row_order() -> None:
+    # GTFS does not require stop_times rows to be stored in sequence order.
+    seq = [12, *range(1, 12)]
+    df = pd.DataFrame({"trip_id": ["T1"] * 12, "stop_sequence": seq, "stop_id": seq})
+    out = mark_first_and_last_stops(df)
+    assert out.loc[out["is_first_stop"], "stop_sequence"].tolist() == [1]
+    assert out.loc[out["is_last_stop"], "stop_sequence"].tolist() == [12]
+
+
+def test_merge_and_filter_orders_text_stop_sequences_numerically(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.gtfs_exports.bus_block_exporter as mod
+
+    monkeypatch.setattr(mod, "CALENDAR_SERVICE_IDS", [])
+    seq = [str(n) for n in [12, *range(1, 12)]]  # as read from stop_times.txt
+    stop_times = pd.DataFrame(
+        {
+            "trip_id": ["T1"] * 12,
+            "stop_sequence": seq,
+            "stop_id": [f"S{n}" for n in seq],
+            "arrival_time": [f"07:{int(n):02d}:00" for n in seq],
+            "departure_time": [f"07:{int(n):02d}:00" for n in seq],
+        }
+    )
+    trips = pd.DataFrame(
+        {
+            "trip_id": ["T1"],
+            "route_short_name": ["R1"],
+            "direction_id": ["0"],
+            "block_id": ["B1"],
+            "service_id": ["WKDY"],
+        }
+    )
+    stops = pd.DataFrame({"stop_id": [f"S{n}" for n in range(1, 13)], "stop_name": "x"})
+
+    merged = mod._merge_and_filter_data(trips, stop_times, stops)
+
+    assert merged["stop_sequence"].tolist() == list(range(1, 13))
+    assert merged.loc[merged["is_first_stop"], "stop_id"].tolist() == ["S1"]
+    assert merged.loc[merged["is_last_stop"], "stop_id"].tolist() == ["S12"]
 
 
 # ---------------------------------------------------------------------------
@@ -264,3 +308,22 @@ def test_run_writes_real_block_workbooks(tmp_path: Path, monkeypatch: pytest.Mon
     # list the other as interlined.
     assert ("R1", "R2") in pairs
     assert ("R2", "R1") in pairs
+
+
+def test_run_without_optional_gtfs_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import scripts.gtfs_exports.bus_block_exporter as mod
+
+    # Most real feeds lack some optional files (fares, transfers, frequencies, ...).
+    feed = tmp_path / "gtfs"
+    feed.mkdir()
+    for name in mod.REQUIRED_GTFS_FILES:
+        shutil.copy(FIXTURES / "gtfs_basic" / name, feed / name)
+    out = tmp_path / "out"
+    monkeypatch.setattr(mod, "GTFS_FOLDER_PATH", str(feed))
+    monkeypatch.setattr(mod, "OUTPUT_FOLDER", str(out))
+    monkeypatch.setattr(mod, "CALENDAR_SERVICE_IDS", ["WKDY"])
+
+    assert mod.run() == 0
+    assert sorted(p.name for p in out.glob("block_*.xlsx")) == [
+        f"block_B{n}.xlsx" for n in range(1, 7)
+    ]
