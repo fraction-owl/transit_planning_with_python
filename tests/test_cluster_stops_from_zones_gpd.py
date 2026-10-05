@@ -13,6 +13,11 @@ from shapely.geometry import LineString, Polygon
 
 import scripts.facilities_tools.cluster_stops_from_zones_gpd as target
 
+# Three zones drawn in ArcGIS around transit centers near DC and Arlington: Pentagon,
+# East Falls Church Metro and Huntington Metro North. A zipped shapefile in Virginia
+# North State Plane (US feet, EPSG:2283) with one GEO_NAME field.
+STOP_CLUSTERS_ZIP = Path(__file__).parent / "fixtures" / "stop_clusters_sample.zip"
+
 # Metro and Park & Ride share the lon = -76.95 edge; Empty Lot holds no stop (WGS84).
 _EDGE_LON = -76.95
 
@@ -438,6 +443,42 @@ def test_main_reads_a_zipped_feed(tmp_path: Path) -> None:
     with zipfile.ZipFile(feed, "w") as archive:
         archive.write(Path(paths["gtfs"]) / "stops.txt", "feed/stops.txt")
     assert target.main(_cli({**paths, "gtfs": str(feed)})) == 0
+
+
+def test_main_reads_a_zipped_state_plane_shapefile(tmp_path: Path) -> None:
+    gtfs_dir = tmp_path / "gtfs"
+    gtfs_dir.mkdir()
+    # HUN_S is at Huntington Metro South, a zone left out of the fixture.
+    pd.DataFrame(
+        {
+            "stop_id": ["HUN_N", "EFC_1", "PEN_B", "PEN_A", "HUN_S"],
+            "stop_lat": ["38.79526", "38.88690", "38.86850", "38.86900", "38.79246"],
+            "stop_lon": ["-77.07522", "-77.15705", "-77.05400", "-77.05450", "-77.07637"],
+        }
+    ).to_csv(gtfs_dir / "stops.txt", index=False)
+    out_dir = tmp_path / "out"
+    argv = [
+        "--gtfs-path",
+        str(gtfs_dir),
+        "--zones-path",
+        str(STOP_CLUSTERS_ZIP),
+        "--zone-name-field",
+        "GEO_NAME",
+        "--output-dir",
+        str(out_dir),
+    ]
+    assert target.main(argv) == 0
+
+    text = (out_dir / "cluster_stops_from_zones.txt").read_text(encoding="utf-8")
+    values = dict(_values(text.split("# Step 2:")[0]))
+    assert values["CLUSTER_DEFINITIONS"] == {
+        "Pentagon": {"stops": ["PEN_A", "PEN_B"]},
+        "East Falls Church Metro": {"stops": ["EFC_1"]},
+        "Huntington Metro North": {"stops": ["HUN_N"]},
+    }
+    runlog = (out_dir / "cluster_stops_from_zones_runlog.txt").read_text(encoding="utf-8")
+    assert f"Zone layer: {STOP_CLUSTERS_ZIP}" in runlog
+    assert "not fingerprinted" not in runlog  # the archive itself is fingerprinted
 
 
 def test_main_overlapping_zones_exit_1(tmp_path: Path) -> None:
