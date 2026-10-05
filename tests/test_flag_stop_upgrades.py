@@ -93,13 +93,27 @@ def test_standardise_yn_strips_whitespace() -> None:
     assert list(result) == ["Y", "N", "Y"]
 
 
-def test_standardise_yn_fills_na_with_n() -> None:
-    """NaN and None values are treated as 'N'."""
-    s = pd.Series([None, float("nan"), "Y"])
+def test_standardise_yn_keeps_blanks_missing() -> None:
+    """NaN, None and blank values stay missing (unknown), not 'N'."""
+    s = pd.Series([None, float("nan"), "", "Y"])
     result = target._standardise_yn(s)
-    assert result.iloc[0] == "N"
-    assert result.iloc[1] == "N"
-    assert result.iloc[2] == "Y"
+    assert result.iloc[:3].isna().all()
+    assert result.iloc[3] == "Y"
+
+
+def test_standardise_yn_accepts_yes_true_and_one() -> None:
+    """Common spellings of present/absent are recognised."""
+    s = pd.Series(["Yes", "TRUE", "1", "no", "False", "0"])
+    result = target._standardise_yn(s)
+    assert list(result) == ["Y", "Y", "Y", "N", "N", "N"]
+
+
+def test_standardise_yn_unrecognised_value_is_missing() -> None:
+    """Values that are neither present nor absent are treated as unknown."""
+    s = pd.Series(["maybe", "Y"])
+    result = target._standardise_yn(s)
+    assert pd.isna(result.iloc[0])
+    assert result.iloc[1] == "Y"
 
 
 def test_standardise_yn_empty_series() -> None:
@@ -115,12 +129,12 @@ def test_standardise_yn_empty_series() -> None:
 
 
 def test_prepare_amenity_columns_adds_missing_columns() -> None:
-    """Missing amenity columns are created and defaulted to 'N'."""
+    """Missing amenity columns are created and marked UNKNOWN."""
     df = _make_ridership_df()
     result = target._prepare_amenity_columns(df)
     for col in ["SHELTER", "BENCH", "TRASHCAN", "PAD"]:
         assert col in result.columns
-        assert (result[col] == "N").all()
+        assert (result[col] == target.UNKNOWN_VALUE).all()
 
 
 def test_prepare_amenity_columns_standardises_existing() -> None:
@@ -144,12 +158,11 @@ def test_prepare_amenity_columns_preserves_other_columns() -> None:
 # =============================================================================
 
 
-def test_convert_ridership_float_strings_truncated_to_int() -> None:
-    """Float strings are coerced to int (truncated, not rounded)."""
+def test_convert_ridership_float_strings_keep_decimals() -> None:
+    """Float strings keep their decimals (no truncation before aggregation)."""
     df = pd.DataFrame({"XBOARDINGS": ["4.034", "12.354", "3.712"]})
     result = target._convert_ridership(df)
-    assert result["XBOARDINGS"].tolist() == [4, 12, 3]
-    assert result["XBOARDINGS"].dtype == int
+    assert result["XBOARDINGS"].tolist() == [4.034, 12.354, 3.712]
 
 
 def test_convert_ridership_non_numeric_becomes_zero() -> None:
@@ -159,12 +172,12 @@ def test_convert_ridership_non_numeric_becomes_zero() -> None:
     assert result["XBOARDINGS"].tolist() == [0, 0, 10]
 
 
-def test_convert_ridership_fixture_values_are_non_negative_ints() -> None:
-    """All fixture ridership values convert to non-negative integers."""
+def test_convert_ridership_fixture_values_are_non_negative_numbers() -> None:
+    """All fixture ridership values convert to non-negative numbers."""
     df = pd.read_csv(FIXTURE_PATH, dtype=str)
     result = target._convert_ridership(df)
     assert (result["XBOARDINGS"] >= 0).all()
-    assert result["XBOARDINGS"].dtype == int
+    assert pd.api.types.is_numeric_dtype(result["XBOARDINGS"])
 
 
 # =============================================================================
@@ -244,6 +257,26 @@ def test_aggregate_by_stop_one_row_per_stop_id() -> None:
     df = _make_duplicate_stop_df()
     result = target._aggregate_by_stop(df)
     assert len(result) == 2
+
+
+def test_aggregate_by_stop_unknown_when_no_record_is_known() -> None:
+    """A stop whose rows are all UNKNOWN stays UNKNOWN; one N makes it N."""
+    df = _make_duplicate_stop_df()
+    df["TRASHCAN"] = ["UNKNOWN", "UNKNOWN", "UNKNOWN"]
+    df["SHELTER"] = ["UNKNOWN", "N", "UNKNOWN"]
+    result = target._aggregate_by_stop(df).set_index("STOP_ID")
+    assert result.loc["1257", "TRASHCAN"] == target.UNKNOWN_VALUE
+    assert result.loc["1257", "SHELTER"] == "N"
+
+
+def test_aggregate_by_stop_sums_decimals_before_flagging() -> None:
+    """12.8 + 12.8 boardings reach the 25-boarding shelter threshold."""
+    df = pd.DataFrame({"STOP_ID": ["1", "1"], "XBOARDINGS": ["12.8", "12.8"]})
+    df = target._prepare_amenity_columns(df)
+    df = target._convert_ridership(df)
+    result, _ = target._compute_flags(target._aggregate_by_stop(df))
+    assert result["XBOARDINGS"].iloc[0] == 25.6
+    assert result["FLAG_SHELTER"].iloc[0]
 
 
 # =============================================================================
@@ -377,6 +410,93 @@ def test_merge_all_ridership_rows_retained() -> None:
     amen = _make_amenity_merge_df()
     result = target._merge_ridership_and_amenities(rider, amen)
     assert len(result) == 3
+
+
+def test_merge_duplicate_amenity_keys_do_not_duplicate_ridership() -> None:
+    """Two inventory records for one stop yield one ridership row, amenities OR-ed."""
+    rider = pd.DataFrame({"STOP_ID": ["1257"], "XBOARDINGS": ["15"]})
+    amen = pd.concat([_make_amenity_merge_df()] * 2, ignore_index=True)
+    amen.loc[2, "BENCH"] = "Y"
+    result = target._merge_ridership_and_amenities(rider, amen)
+    assert len(result) == 1
+    assert result["BENCH"].iloc[0] == "Y"
+
+
+def test_merge_amenity_workbook_takes_precedence() -> None:
+    """Where both sources have a value, the amenity workbook wins."""
+    rider = _make_ridership_merge_df()
+    rider["SHELTER"] = ["N", "Y", "Y"]
+    amen = _make_amenity_merge_df()
+    result = target._merge_ridership_and_amenities(rider, amen).set_index("STOP_ID")
+    assert result.loc["1257", "SHELTER"] == "Y"
+    assert result.loc["2169", "SHELTER"] == "N"
+    assert result.loc["9999", "SHELTER"] == "Y"  # unmatched: ridership fallback
+
+
+def test_merge_amenity_blank_falls_back_to_ridership() -> None:
+    """A blank inventory cell does not overwrite the ridership value."""
+    rider = _make_ridership_merge_df()
+    rider["SHELTER"] = ["Y", "N", "N"]
+    amen = _make_amenity_merge_df()
+    amen["SHELTER"] = target._standardise_yn(pd.Series([None, "N"]))
+    result = target._merge_ridership_and_amenities(rider, amen).set_index("STOP_ID")
+    assert result.loc["1257", "SHELTER"] == "Y"
+
+
+def test_merge_blank_ids_are_dropped_not_matched() -> None:
+    """Blank IDs on either side are dropped instead of matching each other."""
+    rider = pd.DataFrame({"STOP_ID": [None, " ", "1257"], "XBOARDINGS": ["10", "20", "4"]})
+    amen = _make_amenity_merge_df()
+    amen.loc[1, "stop_code"] = None
+    result = target._merge_ridership_and_amenities(rider, amen)
+    assert result["STOP_ID"].tolist() == ["1257"]
+
+
+def test_merge_amenity_workbook_missing_column() -> None:
+    """An inventory without an amenity column keeps the ridership value."""
+    rider = _make_ridership_merge_df()
+    rider["PAD"] = ["Y", "Y", "Y"]
+    amen = _make_amenity_merge_df().drop(columns=["PAD"])
+    result = target._merge_ridership_and_amenities(rider, amen)
+    assert (result["PAD"] == "Y").all()
+
+
+def test_merge_join_field_same_as_stop_id_field() -> None:
+    """Using STOP_ID as the amenity join field keeps the STOP_ID column."""
+    rider = _make_ridership_merge_df()
+    amen = _make_amenity_merge_df().rename(columns={"stop_code": "STOP_ID"})
+    with patch.object(target, "AMENITY_JOIN_FIELD", "STOP_ID"):
+        result = target._merge_ridership_and_amenities(rider, amen)
+    assert result["STOP_ID"].tolist() == ["1257", "2169", "9999"]
+    assert result.set_index("STOP_ID").loc["1257", "SHELTER"] == "Y"
+
+
+# =============================================================================
+# main
+# =============================================================================
+
+
+def test_main_single_workbook_uses_ridership_aliases(tmp_path: Path) -> None:
+    """With AMENITIES_XLSX=None, ridership amenity aliases are used; Raw Data is untouched."""
+    rider = pd.DataFrame(
+        {"STOP_ID": ["1", "1"], "XBOARDINGS": ["12.8", "12.8"], "bus_shelte": ["Y", "N"]}
+    )
+    rider_path = tmp_path / "rider.xlsx"
+    rider.to_excel(rider_path, index=False)
+    with patch.multiple(
+        target,
+        RIDERSHIP_XLSX=rider_path,
+        AMENITIES_XLSX=None,
+        OUTPUT_FOLDER=tmp_path,
+        TXT_LOG_PATH=tmp_path / "log.txt",
+    ):
+        assert target.main() == 0
+    sheets = pd.read_excel(tmp_path / "stops_needing_improvement.xlsx", sheet_name=None, dtype=str)
+    pd.testing.assert_frame_equal(sheets["Raw Data"], rider)
+    flags = sheets["All Flags"]
+    assert flags["XBOARDINGS"].tolist() == ["25.6"]
+    assert flags["SHELTER"].tolist() == ["Y"]
+    assert flags["FLAG_SHELTER"].tolist() == ["False"]
 
 
 # =============================================================================
