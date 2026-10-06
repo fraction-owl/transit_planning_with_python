@@ -13,6 +13,13 @@ The long-spacing check examines whether stops from other routes fall within a
 specified buffer distance of unusually long segments and may merit further
 review as possible missed service opportunities.
 
+Spacing is measured along each distinct stopping pattern: the ordered stops
+of a trip in ``stop_times.txt``, on the shape that trip uses. Express and
+local trips sharing a shape are measured separately, and a stop visited twice
+(a loop) keeps both visits. Each stop is placed along the shape from
+``shape_dist_traveled`` when both files provide it; otherwise the stops are
+matched to the shape in trip order.
+
 Typical usage:
 Update the paths in the CONFIGURATION section and run from ArcGIS Pro's Python
 window or a shell whose environment provides ``arcpy`` (an ArcGIS Pro install).
@@ -26,9 +33,8 @@ import os
 import sys
 import tempfile
 import zipfile
-from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, NamedTuple, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, NamedTuple, Sequence, Tuple
 
 import arcpy
 import numpy as np
@@ -48,16 +54,21 @@ OUTPUT_FOLDER: str = r"Path\To\Your\Output_Folder"
 FILTER_OUT_LIST: list[str] = []
 INCLUDE_ROUTE_IDS: list[str] = ["101", "202", "303"]  # empty list → all routes except filtered-out
 
-# Route geometry options
+# Route geometry options – union each route/direction's shapes in routes.shp
+# only; spacing is always measured along each stopping pattern's own shape.
 ROUTE_UNION: bool = False
 
-# Projected CRS – should be feet-based if you want spacing_ft directly in feet.
+# Projected CRS in any linear unit; distances are reported in feet.
 # Example: 2248 = NAD83 / Maryland (ftUS)
 PROJECTED_WKID: int = 2248
 
-# A route's own stops count as served by one of its shapes only within this
-# distance of it; 100 m (328 ft) is the GTFS Best Practices stop-to-shape limit.
+# A pattern's stop farther than this from its place on the shape is skipped;
+# 100 m (328 ft) is the GTFS Best Practices stop-to-shape limit.
 SERVED_STOP_MAX_OFFSET_FT: float = 328.0
+
+# direction_id is optional in GTFS; trips without a 0/1 value are analyzed
+# under this direction instead of being dropped.
+UNKNOWN_DIRECTION_ID: int = -1
 
 # Short-spacing QA – “too close” consecutive served stops along a route
 MIN_SPACING_FT: float = 400.0
@@ -89,6 +100,10 @@ def _read_gtfs_tables(gtfs_path: str | Path) -> Dict[str, pd.DataFrame]:
     Args:
         gtfs_path: Path to either a directory containing *.txt files or a .zip GTFS.
 
+    Every column is read as text and blanks stay empty strings, so IDs keep
+    leading zeros and values such as "NA"; _prepare_tables converts the numeric
+    fields afterwards.
+
     Returns:
         Mapping of table name to DataFrame with keys:
         "stops", "routes", "trips", "stop_times", "shapes".
@@ -105,9 +120,12 @@ def _read_gtfs_tables(gtfs_path: str | Path) -> Dict[str, pd.DataFrame]:
         "shapes": "shapes.txt",
     }
 
+    def _read(path: Path) -> pd.DataFrame:
+        return pd.read_csv(path, dtype=str, keep_default_na=False)
+
     if gtfs.is_dir():
         logging.info("Detected GTFS directory at %s", gtfs)
-        return {k: pd.read_csv(gtfs / v) for k, v in filenames.items()}
+        return {k: _read(gtfs / v) for k, v in filenames.items()}
 
     if gtfs.is_file() and gtfs.suffix.lower() == ".zip":
         logging.info("Detected GTFS zip at %s – extracting to temporary directory …", gtfs)
@@ -115,7 +133,7 @@ def _read_gtfs_tables(gtfs_path: str | Path) -> Dict[str, pd.DataFrame]:
         with zipfile.ZipFile(gtfs, "r") as zf:
             zf.extractall(tmp.name)
         root = Path(tmp.name)
-        tables = {k: pd.read_csv(root / v) for k, v in filenames.items()}
+        tables = {k: _read(root / v) for k, v in filenames.items()}
         return tables
 
     raise ValueError("GTFS_PATH must be a folder or a .zip file.")
@@ -126,8 +144,8 @@ def _validate_columns(dfs: Dict[str, pd.DataFrame]) -> None:
     required: Dict[str, set[str]] = {
         "stops": {"stop_id", "stop_lat", "stop_lon", "stop_name"},
         "routes": {"route_id", "route_short_name"},
-        "trips": {"trip_id", "route_id", "shape_id", "direction_id"},
-        "stop_times": {"trip_id", "stop_id"},
+        "trips": {"trip_id", "route_id", "shape_id"},
+        "stop_times": {"trip_id", "stop_id", "stop_sequence"},
         "shapes": {
             "shape_id",
             "shape_pt_sequence",
@@ -148,11 +166,45 @@ def _validate_columns(dfs: Dict[str, pd.DataFrame]) -> None:
         raise ValueError(f"GTFS validation failed – required columns not found:\n{joined}")
 
 
+def _prepare_tables(
+    dfs: Dict[str, pd.DataFrame],
+    unknown_direction: int = UNKNOWN_DIRECTION_ID,
+) -> None:
+    """Convert the numeric GTFS fields in place; IDs stay text.
+
+    Unparseable numbers become NaN. trips.direction_id becomes an int, with
+    unknown_direction for trips whose value is blank, invalid or absent (the
+    field is optional in GTFS).
+    """
+    numeric: Dict[str, List[str]] = {
+        "stops": ["stop_lat", "stop_lon"],
+        "stop_times": ["stop_sequence", "shape_dist_traveled"],
+        "shapes": ["shape_pt_sequence", "shape_pt_lat", "shape_pt_lon", "shape_dist_traveled"],
+    }
+    for tbl, cols in numeric.items():
+        for col in cols:
+            if col in dfs[tbl].columns:
+                dfs[tbl][col] = pd.to_numeric(dfs[tbl][col], errors="coerce")
+
+    trips = dfs["trips"]
+    raw = trips["direction_id"] if "direction_id" in trips.columns else pd.Series("", trips.index)
+    direction = pd.to_numeric(raw, errors="coerce")
+    unknown = ~direction.isin([0, 1])
+    if unknown.any():
+        logging.info(
+            "%d of %d trips have no valid direction_id; analyzing them as direction %d.",
+            unknown.sum(),
+            len(trips),
+            unknown_direction,
+        )
+    trips["direction_id"] = direction.where(~unknown, unknown_direction).astype(int)
+
+
 def _filter_routes(
     routes: pd.DataFrame,
     trips: pd.DataFrame,
-    include_ids: Sequence[str],
-    exclude_ids: Sequence[str],
+    include_ids: Sequence[str | int],
+    exclude_ids: Sequence[str | int],
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Apply include/exclude lists and return filtered routes and trips.
 
@@ -165,28 +217,44 @@ def _filter_routes(
     Returns:
         (routes_filtered, trips_filtered)
     """
-    routes_ok = routes.loc[~routes["route_id"].isin(exclude_ids)].copy()
-    if include_ids:
-        routes_ok = routes_ok.loc[routes_ok["route_id"].isin(include_ids)].copy()
+    exclude = {str(rid) for rid in exclude_ids}
+    include = {str(rid) for rid in include_ids}
+    routes_ok = routes.loc[~routes["route_id"].isin(exclude)].copy()
+    if include:
+        routes_ok = routes_ok.loc[routes_ok["route_id"].isin(include)].copy()
 
     trips_ok = trips.loc[trips["route_id"].isin(routes_ok["route_id"])].copy()
     return routes_ok, trips_ok
 
 
 def _get_projected_sr(wkid: int) -> arcpy.SpatialReference:
-    """Return the projected spatial reference for the given WKID."""
-    sr = arcpy.SpatialReference(wkid)
+    """Return the projected spatial reference for the given WKID.
+
+    Raises:
+        ValueError: If the WKID is unknown or not a projected coordinate
+            system (degrees are not a distance unit).
+    """
+    try:
+        sr = arcpy.SpatialReference(wkid)
+    except RuntimeError as err:
+        raise ValueError(f"Spatial reference WKID {wkid} is not recognized.") from err
     if sr.name == "Unknown":
         raise ValueError(f"Spatial reference WKID {wkid} is not recognized.")
+    if sr.type != "Projected":
+        raise ValueError(
+            f"Spatial reference {sr.name} (WKID {wkid}) is not projected; set "
+            "PROJECTED_WKID to a projected coordinate system (e.g. 2248)."
+        )
     return sr
 
 
 def _feet_factor(sr: arcpy.SpatialReference) -> float:
-    """Return factor to convert from SR linear units to feet."""
-    name = (sr.linearUnitName or "").lower()
-    if "foot" in name:
-        return 1.0
-    return 3.28084
+    """Return factor to convert from SR linear units to feet.
+
+    Read from the SR's unit, so any projected unit works: about 1.000002 for
+    US survey feet (e.g. WKID 2248) and 3.28084 for metres (e.g. WKID 26918).
+    """
+    return sr.metersPerUnit / 0.3048
 
 
 def _is_empty_polyline(geom: arcpy.Polyline | None) -> bool:
@@ -232,6 +300,8 @@ def _build_stop_geometries(
             lon = float(row["stop_lon"])
             lat = float(row["stop_lat"])
         except (TypeError, ValueError):
+            lon = lat = float("nan")
+        if not (np.isfinite(lon) and np.isfinite(lat)):
             logging.warning("Skipping stop %s due to invalid coords.", stop_id)
             continue
 
@@ -246,7 +316,7 @@ def _build_stop_geometries(
 def _build_shape_geometries(
     shapes_df: pd.DataFrame,
     projected_sr: arcpy.SpatialReference,
-) -> Dict[str, arcpy.Polyline]:
+) -> Tuple[Dict[str, arcpy.Polyline], Dict[str, np.ndarray]]:
     """Build projected Polyline geometries keyed by shape_id.
 
     Args:
@@ -254,7 +324,9 @@ def _build_shape_geometries(
         projected_sr: Target projected spatial reference.
 
     Returns:
-        Mapping shape_id → Polyline in projected_sr.
+        (lines, vertex_dists): mapping shape_id → Polyline in projected_sr,
+        and shape_id → each vertex's shape_dist_traveled for shapes whose
+        values are present and never decrease.
     """
     required = {
         "shape_id",
@@ -268,6 +340,8 @@ def _build_shape_geometries(
 
     wgs84 = arcpy.SpatialReference(4326)
     out: Dict[str, arcpy.Polyline] = {}
+    vertex_dists: Dict[str, np.ndarray] = {}
+    has_dists = "shape_dist_traveled" in shapes_df.columns
 
     shapes = shapes_df.copy()
     shapes["shape_pt_sequence"] = pd.to_numeric(
@@ -279,15 +353,19 @@ def _build_shape_geometries(
 
     for shape_id, group in shapes_sorted.groupby("shape_id"):
         array = arcpy.Array()
+        dists: List[float] = []
         for _, row in group.iterrows():
             try:
                 lon = float(row["shape_pt_lon"])
                 lat = float(row["shape_pt_lat"])
             except (TypeError, ValueError):
+                lon = lat = float("nan")
+            if not (np.isfinite(lon) and np.isfinite(lat)):
                 logging.warning("Skipping bad shape point in shape_id=%s", shape_id)
                 continue
             pt = arcpy.Point(lon, lat)
             array.add(pt)
+            dists.append(float(row["shape_dist_traveled"]) if has_dists else float("nan"))
 
         if array.count < 2:
             logging.debug("Shape %s has fewer than 2 points; skipping.", shape_id)
@@ -296,9 +374,12 @@ def _build_shape_geometries(
         line_wgs = arcpy.Polyline(array, wgs84)
         line_proj = line_wgs.projectAs(projected_sr)
         out[str(shape_id)] = line_proj
+        dist_arr = np.asarray(dists)
+        if np.isfinite(dist_arr).all() and (np.diff(dist_arr) >= 0).all():
+            vertex_dists[str(shape_id)] = dist_arr
 
     logging.info("Built %d shape polylines.", len(out))
-    return out
+    return out, vertex_dists
 
 
 def _build_routes_from_shapes(
@@ -307,7 +388,7 @@ def _build_routes_from_shapes(
     shape_geoms: Dict[str, arcpy.Polyline],
     union_shapes: bool,
 ) -> List[Dict[str, Any]]:
-    """Build route polylines keyed by (route_id, direction_id).
+    """Build route polylines keyed by (route_id, direction_id), for routes.shp.
 
     Args:
         trips_df: Filtered trips.txt DataFrame.
@@ -325,8 +406,7 @@ def _build_routes_from_shapes(
             "geometry": arcpy.Polyline,
         }
     """
-    trips = trips_df.copy()
-    trips = trips.dropna(subset=["direction_id", "shape_id"]).copy()
+    trips = trips_df.loc[trips_df["shape_id"] != ""].copy()
 
     # NEW: collapse to unique combinations so we do not duplicate per trip.
     trips = trips.drop_duplicates(subset=["route_id", "direction_id", "shape_id"]).copy()
@@ -434,8 +514,10 @@ def _build_stop_aggregates(
     Returns:
         (all_stops_df, selected_stops_df) where each DataFrame contains:
         stop_id, stop_name, stop_lat, stop_lon, route_id, direction_id,
-        route_short_name. The three *_id/name columns are Python lists with
-        normalized types (route_id → str, direction_id → int, route_short_name → str).
+        route_short_name, route_dirs. The three *_id/name columns are Python
+        lists with normalized types (route_id → str, direction_id → int,
+        route_short_name → str); route_dirs lists the actual (route_id,
+        direction_id) pairs, which the separate lists cannot reconstruct.
     """
     stops = dfs["stops"]
     stop_times = dfs["stop_times"]
@@ -458,9 +540,15 @@ def _build_stop_aggregates(
             merged["direction_id"],
             errors="coerce",
         )
+        merged = merged.drop_duplicates(["stop_id", "route_id", "direction_id"])
+        merged["route_dirs"] = [
+            (str(rid), int(drn)) for rid, drn in zip(merged["route_id"], merged["direction_id"])
+        ]
 
         agg = (
-            merged.groupby("stop_id")[["route_id", "direction_id", "route_short_name"]]
+            merged.groupby("stop_id")[
+                ["route_id", "direction_id", "route_short_name", "route_dirs"]
+            ]
             .agg(lambda s: sorted(set(s.dropna())))
             .reset_index()
         )
@@ -491,29 +579,111 @@ def _build_stop_aggregates(
 
 
 # =============================================================================
-# ROUTE/STOP INDEX + ORDERED STOPS
+# STOPPING PATTERNS + ORDERED STOPS
 # =============================================================================
 
 
-def _build_route_stop_index(
-    stops_df: pd.DataFrame,
-) -> Dict[Tuple[str, int], np.ndarray]:
-    """Map (route_id, direction_id) to row indices in stops_df.
+def _vertices(line: arcpy.Polyline) -> np.ndarray:
+    """Return a single-part polyline's vertices as an (n, 2) array."""
+    return np.array([(pt.X, pt.Y) for pt in line.getPart(0)], dtype=float).reshape(-1, 2)
 
-    This is a one-time, global index that replaces repeated per-route
-    `.apply(lambda ids: rid in ids)` scans in the QA and segment exporter.
+
+def _vertex_along(vertices: np.ndarray) -> np.ndarray:
+    """Return each vertex's distance along the polyline (SR units)."""
+    steps = np.diff(vertices, axis=0)
+    return np.concatenate(([0.0], np.cumsum(np.hypot(steps[:, 0], steps[:, 1]))))
+
+
+def _dists_along_line(
+    line: arcpy.Polyline,
+    vertex_dists: np.ndarray | None,
+    stop_dists: Sequence[float],
+) -> Tuple[float, ...]:
+    """Convert stops' shape_dist_traveled to SR distances along line.
+
+    Interpolates between the shape's vertices, whose own values are
+    vertex_dists. Returns NaNs when either side lacks the values.
     """
-    index: dict[tuple[str, int], list[int]] = defaultdict(list)
+    stop_along = np.asarray(stop_dists, dtype=float)
+    vertices = _vertices(line)
+    if (
+        vertex_dists is None
+        or len(vertex_dists) != len(vertices)
+        or not np.isfinite(stop_along).all()
+    ):
+        return tuple(np.full(len(stop_along), np.nan))
+    return tuple(np.interp(stop_along, vertex_dists, _vertex_along(vertices)))
 
-    for idx, row in stops_df.iterrows():
-        route_ids: list[str] = row.route_id
-        dir_ids: list[int] = row.direction_id
-        for rid in route_ids:
-            for drn in dir_ids:
-                key = (str(rid), int(drn))
-                index[key].append(int(idx))
 
-    return {key: np.asarray(vals, dtype=int) for key, vals in index.items()}
+def _build_pattern_records(
+    stop_times_df: pd.DataFrame,
+    trips_df: pd.DataFrame,
+    routes_df: pd.DataFrame,
+    shape_geoms: Dict[str, arcpy.Polyline],
+    shape_vertex_dists: Dict[str, np.ndarray],
+) -> List[Dict[str, Any]]:
+    """Return one record per distinct stopping pattern.
+
+    A pattern is a (route_id, direction_id, shape_id) and the trip's stop IDs
+    in stop_sequence order, repeats included.
+
+    Returns:
+        List of records:
+        {
+            "route_id": str,
+            "direction_id": int,
+            "route_short": str | None,
+            "shape_id": str,
+            "stop_ids": tuple of str,
+            "stop_dists": tuple of float (SR units along the shape from
+                shape_dist_traveled; NaN when the feed lacks it),
+            "geometry": arcpy.Polyline,
+        }
+    """
+    st = stop_times_df.loc[stop_times_df["trip_id"].isin(trips_df["trip_id"])]
+    st = st.dropna(subset=["stop_sequence"]).sort_values(["trip_id", "stop_sequence"])
+    if "shape_dist_traveled" not in st.columns:
+        st = st.assign(shape_dist_traveled=np.nan)
+
+    per_trip = (
+        st.groupby("trip_id", sort=False)
+        .agg(stop_ids=("stop_id", tuple), stop_dists=("shape_dist_traveled", tuple))
+        .reset_index()
+        .merge(trips_df[["trip_id", "route_id", "direction_id", "shape_id"]], on="trip_id")
+    )
+    no_shape = ~per_trip["shape_id"].isin(list(shape_geoms))
+    if no_shape.any():
+        logging.warning(
+            "Skipping %d of %d trips whose shape_id is blank or has no usable shape.",
+            no_shape.sum(),
+            len(per_trip),
+        )
+    patterns = (
+        per_trip.loc[~no_shape]
+        .drop_duplicates(["route_id", "direction_id", "shape_id", "stop_ids"])
+        .sort_values(["route_id", "direction_id", "shape_id"], kind="stable")
+    )
+
+    route_short_lookup = dict(zip(routes_df["route_id"], routes_df["route_short_name"]))
+    records: List[Dict[str, Any]] = []
+    for row in patterns.itertuples(index=False):
+        line = shape_geoms[row.shape_id]
+        records.append(
+            {
+                "route_id": str(row.route_id),
+                "direction_id": int(row.direction_id),
+                "route_short": route_short_lookup.get(row.route_id),
+                "shape_id": row.shape_id,
+                "stop_ids": row.stop_ids,
+                "stop_dists": _dists_along_line(
+                    line, shape_vertex_dists.get(row.shape_id), row.stop_dists
+                ),
+                "geometry": line,
+            }
+        )
+
+    logging.info("Patterns – %d stopping patterns from %d trips.", len(records), len(per_trip))
+    return records
 
 
 class RouteStop(NamedTuple):
@@ -524,62 +694,137 @@ class RouteStop(NamedTuple):
     measure: float
 
 
-def _ordered_route_stops(
+def _match_in_order(vertices: np.ndarray, xy: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Place points on a polyline in their given order.
+
+    Each point goes to its nearest spot on one segment of the polyline. The
+    segments are chosen so they never go backwards from one point to the
+    next, and so that the total of each point's distance from the line, plus
+    any backtrack between two points on the same segment, is as small as
+    possible (a dynamic programme over segments). Unlike projecting each
+    point on its own, a stop on a street the route uses twice is placed on
+    the pass that fits the trip's order.
+
+    Args:
+        vertices: ``(k + 1, 2)`` polyline vertices.
+        xy: ``(n, 2)`` points in order.
+
+    Returns:
+        ``(along, offset)``: each point's distance along the polyline and its
+        distance from that spot.
+    """
+    start = vertices[:-1]
+    vec = np.diff(vertices, axis=0)
+    seg_len = np.hypot(vec[:, 0], vec[:, 1])
+    seg_from = np.concatenate(([0.0], np.cumsum(seg_len)[:-1]))
+    len_sq = np.where(seg_len > 0, seg_len**2, 1.0)
+
+    def _on_segments(pt: np.ndarray, segs: np.ndarray | slice) -> Tuple[np.ndarray, np.ndarray]:
+        rel = pt - start[segs]
+        t = np.clip((rel * vec[segs]).sum(axis=-1) / len_sq[segs], 0.0, 1.0)
+        gap = rel - t[..., None] * vec[segs]
+        return seg_from[segs] + t * seg_len[segs], np.hypot(gap[..., 0], gap[..., 1])
+
+    # cost[j]: least total so far with the latest point on segment j
+    idx = np.arange(len(seg_len))
+    prev_along, cost = _on_segments(xy[0], slice(None))
+    back: List[np.ndarray] = []
+    for pt in xy[1:]:
+        along, offset = _on_segments(pt, slice(None))
+        # best over strictly earlier segments, and which segment gave it
+        best = np.minimum.accumulate(cost)
+        improves = np.concatenate(([True], cost[1:] < best[:-1]))
+        best_arg = np.maximum.accumulate(np.where(improves, idx, 0))
+        earlier = np.concatenate(([np.inf], best[:-1]))
+        earlier_arg = np.concatenate(([0], best_arg[:-1]))
+        # or the same segment, paying for any step backwards along it; ties
+        # go to the earlier segment, i.e. the first pass that fits
+        same = cost + np.maximum(prev_along - along, 0.0)
+        back.append(np.where(same < earlier, idx, earlier_arg))
+        cost = offset + np.minimum(same, earlier)
+        prev_along = along
+
+    segs = [int(np.argmin(cost))]
+    for prev_best in reversed(back):
+        segs.append(int(prev_best[segs[-1]]))
+    segs.reverse()
+    return _on_segments(xy, np.asarray(segs))
+
+
+def _ordered_pattern_stops(
     rec: Dict[str, Any],
-    stops_df: pd.DataFrame,
-    route_index: Dict[Tuple[str, int], np.ndarray],
     stop_geoms: Dict[str, arcpy.PointGeometry],
-    line: arcpy.Polyline,
+    stop_names: Dict[str, str],
     max_offset: float,
 ) -> List[RouteStop]:
-    """Return unique, ordered stops along a route polyline.
+    """Return a pattern's stops in trip order, with measures along its shape.
 
-    Only the route's stops within max_offset (SR units) of the polyline count.
-    The result is sorted by measureOnLine and de-duplicates equal measures.
+    The shape_dist_traveled positions in rec["stop_dists"] are used when
+    every stop has one, they never decrease, and each lies within max_offset
+    of its stop. Otherwise the stops are matched to the shape in trip order
+    (see _match_in_order), so a loop or a retraced street keeps the trip's
+    sequence. Stops without a geometry or farther than max_offset (SR units)
+    from their position are left out.
     """
-    rid = rec["route_id"]
-    drn = int(rec["direction_id"])
+    line: arcpy.Polyline = rec["geometry"]
+    vertices = _vertices(line)
+    stop_ids: List[str] = list(rec["stop_ids"])
+    geoms = [stop_geoms.get(sid) for sid in stop_ids]
+    xy = np.array(
+        [(g.firstPoint.X, g.firstPoint.Y) if g is not None else (np.nan, np.nan) for g in geoms],
+        dtype=float,
+    ).reshape(-1, 2)
 
-    idxs = route_index.get((rid, drn))
-    if idxs is None or len(idxs) < 2:
-        return []
+    measures = np.asarray(rec.get("stop_dists", [np.nan] * len(stop_ids)), dtype=float)
+    use_hint = (
+        len(measures) == len(stop_ids)
+        and np.isfinite(measures).all()
+        and (np.diff(measures) >= 0).all()
+    )
+    if use_hint:
+        along = _vertex_along(vertices)
+        at_x = np.interp(measures, along, vertices[:, 0])
+        at_y = np.interp(measures, along, vertices[:, 1])
+        use_hint = bool((np.hypot(xy[:, 0] - at_x, xy[:, 1] - at_y) <= max_offset).all())
 
-    served = stops_df.iloc[idxs]
+    if not use_hint:
+        measures = np.full(len(stop_ids), np.nan)
+        usable = [
+            i for i, g in enumerate(geoms) if g is not None and line.distanceTo(g) <= max_offset
+        ]
+        if usable:
+            along, offset = _match_in_order(vertices, xy[usable])
+            ok = offset <= max_offset
+            measures[np.asarray(usable)[ok]] = np.maximum.accumulate(along[ok])
 
-    dists: list[float] = []
-    stop_ids: list[str] = []
-    stop_names: list[str] = []
+    return [
+        RouteStop(stop_id=sid, stop_name=stop_names.get(sid), measure=float(m))
+        for sid, m in zip(stop_ids, measures)
+        if np.isfinite(m)
+    ]
 
-    for _, row in served.iterrows():
-        sid = str(row.stop_id)
-        pt_geom = stop_geoms.get(sid)
-        if pt_geom is None or line.distanceTo(pt_geom) > max_offset:
+
+def _consecutive_stops(
+    patterns: List[Dict[str, Any]],
+    stop_geoms: Dict[str, arcpy.PointGeometry],
+    stop_names: Dict[str, str],
+    max_offset: float,
+) -> Iterator[Tuple[Dict[str, Any], RouteStop, RouteStop]]:
+    """Yield (pattern, stop, next_stop) for consecutive stops of each pattern.
+
+    A pair repeated by another pattern of the same route, direction and shape
+    (e.g. a local and an express sharing a stretch) is yielded once.
+    """
+    seen: set = set()
+    for rec in patterns:
+        if _is_empty_polyline(rec["geometry"]):
             continue
-
-        m = line.measureOnLine(pt_geom, use_percentage=False)
-        if not np.isfinite(m):
-            continue
-
-        dists.append(float(m))
-        stop_ids.append(sid)
-        stop_names.append(str(row.stop_name))
-
-    if len(dists) < 2:
-        return []
-
-    order = np.argsort(dists)
-    d_sorted = [dists[i] for i in order]
-    id_sorted = [stop_ids[i] for i in order]
-    name_sorted = [stop_names[i] for i in order]
-
-    result: list[RouteStop] = []
-    last_d: float | None = None
-    for d_val, sid, sname in zip(d_sorted, id_sorted, name_sorted):
-        if last_d is None or d_val > last_d:
-            result.append(RouteStop(stop_id=sid, stop_name=sname, measure=d_val))
-            last_d = d_val
-
-    return result
+        stops = _ordered_pattern_stops(rec, stop_geoms, stop_names, max_offset)
+        for s0, s1 in zip(stops[:-1], stops[1:]):
+            key = (rec["route_id"], rec["direction_id"], rec["shape_id"], s0, s1)
+            if key not in seen:
+                seen.add(key)
+                yield rec, s0, s1
 
 
 # =============================================================================
@@ -718,18 +963,18 @@ def _export_routes_shapefile(
 
 
 def _export_segments_shapefile(
-    routes: List[Dict[str, Any]],
-    stops_df: pd.DataFrame,
-    route_index: Dict[Tuple[str, int], np.ndarray],
+    patterns: List[Dict[str, Any]],
     stop_geoms: Dict[str, arcpy.PointGeometry],
+    stop_names: Dict[str, str],
     sr: arcpy.SpatialReference,
     out_folder: Path,
     max_offset_ft: float = SERVED_STOP_MAX_OFFSET_FT,
 ) -> None:
-    """Split each route polyline at its own stops and write segments.shp.
+    """Split each pattern's shape between consecutive stops and write segments.shp.
 
-    The route's stops farther than max_offset_ft from the polyline are not
-    counted as served by it.
+    A pattern's stops farther than max_offset_ft from the shape are skipped,
+    and a segment repeated by another pattern on the same shape is written
+    once.
     """
     arcpy.env.overwriteOutput = True
 
@@ -768,37 +1013,28 @@ def _export_segments_shapefile(
     rows_written = 0
 
     with arcpy.da.InsertCursor(fc_path, insert_fields) as cursor:
-        for rec in routes:
+        for rec, s0, s1 in _consecutive_stops(patterns, stop_geoms, stop_names, max_offset):
+            start_m = s0.measure
+            end_m = s1.measure
+            if end_m <= start_m:
+                continue
+
             line: arcpy.Polyline = rec["geometry"]
-            if _is_empty_polyline(line):
+            seg_geom = line.segmentAlongLine(start_m, end_m, use_percentage=False)
+            if _is_empty_polyline(seg_geom):
                 continue
 
-            rid = rec["route_id"]
-            drn = int(rec["direction_id"])
-            rshort = rec.get("route_short")
-
-            stops = _ordered_route_stops(rec, stops_df, route_index, stop_geoms, line, max_offset)
-            if len(stops) < 2:
-                logging.debug(
-                    "Route %s dir=%s has fewer than 2 ordered stops; skipping segments.",
-                    rid,
-                    drn,
-                )
-                continue
-
-            for j in range(len(stops) - 1):
-                start_m = stops[j].measure
-                end_m = stops[j + 1].measure
-                if end_m <= start_m:
-                    continue
-
-                seg_geom = line.segmentAlongLine(start_m, end_m, use_percentage=False)
-                if _is_empty_polyline(seg_geom):
-                    continue
-
-                length_ft = seg_geom.length * ft_factor
-                cursor.insertRow([rid, drn, rshort, float(length_ft), seg_geom])
-                rows_written += 1
+            length_ft = seg_geom.length * ft_factor
+            cursor.insertRow(
+                [
+                    rec["route_id"],
+                    int(rec["direction_id"]),
+                    rec.get("route_short"),
+                    float(length_ft),
+                    seg_geom,
+                ]
+            )
+            rows_written += 1
 
     logging.info("Wrote %s (%d features).", fc_path, rows_written)
 
@@ -809,10 +1045,9 @@ def _export_segments_shapefile(
 
 
 def _flag_short_spacing(
-    routes: List[Dict[str, Any]],
-    stops_df: pd.DataFrame,
-    route_index: Dict[Tuple[str, int], np.ndarray],
+    patterns: List[Dict[str, Any]],
     stop_geoms: Dict[str, arcpy.PointGeometry],
+    stop_names: Dict[str, str],
     sr: arcpy.SpatialReference,
     threshold_ft: float,
     log_path: Path,
@@ -820,8 +1055,8 @@ def _flag_short_spacing(
 ) -> None:
     """Write a log of consecutive stops spaced closer than threshold_ft.
 
-    The route's stops farther than max_offset_ft from the polyline are not
-    counted as served by it.
+    Stops are evaluated in trip order along each stopping pattern's shape.
+    A pattern's stops farther than max_offset_ft from the shape are skipped.
     """
     ft_factor = _feet_factor(sr)
     max_offset = max_offset_ft / ft_factor
@@ -833,28 +1068,16 @@ def _flag_short_spacing(
             "end_stop_id\tend_stop_name\tspacing_ft\n"
         )
 
-        for rec in routes:
-            line: arcpy.Polyline = rec["geometry"]
-            if _is_empty_polyline(line):
-                continue
-
-            rid = rec["route_id"]
-            drn = int(rec["direction_id"])
-
-            stops = _ordered_route_stops(rec, stops_df, route_index, stop_geoms, line, max_offset)
-            if len(stops) < 2:
-                continue
-
-            for i in range(len(stops) - 1):
-                spacing_ft = (stops[i + 1].measure - stops[i].measure) * ft_factor
-                if spacing_ft < threshold_ft:
-                    fh.write(
-                        f"{rid}\t{drn}\t"
-                        f"{stops[i].stop_id}\t{stops[i].stop_name}\t"
-                        f"{stops[i + 1].stop_id}\t{stops[i + 1].stop_name}\t"
-                        f"{spacing_ft:.1f}\n"
-                    )
-                    count += 1
+        for rec, s0, s1 in _consecutive_stops(patterns, stop_geoms, stop_names, max_offset):
+            spacing_ft = (s1.measure - s0.measure) * ft_factor
+            if spacing_ft < threshold_ft:
+                fh.write(
+                    f"{rec['route_id']}\t{int(rec['direction_id'])}\t"
+                    f"{s0.stop_id}\t{s0.stop_name}\t"
+                    f"{s1.stop_id}\t{s1.stop_name}\t"
+                    f"{spacing_ft:.1f}\n"
+                )
+                count += 1
 
     logging.info(
         "Wrote short-spacing log → %s (%d flagged segments).",
@@ -864,10 +1087,10 @@ def _flag_short_spacing(
 
 
 def _flag_long_spacing_csv(
-    routes: List[Dict[str, Any]],
+    patterns: List[Dict[str, Any]],
     all_stops_df: pd.DataFrame,
-    all_route_index: Dict[Tuple[str, int], np.ndarray],
     stop_geoms: Dict[str, arcpy.PointGeometry],
+    stop_names: Dict[str, str],
     sr: arcpy.SpatialReference,
     threshold_ft: float,
     near_buffer_ft: float,
@@ -877,99 +1100,76 @@ def _flag_long_spacing_csv(
 ) -> None:
     """Export a CSV of “missed” stops that fill unusually long gaps.
 
-    A long gap is any consecutive pair of served stops on a given
-    (route_id, direction_id) whose spacing exceeds threshold_ft. For every
-    other-route stop that lies inside the gap and within near_buffer_ft of
-    the route polyline, a row is written to the CSV. The route's stops
-    farther than max_offset_ft from the polyline are not counted as served
-    by it.
+    A long gap is any consecutive pair of stops in a stopping pattern whose
+    spacing exceeds threshold_ft. For every stop not served by the pattern's
+    (route_id, direction_id) that lies inside the gap and within
+    near_buffer_ft of it, a row is written to the CSV. A pattern's stops
+    farther than max_offset_ft from the shape are skipped. The CSV and
+    summary are rewritten on every run, header only when nothing is
+    flagged, so results from an earlier run never linger.
     """
     ft_factor = _feet_factor(sr)
     near_buffer = near_buffer_ft / ft_factor  # SR units
     max_offset = max_offset_ft / ft_factor
     records: List[Dict[str, Any]] = []
 
-    # Optional precomputation of stop coordinates (not strictly required, but cheap).
-    stop_coords: dict[str, Tuple[float, float]] = {}
-    for sid, geom in stop_geoms.items():
+    # Stop coordinates aligned with all_stops_df rows, for a quick box filter.
+    xs = np.full(len(all_stops_df), np.nan)
+    ys = np.full(len(all_stops_df), np.nan)
+    for pos, sid in enumerate(all_stops_df["stop_id"]):
+        geom = stop_geoms.get(str(sid))
         if geom is not None and geom.firstPoint is not None:
-            stop_coords[sid] = (geom.firstPoint.X, geom.firstPoint.Y)
+            xs[pos], ys[pos] = geom.firstPoint.X, geom.firstPoint.Y
 
-    for rec in routes:
-        line: arcpy.Polyline = rec["geometry"]
-        if _is_empty_polyline(line):
+    for rec, s0, s1 in _consecutive_stops(patterns, stop_geoms, stop_names, max_offset):
+        start_m = float(s0.measure)
+        end_m = float(s1.measure)
+        seg_len_ft = (end_m - start_m) * ft_factor
+        if seg_len_ft <= threshold_ft:
             continue
 
         rid = rec["route_id"]
         drn = int(rec["direction_id"])
-        rshort = rec.get("route_short")
-
-        stops = _ordered_route_stops(
-            rec, all_stops_df, all_route_index, stop_geoms, line, max_offset
+        # The gap itself, so a loop's other passes and curves are handled
+        line: arcpy.Polyline = rec["geometry"]
+        gap = line.segmentAlongLine(start_m, end_m, use_percentage=False)
+        ext = gap.extent
+        in_box = np.flatnonzero(
+            (xs >= ext.XMin - near_buffer)
+            & (xs <= ext.XMax + near_buffer)
+            & (ys >= ext.YMin - near_buffer)
+            & (ys <= ext.YMax + near_buffer)
         )
-        if len(stops) < 2:
-            continue
 
-        for i in range(len(stops) - 1):
-            start_m = float(stops[i].measure)
-            end_m = float(stops[i + 1].measure)
-            seg_len_ft = (end_m - start_m) * ft_factor
-            if seg_len_ft <= threshold_ft:
+        for pos in in_box:
+            st_row = all_stops_df.iloc[pos]
+            # Skip stops served by this route/direction.
+            if (rid, drn) in st_row.route_dirs:
                 continue
 
-            # Extent of the whole gap, so stops beside a curve are also examined
-            gap = line.segmentAlongLine(start_m, end_m, use_percentage=False).extent
-            minx = gap.XMin - near_buffer
-            miny = gap.YMin - near_buffer
-            maxx = gap.XMax + near_buffer
-            maxy = gap.YMax + near_buffer
+            sid = str(st_row.stop_id)
+            pt_geom = stop_geoms[sid]
+            proj_m = gap.measureOnLine(pt_geom, use_percentage=False)
+            if not (np.isfinite(proj_m) and 0 < proj_m < gap.length):
+                continue
 
-            start_sid = stops[i].stop_id
-            end_sid = stops[i + 1].stop_id
-            start_name = stops[i].stop_name or ""
-            end_name = stops[i + 1].stop_name or ""
-
-            # Scan all stops (could be optimized further with spatial index if needed).
-            for _, st_row in all_stops_df.iterrows():
-                # Skip stops on the same route/direction.
-                if rid in st_row.route_id and drn in st_row.direction_id:
-                    continue
-
-                sid = str(st_row.stop_id)
-                pt_geom = stop_geoms.get(sid)
-                if pt_geom is None or pt_geom.firstPoint is None:
-                    continue
-
-                x = pt_geom.firstPoint.X
-                y = pt_geom.firstPoint.Y
-                if not (minx <= x <= maxx and miny <= y <= maxy):
-                    continue
-
-                proj_m = line.measureOnLine(pt_geom, use_percentage=False)
-                if not (np.isfinite(proj_m) and start_m < proj_m < end_m):
-                    continue
-
-                dist_to_route_ft = line.distanceTo(pt_geom) * ft_factor
-                if dist_to_route_ft <= near_buffer_ft:
-                    records.append(
-                        {
-                            "route_id": rid,
-                            "route_short": rshort,
-                            "direction_id": drn,
-                            "seg_len_ft": round(seg_len_ft, 1),
-                            "start_stop_id": start_sid,
-                            "start_stop_name": start_name,
-                            "end_stop_id": end_sid,
-                            "end_stop_name": end_name,
-                            "flagged_stop_id": sid,
-                            "flagged_stop_name": str(st_row.stop_name),
-                            "dist_to_route_ft": round(dist_to_route_ft, 1),
-                        }
-                    )
-
-    if not records:
-        logging.info("No long-spacing issues found.")
-        return
+            dist_to_route_ft = gap.distanceTo(pt_geom) * ft_factor
+            if dist_to_route_ft <= near_buffer_ft:
+                records.append(
+                    {
+                        "route_id": rid,
+                        "route_short": rec.get("route_short"),
+                        "direction_id": drn,
+                        "seg_len_ft": round(seg_len_ft, 1),
+                        "start_stop_id": s0.stop_id,
+                        "start_stop_name": s0.stop_name or "",
+                        "end_stop_id": s1.stop_id,
+                        "end_stop_name": s1.stop_name or "",
+                        "flagged_stop_id": sid,
+                        "flagged_stop_name": str(st_row.stop_name),
+                        "dist_to_route_ft": round(dist_to_route_ft, 1),
+                    }
+                )
 
     fieldnames = [
         "route_id",
@@ -990,7 +1190,10 @@ def _flag_long_spacing_csv(
         for rec in records:
             writer.writerow(rec)
 
-    logging.info("Wrote long-spacing CSV → %s (%d rows).", csv_path.name, len(records))
+    if records:
+        logging.info("Wrote long-spacing CSV → %s (%d rows).", csv_path.name, len(records))
+    else:
+        logging.info("No long-spacing issues found; wrote empty %s.", csv_path.name)
 
     if summary:
         flagged_pairs = {(rec["route_id"], rec["direction_id"]) for rec in records}
@@ -1031,6 +1234,14 @@ def main() -> int:  # noqa: D401
         return 2
     arcpy.env.overwriteOutput = True
 
+    try:
+        sr = _get_projected_sr(PROJECTED_WKID)
+    except ValueError as err:
+        logging.error("%s", err)
+        return 2
+    feet_factor = _feet_factor(sr)
+    logging.info("Using SR: %s (1 unit ≈ %.3f ft)", sr.name, feet_factor)
+
     out_dir = _ensure_output_folder(OUTPUT_FOLDER)
     logging.info("STEP 0  Reading GTFS tables …")
     dfs = _read_gtfs_tables(GTFS_PATH)
@@ -1040,6 +1251,7 @@ def main() -> int:  # noqa: D401
     except ValueError as err:
         logging.error("ERROR – invalid GTFS feed:\n%s", err)
         return 1
+    _prepare_tables(dfs)
 
     logging.info("STEP 0·1  Filtering routes and trips …")
     routes_df, trips_df = _filter_routes(
@@ -1053,29 +1265,31 @@ def main() -> int:  # noqa: D401
         len(routes_df),
         len(trips_df),
     )
-
-    sr = _get_projected_sr(PROJECTED_WKID)
-    feet_factor = _feet_factor(sr)
-    logging.info("Using SR: %s (1 unit ≈ %.3f ft)", sr.name, feet_factor)
+    if trips_df.empty:
+        logging.error(
+            "No trips left after applying INCLUDE_ROUTE_IDS / FILTER_OUT_LIST; "
+            "check that the IDs match route_id values in routes.txt."
+        )
+        return 2
 
     logging.info("STEP 1  Building stop aggregates …")
     all_stops_df, sel_stops_df = _build_stop_aggregates(dfs, trips_df, routes_df)
 
-    # Build route/stop index (all stops and selected stops) once.
-    sel_route_index = _build_route_stop_index(sel_stops_df)
-    all_route_index = _build_route_stop_index(all_stops_df)
-
     logging.info("STEP 2  Building geometries for shapes and stops …")
-    shape_geoms = _build_shape_geometries(dfs["shapes"], sr)
+    shape_geoms, shape_vertex_dists = _build_shape_geometries(dfs["shapes"], sr)
     stop_geoms = _build_stop_geometries(dfs["stops"], sr)
+    stop_names = dict(zip(dfs["stops"]["stop_id"], dfs["stops"]["stop_name"]))
     logging.info(
         "Built %d shape polylines and %d stop points.",
         len(shape_geoms),
         len(stop_geoms),
     )
 
-    logging.info("STEP 3  Building route polylines …")
+    logging.info("STEP 3  Building route polylines and stopping patterns …")
     routes = _build_routes_from_shapes(trips_df, routes_df, shape_geoms, ROUTE_UNION)
+    patterns = _build_pattern_records(
+        dfs["stop_times"], trips_df, routes_df, shape_geoms, shape_vertex_dists
+    )
 
     logging.info("STEP 4  Exporting stops and routes shapefiles …")
     _export_stops_shapefile(sel_stops_df, stop_geoms, sr, out_dir)
@@ -1083,10 +1297,9 @@ def main() -> int:  # noqa: D401
 
     logging.info("STEP 5  Building stop-to-stop segment shapefile …")
     _export_segments_shapefile(
-        routes,
-        sel_stops_df,
-        sel_route_index,
+        patterns,
         stop_geoms,
+        stop_names,
         sr,
         out_dir,
         max_offset_ft=SERVED_STOP_MAX_OFFSET_FT,
@@ -1094,10 +1307,9 @@ def main() -> int:  # noqa: D401
 
     logging.info("STEP 6  Short-spacing QA …")
     _flag_short_spacing(
-        routes,
-        sel_stops_df,
-        sel_route_index,
+        patterns,
         stop_geoms,
+        stop_names,
         sr,
         MIN_SPACING_FT,
         out_dir / SPACING_LOG_FILE,
@@ -1106,10 +1318,10 @@ def main() -> int:  # noqa: D401
 
     logging.info("STEP 7  Long-spacing QA …")
     _flag_long_spacing_csv(
-        routes,
+        patterns,
         all_stops_df,
-        all_route_index,
         stop_geoms,
+        stop_names,
         sr,
         LONG_SPACING_FT,
         NEAR_BUFFER_FT,
