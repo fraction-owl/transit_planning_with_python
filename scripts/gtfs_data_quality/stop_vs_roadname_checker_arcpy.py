@@ -37,7 +37,7 @@ OUTPUT_CSV = "potential_typos.csv"
 
 # Spatial references
 STOPS_CRS = 4326  # GTFS lat/lon – WGS-84
-TARGET_CRS = 2248  # example: VA North (US ft). change if needed
+TARGET_CRS = 2248  # example: NAD83 / Maryland (US ft). change if needed
 
 # Processing parameters
 BUFFER_DISTANCE = 50
