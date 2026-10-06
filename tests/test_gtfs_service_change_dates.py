@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ast
+import datetime as dt
 import logging
 import shutil
 import zipfile
@@ -314,3 +316,213 @@ def test_main_runs_end_to_end(tmp_path: Path) -> None:
     sheet = workbook["Service Changes"]
     assert str(sheet["A1"].value).startswith("Service Change Quick Reference")
     assert sheet["A4"].value == "2025-06-16"
+
+
+def test_boundary_dated_where_new_feeds_stable_pattern_begins(tmp_path: Path) -> None:
+    # The newer feed opens with one leftover week of A before B takes over.
+    feeds = tmp_path / "archive"
+    _write_feed(feeds, "old", calendar_rows=[("A", "1111100", "20251201", "20260116")])
+    _write_feed(
+        feeds,
+        "new",
+        calendar_rows=[
+            ("A", "1111100", "20260119", "20260123"),
+            ("B", "1111100", "20260126", "20260327"),
+        ],
+    )
+    changes, _ = target.run(feeds_dir=feeds, output_dir=tmp_path / "out")
+    assert list(changes["change_date"]) == ["2026-01-26"]
+    assert changes.iloc[0]["services_added"] == "B"
+    assert changes.iloc[0]["services_removed"] == "A"
+
+
+def test_isolated_holiday_does_not_pull_change_date_backward(tmp_path: Path) -> None:
+    # B runs on the Jan 19 holiday only, A resumes, then B takes over Feb 2.
+    feeds = tmp_path / "archive"
+    _write_feed(
+        feeds,
+        "single",
+        calendar_rows=[
+            ("A", "1111100", "20251201", "20260130"),
+            ("B", "1111100", "20260202", "20260327"),
+        ],
+        calendar_dates_rows=[("A", "20260119", "2"), ("B", "20260119", "1")],
+    )
+    changes, _ = target.run(feeds_dir=feeds, output_dir=tmp_path / "out")
+    assert list(changes["change_date"]) == ["2026-02-02"]
+
+
+def test_mid_week_change_with_holiday_in_transition(tmp_path: Path) -> None:
+    # B starts Wednesday Jan 28; Thursday Jan 29 is a holiday running neither pattern.
+    feeds = tmp_path / "archive"
+    _write_feed(
+        feeds,
+        "single",
+        calendar_rows=[
+            ("A", "1111100", "20251201", "20260127"),
+            ("B", "1111100", "20260128", "20260327"),
+        ],
+        calendar_dates_rows=[("B", "20260129", "2"), ("HOL", "20260129", "1")],
+    )
+    changes, _ = target.run(feeds_dir=feeds, output_dir=tmp_path / "out")
+    assert list(changes["change_date"]) == ["2026-01-28"]
+
+
+def test_coverage_gap_uses_whole_archive(tmp_path: Path, caplog) -> None:
+    # B ends in February, but A covers March, so C's April start is no gap.
+    feeds = tmp_path / "archive"
+    _write_feed(feeds, "a_year", calendar_rows=[("W", "1111100", "20260105", "20261231")])
+    _write_feed(feeds, "b_feb", calendar_rows=[("W", "1111100", "20260202", "20260227")])
+    _write_feed(feeds, "c_q2", calendar_rows=[("W", "1111100", "20260406", "20260626")])
+    with caplog.at_level(logging.WARNING):
+        changes, _ = target.run(feeds_dir=feeds, output_dir=tmp_path / "out")
+    assert changes.empty
+    assert "coverage gap" not in caplog.text.lower()
+
+
+def test_real_coverage_gap_still_reported(tmp_path: Path) -> None:
+    feeds = tmp_path / "archive"
+    _write_feed(feeds, "spring", calendar_rows=[("W", "1111100", "20260105", "20260227")])
+    _write_feed(feeds, "summer", calendar_rows=[("W", "1111100", "20260406", "20260626")])
+    changes, _ = target.run(feeds_dir=feeds, output_dir=tmp_path / "out")
+    assert list(changes["change_date"]) == ["2026-04-06"]
+    assert changes.iloc[0]["change_type"] == "New service period"
+    assert "37-day gap" in changes.iloc[0]["notes"]
+
+
+def test_folder_and_zip_with_same_name_get_distinct_labels(tmp_path: Path) -> None:
+    feeds = tmp_path / "archive"
+    _write_feed(
+        feeds, "2026", calendar_rows=[("B", "1111100", "20260202", "20260327")], zipped=True
+    )
+    _write_feed(feeds, "2026", calendar_rows=[("A", "1111100", "20260105", "20260130")])
+    changes, feeds_df = target.run(feeds_dir=feeds, output_dir=tmp_path / "out")
+    assert sorted(feeds_df["feed"]) == ["2026", "2026.zip"]
+    assert list(changes["change_date"]) == ["2026-02-02"]
+    assert changes.iloc[0]["source_feeds"] == "2026; 2026.zip"
+
+
+def test_duplicate_labels_rejected_by_merge(tmp_path: Path) -> None:
+    feeds = tmp_path / "archive"
+    first = _write_feed(feeds, "x", calendar_rows=[("A", "1111100", "20260105", "20260130")])
+    second = _write_feed(feeds, "y", calendar_rows=[("B", "1111100", "20260202", "20260327")])
+    summaries = [target.inspect_feed(first, "same"), target.inspect_feed(second, "same")]
+    with pytest.raises(ValueError, match="unique label"):
+        target.merge_service_changes(summaries)
+
+
+def test_literal_na_service_ids_survive_and_blank_ids_are_flagged(tmp_path: Path) -> None:
+    feeds = tmp_path / "archive"
+    _write_feed(
+        feeds,
+        "nas",
+        calendar_rows=[
+            ("NA", "1111100", "20260105", "20260130"),
+            ("NULL", "1111100", "20260202", "20260327"),
+            ("", "0000010", "20260105", "20260327"),
+        ],
+    )
+    changes, feeds_df = target.run(feeds_dir=feeds, output_dir=tmp_path / "out")
+    assert list(changes["change_date"]) == ["2026-02-02"]
+    assert changes.iloc[0]["services_added"] == "NULL"
+    assert changes.iloc[0]["services_removed"] == "NA"
+    assert feeds_df.iloc[0]["service_ids"] == 2
+    assert "blank service_id" in feeds_df.iloc[0]["issues"]
+
+
+def _event(day: int, feed: str, added: str, removed: str) -> target.ServiceChange:
+    return target.ServiceChange(
+        dt.date(2026, 1, day), (feed,), "Service change", frozenset({added}), frozenset({removed})
+    )
+
+
+def test_cluster_does_not_chain_successive_changes() -> None:
+    events = [
+        _event(1, "f1", "B", "A"),
+        _event(4, "f2", "C", "B"),
+        _event(7, "f3", "D", "C"),
+        _event(10, "f4", "E", "D"),
+    ]
+    first_active = {f"f{i}": dt.date(2025, i, 1) for i in range(1, 5)}
+    merged = target._cluster_events(events, first_active)
+    assert [(c.date.day, set(c.added), set(c.removed)) for c in merged] == [
+        (1, {"B"}, {"A"}),
+        (4, {"C"}, {"B"}),
+        (7, {"D"}, {"C"}),
+        (10, {"E"}, {"D"}),
+    ]
+
+
+def test_cluster_span_is_bounded_from_its_first_event() -> None:
+    # Same change reported 1, 4 and 7 Jan: 7 Jan is 6 days from the cluster start.
+    events = [_event(1, "f1", "B", "A"), _event(4, "f2", "B", "A"), _event(7, "f3", "B", "A")]
+    first_active = {f"f{i}": dt.date(2025, i, 1) for i in range(1, 4)}
+    merged = target._cluster_events(events, first_active)
+    assert [c.feeds for c in merged] == [("f1", "f2"), ("f3",)]
+    assert merged[0].date == dt.date(2026, 1, 4)
+
+
+def test_run_log_written_without_source_file(tmp_path: Path, monkeypatch) -> None:
+    # A notebook cell has no __file__; the run log falls back to runtime values.
+    monkeypatch.delitem(target.__dict__, "__file__")
+    feeds = tmp_path / "archive"
+    _write_feed(feeds, "single", calendar_rows=[("A", "1111100", "20260105", "20260327")])
+    out = tmp_path / "out"
+    target.run(feeds_dir=feeds, output_dir=out)
+    text = (out / "gtfs_service_change_dates_runlog.txt").read_text(encoding="utf-8")
+    assert "runtime values" in text
+    assert "MIN_STABLE_WEEKS = 2" in text
+
+
+def test_config_names_match_config_block() -> None:
+    block = target.extract_config_block(Path(target.__file__))
+    names = {
+        node.target.id
+        for node in ast.parse(block).body
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+    }
+    assert names == set(target._CONFIG_NAMES)
+
+
+def test_historical_long_calendar_is_not_anchored_to_today(tmp_path: Path) -> None:
+    feeds = tmp_path / "archive"
+    _write_feed(feeds, "hist", calendar_rows=[("H", "1111100", "20100104", "20161230")])
+    _, feeds_df = target.run(feeds_dir=feeds, output_dir=tmp_path / "out")
+    row = feeds_df.iloc[0]
+    assert row["last_active_date"] == "2016-12-30"
+    assert row["active_days"] > 1000
+
+
+def test_long_calendar_anchored_on_feeds_ordinary_rows(tmp_path: Path) -> None:
+    # A 2000-2099 placeholder row is clamped around the feed's 2012 rows, not today.
+    feeds = tmp_path / "archive"
+    _write_feed(
+        feeds,
+        "old_feed",
+        calendar_rows=[
+            ("WKD", "1111100", "20120102", "20121228"),
+            ("SUN", "0000001", "20000102", "20991227"),
+        ],
+    )
+    _, feeds_df = target.run(feeds_dir=feeds, output_dir=tmp_path / "out")
+    assert feeds_df.iloc[0]["last_active_date"] < "2016-01-01"
+
+
+def test_range_outside_clamp_window_warns_explicitly(caplog) -> None:
+    calendar = pd.DataFrame(
+        [
+            {
+                "service_id": "H",
+                **{day: "1" for day in ("monday", "tuesday", "wednesday", "thursday")},
+                "friday": "1",
+                "saturday": "0",
+                "sunday": "0",
+                "start_date": "20100104",
+                "end_date": "20161230",
+            }
+        ]
+    )
+    with caplog.at_level(logging.WARNING):
+        active = target.expand_service_active_dates(calendar, today=dt.date(2026, 10, 6))
+    assert active == {"H": set()}
+    assert "entirely outside the expansion window" in caplog.text
