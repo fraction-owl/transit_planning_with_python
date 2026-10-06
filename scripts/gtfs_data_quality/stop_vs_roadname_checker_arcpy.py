@@ -5,7 +5,8 @@ and uses fuzzy string matching to flag stop names that are similar—but not ide
 to adjacent street names. Intended for QA of stop name consistency in GIS-based transit data.
 
 Outputs:
-    - CSV of potential stop name typos and similarity scores.
+    - CSV of potential stop name typos and similarity scores. The CSV is
+      rewritten on every run; a run with no findings writes a header-only CSV.
     - File geodatabase with intermediate feature classes for inspection.
 
 Typical usage:
@@ -103,19 +104,30 @@ def load_gtfs_stops(folder: str) -> pd.DataFrame:
         folder: The path to the folder containing the GTFS `stops.txt` file.
 
     Returns:
-        A pandas DataFrame with stop data.
+        A pandas DataFrame with stop data. Pandas' default NA parsing is
+        disabled, so literal values such as ``"NA"`` stay strings. Rows with
+        blank coordinates (allowed by GTFS for some location types) are
+        dropped with a warning.
 
     Raises:
         FileNotFoundError: If `stops.txt` is not found in the specified folder.
-        ValueError: If the `stops.txt` file is missing required columns.
+        ValueError: If the `stops.txt` file is missing required columns, or a
+            non-blank lat/lon cannot be cast to float.
     """
     path = os.path.join(folder, "stops.txt")
     if not os.path.isfile(path):
         raise FileNotFoundError(f"stops.txt not found in {folder}")
-    df = pd.read_csv(path, dtype=str, low_memory=False)
+    df = pd.read_csv(path, dtype=str, keep_default_na=False, low_memory=False)
     need = {"stop_id", "stop_name", "stop_lat", "stop_lon"}
     if not need.issubset(df.columns):
         raise ValueError(f"stops.txt missing columns: {', '.join(need - set(df.columns))}")
+    blank = pd.Series(False, index=df.index)
+    for col in ("stop_lat", "stop_lon"):
+        text = df[col].astype("string").str.strip()
+        blank |= text.isna() | (text == "")
+    if blank.any():
+        logging.warning("Dropping %d stop(s) with blank coordinates.", int(blank.sum()))
+        df = df.loc[~blank].copy()
     df["stop_lat"] = df["stop_lat"].astype(float)
     df["stop_lon"] = df["stop_lon"].astype(float)
     return df
@@ -150,7 +162,7 @@ def normalize_street(name: str, mods: set[str]) -> str:
 def split_stop_name(stop_name: str, mods: set[str]) -> list[str]:
     """Splits a GTFS stop name into normalized street name components.
 
-    Uses common intersection separators (e.g., '@', '&', '/') to divide the
+    Uses common intersection separators (e.g., '@', '&', '/', '+') to divide the
     stop name and then normalizes each resulting part.
 
     Args:
@@ -162,8 +174,9 @@ def split_stop_name(stop_name: str, mods: set[str]) -> list[str]:
     """
     if not isinstance(stop_name, str):
         return []
-    seps = [" @ ", " and ", " & ", "/", " intersection of "]
-    parts = re.split("|".join(map(re.escape, seps)), stop_name, flags=re.IGNORECASE)
+    # Symbol separators split with or without surrounding spaces ("A&B", "A @ B").
+    pattern = r"\s*[@&/+]\s*| and | intersection of "
+    parts = re.split(pattern, stop_name, flags=re.IGNORECASE)
     return [normalize_street(p, mods) for p in parts if p.strip()]
 
 
@@ -196,8 +209,11 @@ def make_stops_fc(df: pd.DataFrame, out_fc: str, sr: int) -> None:
         "POINT",
         spatial_reference=arcpy.SpatialReference(sr),
     )
-    arcpy.management.AddField(out_fc, "stop_id", "TEXT", 50)
-    arcpy.management.AddField(out_fc, "stop_name", "TEXT", 255)
+    # Widen past the defaults if needed: an over-long value fails on insert.
+    id_len = int(max([50, *df["stop_id"].str.len()]))
+    name_len = int(max([255, *df["stop_name"].str.len()]))
+    arcpy.management.AddField(out_fc, "stop_id", "TEXT", field_length=id_len)
+    arcpy.management.AddField(out_fc, "stop_name", "TEXT", field_length=name_len)
     with arcpy.da.InsertCursor(out_fc, ["SHAPE@XY", "stop_id", "stop_name"]) as cur:
         for r in df.itertuples(index=False):
             cur.insertRow([(r.stop_lon, r.stop_lat), r.stop_id, r.stop_name])
@@ -324,30 +340,10 @@ def modifiers_from_roads(fc: str, fld: str) -> set[str]:
     return mods
 
 
-def road_clean_dict(fc: str, fullname: str, mods: set[str]) -> dict[str, set[str]]:
-    """Creates a lookup from normalized road names to original names.
-
-    Args:
-        fc: The roadway feature class.
-        fullname: The field containing the full roadway name.
-        mods: A set of modifiers to remove during normalization.
-
-    Returns:
-        A dictionary where keys are normalized road names and values are sets
-        of the original, un-normalized names corresponding to each key.
-    """
-    d = defaultdict(set)
-    with arcpy.da.SearchCursor(fc, [fullname]) as cur:
-        for (full,) in cur:
-            if not full:
-                continue
-            clean = normalize_street(full, mods)
-            d[clean].add(full)
-    return d
-
-
-def stop_to_candidate_roads(join_fc: str, fullname: str, mods: set[str]) -> dict[str, set[str]]:
-    """Maps each stop ID to the set of nearby, normalized road names.
+def stop_to_candidate_roads(
+    join_fc: str, fullname: str, mods: set[str]
+) -> dict[str, dict[str, set[str]]]:
+    """Maps each stop ID to the roads inside its buffer.
 
     Args:
         join_fc: The feature class from the stop-to-road spatial join.
@@ -355,21 +351,21 @@ def stop_to_candidate_roads(join_fc: str, fullname: str, mods: set[str]) -> dict
         mods: A set of modifiers to remove during road name normalization.
 
     Returns:
-        A dictionary where keys are 'stop_id's and values are sets of
-        normalized names of roads that were spatially joined to that stop.
+        A dictionary where keys are 'stop_id's and values map each normalized
+        name of a road spatially joined to that stop to the original names of
+        those same road features. Stops with no roads in their buffer are absent.
     """
-    sc = defaultdict(set)
+    sc: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
     with arcpy.da.SearchCursor(join_fc, ["stop_id", fullname]) as cur:
         for sid, full in cur:
             if full:
-                sc[sid].add(normalize_street(full, mods))
+                sc[sid][normalize_street(full, mods)].add(full)
     return sc
 
 
 def detect_typos(
     stops_df: pd.DataFrame,
-    stop2roads: dict[str, set[str]],
-    road_clean: dict[str, set[str]],
+    stop2roads: dict[str, dict[str, set[str]]],
     mods: set[str],
     thresh: int,
 ) -> pd.DataFrame:
@@ -378,26 +374,32 @@ def detect_typos(
     For each stop, it splits the stop name into parts. Each part is then
     compared against the set of nearby road names for that stop. If a part
     is very similar (but not identical) to a nearby road name, it's flagged
-    as a potential typo.
+    as a potential typo. Stops with no roads in their buffer are skipped and
+    counted as unassessed.
 
     Args:
         stops_df: DataFrame of all GTFS stops.
-        stop2roads: A mapping from stop_id to a set of nearby normalized road names.
-        road_clean: A mapping from a normalized road name to its original form(s).
+        stop2roads: A mapping from stop_id to {normalized road name -> original
+            names} for the roads inside that stop's buffer.
         mods: A set of modifiers to remove during name normalization.
         thresh: The similarity score (0-100) threshold for flagging a typo.
 
     Returns:
         A pandas DataFrame containing details of each potential typo found.
+        Has the same columns, with no rows, when nothing is found.
     """
-    universe = set(road_clean.keys())
     out_rows = []
+    unassessed = 0
 
     for rec in stops_df.itertuples(index=False):
         # Ensure sid and sname are strings to satisfy the type checker
         sid, sname = str(rec.stop_id), str(rec.stop_name)
         pieces = split_stop_name(sname, mods)
-        candidates = stop2roads.get(sid, universe)
+        candidates = stop2roads.get(sid)
+        if not candidates:
+            # No roads within this stop's buffer -- nothing to compare against.
+            unassessed += 1
+            continue
 
         for frag in pieces:
             if frag in candidates:
@@ -405,7 +407,7 @@ def detect_typos(
             for match in difflib.get_close_matches(frag, candidates, n=3, cutoff=thresh / 100):
                 score = dl_score(frag, match)
                 if thresh <= score < 100:
-                    for orig in road_clean.get(match, {match}):
+                    for orig in sorted(candidates[match]):
                         out_rows.append(
                             {
                                 "stop_id": sid,
@@ -417,8 +419,20 @@ def detect_typos(
                             }
                         )
 
+    if unassessed:
+        logging.info("%d stop(s) had no roads within the buffer and were not assessed.", unassessed)
+
     if not out_rows:
-        return pd.DataFrame()
+        return pd.DataFrame(
+            columns=[
+                "stop_id",
+                "stop_name",
+                "street_in_stop_name",
+                "similar_road_name_clean",
+                "similar_road_name_orig",
+                "similarity_score",
+            ]
+        )
 
     return pd.DataFrame(out_rows).sort_values("similarity_score", ascending=False).drop_duplicates()
 
@@ -468,7 +482,10 @@ def main() -> int:
     # Roadway schema
     logging.info("Mapping roadway fields …")
     col_map = map_road_fields(roads_proj)
-    mods = modifiers_from_roads(roads_proj, col_map.get("RW_TYPE_US", col_map["FULLNAME"]))
+    # Without a street-type field, strip no modifiers: falling back to FULLNAME
+    # would treat whole road names as modifiers and blank them out.
+    type_field = col_map.get("RW_TYPE_US")
+    mods = modifiers_from_roads(roads_proj, type_field) if type_field else set()
     logging.info("Found %d modifiers.", len(mods))
 
     # Buffer stops
@@ -481,20 +498,20 @@ def main() -> int:
     logging.info("SpatialJoin buffers ↔ roads …")
     spatial_join_fc(stops_buf, roads_proj, join_fc)
 
-    # Build lookup dictionaries
-    r_clean = road_clean_dict(roads_proj, col_map["FULLNAME"], mods)
+    # Build lookup dictionary
     stop2rd = stop_to_candidate_roads(join_fc, col_map["FULLNAME"], mods)
 
     # Detect typos
     logging.info("Running difflib matching …")
-    typos = detect_typos(stops_df, stop2rd, r_clean, mods, SIMILARITY_THRESHOLD)
+    typos = detect_typos(stops_df, stop2rd, mods, SIMILARITY_THRESHOLD)
 
-    # Output
+    # Output. Always write, so a clean run replaces stale findings from an
+    # earlier run with a header-only CSV.
     out_csv = os.path.join(OUTPUT_DIR, OUTPUT_CSV)
+    typos.to_csv(out_csv, index=False)
     if typos.empty:
-        logging.info("No potential typos found.")
+        logging.info("No potential typos found; wrote header-only CSV → %s", out_csv)
     else:
-        typos.to_csv(out_csv, index=False)
         logging.info("Wrote %d rows → %s", len(typos), out_csv)
 
     logging.info("All done. Workspace retained at %s for inspection.", WORK_GDB)
