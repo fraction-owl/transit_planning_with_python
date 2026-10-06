@@ -60,8 +60,20 @@ def test_standardise_yn_maps_truthy_tokens_to_y() -> None:
 
 
 def test_standardise_yn_maps_falsy_tokens_to_n() -> None:
-    s = pd.Series(["no", "FALSE", "0", None])
-    assert list(target._standardise_yn(s)) == ["N", "N", "N", "N"]
+    s = pd.Series(["no", "FALSE", "0", None, "", "  "])
+    assert list(target._standardise_yn(s)) == ["N", "N", "N", "N", "N", "N"]
+
+
+# ---------------------------------------------------------------------------
+# load_gtfs_data
+# ---------------------------------------------------------------------------
+
+
+def test_load_gtfs_data_keeps_literal_na_values(tmp_path: Path) -> None:
+    (tmp_path / "routes.txt").write_text("route_id,route_short_name\nR1,NA\nR2,\n")
+    routes = target.load_gtfs_data(str(tmp_path), files=("routes.txt",))["routes"]
+    assert list(routes["route_short_name"]) == ["NA", ""]
+    assert target.resolve_route_ids_by_short_name(routes, {"NA"}) == {"R1"}
 
 
 # ---------------------------------------------------------------------------
@@ -128,7 +140,40 @@ def test_collapse_blank_key_falls_back_to_stop_id() -> None:
     stops.loc[stops["stop_id"] == "S3", "stop_code"] = ""
     stop_to_routes = target.build_stop_to_routes(_stop_times_df(), _trips_df(), _routes_df())
     out = target.collapse_to_logical_stops(stops, stop_to_routes, "stop_code")
-    assert "S3" in set(out["stop_code"])
+    assert len(out) == 3  # C1 (S1), C2 (S2), and S3 on its own
+    s3 = out[out["stop_ids"] == "S3"].iloc[0]
+    assert s3["stop_code"] == ""  # real (blank) code is kept for the improvements join
+    assert s3["route_ids"] == "R3"
+
+
+def test_collapse_fallback_stop_id_does_not_merge_with_matching_stop_code() -> None:
+    # S3's blank code must not fall back into the same key as stop_code "S1".
+    stops = pd.DataFrame(
+        {
+            "stop_id": ["S1", "S3"],
+            "stop_code": ["S3", ""],
+            "stop_name": ["First", "Unrelated"],
+        }
+    )
+    stop_to_routes = target.build_stop_to_routes(_stop_times_df(), _trips_df(), _routes_df())
+    out = target.collapse_to_logical_stops(stops, stop_to_routes, "stop_code")
+    assert sorted(out["stop_ids"]) == ["S1", "S3"]
+    assert dict(zip(out["stop_ids"], out["stop_code"])) == {"S1": "S3", "S3": ""}
+    assert dict(zip(out["stop_ids"], out["route_ids"])) == {"S1": "R1", "S3": "R3"}
+
+
+def test_collapse_by_stop_id_keeps_each_physical_stop() -> None:
+    stop_to_routes = target.build_stop_to_routes(_stop_times_df(), _trips_df(), _routes_df())
+    out = target.collapse_to_logical_stops(_stops_df(), stop_to_routes, "stop_id")
+    assert list(out.columns) == [
+        "stop_id",
+        "stop_ids",
+        "stop_name",
+        "route_ids",
+        "route_short_names",
+    ]
+    assert list(out["stop_id"]) == ["S1", "S2", "S3"]
+    assert dict(zip(out["stop_id"], out["route_ids"])) == {"S1": "R1", "S2": "R1,R2", "S3": "R3"}
 
 
 def test_collapse_missing_key_field_raises() -> None:
@@ -197,11 +242,11 @@ def test_load_improvements_missing_join_field_raises(tmp_path: Path) -> None:
         )
 
 
-def test_load_improvements_drops_duplicate_join_keys(tmp_path: Path) -> None:
+def test_load_improvements_collapses_duplicate_keys_any_y_wins(tmp_path: Path) -> None:
     csv_path = _write_improvements_csv(
         tmp_path / "improvements.csv",
         "stop_code,SHELTER,BENCH,TRASHCAN,PAD",
-        ["C1,Y,N,N,N", "C1,N,Y,N,N"],
+        ["C1,N,Y,N,", "C1,Y,N,N,N"],
     )
     df, _ = target.load_improvements(
         csv_path,
@@ -210,6 +255,22 @@ def test_load_improvements_drops_duplicate_join_keys(tmp_path: Path) -> None:
         target.IMPROVEMENT_ALIASES,
     )
     assert len(df) == 1
+    c1 = df.iloc[0]
+    assert (c1["SHELTER"], c1["BENCH"], c1["TRASHCAN"], c1["PAD"]) == ("Y", "Y", "N", "N")
+
+
+def test_load_improvements_keeps_literal_na_key_and_drops_blank_keys(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    csv_path = _write_improvements_csv(
+        tmp_path / "improvements.csv",
+        "stop_code,SHELTER",
+        ["NA,Y", ",Y", "nan,N"],
+    )
+    with caplog.at_level("WARNING"):
+        df, _ = target.load_improvements(csv_path, "stop_code", {"Shelter": "SHELTER"}, {})
+    assert dict(zip(df["stop_code"], df["SHELTER"])) == {"NA": "Y", "nan": "N"}
+    assert "1 improvements rows have a blank stop_code" in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -217,7 +278,7 @@ def test_load_improvements_drops_duplicate_join_keys(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_attach_improvements_joins_on_logical_key() -> None:
+def test_attach_improvements_joins_on_logical_key(caplog: pytest.LogCaptureFixture) -> None:
     logical = pd.DataFrame(
         {
             "stop_code": ["C1", "C2", "C9"],
@@ -230,11 +291,27 @@ def test_attach_improvements_joins_on_logical_key() -> None:
             "SHELTER": ["Y", "N"],
         }
     )
-    out = target.attach_improvements(logical, improvements, "stop_code", "stop_code", ["SHELTER"])
+    with caplog.at_level("WARNING"):
+        out = target.attach_improvements(
+            logical, improvements, "stop_code", "stop_code", ["SHELTER"]
+        )
     lookup = dict(zip(out["stop_code"], out["SHELTER"]))
     assert lookup["C1"] == "Y"
     assert lookup["C2"] == "N"
     assert lookup["C9"] == "N"  # unmatched → normalised to 'N'
+    assert "_merge" not in out.columns
+    assert "1 of 3 logical stops did not match" in caplog.text
+
+
+def test_attach_improvements_all_matched_logs_no_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    logical = pd.DataFrame({"stop_code": ["C1"], "route_ids": ["R1"]})
+    improvements = pd.DataFrame({"code": ["C1"], "SHELTER": ["Y"]})
+    with caplog.at_level("WARNING"):
+        out = target.attach_improvements(logical, improvements, "stop_code", "code", ["SHELTER"])
+    assert list(out.columns) == ["stop_code", "route_ids", "SHELTER"]
+    assert "did not match" not in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -345,3 +422,46 @@ def test_write_summary_txt_without_improvements(tmp_path: Path) -> None:
     target.write_summary_txt(summary, set(), out)
     content = out.read_text(encoding="utf-8")
     assert "no improvements CSV supplied" in content
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("use_stop_code", [True, False])
+def test_main_runs_with_only_required_gtfs_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, use_stop_code: bool
+) -> None:
+    gtfs_dir = tmp_path / "gtfs"
+    gtfs_dir.mkdir()
+    for name, df in {
+        "stops": _stops_df(),
+        "routes": _routes_df(),
+        "trips": _trips_df(),
+        "stop_times": _stop_times_df(),
+    }.items():
+        df.to_csv(gtfs_dir / f"{name}.txt", index=False)
+    join_field = "stop_code" if use_stop_code else "stop_id"
+    first_key = "C1" if use_stop_code else "S1"
+    csv_path = _write_improvements_csv(
+        tmp_path / "improvements.csv",
+        f"{join_field},SHELTER",
+        [f"{first_key},N", f"{first_key},Y"],
+    )
+    out_dir = tmp_path / "out"
+    monkeypatch.setattr(target, "GTFS_DIR", gtfs_dir)
+    monkeypatch.setattr(target, "USE_STOP_CODE", use_stop_code)
+    monkeypatch.setattr(target, "IMPROVEMENTS_CSV", csv_path)
+    monkeypatch.setattr(target, "IMPROVEMENTS_JOIN_FIELD", join_field)
+    monkeypatch.setattr(target, "ROUTE_WHITELIST", {"101"})
+    monkeypatch.setattr(target, "ROUTE_BLACKLIST", set())
+    monkeypatch.setattr(target, "OUTPUT_DIR", out_dir)
+
+    assert target.main() == 0
+
+    detail = pd.read_csv(out_dir / target.DETAIL_CSV_NAME, dtype=str)
+    shelter = dict(zip(detail[join_field], detail["SHELTER"]))
+    assert shelter[first_key] == "Y"
+    assert len(detail) == (2 if use_stop_code else 3)
+    assert (out_dir / target.SUMMARY_TXT_NAME).exists()

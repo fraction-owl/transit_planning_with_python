@@ -143,6 +143,9 @@ def load_gtfs_data(
             the standard 13 GTFS text files are attempted.
         dtype: Value forwarded to :pyfunc:`pandas.read_csv(dtype=…)` to
             control column dtypes. Supply a mapping for per-column dtypes.
+            Pandas' default NA parsing is disabled (``keep_default_na=False``),
+            so values such as ``"NA"`` stay literal strings and empty fields
+            load as ``""``.
         logger: Logger for progress messages. Defaults to this module's
             logger (``logging.getLogger(__name__)``) rather than the root
             logger, so callers keep control of handler configuration.
@@ -229,11 +232,16 @@ def load_gtfs_data(
             try:
                 if archive is None:
                     df = pd.read_csv(
-                        os.path.join(gtfs_path, file_name), dtype=dtype, low_memory=False
+                        os.path.join(gtfs_path, file_name),
+                        dtype=dtype,
+                        keep_default_na=False,
+                        low_memory=False,
                     )
                 else:
                     with archive.open(resolved[file_name]) as handle:
-                        df = pd.read_csv(handle, dtype=dtype, low_memory=False)
+                        df = pd.read_csv(
+                            handle, dtype=dtype, keep_default_na=False, low_memory=False
+                        )
                 data[key] = df
                 log.info("Loaded %s (%d records).", file_name, len(df))
 
@@ -255,13 +263,16 @@ def load_gtfs_data(
 
 
 def _standardise_yn(series: pd.Series) -> pd.Series:
-    """Normalise a Y/N column to uppercase 'Y' or 'N' with no whitespace."""
+    """Normalise a Y/N column to uppercase 'Y' or 'N' with no whitespace.
+
+    Missing and blank values map to 'N'.
+    """
     return (
         series.fillna("N")
         .astype(str)
         .str.strip()
         .str.upper()
-        .replace({"YES": "Y", "TRUE": "Y", "1": "Y", "NO": "N", "FALSE": "N", "0": "N"})
+        .replace({"YES": "Y", "TRUE": "Y", "1": "Y", "NO": "N", "FALSE": "N", "0": "N", "": "N"})
     )
 
 
@@ -358,26 +369,36 @@ def collapse_to_logical_stops(
 
     Returns:
         DataFrame keyed by stop_key_field with route membership columns and a
-        comma-separated list of underlying stop_ids.
+        comma-separated list of underlying stop_ids. Stops with a blank
+        stop_key_field each remain a separate logical stop (one per stop_id)
+        and keep the blank value, so they never join to improvements keyed
+        on stop_key_field.
     """
     if stop_key_field not in stops.columns:
         raise ValueError(f"stops.txt is missing the configured key field '{stop_key_field}'.")
 
-    s = stops[["stop_id", stop_key_field, "stop_name"]].copy()
+    # dict.fromkeys de-duplicates while keeping order: stop_key_field may itself
+    # be "stop_id".
+    s = stops[list(dict.fromkeys(["stop_id", stop_key_field, "stop_name"]))].copy()
     s["stop_id"] = s["stop_id"].astype(str)
-    s[stop_key_field] = s[stop_key_field].fillna("").astype(str).str.strip()
     s["stop_name"] = s["stop_name"].fillna("").astype(str)
+    # Normalise the key in its own column so stop_id keeps its raw value for
+    # the stop_to_routes merge below.
+    s["_key"] = s[stop_key_field].fillna("").astype(str).str.strip()
 
     # Stops with no value for the configured key field cannot be aggregated;
     # warn and fall back to stop_id for those rows so we don't silently lose them.
-    blank_mask = s[stop_key_field].eq("")
+    # The fallback stop_id goes in a separate grouping column rather than into
+    # the key itself, so a stop_id can never merge with an unrelated stop whose
+    # stop_code has the same text.
+    blank_mask = s["_key"].eq("")
     if blank_mask.any():
         logging.warning(
             "%d stops have a blank %s; falling back to stop_id for those rows.",
             int(blank_mask.sum()),
             stop_key_field,
         )
-        s.loc[blank_mask, stop_key_field] = s.loc[blank_mask, "stop_id"]
+    s["_fallback_stop_id"] = s["stop_id"].where(blank_mask, "")
 
     s = s.merge(stop_to_routes, on="stop_id", how="left")
     s["route_ids"] = s["route_ids"].fillna("")
@@ -390,7 +411,7 @@ def collapse_to_logical_stops(
         return ",".join(sorted(items))
 
     collapsed = (
-        s.groupby(stop_key_field, sort=False)
+        s.groupby(["_key", "_fallback_stop_id"], sort=False)
         .agg(
             stop_ids=("stop_id", lambda x: ",".join(sorted(set(x)))),
             stop_name=("stop_name", "first"),
@@ -398,6 +419,8 @@ def collapse_to_logical_stops(
             route_short_names=("route_short_names", _union_csv),
         )
         .reset_index()
+        .drop(columns="_fallback_stop_id")
+        .rename(columns={"_key": stop_key_field})
     )
     return collapsed
 
@@ -417,10 +440,14 @@ def load_improvements(
         aliases: Map from messy source column name -> canonical CSV column name.
 
     Returns:
-        Tuple of (DataFrame indexed on join_field with one normalised Y/N column
-        per improvement, list of canonical column names in display order).
+        Tuple of (DataFrame with one row per join_field value and one normalised
+        Y/N column per improvement, list of canonical column names in display
+        order). When several rows share a join_field value (e.g., one per
+        platform), an improvement is 'Y' if ANY of those rows has it.
     """
-    df = pd.read_csv(csv_path, dtype=str)
+    # keep_default_na=False keeps literal identifiers such as "NA" intact;
+    # genuinely empty fields load as "" and are handled below.
+    df = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
     df.columns = [c.strip() for c in df.columns]
     df = df.rename(columns={k: v for k, v in aliases.items() if k in df.columns})
 
@@ -431,6 +458,14 @@ def load_improvements(
         )
 
     df[join_field] = df[join_field].astype(str).str.strip()
+    blank_key = df[join_field].eq("")
+    if blank_key.any():
+        logging.warning(
+            "%d improvements rows have a blank %s and cannot be joined; dropping them.",
+            int(blank_key.sum()),
+            join_field,
+        )
+        df = df.loc[~blank_key].copy()
 
     canonical_cols: List[str] = []
     for label, col in column_map.items():
@@ -445,7 +480,15 @@ def load_improvements(
         canonical_cols.append(col)
 
     keep = [join_field] + canonical_cols
-    return df[keep].drop_duplicates(subset=[join_field]), canonical_cols
+    # Collapse duplicate keys column by column: 'Y' wins if any row has it,
+    # otherwise keep the first row's value.
+    collapsed = (
+        df[keep]
+        .groupby(join_field, sort=False)
+        .agg(lambda values: "Y" if values.eq("Y").any() else values.iloc[0])
+        .reset_index()
+    )
+    return collapsed, canonical_cols
 
 
 def attach_improvements(
@@ -455,11 +498,12 @@ def attach_improvements(
     join_field: str,
     canonical_cols: Sequence[str],
 ) -> pd.DataFrame:
-    """Left-join improvements onto logical stops and OR-merge across platforms.
+    """Left-join improvements onto logical stops.
 
-    Because logical stops were already collapsed by stop_key_field, the join
-    is one-to-one in expectation; however, if the CSV happens to have
-    duplicates (one row per platform), we OR-merge so any 'Y' wins.
+    Duplicate CSV rows (e.g., one per platform) are OR-merged by
+    load_improvements so any 'Y' wins, which keeps this join many-to-one.
+    Logical stops with no matching CSV row are counted and logged as a
+    warning before their improvements are filled with 'N'.
     """
     out = logical_stops.merge(
         improvements,
@@ -467,7 +511,17 @@ def attach_improvements(
         left_on=stop_key_field,
         right_on=join_field,
         validate="many_to_one",
+        indicator=True,
     )
+    unmatched = int(out["_merge"].eq("left_only").sum())
+    if unmatched:
+        logging.warning(
+            "%d of %d logical stops did not match any row in the improvements CSV; "
+            "their improvements are reported as 'N'.",
+            unmatched,
+            len(out),
+        )
+    out = out.drop(columns="_merge")
     if join_field != stop_key_field:
         out = out.drop(columns=[join_field], errors="ignore")
     for col in canonical_cols:
@@ -594,9 +648,10 @@ def main() -> int:
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # 1. Load GTFS.
-    validate_gtfs_files_exist(str(GTFS_DIR))
-    g = load_gtfs_data(str(GTFS_DIR))
+    # 1. Load GTFS (only the files this analysis uses).
+    gtfs_files = ("stops.txt", "routes.txt", "trips.txt", "stop_times.txt")
+    validate_gtfs_files_exist(str(GTFS_DIR), files=gtfs_files)
+    g = load_gtfs_data(str(GTFS_DIR), files=gtfs_files)
     stops = g["stops"]
     routes = g["routes"]
     trips = g["trips"]
@@ -663,12 +718,6 @@ def main() -> int:
                 IMPROVEMENTS_JOIN_FIELD,
                 canonical_cols,
             )
-            unmatched = logical[canonical_cols[0]].isna().sum() if canonical_cols else 0
-            if unmatched:
-                logging.warning(
-                    "%d logical stops did not match any row in the improvements CSV.",
-                    int(unmatched),
-                )
 
     # 8. Compute summary metrics.
     summary = compute_summary(
