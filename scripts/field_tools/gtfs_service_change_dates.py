@@ -14,11 +14,15 @@ when a new fingerprint persists for ``MIN_STABLE_WEEKS``, so one-week
 variations (holidays, special events) are logged as transient rather than
 reported as service changes. A pick that changes only trip times never
 touches calendar structure, so it is visible only when the archive contains
-a new feed for it — the feed-succession boundary is then reported, with a
-log note about the ambiguity. The script also cross-checks the feeds
-against each other — agency names, timezones, declared ``feed_info`` ranges
-vs. real active dates, coverage gaps, and overlapping snapshots that
-disagree — and logs an actionable warning for every inconsistency it finds.
+a new feed for it that also renames its service_ids — the feed-succession
+boundary is then reported, with a log note about the ambiguity. A new feed
+that keeps the same service_ids and weekly pattern is treated as a
+republished snapshot: the script reads calendars only, never trips or
+stop_times, so a timetable-only change in it is not detected. The script
+also cross-checks the feeds against each other — agency names, timezones,
+declared ``feed_info`` ranges vs. real active dates, coverage gaps, and
+overlapping snapshots that disagree — and logs an actionable warning for
+every inconsistency it finds.
 
 Inputs
 ------
@@ -116,6 +120,23 @@ LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
 
 # === END CONFIG ===
 
+# Names assigned in the CONFIGURATION block. With no source file to copy the
+# block from (the script pasted into a notebook cell), the run log records
+# these names' live values instead.
+_CONFIG_NAMES: tuple[str, ...] = (
+    "FEEDS_DIR",
+    "OUTPUT_DIR",
+    "OUTPUT_FILENAME",
+    "CHANGES_CSV_FILENAME",
+    "FEEDS_CSV_FILENAME",
+    "MAX_CHANGES",
+    "MAX_YEARS",
+    "MIN_STABLE_WEEKS",
+    "COVERAGE_GAP_DAYS",
+    "REQUIRE_RUN_LOG",
+    "LOG_LEVEL",
+)
+
 # Change events from different feeds within this many days of each other are
 # treated as the same service change (feed exports often disagree by a day
 # or two on when a pick formally begins).
@@ -124,6 +145,12 @@ _MERGE_TOLERANCE_DAYS: int = 3
 # A feed "covers" a change date — and can therefore dispute it — only when
 # its active range extends at least this many days on both sides of it.
 _DISPUTE_COVERAGE_BUFFER_DAYS: int = 7
+
+# Calendar rows spanning more than this many days (placeholders such as
+# 2000–2099) are clamped to a window of this length before expansion. The
+# window is centred on each feed's own service period, not on today, so
+# historical feeds keep their dates (see _expansion_anchor).
+_MAX_EXPANSION_DAYS: int = 1830
 
 # Files whose presence marks a folder or zip as a candidate GTFS feed.
 _GTFS_PROBE_FILES: tuple[str, ...] = (
@@ -151,6 +178,8 @@ _DAY_NAMES: tuple[str, ...] = (
 # =============================================================================
 
 # ---- REUSABLE HELPERS (copied from utils/gtfs_helpers.py) ------------------
+# Local change: load_gtfs_data reads with keep_default_na=False so literal
+# service_ids such as "NA" survive (same change as stop_vs_roadname_checker_gpd).
 
 
 def load_gtfs_data(
@@ -171,6 +200,9 @@ def load_gtfs_data(
             the standard 13 GTFS text files are attempted.
         dtype: Value forwarded to :pyfunc:`pandas.read_csv(dtype=…)` to
             control column dtypes. Supply a mapping for per-column dtypes.
+            Pandas' default NA parsing is disabled (``keep_default_na=False``),
+            so values such as ``"NA"`` or ``"NULL"`` — valid GTFS identifiers —
+            stay literal strings and empty fields load as ``""``.
         logger: Logger for progress messages. Defaults to this module's
             logger (``logging.getLogger(__name__)``) rather than the root
             logger, so callers keep control of handler configuration.
@@ -257,11 +289,16 @@ def load_gtfs_data(
             try:
                 if archive is None:
                     df = pd.read_csv(
-                        os.path.join(gtfs_path, file_name), dtype=dtype, low_memory=False
+                        os.path.join(gtfs_path, file_name),
+                        dtype=dtype,
+                        keep_default_na=False,
+                        low_memory=False,
                     )
                 else:
                     with archive.open(resolved[file_name]) as handle:
-                        df = pd.read_csv(handle, dtype=dtype, low_memory=False)
+                        df = pd.read_csv(
+                            handle, dtype=dtype, keep_default_na=False, low_memory=False
+                        )
                 data[key] = df
                 log.info("Loaded %s (%d records).", file_name, len(df))
 
@@ -278,6 +315,8 @@ def load_gtfs_data(
 
 
 # ---- REUSABLE HELPERS (copied from utils/calendar_helpers.py) --------------
+# Local change: expand_service_active_dates warns and skips a row whose range
+# lies entirely outside the clamp window instead of silently expanding nothing.
 
 
 def expand_service_active_dates(
@@ -299,7 +338,9 @@ def expand_service_active_dates(
     A date range longer than *max_days_per_service* (a common placeholder
     pattern, e.g. 2000–2099) is clamped to a window of that length centred
     on *today* and logged, so expansion stays fast and downstream per-year
-    statistics stay meaningful.
+    statistics stay meaningful. A range lying entirely outside that window
+    is skipped with an explicit warning rather than silently expanding to
+    nothing.
 
     Args:
         calendar_df: Parsed ``calendar.txt``, or ``None`` if the feed has
@@ -353,6 +394,19 @@ def expand_service_active_dates(
                 half = max_days_per_service // 2
                 clamped_start = max(start, anchor - dt.timedelta(days=half))
                 clamped_end = min(end, anchor + dt.timedelta(days=half))
+                if clamped_end < clamped_start:
+                    logging.warning(
+                        "Service %s: date range %s–%s lies entirely outside the expansion "
+                        "window %s–%s around %s — skipping row.",
+                        sid,
+                        start,
+                        end,
+                        anchor - dt.timedelta(days=half),
+                        anchor + dt.timedelta(days=half),
+                        anchor,
+                    )
+                    active.setdefault(sid, set())
+                    continue
                 logging.warning(
                     "Service %s: date range %s–%s looks like a placeholder; "
                     "clamping expansion to %s–%s.",
@@ -598,6 +652,19 @@ def discover_feeds(feeds_dir: Path) -> list[Path]:
     return feeds
 
 
+def feed_labels(feed_paths: Sequence[Path]) -> list[str]:
+    """Return one display label per feed, unique across the archive.
+
+    Feeds are labelled by folder name or zip stem. When a folder and a zip
+    share that name (``2026/`` and ``2026.zip``), both fall back to their
+    full file names, because the label keys every per-feed lookup in the
+    reconciliation and must tell the two apart in the printed reference.
+    """
+    stems = [p.stem if p.suffix.lower() == ".zip" else p.name for p in feed_paths]
+    counts = Counter(stems)
+    return [p.name if counts[stem] > 1 else stem for p, stem in zip(feed_paths, stems)]
+
+
 # ---- PER-FEED INSPECTION ----------------------------------------------------
 
 
@@ -633,7 +700,68 @@ def _parse_gtfs_date(value: Any) -> Optional[dt.date]:
         return None
 
 
-def inspect_feed(feed_path: Path) -> FeedSummary:
+def _drop_blank_service_ids(
+    table: Optional[pd.DataFrame], file_name: str, label: str, issues: list[str]
+) -> Optional[pd.DataFrame]:
+    """Drop rows whose service_id is blank, logging and recording an issue."""
+    if table is None or "service_id" not in table.columns:
+        return table
+    blank = table["service_id"].fillna("").astype(str).str.strip() == ""
+    if not blank.any():
+        return table
+    issues.append(f"{file_name}: skipped {int(blank.sum())} row(s) with a blank service_id")
+    logging.warning("Feed '%s': %s.", label, issues[-1])
+    return table.loc[~blank]
+
+
+def _expansion_anchor(
+    calendar: Optional[pd.DataFrame],
+    calendar_dates: Optional[pd.DataFrame],
+    declared_start: Optional[dt.date],
+    declared_end: Optional[dt.date],
+    max_days: int = _MAX_EXPANSION_DAYS,
+    today: Optional[dt.date] = None,
+) -> dt.date:
+    """Pick the date a feed's oversized calendar ranges are clamped around.
+
+    Placeholder ranges (e.g. 2000–2099) must be trimmed, but around the
+    feed's own service period: anchoring on today would clamp a historical
+    feed's long rows to a window years after they end, leaving no dates.
+    The anchor is the midpoint of the feed's ordinary evidence — calendar
+    rows no longer than *max_days* plus calendar_dates entries — else of the
+    ``feed_info`` range when that is not itself oversized. With nothing but
+    oversized rows to go on, today is pulled inside their span so the
+    clamp window always overlaps them.
+    """
+    anchor_today = dt.date.today() if today is None else today
+    evidence: list[dt.date] = []
+    long_starts: list[dt.date] = []
+    long_ends: list[dt.date] = []
+    if calendar is not None and {"start_date", "end_date"} <= set(calendar.columns):
+        for start_raw, end_raw in zip(calendar["start_date"], calendar["end_date"]):
+            start, end = _parse_gtfs_date(start_raw), _parse_gtfs_date(end_raw)
+            if start is None or end is None or end < start:
+                continue
+            if (end - start).days + 1 > max_days:
+                long_starts.append(start)
+                long_ends.append(end)
+            else:
+                evidence += [start, end]
+    if calendar_dates is not None and "date" in calendar_dates.columns:
+        evidence += [d for d in map(_parse_gtfs_date, calendar_dates["date"]) if d is not None]
+    if not evidence:
+        declared = [d for d in (declared_start, declared_end) if d is not None]
+        if declared and (max(declared) - min(declared)).days + 1 <= max_days:
+            evidence = declared
+    if evidence:
+        return min(evidence) + (max(evidence) - min(evidence)) / 2
+    if long_starts:
+        half = dt.timedelta(days=max_days // 2)
+        return min(max(anchor_today, min(long_starts) + half), max(long_ends) - half)
+    return anchor_today
+
+
+def inspect_feed(feed_path: Path, label: Optional[str] = None) -> FeedSummary:
     """Summarize one feed: identity, real active dates, and data issues.
 
     Loads ``calendar.txt`` / ``calendar_dates.txt`` (either may be absent),
@@ -644,16 +772,23 @@ def inspect_feed(feed_path: Path) -> FeedSummary:
 
     Args:
         feed_path: Path to a feed folder or ``.zip``.
+        label: Display name, unique across the archive (see
+            :func:`feed_labels`). Defaults to the folder name or zip stem.
 
     Returns:
         A :class:`FeedSummary`; ``usable`` is ``False`` when no active
         service dates could be derived.
     """
-    label = feed_path.stem if feed_path.suffix.lower() == ".zip" else feed_path.name
+    if label is None:
+        label = feed_path.stem if feed_path.suffix.lower() == ".zip" else feed_path.name
     issues: list[str] = []
 
-    calendar = _load_optional(feed_path, "calendar.txt")
-    calendar_dates = _load_optional(feed_path, "calendar_dates.txt")
+    calendar = _drop_blank_service_ids(
+        _load_optional(feed_path, "calendar.txt"), "calendar.txt", label, issues
+    )
+    calendar_dates = _drop_blank_service_ids(
+        _load_optional(feed_path, "calendar_dates.txt"), "calendar_dates.txt", label, issues
+    )
     agency = _load_optional(feed_path, "agency.txt")
     feed_info = _load_optional(feed_path, "feed_info.txt")
 
@@ -698,7 +833,10 @@ def inspect_feed(feed_path: Path) -> FeedSummary:
             issues,
         )
 
-    active = expand_service_active_dates(calendar, calendar_dates)
+    anchor = _expansion_anchor(calendar, calendar_dates, declared_start, declared_end)
+    active = expand_service_active_dates(
+        calendar, calendar_dates, max_days_per_service=_MAX_EXPANSION_DAYS, today=anchor
+    )
     all_dates: set[dt.date] = set()
     for dates in active.values():
         all_dates |= dates
@@ -722,6 +860,7 @@ def inspect_feed(feed_path: Path) -> FeedSummary:
         )
 
     first_active, last_active = min(all_dates), max(all_dates)
+    already_logged = len(issues)
     if declared_start is not None and first_active < declared_start:
         issues.append(
             f"active service starts {first_active}, before the declared "
@@ -736,7 +875,7 @@ def inspect_feed(feed_path: Path) -> FeedSummary:
             f"feed_info declares service through {declared_end} but the last active date "
             f"is {last_active} — the calendar may end early"
         )
-    for issue in issues:
+    for issue in issues[already_logged:]:
         logging.warning("Feed '%s': %s.", label, issue)
     logging.info(
         "Feed '%s': %d service_id(s), active %s → %s%s.",
@@ -929,25 +1068,36 @@ def _change_date_between(
     services_by_date: Mapping[dt.date, frozenset[str]],
     prev: Regime,
     new: Regime,
+    earliest: Optional[dt.date] = None,
 ) -> dt.date:
-    """Pin down the first date the old pattern stops matching and the new one starts.
+    """Pin down the day the sustained new pattern takes over from the old one.
 
-    Scans day by day from the end of the previous stable regime through the
-    first week of the new one, so mid-week markups land on the true day and
-    holidays inside the transition window (matching neither pattern) are
-    skipped. Falls back to the new regime's first Monday.
+    Scans day by day *backward* from the new stable regime's first Monday
+    toward *earliest* (default: the Monday after the previous regime's last
+    week), moving the change date onto every day that already runs the new
+    pattern and stopping at the first day that still runs the old one. So a
+    mid-week markup lands on its true day, holidays matching neither pattern
+    are skipped, and an isolated holiday that resembles the new pattern but
+    is followed by a return to the old one cannot pull the date backward.
+    Falls back to the new regime's first Monday.
     """
     prev_map = _pattern_day_map(prev.pattern)
     new_map = _pattern_day_map(new.pattern)
-    day = prev.end_week + dt.timedelta(days=7)
-    last = new.start_week + dt.timedelta(days=6)
-    while day <= last:
+    if earliest is None:
+        earliest = prev.end_week + dt.timedelta(days=7)
+    change = new.start_week
+    day = new.start_week - dt.timedelta(days=1)
+    while day >= earliest:
         sids = services_by_date.get(day, frozenset())
         dow = day.weekday()
-        if sids != prev_map.get(dow, frozenset()) and sids == new_map.get(dow, frozenset()):
-            return day
-        day += dt.timedelta(days=1)
-    return new.start_week
+        runs_new = sids == new_map.get(dow, frozenset())
+        runs_prev = sids == prev_map.get(dow, frozenset())
+        if runs_prev and not runs_new:
+            break
+        if runs_new and not runs_prev:
+            change = day
+        day -= dt.timedelta(days=1)
+    return change
 
 
 def analyze_feed_changes(
@@ -1027,6 +1177,7 @@ def _boundary_event(
     next_feed: FeedSummary,
     next_regimes: Sequence[Regime],
     coverage_gap_days: int = COVERAGE_GAP_DAYS,
+    covered_through: Optional[dt.date] = None,
 ) -> Optional[ServiceChange]:
     """Derive the service change (if any) implied by one feed superseding another.
 
@@ -1039,15 +1190,20 @@ def _boundary_event(
     from calendars alone.
 
     Args:
-        prev_feed: The earlier feed (by first active date).
+        prev_feed: The feed *next_feed* takes over from (see :func:`_predecessor`).
         prev_regimes: Its stable regimes.
         next_feed: The later feed.
         next_regimes: Its stable regimes.
         coverage_gap_days: Max uncovered days still treated as contiguous.
+        covered_through: Last date any earlier feed in the archive covers —
+            the reference for coverage gaps, so a feed that ended early does
+            not open a gap another feed fills. Defaults to *prev_feed*'s last
+            active date.
 
     Returns:
-        A :class:`ServiceChange` dated at *next_feed*'s first active date,
-        or ``None`` when the boundary shows no service change.
+        A :class:`ServiceChange` dated where *next_feed*'s first stable
+        pattern takes over (its first active date after a coverage gap), or
+        ``None`` when the boundary shows no service change.
     """
     if (
         prev_feed.first_active is None
@@ -1081,13 +1237,15 @@ def _boundary_event(
     removed = frozenset(prev_ids - next_ids)
     evidence = (prev_feed.label, next_feed.label)
 
-    gap_days = (next_feed.first_active - prev_feed.last_active).days - 1
+    if covered_through is None:
+        covered_through = prev_feed.last_active
+    gap_days = (next_feed.first_active - covered_through).days - 1
     if gap_days > coverage_gap_days:
         logging.warning(
-            "Coverage gap: feed '%s' has no service after %s and feed '%s' none before %s — "
-            "%d day(s) are uncovered by the archive.",
+            "Coverage gap: no feed in the archive has service after %s (last: feed '%s') and "
+            "feed '%s' none before %s — %d day(s) are uncovered by the archive.",
+            covered_through,
             prev_feed.label,
-            prev_feed.last_active,
             next_feed.label,
             next_feed.first_active,
             gap_days,
@@ -1109,6 +1267,12 @@ def _boundary_event(
             prev_feed.label,
         )
         return None
+    # The newer feed may open with a few transient days or weeks (often a tail
+    # of the old pattern) before its first stable pattern; date the change
+    # where that pattern takes over, not at the feed's first active date.
+    change_date = _change_date_between(
+        _service_ids_by_date(next_feed.active), prev_ref, next_ref, next_feed.first_active
+    )
     if _weekly_signature(prev_ref.pattern) == _weekly_signature(next_ref.pattern):
         logging.warning(
             "Feed '%s' takes over from '%s' on %s with an identical day-of-week structure "
@@ -1116,11 +1280,11 @@ def _boundary_event(
             "feeds if %s is not a known change date.",
             next_feed.label,
             prev_feed.label,
-            next_feed.first_active,
-            next_feed.first_active,
+            change_date,
+            change_date,
         )
         return ServiceChange(
-            next_feed.first_active,
+            change_date,
             evidence,
             "New service period",
             added,
@@ -1129,7 +1293,7 @@ def _boundary_event(
             "feed takes over",
         )
     return ServiceChange(
-        next_feed.first_active,
+        change_date,
         evidence,
         "Service change",
         added,
@@ -1138,23 +1302,43 @@ def _boundary_event(
     )
 
 
+def _joins_cluster(
+    cluster: Sequence[ServiceChange], event: ServiceChange, tolerance_days: int
+) -> bool:
+    """Return ``True`` when *event* plausibly records the same change as *cluster*.
+
+    The whole cluster must fit within *tolerance_days* of its first event, so
+    changes a few days apart never chain into one. Events that run in
+    sequence — one adds a service_id another removes — are successive
+    changes, not one change seen by several feeds, and stay separate.
+    """
+    if (event.date - cluster[0].date).days > tolerance_days:
+        return False
+    added = frozenset().union(*(e.added for e in cluster))
+    removed = frozenset().union(*(e.removed for e in cluster))
+    return not (event.added & removed or event.removed & added)
+
+
 def _cluster_events(
     events: Sequence[ServiceChange],
     first_active_by_feed: Mapping[str, dt.date],
     tolerance_days: int = _MERGE_TOLERANCE_DAYS,
 ) -> list[MergedChange]:
-    """Merge events that fall within *tolerance_days* of each other.
+    """Merge events that plausibly record one change seen by several feeds.
 
-    When several feeds evidence the same change on slightly different dates,
-    the event from the newest feed (largest first active date) supplies the
-    representative date and description, on the grounds that newer exports
-    supersede older ones.
+    Events join a cluster only while the cluster spans at most
+    *tolerance_days* and the events do not describe successive changes (see
+    :func:`_joins_cluster`). When several feeds evidence the same change on
+    slightly different dates, the event from the newest feed (largest first
+    active date) supplies the representative date and description, on the
+    grounds that newer exports supersede older ones.
     """
     ordered = sorted(events, key=lambda e: (e.date, e.feeds))
     clusters: list[list[ServiceChange]] = []
     for event in ordered:
-        if clusters and (event.date - clusters[-1][-1].date).days <= tolerance_days:
-            clusters[-1].append(event)
+        home = next((c for c in clusters if _joins_cluster(c, event, tolerance_days)), None)
+        if home is not None:
+            home.append(event)
         else:
             clusters.append([event])
     merged: list[MergedChange] = []
@@ -1212,6 +1396,27 @@ def _flag_disputes(
     return out
 
 
+def _predecessor(
+    earlier: Sequence[FeedSummary], next_start: dt.date, coverage_gap_days: int
+) -> FeedSummary:
+    """Pick the feed that a feed starting on *next_start* takes over from.
+
+    That is the newest-starting earlier feed whose service reaches the
+    hand-off (within *coverage_gap_days*) — not simply the feed that started
+    just before, which may have ended long ago while an older feed still
+    covers the date. When no earlier feed reaches it, the archive has a
+    coverage gap and the feed with the latest service before it is used.
+    """
+    reach = next_start - dt.timedelta(days=coverage_gap_days + 1)
+    reaching = [s for s in earlier if (s.last_active or dt.date.min) >= reach]
+    if reaching:
+        return max(reaching, key=lambda s: (s.first_active or dt.date.min, s.label))
+    return max(
+        earlier,
+        key=lambda s: (s.last_active or dt.date.min, s.first_active or dt.date.min, s.label),
+    )
+
+
 def merge_service_changes(
     summaries: Sequence[FeedSummary],
     min_stable_weeks: int = MIN_STABLE_WEEKS,
@@ -1227,24 +1432,45 @@ def merge_service_changes(
 
     Returns:
         Chronological list of merged, dispute-flagged change events.
+
+    Raises:
+        ValueError: If two usable feeds share a label (labels key every
+            per-feed lookup; see :func:`feed_labels`).
     """
     ordered = sorted(
         (s for s in summaries if s.usable and s.first_active is not None),
         key=lambda s: (s.first_active, s.label),
     )
+    shared = sorted(label for label, n in Counter(s.label for s in ordered).items() if n > 1)
+    if shared:
+        raise ValueError(
+            f"Feed label(s) {', '.join(shared)} name more than one feed; give each feed a "
+            "unique label (see feed_labels())."
+        )
     events: list[ServiceChange] = []
     regimes_by_feed: dict[str, list[Regime]] = {}
     for summary in ordered:
         feed_events, regimes = analyze_feed_changes(summary.active, min_stable_weeks, summary.label)
         events.extend(feed_events)
         regimes_by_feed[summary.label] = regimes
-    for prev_feed, next_feed in zip(ordered, ordered[1:]):
+    for idx, next_feed in enumerate(ordered):
+        next_start = next_feed.first_active
+        if next_start is None:
+            continue
+        earlier = [s for s in ordered[:idx] if (s.first_active or dt.date.max) < next_start]
+        if not earlier:
+            continue
+        # Coverage is a property of the whole archive: a gap exists only when
+        # no earlier feed at all reaches the hand-off, whichever started last.
+        covered_through = max(s.last_active or dt.date.min for s in earlier)
+        prev_feed = _predecessor(earlier, next_start, coverage_gap_days)
         boundary = _boundary_event(
             prev_feed,
             regimes_by_feed[prev_feed.label],
             next_feed,
             regimes_by_feed[next_feed.label],
             coverage_gap_days,
+            covered_through,
         )
         if boundary is not None:
             events.append(boundary)
@@ -1552,17 +1778,31 @@ def export_quick_reference_xlsx(
 
 
 def write_run_log(output_dir: Path, summary_lines: List[str]) -> bool:
-    """Write the verbatim config block plus a run summary into *output_dir*.
+    """Write the config block plus a run summary into *output_dir*.
+
+    The CONFIGURATION block is copied verbatim from this script's source
+    file. When there is none — the script was pasted into a notebook cell,
+    where ``__file__`` is undefined — the block's settings are recorded from
+    their live values instead, so the log is still written.
 
     Returns:
         ``True`` if the log was written successfully, ``False`` otherwise.
     """
     log_path = output_dir / "gtfs_service_change_dates_runlog.txt"
-    try:
-        config_text = extract_config_block(Path(__file__))
-    except (OSError, ValueError) as exc:
-        logging.error("Could not extract config block for run log: %s", exc)
-        return False
+    file_attr: Optional[str] = globals().get("__file__")
+    if file_attr is not None:
+        source_label = str(Path(file_attr).resolve())
+        config_heading = "CONFIGURATION (verbatim)"
+        try:
+            config_text = extract_config_block(Path(file_attr))
+        except (OSError, ValueError) as exc:
+            logging.error("Could not extract config block for run log: %s", exc)
+            return False
+    else:
+        namespace = globals()
+        source_label = "<no source file — e.g. pasted into a notebook cell>"
+        config_heading = "CONFIGURATION (runtime values; no source file to copy verbatim)"
+        config_text = "\n".join(f"{name} = {namespace.get(name)!r}" for name in _CONFIG_NAMES)
 
     lines: List[str] = [
         "=" * 72,
@@ -1570,7 +1810,7 @@ def write_run_log(output_dir: Path, summary_lines: List[str]) -> bool:
         "=" * 72,
         f"Run timestamp:    {datetime.now().isoformat(timespec='seconds')}",
         f"Output directory: {output_dir}",
-        f"Source script:    {Path(__file__).resolve()}",
+        f"Source script:    {source_label}",
         "",
         "-" * 72,
         "RUN SUMMARY",
@@ -1578,7 +1818,7 @@ def write_run_log(output_dir: Path, summary_lines: List[str]) -> bool:
         *summary_lines,
         "",
         "-" * 72,
-        "CONFIGURATION (verbatim)",
+        config_heading,
         "-" * 72,
         "# === BEGIN CONFIG ===",
         config_text,
@@ -1629,7 +1869,9 @@ def run(
     max_years = MAX_YEARS if max_years is None else max_years
 
     feed_paths = discover_feeds(feeds_dir)
-    summaries = [inspect_feed(path) for path in feed_paths]
+    summaries = [
+        inspect_feed(path, label) for path, label in zip(feed_paths, feed_labels(feed_paths))
+    ]
     usable = [s for s in summaries if s.usable]
     if not usable:
         raise ValueError(
