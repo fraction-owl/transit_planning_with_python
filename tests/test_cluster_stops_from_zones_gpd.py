@@ -9,6 +9,7 @@ from typing import Any, Optional
 import geopandas as gpd
 import pandas as pd
 import pytest
+from openpyxl import load_workbook
 from shapely.geometry import LineString, Polygon
 
 import scripts.facilities_tools.cluster_stops_from_zones_gpd as target
@@ -18,6 +19,9 @@ import scripts.facilities_tools.cluster_stops_from_zones_gpd as target
 # A zipped shapefile in Maryland State Plane (US feet, EPSG:2248) with one NAME field.
 STOP_CLUSTERS_ZIP = Path(__file__).parent / "fixtures" / "stop_clusters_sample.zip"
 MOCK_GTFS_DC_ZIP = Path(__file__).parent / "fixtures" / "mock_gtfs_dc.zip"
+
+# The workbook is on by default; runs on the stops-only synthetic feed turn it off.
+TEXT_ONLY = "--no-bay-assignment-xlsx"
 
 # Metro and Park & Ride share the lon = -76.95 edge; Empty Lot holds no stop (WGS84).
 _EDGE_LON = -76.95
@@ -136,6 +140,20 @@ def _values(text: str) -> list[tuple[str, Any]]:
         assert node.value is not None
         values.append((name.id, ast.literal_eval(node.value)))
     return values
+
+
+# ---------------------------------------------------------------------------
+# load_gtfs_data
+# ---------------------------------------------------------------------------
+
+
+def test_load_gtfs_data_keeps_na_ids_as_text(tmp_path: Path) -> None:
+    (tmp_path / "stops.txt").write_text(
+        "stop_id,stop_code,stop_name,stop_lat,stop_lon\nNA,,NULL,38.90,-76.97\n",
+        encoding="utf-8",
+    )
+    stops = target.load_gtfs_data(str(tmp_path), files=("stops.txt",))["stops"]
+    assert stops.loc[0, ["stop_id", "stop_code", "stop_name"]].tolist() == ["NA", "", "NULL"]
 
 
 # ---------------------------------------------------------------------------
@@ -485,6 +503,66 @@ def test_literal_round_trips_quotes_backslashes_and_accents() -> None:
 
 
 # ---------------------------------------------------------------------------
+# bay assignment workbook
+# ---------------------------------------------------------------------------
+
+
+def _bay_assignments(
+    stop_times: list[tuple[str, str]],
+    trips: Optional[list[tuple[str, str, str]]] = None,
+    routes: Optional[list[tuple[str, str, str]]] = None,
+) -> pd.DataFrame:
+    """build_bay_assignments for the sample zones, from (stop_id, trip_id) visits."""
+    trips = trips or [
+        ("t1", "R10", "0"),
+        ("t2", "R10", "0"),
+        ("t3", "R10", "1"),
+        ("t4", "RX", ""),
+        ("t5", "R10B", "2"),
+    ]
+    routes = routes or [("R10", "10", ""), ("R10B", "10", ""), ("RX", "", "Cross  town")]
+    return target.build_bay_assignments(
+        _sample_assignments(),
+        pd.DataFrame(stop_times, columns=["stop_id", "trip_id"]),
+        pd.DataFrame(trips, columns=["trip_id", "route_id", "direction_id"]),
+        pd.DataFrame(routes, columns=["route_id", "route_short_name", "route_long_name"]),
+    )
+
+
+def test_build_bay_assignments_lists_each_route_direction_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # OUT is outside every zone, so its unknown trip is never looked up.
+    visits = [("65", "t1"), ("65", "t2"), ("65", "t1"), ("65", "t3"), ("7", "t4")]
+    with caplog.at_level(logging.WARNING):
+        uses = _bay_assignments([*visits, ("3881", "t5"), ("OUT", "ghost")])
+    assert uses.to_dict("split")["data"] == [
+        ["65", "R10", "10 [route_id=R10]", "0"],  # two routes share the short name 10
+        ["65", "R10", "10 [route_id=R10]", "1"],
+        ["7", "RX", "Cross town", "?"],  # no short name; blank direction
+        ["3881", "R10B", "10 [route_id=R10B]", "?"],  # direction_id 2 is invalid
+    ]
+    assert "Invalid direction_id values shown as (?): 2" in caplog.text
+
+
+def test_build_bay_assignments_unknown_trip_or_route_raises() -> None:
+    with pytest.raises(ValueError, match="missing trips.txt trip_id values: ghost"):
+        _bay_assignments([("65", "ghost")])
+    with pytest.raises(ValueError, match="missing routes.txt route_id values: R99"):
+        _bay_assignments([("65", "t1")], trips=[("t1", "R99", "0")])
+
+
+def test_worksheet_name_is_excel_safe_and_unique() -> None:
+    used = {"index", "history"}
+    assert target._worksheet_name("Metro: Bay [A]/B?", used) == "Metro_ Bay _A__B_"
+    assert target._worksheet_name("History", used) == "History_2"  # reserved by Excel
+    assert target._worksheet_name("X" * 40, used) == "X" * 31
+    assert target._worksheet_name("X" * 40, used) == "X" * 29 + "_2"
+    assert target._worksheet_name("'quoted'", used) == "quoted"
+    assert target._worksheet_name("", used) == "Cluster"
+
+
+# ---------------------------------------------------------------------------
 # input fingerprints
 # ---------------------------------------------------------------------------
 
@@ -495,6 +573,16 @@ def test_input_fingerprints_cover_stops_and_shapefile_sidecars(tmp_path: Path) -
     for label in ("GTFS stops.txt", "Zone layer:", "Zone layer .dbf", "Zone layer .prj"):
         assert label in text
     assert "not fingerprinted" not in text
+
+
+def test_input_fingerprints_cover_every_gtfs_file_read(tmp_path: Path) -> None:
+    paths = _write_inputs(tmp_path)
+    (Path(paths["gtfs"]) / "trips.txt").write_text("route_id,trip_id\nR1,T1\n", encoding="utf-8")
+    text = "\n".join(
+        target.input_fingerprints(paths["gtfs"], paths["zones"], ["stops.txt", "trips.txt"])
+    )
+    assert "GTFS stops.txt" in text
+    assert "GTFS trips.txt" in text
 
 
 # ---------------------------------------------------------------------------
@@ -512,7 +600,7 @@ def test_main_logs_the_text_and_writes_no_files(
     paths = _write_inputs(tmp_path)
     before = set(tmp_path.rglob("*"))
     with caplog.at_level(logging.INFO):
-        assert target.main(_cli(paths)) == 0
+        assert target.main(_cli(paths, TEXT_ONLY)) == 0
     assert '"Park & Ride": {' in caplog.text
     assert set(tmp_path.rglob("*")) == before
 
@@ -521,7 +609,7 @@ def test_main_writes_the_text_and_a_run_log(tmp_path: Path) -> None:
     # A projected shapefile, as zones are often drawn.
     paths = _write_inputs(tmp_path, _layer().to_crs("EPSG:2248"), "zones.shp")
     out_dir = tmp_path / "out"
-    assert target.main(_cli(paths, "--output-dir", str(out_dir))) == 0
+    assert target.main(_cli(paths, TEXT_ONLY, "--output-dir", str(out_dir))) == 0
 
     text = (out_dir / "cluster_stops_from_zones.txt").read_text(encoding="utf-8")
     values = dict(_values(text.split("# Step 2:")[0]))
@@ -538,7 +626,7 @@ def test_main_reads_a_zipped_feed(tmp_path: Path) -> None:
     feed = tmp_path / "feed.zip"
     with zipfile.ZipFile(feed, "w") as archive:
         archive.write(Path(paths["gtfs"]) / "stops.txt", "feed/stops.txt")
-    assert target.main(_cli({**paths, "gtfs": str(feed)})) == 0
+    assert target.main(_cli({**paths, "gtfs": str(feed)}, TEXT_ONLY)) == 0
 
 
 def test_main_clusters_the_mock_dc_feed_with_a_zipped_state_plane_shapefile(
@@ -576,6 +664,61 @@ def test_main_clusters_the_mock_dc_feed_with_a_zipped_state_plane_shapefile(
     assert "not fingerprinted" not in runlog  # the archive itself is fingerprinted
 
 
+def test_main_writes_the_bay_assignment_workbook(tmp_path: Path) -> None:
+    paths = {"gtfs": str(MOCK_GTFS_DC_ZIP), "zones": str(STOP_CLUSTERS_ZIP)}
+    out_dir = tmp_path / "out"
+    assert target.main(_cli(paths, "--output-dir", str(out_dir))) == 0  # workbook on by default
+
+    workbook = load_workbook(out_dir / "cluster_bay_assignments.xlsx")
+    centers = [f"Mock Transit Center 0{n}" for n in range(1, 6)]
+    assert workbook.sheetnames == ["Index", *centers]
+    index = workbook["Index"]
+    assert [cell.value for cell in index[9]] == [centers[0], centers[0], 3, 6]
+    assert index["B9"].hyperlink.target == "#'Mock Transit Center 01'!A1"
+    center = workbook[centers[0]]
+    assert [[cell.value for cell in row] for row in center.iter_rows(min_row=5)] == [
+        [
+            "CAPITOL ST\n(DC_NS_034)",
+            "PENNSYLVANIA AVE SE\n(DC_R30_044)",
+            "MASSACHUSETTS AVE NW\n(DC_R40_088)",
+        ],
+        ["10 (0)", "30 (0)", "40 (0)"],
+        ["10 (1)", "30 (1)", "40 (1)"],
+    ]
+    assert {str(cells) for cells in center.merged_cells.ranges} == {"A1:C1", "A2:C2", "A3:C3"}
+    assert center.page_setup.paperSize == 1  # Letter, 8.5 x 11 in
+    empty = workbook[centers[3]]
+    assert empty["A5"].value == "No stops in this cluster"
+    assert not empty.merged_cells.ranges  # Excel rejects one-cell merges as corrupt
+
+    runlog = (out_dir / "cluster_bay_assignments_runlog.txt").read_text(encoding="utf-8")
+    assert f"Output file:      {out_dir / 'cluster_bay_assignments.xlsx'}" in runlog
+    assert "Bay workbook:" in (out_dir / "cluster_stops_from_zones_runlog.txt").read_text(
+        encoding="utf-8"
+    )
+
+
+@pytest.mark.parametrize(
+    ("extra", "message"),
+    [
+        ((), "Set OUTPUT_DIR / --output-dir to save the workbook"),
+        (("--output-dir", "out", "--bay-assignment-filename", "bays.csv"), "ending in .xlsx"),
+        (
+            ("--output-dir", "out", "--output-filename", "cluster_bay_assignments.xlsx"),
+            "must have unique names",
+        ),
+    ],
+)
+def test_main_bad_workbook_settings_exit_1(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, extra: tuple[str, ...], message: str
+) -> None:
+    paths = _write_inputs(tmp_path)
+    extra = tuple(str(tmp_path / value) if value == "out" else value for value in extra)
+    assert target.main(_cli(paths, "--bay-assignment-xlsx", *extra)) == 1
+    assert message in caplog.text
+    assert not (tmp_path / "out").exists()
+
+
 @pytest.mark.parametrize("near_miss_feet", ["-1", "nan"])
 def test_main_bad_near_miss_feet_exits_1(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, near_miss_feet: str
@@ -585,9 +728,10 @@ def test_main_bad_near_miss_feet_exits_1(
     assert "NEAR_MISS_FEET must be 0 (off) or a positive number of feet" in caplog.text
 
 
-def test_main_overlapping_zones_exit_1(tmp_path: Path) -> None:
+def test_main_overlapping_zones_exit_1(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     layer = _layer(["Metro", "Park & Ride"], [METRO, OVERLAPS_METRO])
-    assert target.main(_cli(_write_inputs(tmp_path, layer))) == 1
+    assert target.main(_cli(_write_inputs(tmp_path, layer), TEXT_ONLY)) == 1
+    assert "Zones overlap: 'Metro' and 'Park & Ride'" in caplog.text
 
 
 def test_main_output_filename_with_a_folder_exits_1(tmp_path: Path) -> None:
