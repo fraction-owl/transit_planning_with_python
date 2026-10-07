@@ -20,6 +20,9 @@ import scripts.facilities_tools.cluster_stops_from_zones_gpd as target
 STOP_CLUSTERS_ZIP = Path(__file__).parent / "fixtures" / "stop_clusters_sample.zip"
 MOCK_GTFS_DC_ZIP = Path(__file__).parent / "fixtures" / "mock_gtfs_dc.zip"
 
+# The workbook is on by default; runs on the stops-only synthetic feed turn it off.
+TEXT_ONLY = "--no-bay-assignment-xlsx"
+
 # Metro and Park & Ride share the lon = -76.95 edge; Empty Lot holds no stop (WGS84).
 _EDGE_LON = -76.95
 
@@ -597,7 +600,7 @@ def test_main_logs_the_text_and_writes_no_files(
     paths = _write_inputs(tmp_path)
     before = set(tmp_path.rglob("*"))
     with caplog.at_level(logging.INFO):
-        assert target.main(_cli(paths)) == 0
+        assert target.main(_cli(paths, TEXT_ONLY)) == 0
     assert '"Park & Ride": {' in caplog.text
     assert set(tmp_path.rglob("*")) == before
 
@@ -606,7 +609,7 @@ def test_main_writes_the_text_and_a_run_log(tmp_path: Path) -> None:
     # A projected shapefile, as zones are often drawn.
     paths = _write_inputs(tmp_path, _layer().to_crs("EPSG:2248"), "zones.shp")
     out_dir = tmp_path / "out"
-    assert target.main(_cli(paths, "--output-dir", str(out_dir))) == 0
+    assert target.main(_cli(paths, TEXT_ONLY, "--output-dir", str(out_dir))) == 0
 
     text = (out_dir / "cluster_stops_from_zones.txt").read_text(encoding="utf-8")
     values = dict(_values(text.split("# Step 2:")[0]))
@@ -623,7 +626,7 @@ def test_main_reads_a_zipped_feed(tmp_path: Path) -> None:
     feed = tmp_path / "feed.zip"
     with zipfile.ZipFile(feed, "w") as archive:
         archive.write(Path(paths["gtfs"]) / "stops.txt", "feed/stops.txt")
-    assert target.main(_cli({**paths, "gtfs": str(feed)})) == 0
+    assert target.main(_cli({**paths, "gtfs": str(feed)}, TEXT_ONLY)) == 0
 
 
 def test_main_clusters_the_mock_dc_feed_with_a_zipped_state_plane_shapefile(
@@ -664,7 +667,7 @@ def test_main_clusters_the_mock_dc_feed_with_a_zipped_state_plane_shapefile(
 def test_main_writes_the_bay_assignment_workbook(tmp_path: Path) -> None:
     paths = {"gtfs": str(MOCK_GTFS_DC_ZIP), "zones": str(STOP_CLUSTERS_ZIP)}
     out_dir = tmp_path / "out"
-    assert target.main(_cli(paths, "--output-dir", str(out_dir), "--bay-assignment-xlsx")) == 0
+    assert target.main(_cli(paths, "--output-dir", str(out_dir))) == 0  # workbook on by default
 
     workbook = load_workbook(out_dir / "cluster_bay_assignments.xlsx")
     centers = [f"Mock Transit Center 0{n}" for n in range(1, 6)]
@@ -683,6 +686,7 @@ def test_main_writes_the_bay_assignment_workbook(tmp_path: Path) -> None:
         ["10 (1)", "30 (1)", "40 (1)"],
     ]
     assert {str(cells) for cells in center.merged_cells.ranges} == {"A1:C1", "A2:C2", "A3:C3"}
+    assert center.page_setup.paperSize == 1  # Letter, 8.5 x 11 in
     empty = workbook[centers[3]]
     assert empty["A5"].value == "No stops in this cluster"
     assert not empty.merged_cells.ranges  # Excel rejects one-cell merges as corrupt
@@ -724,9 +728,10 @@ def test_main_bad_near_miss_feet_exits_1(
     assert "NEAR_MISS_FEET must be 0 (off) or a positive number of feet" in caplog.text
 
 
-def test_main_overlapping_zones_exit_1(tmp_path: Path) -> None:
+def test_main_overlapping_zones_exit_1(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     layer = _layer(["Metro", "Park & Ride"], [METRO, OVERLAPS_METRO])
-    assert target.main(_cli(_write_inputs(tmp_path, layer))) == 1
+    assert target.main(_cli(_write_inputs(tmp_path, layer), TEXT_ONLY)) == 1
+    assert "Zones overlap: 'Metro' and 'Park & Ride'" in caplog.text
 
 
 def test_main_output_filename_with_a_folder_exits_1(tmp_path: Path) -> None:

@@ -60,6 +60,7 @@ matching setting, then add capacities.
 from __future__ import annotations
 
 import argparse
+import datetime as datetime_module  # the from-import errored in some ArcGIS Pro setups
 import hashlib
 import json
 import logging
@@ -70,7 +71,6 @@ import sys
 import tempfile
 import zipfile
 from collections.abc import Mapping, Sequence
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
@@ -112,8 +112,8 @@ OUTPUT_FILENAME: str = r"cluster_stops_from_zones.txt"
 
 # Optional scheduled bay-use inventory. Set OUTPUT_DIR to save the workbook.
 # All services are combined; no date, day-of-week or pickup filter is applied.
-# Set True (or pass --bay-assignment-xlsx) to add it to the text-only workflow.
-WRITE_BAY_ASSIGNMENT_XLSX: bool = False
+# Set False (or pass --no-bay-assignment-xlsx) for the original text-only workflow.
+WRITE_BAY_ASSIGNMENT_XLSX: bool = True
 BAY_ASSIGNMENT_FILENAME: str = r"cluster_bay_assignments.xlsx"
 
 # Every output must be traceable: a failed run-log write aborts the script.
@@ -1204,7 +1204,7 @@ def write_bay_assignment_workbook(
             scope,
             notes,
             f"GTFS: {gtfs_path}",
-            f"Generated: {datetime.now().isoformat(timespec='seconds')}",
+            f"Generated: {datetime_module.datetime.now().isoformat(timespec='seconds')}",
             "Stop headers use stop_id, not stop_code. No conflict or optimization analysis.",
         ],
         start=1,
@@ -1259,7 +1259,7 @@ def write_bay_assignment_workbook(
         sheet.print_title_rows = "1:5"
         sheet.sheet_properties.pageSetUpPr.fitToPage = True
         sheet.page_setup.orientation = "landscape"
-        sheet.page_setup.paperSize = sheet.PAPERSIZE_A3
+        sheet.page_setup.paperSize = sheet.PAPERSIZE_LETTER
         sheet.page_setup.fitToWidth = 1
         sheet.page_setup.fitToHeight = 0
         sheet.print_options.horizontalCentered = True
@@ -1434,7 +1434,7 @@ def write_run_log(
         "=" * 72,
         "CLUSTER STOPS FROM ZONES RUN LOG",
         "=" * 72,
-        f"Run timestamp:    {datetime.now().isoformat(timespec='seconds')}",
+        f"Run timestamp:    {datetime_module.datetime.now().isoformat(timespec='seconds')}",
         f"Output file:      {output_file}",
         f"Source script:    {source_display}",
         "",
