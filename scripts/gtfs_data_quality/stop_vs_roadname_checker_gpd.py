@@ -366,8 +366,8 @@ def extract_street_names(stop_name: str, modifiers: Set[str]) -> List[str]:
     """
     if pd.isna(stop_name) or not isinstance(stop_name, str):
         return []
-    separators = [" @ ", " and ", " & ", "/", " intersection of "]
-    pattern = "|".join(map(re.escape, separators))
+    # Symbol separators split with or without surrounding spaces ("A&B", "A @ B").
+    pattern = r"\s*[@&/+]\s*| and | intersection of "
     streets = re.split(pattern, stop_name, flags=re.IGNORECASE)
     return [normalize_street_name(street, modifiers) for street in streets if street]
 

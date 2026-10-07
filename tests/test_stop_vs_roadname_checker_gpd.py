@@ -265,6 +265,13 @@ def test_extract_street_names_splits_on_ampersand() -> None:
     assert len(names) == 2
 
 
+@pytest.mark.parametrize(
+    "stop_name", ["Mainn St&Elm St", "Mainn St@Elm St", "Mainn St + Elm St", "Mainn St/Elm St"]
+)
+def test_extract_street_names_splits_symbols_without_spaces(stop_name: str) -> None:
+    assert target.extract_street_names(stop_name, {"st"}) == ["mainn", "elm"]
+
+
 def test_extract_street_names_single_name() -> None:
     names = target.extract_street_names("Main Street", set())
     assert len(names) == 1
