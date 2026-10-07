@@ -21,7 +21,8 @@ redrawing it.
 Inputs
 ------
 - GTFS feed folder or .zip (stops.txt): the feed Step 1 reads, so the
-  stop_ids match.
+  stop_ids match. The optional workbook also reads routes.txt, trips.txt
+  and stop_times.txt.
 - Zone polygon layer in any format geopandas reads (shapefile, GeoJSON,
   GeoPackage, ...) with a defined CRS. A name field is optional; unnamed
   zones are numbered by their position in the file.
@@ -33,6 +34,11 @@ Outputs
 - Optionally, the same text as ``OUTPUT_FILENAME`` in ``OUTPUT_DIR`` with a
   ``_runlog.txt`` sidecar capturing the verbatim CONFIGURATION block and
   SHA-256 fingerprints of the inputs.
+- Optional Excel workbook: an index and one sheet per cluster, with stop
+  names and IDs across the top and unique route-direction entries below.
+  It includes all services in the feed and all scheduled stop visits,
+  including no-pickup visits. It is an inventory, not a boarding guide or
+  an optimized assignment. Requires openpyxl only when this export is on.
 
 Typical usage
 -------------
@@ -52,6 +58,7 @@ import math
 import os
 import re
 import sys
+import tempfile
 import zipfile
 from collections.abc import Mapping, Sequence
 from datetime import datetime
@@ -84,10 +91,16 @@ ZONE_NAME_FIELD: str = ""
 # little short misses them. 0 turns the check off.
 NEAR_MISS_FEET: float = 250.0
 
-# Optional copy of the config text, with a run log beside it. Leave OUTPUT_DIR
-# "" to write the text to the log only.
+# Output folder for the config text, workbook and run logs. Leave OUTPUT_DIR
+# "" for log-only output when WRITE_BAY_ASSIGNMENT_XLSX is False.
 OUTPUT_DIR: str = r""
 OUTPUT_FILENAME: str = r"cluster_stops_from_zones.txt"
+
+# Optional scheduled bay-use inventory. Set OUTPUT_DIR to save the workbook.
+# All services are combined; no date, day-of-week or pickup filter is applied.
+# Set True (or pass --bay-assignment-xlsx) to add it to the text-only workflow.
+WRITE_BAY_ASSIGNMENT_XLSX: bool = False
+BAY_ASSIGNMENT_FILENAME: str = r"cluster_bay_assignments.xlsx"
 
 # Every output must be traceable: a failed run-log write aborts the script.
 # Set to False only when writing to a genuinely read-only location.
@@ -119,7 +132,7 @@ METERS_PER_FOOT = 0.3048
 # =============================================================================
 
 
-# Canonical version lives in utils/gtfs_helpers.py -- keep this copy in sync.
+# Based on utils/gtfs_helpers.py; this variant preserves literal IDs such as "NA".
 def load_gtfs_data(
     gtfs_path: str,
     files: Optional[Sequence[str]] = None,
@@ -155,7 +168,8 @@ def load_gtfs_data(
 
     Notes:
         All columns default to ``str`` to avoid pandas’ type-inference
-        pitfalls (e.g. leading zeros in IDs).
+        pitfalls (e.g. leading zeros in IDs). Default NA tokens are disabled
+        so IDs and names such as "NA" and "NULL" remain literal text.
     """
     log = logger if logger is not None else logging.getLogger(__name__)
 
@@ -224,11 +238,16 @@ def load_gtfs_data(
             try:
                 if archive is None:
                     df = pd.read_csv(
-                        os.path.join(gtfs_path, file_name), dtype=dtype, low_memory=False
+                        os.path.join(gtfs_path, file_name),
+                        dtype=dtype,
+                        low_memory=False,
+                        keep_default_na=False,
                     )
                 else:
                     with archive.open(resolved[file_name]) as handle:
-                        df = pd.read_csv(handle, dtype=dtype, low_memory=False)
+                        df = pd.read_csv(
+                            handle, dtype=dtype, low_memory=False, keep_default_na=False
+                        )
                 data[key] = df
                 log.info("Loaded %s (%d records).", file_name, len(df))
 
@@ -817,6 +836,302 @@ def _preview(values: Sequence[Any], limit: int = 10, separator: str = ", ") -> s
 
 
 # =============================================================================
+# BAY ASSIGNMENT WORKBOOK
+# =============================================================================
+
+
+def _text_column(frame: pd.DataFrame, name: str) -> pd.Series:
+    """Return a column as text, or aligned blanks for an absent optional column."""
+    if name not in frame:
+        return pd.Series("", index=frame.index, dtype=str)
+    return frame[name].fillna("").astype(str)
+
+
+def _require_columns(frame: pd.DataFrame, columns: Sequence[str], filename: str) -> None:
+    """Reject a GTFS table missing columns needed for the workbook."""
+    missing = [column for column in columns if column not in frame]
+    if missing:
+        raise ValueError(f"{filename} is missing column(s): {', '.join(missing)}.")
+
+
+def _require_unique_ids(frame: pd.DataFrame, column: str, filename: str) -> None:
+    """Reject blank or duplicate keys before a many-to-one GTFS join."""
+    values = _text_column(frame, column)
+    if values.str.strip().eq("").any():
+        raise ValueError(f"{filename} contains blank {column} values.")
+    repeated = values[values.duplicated()].unique().tolist()
+    if repeated:
+        raise ValueError(f"{filename} repeats {column}: {_preview(repeated)}.")
+
+
+def build_bay_assignments(
+    assignments: pd.DataFrame,
+    stop_times: pd.DataFrame,
+    trips: pd.DataFrame,
+    routes: pd.DataFrame,
+) -> pd.DataFrame:
+    """Build unique scheduled stop/route/direction combinations for cluster stops.
+
+    Args:
+        assignments: Stops already assigned to zones by the spatial workflow.
+        stop_times: GTFS stop_times.txt, read as strings.
+        trips: GTFS trips.txt, read as strings.
+        routes: GTFS routes.txt, read as strings.
+
+    Returns:
+        Columns stop_id, route_id, route_label and direction_id. Unknown
+        directions use "?". Route labels prefer route_short_name, then
+        route_long_name, then route_id. Duplicate names include route_id.
+
+    Raises:
+        ValueError: Required columns or keys are invalid, or a clustered stop
+            references an unknown trip or route. No silent dropping of visits.
+
+    Notes:
+        All service_ids and all stop visits are included. A route-direction
+        may legitimately appear at several stops. Pickup restrictions and
+        calendars are not interpreted; this is not a boarding assignment guide.
+    """
+    _require_columns(stop_times, ("stop_id", "trip_id"), "stop_times.txt")
+    _require_columns(trips, ("trip_id", "route_id"), "trips.txt")
+    _require_columns(routes, ("route_id",), "routes.txt")
+    _require_unique_ids(trips, "trip_id", "trips.txt")
+    _require_unique_ids(routes, "route_id", "routes.txt")
+
+    visits = pd.DataFrame(
+        {
+            "stop_id": _text_column(stop_times, "stop_id"),
+            "trip_id": _text_column(stop_times, "trip_id"),
+        }
+    )
+    visits = visits[visits["stop_id"].isin(assignments["stop_id"])].drop_duplicates()
+    trip_table = pd.DataFrame(
+        {
+            "trip_id": _text_column(trips, "trip_id"),
+            "route_id": _text_column(trips, "route_id"),
+            "direction_id": _text_column(trips, "direction_id").str.strip(),
+        }
+    )
+    joined = visits.merge(
+        trip_table, on="trip_id", how="left", validate="many_to_one", indicator=True
+    )
+    missing_trips = joined.loc[joined["_merge"].eq("left_only"), "trip_id"].unique()
+    if len(missing_trips):
+        raise ValueError(
+            "Cluster stop visits reference missing trips.txt trip_id values: "
+            f"{_preview(missing_trips.tolist())}."
+        )
+    joined = joined.drop(columns="_merge")
+    route_table = pd.DataFrame(
+        {
+            "route_id": _text_column(routes, "route_id"),
+            "route_label": _text_column(routes, "route_short_name").map(_one_line),
+        }
+    )
+    long_names = _text_column(routes, "route_long_name").map(_one_line)
+    route_table["route_label"] = route_table["route_label"].where(
+        route_table["route_label"].ne(""), long_names
+    )
+    route_table["route_label"] = route_table["route_label"].where(
+        route_table["route_label"].ne(""), route_table["route_id"]
+    )
+    ambiguous = route_table["route_label"].duplicated(keep=False)
+    route_table.loc[ambiguous, "route_label"] = (
+        route_table.loc[ambiguous, "route_label"]
+        + " [route_id="
+        + route_table.loc[ambiguous, "route_id"]
+        + "]"
+    )
+    joined = joined.merge(
+        route_table, on="route_id", how="left", validate="many_to_one", indicator=True
+    )
+    missing_routes = joined.loc[joined["_merge"].eq("left_only"), "route_id"].unique()
+    if len(missing_routes):
+        raise ValueError(
+            "Trips serving cluster stops reference missing routes.txt route_id values: "
+            f"{_preview(missing_routes.tolist())}."
+        )
+    invalid = ~joined["direction_id"].isin(["", "0", "1"])
+    if invalid.any():
+        logging.warning(
+            "Invalid direction_id values shown as (?): %s",
+            _preview(joined.loc[invalid, "direction_id"].unique().tolist()),
+        )
+    joined.loc[~joined["direction_id"].isin(["0", "1"]), "direction_id"] = "?"
+    columns = ["stop_id", "route_id", "route_label", "direction_id"]
+    result = joined[columns].drop_duplicates(["stop_id", "route_id", "direction_id"])
+    logging.info("Found %d unique stop/route/direction combination(s).", len(result))
+    return result.reset_index(drop=True)
+
+
+def _excel_text(value: str) -> str:
+    """Remove control characters Excel cannot store from display text only."""
+    return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", value)
+
+
+def _worksheet_name(zone: str, used: set[str]) -> str:
+    """Return a unique Excel-safe title; *used* contains casefolded titles."""
+    base = re.sub(r"[\\/*?:\[\]]", "_", _excel_text(zone)).strip().strip("'")
+    base = base or "Cluster"
+    title = base[:31].rstrip("'")
+    number = 2
+    while title.casefold() in used:
+        suffix = f"_{number}"
+        title = base[: 31 - len(suffix)].rstrip("'") + suffix
+        number += 1
+    used.add(title.casefold())
+    return title
+
+
+def write_bay_assignment_workbook(
+    output_file: Path,
+    assignments: pd.DataFrame,
+    bay_assignments: pd.DataFrame,
+    zone_order: Sequence[str],
+    gtfs_path: str,
+) -> None:
+    """Write an index and one formatted, printable stop-column sheet per cluster.
+
+    Args:
+        output_file: Destination .xlsx file.
+        assignments: Cluster membership with stop names and IDs.
+        bay_assignments: Unique scheduled uses from build_bay_assignments.
+        zone_order: Full cluster order, including clusters with no stops.
+        gtfs_path: Source feed path to record in the workbook.
+
+    Raises:
+        RuntimeError: openpyxl is unavailable in the Python environment.
+        ValueError: A cluster exceeds Excel's column limit.
+        OSError: The workbook cannot be saved, e.g. it is open in Excel.
+    """
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Alignment, Font, PatternFill
+        from openpyxl.utils import get_column_letter
+    except ImportError as exc:
+        raise RuntimeError(
+            "The Excel export requires openpyxl in this Python environment. "
+            "Install openpyxl or set WRITE_BAY_ASSIGNMENT_XLSX = False."
+        ) from exc
+
+    workbook = Workbook()
+    index = workbook.active
+    index.title = "Index"
+    used_names = {"index", "history"}
+    navy = "17365D"
+    pale_blue = "EAF1F8"
+
+    def put(sheet: Any, row: int, column: int, value: Any, header: bool = False) -> Any:
+        cell = sheet.cell(row=row, column=column, value=value)
+        if isinstance(value, str):
+            cell.value = _excel_text(value)
+            cell.data_type = "s"  # IDs/names starting with '=' remain literal text.
+        cell.alignment = Alignment(vertical="top", wrap_text=True)
+        cell.font = Font(
+            name="Calibri", size=11, bold=header, color="FFFFFF" if header else "202B38"
+        )
+        if header or row % 2 == 0:
+            cell.fill = PatternFill("solid", fgColor=navy if header else pale_blue)
+        return cell
+
+    scope = "All services in feed; no date or day-of-week filter."
+    notes = (
+        "All scheduled stop visits, including arrivals and no-pickup visits; not a boarding "
+        "guide. Entries are route (direction_id); (?) means missing/invalid direction. "
+        "Columns are independent lists; rows do not indicate simultaneous use."
+    )
+    for row, value in enumerate(
+        [
+            "Scheduled bay use by cluster",
+            scope,
+            notes,
+            f"GTFS: {gtfs_path}",
+            f"Generated: {datetime.now().isoformat(timespec='seconds')}",
+            "Stop headers use stop_id, not stop_code. No conflict or optimization analysis.",
+        ],
+        start=1,
+    ):
+        index.merge_cells(start_row=row, start_column=1, end_row=row, end_column=4)
+        put(index, row, 1, value, header=(row == 1))
+        index.row_dimensions[row].height = 45 if row in (3, 4) else 30
+    for column, label in enumerate(["Cluster", "Worksheet", "Stops", "Route-directions"], 1):
+        put(index, 8, column, label, header=True)
+    index.column_dimensions["A"].width = 42
+    index.column_dimensions["B"].width = 34
+    index.column_dimensions["C"].width = 12
+    index.column_dimensions["D"].width = 20
+    index.freeze_panes = "A9"
+
+    by_stop: dict[str, list[str]] = {}
+    records = sorted(
+        bay_assignments.to_dict("records"),
+        key=lambda row: (_natural_key(row["route_label"]), row["direction_id"], row["route_id"]),
+    )
+    for record in records:
+        by_stop.setdefault(record["stop_id"], []).append(
+            f"{record['route_label']} ({record['direction_id']})"
+        )
+
+    for row_number, zone in enumerate(dict.fromkeys(zone_order), start=9):
+        group = assignments[assignments["zone"].eq(zone)]
+        stops = sorted(group.to_dict("records"), key=lambda row: _natural_key(row["stop_id"]))
+        if len(stops) > 16384:
+            raise ValueError(f"Cluster {zone!r} has more stops than Excel permits columns.")
+        title = _worksheet_name(str(zone), used_names)
+        sheet = workbook.create_sheet(title)
+        sheet.sheet_view.showGridLines = False
+        width = max(1, len(stops))
+        for row, value in enumerate([str(zone), scope, notes], start=1):
+            if width > 1:  # Excel reports a one-cell merge as corrupt content.
+                sheet.merge_cells(start_row=row, start_column=1, end_row=row, end_column=width)
+            put(sheet, row, 1, value, header=(row == 1))
+            sheet.row_dimensions[row].height = (120 if width == 1 else 72) if row == 3 else 42
+        for column, stop in enumerate(stops, start=1):
+            name = stop["stop_name"] or "Unnamed stop"
+            put(sheet, 5, column, f"{name}\n({stop['stop_id']})", header=True)
+            for row, label in enumerate(by_stop.get(stop["stop_id"], ["No scheduled trips"]), 6):
+                put(sheet, row, column, label)
+                sheet.row_dimensions[row].height = 32
+            sheet.column_dimensions[get_column_letter(column)].width = 36
+        if not stops:
+            sheet.column_dimensions["A"].width = 52
+            put(sheet, 5, 1, "No stops in this cluster", header=True)
+        sheet.row_dimensions[5].height = 66
+        sheet.freeze_panes = "A6"
+        sheet.print_title_rows = "1:5"
+        sheet.sheet_properties.pageSetUpPr.fitToPage = True
+        sheet.page_setup.orientation = "landscape"
+        sheet.page_setup.paperSize = sheet.PAPERSIZE_A3
+        sheet.page_setup.fitToWidth = 1
+        sheet.page_setup.fitToHeight = 0
+        sheet.print_options.horizontalCentered = True
+        sheet.print_area = f"A1:{get_column_letter(width)}{sheet.max_row}"
+        cluster_uses = bay_assignments[bay_assignments["stop_id"].isin(group["stop_id"])]
+        count = len(cluster_uses.drop_duplicates(["route_id", "direction_id"]))
+        for column, value in enumerate([str(zone), title, len(stops), count], 1):
+            cell = put(index, row_number, column, value)
+            if column == 2:
+                escaped = title.replace("'", "''")
+                cell.hyperlink = f"#'{escaped}'!A1"
+        index.row_dimensions[row_number].height = 32
+
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    temporary_file: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=output_file.parent, suffix=".xlsx", delete=False
+        ) as tmp:
+            temporary_file = Path(tmp.name)
+        workbook.save(temporary_file)
+        os.replace(temporary_file, output_file)
+    finally:
+        workbook.close()
+        if temporary_file is not None and temporary_file.exists():
+            temporary_file.unlink()
+    logging.info("Bay assignment workbook saved to %s", output_file)
+
+
+# =============================================================================
 # RUN LOG
 # =============================================================================
 
@@ -889,23 +1204,27 @@ def sha256_of_file(path: str) -> Optional[str]:
         return None
 
 
-def input_fingerprints(gtfs_path: str, zones_path: str) -> List[str]:
+def input_fingerprints(
+    gtfs_path: str, zones_path: str, gtfs_files: Sequence[str] = ("stops.txt",)
+) -> List[str]:
     """Return SHA-256 fingerprint lines for the inputs, for the run log.
 
-    A GTFS folder fingerprints its stops.txt; a .zip feed the archive. A
+    A GTFS folder fingerprints every file read; a .zip feed the archive. A
     shapefile zone layer also fingerprints its .dbf (names) and .prj (CRS).
     A folder-based layer, such as a file geodatabase, is not fingerprinted.
 
     Args:
         gtfs_path: The GTFS feed used for this run.
         zones_path: The zone layer used for this run.
+        gtfs_files: Files read from the feed, including workbook inputs if enabled.
 
     Returns:
         "label: path" / "sha256: digest" line pairs.
     """
     targets: List[Tuple[str, str]] = []
     if os.path.isdir(gtfs_path):
-        targets.append(("GTFS stops.txt", os.path.join(gtfs_path, "stops.txt")))
+        for filename in gtfs_files:
+            targets.append((f"GTFS {filename}", os.path.join(gtfs_path, filename)))
     else:
         targets.append(("GTFS feed", gtfs_path))
     targets.append(("Zone layer", zones_path))
@@ -932,7 +1251,7 @@ def write_run_log(
     actually used (which CLI flags may have changed), and input fingerprints.
 
     Args:
-        output_file: The config text file this run wrote.
+        output_file: The config text file or workbook this run wrote.
         effective_settings: Pre-formatted lines of the resolved settings.
         fingerprints: Lines from :func:`input_fingerprints`.
 
@@ -1027,7 +1346,7 @@ def check_near_miss_feet(near_miss_feet: float) -> None:
 
 
 def run(args: argparse.Namespace) -> str:
-    """Build the config text from the zones and the feed, log it, and optionally save it.
+    """Build config text and optionally export scheduled bay use by cluster.
 
     Args:
         args: Parsed CLI arguments (defaults mirror the CONFIGURATION block).
@@ -1045,12 +1364,38 @@ def run(args: argparse.Namespace) -> str:
     """
     check_near_miss_feet(args.near_miss_feet)
     output_file = resolve_output_file(args.output_dir, args.output_filename)
+    workbook_file = None
+    gtfs_files = ["stops.txt"]
+    if args.write_bay_assignment_xlsx:
+        if output_file is None:
+            raise ValueError(
+                "Set OUTPUT_DIR / --output-dir to save the workbook, or disable it with "
+                "WRITE_BAY_ASSIGNMENT_XLSX = False / --no-bay-assignment-xlsx."
+            )
+        workbook_file = resolve_output_file(args.output_dir, args.bay_assignment_filename)
+        if workbook_file is None or workbook_file.suffix.lower() != ".xlsx":
+            raise ValueError("BAY_ASSIGNMENT_FILENAME must be a filename ending in .xlsx.")
+        output_names = [
+            output_file.name,
+            workbook_file.name,
+            f"{output_file.stem}_runlog.txt",
+            f"{workbook_file.stem}_runlog.txt",
+        ]
+        if len({name.casefold() for name in output_names}) != len(output_names):
+            raise ValueError("The config text, workbook and their run logs must have unique names.")
+        gtfs_files += ["stop_times.txt", "trips.txt", "routes.txt"]
     zones = load_zones(args.zones_path, args.zone_name_field)
     check_zone_overlaps(zones)
-    stops = prepare_stops(load_gtfs_data(args.gtfs_path, files=("stops.txt",))["stops"])
+    gtfs = load_gtfs_data(args.gtfs_path, files=gtfs_files)
+    stops = prepare_stops(gtfs["stops"])
     assignments = assign_stops_to_zones(stops, zones)
     near_misses = find_near_misses(stops, zones, assignments, args.near_miss_feet)
     zone_order = list(dict.fromkeys(zones["zone"]))
+    bay_assignments = None
+    if workbook_file is not None:
+        bay_assignments = build_bay_assignments(
+            assignments, gtfs["stop_times"], gtfs["trips"], gtfs["routes"]
+        )
     text = build_config_text(
         assignments,
         zone_order,
@@ -1062,6 +1407,10 @@ def run(args: argparse.Namespace) -> str:
     logging.info("Config text to paste:\n\n%s", text)
     if output_file is None:
         return text
+    if workbook_file is not None and bay_assignments is not None:
+        write_bay_assignment_workbook(
+            workbook_file, assignments, bay_assignments, zone_order, args.gtfs_path
+        )
     output_file.parent.mkdir(parents=True, exist_ok=True)
     output_file.write_text(text, encoding="utf-8")
     logging.info("Config text saved to %s", output_file)
@@ -1071,9 +1420,13 @@ def run(args: argparse.Namespace) -> str:
         f"Zone name field:  {args.zone_name_field or '(none: zones numbered by position)'}",
         f"Near-miss feet:   {args.near_miss_feet:,g}",
         f"Output file:      {output_file}",
+        f"Bay workbook:     {workbook_file or '(disabled)'}",
+        "Workbook scope:   All services; all scheduled stop visits (including no-pickup).",
     ]
-    fingerprints = input_fingerprints(args.gtfs_path, args.zones_path)
+    fingerprints = input_fingerprints(args.gtfs_path, args.zones_path, gtfs_files)
     require_run_log(write_run_log(output_file, settings, fingerprints))
+    if workbook_file is not None:
+        require_run_log(write_run_log(workbook_file, settings, fingerprints))
     return text
 
 
@@ -1141,12 +1494,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output-dir",
         default=OUTPUT_DIR,
-        help='Folder for a copy of the config text and its run log; "" logs the text only.',
+        help='Folder for output files; "" permits log-only output when the workbook is disabled.',
     )
     parser.add_argument(
         "--output-filename",
         default=OUTPUT_FILENAME,
         help="File name for the copy of the config text.",
+    )
+    parser.add_argument(
+        "--bay-assignment-xlsx",
+        dest="write_bay_assignment_xlsx",
+        action=argparse.BooleanOptionalAction,
+        default=WRITE_BAY_ASSIGNMENT_XLSX,
+        help="Export an Excel inventory of scheduled stop use, one sheet per cluster.",
+    )
+    parser.add_argument(
+        "--bay-assignment-filename",
+        default=BAY_ASSIGNMENT_FILENAME,
+        help="File name for the optional Excel workbook (must end in .xlsx).",
     )
     return parser
 
