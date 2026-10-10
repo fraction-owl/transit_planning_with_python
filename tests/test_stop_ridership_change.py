@@ -311,3 +311,91 @@ def test_main_returns_1_for_missing_input(tmp_path: Path) -> None:
         ]
     )
     assert code == 1
+
+
+# --- input hardening and output publishing ----------------------------------
+
+
+def test_stop_ids_file_keeps_leading_zeros(tmp_path: Path) -> None:
+    ids = tmp_path / "ids.txt"
+    ids.write_text("﻿0123, 1001 # inline note\n# whole-line comment\n1001.0\n", encoding="utf-8")
+    assert target.resolve_stop_ids([], ids) == ["0123", "1001"]
+    assert target.resolve_stop_ids(["0123", 1001], None) == ["0123", "1001"]
+
+
+def test_prepare_signup_parses_grouped_numbers_and_blank_cells() -> None:
+    raw = pd.DataFrame(
+        [["AM PEAK", "NA", "A", "0123", "1,234.5", ""], ["AM PEAK", "10", "B", "7", "", "2"]],
+        columns=COLUMNS,
+    )
+    df = target.prepare_signup(raw, source="s1")
+    assert df["ROUTE_NAME"].tolist() == ["NA", "10"]
+    assert df["STOP_ID"].tolist() == ["0123", "7"]
+    assert df["BOARD_ALL"].tolist() == [1234.5, 0.0]
+    assert df["ALIGHT_ALL"].tolist() == [0.0, 2.0]
+
+
+def test_prepare_signup_rejects_infinite_values() -> None:
+    raw = _signup(SIGNUP_1)
+    raw["BOARD_ALL"] = raw["BOARD_ALL"].astype(object)
+    raw.loc[0, "BOARD_ALL"] = "inf"
+    with pytest.raises(ValueError, match="infinite"):
+        target.prepare_signup(raw, source="s1")
+
+
+def test_labels_cannot_collide_with_generated_change_columns() -> None:
+    with pytest.raises(ValueError, match="duplicate output column"):
+        target.derive_signup_labels(
+            [Path("a.xlsx"), Path("b.xlsx"), Path("c.xlsx")], ["A", "B", "Chg A to B"]
+        )
+
+
+def test_restore_numeric_ids_keeps_long_ids_as_text() -> None:
+    out = target.restore_numeric_ids(pd.DataFrame({"STOP_ID": ["1234567890123456", "1"]}))
+    assert out["STOP_ID"].tolist() == ["1234567890123456", "1"]
+
+
+def test_resolve_script_source_prefers_module_file() -> None:
+    _, label = target._resolve_script_source()
+    assert label.endswith("stop_ridership_change.py")
+
+
+def test_main_overwrites_cleanly_without_leftover_staging(tmp_path: Path) -> None:
+    inputs = [str(p) for p in _write_inputs(tmp_path)]
+    out_dir = tmp_path / "out"
+    for _ in range(2):
+        assert target.main(["--inputs", *inputs, "--output-dir", str(out_dir)]) == 0
+    assert sorted(p.name for p in out_dir.iterdir()) == [
+        "ridership_change_stop.xlsx",
+        "ridership_change_stop_runlog.txt",
+    ]
+
+
+def test_main_restores_previous_workbook_when_publishing_fails(tmp_path: Path) -> None:
+    inputs = [str(p) for p in _write_inputs(tmp_path)]
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    (out_dir / "ridership_change_stop.xlsx").write_bytes(b"previous")
+    # A directory where the run log should go makes the second replacement fail.
+    (out_dir / "ridership_change_stop_runlog.txt").mkdir()
+
+    assert target.main(["--inputs", *inputs, "--output-dir", str(out_dir)]) == 1
+    assert (out_dir / "ridership_change_stop.xlsx").read_bytes() == b"previous"
+    assert not any(p.name.startswith(".ridership_change_") for p in out_dir.iterdir())
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [["--output-filename", "change.csv"], ["--min-base-for-pct", "-1"]],
+)
+def test_main_returns_2_for_bad_output_name_or_min_base(tmp_path: Path, extra: list) -> None:
+    inputs = [str(p) for p in _write_inputs(tmp_path)]
+    assert target.main(["--inputs", *inputs, "--output-dir", str(tmp_path), *extra]) == 2
+
+
+def test_main_refuses_to_overwrite_an_input(tmp_path: Path) -> None:
+    inputs = _write_inputs(tmp_path)
+    clash = tmp_path / "ridership_change_stop.xlsx"
+    _signup(SIGNUP_1).to_excel(clash, index=False)
+    code = target.main(["--inputs", str(clash), str(inputs[1]), "--output-dir", str(tmp_path)])
+    assert code == 2

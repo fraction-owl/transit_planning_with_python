@@ -47,10 +47,13 @@ from __future__ import annotations
 import argparse
 import hashlib
 import logging
+import math
 import re
+import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
@@ -101,7 +104,7 @@ METRICS: List[str] = ["BOARD_ALL", "ALIGHT_ALL", "TOTAL"]
 # ROUTES = keep-only list   |  ROUTES_EXCLUDE = toss-out list   (empty → no filter)
 ROUTES: List[str] = []
 ROUTES_EXCLUDE: List[str] = []
-STOP_IDS: List[int] = []  # keep these (empty → keep all)
+STOP_IDS: List[str] = []  # keep these (empty → keep all); quote IDs to retain leading zeros
 # Optional plain-text file of stop IDs (newline/comma/space separated, "#" comments).
 # When set it replaces the inline STOP_IDS list.
 STOP_IDS_FILE: Path | None = None  # e.g. Path(r"C:\Data\stop_ids.txt")
@@ -238,81 +241,78 @@ def derive_signup_labels(input_files: Sequence[Path], labels: Sequence[str]) -> 
             raise ValueError("SIGNUP_LABELS contains a blank label.")
         if len(set(cleaned)) != len(cleaned):
             raise ValueError(f"SIGNUP_LABELS must be unique; got {cleaned}.")
-        clashes = sorted(set(cleaned) & RESERVED_COLUMNS)
-        if clashes:
-            raise ValueError(f"SIGNUP_LABELS may not reuse output column names: {clashes}.")
+        validate_label_columns(cleaned)
         return cleaned
 
     for candidate in ([p.stem for p in input_files], [p.parent.name for p in input_files]):
         if all(candidate) and len(set(candidate)) == len(candidate):
-            if not set(candidate) & RESERVED_COLUMNS:
-                return list(candidate)
+            try:
+                validate_label_columns(candidate)
+            except ValueError:
+                continue
+            return list(candidate)
     return [f"Signup {i}" for i in range(1, len(input_files) + 1)]
 
 
-def load_stop_ids_from_file(stop_ids_file: Path) -> List[int]:
-    """Read a plain-text list of integer stop IDs from *stop_ids_file*.
+def validate_label_columns(labels: Sequence[str]) -> None:
+    """Reject labels that collide with descriptive or generated change columns."""
+    changes = [
+        f"{prefix}{labels[a]} to {labels[b]}"
+        for a, b in _comparison_pairs(len(labels))
+        for prefix in ("Chg ", "% Chg ")
+    ]
+    clashes = set(labels) & (RESERVED_COLUMNS | set(changes))
+    if clashes or len(set(changes)) != len(changes):
+        raise ValueError(
+            "SIGNUP_LABELS produce duplicate output column names. "
+            f"Use simpler, distinct labels; conflicting labels: {sorted(clashes)}."
+        )
+
+
+def load_stop_ids_from_file(stop_ids_file: Path) -> List[str]:
+    """Read a plain-text list of stop IDs without discarding leading zeros.
 
     The file may separate IDs by newlines, commas, or whitespace. Blank lines and lines
-    beginning with ``#`` are ignored. Non-integer tokens are skipped with a warning.
+    beginning with ``#`` are ignored; inline ``#`` comments are also supported.
     Duplicates are collapsed while preserving first-seen order.
 
     Args:
         stop_ids_file: Path to the text file of stop IDs.
 
     Returns:
-        A list of unique integer stop IDs in first-seen order.
+        A list of unique normalized stop ID strings in first-seen order.
 
     Raises:
-        ValueError: If the file cannot be read or contains no valid integer stop IDs.
+        ValueError: If the file cannot be read or contains no stop IDs.
     """
     try:
-        raw_text: str = stop_ids_file.read_text(encoding="utf-8")
-    except OSError as exc:
+        raw_text: str = stop_ids_file.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeError) as exc:
         raise ValueError(f"Error reading STOP_IDS_FILE '{stop_ids_file}': {exc}") from exc
 
-    stop_ids: List[int] = []
-    bad_tokens: List[str] = []
-    seen: set[int] = set()
+    tokens: List[str] = []
     for raw_line in raw_text.splitlines():
-        line: str = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        for token in line.replace(",", " ").split():
-            try:
-                value: int = int(token)
-            except ValueError:
-                bad_tokens.append(token)
-                continue
-            if value not in seen:
-                seen.add(value)
-                stop_ids.append(value)
-
-    if bad_tokens:
-        logging.warning(
-            "Ignored %d non-integer token(s) in STOP_IDS_FILE '%s': %s",
-            len(bad_tokens),
-            stop_ids_file,
-            bad_tokens,
-        )
+        line = raw_line.split("#", 1)[0]
+        tokens.extend(line.replace(",", " ").split())
+    stop_ids: List[str] = normalize_id(pd.Series(tokens, dtype=object)).dropna().unique().tolist()
     if not stop_ids:
-        raise ValueError(f"STOP_IDS_FILE '{stop_ids_file}' contained no valid integer stop IDs.")
+        raise ValueError(f"STOP_IDS_FILE '{stop_ids_file}' contained no stop IDs.")
 
     logging.info("Loaded %d stop ID(s) from STOP_IDS_FILE '%s'.", len(stop_ids), stop_ids_file)
     return stop_ids
 
 
-def resolve_stop_ids(stop_ids: Sequence[int], stop_ids_file: Path | None) -> List[int]:
+def resolve_stop_ids(stop_ids: Sequence[Any], stop_ids_file: Path | None) -> List[str]:
     """Return the effective STOP_IDS filter; ``stop_ids_file`` wins when both are set."""
     if stop_ids_file is not None:
-        loaded: List[int] = load_stop_ids_from_file(stop_ids_file)
+        loaded: List[str] = load_stop_ids_from_file(stop_ids_file)
         if stop_ids:
             logging.warning(
                 "Both STOP_IDS and STOP_IDS_FILE are set; using STOP_IDS_FILE "
                 "and ignoring the inline STOP_IDS list."
             )
         return loaded
-    return list(stop_ids)
+    return normalize_id(pd.Series(list(stop_ids), dtype=object)).dropna().unique().tolist()
 
 
 def read_ridership_table(path: Path) -> pd.DataFrame:
@@ -326,9 +326,9 @@ def read_ridership_table(path: Path) -> pd.DataFrame:
         raise FileNotFoundError(f"Input file not found: '{path}'.")
     try:
         if path.suffix.lower() == ".csv":
-            return pd.read_csv(path)
-        return pd.read_excel(path)
-    except (OSError, ValueError) as exc:
+            return pd.read_csv(path, dtype=object, keep_default_na=False)
+        return pd.read_excel(path, dtype=object, keep_default_na=False)
+    except (OSError, ValueError, ImportError) as exc:
         raise ValueError(f"Could not read '{path}': {exc}") from exc
 
 
@@ -384,8 +384,14 @@ def prepare_signup(
         df = df.loc[~no_key].copy()
 
     for col in ("BOARD_ALL", "ALIGHT_ALL"):
-        numeric = pd.to_numeric(df[col], errors="coerce")
-        bad = numeric.isna() & df[col].notna()
+        raw_values = df[col]
+        text_values = raw_values.astype(str).str.strip()
+        grouped_number = text_values.str.fullmatch(r"[+-]?\d{1,3}(?:,\d{3})+(?:\.\d+)?")
+        cleaned = raw_values.where(~grouped_number, text_values.str.replace(",", "", regex=False))
+        numeric = pd.to_numeric(cleaned, errors="coerce")
+        if numeric.isin([float("inf"), float("-inf")]).any():
+            raise ValueError(f"'{source}' contains infinite {col} values.")
+        bad = numeric.isna() & raw_values.notna() & text_values.ne("")
         if bad.any():
             logging.warning(
                 "%s: %d non-numeric %s value(s) treated as 0.", source, int(bad.sum()), col
@@ -534,9 +540,9 @@ def pct_change(old: pd.Series, new: pd.Series, min_base: float = 0.0) -> pd.Seri
     return (new - old) / old.where(valid) * 100.0
 
 
-def _pct_scalar(old: float, new: float) -> float:
-    """Percent change between two totals; NaN when ``old`` is not positive."""
-    return (new - old) / old * 100.0 if old > 0 else float("nan")
+def _pct_scalar(old: float, new: float, min_base: float = 0.0) -> float:
+    """Percent change between totals using the same base threshold as metric sheets."""
+    return (new - old) / old * 100.0 if old > 0 and old >= min_base else float("nan")
 
 
 def _comparison_pairs(n_signups: int) -> List[Tuple[int, int]]:
@@ -601,17 +607,20 @@ def build_metric_table(
     for idx, label in enumerate(labels):
         out[label] = values[idx]
 
+    absolute_columns: List[str] = list(labels)
+    percent_columns: List[str] = []
     for a, b in _comparison_pairs(len(labels)):
         old, new = values[a], values[b]
-        out[f"Chg {labels[a]} to {labels[b]}"] = new - old
-        out[f"% Chg {labels[a]} to {labels[b]}"] = pct_change(old, new, min_base)
+        change_col = f"Chg {labels[a]} to {labels[b]}"
+        percent_col = f"% Chg {labels[a]} to {labels[b]}"
+        out[change_col] = new - old
+        out[percent_col] = pct_change(old, new, min_base)
+        absolute_columns.append(change_col)
+        percent_columns.append(percent_col)
 
     if apply_rounding:
-        for col in out.columns:
-            if str(col).startswith("% Chg "):
-                out[col] = out[col].round(2)
-            elif col in labels or str(col).startswith("Chg "):
-                out[col] = out[col].round(1)
+        out[absolute_columns] = out[absolute_columns].round(1)
+        out[percent_columns] = out[percent_columns].round(2)
 
     return sort_by_key(out.reset_index(), keys)
 
@@ -688,6 +697,7 @@ def build_change_summary(
     labels: Sequence[str],
     metrics: Sequence[str],
     *,
+    min_base: float = 0.0,
     apply_rounding: bool = True,
 ) -> pd.DataFrame:
     """Summarize each transition: key counts, added/removed, and total % change.
@@ -725,8 +735,8 @@ def build_change_summary(
             both_a, both_b = float(v[a][both].sum()), float(v[b][both].sum())
             row[f"{name} From"] = total_a
             row[f"{name} To"] = total_b
-            row[f"{name} % Chg"] = _pct_scalar(total_a, total_b)
-            row[f"{name} % Chg (in both)"] = _pct_scalar(both_a, both_b)
+            row[f"{name} % Chg"] = _pct_scalar(total_a, total_b, min_base)
+            row[f"{name} % Chg (in both)"] = _pct_scalar(both_a, both_b, min_base)
         rows.append(row)
 
     out = pd.DataFrame(rows)
@@ -806,14 +816,19 @@ def restore_numeric_ids(df: pd.DataFrame) -> pd.DataFrame:
 
     IDs are compared as text, but Excel users expect numeric IDs to stay numeric so
     they can join or filter against other tables. Columns holding any ID with a
-    leading zero (e.g. "0123") stay text so the zero isn't lost.
+    leading zero (e.g. "0123") or more than Excel's 15 reliable numeric digits stay
+    text so their identity isn't lost.
     """
     out = df.copy()
     for col in ("ROUTE_NAME", "STOP_ID"):
         if col not in out.columns or out.empty:
             continue
         text = out[col].dropna().astype(str)
-        if not text.empty and text.str.fullmatch(r"-?(?:0|[1-9]\d*)").all():
+        if (
+            not text.empty
+            and text.str.fullmatch(r"-?(?:0|[1-9]\d*)").all()
+            and text.str.lstrip("-").str.len().le(15).all()
+        ):
             out[col] = pd.to_numeric(out[col]).astype("Int64")
     return out
 
@@ -909,25 +924,44 @@ def _resolve_script_source() -> Tuple[str, str]:
 
     Resolution order:
 
-    1. **Jupyter / IPython kernel** – walks ``In`` history in reverse and
+    1. **Source file defining this function** – prefer the actual module when
+       imported or run from IPython, rather than an unrelated notebook cell.
+
+    2. **Jupyter / IPython kernel** – walks ``In`` history in reverse and
        returns the most-recent cell that contains both CONFIG markers.
        Label is the notebook path when detectable, otherwise ``"<Jupyter cell>"``.
 
-    2. **Plain script / imported module** – reads ``__file__`` from the
+    3. **Plain script / imported module fallback** – reads ``__file__`` from the
        module's own globals. Label is the resolved file path.
 
     Raises:
         RuntimeError: If neither source can be located.
     """
+    source_path = Path(_resolve_script_source.__code__.co_filename)
+    if source_path.is_file():
+        source_path = source_path.resolve()
+        source_text = source_path.read_text(encoding="utf-8")
+        try:
+            extract_config_block_from_text(source_text, str(source_path))
+        except ValueError:
+            # A cached notebook cell may define the functions while a separate cell
+            # holds the configuration. Continue to the history lookup in that case.
+            pass
+        else:
+            return source_text, str(source_path)
+
     _ipython = sys.modules.get("IPython")
     ip = _ipython.get_ipython() if _ipython is not None else None  # type: ignore[attr-defined]
 
     if ip is not None:
         history: List[str] = ip.user_ns.get("In", [])
         for cell in reversed(history):
-            if CONFIG_BEGIN_MARKER in cell and CONFIG_END_MARKER in cell:
-                label: str = _notebook_path(ip) or "<Jupyter cell>"
-                return cell, label
+            try:
+                extract_config_block_from_text(cell, "<Jupyter cell>")
+            except ValueError:
+                continue
+            label: str = _notebook_path(ip) or "<Jupyter cell>"
+            return cell, label
 
     file_attr: str | None = globals().get("__file__")
     if file_attr is not None:
@@ -959,6 +993,7 @@ def write_run_log(
     settings_lines: Sequence[str],
     input_files: Sequence[Path],
     labels: Sequence[str],
+    log_path: Path | None = None,
 ) -> bool:
     """Write a ``<output stem>_runlog.txt`` sidecar next to *output_file*.
 
@@ -969,7 +1004,8 @@ def write_run_log(
     Returns:
         ``True`` if the log was written successfully, ``False`` otherwise.
     """
-    log_path: Path = output_file.with_name(f"{output_file.stem}_runlog.txt")
+    if log_path is None:
+        log_path = output_file.with_name(f"{output_file.stem}_runlog.txt")
 
     try:
         source_text, source_label = _resolve_script_source()
@@ -1019,6 +1055,43 @@ def write_run_log(
         return False
 
 
+def publish_run_outputs(staged_workbook: Path, output_file: Path, staged_log: Path | None) -> None:
+    """Publish completed outputs, restoring previous files if a replacement fails.
+
+    Staging and backups must be in the output directory's filesystem. An ordinary
+    write/permission error is rolled back; a process or system crash during the two
+    replacements is not an atomic transaction.
+    """
+    final_log = output_file.with_name(f"{output_file.stem}_runlog.txt")
+    publications = [(staged_workbook, output_file), (staged_log, final_log)]
+    backups: Dict[Path, Path] = {}
+    for idx, (_, destination) in enumerate(publications):
+        if destination.exists():
+            backup = staged_workbook.parent / f"previous_output_{idx}.bak"
+            shutil.copy2(destination, backup)
+            backups[destination] = backup
+
+    changed: List[Path] = []
+    try:
+        for staged, destination in publications:
+            if staged is None:
+                # Optional log failure must not leave a stale log for a new workbook.
+                destination.unlink(missing_ok=True)
+            else:
+                staged.replace(destination)
+            changed.append(destination)
+    except OSError:
+        for destination in reversed(changed):
+            try:
+                if destination in backups:
+                    backups[destination].replace(destination)
+                else:
+                    destination.unlink(missing_ok=True)
+            except OSError as rollback_error:
+                logging.error("Could not restore previous '%s': %s", destination, rollback_error)
+        raise
+
+
 def run(
     input_files: Sequence[Path],
     labels: Sequence[str],
@@ -1047,6 +1120,19 @@ def run(
             is left after filtering.
         OSError: If the workbook cannot be written.
     """
+    if len(input_files) < 2:
+        raise ValueError("At least two input files are needed.")
+    labels = derive_signup_labels(input_files, labels)
+    metrics = list(dict.fromkeys(metrics))
+    if not metrics or any(metric not in VALID_METRICS for metric in metrics):
+        raise ValueError(f"METRICS must be drawn from {list(VALID_METRICS)}; got {metrics}.")
+    if not math.isfinite(min_base_for_pct) or min_base_for_pct < 0:
+        raise ValueError("MIN_BASE_FOR_PCT must be finite and nonnegative.")
+    if output_file.suffix.lower() != ".xlsx":
+        raise ValueError("The output workbook must use the .xlsx extension.")
+    if output_file.resolve() in {path.resolve() for path in input_files}:
+        raise ValueError("The output workbook cannot overwrite an input file.")
+
     keys: List[str] = key_columns(aggregate_routes_together)
 
     tables: List[pd.DataFrame] = []
@@ -1068,7 +1154,9 @@ def run(
     panel = build_panel(tables, keys, treat_zero_as_absent=treat_zero_as_absent)
     attributes = build_key_attributes(panel, keys, labels)
 
-    summary = build_change_summary(panel, keys, labels, metrics, apply_rounding=apply_rounding)
+    summary = build_change_summary(
+        panel, keys, labels, metrics, min_base=min_base_for_pct, apply_rounding=apply_rounding
+    )
     sheets: Dict[str, pd.DataFrame] = {
         "Change Summary": summary,
         "Signup Totals": build_signup_totals(
@@ -1186,7 +1274,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--routes-exclude", nargs="+", default=list(ROUTES_EXCLUDE), help="Routes to drop."
     )
     p.add_argument(
-        "--stop-ids", nargs="+", type=int, default=list(STOP_IDS), help="Stop IDs to keep."
+        "--stop-ids", nargs="+", type=str, default=list(STOP_IDS), help="Stop IDs to keep."
     )
     p.add_argument(
         "--stop-ids-file",
@@ -1268,36 +1356,24 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         labels: List[str] = derive_signup_labels(input_files, args.labels)
-        stop_ids: List[int] = resolve_stop_ids(args.stop_ids, args.stop_ids_file)
+        stop_ids: List[str] = resolve_stop_ids(args.stop_ids, args.stop_ids_file)
     except ValueError as exc:
         logging.error("%s", exc)
         return 2
 
     level = comparison_level(args.aggregate_routes_together)
     base = Path(args.output_filename)
-    output_file: Path = output_dir / f"{base.stem}_{level}{base.suffix or '.xlsx'}"
+    if base.suffix.lower() not in ("", ".xlsx"):
+        logging.error("OUTPUT_FILENAME must use the .xlsx extension.")
+        return 2
+    output_file: Path = output_dir / f"{base.stem}_{level}.xlsx"
+    if output_file.resolve() in {path.resolve() for path in input_files}:
+        logging.error("The output workbook cannot overwrite an input file.")
+        return 2
+    if not math.isfinite(args.min_base_for_pct) or args.min_base_for_pct < 0:
+        logging.error("MIN_BASE_FOR_PCT must be finite and nonnegative.")
+        return 2
     logging.info("Comparing %d signups by %s: %s.", len(labels), level, " → ".join(labels))
-
-    try:
-        run(
-            input_files,
-            labels,
-            output_file,
-            aggregate_routes_together=args.aggregate_routes_together,
-            metrics=metrics,
-            routes=args.routes,
-            routes_exclude=args.routes_exclude,
-            stop_ids=stop_ids,
-            time_periods=args.time_periods,
-            min_base_for_pct=args.min_base_for_pct,
-            treat_zero_as_absent=args.treat_zero_as_absent,
-            flag_added_removed=args.flag_added_removed,
-            export_long_sheet=args.long_sheet,
-            apply_rounding=APPLY_ROUNDING,
-        )
-    except (FileNotFoundError, ValueError, OSError) as exc:
-        logging.error("%s", exc)
-        return 1
 
     settings_lines: List[str] = [
         f"Comparison level:     {level}",
@@ -1306,23 +1382,55 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"Routes kept:          {list(args.routes) or 'all'}",
         f"Routes excluded:      {list(args.routes_exclude) or 'none'}",
         f"Stop IDs kept:        {stop_ids or 'all'}",
+        f"Stop IDs file:        {args.stop_ids_file or 'none'}",
         f"Time periods kept:    {list(args.time_periods) or 'all'}",
         f"Min base for %:       {args.min_base_for_pct}",
         f"Zero counts absent:   {args.treat_zero_as_absent}",
+        f"Added/removed sheet:  {args.flag_added_removed}",
+        f"Long sheet requested: {args.long_sheet}",
+        f"Apply rounding:       {APPLY_ROUNDING}",
+        f"Require run log:      {REQUIRE_RUN_LOG}",
     ]
-    if (
-        not write_run_log(
-            output_file, settings_lines=settings_lines, input_files=input_files, labels=labels
-        )
-        and REQUIRE_RUN_LOG
-    ):
-        logging.error(
-            "Run log could not be written. Set REQUIRE_RUN_LOG = False to suppress this "
-            "error when a sidecar file is genuinely impossible."
-        )
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        with TemporaryDirectory(prefix=".ridership_change_", dir=output_dir) as stage_dir:
+            staged_output = Path(stage_dir) / output_file.name
+            staged_log = staged_output.with_name(f"{staged_output.stem}_runlog.txt")
+            run(
+                input_files,
+                labels,
+                staged_output,
+                aggregate_routes_together=args.aggregate_routes_together,
+                metrics=metrics,
+                routes=args.routes,
+                routes_exclude=args.routes_exclude,
+                stop_ids=stop_ids,
+                time_periods=args.time_periods,
+                min_base_for_pct=args.min_base_for_pct,
+                treat_zero_as_absent=args.treat_zero_as_absent,
+                flag_added_removed=args.flag_added_removed,
+                export_long_sheet=args.long_sheet,
+                apply_rounding=APPLY_ROUNDING,
+            )
+            log_written = write_run_log(
+                output_file,
+                settings_lines=settings_lines,
+                input_files=input_files,
+                labels=labels,
+                log_path=staged_log,
+            )
+            if not log_written and REQUIRE_RUN_LOG:
+                logging.error(
+                    "Run log could not be written; no new final outputs were published. "
+                    "Set REQUIRE_RUN_LOG = False only when a sidecar is genuinely impossible."
+                )
+                return 1
+            publish_run_outputs(staged_output, output_file, staged_log if log_written else None)
+    except (ValueError, OSError) as exc:
+        logging.error("%s", exc)
         return 1
 
-    logging.info("Script completed successfully.")
+    logging.info("Script completed successfully: '%s'.", output_file)
     return 0
 
 
