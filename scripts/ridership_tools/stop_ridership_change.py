@@ -862,6 +862,50 @@ def format_workbook(output_file: Path, sample_rows: int = 200, max_width: int = 
     workbook.save(output_file)
 
 
+# Canonical version lives in utils/run_log.py — keep this copy in sync.
+def extract_config_block(source_file: Path) -> str:
+    r"""Return the text between the CONFIG markers in *source_file*.
+
+    Reads ``source_file`` as UTF-8 text and slices out the lines strictly
+    *between* the first occurrence of ``# === BEGIN CONFIG ===`` and the first
+    subsequent occurrence of ``# === END CONFIG ===``.  The marker lines
+    themselves are excluded; whitespace and inline comments inside the block
+    are preserved verbatim.
+
+    Args:
+        source_file: Path to the Python source file to scan (typically
+            ``Path(__file__)`` from the calling script).
+
+    Returns:
+        The verbatim text of the configuration block, joined with ``\n``.
+
+    Raises:
+        ValueError: If either marker is missing or they appear out of order.
+        OSError: If ``source_file`` cannot be read.
+    """
+    _BEGIN = "# === BEGIN CONFIG ==="
+    _END = "# === END CONFIG ==="
+
+    lines: list[str] = source_file.read_text(encoding="utf-8").splitlines()
+
+    begin_idx: int | None = None
+    end_idx: int | None = None
+    for i, line in enumerate(lines):
+        stripped: str = line.strip()
+        if begin_idx is None and stripped == _BEGIN:
+            begin_idx = i
+        elif begin_idx is not None and stripped == _END:
+            end_idx = i
+            break
+
+    if begin_idx is None or end_idx is None:
+        raise ValueError(
+            f"Config markers not found in '{source_file}'. Expected '{_BEGIN}' and '{_END}'."
+        )
+
+    return "\n".join(lines[begin_idx + 1 : end_idx])
+
+
 def extract_config_block_from_text(source_text: str, source_label: str) -> str:
     r"""Return the text between the CONFIG markers in *source_text*.
 
@@ -940,15 +984,14 @@ def _resolve_script_source() -> Tuple[str, str]:
     source_path = Path(_resolve_script_source.__code__.co_filename)
     if source_path.is_file():
         source_path = source_path.resolve()
-        source_text = source_path.read_text(encoding="utf-8")
         try:
-            extract_config_block_from_text(source_text, str(source_path))
+            extract_config_block(source_path)
         except ValueError:
             # A cached notebook cell may define the functions while a separate cell
             # holds the configuration. Continue to the history lookup in that case.
             pass
         else:
-            return source_text, str(source_path)
+            return source_path.read_text(encoding="utf-8"), str(source_path)
 
     _ipython = sys.modules.get("IPython")
     ip = _ipython.get_ipython() if _ipython is not None else None  # type: ignore[attr-defined]
