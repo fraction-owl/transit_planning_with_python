@@ -106,6 +106,7 @@ transit_planning_with_python/
 │   │   ├── ntd_monthly_trends_export.py
 │   │   ├── ridership_by_hour.py
 │   │   ├── ridership_from_tides.py
+│   │   ├── stop_ridership_change.py
 │   │   ├── stops_ridership_joiner_arcpy.py
 │   │   └── stops_ridership_joiner_gpd.py
 │   ├── service_coverage/
@@ -294,6 +295,7 @@ transit_planning_with_python/
 │   ├── test_stop_improvement_coverage_summary.py
 │   ├── test_stop_pattern_exporter.py
 │   ├── test_stop_removal_impact_gpd.py
+│   ├── test_stop_ridership_change.py
 │   ├── test_stop_spacing_flagger_gpd.py
 │   ├── test_stop_v_conflict_checker_gpd.py
 │   ├── test_stop_vs_roadname_checker_gpd.py
