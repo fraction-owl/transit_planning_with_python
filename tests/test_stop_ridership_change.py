@@ -366,7 +366,10 @@ def test_main_overwrites_cleanly_without_leftover_staging(tmp_path: Path) -> Non
     for _ in range(2):
         assert target.main(["--inputs", *inputs, "--output-dir", str(out_dir)]) == 0
     assert sorted(p.name for p in out_dir.iterdir()) == [
+        "ridership_change_stop.csv",
         "ridership_change_stop.xlsx",
+        "ridership_change_stop_before_after.png",
+        "ridership_change_stop_gainers_losers.png",
         "ridership_change_stop_runlog.txt",
     ]
 
@@ -397,5 +400,89 @@ def test_main_refuses_to_overwrite_an_input(tmp_path: Path) -> None:
     inputs = _write_inputs(tmp_path)
     clash = tmp_path / "ridership_change_stop.xlsx"
     _signup(SIGNUP_1).to_excel(clash, index=False)
+    code = target.main(["--inputs", str(clash), str(inputs[1]), "--output-dir", str(tmp_path)])
+    assert code == 2
+
+
+# --- CSV export and charts ---------------------------------------------------
+
+
+def _metric_tables(aggregate_routes_together: bool = True) -> dict:
+    panel = _panel(aggregate_routes_together)
+    keys = target.key_columns(aggregate_routes_together)
+    attrs = target.build_key_attributes(panel, keys, LABELS)
+    return {
+        metric: target.build_metric_table(panel, attrs, metric, LABELS, keys)
+        for metric in ("BOARD_ALL", "TOTAL")
+    }
+
+
+def test_combined_change_table_prefixes_each_metric() -> None:
+    combined = target.build_combined_change_table(_metric_tables(), ["STOP_ID"])
+    assert len(combined) == 5  # one row per stop
+    assert combined.columns[:3].tolist() == ["STOP_ID", "STOP", "ROUTES"]
+    row = combined.set_index("STOP_ID").loc["1001"]
+    assert row["BOARD_ALL Fall 25"] == pytest.approx(19.0)
+    assert row["TOTAL Fall 25"] == pytest.approx(30.0)
+    assert row["BOARD_ALL % Chg Fall 25 to Fall 26"] == pytest.approx(26.32)
+    assert "STATUS" in combined.columns and "BOARD_ALL STATUS" not in combined.columns
+
+
+def test_select_gainers_losers_ranks_by_absolute_change() -> None:
+    table = _metric_tables()["BOARD_ALL"]
+    picked = target.select_gainers_losers(table, "Fall 25", "Fall 26", 1)
+    # 1001: 19 → 24 (+5) is the only gain; 1003: 6 → 2 and 1002: 3 → 2 decline.
+    assert picked["STOP_ID"].tolist() == ["1001", "1003"]
+    assert picked["CHANGE"].tolist() == [5.0, -4.0]
+    # 1004 and 2001 are missing from one of the two signups, so they are never picked.
+    everything = target.select_gainers_losers(table, "Fall 25", "Fall 26", 10)
+    assert set(everything["STOP_ID"]) == {"1001", "1002", "1003"}
+
+
+def test_write_charts_creates_pngs_and_skips_without_overlap(tmp_path: Path) -> None:
+    table = _metric_tables(False)["BOARD_ALL"]
+    paths = target.companion_paths(tmp_path / "change.xlsx")
+    written = target.write_charts(table, ["ROUTE_NAME", "STOP_ID"], "BOARD_ALL", LABELS, paths)
+    assert written == [paths["gainers_losers"], paths["before_after"]]
+    for path in written:
+        assert path.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+
+    only_first = table.assign(**{"Fall 26": float("nan")})
+    assert target.write_charts(only_first, ["STOP_ID"], "BOARD_ALL", LABELS, paths) == []
+
+
+def test_main_removes_csv_and_charts_from_an_earlier_run_when_disabled(tmp_path: Path) -> None:
+    inputs = [str(p) for p in _write_inputs(tmp_path)]
+    out_dir = tmp_path / "out"
+    assert target.main(["--inputs", *inputs, "--output-dir", str(out_dir)]) == 0
+    assert (out_dir / "ridership_change_stop.csv").exists()
+
+    flags = ["--no-csv", "--no-charts"]
+    assert target.main(["--inputs", *inputs, "--output-dir", str(out_dir), *flags]) == 0
+    assert sorted(p.name for p in out_dir.iterdir()) == [
+        "ridership_change_stop.xlsx",
+        "ridership_change_stop_runlog.txt",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("metric", "top_n", "scale"),
+    [("LOAD", 15, "symlog"), ("BOARD_ALL", 0, "symlog"), ("BOARD_ALL", 15, "log")],
+)
+def test_validate_chart_settings_rejects_bad_values(metric: str, top_n: int, scale: str) -> None:
+    with pytest.raises(ValueError):
+        target.validate_chart_settings(metric, top_n, scale)
+
+
+def test_main_returns_2_for_zero_chart_top_n(tmp_path: Path) -> None:
+    inputs = [str(p) for p in _write_inputs(tmp_path)]
+    extra = ["--chart-top-n", "0"]
+    assert target.main(["--inputs", *inputs, "--output-dir", str(tmp_path), *extra]) == 2
+
+
+def test_main_refuses_to_overwrite_an_input_with_the_csv(tmp_path: Path) -> None:
+    inputs = _write_inputs(tmp_path)
+    clash = tmp_path / "ridership_change_stop.csv"
+    _signup(SIGNUP_1).to_csv(clash, index=False)
     code = target.main(["--inputs", str(clash), str(inputs[1]), "--output-dir", str(tmp_path)])
     assert code == 2
