@@ -26,6 +26,10 @@ Outputs
   all keys and for keys present in both signups), ``Signup Totals``, one sheet per
   metric (value per signup, change and % change for each consecutive pair and for
   first to last, plus a presence STATUS), ``Added & Removed`` and ``Long`` (optional).
+- ``<same stem>.csv`` (optional): one row per key with every metric's values, changes
+  and % changes, ready to join to a stops layer on STOP_ID.
+- ``<same stem>_gainers_losers.png`` and ``<same stem>_before_after.png`` (optional):
+  the largest first-to-last increases and decreases, and first vs last per key.
 - A ``_runlog.txt`` sidecar with the verbatim CONFIGURATION block, the settings
   actually used (including CLI overrides), and a SHA-256 hash of each input file.
 
@@ -129,6 +133,28 @@ FLAG_ADDED_REMOVED: bool = True
 # Write a "Long" sheet (one row per key × signup) for pivot tables and charts.
 EXPORT_LONG_SHEET: bool = True
 
+# Write a CSV next to the workbook (same stem, .csv): one row per key with STATUS and,
+# for each metric, its value per signup plus change and % change, prefixed with the
+# metric name (e.g. "BOARD_ALL Chg Fall 25 to Spring 26").
+EXPORT_CSV: bool = True
+
+# Write two PNG charts of the first-to-last change in CHART_METRIC next to the workbook:
+#   <stem>_gainers_losers.png → the CHART_TOP_N largest increases and decreases;
+#   <stem>_before_after.png   → first vs last signup for every key, with a y = x line.
+# Only keys present in both the first and the last signup are charted.
+EXPORT_CHARTS: bool = True
+CHART_METRIC: str = "BOARD_ALL"  # BOARD_ALL, ALIGHT_ALL or TOTAL
+CHART_TOP_N: int = 15  # bars on each side of the gainers/losers chart
+# Before/after axis scale: "symlog" spreads out the many low-ridership stops while
+# keeping zero on the axis; "linear" plots raw values.
+SCATTER_SCALE: str = "symlog"
+
+# Mapping is not built yet. The CSV keeps STOP_ID, so it can be joined to GTFS
+# stops.txt or a stops layer (stops_ridership_joiner_gpd.py / _arcpy.py do that join)
+# and drawn with a diverging ramp on % change: blue for decreases, red for increases,
+# neutral gray near zero, optionally sizing markers by absolute change so a stop with
+# a large change on a large base still stands out. See GitHub issue #102.
+
 # If True → round ridership and changes to 1 decimal place and % changes to 2.
 APPLY_ROUNDING: bool = True
 
@@ -170,6 +196,18 @@ RESERVED_COLUMNS: frozenset = frozenset(
 
 EXCEL_MAX_ROWS: int = 1_048_576
 PLACEHOLDER_PREFIX: str = "Path\\To\\"
+
+SCATTER_SCALES: Tuple[str, ...] = ("symlog", "linear")
+# Chart styling: issue #102's diverging pair (blue = decrease, red = increase), neutral
+# ink for text, and a recessive hairline grid on a near-white surface.
+COLOR_INCREASE: str = "#e34948"
+COLOR_DECREASE: str = "#2a78d6"
+COLOR_SURFACE: str = "#fcfcfb"
+COLOR_TEXT: str = "#0b0b0b"
+COLOR_TEXT_MUTED: str = "#52514e"
+COLOR_GRID: str = "#e4e3df"
+COLOR_NEUTRAL: str = "#8f8e88"  # points that did not change
+CHART_DPI: int = 150
 
 # =============================================================================
 # FUNCTIONS
@@ -811,6 +849,334 @@ def sort_by_key(df: pd.DataFrame, columns: Sequence[str]) -> pd.DataFrame:
     return df.iloc[order].reset_index(drop=True)
 
 
+def companion_paths(output_file: Path) -> Dict[str, Path]:
+    """Return the CSV and chart paths written next to *output_file* (same stem)."""
+    stem = output_file.stem
+    return {
+        "csv": output_file.with_name(f"{stem}.csv"),
+        "gainers_losers": output_file.with_name(f"{stem}_gainers_losers.png"),
+        "before_after": output_file.with_name(f"{stem}_before_after.png"),
+    }
+
+
+def overwrites_input(output_file: Path, input_files: Sequence[Path]) -> bool:
+    """True when the workbook or a companion file would replace one of the inputs."""
+    inputs = {path.resolve() for path in input_files}
+    outputs = [output_file, *companion_paths(output_file).values()]
+    return any(path.resolve() in inputs for path in outputs)
+
+
+def build_combined_change_table(
+    metric_tables: Dict[str, pd.DataFrame], key_cols: Sequence[str]
+) -> pd.DataFrame:
+    """Merge the per-metric change tables into one row per key for the CSV export.
+
+    The key and descriptive columns (STOP, ROUTES, STATUS, ...) appear once; each
+    metric's value, change and % change columns follow, prefixed with the metric name
+    (e.g. ``"BOARD_ALL Chg Fall 25 to Spring 26"``).
+
+    Args:
+        metric_tables: Outputs of :func:`build_metric_table`, keyed by metric.
+        key_cols: Comparison key columns.
+
+    Returns:
+        One row per key, in the metric tables' order.
+    """
+    keys: List[str] = list(key_cols)
+    first: pd.DataFrame = next(iter(metric_tables.values()))
+    shared: List[str] = [c for c in first.columns if c in keys or c in RESERVED_COLUMNS]
+    out: pd.DataFrame = first[shared].copy()
+    for metric, table in metric_tables.items():
+        value_cols = [c for c in table.columns if c not in shared]
+        renamed = table[keys + value_cols].rename(columns={c: f"{metric} {c}" for c in value_cols})
+        out = out.merge(renamed, on=keys, how="left")
+    return out
+
+
+def validate_chart_settings(chart_metric: str, chart_top_n: int, scatter_scale: str) -> None:
+    """Raise ValueError when a chart setting can't be used."""
+    if chart_metric not in VALID_METRICS:
+        raise ValueError(
+            f"CHART_METRIC must be one of {list(VALID_METRICS)}; got {chart_metric!r}."
+        )
+    if chart_top_n < 1:
+        raise ValueError(f"CHART_TOP_N must be at least 1; got {chart_top_n}.")
+    if scatter_scale not in SCATTER_SCALES:
+        raise ValueError(
+            f"SCATTER_SCALE must be one of {list(SCATTER_SCALES)}; got {scatter_scale!r}."
+        )
+
+
+def select_gainers_losers(
+    table: pd.DataFrame, first: str, last: str, top_n: int, *, min_base: float = 0.0
+) -> pd.DataFrame:
+    """Pick the *top_n* largest first-to-last increases and decreases.
+
+    Ranks by absolute change, since a % ranking would be led by stops with tiny bases.
+    Keys missing from either signup, and keys that did not change, are left out.
+
+    Args:
+        table: A :func:`build_metric_table` output.
+        first: Label of the earlier signup column.
+        last: Label of the later signup column.
+        top_n: Rows to keep on each side.
+        min_base: Passed to :func:`pct_change` for the ``PCT_CHANGE`` column.
+
+    Returns:
+        The selected rows plus ``CHANGE`` and ``PCT_CHANGE``: increases first (largest
+        at the top), then decreases (largest at the bottom).
+    """
+    both = table.dropna(subset=[first, last]).copy()
+    both["CHANGE"] = both[last] - both[first]
+    both["PCT_CHANGE"] = pct_change(both[first], both[last], min_base)
+    gains = both.loc[both["CHANGE"] > 0].nlargest(top_n, "CHANGE")
+    losses = both.loc[both["CHANGE"] < 0].nsmallest(top_n, "CHANGE").iloc[::-1]
+    return pd.concat([gains, losses], ignore_index=True)
+
+
+def _key_label(row: pd.Series, key_cols: Sequence[str], max_len: int = 42) -> str:
+    """Short axis label for one key: ``"1001 Main St"`` or ``"Rt 10 · 1001 Main St"``."""
+    stop = "" if pd.isna(row.get("STOP")) else f" {row['STOP']}"
+    text = f"{row['STOP_ID']}{stop}"
+    if "ROUTE_NAME" in key_cols:
+        text = f"Rt {row['ROUTE_NAME']} · {text}"
+    return text if len(text) <= max_len else text[: max_len - 1] + "…"
+
+
+def _pyplot() -> Any:
+    """Import pyplot on a file-only backend; charts are saved, never shown."""
+    import matplotlib
+
+    matplotlib.use("Agg", force=False)  # leaves an already-active GUI backend alone
+    import matplotlib.pyplot as plt
+
+    return plt
+
+
+def _style_axes(ax: Any, grid_axis: str, title: str, subtitle: str) -> None:
+    """Apply the shared chart look: quiet axes, hairline grid, left-aligned titles."""
+    ax.set_facecolor(COLOR_SURFACE)
+    for side in ("top", "right", "left"):
+        ax.spines[side].set_visible(False)
+    ax.spines["bottom"].set_color(COLOR_GRID)
+    ax.tick_params(colors=COLOR_TEXT_MUTED, labelsize=8, length=0)
+    ax.grid(axis=grid_axis, color=COLOR_GRID, linewidth=0.8)
+    ax.set_axisbelow(True)
+    ax.set_title(title, loc="left", fontsize=12, fontweight="bold", color=COLOR_TEXT, pad=24)
+    ax.text(
+        0, 1.02, subtitle, transform=ax.transAxes, fontsize=9, color=COLOR_TEXT_MUTED, va="bottom"
+    )
+
+
+def plot_gainers_losers(
+    selected: pd.DataFrame,
+    key_cols: Sequence[str],
+    metric: str,
+    first: str,
+    last: str,
+    out_path: Path,
+    *,
+    keys_in_both: int,
+) -> None:
+    """Draw a ranked horizontal bar chart of the largest increases and decreases.
+
+    Args:
+        selected: Output of :func:`select_gainers_losers` (must not be empty).
+        key_cols: Comparison key columns, for the bar labels.
+        metric: The charted metric (a key of :data:`METRIC_NAMES`).
+        first: Earlier signup label.
+        last: Later signup label.
+        out_path: PNG file to write.
+        keys_in_both: How many keys were present in both signups (for the subtitle).
+    """
+    plt = _pyplot()
+    n_rows = len(selected)
+    fig, ax = plt.subplots(figsize=(9, 1.8 + 0.3 * n_rows), dpi=CHART_DPI)
+    fig.patch.set_facecolor(COLOR_SURFACE)
+
+    changes: List[float] = [float(v) for v in selected["CHANGE"]]
+    positions = list(range(n_rows))
+    colors = [COLOR_INCREASE if v > 0 else COLOR_DECREASE for v in changes]
+    ax.barh(positions, changes, height=0.55, color=colors, zorder=2)
+    ax.set_yticks(positions)
+    ax.set_yticklabels(
+        [_key_label(row, key_cols) for _, row in selected.iterrows()], color=COLOR_TEXT
+    )
+    ax.invert_yaxis()
+    ax.axvline(0, color=COLOR_TEXT_MUTED, linewidth=0.8, zorder=3)
+
+    # Value labels sit outside each bar end, so widen the axis to make room for them.
+    span = max(abs(v) for v in changes)
+    for pos, (change, pct) in enumerate(zip(changes, selected["PCT_CHANGE"])):
+        text = f"{change:+,.1f}" + ("" if pd.isna(pct) else f" ({pct:+.0f}%)")
+        ax.text(
+            change + (span * 0.01 if change > 0 else -span * 0.01),
+            pos,
+            text,
+            va="center",
+            ha="left" if change > 0 else "right",
+            fontsize=7.5,
+            color=COLOR_TEXT_MUTED,
+        )
+    low, high = min(0.0, min(changes)), max(0.0, max(changes))
+    ax.set_xlim(low - (span * 0.3 if low < 0 else 0), high + (span * 0.3 if high > 0 else 0))
+
+    name = METRIC_NAMES[metric]
+    unit = "route-stop pairs" if "ROUTE_NAME" in key_cols else "stops"
+    ax.set_xlabel(f"Change in {name.lower()}, {first} to {last}", color=COLOR_TEXT_MUTED)
+    handles, names = [], []
+    for color, label, present in (
+        (COLOR_INCREASE, "Increase", any(v > 0 for v in changes)),
+        (COLOR_DECREASE, "Decrease", any(v < 0 for v in changes)),
+    ):
+        if present:
+            handles.append(plt.Rectangle((0, 0), 1, 1, color=color))
+            names.append(label)
+    ax.legend(handles, names, loc="lower right", frameon=False, fontsize=8)
+    _style_axes(
+        ax,
+        "x",
+        f"{name}: largest changes, {first} to {last}",
+        f"Largest {sum(v > 0 for v in changes)} increases and {sum(v < 0 for v in changes)} "
+        f"decreases among {keys_in_both:,} {unit} present in both signups",
+    )
+    fig.savefig(out_path, dpi=CHART_DPI, bbox_inches="tight", facecolor=COLOR_SURFACE)
+    plt.close(fig)
+
+
+def plot_before_after(
+    table: pd.DataFrame,
+    key_cols: Sequence[str],
+    metric: str,
+    first: str,
+    last: str,
+    out_path: Path,
+    *,
+    scale: str = SCATTER_SCALE,
+) -> None:
+    """Draw first-signup vs last-signup values per key, with a y = x reference line.
+
+    Points above the line increased, below it decreased; color repeats that so the
+    direction reads at a glance. Keys missing from either signup are left out.
+
+    Args:
+        table: A :func:`build_metric_table` output.
+        key_cols: Comparison key columns (only used to name the unit).
+        metric: The charted metric (a key of :data:`METRIC_NAMES`).
+        first: Earlier signup label (x axis).
+        last: Later signup label (y axis).
+        out_path: PNG file to write.
+        scale: ``"symlog"`` or ``"linear"`` for both axes.
+    """
+    from matplotlib.ticker import FuncFormatter
+
+    plt = _pyplot()
+    both = table.dropna(subset=[first, last])
+    x = both[first].astype(float)
+    y = both[last].astype(float)
+
+    fig, ax = plt.subplots(figsize=(7, 7.4), dpi=CHART_DPI)
+    fig.patch.set_facecolor(COLOR_SURFACE)
+    ax.set_box_aspect(1)
+
+    top = max(float(x.max()), float(y.max()), 1.0)
+    if scale == "symlog":
+        ax.set_xscale("symlog", linthresh=1)
+        ax.set_yscale("symlog", linthresh=1)
+        limits = (-0.3, top * 1.5)
+    else:
+        limits = (-top * 0.02, top * 1.05)
+    ax.set_xlim(*limits)
+    ax.set_ylim(*limits)
+    ax.plot([0, limits[1]], [0, limits[1]], color=COLOR_TEXT_MUTED, linewidth=1, zorder=1)
+
+    for mask, color in ((y > x, COLOR_INCREASE), (y < x, COLOR_DECREASE), (y == x, COLOR_NEUTRAL)):
+        ax.scatter(
+            x[mask],
+            y[mask],
+            s=18,
+            color=color,
+            alpha=0.75,
+            edgecolors=COLOR_SURFACE,
+            linewidths=0.5,
+            zorder=2,
+        )
+    plain = FuncFormatter(lambda value, _pos: f"{value:,.0f}")
+    ax.xaxis.set_major_formatter(plain)
+    ax.yaxis.set_major_formatter(plain)
+
+    name = METRIC_NAMES[metric]
+    unit = "route-stop pairs" if "ROUTE_NAME" in key_cols else "stops"
+    ax.set_xlabel(f"{name}, {first}", color=COLOR_TEXT_MUTED)
+    ax.set_ylabel(f"{name}, {last}", color=COLOR_TEXT_MUTED)
+    ax.legend(
+        [
+            plt.Line2D([], [], marker="o", linestyle="", color=COLOR_INCREASE),
+            plt.Line2D([], [], marker="o", linestyle="", color=COLOR_DECREASE),
+            plt.Line2D([], [], color=COLOR_TEXT_MUTED, linewidth=1),
+        ],
+        ["Increase", "Decrease", "No change (y = x)"],
+        loc="upper left",
+        frameon=False,
+        fontsize=8,
+    )
+    _style_axes(
+        ax,
+        "both",
+        f"{name}: {first} vs {last}",
+        f"{len(both):,} {unit} present in both signups"
+        + ("; axes are logarithmic above 1" if scale == "symlog" else ""),
+    )
+    fig.savefig(out_path, dpi=CHART_DPI, bbox_inches="tight", facecolor=COLOR_SURFACE)
+    plt.close(fig)
+
+
+def write_charts(
+    chart_table: pd.DataFrame,
+    key_cols: Sequence[str],
+    metric: str,
+    labels: Sequence[str],
+    paths: Dict[str, Path],
+    *,
+    top_n: int = CHART_TOP_N,
+    scale: str = SCATTER_SCALE,
+    min_base: float = 0.0,
+) -> List[Path]:
+    """Write the gainers/losers and before/after charts for first vs last signup.
+
+    Returns:
+        The chart files written (none when no key is present in both signups).
+    """
+    first, last = labels[0], labels[-1]
+    keys_in_both = int(chart_table[[first, last]].notna().all(axis=1).sum())
+    if keys_in_both == 0:
+        logging.warning("Skipped charts: nothing is present in both %s and %s.", first, last)
+        return []
+
+    written: List[Path] = []
+    selected = select_gainers_losers(chart_table, first, last, top_n, min_base=min_base)
+    if selected.empty:
+        logging.warning(
+            "Skipped the gainers/losers chart: nothing changed from %s to %s.", first, last
+        )
+    else:
+        plot_gainers_losers(
+            selected,
+            key_cols,
+            metric,
+            first,
+            last,
+            paths["gainers_losers"],
+            keys_in_both=keys_in_both,
+        )
+        written.append(paths["gainers_losers"])
+    plot_before_after(
+        chart_table, key_cols, metric, first, last, paths["before_after"], scale=scale
+    )
+    written.append(paths["before_after"])
+    return written
+
+
 def restore_numeric_ids(df: pd.DataFrame) -> pd.DataFrame:
     """Write all-digit ROUTE_NAME / STOP_ID columns back out as integers.
 
@@ -1098,15 +1464,24 @@ def write_run_log(
         return False
 
 
-def publish_run_outputs(staged_workbook: Path, output_file: Path, staged_log: Path | None) -> None:
+def publish_run_outputs(
+    staged_workbook: Path,
+    output_file: Path,
+    staged_log: Path | None,
+    companions: Sequence[Tuple[Path | None, Path]] = (),
+) -> None:
     """Publish completed outputs, restoring previous files if a replacement fails.
 
+    ``companions`` are extra ``(staged, destination)`` pairs (the CSV and charts); a
+    ``None`` staged file removes the destination, so an output this run did not
+    produce is not left next to the new workbook.
+
     Staging and backups must be in the output directory's filesystem. An ordinary
-    write/permission error is rolled back; a process or system crash during the two
+    write/permission error is rolled back; a process or system crash during the
     replacements is not an atomic transaction.
     """
     final_log = output_file.with_name(f"{output_file.stem}_runlog.txt")
-    publications = [(staged_workbook, output_file), (staged_log, final_log)]
+    publications = [(staged_workbook, output_file), (staged_log, final_log), *companions]
     backups: Dict[Path, Path] = {}
     for idx, (_, destination) in enumerate(publications):
         if destination.exists():
@@ -1118,7 +1493,10 @@ def publish_run_outputs(staged_workbook: Path, output_file: Path, staged_log: Pa
     try:
         for staged, destination in publications:
             if staged is None:
-                # Optional log failure must not leave a stale log for a new workbook.
+                # An output this run did not produce (a failed optional log, a disabled
+                # CSV or chart) must not linger beside the new workbook.
+                if destination.exists():
+                    logging.info("Removing '%s' left by an earlier run.", destination)
                 destination.unlink(missing_ok=True)
             else:
                 staged.replace(destination)
@@ -1151,8 +1529,16 @@ def run(
     flag_added_removed: bool = FLAG_ADDED_REMOVED,
     export_long_sheet: bool = EXPORT_LONG_SHEET,
     apply_rounding: bool = APPLY_ROUNDING,
+    export_csv: bool = EXPORT_CSV,
+    export_charts: bool = EXPORT_CHARTS,
+    chart_metric: str = CHART_METRIC,
+    chart_top_n: int = CHART_TOP_N,
+    scatter_scale: str = SCATTER_SCALE,
 ) -> Dict[str, pd.DataFrame]:
     """Read every signup, build the change tables, and write the workbook.
+
+    The optional CSV and charts are written next to ``output_file`` with the paths
+    :func:`companion_paths` gives.
 
     Returns:
         The sheets written, keyed by sheet name.
@@ -1173,8 +1559,10 @@ def run(
         raise ValueError("MIN_BASE_FOR_PCT must be finite and nonnegative.")
     if output_file.suffix.lower() != ".xlsx":
         raise ValueError("The output workbook must use the .xlsx extension.")
-    if output_file.resolve() in {path.resolve() for path in input_files}:
-        raise ValueError("The output workbook cannot overwrite an input file.")
+    if overwrites_input(output_file, input_files):
+        raise ValueError("The output workbook, CSV or charts would overwrite an input file.")
+    if export_charts:
+        validate_chart_settings(chart_metric, chart_top_n, scatter_scale)
 
     keys: List[str] = key_columns(aggregate_routes_together)
 
@@ -1206,8 +1594,9 @@ def run(
             panel, keys, labels, input_files, apply_rounding=apply_rounding
         ),
     }
+    metric_tables: Dict[str, pd.DataFrame] = {}
     for metric in metrics:
-        sheets[METRIC_NAMES[metric]] = build_metric_table(
+        metric_tables[metric] = build_metric_table(
             panel,
             attributes,
             metric,
@@ -1216,6 +1605,7 @@ def run(
             min_base=min_base_for_pct,
             apply_rounding=apply_rounding,
         )
+        sheets[METRIC_NAMES[metric]] = metric_tables[metric]
     if flag_added_removed:
         sheets["Added & Removed"] = build_added_removed(
             panel, keys, labels, apply_rounding=apply_rounding
@@ -1243,6 +1633,29 @@ def run(
     output_file.parent.mkdir(parents=True, exist_ok=True)
     write_workbook(output_file, sheets)
     logging.info("The comparison workbook has been saved as '%s'.", output_file)
+
+    extras = companion_paths(output_file)
+    if export_csv:
+        combined = build_combined_change_table(metric_tables, keys)
+        restore_numeric_ids(combined).to_csv(extras["csv"], index=False)
+        logging.info("The per-key CSV has been saved as '%s'.", extras["csv"].name)
+    if export_charts:
+        chart_table = metric_tables.get(chart_metric)
+        if chart_table is None:
+            chart_table = build_metric_table(
+                panel, attributes, chart_metric, labels, keys, min_base=min_base_for_pct
+            )
+        for chart in write_charts(
+            chart_table,
+            keys,
+            chart_metric,
+            labels,
+            extras,
+            top_n=chart_top_n,
+            scale=scatter_scale,
+            min_base=min_base_for_pct,
+        ):
+            logging.info("Chart saved as '%s'.", chart.name)
     return sheets
 
 
@@ -1355,6 +1768,33 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=EXPORT_LONG_SHEET,
         help="Write the Long (key × signup) sheet.",
     )
+    p.add_argument(
+        "--csv",
+        action=argparse.BooleanOptionalAction,
+        default=EXPORT_CSV,
+        help="Write the per-key CSV next to the workbook.",
+    )
+    p.add_argument(
+        "--charts",
+        action=argparse.BooleanOptionalAction,
+        default=EXPORT_CHARTS,
+        help="Write the gainers/losers and before/after PNG charts.",
+    )
+    p.add_argument(
+        "--chart-metric", choices=VALID_METRICS, default=CHART_METRIC, help="Metric to chart."
+    )
+    p.add_argument(
+        "--chart-top-n",
+        type=int,
+        default=CHART_TOP_N,
+        help="Bars on each side of the gainers/losers chart.",
+    )
+    p.add_argument(
+        "--scatter-scale",
+        choices=SCATTER_SCALES,
+        default=SCATTER_SCALE,
+        help="Axis scale for the before/after chart.",
+    )
     return p
 
 
@@ -1410,12 +1850,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         logging.error("OUTPUT_FILENAME must use the .xlsx extension.")
         return 2
     output_file: Path = output_dir / f"{base.stem}_{level}.xlsx"
-    if output_file.resolve() in {path.resolve() for path in input_files}:
-        logging.error("The output workbook cannot overwrite an input file.")
+    if overwrites_input(output_file, input_files):
+        logging.error("The output workbook, CSV or charts would overwrite an input file.")
         return 2
     if not math.isfinite(args.min_base_for_pct) or args.min_base_for_pct < 0:
         logging.error("MIN_BASE_FOR_PCT must be finite and nonnegative.")
         return 2
+    if args.charts:
+        try:
+            validate_chart_settings(args.chart_metric, args.chart_top_n, args.scatter_scale)
+        except ValueError as exc:
+            logging.error("%s", exc)
+            return 2
     logging.info("Comparing %d signups by %s: %s.", len(labels), level, " → ".join(labels))
 
     settings_lines: List[str] = [
@@ -1431,6 +1877,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"Zero counts absent:   {args.treat_zero_as_absent}",
         f"Added/removed sheet:  {args.flag_added_removed}",
         f"Long sheet requested: {args.long_sheet}",
+        f"CSV export:           {args.csv}",
+        f"Charts:               {args.charts}"
+        + (
+            f" ({args.chart_metric}, top {args.chart_top_n}, {args.scatter_scale} scatter)"
+            if args.charts
+            else ""
+        ),
         f"Apply rounding:       {APPLY_ROUNDING}",
         f"Require run log:      {REQUIRE_RUN_LOG}",
     ]
@@ -1454,6 +1907,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 flag_added_removed=args.flag_added_removed,
                 export_long_sheet=args.long_sheet,
                 apply_rounding=APPLY_ROUNDING,
+                export_csv=args.csv,
+                export_charts=args.charts,
+                chart_metric=args.chart_metric,
+                chart_top_n=args.chart_top_n,
+                scatter_scale=args.scatter_scale,
             )
             log_written = write_run_log(
                 output_file,
@@ -1468,7 +1926,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "Set REQUIRE_RUN_LOG = False only when a sidecar is genuinely impossible."
                 )
                 return 1
-            publish_run_outputs(staged_output, output_file, staged_log if log_written else None)
+            staged_extras = companion_paths(staged_output)
+            final_extras = companion_paths(output_file)
+            companions = [
+                (staged if staged.exists() else None, final_extras[name])
+                for name, staged in staged_extras.items()
+            ]
+            publish_run_outputs(
+                staged_output, output_file, staged_log if log_written else None, companions
+            )
     except (ValueError, OSError) as exc:
         logging.error("%s", exc)
         return 1
