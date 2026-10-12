@@ -136,18 +136,17 @@ def test_has_timed_connection_empty_arrays() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _routes_table() -> pd.DataFrame:
+def _routes_table(agencies: tuple[str, str, str] = ("1", "1", "1")) -> pd.DataFrame:
     routes = pd.DataFrame(
         {
-            "groute_id": ["f::A", "f::B", "f::C"],
-            "feed": ["f", "f", "f"],
             "route_id": ["A", "B", "C"],
+            "agency_id": list(agencies),
             "route_short_name": ["A", "B", "C"],
             "route_long_name": ["", "", ""],
             "route_label": ["A", "B", "C"],
             "is_target": [True, False, False],
         }
-    ).set_index("groute_id")
+    ).set_index("route_id", drop=False)
     return routes
 
 
@@ -155,7 +154,7 @@ def _stops_gdf() -> pd.DataFrame:
     # S1 (route A) and S2 (route B) are 100 m apart; S3 (route C) is 2 km away.
     return pd.DataFrame(
         {
-            "gstop_id": ["f::S1", "f::S2", "f::S3"],
+            "stop_id": ["S1", "S2", "S3"],
             "x": [0.0, 100.0, 2000.0],
             "y": [0.0, 0.0, 0.0],
         }
@@ -165,9 +164,8 @@ def _stops_gdf() -> pd.DataFrame:
 def _events() -> pd.DataFrame:
     return pd.DataFrame(
         {
-            "gstop_id": ["f::S1", "f::S2", "f::S3"],
-            "groute_id": ["f::A", "f::B", "f::C"],
-            "feed": ["f", "f", "f"],
+            "stop_id": ["S1", "S2", "S3"],
+            "route_id": ["A", "B", "C"],
             "arrival_sec": [28800.0, 29100.0, 29100.0],
             "departure_sec": [28800.0, 29100.0, 29100.0],
         }
@@ -182,9 +180,9 @@ def test_compute_transfers_finds_timed_connection(monkeypatch: pytest.MonkeyPatc
     results = compute_transfers(_stops_gdf(), _events(), _routes_table(), radius_m=400.0)
 
     # A can transfer to B (100 m, 5 min later) but not C (2 km away).
-    assert set(results.keys()) == {"f::A"}
-    assert set(results["f::A"].keys()) == {"f::B"}
-    assert results["f::A"]["f::B"]["min_wait_seconds"] == pytest.approx(300.0)
+    assert set(results.keys()) == {"A"}
+    assert set(results["A"].keys()) == {"B"}
+    assert results["A"]["B"]["min_wait_seconds"] == pytest.approx(300.0)
 
 
 def test_compute_transfers_respects_max_wait(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -200,14 +198,12 @@ def test_compute_transfers_respects_max_wait(monkeypatch: pytest.MonkeyPatch) ->
 def test_compute_transfers_spatial_only_ignores_time(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(rtc, "ENABLE_TIME_CHECK", False)
     results = compute_transfers(_stops_gdf(), _events(), _routes_table(), radius_m=400.0)
-    assert set(results["f::A"].keys()) == {"f::B"}
+    assert set(results["A"].keys()) == {"B"}
 
 
 def test_build_output_tables_includes_zero_transfer_targets() -> None:
     routes = _routes_table()
-    results = {
-        "f::A": {"f::B": {"stop_pairs": 1.0, "min_distance_m": 100.0, "min_wait_seconds": 300.0}}
-    }
+    results = {"A": {"B": {"stop_pairs": 1.0, "min_distance_m": 100.0, "min_wait_seconds": 300.0}}}
     summary, detail = build_output_tables(results, routes)
 
     assert list(summary["route_id"]) == ["A"]
@@ -216,7 +212,30 @@ def test_build_output_tables_includes_zero_transfer_targets() -> None:
     assert row["transfer_routes"] == "B"
     assert len(detail) == 1
     assert detail.iloc[0]["min_transfer_wait_min"] == pytest.approx(5.0)
-    assert not bool(detail.iloc[0]["cross_feed"])
+    assert not bool(detail.iloc[0]["cross_agency"])
+
+
+def test_build_output_tables_prefixes_other_agency_connectors() -> None:
+    # In a merged multi-agency feed, B belongs to another agency than target A.
+    routes = _routes_table(agencies=("FFX", "WMATA", "FFX"))
+    results = {"A": {"B": {"stop_pairs": 2.0, "min_distance_m": 0.0, "min_wait_seconds": 60.0}}}
+    summary, detail = build_output_tables(results, routes)
+
+    assert summary.iloc[0]["agency_id"] == "FFX"
+    assert summary.iloc[0]["transfer_routes"] == "WMATA:B"
+    row = detail.iloc[0]
+    assert (row["target_agency_id"], row["connector_agency_id"]) == ("FFX", "WMATA")
+    assert bool(row["cross_agency"])
+
+
+def test_build_route_table_filters_targets_by_agency(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(rtc, "TARGET_AGENCY_IDS", {"FFX"})
+    routes = pd.DataFrame(
+        {"route_id": ["1", "2"], "agency_id": ["FFX", "WMATA"], "route_short_name": ["1", "2"]}
+    )
+    table = rtc._build_route_table(routes)
+    assert table["is_target"].tolist() == [True, False]
+    assert table.loc["1", "route_label"] == "1"
 
 
 # ---------------------------------------------------------------------------
@@ -230,10 +249,8 @@ def test_parse_args_defaults_to_weekday_filter() -> None:
 
 
 def test_parse_args_overrides() -> None:
-    args = rtc.parse_args(
-        ["--gtfs-dirs", "feed_a", "feed_b", "--output-dir", "out", "--day", "all"]
-    )
-    assert args.gtfs_dirs == ["feed_a", "feed_b"]
+    args = rtc.parse_args(["--gtfs-dir", "merged_feed", "--output-dir", "out", "--day", "all"])
+    assert args.gtfs_dir == "merged_feed"
     assert str(args.output_dir) == "out"
     assert args.day == "all"
 
@@ -242,7 +259,7 @@ def test_parse_args_rejects_unknown_tokens() -> None:
     # Strict parsing: a stray flag (e.g. a mismatched orchestrator cmd template)
     # fails loudly with argparse's exit code 2 instead of being silently ignored.
     with pytest.raises(SystemExit) as excinfo:
-        rtc.parse_args(["--input-dir", "somewhere", "--gtfs-dirs", "feed_a"])
+        rtc.parse_args(["--input-dir", "somewhere", "--gtfs-dir", "feed_a"])
     assert excinfo.value.code == 2
 
 
@@ -252,7 +269,7 @@ def test_parse_args_rejects_unknown_tokens() -> None:
 
 
 def test_main_end_to_end_on_gtfs_basic(tmp_path: Path) -> None:
-    assert rtc.main(["--gtfs-dirs", str(GTFS_BASIC), "--output-dir", str(tmp_path)]) == 0
+    assert rtc.main(["--gtfs-dir", str(GTFS_BASIC), "--output-dir", str(tmp_path)]) == 0
 
     # Only shared stops fall inside the 0.25-mile walk. At them, R2 leaves
     # S3-S5 25 minutes after R1 arrives; every other pairing waits 35+ minutes.

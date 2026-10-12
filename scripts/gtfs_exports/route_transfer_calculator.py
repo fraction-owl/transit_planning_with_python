@@ -1,4 +1,4 @@
-"""Compute the routes each target route can transfer to across one or more GTFS feeds.
+"""Compute the routes each target route can transfer to within one GTFS feed.
 
 For every *target* route the user designates, this script finds the other routes a
 rider can transfer to, subject to a **space buffer** (how far a rider will walk
@@ -6,12 +6,14 @@ between an alighting stop and a boarding stop) and an optional **time buffer**
 (the connecting trip must depart after the feeder trip arrives — accounting for
 walk time — and within a maximum wait).
 
-Multiple feeds are supported. All feeds are pooled into one network, so a target
-route in one agency's feed can transfer to a route in another agency's feed.
 Targets are chosen with ``TARGET_ROUTE_TOKENS`` (matched against
-``route_short_name`` or ``route_id``) and may optionally be restricted to a
-subset of feeds with ``TARGET_FEED_LABELS``; every route in every feed is
-eligible as a *connector*.
+``route_short_name`` or ``route_id``); every route in the feed is eligible as a
+*connector*. To find transfers between agencies, first merge their feeds with
+``gtfs_feed_merger.py``, which combines duplicate stops (so a stop both
+agencies serve counts as one shared stop) and aligns their calendars, then run
+this script on the merged feed. ``TARGET_AGENCY_IDS`` can restrict targets to
+one agency's routes, and connectors from another agency are labelled
+``"<agency_id>:<route>"``.
 
 Transfers are directional: an A -> B transfer means a rider can ride route A,
 get off, and board route B. The time check uses A's arrival times at the
@@ -27,8 +29,9 @@ never enters the pool either. Set a single day name to filter to that day, or
 pair trips that never run on the same day — inflating counts).
 
 Inputs:
-    - One or more GTFS feed folders, each with stops.txt, routes.txt, trips.txt,
-      and stop_times.txt. calendar.txt is used when a day filter is set.
+    - A GTFS feed folder with stops.txt, routes.txt, trips.txt, and
+      stop_times.txt (a single agency's feed, or a merged multi-agency feed
+      from gtfs_feed_merger.py). calendar.txt is used when a day filter is set.
 
 Outputs:
     - A summary CSV keyed on ``route_id``: one row per target route with a
@@ -37,7 +40,7 @@ Outputs:
       with the number of qualifying stop pairs, nearest walk distance, and the
       shortest feasible wait observed.
 
-Defaults come from the CONFIGURATION block; ``--gtfs-dirs`` / ``--output-dir`` /
+Defaults come from the CONFIGURATION block; ``--gtfs-dir`` / ``--output-dir`` /
 ``--day`` / ``--log-level`` override them, so the script can run standalone or
 under the prep_features_public.py orchestrator.
 
@@ -65,28 +68,23 @@ from shapely.geometry import Point
 # CONFIGURATION
 # =============================================================================
 
-# One or more GTFS feed folders. Each must contain stops.txt, routes.txt,
-# trips.txt, and stop_times.txt. Use raw strings (r"") for Windows paths.
-GTFS_FEEDS: list[str] = [
-    r"Path\To\Your\GTFS_Folder",
-    # r"Path\To\Another_Agency_GTFS_Folder",
-]
-
-# Optional human-readable labels for each feed, parallel to GTFS_FEEDS. Used to
-# tag routes/stops in the output. Leave as None to label each feed by its folder
-# name (duplicates are de-duplicated automatically).
-FEED_LABELS: Optional[list[str]] = None
+# GTFS feed folder containing stops.txt, routes.txt, trips.txt, and
+# stop_times.txt. For transfers between agencies, merge their feeds first with
+# gtfs_feed_merger.py and point this at the merged feed. Use raw strings (r"")
+# for Windows paths.
+GTFS_FOLDER: str = r"Path\To\Your\GTFS_Folder"
 
 # Folder where the output CSV(s) are written.
 OUTPUT_DIR: Path = Path(r"Path\To\Output_Folder")
 
 # Routes we want transfers FOR. Each token is matched against route_short_name OR
-# route_id, across every feed. Leave empty to treat every route as a target.
+# route_id. Leave empty to treat every route as a target.
 TARGET_ROUTE_TOKENS: set[str] = set()  # e.g. {"10", "20"}; empty = every route is a target
 
-# Optionally restrict which feeds' routes can be targets (by label). None = any
-# feed. Connectors are always drawn from all feeds regardless of this setting.
-TARGET_FEED_LABELS: Optional[set[str]] = None
+# Optionally restrict targets to these routes.agency_id values, e.g. {"FFX"} in a
+# merged multi-agency feed. None = any agency. Connectors are always drawn from
+# every agency regardless of this setting.
+TARGET_AGENCY_IDS: Optional[set[str]] = None
 
 # --- Space buffer ---------------------------------------------------------
 # Maximum walking distance between an alighting stop and a boarding stop for the
@@ -267,80 +265,30 @@ def has_timed_connection(
     return best_wait is not None, best_wait
 
 
-def _unique_labels(feeds: list[str], labels: Optional[list[str]]) -> list[str]:
-    """Derive a unique label for each feed folder.
-
-    Args:
-        feeds: Feed folder paths.
-        labels: Optional explicit labels parallel to ``feeds``.
-
-    Returns:
-        A list of unique, non-empty labels parallel to ``feeds``.
-    """
-    if labels is not None:
-        if len(labels) != len(feeds):
-            raise ValueError("FEED_LABELS must have the same length as GTFS_FEEDS.")
-        raw = [str(name).strip() for name in labels]
-    else:
-        raw = [Path(path).name or f"feed{i + 1}" for i, path in enumerate(feeds)]
-
-    seen: dict[str, int] = {}
-    out: list[str] = []
-    for name in raw:
-        if name in seen:
-            seen[name] += 1
-            out.append(f"{name}_{seen[name]}")
-        else:
-            seen[name] = 0
-            out.append(name)
-    return out
-
-
-def _read_feed(folder: str, label: str) -> dict[str, pd.DataFrame]:
-    """Load the required GTFS tables for one feed and tag them with the label.
-
-    IDs are namespaced as ``"<label>::<id>"`` so that ids never collide across
-    feeds when the network is pooled.
+def _read_feed(folder: str) -> tuple[dict[str, pd.DataFrame], Optional[pd.DataFrame]]:
+    """Load the GTFS tables this script needs from one feed folder.
 
     Args:
         folder: Path to the GTFS feed folder.
-        label: Unique feed label.
 
     Returns:
-        A mapping with namespaced ``stops``, ``routes``, ``trips``,
-        ``stop_times`` frames and an optional ``calendar`` frame.
+        A tuple ``(tables, calendar)``: ``stops``, ``routes``, ``trips`` and
+        ``stop_times`` frames, and calendar.txt (None when the feed has none).
 
     Raises:
         FileNotFoundError: If a required GTFS file is missing.
     """
     for filename in _REQUIRED_FILES:
         if not os.path.exists(os.path.join(folder, filename)):
-            raise FileNotFoundError(f"Feed '{label}': missing {filename} in {folder}")
+            raise FileNotFoundError(f"Missing {filename} in {folder}")
 
     def _read(name: str) -> pd.DataFrame:
         return pd.read_csv(os.path.join(folder, name), dtype=str, low_memory=False)
-
-    def _ns(series: pd.Series) -> pd.Series:
-        return label + "::" + series.astype(str)
 
     stops = _read("stops.txt")
     routes = _read("routes.txt")
     trips = _read("trips.txt")
     stop_times = _read("stop_times.txt")
-
-    stops["feed"] = label
-    stops["gstop_id"] = _ns(stops["stop_id"])
-
-    routes["feed"] = label
-    routes["groute_id"] = _ns(routes["route_id"])
-
-    trips["feed"] = label
-    trips["groute_id"] = _ns(trips["route_id"])
-    trips["gtrip_id"] = _ns(trips["trip_id"])
-
-    stop_times["feed"] = label
-    stop_times["gtrip_id"] = _ns(stop_times["trip_id"])
-    stop_times["gstop_id"] = _ns(stop_times["stop_id"])
 
     calendar_path = os.path.join(folder, "calendar.txt")
     calendar: Optional[pd.DataFrame] = None
@@ -348,71 +296,65 @@ def _read_feed(folder: str, label: str) -> dict[str, pd.DataFrame]:
         try:
             calendar = pd.read_csv(calendar_path, dtype=str)
         except (OSError, ValueError, pd.errors.ParserError) as exc:
-            logging.warning("Feed '%s': could not read calendar.txt (%s).", label, exc)
+            logging.warning("Could not read calendar.txt (%s).", exc)
 
     logging.info(
-        "Feed '%s': %d stops, %d routes, %d trips, %d stop_times.",
-        label,
+        "Feed: %d stops, %d routes, %d trips, %d stop_times.",
         len(stops),
         len(routes),
         len(trips),
         len(stop_times),
     )
-    return {
-        "stops": stops,
-        "routes": routes,
-        "trips": trips,
-        "stop_times": stop_times,
-        "calendar": calendar,
-    }
+    tables = {"stops": stops, "routes": routes, "trips": trips, "stop_times": stop_times}
+    return tables, calendar
 
 
-def _build_route_table(routes_frames: list[pd.DataFrame]) -> pd.DataFrame:
-    """Combine per-feed route tables and add display labels and target flags.
+def _build_route_table(routes: pd.DataFrame) -> pd.DataFrame:
+    """Add display labels and target flags to the routes table.
 
     Args:
-        routes_frames: One namespaced routes frame per feed.
+        routes: Parsed routes.txt.
 
     Returns:
-        A routes frame indexed by ``groute_id`` with ``route_label`` (short name,
-        else long name, else route_id) and an ``is_target`` flag.
+        A routes frame indexed by ``route_id`` with ``agency_id`` (blank when
+        the feed omits it), ``route_label`` (short name, else long name, else
+        route_id) and an ``is_target`` flag.
     """
-    routes = pd.concat(routes_frames, ignore_index=True)
-    for col in ("route_short_name", "route_long_name"):
+    routes = routes.copy()
+    routes["route_id"] = routes["route_id"].astype(str)
+    for col in ("agency_id", "route_short_name", "route_long_name"):
         if col not in routes.columns:
             routes[col] = ""
-    routes["route_short_name"] = routes["route_short_name"].fillna("").astype(str).str.strip()
-    routes["route_long_name"] = routes["route_long_name"].fillna("").astype(str).str.strip()
+        routes[col] = routes[col].fillna("").astype(str).str.strip()
 
     label = routes["route_short_name"].where(routes["route_short_name"] != "")
     label = label.fillna(routes["route_long_name"].where(routes["route_long_name"] != ""))
-    routes["route_label"] = label.fillna(routes["route_id"].astype(str))
+    routes["route_label"] = label.fillna(routes["route_id"])
 
     if TARGET_ROUTE_TOKENS:
         tokens = {str(t) for t in TARGET_ROUTE_TOKENS}
-        is_target = routes["route_short_name"].isin(tokens) | routes["route_id"].astype(str).isin(
-            tokens
-        )
+        is_target = routes["route_short_name"].isin(tokens) | routes["route_id"].isin(tokens)
     else:
         is_target = pd.Series(True, index=routes.index)
 
-    if TARGET_FEED_LABELS:
-        is_target = is_target & routes["feed"].isin({str(f) for f in TARGET_FEED_LABELS})
+    if TARGET_AGENCY_IDS:
+        is_target = is_target & routes["agency_id"].isin({str(a) for a in TARGET_AGENCY_IDS})
 
     routes["is_target"] = is_target
-    return routes.set_index("groute_id")
+    return routes.set_index("route_id", drop=False)
 
 
 def _project_stops(stops: pd.DataFrame) -> gpd.GeoDataFrame:
     """Project unique stops to ``PROJECTED_CRS`` and attach metric x/y columns.
 
     Args:
-        stops: Combined stops frame with ``gstop_id``, ``stop_lat``, ``stop_lon``.
+        stops: Stops frame with ``stop_id``, ``stop_lat``, ``stop_lon``.
 
     Returns:
         A GeoDataFrame of unique stops with numeric ``x`` and ``y`` (meters).
     """
-    unique = stops.drop_duplicates("gstop_id").copy()
+    unique = stops.drop_duplicates("stop_id").copy()
+    unique["stop_id"] = unique["stop_id"].astype(str)
     unique["stop_lat"] = pd.to_numeric(unique["stop_lat"], errors="coerce")
     unique["stop_lon"] = pd.to_numeric(unique["stop_lon"], errors="coerce")
     before = len(unique)
@@ -431,35 +373,29 @@ def _project_stops(stops: pd.DataFrame) -> gpd.GeoDataFrame:
 
 
 def _build_stop_events(
-    stop_times: pd.DataFrame, trips: pd.DataFrame, keep_service_ids: dict[str, Optional[set[str]]]
+    stop_times: pd.DataFrame, trips: pd.DataFrame, keep_service_ids: Optional[set[str]]
 ) -> pd.DataFrame:
     """Join stop_times to trips and resolve feeder/connector event times.
 
     Args:
-        stop_times: Combined namespaced stop_times frame.
-        trips: Combined namespaced trips frame.
-        keep_service_ids: Per-feed set of service_ids to keep (day filter), or
-            None for a feed to keep everything.
+        stop_times: Parsed stop_times.txt.
+        trips: Parsed trips.txt.
+        keep_service_ids: service_ids to keep (day filter), or None to keep
+            every trip.
 
     Returns:
-        A frame with ``gstop_id``, ``groute_id``, ``feed``, ``arrival_sec``
-        (feeder time), and ``departure_sec`` (connector time).
+        A frame with ``stop_id``, ``route_id``, ``arrival_sec`` (feeder time),
+        and ``departure_sec`` (connector time).
     """
-    trip_cols = trips[["gtrip_id", "groute_id", "feed", "service_id"]]
-    events = stop_times.merge(trip_cols, on="gtrip_id", how="inner", suffixes=("", "_trip"))
-    events["feed"] = events["feed_trip"] if "feed_trip" in events.columns else events["feed"]
+    trip_cols = trips[["trip_id", "route_id", "service_id"]].astype(str)
+    events = stop_times.astype({"trip_id": str, "stop_id": str}).merge(
+        trip_cols, on="trip_id", how="inner"
+    )
 
-    # Apply the optional day-of-week service filter per feed.
-    if any(ids is not None for ids in keep_service_ids.values()):
-        mask = pd.Series(True, index=events.index)
-        for feed_label, ids in keep_service_ids.items():
-            if ids is None:
-                continue
-            feed_rows = events["feed"] == feed_label
-            mask &= ~feed_rows | events["service_id"].astype(str).isin(ids)
-        kept = int(mask.sum())
-        logging.info("Day-of-week filter kept %d/%d stop events.", kept, len(events))
-        events = events[mask]
+    if keep_service_ids is not None:
+        mask = events["service_id"].isin(keep_service_ids)
+        logging.info("Day-of-week filter kept %d/%d stop events.", int(mask.sum()), len(events))
+        events = events.loc[mask].copy()
 
     arrival = events["arrival_time"].map(parse_gtfs_time)
     departure = events["departure_time"].map(parse_gtfs_time)
@@ -467,7 +403,7 @@ def _build_stop_events(
     # (fall back to arrival) so single-time rows still participate.
     events["arrival_sec"] = arrival.fillna(departure)
     events["departure_sec"] = departure.fillna(arrival)
-    return events[["gstop_id", "groute_id", "feed", "arrival_sec", "departure_sec"]]
+    return events[["stop_id", "route_id", "arrival_sec", "departure_sec"]]
 
 
 _StopRouteArrays = dict[tuple[str, str], np.ndarray]
@@ -483,23 +419,23 @@ def _index_events(
 
     Returns:
         A tuple ``(serves, arrivals, departures)`` where ``serves`` maps a
-        ``gstop_id`` to the set of routes serving it, ``arrivals`` maps
-        ``(gstop_id, groute_id)`` to a sorted array of feeder arrival seconds, and
+        ``stop_id`` to the set of routes serving it, ``arrivals`` maps
+        ``(stop_id, route_id)`` to a sorted array of feeder arrival seconds, and
         ``departures`` maps it to a sorted array of connector departure seconds.
     """
     serves: dict[str, set[str]] = {}
-    for gstop_id, groute_id in zip(events["gstop_id"], events["groute_id"]):
-        serves.setdefault(gstop_id, set()).add(groute_id)
+    for stop_id, route_id in zip(events["stop_id"], events["route_id"]):
+        serves.setdefault(stop_id, set()).add(route_id)
 
     arrivals: dict[tuple[str, str], np.ndarray] = {}
     departures: dict[tuple[str, str], np.ndarray] = {}
-    for (gstop_id, groute_id), group in events.groupby(["gstop_id", "groute_id"], sort=False):
+    for (stop_id, route_id), group in events.groupby(["stop_id", "route_id"], sort=False):
         arr = group["arrival_sec"].dropna().to_numpy(dtype=float)
         dep = group["departure_sec"].dropna().to_numpy(dtype=float)
         arr.sort()
         dep.sort()
-        arrivals[(gstop_id, groute_id)] = arr
-        departures[(gstop_id, groute_id)] = dep
+        arrivals[(stop_id, route_id)] = arr
+        departures[(stop_id, route_id)] = dep
     return serves, arrivals, departures
 
 
@@ -514,11 +450,11 @@ def compute_transfers(
     Args:
         stops_gdf: Projected unique stops with ``x``/``y`` in meters.
         events: Stop events from :func:`_build_stop_events`.
-        routes: Route table indexed by ``groute_id`` with ``is_target``.
+        routes: Route table indexed by ``route_id`` with ``is_target``.
         radius_m: Space buffer in meters.
 
     Returns:
-        A nested mapping ``target_groute_id -> connector_groute_id -> stats``,
+        A nested mapping ``target_route_id -> connector_route_id -> stats``,
         where stats holds ``stop_pairs``, ``min_distance_m``, and
         ``min_wait_seconds`` (NaN when the time check is disabled).
     """
@@ -526,7 +462,7 @@ def compute_transfers(
     target_ids = set(routes.index[routes["is_target"]])
 
     coords = np.column_stack([stops_gdf["x"].to_numpy(), stops_gdf["y"].to_numpy()])
-    gstop_ids = stops_gdf["gstop_id"].to_numpy()
+    stop_ids = stops_gdf["stop_id"].to_numpy()
     tree = cKDTree(coords)
     neighbors = tree.query_ball_point(coords, r=radius_m, p=2.0)
 
@@ -537,12 +473,12 @@ def compute_transfers(
     results: dict[str, dict[str, dict[str, float]]] = {}
 
     for i, neigh in enumerate(neighbors):
-        stop_a = gstop_ids[i]
+        stop_a = stop_ids[i]
         targets_here = [r for r in serves.get(stop_a, ()) if r in target_ids]
         if not targets_here:
             continue
         for j in neigh:
-            stop_b = gstop_ids[j]
+            stop_b = stop_ids[j]
             routes_b = serves.get(stop_b)
             if not routes_b:
                 continue
@@ -577,22 +513,22 @@ def compute_transfers(
     return results
 
 
-def _connector_label(connector_id: str, target_feed: str, routes: pd.DataFrame) -> str:
-    """Format a connector route for the output list, prefixing cross-feed routes.
+def _connector_label(connector_id: str, target_agency: str, routes: pd.DataFrame) -> str:
+    """Format a connector route for the output list, prefixing other agencies' routes.
 
     Args:
-        connector_id: The connector ``groute_id``.
-        target_feed: The target route's feed label.
-        routes: Route table indexed by ``groute_id``.
+        connector_id: The connector ``route_id``.
+        target_agency: The target route's ``agency_id`` (may be blank).
+        routes: Route table indexed by ``route_id``.
 
     Returns:
-        The route label, prefixed with ``"<feed>:"`` when it differs from the
-        target's feed.
+        The route label, prefixed with ``"<agency_id>:"`` when the connector
+        belongs to a different agency than the target.
     """
     row = routes.loc[connector_id]
     label = str(row["route_label"])
-    feed = str(row["feed"])
-    return label if feed == target_feed else f"{feed}:{label}"
+    agency = str(row["agency_id"])
+    return label if agency in ("", target_agency) else f"{agency}:{label}"
 
 
 def build_output_tables(
@@ -602,7 +538,7 @@ def build_output_tables(
 
     Args:
         results: Output of :func:`compute_transfers`.
-        routes: Route table indexed by ``groute_id``.
+        routes: Route table indexed by ``route_id``.
 
     Returns:
         A ``(summary, detail)`` tuple. The summary has one row per target route
@@ -616,12 +552,12 @@ def build_output_tables(
     target_ids = list(routes.index[routes["is_target"]])
     for target_id in target_ids:
         target = routes.loc[target_id]
-        target_feed = str(target["feed"])
+        target_agency = str(target["agency_id"])
         connectors = results.get(target_id, {})
 
         labelled = sorted(
             (
-                (_connector_label(cid, target_feed, routes), cid, stats)
+                (_connector_label(cid, target_agency, routes), cid, stats)
                 for cid, stats in connectors.items()
             ),
             key=lambda item: item[0],
@@ -629,7 +565,7 @@ def build_output_tables(
 
         summary_rows.append(
             {
-                "feed": target_feed,
+                "agency_id": target_agency,
                 "route_id": str(target["route_id"]),
                 "route_short_name": str(target["route_short_name"]),
                 "route_long_name": str(target["route_long_name"]),
@@ -643,14 +579,14 @@ def build_output_tables(
             min_wait = stats["min_wait_seconds"]
             detail_rows.append(
                 {
-                    "target_feed": target_feed,
+                    "target_agency_id": target_agency,
                     "target_route_id": str(target["route_id"]),
                     "target_route_short_name": str(target["route_short_name"]),
-                    "connector_feed": str(connector["feed"]),
+                    "connector_agency_id": str(connector["agency_id"]),
                     "connector_route_id": str(connector["route_id"]),
                     "connector_route_short_name": str(connector["route_short_name"]),
                     "connector_label": label,
-                    "cross_feed": str(connector["feed"]) != target_feed,
+                    "cross_agency": str(connector["agency_id"]) != target_agency,
                     "qualifying_stop_pairs": int(stats["stop_pairs"]),
                     "nearest_walk_distance_m": round(stats["min_distance_m"], 1),
                     "min_transfer_wait_min": (
@@ -659,7 +595,7 @@ def build_output_tables(
                 }
             )
 
-    summary = pd.DataFrame(summary_rows).sort_values(["feed", "route_short_name", "route_id"])
+    summary = pd.DataFrame(summary_rows).sort_values(["agency_id", "route_short_name", "route_id"])
     detail = pd.DataFrame(detail_rows)
     return summary, detail
 
@@ -704,16 +640,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """
     parser = argparse.ArgumentParser(
         description=(
-            "Compute the routes each target route can transfer to across one or more "
-            "GTFS feeds. Defaults come from the CONFIGURATION block at the top of this file."
+            "Compute the routes each target route can transfer to within one GTFS feed. "
+            "Defaults come from the CONFIGURATION block at the top of this file."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
-        "--gtfs-dirs",
-        nargs="+",
-        default=list(GTFS_FEEDS),
-        help="One or more GTFS feed folders (pooled into a single network).",
+        "--gtfs-dir",
+        default=GTFS_FOLDER,
+        help="GTFS feed folder (merge several agencies first with gtfs_feed_merger.py).",
     )
     parser.add_argument(
         "--output-dir",
@@ -752,57 +687,42 @@ def main(argv: Sequence[str] | None = None) -> int:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    feeds = [str(f) for f in args.gtfs_dirs if f and str(f) != _PLACEHOLDER_FEED]
+    gtfs_dir = str(args.gtfs_dir)
     output_dir = Path(args.output_dir)
-    if not feeds or output_dir == _PLACEHOLDER_OUTPUT:
+    if not gtfs_dir or gtfs_dir == _PLACEHOLDER_FEED or output_dir == _PLACEHOLDER_OUTPUT:
         logging.warning(
-            "GTFS feed folder(s) and/or the output folder are still set to placeholder "
-            "values. Update the CONFIGURATION section or pass --gtfs-dirs/--output-dir."
+            "The GTFS feed folder and/or the output folder are still set to placeholder "
+            "values. Update the CONFIGURATION section or pass --gtfs-dir/--output-dir."
         )
         return 2
 
     day_token = str(args.day).strip().lower()
     day_filter: Optional[str] = None if day_token in ("", "all", "none") else day_token
 
-    labels = _unique_labels(feeds, FEED_LABELS)
+    try:
+        feed, calendar = _read_feed(gtfs_dir)
+    except (FileNotFoundError, ValueError, pd.errors.ParserError) as exc:
+        logging.error("Failed to load feed '%s': %s", gtfs_dir, exc)
+        return 1
 
-    loaded = []
-    for folder, label in zip(feeds, labels):
-        try:
-            loaded.append(_read_feed(folder, label))
-        except (FileNotFoundError, ValueError, pd.errors.ParserError) as exc:
-            logging.error("Failed to load feed '%s': %s", label, exc)
-            return 1
-
-    routes = _build_route_table([feed["routes"] for feed in loaded])
+    routes = _build_route_table(feed["routes"])
     n_targets = int(routes["is_target"].sum())
     if n_targets == 0:
         logging.warning("No routes matched the target criteria. Nothing to do.")
         return 1
-    logging.info("Identified %d target route(s) across %d feed(s).", n_targets, len(loaded))
+    logging.info("Identified %d target route(s).", n_targets)
 
-    stops = pd.concat([feed["stops"] for feed in loaded], ignore_index=True)
-    trips = pd.concat([feed["trips"] for feed in loaded], ignore_index=True)
-    stop_times = pd.concat([feed["stop_times"] for feed in loaded], ignore_index=True)
-
-    keep_service_ids: dict[str, Optional[set[str]]] = {}
+    keep_service_ids: Optional[set[str]] = None
     if day_filter is not None:
         logging.info("Service-day filter: %s.", day_filter)
-        for feed in loaded:
-            label = str(feed["routes"]["feed"].iloc[0])
-            ids = service_ids_active_on_day(feed["calendar"], day_filter)
-            if ids is None:
-                logging.warning(
-                    "Feed '%s': no usable calendar.txt for day filter; keeping all trips.",
-                    label,
-                )
-            keep_service_ids[label] = ids
+        keep_service_ids = service_ids_active_on_day(calendar, day_filter)
+        if keep_service_ids is None:
+            logging.warning("No usable calendar.txt for the day filter; keeping all trips.")
     else:
         logging.info("No service-day filter: pooling all trips regardless of service day.")
-        keep_service_ids = {str(feed["routes"]["feed"].iloc[0]): None for feed in loaded}
 
-    stops_gdf = _project_stops(stops)
-    events = _build_stop_events(stop_times, trips, keep_service_ids)
+    stops_gdf = _project_stops(feed["stops"])
+    events = _build_stop_events(feed["stop_times"], feed["trips"], keep_service_ids)
 
     radius_m = distance_to_meters(MAX_TRANSFER_DISTANCE, MAX_TRANSFER_DISTANCE_UNIT)
     logging.info(
