@@ -3,24 +3,22 @@
 Built for regional work where riders move between systems, e.g. Fairfax
 Connector + WMATA Metrobus + Montgomery County Ride On. Feeds are listed in
 priority order and the first is *dominant*: wherever two feeds collide, the
-higher-priority feed keeps its IDs and the lower-priority feed is renamed (ID
-collisions) or merged into it (duplicate stops).
+higher-priority feed keeps its IDs and route names, and the lower-priority feed
+is renamed (IDs, and route names another agency already uses, which become
+``"<name>_<agency_name>"``) or merged into it (duplicate stops).
 
 A lower-priority street stop merges into a higher-priority stop within
-``STOP_MATCH_DISTANCE_FT`` (default 100 ft) when the buses at both travel the
+``STOP_MATCH_DISTANCE_FT`` (default 50 ft) when the buses at both travel the
 same way (``HEADING_TOLERANCE_DEG``), so stops across the street or around the
 corner stay separate. Each stop absorbs at most one stop per feed, closest
 pairs first. Bus bays (stops with a ``parent_station``, a name matching
 ``BAY_NAME_PATTERNS``, or inside an optional transit-center polygon layer) sit
 closer together than street stops, so they use ``BAY_MATCH_DISTANCE_FT``
 (default 0 = never merged automatically) and are listed for review instead.
-Manual decisions go in an optional overrides CSV.
 
-Every feed keeps its own service_ids, so each trip still runs only on its
-agency's published dates. By default every calendar is also clipped to the
-date window all feeds cover, and trips left with no dates are dropped, so the
-merged feed never pairs one agency's current schedule with another's expired
-or future one.
+Each feed keeps its own service_ids. By default every calendar is clipped to
+the date window all feeds cover and trips left with no dates are dropped, so
+one agency's current schedule is never paired with another's expired one.
 
 Inputs
 ------
@@ -40,7 +38,8 @@ Outputs
   carried over; each dropped file is logged.
 - ``merge_stop_matches.csv``: every cross-feed stop pair within the match
   distance, with distance, heading difference, name similarity and outcome.
-- ``merge_id_crosswalk.csv``: original to merged ID for every ID in every feed.
+- ``merge_id_crosswalk.csv``: original to merged value of every ID and
+  renamed route name in every feed.
 - ``merge_feed_summary.csv``: one row per input feed.
 - A run-log sidecar capturing the verbatim CONFIGURATION block.
 
@@ -104,7 +103,7 @@ ID_PREFIX_SEPARATOR: str = "_"
 # --- Duplicate street stops ---------------------------------------------------
 # A lower-priority stop merges into a higher-priority stop within this distance.
 # 0 = never merge street stops automatically.
-STOP_MATCH_DISTANCE_FT: float = 100.0
+STOP_MATCH_DISTANCE_FT: float = 50.0
 
 # Two street stops only merge when some bus at one travels within this many
 # degrees of some bus at the other (headings run from the previous stop to the
@@ -121,6 +120,16 @@ HEADING_TOLERANCE_DEG: float = 60.0
 BAY_NAME_PATTERNS: list[str] = [r"\bbay\b"]
 BAY_ZONES_PATH: str = r""  # optional polygon layer, e.g. one polygon per transit center
 BAY_MATCH_DISTANCE_FT: float = 0.0  # 0 = never merge bays automatically
+
+# --- Route names --------------------------------------------------------------
+# When agencies share a route name (route_short_name, or route_long_name for
+# routes without one), the name is suffixed with the agency_name, e.g. "10" and
+# "10_WMATA", plus "_2", "_3"... if that is taken too. Every shared name is
+# logged as a warning and each rename is listed in the ID crosswalk.
+# "lower_priority": the highest-priority agency keeps the plain name.
+# "all": every agency sharing the name is renamed.
+# "keep": names stay as published (warning only).
+DUPLICATE_ROUTE_NAMES: str = "lower_priority"
 
 # Optional CSV of manual stop decisions, applied before automatic matching:
 #   feed, stop_id, target_feed, target_stop_id
@@ -260,6 +269,7 @@ class MergeSettings(NamedTuple):
 
     id_prefix_mode: str = ID_PREFIX_MODE
     id_prefix_separator: str = ID_PREFIX_SEPARATOR
+    duplicate_route_names: str = DUPLICATE_ROUTE_NAMES
     stop_match_distance_ft: float = STOP_MATCH_DISTANCE_FT
     heading_tolerance_deg: float = HEADING_TOLERANCE_DEG
     bay_name_patterns: tuple[str, ...] = tuple(BAY_NAME_PATTERNS)
@@ -1238,6 +1248,90 @@ def apply_id_maps(tables: dict[str, pd.DataFrame], maps: Mapping[str, Mapping[st
 # -----------------------------------------------------------------------------
 
 
+def rename_duplicate_route_names(
+    routes: pd.DataFrame, agency: pd.DataFrame, mode: str
+) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
+    """Suffix route names that more than one agency uses with the agency_name.
+
+    A route's name is its route_short_name, or its route_long_name when the
+    short name is blank. Routes of one agency that share a name (variants of
+    one public route) are not duplicates and always get the same new name.
+
+    Args:
+        routes: Merged routes.txt.
+        agency: Merged agency.txt, in priority order.
+        mode: ``"lower_priority"`` (the highest-priority agency keeps the plain
+            name), ``"all"`` (every sharing agency is renamed) or ``"keep"``.
+
+    Returns:
+        A tuple ``(routes, renames)``: the routes table with names updated, and
+        one record per renamed (agency, name) with keys ``agency_id``,
+        ``field``, ``original_name`` and ``new_name``.
+    """
+    routes = routes.copy()
+    for col in ("route_short_name", "route_long_name"):
+        if col not in routes.columns:
+            routes[col] = ""
+    short = routes["route_short_name"].str.strip()
+    names = pd.DataFrame(
+        {
+            "name": short.where(short != "", routes["route_long_name"].str.strip()),
+            "field": np.where(short != "", "route_short_name", "route_long_name"),
+            "agency_id": routes["agency_id"],
+        },
+        index=routes.index,
+    )
+    names = names.loc[names["name"] != ""]
+    rank = {agency_id: i for i, agency_id in enumerate(agency["agency_id"])}
+    agency_name = dict(zip(agency["agency_id"], agency["agency_name"].str.strip()))
+    taken = set(names["name"])
+
+    shared: list[str] = []
+    renames: list[dict[str, Any]] = []
+    for name, group in names.groupby("name", sort=True):
+        sharing = sorted(group["agency_id"].unique(), key=lambda a: rank.get(a, len(rank)))
+        if len(sharing) < 2:
+            continue
+        shared.append(str(name))
+        to_rename = {"all": sharing, "keep": []}.get(mode, sharing[1:])
+        for agency_id in to_rename:
+            base = f"{name}_{agency_name.get(agency_id) or agency_id}"
+            new, n = base, 1
+            while new in taken:
+                n += 1
+                new = f"{base}_{n}"
+            taken.add(new)
+            rows = group.loc[group["agency_id"] == agency_id]
+            for field_name, field_rows in rows.groupby("field"):
+                routes.loc[field_rows.index, str(field_name)] = new
+                renames.append(
+                    {
+                        "agency_id": agency_id,
+                        "field": field_name,
+                        "original_name": str(name),
+                        "new_name": new,
+                    }
+                )
+
+    if renames:
+        examples = ", ".join(f"{r['original_name']} -> {r['new_name']}" for r in renames[:10])
+        logging.warning(
+            "%d route name(s) are used by more than one agency; renamed %d agency route "
+            "name(s) (e.g. %s). The full list is in the ID crosswalk (id_type route_name).",
+            len(shared),
+            len(renames),
+            examples,
+        )
+    elif shared:
+        logging.warning(
+            "%d route name(s) are used by more than one agency and were kept as published "
+            "(e.g. %s); tools that select routes by name will match all of them.",
+            len(shared),
+            ", ".join(shared[:10]),
+        )
+    return routes, renames
+
+
 def build_feed_info(
     feeds: Sequence[Feed], window: Optional[tuple[dt.date, dt.date]], settings: MergeSettings
 ) -> pd.DataFrame:
@@ -1349,6 +1443,8 @@ def merge_feeds(
         raise MergeError("At least two feeds are needed to merge.")
     if settings.id_prefix_mode not in ("on_collision", "always"):
         raise MergeError("ID_PREFIX_MODE must be 'on_collision' or 'always'.")
+    if settings.duplicate_route_names not in ("lower_priority", "all", "keep"):
+        raise MergeError("DUPLICATE_ROUTE_NAMES must be 'lower_priority', 'all' or 'keep'.")
     overrides = overrides or {}
 
     for feed in feeds:
@@ -1383,6 +1479,7 @@ def merge_feeds(
     merged_stop_ids: dict[tuple[str, str], str] = {}
     match_rows: list[dict[str, Any]] = []
     crosswalk_frames: list[pd.DataFrame] = []
+    agency_feed: dict[str, str] = {}
     summary_rows: list[dict[str, Any]] = []
 
     for rank, feed in enumerate(feeds):
@@ -1457,6 +1554,7 @@ def merge_feeds(
 
         tables["stops"] = stops.loc[~stops["stop_id"].isin(list(matches))].reset_index(drop=True)
         apply_id_maps(tables, maps)
+        agency_feed.update(dict.fromkeys(tables["agency"]["agency_id"], feed.label))
 
         span = windows[feed.label]
         summary_rows.append(
@@ -1499,18 +1597,26 @@ def merge_feeds(
         merged["transfers"] = deduped.reset_index(drop=True)
     merged["feed_info"] = build_feed_info(feeds, window, settings)
 
-    routes = merged["routes"]
-    if "route_short_name" in routes.columns:
-        named = routes[routes["route_short_name"].str.strip() != ""]
-        shared = named.groupby("route_short_name")["agency_id"].nunique()
-        shared = shared[shared > 1]
-        if not shared.empty:
-            logging.info(
-                "%d route_short_name value(s) are used by more than one agency (e.g. %s); "
-                "tools that select routes by short name will match all of them.",
-                len(shared),
-                ", ".join(shared.index[:10]),
+    merged["routes"], renames = rename_duplicate_route_names(
+        merged["routes"], merged["agency"], settings.duplicate_route_names
+    )
+    if renames:
+        crosswalk_frames.append(
+            pd.DataFrame(
+                {
+                    "id_type": "route_name",
+                    "feed": [agency_feed.get(r["agency_id"], "") for r in renames],
+                    "original_id": [r["original_name"] for r in renames],
+                    "merged_id": [r["new_name"] for r in renames],
+                    "change": "renamed",
+                }
             )
+        )
+    renamed_by_feed = pd.Series(
+        [agency_feed.get(r["agency_id"], "") for r in renames]
+    ).value_counts()
+    for row in summary_rows:
+        row["route_names_renamed"] = int(renamed_by_feed.get(row["feed"], 0))
     for message in find_broken_references(merged):
         logging.warning("Merged feed: %s.", message)
 
@@ -1872,6 +1978,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="When to prefix lower-priority IDs with their feed label.",
     )
     p.add_argument(
+        "--duplicate-route-names",
+        choices=("lower_priority", "all", "keep"),
+        default=DUPLICATE_ROUTE_NAMES,
+        help="Which agencies' shared route names get an agency_name suffix.",
+    )
+    p.add_argument(
         "--clip-to-common-window",
         action=argparse.BooleanOptionalAction,
         default=CLIP_TO_COMMON_WINDOW,
@@ -1932,6 +2044,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     settings = MergeSettings(
         id_prefix_mode=args.id_prefix_mode,
+        duplicate_route_names=args.duplicate_route_names,
         stop_match_distance_ft=args.stop_match_distance_ft,
         heading_tolerance_deg=args.heading_tolerance_deg,
         bay_match_distance_ft=args.bay_match_distance_ft,

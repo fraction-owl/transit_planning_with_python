@@ -36,7 +36,7 @@ FT = 1.0 / 364_000.0
 # from transit-center bay 9 to stop 1.
 # Agency B: eastbound route R1 (same route_id as A's) whose stop 21 sits 40 ft
 # north of A's stop 2 (a duplicate of it); westbound route R5 whose stops 31
-# and 32 sit 60 ft south of A's stops 3 and 2 (across the street); and a bay
+# and 32 sit 45 ft south of A's stops 3 and 2 (across the street); and a bay
 # 99 at the same transit center, 30 ft from A's bay 9.
 # ---------------------------------------------------------------------------
 
@@ -100,9 +100,9 @@ FEED_B = {
         f"20,Main St & Oak St,{_lat(40)},-77.0050",
         f"21,Main St & 2nd St,{_lat(40)},-76.9950",
         f"22,Main St & Elm St,{_lat(40)},-76.9850",
-        f"30,Main St & Elm St WB,{_lat(-60)},-76.9850",
-        f"31,Main St & 3rd St WB,{_lat(-60)},-76.9900",
-        f"32,Main St & 2nd St WB,{_lat(-60)},-76.9950",
+        f"30,Main St & Elm St WB,{_lat(-45)},-76.9850",
+        f"31,Main St & 3rd St WB,{_lat(-45)},-76.9900",
+        f"32,Main St & 2nd St WB,{_lat(-45)},-76.9950",
         f"99,Transit Center Bay 3,{38.91 + 30 * FT:.7f},-77.0100",
     ],
     "routes": [
@@ -294,7 +294,7 @@ def test_merge_bays_when_bay_distance_allows(tmp_path: Path) -> None:
 
 def test_merge_without_heading_check_takes_closest_pair(tmp_path: Path) -> None:
     result = merge_feeds(_feeds(tmp_path), MergeSettings(heading_tolerance_deg=180.0))
-    # 21 (40 ft) and 32 (60 ft) both fit A's stop 2; only the closer one merges.
+    # 21 (40 ft) and 32 (45 ft) both fit A's stop 2; only the closer one merges.
     assert _outcome(result, "21") == ["merged"]
     assert _outcome(result, "32") == ["kept_target_taken"]
     assert _outcome(result, "31") == ["merged"]
@@ -432,7 +432,6 @@ def test_merge_three_feeds_matches_against_all_earlier_feeds(tmp_path: Path) -> 
         ("20", "A", "2", "merged"),
         ("20", "B", "32", "kept_heading"),
         ("22", "B", "22", "merged"),
-        ("22", "B", "30", "kept_heading"),
     }
     c_stops = result.tables["stop_times"][result.tables["stop_times"]["trip_id"] == "C_T1"]
     assert c_stops["stop_id"].tolist() == ["2", "22"]
@@ -537,3 +536,69 @@ def test_merge_keeps_unserved_street_stops_separate(tmp_path: Path) -> None:
         _feeds(tmp_path / "again", b_files), MergeSettings(heading_tolerance_deg=180.0)
     )
     assert _outcome(no_check, "40") == ["merged"]
+
+
+# ---------------------------------------------------------------------------
+# Route names shared by several agencies
+# ---------------------------------------------------------------------------
+
+
+def _name_tables() -> tuple[pd.DataFrame, pd.DataFrame]:
+    agency = pd.DataFrame(
+        {"agency_id": ["A", "B", "C"], "agency_name": ["Connector", "WMATA", "Ride On"]}
+    )
+    routes = pd.DataFrame(
+        {
+            "route_id": ["a10", "b10", "b10x", "c1", "a20", "b_silver", "c_silver"],
+            "agency_id": ["A", "B", "B", "C", "A", "B", "C"],
+            "route_short_name": ["10", "10", "10", "10_WMATA", "20", "", ""],
+            "route_long_name": ["", "", "", "", "", "Silver Line", "Silver Line"],
+        }
+    )
+    return routes, agency
+
+
+def test_rename_duplicate_route_names_lower_priority() -> None:
+    routes, agency = _name_tables()
+    renamed, renames = gfm.rename_duplicate_route_names(routes, agency, "lower_priority")
+    names = dict(zip(renamed["route_id"], renamed["route_short_name"]))
+    # A keeps "10"; both of B's "10" variants get one new name, which skips the
+    # "10_WMATA" that Ride On already uses.
+    assert (names["a10"], names["b10"], names["b10x"]) == ("10", "10_WMATA_2", "10_WMATA_2")
+    assert names["c1"] == "10_WMATA" and names["a20"] == "20"
+    # Routes without a short name compare (and are renamed) by long name.
+    long_names = dict(zip(renamed["route_id"], renamed["route_long_name"]))
+    assert (long_names["b_silver"], long_names["c_silver"]) == (
+        "Silver Line",
+        "Silver Line_Ride On",
+    )
+    assert {(r["agency_id"], r["new_name"]) for r in renames} == {
+        ("B", "10_WMATA_2"),
+        ("C", "Silver Line_Ride On"),
+    }
+
+
+def test_rename_duplicate_route_names_all_and_keep() -> None:
+    routes, agency = _name_tables()
+    renamed, _ = gfm.rename_duplicate_route_names(routes, agency, "all")
+    names = dict(zip(renamed["route_id"], renamed["route_short_name"]))
+    assert (names["a10"], names["b10"]) == ("10_Connector", "10_WMATA_2")
+
+    kept, renames = gfm.rename_duplicate_route_names(routes, agency, "keep")
+    assert renames == []
+    assert kept["route_short_name"].tolist() == routes["route_short_name"].tolist()
+
+
+def test_merge_renames_lower_priority_route_names(tmp_path: Path) -> None:
+    result = merge_feeds(_feeds(tmp_path), MergeSettings())
+    routes = result.tables["routes"].set_index("route_id")
+    assert routes.loc["R1", "route_short_name"] == "10"  # dominant keeps its name
+    assert routes.loc["B_R1", "route_short_name"] == "10_Agency B"
+    assert routes.loc["R5", "route_short_name"] == "50"
+    crosswalk = result.crosswalk
+    rows = crosswalk[crosswalk["id_type"] == "route_name"]
+    assert rows[["feed", "original_id", "merged_id"]].to_numpy().tolist() == [
+        ["B", "10", "10_Agency B"]
+    ]
+    summary = result.feed_summary.set_index("feed")
+    assert summary["route_names_renamed"].to_dict() == {"A": 0, "B": 1}
