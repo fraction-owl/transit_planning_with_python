@@ -283,6 +283,9 @@ def test_merge_keeps_bays_separate_by_default(tmp_path: Path) -> None:
     result = merge_feeds(_feeds(tmp_path), MergeSettings())
     assert "99" in set(result.tables["stops"]["stop_id"])
     assert _outcome(result, "99") == ["kept_bay"]
+    # Without a polygon layer the "Bay" names make 9 and 99 bays already, so they
+    # are not reported as a possible cluster.
+    assert result.possible_bay_clusters.empty
 
 
 def test_merge_bays_when_bay_distance_allows(tmp_path: Path) -> None:
@@ -486,7 +489,12 @@ def test_main_end_to_end(tmp_path: Path) -> None:
         ]
     )
     assert code == 0
-    for name in ("merge_stop_matches.csv", "merge_id_crosswalk.csv", "merge_feed_summary.csv"):
+    for name in (
+        "merge_stop_matches.csv",
+        "merge_id_crosswalk.csv",
+        "merge_feed_summary.csv",
+        "merge_possible_bay_clusters.csv",
+    ):
         assert (out / name).exists()
     runlog = (out / "merged_gtfs_runlog.txt").read_text(encoding="utf-8")
     assert "STOP_MATCH_DISTANCE_FT" in runlog
@@ -522,6 +530,58 @@ def test_merge_treats_stops_in_bay_zones_as_bays(tmp_path: Path) -> None:
     result = merge_feeds(_feeds(tmp_path), MergeSettings(), zones=zones)
     assert _outcome(result, "21") == ["kept_bay"]
     assert "21" in set(result.tables["stops"]["stop_id"])
+
+    # With polygons, names no longer make bays: the transit-center bays 9 and 99
+    # (outside the polygon) follow the street-stop rules (their buses leave in
+    # opposite directions) and are reported as a possible undrawn bay cluster.
+    assert _outcome(result, "99") == ["kept_heading"]
+    clusters = result.possible_bay_clusters
+    assert set(zip(clusters["feed"], clusters["stop_id"])) == {("A", "9"), ("B", "99")}
+    assert set(clusters["reason"]) == {"bay names"}
+
+
+def _cluster_candidates(names: list[str], terminals: list[bool]) -> pd.DataFrame:
+    # Stops 80 ft apart in a row along a curb.
+    n = len(names)
+    return pd.DataFrame(
+        {
+            "feed": ["A"] * n,
+            "stop_id": [f"s{i}" for i in range(n)],
+            "stop_name": names,
+            "stop_lat": [_lat(80 * i) for i in range(n)],
+            "stop_lon": ["-77.0"] * n,
+            "starts_or_ends_trips": terminals,
+        }
+    )
+
+
+def test_find_possible_bay_clusters_by_name() -> None:
+    candidates = _cluster_candidates(["Center Bay 1", "Center Bay 2", "Elm St"], [False] * 3)
+    far = _cluster_candidates(["Far Bay 9"], [False]).assign(stop_id="far", stop_lat="39.5")
+    clusters = gfm.find_possible_bay_clusters(
+        pd.concat([candidates, far], ignore_index=True), [r"\bbay\b"], 150.0, 4
+    )
+    # The chained group is reported whole; the lone far stop is not a cluster.
+    assert clusters["stop_id"].tolist() == ["s0", "s1", "s2"]
+    assert clusters["bay_name"].tolist() == [True, True, False]
+    assert set(clusters["reason"]) == {"bay names"}
+
+
+def test_find_possible_bay_clusters_by_trip_starts_and_ends() -> None:
+    names = ["Hub A", "Hub B", "Hub C", "Hub D"]
+    clusters = gfm.find_possible_bay_clusters(
+        _cluster_candidates(names, [True, True, False, False]), [r"\bbay\b"], 150.0, 4
+    )
+    assert clusters["reason"].unique().tolist() == ["trips start or end here"]
+    assert len(clusters) == 4
+
+    # One terminal of four (e.g. a busy street corner) is not reported, and
+    # neither is anything once the gap is shorter than the stop spacing.
+    one = _cluster_candidates(names, [True, False, False, False])
+    assert gfm.find_possible_bay_clusters(one, [r"\bbay\b"], 150.0, 4).empty
+    two = _cluster_candidates(names, [True, True, False, False])
+    assert gfm.find_possible_bay_clusters(two, [r"\bbay\b"], 50.0, 4).empty
+    assert gfm.find_possible_bay_clusters(two, [r"\bbay\b"], 0.0, 4).empty
 
 
 def test_merge_keeps_unserved_street_stops_separate(tmp_path: Path) -> None:

@@ -11,10 +11,11 @@ A lower-priority street stop merges into a higher-priority stop within
 ``STOP_MATCH_DISTANCE_FT`` (default 50 ft) when the buses at both travel the
 same way (``HEADING_TOLERANCE_DEG``), so stops across the street or around the
 corner stay separate. Each stop absorbs at most one stop per feed, closest
-pairs first. Bus bays (stops with a ``parent_station``, a name matching
-``BAY_NAME_PATTERNS``, or inside an optional transit-center polygon layer) sit
-closer together than street stops, so they use ``BAY_MATCH_DISTANCE_FT``
-(default 0 = never merged automatically) and are listed for review instead.
+pairs first. Bus bays sit closer together than street stops, so they use
+``BAY_MATCH_DISTANCE_FT`` (default 0 = never merged automatically). Bays are
+stops with a ``parent_station`` or inside a transit-center polygon layer (or,
+with no layer, named like ``BAY_NAME_PATTERNS``); stops outside the polygons
+that look like a bay cluster are reported so the missing polygons can be drawn.
 
 Each feed keeps its own service_ids. By default every calendar is clipped to
 the date window all feeds cover and trips left with no dates are dropped, so
@@ -27,8 +28,7 @@ Inputs
   calendar_dates.txt.
 - Optional overrides CSV with columns ``feed, stop_id, target_feed,
   target_stop_id`` (blank target = keep the stop separate).
-- Optional transit-center polygon layer, e.g. the zones drawn for
-  ``cluster_stops_from_zones_gpd.py`` (requires geopandas).
+- Optional transit-center polygon layer (requires geopandas).
 
 Outputs
 -------
@@ -41,13 +41,13 @@ Outputs
 - ``merge_id_crosswalk.csv``: original to merged value of every ID and
   renamed route name in every feed.
 - ``merge_feed_summary.csv``: one row per input feed.
+- ``merge_possible_bay_clusters.csv``: street stops that look like bus bays.
 - A run-log sidecar capturing the verbatim CONFIGURATION block.
 
 Typical usage
 -------------
-Update the paths in the CONFIGURATION section (or pass the matching CLI
-flags) and run from a shell or a Jupyter notebook. Review
-``merge_stop_matches.csv``, add overrides where needed, and rerun.
+Update the CONFIGURATION section (or pass the matching CLI flags) and run from
+a shell or a notebook. Review the reports, add overrides or polygons, and rerun.
 """
 
 from __future__ import annotations
@@ -66,6 +66,8 @@ from typing import IO, Any, List, Mapping, NamedTuple, Optional, Sequence, Union
 
 import numpy as np
 import pandas as pd
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
 from scipy.spatial import cKDTree
 
 # =============================================================================
@@ -113,13 +115,24 @@ STOP_MATCH_DISTANCE_FT: float = 50.0
 HEADING_TOLERANCE_DEG: float = 60.0
 
 # --- Bus bays -----------------------------------------------------------------
-# A stop is a bay when it has a parent_station, its stop_name matches one of
-# these case-insensitive regular expressions, or it lies inside a polygon of
-# BAY_ZONES_PATH. Bays merge only within BAY_MATCH_DISTANCE_FT; bay pairs
-# within STOP_MATCH_DISTANCE_FT are listed for review either way.
+# A stop is a bay when it has a parent_station or lies inside a polygon of
+# BAY_ZONES_PATH (e.g. the transit-center zones drawn for
+# cluster_stops_from_zones_gpd.py). Without a polygon layer, a stop_name matching
+# one of BAY_NAME_PATTERNS (case-insensitive regular expressions) also makes it a
+# bay; with one, the polygons decide and the patterns only feed the warning
+# below. Bays merge only within BAY_MATCH_DISTANCE_FT; bay pairs within
+# STOP_MATCH_DISTANCE_FT are listed for review either way.
+BAY_ZONES_PATH: str = r""  # optional polygon layer, one polygon per transit center
 BAY_NAME_PATTERNS: list[str] = [r"\bbay\b"]
-BAY_ZONES_PATH: str = r""  # optional polygon layer, e.g. one polygon per transit center
 BAY_MATCH_DISTANCE_FT: float = 0.0  # 0 = never merge bays automatically
+
+# Warn about street stops (not bays) that look like an undrawn transit center:
+# stops chained within BAY_CLUSTER_LINK_FT of one another where at least two
+# names match BAY_NAME_PATTERNS, or at least BAY_CLUSTER_MIN_STOPS stops where
+# half or more start or end trips. Each group is logged and listed in
+# POSSIBLE_BAY_CLUSTERS_FILENAME. 0 = no warning.
+BAY_CLUSTER_LINK_FT: float = 150.0
+BAY_CLUSTER_MIN_STOPS: int = 4
 
 # --- Route names --------------------------------------------------------------
 # When agencies share a route name (route_short_name, or route_long_name for
@@ -156,6 +169,7 @@ FEED_PUBLISHER_URL: str = ""
 STOP_MATCHES_FILENAME: str = r"merge_stop_matches.csv"
 CROSSWALK_FILENAME: str = r"merge_id_crosswalk.csv"
 FEED_SUMMARY_FILENAME: str = r"merge_feed_summary.csv"
+POSSIBLE_BAY_CLUSTERS_FILENAME: str = r"merge_possible_bay_clusters.csv"
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
 
@@ -253,6 +267,18 @@ STOP_MATCH_COLUMNS: list[str] = [
     "outcome",
 ]
 
+POSSIBLE_BAY_CLUSTER_COLUMNS: list[str] = [
+    "cluster",
+    "reason",
+    "feed",
+    "stop_id",
+    "stop_name",
+    "stop_lat",
+    "stop_lon",
+    "starts_or_ends_trips",
+    "bay_name",
+]
+
 _NO_HEADINGS = np.empty(0)
 
 # =============================================================================
@@ -274,6 +300,8 @@ class MergeSettings(NamedTuple):
     heading_tolerance_deg: float = HEADING_TOLERANCE_DEG
     bay_name_patterns: tuple[str, ...] = tuple(BAY_NAME_PATTERNS)
     bay_match_distance_ft: float = BAY_MATCH_DISTANCE_FT
+    bay_cluster_link_ft: float = BAY_CLUSTER_LINK_FT
+    bay_cluster_min_stops: int = BAY_CLUSTER_MIN_STOPS
     clip_to_common_window: bool = CLIP_TO_COMMON_WINDOW
     window_start: str = WINDOW_START
     window_end: str = WINDOW_END
@@ -300,6 +328,7 @@ class MergeResult(NamedTuple):
     stop_matches: pd.DataFrame
     crosswalk: pd.DataFrame
     feed_summary: pd.DataFrame
+    possible_bay_clusters: pd.DataFrame
     window: Optional[tuple[dt.date, dt.date]]
 
 
@@ -986,6 +1015,88 @@ def flag_bay_stops(
     return is_bay.to_numpy(dtype=bool)
 
 
+def terminal_stop_ids(stop_times: pd.DataFrame) -> set[str]:
+    """Return the stop_ids that are the first or last stop of at least one trip.
+
+    Args:
+        stop_times: stop_times.txt.
+
+    Returns:
+        The set of terminal stop_ids.
+    """
+    if stop_times.empty:
+        return set()
+    visits = stop_times[["trip_id", "stop_id"]].copy()
+    visits["seq"] = pd.to_numeric(stop_times["stop_sequence"], errors="coerce")
+    visits = visits.dropna(subset=["seq"]).sort_values(["trip_id", "seq"], kind="mergesort")
+    first = visits.drop_duplicates("trip_id", keep="first")["stop_id"]
+    last = visits.drop_duplicates("trip_id", keep="last")["stop_id"]
+    return set(first) | set(last)
+
+
+def find_possible_bay_clusters(
+    candidates: pd.DataFrame, name_patterns: Sequence[str], link_ft: float, min_stops: int
+) -> pd.DataFrame:
+    """Find groups of street stops that look like an undrawn bus bay cluster.
+
+    Stops are grouped when they chain together within *link_ft* of one another.
+    A group is reported when at least two of its stop names match
+    *name_patterns*, or when it has at least *min_stops* stops and half or more
+    of them start or end trips (as bays at a transit center do).
+
+    Args:
+        candidates: Boarding stops that are not bays, from every feed, with
+            columns ``feed``, ``stop_id``, ``stop_name``, ``stop_lat``,
+            ``stop_lon`` and ``starts_or_ends_trips``.
+        name_patterns: Case-insensitive regular expressions for bay names.
+        link_ft: Largest gap between neighbouring stops of one group. 0 turns
+            the check off.
+        min_stops: Smallest group the start/end rule reports (0 = rule off).
+
+    Returns:
+        One row per stop in a reported group (columns
+        :data:`POSSIBLE_BAY_CLUSTER_COLUMNS`), numbered by ``cluster``.
+    """
+    empty = pd.DataFrame(columns=POSSIBLE_BAY_CLUSTER_COLUMNS)
+    lat = pd.to_numeric(candidates["stop_lat"], errors="coerce")
+    lon = pd.to_numeric(candidates["stop_lon"], errors="coerce")
+    stops = candidates.loc[lat.notna() & lon.notna()].reset_index(drop=True)
+    if link_ft <= 0 or len(stops) < 2:
+        return empty
+    xyz = to_xyz_ft(
+        pd.to_numeric(stops["stop_lat"]).to_numpy(dtype=float),
+        pd.to_numeric(stops["stop_lon"]).to_numpy(dtype=float),
+    )
+    pairs = np.array(sorted(cKDTree(xyz).query_pairs(r=ground_ft_to_chord_ft(link_ft))))
+    if pairs.size == 0:
+        return empty
+    graph = coo_matrix(
+        (np.ones(len(pairs)), (pairs[:, 0], pairs[:, 1])), shape=(len(stops), len(stops))
+    )
+    _, labels = connected_components(graph, directed=False)
+    stops["group"] = labels
+    if name_patterns:
+        pattern = "|".join(f"(?:{p})" for p in name_patterns)
+        stops["bay_name"] = stops["stop_name"].str.contains(pattern, case=False, regex=True)
+    else:
+        stops["bay_name"] = False
+
+    frames: list[pd.DataFrame] = []
+    for _, group in stops.groupby("group", sort=False):
+        if len(group) < 2:
+            continue
+        reasons = []
+        if int(group["bay_name"].sum()) >= 2:
+            reasons.append("bay names")
+        terminals = int(group["starts_or_ends_trips"].sum())
+        if min_stops > 0 and len(group) >= min_stops and 2 * terminals >= len(group):
+            reasons.append("trips start or end here")
+        if reasons:
+            frame = group.assign(cluster=len(frames) + 1, reason="; ".join(reasons))
+            frames.append(frame[POSSIBLE_BAY_CLUSTER_COLUMNS])
+    return pd.concat(frames, ignore_index=True) if frames else empty
+
+
 def name_similarity(a: str, b: str) -> float:
     """Similarity of two stop names from 0 to 1, ignoring case and punctuation."""
 
@@ -1419,6 +1530,69 @@ def find_broken_references(tables: Mapping[str, pd.DataFrame]) -> list[str]:
     return messages
 
 
+def classify_bays(
+    feeds: Sequence[Feed], settings: MergeSettings, zones: Any
+) -> tuple[dict[str, np.ndarray], pd.DataFrame]:
+    """Flag each feed's bays and look for street stops that resemble a bay cluster.
+
+    With a polygon layer, bays are stops inside a polygon or with a
+    parent_station, and BAY_NAME_PATTERNS only feeds the warning. Without one,
+    a matching stop_name also makes a stop a bay.
+
+    Args:
+        feeds: Loaded feeds (calendars already clipped).
+        settings: Merge settings.
+        zones: Output of :func:`load_bay_zones`, or None.
+
+    Returns:
+        A tuple ``(bay_flags, possible_bay_clusters)``: per feed label, a
+        boolean array aligned to its stops; and the output of
+        :func:`find_possible_bay_clusters` across all feeds.
+    """
+    patterns = settings.bay_name_patterns if zones is None else ()
+    bay_flags: dict[str, np.ndarray] = {}
+    candidates: list[pd.DataFrame] = []
+    for feed in feeds:
+        stops = feed.tables["stops"]
+        zone_ids = stops_in_zones(stops, zones) if zones is not None else set()
+        bay_flags[feed.label] = flag_bay_stops(stops, patterns, zone_ids)
+        street = is_platform_stop(stops).to_numpy() & ~bay_flags[feed.label]
+        frame = stops.loc[street, ["stop_id", "stop_name", "stop_lat", "stop_lon"]].copy()
+        frame.insert(0, "feed", feed.label)
+        terminals = terminal_stop_ids(feed.tables["stop_times"])
+        frame["starts_or_ends_trips"] = frame["stop_id"].isin(list(terminals))
+        candidates.append(frame)
+        if zones is not None:
+            logging.info("Feed '%s': %d stop(s) inside bay polygons.", feed.label, len(zone_ids))
+
+    clusters = find_possible_bay_clusters(
+        pd.concat(candidates, ignore_index=True),
+        settings.bay_name_patterns,
+        settings.bay_cluster_link_ft,
+        settings.bay_cluster_min_stops,
+    )
+    if not clusters.empty:
+        n_clusters = int(clusters["cluster"].nunique())
+        logging.warning(
+            "%d group(s) of stops look like bus bay clusters but are treated as street "
+            "stops (see the possible bay clusters report). Draw a polygon around each "
+            "real one in BAY_ZONES_PATH and rerun.",
+            n_clusters,
+        )
+        for cluster, group in list(clusters.groupby("cluster"))[:10]:
+            logging.warning(
+                "  Possible bay cluster %s (%s): %d stops near '%s': %s",
+                cluster,
+                group["reason"].iloc[0],
+                len(group),
+                group["stop_name"].iloc[0],
+                ", ".join(f"{f}/{sid}" for f, sid in zip(group["feed"], group["stop_id"])),
+            )
+        if n_clusters > 10:
+            logging.warning("  ... and %d more.", n_clusters - 10)
+    return bay_flags, clusters
+
+
 def merge_feeds(
     feeds: Sequence[Feed],
     settings: MergeSettings,
@@ -1482,12 +1656,13 @@ def merge_feeds(
     agency_feed: dict[str, str] = {}
     summary_rows: list[dict[str, Any]] = []
 
+    bay_flags, possible_bay_clusters = classify_bays(feeds, settings, zones)
+
     for rank, feed in enumerate(feeds):
         tables = feed.tables
         stops = tables["stops"]
         headings = compute_stop_headings(stops, tables["stop_times"])
-        zone_ids = stops_in_zones(stops, zones) if zones is not None else set()
-        is_bay = flag_bay_stops(stops, settings.bay_name_patterns, zone_ids)
+        is_bay = bay_flags[feed.label]
 
         matches: dict[str, int] = {}
         if rank > 0:
@@ -1631,6 +1806,7 @@ def merge_feeds(
         stop_matches=stop_matches,
         crosswalk=crosswalk,
         feed_summary=pd.DataFrame(summary_rows),
+        possible_bay_clusters=possible_bay_clusters,
         window=window,
     )
 
@@ -1969,6 +2145,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--bay-zones", default=BAY_ZONES_PATH, help="Optional bay polygon layer.")
     p.add_argument(
+        "--bay-cluster-link-ft",
+        type=float,
+        default=BAY_CLUSTER_LINK_FT,
+        help="Gap that chains stops into a possible bay cluster (0 = no warning).",
+    )
+    p.add_argument(
+        "--bay-cluster-min-stops",
+        type=int,
+        default=BAY_CLUSTER_MIN_STOPS,
+        help="Smallest group of trip-start/end stops reported as a possible bay cluster.",
+    )
+    p.add_argument(
         "--stop-overrides", default=STOP_OVERRIDES_PATH, help="Optional stop overrides CSV."
     )
     p.add_argument(
@@ -2035,8 +2223,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if len(labels) != len(paths) or len(set(labels)) != len(labels) or not all(labels):
         logging.error("FEED_LABELS needs one unique, non-blank label per feed (or none).")
         return 2
-    if args.stop_match_distance_ft < 0 or args.bay_match_distance_ft < 0:
-        logging.error("Match distances cannot be negative.")
+    if min(args.stop_match_distance_ft, args.bay_match_distance_ft, args.bay_cluster_link_ft) < 0:
+        logging.error("Distances cannot be negative.")
+        return 2
+    if args.bay_cluster_min_stops < 0:
+        logging.error("BAY_CLUSTER_MIN_STOPS cannot be negative.")
         return 2
     if not 0 <= args.heading_tolerance_deg <= 180:
         logging.error("HEADING_TOLERANCE_DEG must be between 0 and 180.")
@@ -2048,6 +2239,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         stop_match_distance_ft=args.stop_match_distance_ft,
         heading_tolerance_deg=args.heading_tolerance_deg,
         bay_match_distance_ft=args.bay_match_distance_ft,
+        bay_cluster_link_ft=args.bay_cluster_link_ft,
+        bay_cluster_min_stops=args.bay_cluster_min_stops,
         clip_to_common_window=args.clip_to_common_window,
         window_start=args.window_start,
         window_end=args.window_end,
@@ -2063,6 +2256,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         result.stop_matches.to_csv(output_dir / STOP_MATCHES_FILENAME, index=False)
         result.crosswalk.to_csv(output_dir / CROSSWALK_FILENAME, index=False)
         result.feed_summary.to_csv(output_dir / FEED_SUMMARY_FILENAME, index=False)
+        result.possible_bay_clusters.to_csv(
+            output_dir / POSSIBLE_BAY_CLUSTERS_FILENAME, index=False
+        )
     except (MergeError, OSError, ValueError) as exc:
         logging.error("%s", exc)
         return 1
@@ -2075,6 +2271,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"Merged stops: {len(result.tables['stops'])}",
         f"Stop pair outcomes: {', '.join(f'{k}={v}' for k, v in outcomes.items()) or 'none'}",
         f"IDs renamed: {int((result.crosswalk['change'] == 'renamed').sum())}",
+        "Possible bay clusters outside the bay polygons: "
+        f"{result.possible_bay_clusters['cluster'].nunique()}",
     ]
     if not write_run_log(output_dir, summary_lines) and REQUIRE_RUN_LOG:
         logging.error(
