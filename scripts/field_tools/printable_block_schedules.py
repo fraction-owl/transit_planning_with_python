@@ -29,6 +29,7 @@ Key Features
 - Lists scheduled arrival and departure separately and provides separate blanks
   for actual arrival and departure, along with boardings, alightings and notes.
 - Widens the Comments column and shades timepoint rows for easier field use.
+- Fills the Stop ID column from ``stop_code`` (default) or ``stop_id``.
 - Names each file by block, routes, time span and calendar for easy sorting by hand.
 - Marks boardings at the last stop and alightings at the first stop of each trip.
 - Prints collector Name/Date fields and the generated workbook's full file path
@@ -80,6 +81,10 @@ SERVICE_LABEL_OVERRIDES: dict[str, str] = {}  # e.g. {"4": "Weekday", "5": "Satu
 
 # Stops to list on each block sheet:
 TIMEPOINTS_ONLY: bool = False  # True → timepoint stops only; False → all stops
+
+# stops.txt field printed in the "Stop ID" column: "stop_code" or "stop_id".
+# Falls back to stop_id if stops.txt has no stop_code column.
+STOP_ID_FIELD: str = "stop_code"
 
 # Add observation rows for positive scheduled gaps between trips in a block.
 INCLUDE_LAYOVER_ROWS: bool = True  # False → stop events only.
@@ -383,7 +388,8 @@ def prepare_stop_times(
     1. Ensure a numeric ``timepoint`` column (create if absent).
     2. Attach ``block_id``, ``route_short_name``, ``direction_id`` and ``service_id``.
     3. Convert arrival/departure times → seconds → ``HH:MM`` format.
-    4. Map ``stop_id`` → human-readable stop names.
+    4. Map ``stop_id`` → human-readable stop names and the ``stop_label``
+       printed as Stop ID (per ``STOP_ID_FIELD``).
     5. Sort by ``block_id``, ``trip_id``, ``stop_sequence``.
 
     Args:
@@ -393,7 +399,13 @@ def prepare_stop_times(
 
     Returns:
         Cleaned ``stop_times`` DataFrame ready for grouping by block.
+
+    Raises:
+        ValueError: If ``STOP_ID_FIELD`` is not ``"stop_code"`` or ``"stop_id"``.
     """
+    if STOP_ID_FIELD not in ("stop_code", "stop_id"):
+        raise ValueError(f"STOP_ID_FIELD must be 'stop_code' or 'stop_id', not {STOP_ID_FIELD!r}.")
+
     # If 'timepoint' does not exist, create a new column with 0.
     if "timepoint" not in stop_times_df.columns:
         stop_times_df["timepoint"] = 0
@@ -418,6 +430,15 @@ def prepare_stop_times(
     # Merge in stop names
     stop_name_map = stops_df.set_index("stop_id")["stop_name"].to_dict()
     stop_times_df["stop_name"] = stop_times_df["stop_id"].map(stop_name_map).fillna("Unknown Stop")
+
+    # Stop identifier printed in the "Stop ID" column
+    if STOP_ID_FIELD == "stop_code" and "stop_code" in stops_df.columns:
+        stop_code_map = stops_df.set_index("stop_id")["stop_code"].to_dict()
+        stop_times_df["stop_label"] = stop_times_df["stop_id"].map(stop_code_map).fillna("")
+    else:
+        if STOP_ID_FIELD == "stop_code":
+            logging.warning("stops.txt has no stop_code column; printing stop_id as Stop ID.")
+        stop_times_df["stop_label"] = stop_times_df["stop_id"]
 
     # Sort by block, trip, and stop_sequence
     stop_times_df = stop_times_df.dropna(subset=["block_id"])
@@ -613,7 +634,7 @@ def add_layover_rows(schedule_df: pd.DataFrame, block_df: pd.DataFrame) -> pd.Da
                 "Direction": last["direction_id"],
                 "Trip ID": trip_id,
                 "Trip Start Time": format_hhmm(first["trip_start_seconds"]),
-                "Stop ID": last["stop_id"] if same_stop else "",
+                "Stop ID": last["stop_label"] if same_stop else "",
                 "Stop Name": (
                     last["stop_name"]
                     if same_stop
@@ -719,7 +740,7 @@ def export_blocks(
             "Trip Start Time",
             "stop_sequence",
             "timepoint",
-            "stop_id",
+            "stop_label",
             "stop_name",
             "scheduled_arrival_hhmm",
             "scheduled_departure_hhmm",
@@ -733,7 +754,7 @@ def export_blocks(
                 "trip_id": "Trip ID",
                 "stop_sequence": "Stop Sequence",
                 "timepoint": "Timepoint",
-                "stop_id": "Stop ID",
+                "stop_label": "Stop ID",
                 "stop_name": "Stop Name",
                 "scheduled_arrival_hhmm": "Scheduled Arrival Time",
                 "scheduled_departure_hhmm": "Scheduled Departure Time",
