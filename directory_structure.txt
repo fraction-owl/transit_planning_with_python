@@ -54,6 +54,7 @@ transit_planning_with_python/
 │   ├── gtfs_exports/
 │   │   ├── block_status_timeline_exporter.py
 │   │   ├── bus_block_exporter.py
+│   │   ├── gtfs_feed_merger.py
 │   │   ├── gtfs_route_features.py
 │   │   ├── gtfs_route_timeline.py
 │   │   ├── gtfs_to_shapefile_arcpy.py
@@ -243,6 +244,7 @@ transit_planning_with_python/
 │   ├── test_gbfs_ridership_join.py
 │   ├── test_gbfs_stations_exporter.py
 │   ├── test_gtfs_calendar_inspector.py
+│   ├── test_gtfs_feed_merger.py
 │   ├── test_gtfs_linear_diff_gpd.py
 │   ├── test_gtfs_route_diff.py
 │   ├── test_gtfs_route_features.py

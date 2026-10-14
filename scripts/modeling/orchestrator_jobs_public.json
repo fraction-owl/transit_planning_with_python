@@ -63,7 +63,7 @@
     },
     {
       "script": "route_transfer_calculator.py",
-      "cmd": ["{python}", "{script}", "--gtfs-dirs", "{input}/gtfs",
+      "cmd": ["{python}", "{script}", "--gtfs-dir", "{input}/gtfs",
               "--output-dir", "{output}"],
       "outputs": [
         {"file": "route_transfers_summary.csv", "join_keys": ["route_id"],
