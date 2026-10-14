@@ -10,7 +10,10 @@ import pytest
 from openpyxl import load_workbook
 
 from scripts.field_tools.printable_block_schedules import (
+    BLOCKED_COUNT_MARKER,
     COMMENTS_PLACEHOLDER,
+    MISSING_VALUE,
+    add_layover_rows,
     build_block_filename,
     build_service_labels,
     export_blocks,
@@ -47,9 +50,14 @@ def test_time_to_seconds_midnight() -> None:
     assert time_to_seconds("00:00:00") == 0
 
 
-def test_time_to_seconds_past_midnight_rolls_over() -> None:
-    # 25:10:00 → (25 % 24) = 1 h + 10 min = 4200 s
-    assert time_to_seconds("25:10:00") == 4200
+def test_time_to_seconds_keeps_hours_past_midnight() -> None:
+    # 25:10:00 stays on the GTFS service day: 25 h + 10 min = 90600 s
+    assert time_to_seconds("25:10:00") == 90600
+
+
+@pytest.mark.parametrize("bad", ["08:60:00", "08:30:60", "-01:00:00", "08:30:00:00"])
+def test_time_to_seconds_out_of_range_returns_nan(bad: str) -> None:
+    assert math.isnan(time_to_seconds(bad))
 
 
 def test_time_to_seconds_nan_returns_nan() -> None:
@@ -274,10 +282,13 @@ def _make_stops() -> pd.DataFrame:
     )
 
 
-def test_prepare_stop_times_adds_scheduled_time_column() -> None:
-    result = prepare_stop_times(_make_prep_trips(), _make_prep_stop_times(), _make_stops())
-    assert "scheduled_time_hhmm" in result.columns
-    assert result["scheduled_time_hhmm"].iloc[0] == "07:00"
+def test_prepare_stop_times_formats_arrival_and_departure_separately() -> None:
+    st = _make_prep_stop_times()
+    st.loc[1, "departure_time"] = "07:06:00"
+    result = prepare_stop_times(_make_prep_trips(), st, _make_stops())
+    row = result[result["stop_id"] == "S2"].iloc[0]
+    assert row["scheduled_arrival_hhmm"] == "07:05"
+    assert row["scheduled_departure_hhmm"] == "07:06"
 
 
 def test_prepare_stop_times_maps_stop_names() -> None:
@@ -361,7 +372,9 @@ def _make_block_df() -> pd.DataFrame:
             "timepoint": [0, 0, 1],
             "stop_id": ["S1", "S2", "S3"],
             "stop_name": ["Oak St", "Elm Ave", "Pine Rd"],
-            "scheduled_time_hhmm": ["07:00", "07:05", "08:00"],
+            "scheduled_arrival_hhmm": ["07:00", "07:05", "08:00"],
+            "scheduled_departure_hhmm": ["07:00", "07:05", "08:00"],
+            "arrival_seconds": [25200.0, 25500.0, 28800.0],
             "departure_seconds": [25200.0, 25500.0, 28800.0],
             "service_id": ["WKDY", "WKDY", "WKDY"],
             "arrival_time": ["07:00:00", "07:05:00", "08:00:00"],
@@ -393,8 +406,18 @@ def test_export_blocks_output_includes_placeholder_columns(tmp_path: Path) -> No
     with patch(f"{_MODULE}.BASE_OUTPUT_PATH", str(tmp_path)):
         export_blocks(_make_block_df())
     result = pd.read_excel(tmp_path / B1_FILE)
-    for col in ("Actual Time", "Boardings", "Alightings", "Comments"):
+    for col in (
+        "Event Type",
+        "Scheduled Arrival Time",
+        "Scheduled Departure Time",
+        "Actual Arrival Time",
+        "Actual Departure Time",
+        "Boardings",
+        "Alightings",
+        "Comments",
+    ):
         assert col in result.columns
+    assert (result["Event Type"] == "Stop").all()
 
 
 def test_export_blocks_all_stops_by_default(tmp_path: Path) -> None:
@@ -475,6 +498,138 @@ def test_export_blocks_timepoints_only_filename_spans_whole_block(tmp_path: Path
     ):
         export_blocks(df)
     assert (tmp_path / B1_FILE).exists()
+
+
+# ---------------------------------------------------------------------------
+# export_blocks: trip endpoints, trip order, service split, layover rows
+# ---------------------------------------------------------------------------
+
+
+def _make_prepared_block(
+    rows: list[tuple[str, str, int, str, str]], service_id: str = "WKDY"
+) -> pd.DataFrame:
+    """Build prepared stop times from (trip_id, stop_id, sequence, arrival, departure)."""
+    df = pd.DataFrame(
+        rows, columns=["trip_id", "stop_id", "stop_sequence", "arrival_time", "departure_time"]
+    )
+    df["block_id"] = "B1"
+    df["route_short_name"] = "10"
+    df["direction_id"] = "0"
+    df["service_id"] = service_id
+    df["timepoint"] = 1
+    df["stop_name"] = "Stop " + df["stop_id"]
+    df["arrival_seconds"] = df["arrival_time"].map(time_to_seconds)
+    df["departure_seconds"] = df["departure_time"].map(time_to_seconds)
+    df["scheduled_arrival_hhmm"] = df["arrival_seconds"].map(format_hhmm)
+    df["scheduled_departure_hhmm"] = df["departure_seconds"].map(format_hhmm)
+    return df
+
+
+def _export_single(df: pd.DataFrame, tmp_path: Path, layovers: bool = True) -> pd.DataFrame:
+    with (
+        patch(f"{_MODULE}.BASE_OUTPUT_PATH", str(tmp_path)),
+        patch(f"{_MODULE}.TIMEPOINTS_ONLY", False),
+        patch(f"{_MODULE}.INCLUDE_LAYOVER_ROWS", layovers),
+    ):
+        export_blocks(df)
+    (path,) = tmp_path.glob("*.xlsx")
+    return pd.read_excel(path, dtype=str, keep_default_na=False)
+
+
+# Two trips with a 10-minute layover at S2 (07:20 → 07:30)
+_LAYOVER_TRIPS = [
+    ("T1", "S1", 1, "07:00:00", "07:00:00"),
+    ("T1", "S2", 2, "07:20:00", "07:20:00"),
+    ("T2", "S2", 1, "07:30:00", "07:30:00"),
+    ("T2", "S1", 2, "07:50:00", "07:50:00"),
+]
+
+
+def test_export_blocks_marks_counts_at_trip_endpoints_by_sequence(tmp_path: Path) -> None:
+    # Loop trip: the first and last stops share a stop ID
+    df = _make_prepared_block(
+        [
+            ("T1", "S1", 1, "07:00:00", "07:00:00"),
+            ("T1", "S2", 2, "07:10:00", "07:10:00"),
+            ("T1", "S1", 3, "07:20:00", "07:20:00"),
+        ]
+    )
+    result = _export_single(df, tmp_path)
+    assert result["Alightings"].tolist() == [BLOCKED_COUNT_MARKER, MISSING_VALUE, MISSING_VALUE]
+    assert result["Boardings"].tolist() == [MISSING_VALUE, MISSING_VALUE, BLOCKED_COUNT_MARKER]
+
+
+def test_export_blocks_orders_after_midnight_trips_by_start_time(tmp_path: Path) -> None:
+    # Trip "A" sorts first by ID but starts after "B"
+    df = _make_prepared_block(
+        [
+            ("A", "S1", 1, "24:30:00", "24:30:00"),
+            ("A", "S2", 2, "25:00:00", "25:00:00"),
+            ("B", "S2", 1, "23:50:00", "23:50:00"),
+            ("B", "S1", 2, "24:20:00", "24:20:00"),
+        ]
+    )
+    result = _export_single(df, tmp_path, layovers=False)
+    assert result["Trip ID"].tolist() == ["B", "B", "A", "A"]
+    assert result["Trip Start Time"].tolist() == ["23:50", "23:50", "24:30", "24:30"]
+
+
+def test_export_blocks_trip_start_falls_back_to_first_stop_arrival(tmp_path: Path) -> None:
+    df = _make_prepared_block(
+        [("T1", "S1", 1, "07:00:00", ""), ("T1", "S2", 2, "07:10:00", "07:10:00")]
+    )
+    result = _export_single(df, tmp_path)
+    assert result["Trip Start Time"].tolist() == ["07:00", "07:00"]
+    assert result["Scheduled Departure Time"].tolist() == ["", "07:10"]
+
+
+def test_export_blocks_splits_block_shared_by_service_ids(tmp_path: Path) -> None:
+    weekday = _make_prepared_block(_LAYOVER_TRIPS[:2], "WKDY")
+    saturday = _make_prepared_block(_LAYOVER_TRIPS[:2], "SAT").assign(trip_id="T9")
+    with patch(f"{_MODULE}.BASE_OUTPUT_PATH", str(tmp_path)):
+        export_blocks(pd.concat([weekday, saturday]), {"WKDY": "Weekday", "SAT": "Saturday"})
+    assert {f.name for f in tmp_path.glob("*.xlsx")} == {
+        "block_B1_10_0700-0720_Weekday_service-WKDY.xlsx",
+        "block_B1_10_0700-0720_Saturday_service-SAT.xlsx",
+    }
+
+
+def test_export_blocks_adds_layover_row_at_shared_stop(tmp_path: Path) -> None:
+    result = _export_single(_make_prepared_block(_LAYOVER_TRIPS), tmp_path)
+    assert result["Event Type"].tolist() == ["Stop", "Stop", "Layover", "Stop", "Stop"]
+    gap = result.iloc[2]
+    assert gap["Trip ID"] == "T1"
+    assert gap["Stop ID"] == "S2"
+    assert gap["Stop Sequence"] == ""
+    assert (gap["Scheduled Arrival Time"], gap["Scheduled Departure Time"]) == ("07:20", "07:30")
+    assert gap["Boardings"] == gap["Alightings"] == BLOCKED_COUNT_MARKER
+    assert gap["Comments"].startswith("Scheduled gap: 10 min\n")
+
+
+def test_export_blocks_labels_gap_between_different_stops(tmp_path: Path) -> None:
+    trips = [*_LAYOVER_TRIPS[:2], ("T2", "S3", 1, "07:37:30", "07:37:30")]
+    result = _export_single(_make_prepared_block(trips), tmp_path)
+    gap = result.iloc[2]
+    assert gap["Event Type"] == "Between trips"
+    assert gap["Stop ID"] == ""
+    assert gap["Stop Name"] == "From: Stop S2\nTo: Stop S3"
+    assert gap["Comments"].startswith("Scheduled gap: 17m 30s (may include travel)\n")
+
+
+@pytest.mark.parametrize(
+    ("next_start", "layovers"),
+    [("07:20:00", True), ("07:10:00", True), ("07:30:00", False)],
+    ids=["zero-gap", "overlap", "disabled"],
+)
+def test_export_blocks_omits_gap_row(tmp_path: Path, next_start: str, layovers: bool) -> None:
+    trips = [*_LAYOVER_TRIPS[:2], ("T2", "S2", 1, next_start, next_start)]
+    result = _export_single(_make_prepared_block(trips), tmp_path, layovers=layovers)
+    assert result["Event Type"].tolist() == ["Stop", "Stop", "Stop"]
+
+
+def test_add_layover_rows_rejects_mixed_service_ids() -> None:
+    with pytest.raises(ValueError, match="one service ID"):
+        add_layover_rows(pd.DataFrame(), pd.DataFrame({"service_id": ["WKDY", "SAT"]}))
 
 
 # ---------------------------------------------------------------------------
@@ -651,6 +806,24 @@ def test_main_timepoints_only_without_timepoints_returns_1(tmp_path: Path) -> No
     assert not list(tmp_path.glob("*.xlsx"))
 
 
+def test_main_blank_paths_return_2() -> None:
+    with (
+        patch(f"{_MODULE}.GTFS_FOLDER_PATH", ""),
+        patch(f"{_MODULE}.BASE_OUTPUT_PATH", "  "),
+    ):
+        assert main() == 2
+
+
+def test_main_exports_gtfs_basic_fixture(tmp_path: Path) -> None:
+    with (
+        patch(f"{_MODULE}.GTFS_FOLDER_PATH", str(GTFS_BASIC)),
+        patch(f"{_MODULE}.BASE_OUTPUT_PATH", str(tmp_path)),
+        patch(f"{_MODULE}.TIMEPOINTS_ONLY", False),
+    ):
+        assert main() == 0
+    assert list(tmp_path.glob("*.xlsx"))
+
+
 @pytest.mark.parametrize(
     ("header", "width"),
     [("Trip Start Time", 10), ("Stop Sequence", 8), ("Block ID", 5), ("Timepoint", 9)],
@@ -683,3 +856,38 @@ def test_export_to_excel_sets_print_layout(tmp_path: Path) -> None:
     assert ws.page_setup.fitToWidth == 1
     assert ws.page_setup.fitToHeight == 0
     assert ws.print_title_rows == "$1:$1"
+
+
+def test_export_to_excel_sets_print_header_and_footer(tmp_path: Path) -> None:
+    out = tmp_path / "R&D" / "schedule.xlsx"
+    with (
+        patch(f"{_MODULE}.COLLECTOR_NAME_HEADER", "Name: ____"),
+        patch(f"{_MODULE}.COLLECTION_DATE_HEADER", "Date: __"),
+    ):
+        export_to_excel(_make_formatted_df(), str(out))
+    ws = load_workbook(out)["Schedule"]
+    assert ws.oddHeader.left.text == "Name: ____"
+    assert ws.oddHeader.right.text == "Date: __"
+    assert ws.oddFooter.left.text == f"File: {os.path.abspath(out)}".replace("&", "&&")
+    # Header/footer live outside the cells, so row 1 is still the table header
+    assert pd.read_excel(out).columns.tolist() == ["Stop Name", "Timepoint", "Comments"]
+
+
+def test_export_to_excel_formats_gap_rows(tmp_path: Path) -> None:
+    out = tmp_path / "schedule.xlsx"
+    df = pd.DataFrame(
+        {
+            "Event Type": ["Stop", "Layover"],
+            "Boardings": [MISSING_VALUE, BLOCKED_COUNT_MARKER],
+            "Comments": [COMMENTS_PLACEHOLDER, "Scheduled gap: 10 min\nActual location: ___"],
+        }
+    )
+    export_to_excel(df, str(out))
+    ws = load_workbook(out)["Schedule"]
+    assert ws.row_dimensions[3].height == 60
+    assert ws["A3"].font.b
+    assert ws["A3"].border.top.style == "thin"
+    assert ws["B3"].alignment.horizontal == "center"
+    assert ws["B3"].font.b
+    assert ws["C3"].alignment.wrap_text
+    assert ws["A2"].border.top.style is None
