@@ -288,7 +288,7 @@ def export_to_excel(data_frame: pd.DataFrame, output_file: str) -> None:
                     cell.alignment = Alignment(
                         horizontal=cell.alignment.horizontal, vertical="top", wrap_text=True
                     )
-                event_column = data_frame.columns.get_loc("Event Type") + 1
+                event_column = data_frame.columns.tolist().index("Event Type") + 1
                 worksheet.cell(row_i, event_column).font = Font(bold=True)
 
         # Two-line header row (15 pt per line of the default 11 pt font)
