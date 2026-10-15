@@ -18,7 +18,7 @@ Method:
       Nearby but noncoincident shapes are not snapped together. Coincident means
       within the XY tolerance (1 mm by default), so opposite directions on one
       street count once only if their shapes trace the same path.
-    * Measure planar miles in ANALYSIS_WKID (default NAD83 / Virginia North, ftUS).
+    * Measure planar miles in ANALYSIS_EPSG (default NAD83 / Virginia North, ftUS).
     * Report two length/percentage bases: full route (including outside areas),
       and district-only (outside length set to zero and excluded from the total).
     * Split linework shared by multiple district polygons equally among them.
@@ -90,7 +90,8 @@ DISTRICT_NAME_FIELD: Optional[str] = None
 ROUTES_TO_INCLUDE: Set[str] = set()
 ROUTES_TO_EXCLUDE: Set[str] = set()
 
-ANALYSIS_WKID = 2283
+# EPSG code of a local projected CRS (ArcGIS lists it as the WKID).
+ANALYSIS_EPSG = 2283
 OUTSIDE_LABEL = "Outside districts"
 
 # Optional explicit geographic transformations; None selects the first suitable
@@ -470,9 +471,9 @@ def insert_rows(feature_class: str, fields: Sequence[str], rows: Sequence[Sequen
 
 def run_analysis(run_dir: Path) -> None:
     """Build route linework, allocate district lengths, and write tables and GIS data."""
-    target = arcpy.SpatialReference(ANALYSIS_WKID)
+    target = arcpy.SpatialReference(ANALYSIS_EPSG)
     if target.type != "Projected":
-        raise ValueError("ANALYSIS_WKID must be a suitable local projected coordinate system.")
+        raise ValueError("ANALYSIS_EPSG must be a suitable local projected coordinate system.")
     LOGGER.info("Analysis coordinate system: %s", target.name)
     routes, route_shapes, trip_counts = load_routes_and_trips()
     districts, district_field, district_transform = load_districts(target)
@@ -703,7 +704,7 @@ def run_analysis(run_dir: Path) -> None:
         "districts_fc": str(DISTRICTS_FC),
         "district_name_field": district_field,
         "district_labels": list(districts),
-        "analysis_wkid": ANALYSIS_WKID,
+        "analysis_epsg": ANALYSIS_EPSG,
         "analysis_crs": target.name,
         "gtfs_transformation": gtfs_transform,
         "district_transformation": district_transform,
@@ -763,7 +764,7 @@ def main() -> int:
         # Each run uses new output names, avoiding locks and stale temporary layers.
         # No map extent, feature-layer selection, or inherited output CRS is used.
         with arcpy.EnvManager(
-            overwriteOutput=False, outputCoordinateSystem=arcpy.SpatialReference(ANALYSIS_WKID)
+            overwriteOutput=False, outputCoordinateSystem=arcpy.SpatialReference(ANALYSIS_EPSG)
         ):
             run_analysis(run_dir)
         LOGGER.info("Completed successfully in %.1f seconds.", time.perf_counter() - started)
