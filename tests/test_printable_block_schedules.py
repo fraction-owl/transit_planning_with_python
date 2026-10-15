@@ -316,6 +316,34 @@ def test_prepare_stop_times_unknown_stop_falls_back_to_unknown_stop() -> None:
     assert (unknown == "Unknown Stop").all()
 
 
+def test_prepare_stop_times_stop_label_defaults_to_stop_code() -> None:
+    stops = _make_stops()
+    stops["stop_code"] = ["1001", None, "1003"]
+    result = prepare_stop_times(_make_prep_trips(), _make_prep_stop_times(), stops)
+    assert result["stop_label"].tolist() == ["1001", "", "1003"]
+
+
+def test_prepare_stop_times_stop_label_uses_stop_id_when_configured() -> None:
+    stops = _make_stops()
+    stops["stop_code"] = ["1001", "1002", "1003"]
+    with patch(f"{_MODULE}.STOP_ID_FIELD", "stop_id"):
+        result = prepare_stop_times(_make_prep_trips(), _make_prep_stop_times(), stops)
+    assert result["stop_label"].tolist() == ["S1", "S2", "S3"]
+
+
+def test_prepare_stop_times_stop_label_falls_back_without_stop_code_column() -> None:
+    result = prepare_stop_times(_make_prep_trips(), _make_prep_stop_times(), _make_stops())
+    assert result["stop_label"].tolist() == ["S1", "S2", "S3"]
+
+
+def test_prepare_stop_times_invalid_stop_id_field_raises() -> None:
+    with (
+        patch(f"{_MODULE}.STOP_ID_FIELD", "stop_name"),
+        pytest.raises(ValueError, match="STOP_ID_FIELD"),
+    ):
+        prepare_stop_times(_make_prep_trips(), _make_prep_stop_times(), _make_stops())
+
+
 def test_prepare_stop_times_sorted_by_block_trip_sequence() -> None:
     result = prepare_stop_times(_make_prep_trips(), _make_prep_stop_times(), _make_stops())
     result = result.reset_index(drop=True)
@@ -371,6 +399,7 @@ def _make_block_df() -> pd.DataFrame:
             "stop_sequence": [1, 2, 1],
             "timepoint": [0, 0, 1],
             "stop_id": ["S1", "S2", "S3"],
+            "stop_label": ["S1", "S2", "S3"],
             "stop_name": ["Oak St", "Elm Ave", "Pine Rd"],
             "scheduled_arrival_hhmm": ["07:00", "07:05", "08:00"],
             "scheduled_departure_hhmm": ["07:00", "07:05", "08:00"],
@@ -517,6 +546,7 @@ def _make_prepared_block(
     df["direction_id"] = "0"
     df["service_id"] = service_id
     df["timepoint"] = 1
+    df["stop_label"] = df["stop_id"]
     df["stop_name"] = "Stop " + df["stop_id"]
     df["arrival_seconds"] = df["arrival_time"].map(time_to_seconds)
     df["departure_seconds"] = df["departure_time"].map(time_to_seconds)
@@ -821,7 +851,11 @@ def test_main_exports_gtfs_basic_fixture(tmp_path: Path) -> None:
         patch(f"{_MODULE}.TIMEPOINTS_ONLY", False),
     ):
         assert main() == 0
-    assert list(tmp_path.glob("*.xlsx"))
+    files = list(tmp_path.glob("*.xlsx"))
+    assert files
+    result = pd.read_excel(files[0], dtype=str, keep_default_na=False)
+    stop_ids = result.loc[result["Event Type"] == "Stop", "Stop ID"]
+    assert stop_ids.str.fullmatch(r"\d+").all()  # gtfs_basic stop_codes, not S-prefixed stop_ids
 
 
 @pytest.mark.parametrize(
