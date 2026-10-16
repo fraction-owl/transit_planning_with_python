@@ -10,7 +10,11 @@ of the stops they visit, not by stop_sequence numbers, which GTFS only defines
 within a single trip. If trips in one direction visit stops in conflicting
 orders, the extra patterns go to additional sheets (e.g. ``Direction_0_2``).
 Each cell shows the departure time, except at a trip's final stop, which shows
-the arrival time. Rows are sorted by each trip's first displayed time.
+the arrival time. Rows are ordered by times at shared timepoints, so trips
+starting partway along a route appear in the correct position. First displayed
+times break ties between trips whose relative order is unconstrained. If no
+single row order works at every timepoint, the first displayed time order is
+retained and the conflicts are reported for review.
 
 Outputs:
     - One Excel file per route × service type with timetable sheets by direction
@@ -23,6 +27,7 @@ Typical usage:
 
 from __future__ import annotations
 
+import heapq
 import logging
 import os
 import re
@@ -44,16 +49,17 @@ GTFS_FOLDER_PATH = r"Path\To\Your\GTFS_Folder"  # Folder contains GTFS .txt file
 BASE_OUTPUT_PATH = r"Path\To\Your\Output_Folder"
 
 # Filter service id's can be found in calendar.txt or calendar_dates.txt
-FILTER_SERVICE_IDS: list[str] = ["1", "2", "3"]
-FILTER_IN_ROUTES: list[str] = ["101", "202"]  # routes to keep
+FILTER_SERVICE_IDS: list[str] = ["1", "2", "3", "4"]
+FILTER_IN_ROUTES: list[str] = []  # routes to keep
 FILTER_OUT_ROUTES: list[str] = []  # routes to exclude
 
 # Explicit schedule label overrides for the selected service_ids
 # Assignments can be found in calendar.txt file
 SERVICE_LABEL_OVERRIDES: dict[str, str] = {
-    "1": "Weekday",
-    "2": "Saturday",
-    "3": "Sunday",
+    "1": "Saturday",
+    "2": "Sunday",
+    "3": "Holiday",
+    "4": "Weekday",
 }
 
 TIME_FORMAT_OPTION = "24"  # "12" or "24"
@@ -300,9 +306,10 @@ def check_schedule_order(
 ) -> int:
     """Validate that times increase by stop (row) and by trip (column).
 
-    A time that decreases down a column means a trip leaves a stop earlier
-    than the trip listed above it. That can be legitimate (an express
-    overtaking a local), so it is reported for review rather than as an error.
+    A time that decreases down a column means a trip serves a stop earlier
+    than the preceding trip with a time in that column. This can reflect row
+    ordering or legitimate overtaking, so it is reported for review rather
+    than treated as proof of a GTFS error.
 
     Args:
         minutes_df (pandas.DataFrame): Minutes after midnight, one row per trip
@@ -341,6 +348,7 @@ def check_schedule_order(
     # Column-wise check
     for col_name in minutes_df.columns:
         last_time = None
+        last_trip_id = None
         for trip_id, current_time in minutes_df[col_name].items():
             if pd.isna(current_time):
                 continue
@@ -348,17 +356,19 @@ def check_schedule_order(
                 violations += 1
                 logging.warning(
                     "⚠️ Time order violation in Route '%s', Schedule '%s', Direction '%s', "
-                    "Stop '%s': trip '%s' at %s is earlier than the trip listed above it "
-                    "(an overtaking trip, or a data error).",
+                    "Stop '%s': trip '%s' at %s is earlier than preceding nonblank trip "
+                    "'%s' at %s (row ordering, overtaking, or a data error).",
                     route_short_name,
                     schedule_type,
                     dir_id,
                     col_name,
                     trip_id,
                     _minutes_to_hhmm(int(current_time)),
+                    last_trip_id,
+                    _minutes_to_hhmm(int(last_time)),
                 )
-                break
             last_time = current_time
+            last_trip_id = trip_id
 
     if violations:
         logging.warning(
@@ -775,6 +785,63 @@ def process_single_trip(
     return display, minutes
 
 
+def get_timetable_row_order(minutes_df: pd.DataFrame) -> tuple[list[int], bool]:
+    """Find a row order that makes every timepoint column nondecreasing.
+
+    Earlier times at a shared column impose precedence between trips. Equal
+    times impose no order. Connecting adjacent distinct time groups suffices
+    because their ordering also orders every earlier group before later ones.
+    A stable topological sort combines those constraints across all columns,
+    including layouts with no single timepoint served by every trip.
+
+    Args:
+        minutes_df: Numeric timetable in first displayed time order. Missing
+            values are NaN; times retain GTFS hours beyond midnight. Repeated
+            visits to a stop must occupy separate columns.
+
+    Returns:
+        Positional row indices and whether all column constraints can be met.
+        If constraints form a cycle, return the original order and False;
+        overtaking or conflicting patterns require review, not hidden times.
+    """
+    row_count = len(minutes_df)
+    successors: list[set[int]] = [set() for _ in range(row_count)]
+    indegrees = [0] * row_count
+
+    for column_idx in range(minutes_df.shape[1]):
+        time_groups: dict[float, list[int]] = defaultdict(list)
+        for row_idx, value in enumerate(minutes_df.iloc[:, column_idx]):
+            if pd.notna(value):
+                time_groups[float(value)].append(row_idx)
+
+        previous_group: list[int] = []
+        for time_value in sorted(time_groups):
+            current_group = time_groups[time_value]
+            for earlier in previous_group:
+                for later in current_group:
+                    if later not in successors[earlier]:
+                        successors[earlier].add(later)
+                        indegrees[later] += 1
+            previous_group = current_group
+
+    # Original row positions break ties deterministically, without comparing
+    # departure times from different origins when a shared stop supplies order.
+    ready = [idx for idx, degree in enumerate(indegrees) if degree == 0]
+    heapq.heapify(ready)
+    ordered = []
+    while ready:
+        earlier = heapq.heappop(ready)
+        ordered.append(earlier)
+        for later in successors[earlier]:
+            indegrees[later] -= 1
+            if indegrees[later] == 0:
+                heapq.heappush(ready, later)
+
+    if len(ordered) != row_count:
+        return list(range(row_count)), False
+    return ordered, True
+
+
 def process_trips_for_direction(params: dict[str, Any]) -> list[pd.DataFrame]:
     """Generate the timetable grid(s) for a single ``direction_id``.
 
@@ -834,7 +901,7 @@ def process_trips_for_direction(params: dict[str, Any]) -> list[pd.DataFrame]:
             if assignment[patterns[trip_id]] != layout_idx:
                 continue
             display, minutes = process_single_trip(trip_id, times, columns)
-            # Sort by the trip's first displayed time, then its last, then trip_id.
+            # Establish the tie-break/fallback order before shared-stop sorting.
             sort_key = (times[0][1], times[-1][1], trip_id)
             rows.append((sort_key, trip_id, display, minutes))
         rows.sort(key=lambda r: r[0])
@@ -852,6 +919,19 @@ def process_trips_for_direction(params: dict[str, Any]) -> list[pd.DataFrame]:
             columns=headers,
             dtype="float",
         )
+        row_order, consistent_order = get_timetable_row_order(minutes_df)
+        if not consistent_order:
+            logging.warning(
+                "Route '%s', schedule '%s', direction '%s', layout %d: no single trip row "
+                "order makes every timepoint chronological. Possible overtaking or "
+                "conflicting patterns; retaining first displayed time order for review.",
+                route_short,
+                sched_type,
+                dir_id,
+                layout_idx + 1,
+            )
+        out_df = out_df.iloc[row_order].reset_index(drop=True)
+        minutes_df = minutes_df.iloc[row_order]
         safe_check_schedule_order(minutes_df, route_short, sched_type, dir_id)
         frames.append(remove_empty_schedule_columns(out_df))
     return frames

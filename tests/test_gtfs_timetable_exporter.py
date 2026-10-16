@@ -619,6 +619,7 @@ def _run_main(monkeypatch: pytest.MonkeyPatch, feed: Path, out: Path) -> tuple[i
     monkeypatch.setattr(mod, "BASE_OUTPUT_PATH", str(out))
     monkeypatch.setattr(mod, "FILTER_SERVICE_IDS", ["1"])
     monkeypatch.setattr(mod, "FILTER_IN_ROUTES", [])
+    monkeypatch.setattr(mod, "SERVICE_LABEL_OVERRIDES", {"1": "Weekday"})
     monkeypatch.setattr(mod, "TIME_FORMAT_OPTION", "24")
     rc = mod.main()
     workbook = out / "weekday_sid_1" / "route_101_timetable_weekday_sid_1.xlsx"
@@ -691,11 +692,11 @@ def test_main_shared_stop_names_get_distinct_columns(
     assert row[3:] == ("08:00", "08:10", "08:20")
 
 
-def test_main_shows_departure_and_final_arrival_sorted_by_first_time(
+def test_main_shows_departure_and_final_arrival_ordered_by_shared_stops(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # T1 dwells at B and at its final stop D; T2 is a short trip that starts later
-    # but ends earlier, and must still sort below T1.
+    # but serves B and C before T1, so it sorts above T1.
     feed = _write_feed(
         tmp_path / "gtfs",
         _ABCD,
@@ -707,8 +708,8 @@ def test_main_shows_departure_and_final_arrival_sorted_by_first_time(
     assert rc == 0
     ((_, (_, *rows)),) = sheets
     assert [row[3:] for row in rows] == [
-        ("08:00", "08:15", "08:25", "08:40"),
         (MISSING_TIME, "08:12", "08:20", MISSING_TIME),
+        ("08:00", "08:15", "08:25", "08:40"),
     ]
 
 
