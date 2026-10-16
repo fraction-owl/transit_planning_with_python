@@ -65,7 +65,7 @@ transit_planning_with_python/
 │   │   ├── segment_speed_exporter.py
 │   │   ├── stop_pattern_exporter.py
 │   │   ├── time_band_exporter.py
-│   │   └── timepoint_schedule_exporter.py
+│   │   └── gtfs_timetable_exporter.py
 │   ├── modeling/
 │   │   ├── monthly_ridership_model.py
 │   │   ├── orchestrator_jobs_private.json
@@ -304,7 +304,7 @@ transit_planning_with_python/
 │   ├── test_stops_ridership_joiner_gpd.py
 │   ├── test_time_band_exporter.py
 │   ├── test_time_helpers.py
-│   ├── test_timepoint_schedule_exporter.py
+│   ├── test_gtfs_timetable_exporter.py
 │   ├── test_trip_runtime_diagnostics_from_avl.py
 │   ├── test_uscensus_table_build.py
 │   ├── test_uscensus_tiger_join_arcpy.py
