@@ -54,7 +54,8 @@ invalid shapes for routes with trips cause an error rather than partial results.
 total_route_miles is the unique linework length described above.
 CSV miles and percentages are rounded to CSV_DECIMALS places (one by default),
 so a row's displayed percentages may sum to 99.9 or 100.1; the percent-sum
-columns are summed before rounding.
+columns are summed before rounding. The QA shared-length and length-check
+difference columns use QA_CSV_DECIMALS (six by default).
 
 Typical usage:
     Set the paths in the CONFIGURATION section and run with Python 3.12 or newer
@@ -115,6 +116,9 @@ OUTSIDE_LABEL = "Outside districts"
 # Decimal places for miles and percentages in the CSV tables. Calculations, the
 # length check, and GIS layer attributes keep full precision.
 CSV_DECIMALS = 1
+# The QA shared-length and length-check difference columns report amounts near the
+# 0.1-foot check thresholds, so they keep more places (0.000001 mile is about 0.06 inch).
+QA_CSV_DECIMALS = 6
 
 # Optional explicit datum transformations, given as a transformation description
 # from the log; None selects the most accurate one installed for the data's extent.
@@ -136,6 +140,7 @@ LOG_LEVEL = logging.INFO
 
 LOGGER = logging.getLogger("route_length_by_district_gpd")
 METERS_PER_MILE = 1609.344
+QA_DETAIL_FIELDS = {"shared_boundary_or_overlap_miles", "length_check_delta_miles"}
 RouteInfo = dict[str, str]
 Piece = tuple[tuple[str, ...], BaseGeometry]
 
@@ -528,18 +533,19 @@ def inside_percentage(label: str, allocated_miles: float, inside_miles: float) -
 
 
 def write_csv(path: Path, fields: Sequence[str], rows: Sequence[dict[str, Any]]) -> None:
-    """Write an Excel-readable UTF-8 CSV, rounding numbers to CSV_DECIMALS places."""
+    """Write an Excel-readable UTF-8 CSV with numbers rounded to fixed decimal places."""
     with path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
         for row in rows:
-            # Adding 0.0 writes tiny negative values, such as length deltas, as 0.0, not -0.0.
-            writer.writerow(
-                {
-                    key: round(value, CSV_DECIMALS) + 0.0 if isinstance(value, float) else value
-                    for key, value in row.items()
-                }
-            )
+            formatted: dict[str, Any] = {}
+            for key, value in row.items():
+                if isinstance(value, float):
+                    places = QA_CSV_DECIMALS if key in QA_DETAIL_FIELDS else CSV_DECIMALS
+                    # Fixed notation avoids 1.9e-05; adding 0.0 writes -0.0 as 0.0.
+                    value = f"{round(value, places) + 0.0:.{places}f}"
+                formatted[key] = value
+            writer.writerow(formatted)
     LOGGER.info("Wrote %s (%d rows).", path.name, len(rows))
 
 
@@ -813,6 +819,7 @@ def run_analysis(run_dir: Path) -> None:
         "shared_length_policy": "Equal split among all intersecting district labels.",
         "outside_label": OUTSIDE_LABEL,
         "csv_decimals": CSV_DECIMALS,
+        "qa_csv_decimals": QA_CSV_DECIMALS,
         "output_directory": str(run_dir),
         "versions": {
             "geopandas": gpd.__version__,
