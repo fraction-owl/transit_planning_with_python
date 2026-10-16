@@ -540,6 +540,14 @@ def test_check_schedule_order_counts_violations(caplog: pytest.LogCaptureFixture
     assert "Trip 'T1'" in caplog.text
 
 
+def test_check_schedule_order_records_each_violation() -> None:
+    minutes = pd.DataFrame([[510.0, 490.0]], index=["T1"], columns=["A Schedule", "B Schedule"])
+    issues: list[str] = []
+    assert check_schedule_order(minutes, "101", "Weekday", "0", issues) == 1
+    assert len(issues) == 1
+    assert "Trip 'T1': 'B Schedule' time 08:10" in issues[0]
+
+
 def test_check_schedule_order_passes_clean_grid(caplog: pytest.LogCaptureFixture) -> None:
     minutes = pd.DataFrame([[480.0, None], [490.0, 500.0]], index=["T1", "T2"], columns=["A", "B"])
     with caplog.at_level(logging.INFO):
@@ -556,6 +564,9 @@ def test_format_workbook_name_includes_service_id_and_sanitizes() -> None:
     assert format_workbook_name("101", "Weekday", "1") == "route_101_timetable_weekday_sid_1.xlsx"
     assert format_workbook_name("10/11", "Weekday", "A:B") == (
         "route_10_11_timetable_weekday_sid_A_B.xlsx"
+    )
+    assert format_workbook_name("101", "Weekday", "1", flagged=True) == (
+        "route_101_timetable_weekday_sid_1_warning.xlsx"
     )
 
 
@@ -612,7 +623,14 @@ def _write_feed(
     return folder
 
 
-def _run_main(monkeypatch: pytest.MonkeyPatch, feed: Path, out: Path) -> tuple[int, list[tuple]]:
+_WORKBOOK = "route_101_timetable_weekday_sid_1.xlsx"
+_FLAGGED_WORKBOOK = "route_101_timetable_weekday_sid_1_warning.xlsx"
+_RUN_LOG = "gtfs_timetable_exporter_runlog.txt"
+
+
+def _run_main(
+    monkeypatch: pytest.MonkeyPatch, feed: Path, out: Path, workbook_name: str = _WORKBOOK
+) -> tuple[int, list[tuple]]:
     import scripts.gtfs_exports.gtfs_timetable_exporter as mod
 
     monkeypatch.setattr(mod, "GTFS_FOLDER_PATH", str(feed))
@@ -622,7 +640,7 @@ def _run_main(monkeypatch: pytest.MonkeyPatch, feed: Path, out: Path) -> tuple[i
     monkeypatch.setattr(mod, "SERVICE_LABEL_OVERRIDES", {"1": "Weekday"})
     monkeypatch.setattr(mod, "TIME_FORMAT_OPTION", "24")
     rc = mod.main()
-    workbook = out / "weekday_sid_1" / "route_101_timetable_weekday_sid_1.xlsx"
+    workbook = out / "weekday_sid_1" / workbook_name
     if not workbook.is_file():
         return rc, []
     wb = openpyxl.load_workbook(workbook)
@@ -722,7 +740,8 @@ def test_main_exports_trips_without_direction_id(
         "T1,08:00:00,08:00:00,A,1,1\nT1,08:10:00,08:10:00,B,2,1\n",
         trips="route_id,service_id,trip_id,trip_headsign\nR,1,T1,East\n",
     )
-    rc, sheets = _run_main(monkeypatch, feed, tmp_path / "out")
+    # Trips without a direction_id are flagged for review.
+    rc, sheets = _run_main(monkeypatch, feed, tmp_path / "out", _FLAGGED_WORKBOOK)
     assert rc == 0
     assert [title for title, _ in sheets] == ["No_Direction"]
 
@@ -764,3 +783,101 @@ def test_main_returns_1_when_a_workbook_cannot_be_written(
     (out / "weekday_sid_1" / "route_101_timetable_weekday_sid_1.xlsx").mkdir(parents=True)
     rc, _ = _run_main(monkeypatch, feed, out)
     assert rc == 1
+    assert "FAILED EXPORTS (1)\n" in (out / _RUN_LOG).read_text(encoding="utf-8")
+    assert "route '101', service_id '1'" in (out / _RUN_LOG).read_text(encoding="utf-8")
+
+
+# T2 starts after T1 at A but reaches C first, so no row order is chronological at both.
+_OVERTAKING = (
+    "T1,08:00:00,08:00:00,A,1,1\nT1,08:30:00,08:30:00,C,2,1\n"
+    "T2,08:05:00,08:05:00,A,1,1\nT2,08:20:00,08:20:00,C,2,1\n"
+)
+
+
+def test_main_flags_questionable_workbook_and_lists_it_in_run_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    feed = _write_feed(tmp_path / "gtfs", _ABCD, _OVERTAKING)
+    out = tmp_path / "out"
+    rc, sheets = _run_main(monkeypatch, feed, out, _FLAGGED_WORKBOOK)
+    assert rc == 0
+    ((_, (_, *rows)),) = sheets
+    # The first displayed time order is kept for review.
+    assert [row[3:] for row in rows] == [("08:00", "08:30"), ("08:05", "08:20")]
+    assert not (out / "weekday_sid_1" / _WORKBOOK).exists()
+
+    log = (out / _RUN_LOG).read_text(encoding="utf-8")
+    assert "FLAGGED WORKBOOKS (1)" in log
+    assert str(Path("weekday_sid_1") / _FLAGGED_WORKBOOK) in log
+    assert "no single trip row order" in log
+    assert "Stop 'Charlie Schedule': trip 'T2' at 08:20" in log
+    assert "FAILED EXPORTS (0)" in log
+    # The CONFIGURATION block is recorded verbatim.
+    assert 'WARNING_FILENAME_SUFFIX = "_warning"' in log
+
+
+def test_main_clean_workbook_has_plain_name_and_empty_flag_list(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    feed = _write_feed(
+        tmp_path / "gtfs",
+        _ABCD,
+        "T1,08:00:00,08:00:00,A,1,1\nT1,08:10:00,08:10:00,B,2,1\n",
+        trips="route_id,service_id,trip_id,trip_headsign,direction_id\nR,1,T1,East,0\n",
+    )
+    out = tmp_path / "out"
+    rc, sheets = _run_main(monkeypatch, feed, out)
+    assert rc == 0
+    assert sheets
+    log = (out / _RUN_LOG).read_text(encoding="utf-8")
+    assert "FLAGGED WORKBOOKS (0)" in log
+    assert "Service labels:       1 → Weekday" in log
+
+
+@pytest.mark.parametrize(
+    ("stop_times", "stale_name", "kept_name"),
+    [
+        # Fixed since the last run: the old flagged copy is removed.
+        ("T1,08:00:00,08:00:00,A,1,1\nT1,08:10:00,08:10:00,B,2,1\n", _FLAGGED_WORKBOOK, _WORKBOOK),
+        # Newly flagged: the old plain copy is removed.
+        (_OVERTAKING, _WORKBOOK, _FLAGGED_WORKBOOK),
+    ],
+)
+def test_main_removes_previous_copy_under_the_other_name(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stop_times: str,
+    stale_name: str,
+    kept_name: str,
+) -> None:
+    feed = _write_feed(tmp_path / "gtfs", _ABCD, stop_times)
+    out = tmp_path / "out"
+    folder = out / "weekday_sid_1"
+    folder.mkdir(parents=True)
+    (folder / stale_name).write_text("previous run")
+    rc, sheets = _run_main(monkeypatch, feed, out, kept_name)
+    assert rc == 0
+    assert sheets
+    assert sorted(p.name for p in folder.iterdir()) == [kept_name]
+
+
+def test_main_returns_1_when_required_run_log_cannot_be_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import scripts.gtfs_exports.gtfs_timetable_exporter as mod
+
+    feed = _write_feed(
+        tmp_path / "gtfs",
+        _ABCD,
+        "T1,08:00:00,08:00:00,A,1,1\nT1,08:10:00,08:10:00,B,2,1\n",
+        trips="route_id,service_id,trip_id,trip_headsign,direction_id\nR,1,T1,East,0\n",
+    )
+    out = tmp_path / "out"
+    # A directory where the run log should go makes the write fail.
+    (out / _RUN_LOG).mkdir(parents=True)
+    rc, _ = _run_main(monkeypatch, feed, out)
+    assert rc == 1
+
+    monkeypatch.setattr(mod, "REQUIRE_RUN_LOG", False)
+    rc, _ = _run_main(monkeypatch, feed, out)
+    assert rc == 0

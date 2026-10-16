@@ -17,7 +17,11 @@ single row order works at every timepoint, the first displayed time order is
 retained and the conflicts are reported for review.
 
 Outputs:
-    - One Excel file per route × service type with timetable sheets by direction
+    - One Excel file per route × service type with timetable sheets by direction.
+      Files with problems to review end in ``WARNING_FILENAME_SUFFIX``
+      (e.g. ``route_101_timetable_weekday_sid_1_warning.xlsx``).
+    - ``RUN_LOG_FILENAME`` in ``BASE_OUTPUT_PATH``: the problems found in each
+      flagged workbook, any failed exports, and the configuration used.
 
 Typical usage:
     Configuration is manual: edit the constants in the CONFIGURATION section
@@ -28,12 +32,15 @@ Typical usage:
 from __future__ import annotations
 
 import heapq
+import json
 import logging
 import os
 import re
 import sys
 import zipfile
 from collections import Counter, defaultdict
+from datetime import datetime
+from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
 import pandas as pd
@@ -43,6 +50,7 @@ from openpyxl.utils import get_column_letter
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+# === BEGIN CONFIG ===
 
 GTFS_FOLDER_PATH = r"Path\To\Your\GTFS_Folder"  # Folder contains GTFS .txt files
 
@@ -65,6 +73,18 @@ SERVICE_LABEL_OVERRIDES: dict[str, str] = {
 TIME_FORMAT_OPTION = "24"  # "12" or "24"
 MISSING_TIME = "---"
 MAX_COLUMN_WIDTH = 30
+
+# Workbooks with problems to review (e.g. times out of order, skipped trips) get
+# this suffix: route_101_timetable_weekday_sid_1_warning.xlsx. The run log lists
+# each problem. Set to "" to keep plain file names.
+WARNING_FILENAME_SUFFIX = "_warning"
+
+RUN_LOG_FILENAME = "gtfs_timetable_exporter_runlog.txt"  # in BASE_OUTPUT_PATH
+
+# Every output must be traceable: if the run log cannot be written, the script
+# exits with an error. Set to False only when writing to a genuinely read-only
+# location.
+REQUIRE_RUN_LOG: bool = True
 
 # Required and optional GTFS files. At least one of calendar.txt and
 # calendar_dates.txt must be present.
@@ -89,6 +109,8 @@ OPTIONAL_GTFS_FILES: tuple[str, ...] = (
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
 
+# === END CONFIG ===
+
 # =============================================================================
 # FUNCTIONS
 # =============================================================================
@@ -103,15 +125,21 @@ def format_output_folder_name(service_id: str, schedule_type: str) -> str:
     return f"{_slugify(schedule_type)}_sid_{_safe_filename_part(service_id)}"
 
 
-def format_workbook_name(route_short_name: str, schedule_type: str, service_id: str) -> str:
+def format_workbook_name(
+    route_short_name: str, schedule_type: str, service_id: str, flagged: bool = False
+) -> str:
     """Return the workbook file name for one route and service_id.
+
+    A *flagged* workbook (one with problems to review) ends in
+    ``WARNING_FILENAME_SUFFIX``.
 
     Example:
         Route 101, Weekday (service_id=1) → 'route_101_timetable_weekday_sid_1.xlsx'
     """
+    suffix = WARNING_FILENAME_SUFFIX if flagged else ""
     return (
         f"route_{_safe_filename_part(route_short_name)}_timetable_"
-        f"{_slugify(schedule_type)}_sid_{_safe_filename_part(service_id)}.xlsx"
+        f"{_slugify(schedule_type)}_sid_{_safe_filename_part(service_id)}{suffix}.xlsx"
     )
 
 
@@ -298,11 +326,24 @@ def remove_empty_schedule_columns(input_df: pd.DataFrame) -> pd.DataFrame:
     return input_df
 
 
+def flag_issue(issues: Optional[list[str]], message: str, *args: Any) -> None:
+    """Log a warning about the workbook being built and record it in *issues*.
+
+    A workbook with recorded issues is flagged for review: its file name ends
+    in ``WARNING_FILENAME_SUFFIX`` and the run log lists the issues. Recording
+    does not depend on ``LOG_LEVEL``.
+    """
+    logging.warning(message, *args)
+    if issues is not None:
+        issues.append((message % args if args else message).strip())
+
+
 def check_schedule_order(
     minutes_df: pd.DataFrame,
     route_short_name: str,
     schedule_type: str,
     dir_id: str,
+    issues: Optional[list[str]] = None,
 ) -> int:
     """Validate that times increase by stop (row) and by trip (column).
 
@@ -318,6 +359,8 @@ def check_schedule_order(
         route_short_name (str): Human-readable route label.
         schedule_type (str): *Weekday*, *Saturday*, *Holiday*, etc.
         dir_id (str): ``direction_id`` value.
+        issues (list[str] | None): Receives one entry per violation; see
+            :func:`flag_issue`.
 
     Returns:
         The number of order violations found (0 means the check passed).
@@ -332,7 +375,8 @@ def check_schedule_order(
                 continue
             if last_time is not None and current_time < last_time:
                 violations += 1
-                logging.warning(
+                flag_issue(
+                    issues,
                     "⚠️ Time order violation in Route '%s', Schedule '%s', Direction '%s', "
                     "Trip '%s': '%s' time %s is earlier than the previous stop's time.",
                     route_short_name,
@@ -354,7 +398,8 @@ def check_schedule_order(
                 continue
             if last_time is not None and current_time < last_time:
                 violations += 1
-                logging.warning(
+                flag_issue(
+                    issues,
                     "⚠️ Time order violation in Route '%s', Schedule '%s', Direction '%s', "
                     "Stop '%s': trip '%s' at %s is earlier than preceding nonblank trip "
                     "'%s' at %s (row ordering, overtaking, or a data error).",
@@ -394,15 +439,24 @@ def safe_check_schedule_order(
     route_short_name: str,
     schedule_type: str,
     dir_id: str,
+    issues: Optional[list[str]] = None,
 ) -> Optional[int]:
-    """Run :func:`check_schedule_order` but never propagate its errors."""
+    """Run :func:`check_schedule_order` but never propagate its errors.
+
+    A check that could not run is recorded in *issues*, since the workbook's
+    order is then unverified.
+    """
     try:
-        return check_schedule_order(minutes_df, route_short_name, schedule_type, dir_id)
+        return check_schedule_order(minutes_df, route_short_name, schedule_type, dir_id, issues)
     except (ValueError, TypeError, KeyError) as error:
         logging.error(  # Changed print to logging.error
             f"❌ Skipping schedule order check for route '{route_short_name}', "
             f"schedule '{schedule_type}', direction '{dir_id}' due to error:\n  {error}"
         )
+        if issues is not None:
+            issues.append(
+                f"Schedule order check skipped for direction '{dir_id}' due to error: {error}"
+            )
         return None
 
 
@@ -845,6 +899,9 @@ def get_timetable_row_order(minutes_df: pd.DataFrame) -> tuple[list[int], bool]:
 def process_trips_for_direction(params: dict[str, Any]) -> list[pd.DataFrame]:
     """Generate the timetable grid(s) for a single ``direction_id``.
 
+    Problems that need review (skipped trips, conflicting stop orders, times
+    out of order) are recorded in ``params["issues"]``; see :func:`flag_issue`.
+
     Returns:
         One DataFrame per column layout (see :func:`build_column_layouts`);
         usually one. Empty list if the direction has no usable trips.
@@ -855,6 +912,7 @@ def process_trips_for_direction(params: dict[str, Any]) -> list[pd.DataFrame]:
     ctx = params["ctx"]
     route_short = params["route_short"]
     sched_type = params["sched_type"]
+    issues: Optional[list[str]] = params.get("issues")
 
     timepoints_dir = timepoints[timepoints["trip_id"].isin(trips_dir["trip_id"])]
     if timepoints_dir.empty:
@@ -877,14 +935,15 @@ def process_trips_for_direction(params: dict[str, Any]) -> list[pd.DataFrame]:
         if times:
             trip_times[str(trip_id)] = times
         else:
-            logging.warning("Trip %s has no usable timepoint times. Skipping.", trip_id)
+            flag_issue(issues, "Trip %s has no usable timepoint times. Skipping.", trip_id)
     if not trip_times:
         return []
 
     patterns = {trip_id: tuple(s for s, _, _ in times) for trip_id, times in trip_times.items()}
     layouts, assignment = build_column_layouts(Counter(patterns.values()))
     if len(layouts) > 1:
-        logging.warning(
+        flag_issue(
+            issues,
             "Route '%s', schedule '%s', direction '%s': trips visit stops in conflicting "
             "orders, so the timetable is split across %d sheets.",
             route_short,
@@ -921,7 +980,8 @@ def process_trips_for_direction(params: dict[str, Any]) -> list[pd.DataFrame]:
         )
         row_order, consistent_order = get_timetable_row_order(minutes_df)
         if not consistent_order:
-            logging.warning(
+            flag_issue(
+                issues,
                 "Route '%s', schedule '%s', direction '%s', layout %d: no single trip row "
                 "order makes every timepoint chronological. Possible overtaking or "
                 "conflicting patterns; retaining first displayed time order for review.",
@@ -932,7 +992,7 @@ def process_trips_for_direction(params: dict[str, Any]) -> list[pd.DataFrame]:
             )
         out_df = out_df.iloc[row_order].reset_index(drop=True)
         minutes_df = minutes_df.iloc[row_order]
-        safe_check_schedule_order(minutes_df, route_short, sched_type, dir_id)
+        safe_check_schedule_order(minutes_df, route_short, sched_type, dir_id, issues)
         frames.append(remove_empty_schedule_columns(out_df))
     return frames
 
@@ -1024,17 +1084,31 @@ def export_route_service(
     route_ids: pd.Series,
     service_id: str,
     ctx: dict[str, Any],
+    flagged: Optional[dict[str, list[str]]] = None,
 ) -> bool:
     """Build and export the timetable workbook for one route and service_id.
 
     Trips without a ``direction_id`` (the column is optional in GTFS) are
     exported together on a ``No_Direction`` sheet rather than dropped.
 
+    A workbook with problems to review is saved with ``WARNING_FILENAME_SUFFIX``
+    and recorded in *flagged*. The previous run's copy under the other name
+    (flagged or not) is removed, so the folder never holds both.
+
+    Args:
+        route_short_name: Route to export.
+        route_ids: ``route_id`` values sharing that short name.
+        service_id: Service to export.
+        ctx: Run context; see :func:`process_route_service_combinations`.
+        flagged: Receives ``{workbook path: issues}`` for a flagged workbook.
+
     Returns:
-        ``False`` if the workbook could not be written, otherwise ``True``.
+        ``False`` if the workbook could not be written, or an outdated copy
+        could not be removed, otherwise ``True``.
     """
     trips_df = ctx["trips"]
     schedule_type = ctx["service_id_schedule_map"].get(service_id, "Unknown")
+    issues: list[str] = []
 
     # Filter trips for this route + this service_id
     relevant_trips = trips_df[
@@ -1055,7 +1129,8 @@ def export_route_service(
         directions = pd.Series("", index=relevant_trips.index)
     relevant_trips = relevant_trips.assign(direction_id=directions)
     if (directions == "").any():
-        logging.warning(
+        flag_issue(
+            issues,
             "  %d trip(s) on route '%s' have no direction_id; exporting them on a "
             "'No_Direction' sheet.",
             int((directions == "").sum()),
@@ -1077,6 +1152,7 @@ def export_route_service(
             "ctx": ctx,
             "route_short": route_short_name,
             "sched_type": schedule_type,
+            "issues": issues,
         }
         output_dfs = process_trips_for_direction(params_dict)
         if not output_dfs:
@@ -1101,15 +1177,39 @@ def export_route_service(
     )
     os.makedirs(service_output_path, exist_ok=True)
     out_file = os.path.join(
-        service_output_path, format_workbook_name(route_short_name, schedule_type, service_id)
+        service_output_path,
+        format_workbook_name(route_short_name, schedule_type, service_id, flagged=bool(issues)),
     )
-    return export_to_excel_multiple_sheets(df_sheets, out_file)
+    # Where a previous run saved this workbook if it was flagged differently then.
+    outdated_file = os.path.join(
+        service_output_path,
+        format_workbook_name(route_short_name, schedule_type, service_id, flagged=not issues),
+    )
+    if not export_to_excel_multiple_sheets(df_sheets, out_file):
+        return False
+    if issues and flagged is not None:
+        flagged[out_file] = issues
+    if outdated_file != out_file and os.path.isfile(outdated_file):
+        try:
+            os.remove(outdated_file)
+        except OSError as error:
+            logging.error(
+                "Could not remove the previous run's workbook %s, which now sits beside %s: %s",
+                outdated_file,
+                out_file,
+                error,
+            )
+            return False
+        logging.info("Removed the previous run's workbook %s.", outdated_file)
+    return True
 
 
-def process_route_service_combinations(ctx: dict[str, Any]) -> int:
+def process_route_service_combinations(
+    ctx: dict[str, Any],
+) -> tuple[list[str], dict[str, list[str]]]:
     """Loop through every route × service_id and export timetable files.
 
-    A failure on one route × service_id is logged and counted, and the
+    A failure on one route × service_id is logged and recorded, and the
     remaining combinations are still processed.
 
     Args:
@@ -1119,7 +1219,8 @@ def process_route_service_combinations(ctx: dict[str, Any]) -> int:
             - time_fmt
 
     Returns:
-        The number of route × service_id combinations that failed.
+        The route × service_id combinations that failed, and the flagged
+        workbooks (``{workbook path: issues}``).
     """
     routes_df = ctx["routes"]
     calendar_df = ctx["calendar"]
@@ -1130,7 +1231,8 @@ def process_route_service_combinations(ctx: dict[str, Any]) -> int:
     logging.info("Final route selection after filters: %s", final_routes)
 
     # 2) For each route, build timetables by direction & service_id
-    failures = 0
+    failed: list[str] = []
+    flagged: dict[str, list[str]] = {}
     for route_short_name in final_routes:
         logging.info("Processing route '%s'...", route_short_name)
         route_ids = routes_df[routes_df["route_short_name"] == route_short_name]["route_id"]
@@ -1139,17 +1241,164 @@ def process_route_service_combinations(ctx: dict[str, Any]) -> int:
             continue
 
         for service_id in calendar_df["service_id"]:
+            label = f"route '{route_short_name}', service_id '{service_id}'"
             try:
-                if not export_route_service(route_short_name, route_ids, service_id, ctx):
-                    failures += 1
+                if not export_route_service(route_short_name, route_ids, service_id, ctx, flagged):
+                    failed.append(label)
             except Exception:
                 logging.exception(
                     "Failed to build the timetable for route '%s', service_id '%s'.",
                     route_short_name,
                     service_id,
                 )
-                failures += 1
-    return failures
+                failed.append(label)
+    return failed, flagged
+
+
+# -----------------------------------------------------------------------------
+# RUN LOG
+# -----------------------------------------------------------------------------
+
+
+# Canonical version lives in utils/run_log.py -- keep this copy in sync.
+def extract_config_block(source_file: Path) -> str:
+    r"""Return the text between the CONFIG markers in *source_file*.
+
+    Reads ``source_file`` as UTF-8 text and slices out the lines strictly
+    *between* the first occurrence of ``# === BEGIN CONFIG ===`` and the first
+    subsequent occurrence of ``# === END CONFIG ===``.  The marker lines
+    themselves are excluded; whitespace and inline comments inside the block
+    are preserved verbatim.
+
+    Args:
+        source_file: Path to the Python source file to scan (typically
+            ``Path(__file__)`` from the calling script).
+
+    Returns:
+        The verbatim text of the configuration block, joined with ``\n``.
+
+    Raises:
+        ValueError: If either marker is missing or they appear out of order.
+        OSError: If ``source_file`` cannot be read.
+    """
+    _BEGIN = "# === BEGIN CONFIG ==="
+    _END = "# === END CONFIG ==="
+
+    lines: list[str] = source_file.read_text(encoding="utf-8").splitlines()
+
+    begin_idx: int | None = None
+    end_idx: int | None = None
+    for i, line in enumerate(lines):
+        stripped: str = line.strip()
+        if begin_idx is None and stripped == _BEGIN:
+            begin_idx = i
+        elif begin_idx is not None and stripped == _END:
+            end_idx = i
+            break
+
+    if begin_idx is None or end_idx is None:
+        raise ValueError(
+            f"Config markers not found in '{source_file}'. Expected '{_BEGIN}' and '{_END}'."
+        )
+
+    return "\n".join(lines[begin_idx + 1 : end_idx])
+
+
+def resolve_source_file() -> Optional[Path]:
+    """Path of this script on disk, or ``None`` in an interactive session without ``__file__``."""
+    try:
+        return Path(__file__).resolve()
+    except NameError:
+        return None
+
+
+def write_run_log(
+    output_dir: Path,
+    summary_lines: Sequence[str],
+    flagged: Mapping[str, list[str]],
+    failed: Sequence[str],
+) -> bool:
+    """Write the ``_runlog.txt`` sidecar for this run into *output_dir*.
+
+    The run writes one workbook per route × service_id, so a single log named
+    after the script sits above their folders. It lists each flagged workbook
+    with the problems found and any failed exports, then captures this
+    script's CONFIGURATION block verbatim, between the
+    ``# === BEGIN CONFIG ===`` / ``# === END CONFIG ===`` markers, and the
+    effective runtime values, including notebook edits.
+
+    Args:
+        output_dir: Folder that receives ``RUN_LOG_FILENAME``.
+        summary_lines: Human-readable lines describing this run.
+        flagged: ``{workbook path: issues}`` for workbooks to review.
+        failed: Route × service_id combinations that were not exported.
+
+    Returns:
+        ``True`` if the log was written successfully, ``False`` otherwise.
+    """
+    log_path = output_dir / RUN_LOG_FILENAME
+
+    source_file = resolve_source_file()
+    if source_file is None:
+        config_text = "(config block unavailable: interactive session, no __file__ on disk)"
+        source_display = "<interactive>"
+    else:
+        try:
+            config_text = extract_config_block(source_file)
+        except (OSError, ValueError) as exc:
+            logging.error("Could not extract config block for run log: %s", exc)
+            return False
+        source_display = str(source_file)
+
+    flagged_lines: list[str] = []
+    for workbook in sorted(flagged):
+        flagged_lines.append(os.path.relpath(workbook, output_dir))
+        flagged_lines.extend(f"  - {issue}" for issue in flagged[workbook])
+
+    lines: list[str] = [
+        "=" * 72,
+        "GTFS TIMETABLE EXPORTER RUN LOG",
+        "=" * 72,
+        f"Run timestamp:    {datetime.now().isoformat(timespec='seconds')}",
+        f"Output folder:    {output_dir}",
+        f"Source script:    {source_display}",
+        "",
+        "-" * 72,
+        "RUN SUMMARY",
+        "-" * 72,
+        *summary_lines,
+        "",
+        "-" * 72,
+        f"FLAGGED WORKBOOKS ({len(flagged)}): review before use",
+        "-" * 72,
+        *(flagged_lines or ["(none)"]),
+        "",
+        "-" * 72,
+        f"FAILED EXPORTS ({len(failed)})",
+        "-" * 72,
+        *(failed or ["(none)"]),
+        "",
+        "-" * 72,
+        "CONFIGURATION (verbatim from source)",
+        "-" * 72,
+        config_text,
+        "",
+        "EFFECTIVE RUNTIME SETTINGS",
+        json.dumps(
+            {name: value for name, value in globals().items() if name.isupper()},
+            indent=2,
+            default=str,
+        ),
+        "=" * 72,
+    ]
+
+    try:
+        log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except OSError as exc:
+        logging.error("Error writing run log: %s", exc)
+        return False
+    logging.info("Run log saved to %s", log_path)
+    return True
 
 
 # -----------------------------------------------------------------------------
@@ -1390,16 +1639,43 @@ def main() -> int:
 
     # Produce timetables
     try:
-        failures = process_route_service_combinations(ctx)
+        failed, flagged = process_route_service_combinations(ctx)
     except Exception as e:
         logging.error("An error occurred during schedule processing: %s", e, exc_info=True)
         if _in_ipython():
             return 1
         raise
-    if failures:
+
+    missing_ids = [sid for sid in FILTER_SERVICE_IDS if sid not in service_id_schedule_map]
+    summary_lines = [
+        f"GTFS feed:            {GTFS_FOLDER_PATH}",
+        "Service labels:       "
+        + ", ".join(f"{sid} → {label}" for sid, label in service_id_schedule_map.items()),
+        f"Service IDs missing:  {', '.join(missing_ids) or '-'}",
+        f"Flagged workbooks:    {len(flagged)}",
+        f"Failed exports:       {len(failed)}",
+    ]
+    run_log_path = Path(BASE_OUTPUT_PATH) / RUN_LOG_FILENAME
+    if not write_run_log(Path(BASE_OUTPUT_PATH), summary_lines, flagged, failed):
+        if REQUIRE_RUN_LOG:
+            logging.error(
+                "Run log could not be written to %s. Set REQUIRE_RUN_LOG = False to "
+                "continue without one.",
+                run_log_path,
+            )
+            return 1
+        logging.warning("Continuing without a run log (REQUIRE_RUN_LOG is False).")
+    if flagged:
+        logging.warning(
+            "%d workbook(s) flagged for review; see the run log at %s.",
+            len(flagged),
+            run_log_path,
+        )
+    if failed:
         logging.error(
-            "Script finished with %d route/service timetable(s) not exported; see errors above.",
-            failures,
+            "Script finished with %d route/service timetable(s) not exported; see errors "
+            "above and the run log.",
+            len(failed),
         )
         return 1
     logging.info("Script completed successfully.")
