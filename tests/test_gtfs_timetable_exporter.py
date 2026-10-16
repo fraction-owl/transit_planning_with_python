@@ -7,7 +7,7 @@ import openpyxl
 import pandas as pd
 import pytest
 
-from scripts.gtfs_exports.timepoint_schedule_exporter import (
+from scripts.gtfs_exports.gtfs_timetable_exporter import (
     MAX_COLUMN_WIDTH,
     MISSING_TIME,
     adjust_time,
@@ -238,7 +238,7 @@ def test_get_all_route_short_names_drops_na() -> None:
 
 
 def test_apply_in_out_filters_filter_in() -> None:
-    import scripts.gtfs_exports.timepoint_schedule_exporter as mod
+    import scripts.gtfs_exports.gtfs_timetable_exporter as mod
 
     orig_in = mod.FILTER_IN_ROUTES
     orig_out = mod.FILTER_OUT_ROUTES
@@ -253,7 +253,7 @@ def test_apply_in_out_filters_filter_in() -> None:
 
 
 def test_apply_in_out_filters_filter_out() -> None:
-    import scripts.gtfs_exports.timepoint_schedule_exporter as mod
+    import scripts.gtfs_exports.gtfs_timetable_exporter as mod
 
     orig_in = mod.FILTER_IN_ROUTES
     orig_out = mod.FILTER_OUT_ROUTES
@@ -274,7 +274,7 @@ def test_apply_in_out_filters_filter_out() -> None:
 
 
 def test_build_service_id_schedule_map_basic() -> None:
-    import scripts.gtfs_exports.timepoint_schedule_exporter as mod
+    import scripts.gtfs_exports.gtfs_timetable_exporter as mod
 
     orig = mod.SERVICE_LABEL_OVERRIDES
     mod.SERVICE_LABEL_OVERRIDES = {}
@@ -298,7 +298,7 @@ def test_build_service_id_schedule_map_basic() -> None:
 
 
 def test_build_service_id_schedule_map_override_takes_precedence() -> None:
-    import scripts.gtfs_exports.timepoint_schedule_exporter as mod
+    import scripts.gtfs_exports.gtfs_timetable_exporter as mod
 
     orig = mod.SERVICE_LABEL_OVERRIDES
     mod.SERVICE_LABEL_OVERRIDES = {"1": "CustomLabel"}
@@ -360,7 +360,7 @@ def test_export_to_excel_multiple_sheets_empty_dict_writes_nothing(tmp_path: Pat
 def test_main_writes_real_schedule_workbooks(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import scripts.gtfs_exports.timepoint_schedule_exporter as mod
+    import scripts.gtfs_exports.gtfs_timetable_exporter as mod
 
     monkeypatch.setattr(mod, "GTFS_FOLDER_PATH", str(GTFS_BASIC))
     monkeypatch.setattr(mod, "BASE_OUTPUT_PATH", str(tmp_path))
@@ -397,7 +397,7 @@ def test_main_writes_real_schedule_workbooks(
 def test_main_drops_stop_with_no_scheduled_times(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import scripts.gtfs_exports.timepoint_schedule_exporter as mod
+    import scripts.gtfs_exports.gtfs_timetable_exporter as mod
 
     # Blank S2's times on every R1 trip, as GTFS allows at non-timepoint stops.
     feed = tmp_path / "gtfs"
