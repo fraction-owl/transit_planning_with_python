@@ -19,8 +19,9 @@ Method:
       within the XY tolerance (1 mm by default), so opposite directions on one
       street count once only if their shapes trace the same path.
     * Measure planar miles in ANALYSIS_EPSG (default NAD83 / Virginia North, ftUS).
-    * Report two length/percentage bases: full route (including outside areas),
-      and district-only (outside length set to zero and excluded from the total).
+    * Report either or both length/percentage bases, set by OUTSIDE_LENGTH: full
+      route (including outside areas), and district-only (outside length set to
+      zero and excluded from the total; the default).
     * Split linework shared by multiple district polygons equally among them.
       This includes exact shared boundaries and polygon overlaps. Shared length
       is separately flagged, and the GIS output retains every membership. A route
@@ -28,11 +29,13 @@ Method:
       of the boundary line, so it is assigned to that side, not split or flagged.
 
 Outputs (in a new timestamped subfolder beneath OUTPUT_DIR):
-    route_district_percentages.csv: one row per route; both length totals and
-        paired percentage columns for every district (0-100, not 0-1).
-    route_district_detail.csv: one row per route/district; two length columns
-        (including/excluding outside), raw intersected miles, and both percentages.
-    route_length_qa.csv: coverage, shared length, and length-conservation checks.
+    route_district_percentages.csv: one row per route; length totals and
+        percentage columns for every district (0-100, not 0-1) on the selected bases.
+    route_district_detail.csv: one row per route/district; length and percentage
+        columns on the selected bases, and raw intersected miles. The outside row
+        is left out when OUTSIDE_LENGTH is "exclude".
+    route_length_qa.csv: coverage, shared length, and length-conservation checks,
+        always on both bases.
     route_district.gdb: unique_routes, district_segments, districts_projected.
     run_settings.json and run.log: settings, field selection, transformations.
 
@@ -45,6 +48,10 @@ inside any district, district-only percentages are undefined and left blank.
 Routes with no trips have blank percentages and status NO_TRIPS. Missing or
 invalid shapes for routes with trips cause an error rather than partial results.
 total_route_miles is the unique linework length described above.
+CSV miles and percentages are rounded to CSV_DECIMALS places (one by default),
+so a row's displayed percentages may sum to 99.9 or 100.1; the percent-sum
+columns are summed before rounding. The QA shared-length and length-check
+difference columns use QA_CSV_DECIMALS (six by default).
 
 Typical usage:
     Set the paths in the CONFIGURATION section and run with ArcGIS Pro's Python
@@ -67,7 +74,7 @@ import re
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
+from typing import Any, Collection, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
 import arcpy
 
@@ -94,6 +101,20 @@ ROUTES_TO_EXCLUDE: Set[str] = set()
 ANALYSIS_EPSG = 2283
 OUTSIDE_LABEL = "Outside districts"
 
+# Length outside every district polygon in the percentage and detail tables:
+#   "exclude": district-only shares of the length inside districts (default).
+#   "include": full-route shares, with outside length as its own column and row.
+#   "both": both sets of columns side by side.
+# route_length_qa.csv and the GIS feature classes always report both.
+OUTSIDE_LENGTH = "exclude"
+
+# Decimal places for miles and percentages in the CSV tables. Calculations, the
+# length check, and GIS feature class attributes keep full precision.
+CSV_DECIMALS = 1
+# The QA shared-length and length-check difference columns report amounts near the
+# 0.1-foot check thresholds, so they keep more places (0.000001 mile is about 0.06 inch).
+QA_CSV_DECIMALS = 6
+
 # Optional explicit geographic transformations; None selects the first suitable
 # installed transformation returned by ArcPy for the input data's extent.
 GTFS_TRANSFORMATION: Optional[str] = None
@@ -109,6 +130,7 @@ LOG_LEVEL = logging.INFO
 # === END CONFIG ===
 
 LOGGER = logging.getLogger("route_length_by_district_arcpy")
+QA_DETAIL_FIELDS = {"shared_boundary_or_overlap_miles", "length_check_delta_miles"}
 RouteInfo = Dict[str, str]
 Piece = Tuple[Tuple[str, ...], Any]
 
@@ -452,12 +474,29 @@ def create_feature_class(
     return path
 
 
-def write_csv(path: Path, fields: Sequence[str], rows: Sequence[Dict[str, Any]]) -> None:
-    """Write an Excel-readable UTF-8 CSV, keeping numeric percentages unrounded."""
+def write_csv(
+    path: Path,
+    fields: Sequence[str],
+    rows: Sequence[Dict[str, Any]],
+    omit: Collection[str] = (),
+) -> None:
+    """Write an Excel-readable UTF-8 CSV of fields not in omit, with numbers rounded."""
     with path.open("w", encoding="utf-8-sig", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[field for field in fields if field not in omit],
+            extrasaction="ignore",
+        )
         writer.writeheader()
-        writer.writerows(rows)
+        for row in rows:
+            formatted: Dict[str, Any] = {}
+            for key, value in row.items():
+                if isinstance(value, float):
+                    places = QA_CSV_DECIMALS if key in QA_DETAIL_FIELDS else CSV_DECIMALS
+                    # Fixed notation avoids 1.9e-05; adding 0.0 writes -0.0 as 0.0.
+                    value = f"{round(value, places) + 0.0:.{places}f}"
+                formatted[key] = value
+            writer.writerow(formatted)
     LOGGER.info("Wrote %s (%d rows).", path.name, len(rows))
 
 
@@ -474,6 +513,8 @@ def run_analysis(run_dir: Path) -> None:
     target = arcpy.SpatialReference(ANALYSIS_EPSG)
     if target.type != "Projected":
         raise ValueError("ANALYSIS_EPSG must be a suitable local projected coordinate system.")
+    if OUTSIDE_LENGTH not in {"exclude", "include", "both"}:
+        raise ValueError('OUTSIDE_LENGTH must be "exclude", "include", or "both".')
     LOGGER.info("Analysis coordinate system: %s", target.name)
     routes, route_shapes, trip_counts = load_routes_and_trips()
     districts, district_field, district_transform = load_districts(target)
@@ -651,6 +692,28 @@ def run_analysis(run_dir: Path) -> None:
     insert_rows(route_fc, route_cursor_fields, route_feature_rows)
 
     identity = ["route_id", "route_short_name", "route_long_name", "status"]
+    # OUTSIDE_LENGTH leaves one basis out of the next two tables; the QA table keeps both.
+    full_route_fields = {
+        "total_route_miles",
+        "outside_districts_miles",
+        "full_route_percent_sum",
+        "miles_including_outside",
+        "percent_of_full_route",
+        *(f"{label} (full route %)" for label in labels),
+        f"{OUTSIDE_LABEL} (district-only %)",  # Always 0; shown only beside full-route shares.
+    }
+    district_only_fields = {
+        "district_only_percent_sum",
+        "miles_excluding_outside",
+        "percent_of_inside_length",
+        *(f"{label} (district-only %)" for label in labels),
+    }
+    omit: Set[str] = set()
+    if OUTSIDE_LENGTH == "exclude":
+        omit = full_route_fields
+        detail_rows = [row for row in detail_rows if row["district"] != OUTSIDE_LABEL]
+    elif OUTSIDE_LENGTH == "include":
+        omit = district_only_fields
     write_csv(
         run_dir / "route_district_percentages.csv",
         [
@@ -667,6 +730,7 @@ def run_analysis(run_dir: Path) -> None:
             "district_only_percent_sum",
         ],
         wide_rows,
+        omit,
     )
     write_csv(
         run_dir / "route_district_detail.csv",
@@ -682,6 +746,7 @@ def run_analysis(run_dir: Path) -> None:
             "percent_of_inside_length",
         ],
         detail_rows,
+        omit,
     )
     write_csv(
         run_dir / "route_length_qa.csv",
@@ -723,6 +788,9 @@ def run_analysis(run_dir: Path) -> None:
         },
         "shared_length_policy": "Equal split among all intersecting district labels.",
         "outside_label": OUTSIDE_LABEL,
+        "outside_length": OUTSIDE_LENGTH,
+        "csv_decimals": CSV_DECIMALS,
+        "qa_csv_decimals": QA_CSV_DECIMALS,
         "output_directory": str(run_dir),
         "arcgis_version": arcpy.GetInstallInfo().get("Version", "Unknown"),
         "length_check_abs_miles": LENGTH_CHECK_ABS_MILES,
