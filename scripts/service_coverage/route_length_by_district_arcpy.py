@@ -45,6 +45,9 @@ inside any district, district-only percentages are undefined and left blank.
 Routes with no trips have blank percentages and status NO_TRIPS. Missing or
 invalid shapes for routes with trips cause an error rather than partial results.
 total_route_miles is the unique linework length described above.
+CSV miles and percentages are rounded to CSV_DECIMALS places (one by default),
+so a row's displayed percentages may sum to 99.9 or 100.1; the percent-sum
+columns are summed before rounding.
 
 Typical usage:
     Set the paths in the CONFIGURATION section and run with ArcGIS Pro's Python
@@ -93,6 +96,10 @@ ROUTES_TO_EXCLUDE: Set[str] = set()
 # EPSG code of a local projected CRS (ArcGIS lists it as the WKID).
 ANALYSIS_EPSG = 2283
 OUTSIDE_LABEL = "Outside districts"
+
+# Decimal places for miles and percentages in the CSV tables. Calculations, the
+# length check, and GIS feature class attributes keep full precision.
+CSV_DECIMALS = 1
 
 # Optional explicit geographic transformations; None selects the first suitable
 # installed transformation returned by ArcPy for the input data's extent.
@@ -453,11 +460,18 @@ def create_feature_class(
 
 
 def write_csv(path: Path, fields: Sequence[str], rows: Sequence[Dict[str, Any]]) -> None:
-    """Write an Excel-readable UTF-8 CSV, keeping numeric percentages unrounded."""
+    """Write an Excel-readable UTF-8 CSV, rounding numbers to CSV_DECIMALS places."""
     with path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
-        writer.writerows(rows)
+        for row in rows:
+            # Adding 0.0 writes tiny negative values, such as length deltas, as 0.0, not -0.0.
+            writer.writerow(
+                {
+                    key: round(value, CSV_DECIMALS) + 0.0 if isinstance(value, float) else value
+                    for key, value in row.items()
+                }
+            )
     LOGGER.info("Wrote %s (%d rows).", path.name, len(rows))
 
 
@@ -723,6 +737,7 @@ def run_analysis(run_dir: Path) -> None:
         },
         "shared_length_policy": "Equal split among all intersecting district labels.",
         "outside_label": OUTSIDE_LABEL,
+        "csv_decimals": CSV_DECIMALS,
         "output_directory": str(run_dir),
         "arcgis_version": arcpy.GetInstallInfo().get("Version", "Unknown"),
         "length_check_abs_miles": LENGTH_CHECK_ABS_MILES,
