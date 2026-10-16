@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import logging
 import shutil
+import zipfile
 from pathlib import Path
 
 import openpyxl
@@ -12,11 +14,18 @@ from scripts.gtfs_exports.gtfs_timetable_exporter import (
     MISSING_TIME,
     adjust_time,
     apply_in_out_filters,
+    build_column_headers,
+    build_column_layouts,
+    build_service_calendar,
     build_service_id_schedule_map,
+    check_schedule_order,
+    embed_pattern,
     export_to_excel_multiple_sheets,
     format_output_folder_name,
+    format_workbook_name,
     get_all_route_short_names,
     map_service_id_to_schedule,
+    merge_stop_patterns,
     prepare_timepoints,
     remove_empty_schedule_columns,
     time_to_minutes,
@@ -372,10 +381,10 @@ def test_main_writes_real_schedule_workbooks(
     # WKDY has no label override; its Monday-Friday calendar row makes it "Weekday".
     folder = tmp_path / "weekday_sid_WKDY"
     assert sorted(p.name for p in folder.glob("*.xlsx")) == [
-        f"route_R{n}_schedule_weekday.xlsx" for n in (1, 2, 3)
+        f"route_R{n}_timetable_weekday_sid_WKDY.xlsx" for n in (1, 2, 3)
     ]
 
-    wb = openpyxl.load_workbook(folder / "route_R3_schedule_weekday.xlsx")
+    wb = openpyxl.load_workbook(folder / "route_R3_timetable_weekday_sid_WKDY.xlsx")
     assert wb.sheetnames == ["Direction_0"]
     header, *rows = wb["Direction_0"].iter_rows(values_only=True)
     # gtfs_basic has no timepoint column, so every stop gets a schedule column.
@@ -415,7 +424,7 @@ def test_main_drops_stop_with_no_scheduled_times(
     assert mod.main() == 0
 
     folder = tmp_path / "out" / "weekday_sid_WKDY"
-    wb = openpyxl.load_workbook(folder / "route_R1_schedule_weekday.xlsx")
+    wb = openpyxl.load_workbook(folder / "route_R1_timetable_weekday_sid_WKDY.xlsx")
     header, *rows = wb["Direction_0"].iter_rows(values_only=True)
     # S2 (Main St & Robin Hood Rd) has no time on any trip, so its column is dropped.
     assert header[3:] == (
@@ -430,3 +439,327 @@ def test_main_drops_stop_with_no_scheduled_times(
         ("12:00", "12:10", "12:15", "12:20", "12:25"),
         ("17:00", "17:10", "17:15", "17:20", "17:25"),
     ]
+
+
+# ---------------------------------------------------------------------------
+# Time parsing and display
+# ---------------------------------------------------------------------------
+
+
+def test_time_to_minutes_accepts_gtfs_seconds() -> None:
+    assert time_to_minutes("08:20:00") == 500
+    assert time_to_minutes("25:15:00") == 1515
+
+
+def test_adjust_time_12h_wraps_past_midnight() -> None:
+    assert adjust_time("25:15:00", "12") == "1:15 AM"
+    assert adjust_time("24:00:00", "12") == "12:00 AM"
+
+
+# ---------------------------------------------------------------------------
+# prepare_timepoints — blank timepoint column, final-stop flag
+# ---------------------------------------------------------------------------
+
+
+def test_prepare_timepoints_blank_column_keeps_all_rows() -> None:
+    df = _stop_times_with_timepoint().assign(timepoint=[None, None, None])
+    assert len(prepare_timepoints(df)) == 3
+
+
+def test_prepare_timepoints_flags_final_stop_before_filtering() -> None:
+    df = _stop_times_with_timepoint().assign(timepoint=["1", "1", "0"])
+    result = prepare_timepoints(df)
+    # S3 is the trip's final stop but not a timepoint, so no kept row is final.
+    assert result["stop_id"].tolist() == ["S1", "S2"]
+    assert not result["is_final_stop"].any()
+
+
+# ---------------------------------------------------------------------------
+# Column layout: pattern merging, alignment, headers
+# ---------------------------------------------------------------------------
+
+
+def test_merge_stop_patterns_keeps_both_branches() -> None:
+    assert merge_stop_patterns(["A", "B", "D"], ["A", "C", "D"]) == ["A", "B", "C", "D"]
+
+
+def test_merge_stop_patterns_adds_short_turn_extension() -> None:
+    assert merge_stop_patterns(["B", "C"], ["A", "B", "C", "D"]) == ["A", "B", "C", "D"]
+
+
+def test_build_column_layouts_splits_conflicting_stop_order() -> None:
+    layouts, assignment = build_column_layouts({("A", "B", "C"): 3, ("C", "B", "A"): 1})
+    assert layouts == [["A", "B", "C"], ["C", "B", "A"]]
+    assert assignment == {("A", "B", "C"): 0, ("C", "B", "A"): 1}
+
+
+def test_build_column_layouts_keeps_loop_in_one_layout() -> None:
+    layouts, _ = build_column_layouts({("A", "B", "C", "A"): 2, ("C", "A"): 1})
+    assert layouts == [["A", "B", "C", "A"]]
+
+
+def test_embed_pattern_places_loop_tail_on_later_visit() -> None:
+    assert embed_pattern(["C", "A"], ["A", "B", "C", "A"]) == [2, 3]
+    assert embed_pattern(["A", "B"], ["A", "B", "C", "A"]) == [0, 1]
+
+
+def test_build_column_headers_disambiguates_shared_names() -> None:
+    stops = pd.DataFrame(
+        {
+            "stop_id": ["A", "B", "C"],
+            "stop_code": ["101", "102", "103"],
+            "stop_name": ["Central Station", "Main St", "Central Station"],
+        }
+    )
+    assert build_column_headers(["A", "B", "C", "A"], stops) == [
+        "Central Station [101] Schedule",
+        "Main St Schedule",
+        "Central Station [103] Schedule",
+        "Central Station [101] (2) Schedule",
+    ]
+
+
+def test_build_column_headers_falls_back_to_stop_id_without_codes() -> None:
+    stops = pd.DataFrame({"stop_id": ["A", "C"], "stop_name": ["Central", "Central"]})
+    assert build_column_headers(["A", "C"], stops) == [
+        "Central [A] Schedule",
+        "Central [C] Schedule",
+    ]
+
+
+# ---------------------------------------------------------------------------
+# check_schedule_order — reports pass/fail
+# ---------------------------------------------------------------------------
+
+
+def test_check_schedule_order_counts_violations(caplog: pytest.LogCaptureFixture) -> None:
+    minutes = pd.DataFrame([[510.0, 490.0]], index=["T1"], columns=["A Schedule", "B Schedule"])
+    with caplog.at_level(logging.INFO):
+        assert check_schedule_order(minutes, "101", "Weekday", "0") == 1
+    assert "passed" not in caplog.text
+    assert "Trip 'T1'" in caplog.text
+
+
+def test_check_schedule_order_passes_clean_grid(caplog: pytest.LogCaptureFixture) -> None:
+    minutes = pd.DataFrame([[480.0, None], [490.0, 500.0]], index=["T1", "T2"], columns=["A", "B"])
+    with caplog.at_level(logging.INFO):
+        assert check_schedule_order(minutes, "101", "Weekday", "0") == 0
+    assert "passed" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Names and calendars
+# ---------------------------------------------------------------------------
+
+
+def test_format_workbook_name_includes_service_id_and_sanitizes() -> None:
+    assert format_workbook_name("101", "Weekday", "1") == "route_101_timetable_weekday_sid_1.xlsx"
+    assert format_workbook_name("10/11", "Weekday", "A:B") == (
+        "route_10_11_timetable_weekday_sid_A_B.xlsx"
+    )
+
+
+def test_build_service_calendar_adds_calendar_dates_only_services() -> None:
+    calendar = _cal_row({"monday": "1"}).to_frame().T.assign(service_id="WK")
+    calendar_dates = pd.DataFrame(
+        {
+            # 2026-01-03 and 2026-01-10 are Saturdays; WK's removal is ignored.
+            "service_id": ["SAT", "SAT", "WK"],
+            "date": ["20260103", "20260110", "20260105"],
+            "exception_type": ["1", "1", "2"],
+        }
+    )
+    result = build_service_calendar(calendar, calendar_dates).set_index("service_id")
+    assert sorted(result.index) == ["SAT", "WK"]
+    assert map_service_id_to_schedule(result.loc["SAT"]) == "Saturday"
+    assert map_service_id_to_schedule(result.loc["WK"]) == "Special"
+
+
+# ---------------------------------------------------------------------------
+# main — synthetic feeds for alignment, branches, and failure reporting
+# ---------------------------------------------------------------------------
+
+_CALENDAR = (
+    "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,start_date,end_date\n"
+    "1,1,1,1,1,1,0,0,20260101,20261231\n"
+)
+
+
+def _write_feed(
+    folder: Path,
+    stops: str,
+    stop_times: str,
+    trips: str = "route_id,service_id,trip_id,trip_headsign,direction_id\n"
+    "R,1,T1,East,0\nR,1,T2,East,0\n",
+    calendar: str | None = _CALENDAR,
+    calendar_dates: str | None = None,
+) -> Path:
+    folder.mkdir(parents=True)
+    files = {
+        "agency.txt": "agency_id,agency_name,agency_url,agency_timezone\n"
+        "A,Agency,http://x,America/New_York\n",
+        "routes.txt": "route_id,agency_id,route_short_name,route_type\nR,A,101,3\n",
+        "stops.txt": "stop_id,stop_name,stop_lat,stop_lon\n" + stops,
+        "trips.txt": trips,
+        "stop_times.txt": "trip_id,arrival_time,departure_time,stop_id,stop_sequence,timepoint\n"
+        + stop_times,
+        "calendar.txt": calendar,
+        "calendar_dates.txt": calendar_dates,
+    }
+    for name, text in files.items():
+        if text is not None:
+            (folder / name).write_text(text)
+    return folder
+
+
+def _run_main(monkeypatch: pytest.MonkeyPatch, feed: Path, out: Path) -> tuple[int, list[tuple]]:
+    import scripts.gtfs_exports.gtfs_timetable_exporter as mod
+
+    monkeypatch.setattr(mod, "GTFS_FOLDER_PATH", str(feed))
+    monkeypatch.setattr(mod, "BASE_OUTPUT_PATH", str(out))
+    monkeypatch.setattr(mod, "FILTER_SERVICE_IDS", ["1"])
+    monkeypatch.setattr(mod, "FILTER_IN_ROUTES", [])
+    monkeypatch.setattr(mod, "TIME_FORMAT_OPTION", "24")
+    rc = mod.main()
+    workbook = out / "weekday_sid_1" / "route_101_timetable_weekday_sid_1.xlsx"
+    if not workbook.is_file():
+        return rc, []
+    wb = openpyxl.load_workbook(workbook)
+    return rc, [(ws.title, list(ws.iter_rows(values_only=True))) for ws in wb.worksheets]
+
+
+_ABCD = "A,Alpha,0,0\nB,Bravo,0,0\nC,Charlie,0,0\nD,Delta,0,0\nX,Detour,0,0\n"
+
+
+def test_main_aligns_trips_by_stop_order_not_sequence_numbers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # T2 renumbers its stops and adds a non-timepoint detour, shifting B's and C's sequence.
+    feed = _write_feed(
+        tmp_path / "gtfs",
+        _ABCD,
+        "T1,08:00:00,08:00:00,A,1,1\nT1,08:10:00,08:10:00,B,2,1\nT1,08:20:00,08:20:00,C,3,1\n"
+        "T2,09:00:00,09:00:00,A,10,1\nT2,,,X,15,0\nT2,09:12:00,09:12:00,B,20,1\n"
+        "T2,09:22:00,09:22:00,C,30,1\n",
+    )
+    rc, sheets = _run_main(monkeypatch, feed, tmp_path / "out")
+    assert rc == 0
+    ((title, (header, *rows)),) = sheets
+    assert header[3:] == ("Alpha Schedule", "Bravo Schedule", "Charlie Schedule")
+    assert [row[3:] for row in rows] == [
+        ("08:00", "08:10", "08:20"),
+        ("09:00", "09:12", "09:22"),
+    ]
+
+
+def test_main_keeps_timepoints_on_every_branch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    feed = _write_feed(
+        tmp_path / "gtfs",
+        _ABCD,
+        "T1,08:00:00,08:00:00,A,1,1\nT1,08:10:00,08:10:00,B,2,1\nT1,08:20:00,08:20:00,D,3,1\n"
+        "T2,09:00:00,09:00:00,A,1,1\nT2,09:15:00,09:15:00,C,2,1\nT2,09:25:00,09:25:00,D,3,1\n",
+    )
+    rc, sheets = _run_main(monkeypatch, feed, tmp_path / "out")
+    assert rc == 0
+    ((_, (header, *rows)),) = sheets
+    assert header[3:] == ("Alpha Schedule", "Bravo Schedule", "Charlie Schedule", "Delta Schedule")
+    assert [row[3:] for row in rows] == [
+        ("08:00", "08:10", MISSING_TIME, "08:20"),
+        ("09:00", MISSING_TIME, "09:15", "09:25"),
+    ]
+
+
+def test_main_shared_stop_names_get_distinct_columns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    feed = _write_feed(
+        tmp_path / "gtfs",
+        "A,Central Station,0,0\nB,Main St,0,0\nC,Central Station,0,0\n",
+        "T1,08:00:00,08:00:00,A,1,1\nT1,08:10:00,08:10:00,B,2,1\nT1,08:20:00,08:20:00,C,3,1\n",
+        trips="route_id,service_id,trip_id,trip_headsign,direction_id\nR,1,T1,East,0\n",
+    )
+    rc, sheets = _run_main(monkeypatch, feed, tmp_path / "out")
+    assert rc == 0
+    ((_, (header, row)),) = sheets
+    assert header[3:] == (
+        "Central Station [A] Schedule",
+        "Main St Schedule",
+        "Central Station [C] Schedule",
+    )
+    assert row[3:] == ("08:00", "08:10", "08:20")
+
+
+def test_main_shows_departure_and_final_arrival_sorted_by_first_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # T1 dwells at B and at its final stop D; T2 is a short trip that starts later
+    # but ends earlier, and must still sort below T1.
+    feed = _write_feed(
+        tmp_path / "gtfs",
+        _ABCD,
+        "T1,08:00:00,08:00:00,A,1,1\nT1,08:10:00,08:15:00,B,2,1\n"
+        "T1,08:25:00,08:25:00,C,3,1\nT1,08:40:00,08:45:00,D,4,1\n"
+        "T2,08:10:00,08:12:00,B,1,1\nT2,08:20:00,08:22:00,C,2,1\n",
+    )
+    rc, sheets = _run_main(monkeypatch, feed, tmp_path / "out")
+    assert rc == 0
+    ((_, (_, *rows)),) = sheets
+    assert [row[3:] for row in rows] == [
+        ("08:00", "08:15", "08:25", "08:40"),
+        (MISSING_TIME, "08:12", "08:20", MISSING_TIME),
+    ]
+
+
+def test_main_exports_trips_without_direction_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    feed = _write_feed(
+        tmp_path / "gtfs",
+        _ABCD,
+        "T1,08:00:00,08:00:00,A,1,1\nT1,08:10:00,08:10:00,B,2,1\n",
+        trips="route_id,service_id,trip_id,trip_headsign\nR,1,T1,East\n",
+    )
+    rc, sheets = _run_main(monkeypatch, feed, tmp_path / "out")
+    assert rc == 0
+    assert [title for title, _ in sheets] == ["No_Direction"]
+
+
+def test_main_reads_calendar_dates_only_zip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    folder = _write_feed(
+        tmp_path / "gtfs",
+        _ABCD,
+        "T1,08:00:00,08:00:00,A,1,1\nT1,08:10:00,08:10:00,B,2,1\n",
+        trips="route_id,service_id,trip_id,trip_headsign,direction_id\nR,1,T1,East,0\n",
+        calendar=None,
+        # 2026-01-05 through 2026-01-09 are Monday-Friday.
+        calendar_dates="service_id,date,exception_type\n"
+        + "".join(f"1,2026010{d},1\n" for d in range(5, 10)),
+    )
+    feed_zip = tmp_path / "feed.zip"
+    with zipfile.ZipFile(feed_zip, "w") as archive:
+        for path in folder.iterdir():
+            archive.write(path, f"feed/{path.name}")
+    rc, sheets = _run_main(monkeypatch, feed_zip, tmp_path / "out")
+    assert rc == 0
+    ((_, (_, row)),) = sheets
+    assert row[3:] == ("08:00", "08:10")
+
+
+def test_main_returns_1_when_a_workbook_cannot_be_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    feed = _write_feed(
+        tmp_path / "gtfs",
+        _ABCD,
+        "T1,08:00:00,08:00:00,A,1,1\nT1,08:10:00,08:10:00,B,2,1\n",
+        trips="route_id,service_id,trip_id,trip_headsign,direction_id\nR,1,T1,East,0\n",
+    )
+    out = tmp_path / "out"
+    # A directory where the workbook should go makes the write fail, like a locked file.
+    (out / "weekday_sid_1" / "route_101_timetable_weekday_sid_1.xlsx").mkdir(parents=True)
+    rc, _ = _run_main(monkeypatch, feed, out)
+    assert rc == 1
