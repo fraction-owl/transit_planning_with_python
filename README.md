@@ -46,7 +46,7 @@ Manual data collection that supplements or backstops modern AVL and APC systems 
 The repository is organized for ease of use, with:
 
 - ***Standalone scripts:*** Each tool is fully documented with comments explaining field name assumptions, file formats, and usage instructions.
-- ***Standard data formats:*** Most scripts are designed to work with commonly used data types like GTFS files and shapefiles. Specific requirements are outlined in the script comments.
+- ***Standard data formats:*** Most scripts are designed to work with commonly used data types like GTFS files and shapefiles. Many accept a GTFS feed either as the downloaded `.zip` or as an unzipped folder, and a shapefile either as the `.shp` or as a `.zip`, though some still need the unzipped form. Specific requirements are outlined in the script comments.
 
 ## 🛠️ Requirements
 
