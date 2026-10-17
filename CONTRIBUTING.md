@@ -35,6 +35,7 @@ Participation is welcome from anyone, whether you’re new to Python, an experie
     for the reference shape.
 - Use intuitive success messages (`logging`) at the end of script execution.
 - Scripts that write an output file **must** also write a `_runlog.txt` sidecar next to that file. The sidecar captures the CONFIGURATION block verbatim (bounded by `# === BEGIN CONFIG ===` / `# === END CONFIG ===` markers) plus a timestamp and source-script path. This creates a drift-proof record that lets anyone reconstruct exactly what settings produced a given output. See `scripts/ridership_tools/data_request_by_stop_processor.py` for the reference implementation (`extract_config_block` / `write_run_log`).
+  - The sidecar should also work as an input: scripts should accept their settings either from the CONFIGURATION block or from a `.txt` file in the sidecar's format, so a previous run's `_runlog.txt` can be passed back in to repeat that run without re-editing the script. No script supports this yet and there is no canonical helper; see issue #224.
 - Do **not import** functions from the shared `utils/` directory at runtime.
   - Instead, **copy the relevant helper functions** into your script.
   - This keeps each script self-contained and easier for beginners to understand, run, and modify.
