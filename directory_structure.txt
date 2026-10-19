@@ -95,6 +95,7 @@ transit_planning_with_python/
 │   │   ├── runtime_by_route.py
 │   │   ├── runtime_by_segment.py
 │   │   ├── runtime_by_trip.py
+│   │   ├── runtime_schedule_builder.py
 │   │   └── trip_runtime_diagnostics_from_avl.py
 │   ├── ridership_tools/
 │   │   ├── data_request_by_stop_processor.py
@@ -288,6 +289,7 @@ transit_planning_with_python/
 │   ├── test_runtime_by_route.py
 │   ├── test_runtime_by_segment.py
 │   ├── test_runtime_by_trip.py
+│   ├── test_runtime_schedule_builder.py
 │   ├── test_school_coverage_by_route_gpd.py
 │   ├── test_schools_prep_join_gpd.py
 │   ├── test_segment_speed_exporter.py
