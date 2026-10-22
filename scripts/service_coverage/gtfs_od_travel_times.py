@@ -11,7 +11,11 @@ Inputs:
 
 Typical usage:
     Save this single file and run: python gtfs_od_travel_times.py
-    Edit paths, SERVICE_DATE, LOCATIONS and OD_PAIRS in the configuration below.
+    Edit paths, SERVICE_DATE, LOCATIONS and OD_PAIRS in the configuration below,
+    or override scalar settings with flags, for example:
+        python gtfs_od_travel_times.py --feed agency_a=agency_a.zip --output-dir od_runs
+    Run with --help for every flag and its default. LOCATIONS, OD_PAIRS,
+    PERIODS and the benchmark tables are set in the configuration only.
     Use GTFS_FEEDS to add/remove agencies or substitute planned-service feeds.
     A new timestamped output folder is created for every run.
     Set DISCOVERY_ONLY=True to inspect calendars and stop candidates first.
@@ -77,6 +81,8 @@ Outputs (CSV, UTF-8 with BOM, suitable for Excel):
     benchmark_comparison.csv: GTFS means against reported benchmark totals.
     benchmark_method_totals.csv / benchmark_method_legs.csv: formula audit.
     methods.txt, settings.json and run.log: assumptions and diagnostics.
+    gtfs_od_travel_times_runlog.txt: the verbatim CONFIGURATION block, any
+    command-line overrides, the run timestamp and the source script path.
     station_pathway_minutes is INCLUDED in walk_minutes, not an extra cost.
     Means and percentiles cover successful samples only; always check coverage.
 
@@ -111,6 +117,7 @@ Reference: https://gtfs.org/documentation/schedule/reference/
 
 from __future__ import annotations
 
+import argparse
 import csv
 import heapq
 import io
@@ -119,6 +126,7 @@ import logging
 import math
 import re
 import statistics
+import sys
 import zipfile
 from bisect import bisect_left, bisect_right
 from collections import Counter, defaultdict
@@ -129,7 +137,9 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tupl
 
 # =============================================================================
 # CONFIGURATION -- edit here; IDs/codes must remain strings, including leading 0s.
+# Scalar and list settings can also be passed as command-line flags (see --help).
 # =============================================================================
+# === BEGIN CONFIG ===
 GTFS_PATH = Path(r"Path\To\Agency_A_GTFS")  # Unzipped GTFS folder or .zip.
 SECOND_GTFS_PATH = Path(r"Path\To\Agency_B_GTFS.zip")  # Unzipped GTFS folder or .zip.
 # Default: one service DATE, all concurrent calendars, from every feed listed.
@@ -176,6 +186,9 @@ DERIVE_ZERO_TIME_WALKWAYS = True  # Audit zero-time mode-1 pathways using length
 REQUIRE_RAIL_PATHWAYS = True
 EXPORT_NETWORK = True
 LOG_LEVEL = logging.INFO
+# True: if the _runlog.txt sidecar cannot be written, stop before routing so a run
+# folder is never left without a record of its configuration.
+REQUIRE_RUN_LOG = True
 
 # Fixed WGS84 points allow existing/planned comparisons without moving endpoints
 # when stops move. Replace a lat/lon pair with ONE stop_code or stop_id if desired,
@@ -251,6 +264,7 @@ BENCHMARK_ESTIMATES = {
 }
 # Map endpoint variants to one benchmark pair, e.g. {"1A": "1", "1B": "1"}.
 PAIR_BENCHMARK_IDS: Dict[str, str] = {}
+# === END CONFIG ===
 # =============================================================================
 
 EARTH_RADIUS_M = 6371008.8
@@ -2154,7 +2168,7 @@ def run(output: Path) -> int:
         feed.close()
 
 
-def main() -> int:
+def run_once(overrides: Dict[str, Any]) -> int:
     """Create a separate run folder, retain settings, and report actionable failures."""
     feeds = list(GTFS_FEEDS.values()) if USE_MULTIPLE_FEEDS else [GTFS_PATH]
     unset = [
@@ -2165,7 +2179,8 @@ def main() -> int:
     if unset:
         logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(message)s")
         logging.warning(
-            "Placeholder paths are still set: %s. Update the CONFIGURATION section before running.",
+            "Placeholder paths are still set: %s. Update the CONFIGURATION section or pass "
+            "--feed (or --gtfs-path) and --output-dir.",
             ", ".join(unset),
         )
         return 2
@@ -2189,10 +2204,378 @@ def main() -> int:
         (output / "settings.json").write_text(
             json.dumps(settings, indent=2, default=str), encoding="utf-8"
         )
+        if not write_run_log(output, overrides) and REQUIRE_RUN_LOG:
+            logging.error(
+                "Run log could not be written; stopping before routing. Set "
+                "REQUIRE_RUN_LOG = False (or pass --no-require-run-log) to continue without it."
+            )
+            return 1
         return run(output)
     except (ValueError, TypeError, KeyError, OSError, zipfile.BadZipFile) as exc:
         logging.exception("Failed: %s. Completed diagnostics remain in %s", exc, output)
         return 1
+
+
+def notebook_safe_argv(argv: Optional[Sequence[str]]) -> Optional[List[str]]:
+    """Return the argv to parse, shielding notebook kernels from stray flags.
+
+    When a script's ``main()`` runs with no explicit ``argv`` inside a
+    Jupyter/IPython kernel, ``sys.argv`` holds kernel plumbing (for example
+    ``-f /path/kernel.json``) rather than flags meant for the script, and
+    strict ``argparse.parse_args`` would reject it and abort.  This helper
+    detects the notebook case and substitutes an empty argument list so the
+    CONFIGURATION constants stay in charge, while shell runs keep strict
+    parsing (a typo in a flag fails loudly instead of being silently ignored).
+
+    Canonical implementation: ``utils/cli_helpers.py``.
+
+    Args:
+        argv: Explicit argument list passed to ``main()``, or ``None`` to
+            fall back to ``sys.argv``.
+
+    Returns:
+        ``list(argv)`` when *argv* was provided; ``[]`` when running inside a
+        notebook kernel; otherwise ``None`` so argparse reads ``sys.argv[1:]``.
+    """
+    if argv is not None:
+        return list(argv)
+    if "ipykernel" in sys.modules:
+        return []
+    return None
+
+
+def extract_config_block(source_file: Path) -> str:
+    r"""Return the text between the CONFIG markers in *source_file*.
+
+    Reads ``source_file`` as UTF-8 text and slices out the lines strictly
+    *between* the first occurrence of ``# === BEGIN CONFIG ===`` and the first
+    subsequent occurrence of ``# === END CONFIG ===``.  The marker lines
+    themselves are excluded; whitespace and inline comments inside the block
+    are preserved verbatim.
+
+    Args:
+        source_file: Path to the Python source file to scan (typically
+            ``Path(__file__)`` from the calling script).
+
+    Returns:
+        The verbatim text of the configuration block, joined with ``\n``.
+
+    Raises:
+        ValueError: If either marker is missing or they appear out of order.
+        OSError: If ``source_file`` cannot be read.
+    """
+    _BEGIN = "# === BEGIN CONFIG ==="
+    _END = "# === END CONFIG ==="
+
+    lines: list[str] = source_file.read_text(encoding="utf-8").splitlines()
+
+    begin_idx: int | None = None
+    end_idx: int | None = None
+    for i, line in enumerate(lines):
+        stripped: str = line.strip()
+        if begin_idx is None and stripped == _BEGIN:
+            begin_idx = i
+        elif begin_idx is not None and stripped == _END:
+            end_idx = i
+            break
+
+    if begin_idx is None or end_idx is None:
+        raise ValueError(
+            f"Config markers not found in '{source_file}'. Expected '{_BEGIN}' and '{_END}'."
+        )
+
+    return "\n".join(lines[begin_idx + 1 : end_idx])
+
+
+def config_block_source() -> Tuple[str, str]:
+    """Return the CONFIGURATION block text and its source, from this file or a notebook.
+
+    A script run reads its own file. In a notebook, where __file__ is undefined, the
+    most recent input cell containing both CONFIG markers is used instead.
+
+    Raises:
+        ValueError: If neither source holds both CONFIG markers.
+        OSError: If the script file cannot be read.
+    """
+    file_attr = globals().get("__file__")
+    if file_attr:
+        source = Path(file_attr).resolve()
+        return extract_config_block(source), str(source)
+    begin, end = "# === BEGIN CONFIG ===", "# === END CONFIG ==="
+    ipython = sys.modules.get("IPython")
+    shell = getattr(ipython, "get_ipython", lambda: None)() if ipython is not None else None
+    cells = shell.user_ns.get("In", []) if shell is not None else []
+    for cell in reversed(cells):
+        if begin in cell and end in cell.split(begin, 1)[1]:
+            return cell.split(begin, 1)[1].split(end, 1)[0].strip("\n"), "<Jupyter cell>"
+    raise ValueError(
+        "CONFIG markers not found: __file__ is undefined and no notebook cell holds them."
+    )
+
+
+def write_run_log(output: Path, overrides: Dict[str, Any]) -> bool:
+    """Write the run folder's _runlog.txt sidecar: configuration, overrides and source.
+
+    Args:
+        output: The run folder that receives every output of this run.
+        overrides: Settings whose command-line values replaced the CONFIGURATION ones.
+
+    Returns:
+        True if the sidecar was written, False otherwise.
+    """
+    log_path = output / "gtfs_od_travel_times_runlog.txt"
+    try:
+        config_text, source = config_block_source()
+    except (OSError, ValueError) as exc:
+        logging.error("Could not extract the CONFIGURATION block for the run log: %s", exc)
+        return False
+    shown = {**overrides}
+    if "LOG_LEVEL" in shown:
+        shown["LOG_LEVEL"] = logging.getLevelName(shown["LOG_LEVEL"])
+    override_lines = [f"{name} = {json.dumps(value, default=str)}" for name, value in shown.items()]
+    lines = [
+        "=" * 72,
+        "GTFS OD TRAVEL TIMES RUN LOG",
+        "=" * 72,
+        f"Run timestamp:    {datetime.now().isoformat(timespec='seconds')}",
+        f"Output directory: {output}",
+        f"Source script:    {source}",
+        "",
+        "-" * 72,
+        "COMMAND-LINE OVERRIDES (these replace the CONFIGURATION values below)",
+        "-" * 72,
+        *(override_lines or ["(none)"]),
+        "",
+        "-" * 72,
+        "CONFIGURATION (verbatim from source)",
+        "-" * 72,
+        config_text,
+        "=" * 72,
+    ]
+    try:
+        log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except OSError as exc:
+        logging.error("Error writing run log: %s", exc)
+        return False
+    logging.info("Run log saved to %s", log_path)
+    return True
+
+
+def feed_spec(text: str) -> Tuple[str, Path]:
+    """Parse one --feed value written as NAME=PATH."""
+    name, separator, path = text.partition("=")
+    if not separator or not name.strip() or not path.strip():
+        raise argparse.ArgumentTypeError(
+            f"Use NAME=PATH, for example agency_a=agency_a.zip; got {text!r}."
+        )
+    return name.strip(), Path(path.strip())
+
+
+def optional_text(text: str) -> Optional[str]:
+    """Return None for a blank value or 'none'; keep other text, including leading zeros."""
+    return None if text.strip().lower() in {"", "none"} else text.strip()
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    """Create the parser; each flag's default is the matching CONFIGURATION value."""
+    p = argparse.ArgumentParser(
+        description="Estimate door-to-door transit times between configured OD pairs.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    configured = ", ".join(f"{name}={path}" for name, path in GTFS_FEEDS.items())
+    p.add_argument(
+        "--feed",
+        dest="feeds",
+        action="append",
+        type=feed_spec,
+        default=argparse.SUPPRESS,
+        metavar="NAME=PATH",
+        help="GTFS feed as a folder or .zip; repeat for each agency. Replaces GTFS_FEEDS "
+        f"({configured}).",
+    )
+    p.add_argument(
+        "--gtfs-path",
+        dest="GTFS_PATH",
+        type=Path,
+        default=GTFS_PATH,
+        help="Single GTFS feed (folder or .zip), used with --no-multiple-feeds.",
+    )
+    p.add_argument(
+        "--service-date",
+        dest="SERVICE_DATE",
+        type=optional_text,
+        default=SERVICE_DATE,
+        help="Service day as YYYYMMDD; 'none' uses --service-id instead.",
+    )
+    p.add_argument(
+        "--service-id",
+        dest="SERVICE_ID",
+        type=optional_text,
+        default=SERVICE_ID,
+        help="Single-feed service_id, used only when the service date is none.",
+    )
+    p.add_argument(
+        "--output-dir",
+        dest="OUTPUT_DIR",
+        type=Path,
+        default=OUTPUT_DIR,
+        help="Folder that receives a new timestamped run folder.",
+    )
+    numbers = [
+        ("--walk-speed-mph", "WALK_SPEED_MPH", float, "Walking speed."),
+        (
+            "--max-access-walk-miles",
+            "MAX_ACCESS_WALK_MILES",
+            float,
+            "Longest walk from the origin to a stop or station entrance.",
+        ),
+        (
+            "--max-transfer-walk-miles",
+            "MAX_TRANSFER_WALK_MILES",
+            float,
+            "Longest outdoor walk between stops when transferring.",
+        ),
+        (
+            "--max-egress-walk-miles",
+            "MAX_EGRESS_WALK_MILES",
+            float,
+            "Longest walk from a stop or station exit to the destination.",
+        ),
+        (
+            "--min-transfer-minutes",
+            "MIN_TRANSFER_MINUTES",
+            float,
+            "Buffer added after each transfer walk.",
+        ),
+        (
+            "--initial-boarding-buffer-minutes",
+            "INITIAL_BOARDING_BUFFER_MINUTES",
+            float,
+            "Buffer before the first boarding.",
+        ),
+        ("--max-transfers", "MAX_TRANSFERS", int, "Transfers allowed (2 = three boardings)."),
+        (
+            "--max-journey-minutes",
+            "MAX_JOURNEY_MINUTES",
+            float,
+            "Longest door-to-door journey, including waits.",
+        ),
+        (
+            "--max-walk-only-miles",
+            "MAX_WALK_ONLY_MILES",
+            float,
+            "Longest walk-only trip when walk-only results are allowed.",
+        ),
+        (
+            "--departure-step-minutes",
+            "DEPARTURE_STEP_MINUTES",
+            int,
+            "Minutes between sampled departures.",
+        ),
+    ]
+    for flag, name, kind, text in numbers:
+        p.add_argument(flag, dest=name, type=kind, default=globals()[name], help=text)
+    p.add_argument(
+        "--departure-times",
+        dest="EXPLICIT_DEPARTURE_TIMES",
+        nargs="*",
+        default=EXPLICIT_DEPARTURE_TIMES,
+        metavar="HH:MM",
+        help="Exact departures for --no-use-periods; replaces the start/end range.",
+    )
+    p.add_argument(
+        "--departure-start",
+        dest="DEPARTURE_START",
+        default=DEPARTURE_START,
+        metavar="HH:MM",
+        help="First sampled departure for --no-use-periods.",
+    )
+    p.add_argument(
+        "--departure-end",
+        dest="DEPARTURE_END",
+        default=DEPARTURE_END,
+        metavar="HH:MM",
+        help="Last sampled departure for --no-use-periods.",
+    )
+    switches = [
+        ("--multiple-feeds", "USE_MULTIPLE_FEEDS", "Combine every feed in GTFS_FEEDS / --feed."),
+        ("--discovery-only", "DISCOVERY_ONLY", "Write calendar and stop inventories only."),
+        (
+            "--allow-walk-only",
+            "ALLOW_WALK_ONLY",
+            "Allow walk-only results up to --max-walk-only-miles.",
+        ),
+        (
+            "--use-periods",
+            "USE_PERIODS",
+            "Sample the PERIODS windows; otherwise use the --departure-* settings.",
+        ),
+        ("--include-reverse-pairs", "INCLUDE_REVERSE_PAIRS", "Also route each OD pair reversed."),
+        (
+            "--interpolate-missing-stop-times",
+            "INTERPOLATE_MISSING_STOP_TIMES",
+            "Interpolate blank times at timepoint=0 stops.",
+        ),
+        (
+            "--derive-zero-time-walkways",
+            "DERIVE_ZERO_TIME_WALKWAYS",
+            "Derive zero walkway traversal times from length and walking speed.",
+        ),
+        (
+            "--require-rail-pathways",
+            "REQUIRE_RAIL_PATHWAYS",
+            "Require pathways.txt entrances for subway/metro platforms.",
+        ),
+        ("--export-network", "EXPORT_NETWORK", "Write the network segment and walk-link tables."),
+        (
+            "--require-run-log",
+            "REQUIRE_RUN_LOG",
+            "Stop before routing if the _runlog.txt sidecar cannot be written.",
+        ),
+    ]
+    for flag, name, text in switches:
+        p.add_argument(
+            flag,
+            dest=name,
+            action=argparse.BooleanOptionalAction,
+            default=globals()[name],
+            help=text,
+        )
+    p.add_argument(
+        "--log-level",
+        dest="LOG_LEVEL",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        default=logging.getLevelName(LOG_LEVEL),
+        help="Logging detail.",
+    )
+    return p
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """Apply command-line overrides to the CONFIGURATION values for one run.
+
+    Overrides last only for this call; the CONFIGURATION values are restored
+    afterward, so repeated notebook calls start from the same settings.
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if paths are still
+        placeholders, no service was selected, or an endpoint is unresolved.
+    """
+    parser = build_arg_parser()
+    args = vars(parser.parse_args(notebook_safe_argv(argv)))
+    if "feeds" in args:
+        feeds = args.pop("feeds")
+        if len({name for name, _ in feeds}) != len(feeds):
+            parser.error("Each --feed NAME must be unique.")
+        args["GTFS_FEEDS"] = dict(feeds)
+    args["LOG_LEVEL"] = getattr(logging, args["LOG_LEVEL"])
+    overrides = {name: value for name, value in args.items() if value != globals()[name]}
+    saved = {name: globals()[name] for name in args}
+    globals().update(args)
+    try:
+        return run_once(overrides)
+    finally:
+        globals().update(saved)
 
 
 if __name__ == "__main__":
