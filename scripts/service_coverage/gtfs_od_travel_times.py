@@ -239,13 +239,15 @@ OD_PAIRS = [
 # source rounding; the formula audit independently uses half the displayed headway.
 # Route names should match the feed's route_short_name (or route_long_name when the
 # short name is blank) so the comparison can flag routes absent from the service day.
+# Rail lines follow the same rule: a line published with short name "R" is written
+# "R", not "Red Line", or the comparison reports it as absent.
 BENCHMARK_WALK_SPEED_MPH = 3.0
 BENCHMARK_METRO_SPEED_MPH = 45.0
 BENCHMARK_METRO_STATION_MINUTES = 1.0
 BENCHMARK_METRO_ENTRY_EXIT_MINUTES = 5.0
 BENCHMARK_METRO_HEADWAYS = {"Peak": 8.0, "Off-Peak": 12.0}
 # Benchmark legs on these routes use the metro speed, headway and station values above.
-BENCHMARK_METRO_ROUTES: set = set()  # Example: {"Red Line", "Blue Line"}.
+BENCHMARK_METRO_ROUTES: set = set()  # Same names as the legs, e.g. {"R", "B"}.
 # Per-pair tuple: period, reported_total, access_walk_miles, final_walk_miles,
 # number_of_metro_uses, list_of_legs.
 BENCHMARK_ESTIMATES = {
@@ -2180,7 +2182,7 @@ def run_once(overrides: Dict[str, Any]) -> int:
         logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(message)s")
         logging.warning(
             "Placeholder paths are still set: %s. Update the CONFIGURATION section or pass "
-            "--feed (or --gtfs-path) and --output-dir.",
+            "--feed NAME=PATH (or --no-multiple-feeds --gtfs-path PATH) and --output-dir.",
             ", ".join(unset),
         )
         return 2
@@ -2361,6 +2363,20 @@ def write_run_log(output: Path, overrides: Dict[str, Any]) -> bool:
     return True
 
 
+def script_argv(argv: Optional[Sequence[str]]) -> Optional[List[str]]:
+    """Return the arguments to parse, keeping flags given to ``%run`` in a notebook.
+
+    notebook_safe_argv() drops sys.argv whenever ipykernel is loaded, because a
+    kernel's sys.argv holds its own startup flags. ``%run`` instead sets sys.argv
+    to this script's path followed by the flags meant for it, so those are kept.
+    """
+    file_attr = globals().get("__file__")
+    if argv is None and file_attr and "ipykernel" in sys.modules and sys.argv:
+        if Path(sys.argv[0]).resolve() == Path(file_attr).resolve():
+            return sys.argv[1:]
+    return notebook_safe_argv(argv)
+
+
 def feed_spec(text: str) -> Tuple[str, Path]:
     """Parse one --feed value written as NAME=PATH."""
     name, separator, path = text.partition("=")
@@ -2391,7 +2407,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=argparse.SUPPRESS,
         metavar="NAME=PATH",
         help="GTFS feed as a folder or .zip; repeat for each agency. Replaces GTFS_FEEDS "
-        f"({configured}).",
+        f"({configured}) and turns on --multiple-feeds.",
+    )
+    # No default here, so an explicit --no-multiple-feeds can be told apart from the
+    # CONFIGURATION value when checking it against --feed.
+    p.add_argument(
+        "--multiple-feeds",
+        dest="USE_MULTIPLE_FEEDS",
+        action=argparse.BooleanOptionalAction,
+        default=argparse.SUPPRESS,
+        help="Combine every feed in GTFS_FEEDS / --feed; off reads --gtfs-path only. "
+        f"(default: {USE_MULTIPLE_FEEDS})",
     )
     p.add_argument(
         "--gtfs-path",
@@ -2498,7 +2524,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Last sampled departure for --no-use-periods.",
     )
     switches = [
-        ("--multiple-feeds", "USE_MULTIPLE_FEEDS", "Combine every feed in GTFS_FEEDS / --feed."),
         ("--discovery-only", "DISCOVERY_ONLY", "Write calendar and stop inventories only."),
         (
             "--allow-walk-only",
@@ -2562,12 +2587,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         placeholders, no service was selected, or an endpoint is unresolved.
     """
     parser = build_arg_parser()
-    args = vars(parser.parse_args(notebook_safe_argv(argv)))
+    args = vars(parser.parse_args(script_argv(argv)))
     if "feeds" in args:
         feeds = args.pop("feeds")
+        if args.get("USE_MULTIPLE_FEEDS") is False:
+            parser.error("--feed needs multiple-feed mode; remove --no-multiple-feeds.")
         if len({name for name, _ in feeds}) != len(feeds):
             parser.error("Each --feed NAME must be unique.")
         args["GTFS_FEEDS"] = dict(feeds)
+        args["USE_MULTIPLE_FEEDS"] = True
     args["LOG_LEVEL"] = getattr(logging, args["LOG_LEVEL"])
     overrides = {name: value for name, value in args.items() if value != globals()[name]}
     saved = {name: globals()[name] for name in args}
