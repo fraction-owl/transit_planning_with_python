@@ -1002,7 +1002,7 @@ def run(
 
     summary_lines = [
         f"GTFS feed:               {gtfs_path}",
-        f"Routes include / exclude: {list(routes_include)} / {list(routes_exclude)}",
+        f"Route include/exclude:   {list(routes_include)} / {list(routes_exclude)}",
         f"Projected CRS (WKID):    {projected_crs}",
         f"Loop threshold:          {loop_threshold}",
         f"Excel / JPEG export:     {export_xlsx} / {export_jpeg}",

@@ -17,6 +17,8 @@ Outputs:
       ..._Shape_<shape_id>.jpeg per shape when MAP_ONLY_DOMINANT_SHAPE is False
     - Suspicious_RouteDirections.xlsx (rewritten every run; header-only when clean)
     - Trip_Exceptions.xlsx (trips with broken references; rewritten every run)
+    - Directions_Summary_runlog.txt: run-log sidecar with the verbatim CONFIGURATION
+      block and the effective settings.
 
     <route> is route_short_name, or route_id when the short name is blank; route_id is
     appended when several routes share a short name.
@@ -28,19 +30,23 @@ Limitations:
       own direction label.
 
 Typical usage:
-    Update the paths in the CONFIGURATION section and run from a shell or a Jupyter
-    notebook.
+    Update the paths in the CONFIGURATION section (or pass the matching CLI flags) and
+    run from a shell or a Jupyter notebook.
 """
 
 from __future__ import annotations
 
+import argparse
 import logging
 import math
 import os
 import re
+import sys
 import zipfile
 from collections.abc import Mapping, Sequence
-from typing import Any, Optional
+from datetime import datetime
+from pathlib import Path
+from typing import Any, List, Optional
 
 import geopandas as gpd
 import matplotlib.pyplot as plt
@@ -50,14 +56,15 @@ from shapely.geometry import LineString
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+# === BEGIN CONFIG ===
 
-GTFS_FOLDER = r"/path/to/your/gtfs_folder"
-OUTPUT_FOLDER = r"/path/to/your/output_folder"
+GTFS_PATH = r"Path\To\Your\GTFS_Folder"  # folder of .txt files or a .zip
+OUTPUT_DIR = r"Path\To\Your\Output_Folder"
 
 # Optional: Include only these route_short_name values
 ROUTE_FILTER_IN: list[str] = []
 # Routes to exclude
-ROUTE_FILTER_OUT = ["9999A", "9999B", "9999C"]
+ROUTE_FILTER_OUT: list[str] = ["9999A", "9999B", "9999C"]
 
 # NAD83 / Maryland (meters)
 PROJECTED_CRS = "EPSG:26985"
@@ -73,7 +80,21 @@ EXPORT_JPEG = True
 # False: map every shape. Summaries, departures, and flags always use every shape.
 MAP_ONLY_DOMINANT_SHAPE = True
 
+# Fixed output filenames (written inside OUTPUT_DIR).
+SUMMARY_FILENAME = "Directions_Summary.xlsx"
+SUSPICIOUS_FILENAME = "Suspicious_RouteDirections.xlsx"
+EXCEPTIONS_FILENAME = "Trip_Exceptions.xlsx"
+
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
+
+# When True, a failed run-log write aborts the script so an output is never
+# left without a matching configuration record.
+REQUIRE_RUN_LOG: bool = True
+
+# === END CONFIG ===
+
+_PLACEHOLDER_GTFS = r"Path\To\Your\GTFS_Folder"
+_PLACEHOLDER_OUTPUT = r"Path\To\Your\Output_Folder"
 
 # =============================================================================
 # FUNCTIONS
@@ -245,7 +266,7 @@ def plot_route_shape(
     gdf_shape: gpd.GeoDataFrame,
     route: str,
     direction: str,
-    output_path: str,
+    output_path: Path,
     shape_label: str = "Most Common Shape",
 ) -> None:
     """Plot the given shape geometry and save as a .jpeg.
@@ -312,15 +333,17 @@ def to_numeric_column(df: pd.DataFrame, column: str, table: str) -> pd.Series:
     return values
 
 
-def read_gtfs_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Reads GTFS files and returns the dataframes as a tuple.
+def read_gtfs_data(
+    gtfs_path: str,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Read the GTFS files and return routes, trips, stop_times, shapes, and stops.
 
     Sequence and coordinate columns become numbers, so sequences sort as
     1, 2, 10 rather than 1, 10, 2; IDs stay text. Blank or absent optional
     text columns become empty strings so that groupings keep their rows.
     """
     files = ["routes.txt", "trips.txt", "stop_times.txt", "shapes.txt", "stops.txt"]
-    gtfs_data = load_gtfs_data(GTFS_FOLDER, files=files, dtype=str)
+    gtfs_data = load_gtfs_data(gtfs_path, files=files, dtype=str)
 
     routes = gtfs_data["routes"]
     trips = gtfs_data["trips"]
@@ -341,17 +364,17 @@ def read_gtfs_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataF
     return routes, trips, stop_times, shapes, stops
 
 
-def filter_routes(routes: pd.DataFrame) -> pd.DataFrame:
-    """Applies the route filters to the routes DataFrame and returns the filtered routes."""
-    if ROUTE_FILTER_IN:
-        routes_filtered = routes[routes["route_short_name"].isin(ROUTE_FILTER_IN)]
-    else:
-        routes_filtered = routes.copy()
-
-    if ROUTE_FILTER_OUT:
-        routes_filtered = routes_filtered[
-            ~routes_filtered["route_short_name"].isin(ROUTE_FILTER_OUT)
-        ]
+def filter_routes(
+    routes: pd.DataFrame,
+    routes_include: Sequence[str] = (),
+    routes_exclude: Sequence[str] = (),
+) -> pd.DataFrame:
+    """Apply the route_short_name include/exclude lists and return the kept routes."""
+    routes_filtered = routes.copy()
+    if routes_include:
+        routes_filtered = routes_filtered[routes_filtered["route_short_name"].isin(routes_include)]
+    if routes_exclude:
+        routes_filtered = routes_filtered[~routes_filtered["route_short_name"].isin(routes_exclude)]
     return routes_filtered
 
 
@@ -390,7 +413,11 @@ def create_lines_from_shapes(shapes: pd.DataFrame) -> gpd.GeoDataFrame:
 
 
 def merge_and_classify_shapes(
-    trips: pd.DataFrame, routes_filtered: pd.DataFrame, gdf_shapes: gpd.GeoDataFrame
+    trips: pd.DataFrame,
+    routes_filtered: pd.DataFrame,
+    gdf_shapes: gpd.GeoDataFrame,
+    projected_crs: str = PROJECTED_CRS,
+    loop_threshold: float = LOOP_THRESHOLD,
 ) -> pd.DataFrame:
     """Filter trips by routes and merge with shape direction classification.
 
@@ -405,11 +432,13 @@ def merge_and_classify_shapes(
         on="route_id",
     )
 
-    gdf_shapes_proj = gdf_shapes.to_crs(PROJECTED_CRS)
+    gdf_shapes_proj = gdf_shapes.to_crs(projected_crs)
 
     directions: list[tuple[str, str]] = []
     for row_proj in gdf_shapes_proj.itertuples(index=False):
-        directions.append((row_proj.shape_id, classify_direction(row_proj.geometry)))
+        directions.append(
+            (row_proj.shape_id, classify_direction(row_proj.geometry, loop_threshold))
+        )
 
     direction_df = pd.DataFrame(directions, columns=["shape_id", "shape_direction"])
     return trips_merged.merge(direction_df, on="shape_id", how="left")
@@ -580,6 +609,28 @@ def determine_dominant_shapes(final_data: pd.DataFrame) -> pd.DataFrame:
     return merged
 
 
+def summarize_patterns(final_data: pd.DataFrame) -> pd.DataFrame:
+    """Count trips per route, direction, shape, and first/last stop pattern."""
+    return (
+        final_data.groupby(
+            [
+                "route_id",
+                "route_short_name",
+                "route_label",
+                "direction_id",
+                "shape_id",
+                "shape_direction",
+                "is_dominant",
+                "first_stop_name",
+                "last_stop_name",
+            ],
+            dropna=False,
+        )
+        .size()
+        .reset_index(name="trip_count")
+    )
+
+
 def output_file_name(route_label: str, direction_id: str, suffix: str) -> str:
     """Return ``Route_<route>_Dir_<direction>_<suffix>`` safe to use as a file name.
 
@@ -590,26 +641,40 @@ def output_file_name(route_label: str, direction_id: str, suffix: str) -> str:
     return re.sub(r'[\\/:*?"<>|]+', "-", name)
 
 
-def export_excel_summaries(summary: pd.DataFrame, final_data: pd.DataFrame) -> None:
-    """Export Excel summary and per-route/direction departure files.
+def export_excel_summaries(
+    summary: pd.DataFrame,
+    final_data: pd.DataFrame,
+    flagged: pd.DataFrame,
+    exceptions: pd.DataFrame,
+    output_dir: Path,
+) -> None:
+    """Write the summary, review workbooks, and per-route/direction departure files.
 
-    Writes `Directions_Summary.xlsx` and `Route_<route>_Dir_<direction_id>_departures.xlsx`,
-    one per route_id and direction_id, with every trip sorted by first departure.
+    The review workbooks are rewritten on every run, header-only when there is
+    nothing to report, so a clean run never leaves an earlier run's findings in
+    place. Departure files hold every trip of one route_id and direction_id,
+    sorted by first departure.
     """
-    summary_path = os.path.join(OUTPUT_FOLDER, "Directions_Summary.xlsx")
-    summary.to_excel(summary_path, index=False)
+    for frame, name in (
+        (summary, SUMMARY_FILENAME),
+        (flagged, SUSPICIOUS_FILENAME),
+        (exceptions, EXCEPTIONS_FILENAME),
+    ):
+        frame.to_excel(output_dir / name, index=False)
 
     grouped_fd = final_data.groupby(["route_id", "direction_id"])
     for (_route_id, direction), group in grouped_fd:
         output_name = output_file_name(group["route_label"].iloc[0], direction, "departures.xlsx")
-        output_file = os.path.join(OUTPUT_FOLDER, output_name)
-        group.sort_values(["departure_minutes", "trip_id"]).to_excel(output_file, index=False)
+        group.sort_values(["departure_minutes", "trip_id"]).to_excel(
+            output_dir / output_name, index=False
+        )
 
 
 def export_jpegs(
     summary: pd.DataFrame,
     gdf_shapes: gpd.GeoDataFrame,
-    dominant_only: bool = MAP_ONLY_DOMINANT_SHAPE,
+    output_dir: Path,
+    dominant_only: bool,
 ) -> None:
     """Exports JPEG maps of route shapes, one per (route, direction, shape).
 
@@ -631,9 +696,7 @@ def export_jpegs(
             suffix = f"Shape_{shape_id}.jpeg"
             shape_label = f"Shape {shape_id}" + (" (most common)" if row["is_dominant"] else "")
 
-        output_name = output_file_name(route, direction, suffix)
-        output_path = os.path.join(OUTPUT_FOLDER, output_name)
-
+        output_path = output_dir / output_file_name(route, direction, suffix)
         plot_route_shape(route_shape_gdf, route, direction, output_path, shape_label)
 
 
@@ -688,36 +751,312 @@ def flag_suspicious_data(summary: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(flags, columns=["route_id", "route_short_name", "direction_id", "problem"])
 
 
-def write_review_workbooks(flagged: pd.DataFrame, exceptions: pd.DataFrame) -> None:
-    """Write Suspicious_RouteDirections.xlsx and Trip_Exceptions.xlsx.
+# -----------------------------------------------------------------------------
+# RUN LOG
+# -----------------------------------------------------------------------------
 
-    Both are rewritten on every run, header-only when there is nothing to
-    report, so a clean run never leaves an earlier run's findings in place.
+
+def resolve_source_file() -> Optional[Path]:
+    """Best-effort path to this script's source (``None`` in notebooks)."""
+    try:
+        return Path(__file__).resolve()
+    except NameError:
+        return None
+
+
+def extract_config_block(source_file: Path) -> str:
+    r"""Return the text between the CONFIG markers in *source_file*.
+
+    Reads ``source_file`` as UTF-8 text and slices out the lines strictly
+    *between* the first occurrence of ``# === BEGIN CONFIG ===`` and the first
+    subsequent occurrence of ``# === END CONFIG ===``.  The marker lines
+    themselves are excluded; whitespace and inline comments inside the block
+    are preserved verbatim.
+
+    Args:
+        source_file: Path to the Python source file to scan (typically
+            ``Path(__file__)`` from the calling script).
+
+    Returns:
+        The verbatim text of the configuration block, joined with ``\n``.
+
+    Raises:
+        ValueError: If either marker is missing or they appear out of order.
+        OSError: If ``source_file`` cannot be read.
     """
-    for frame, name in (
-        (flagged, "Suspicious_RouteDirections.xlsx"),
-        (exceptions, "Trip_Exceptions.xlsx"),
-    ):
-        frame.to_excel(os.path.join(OUTPUT_FOLDER, name), index=False)
+    _BEGIN = "# === BEGIN CONFIG ==="
+    _END = "# === END CONFIG ==="
+
+    lines: list[str] = source_file.read_text(encoding="utf-8").splitlines()
+
+    begin_idx: int | None = None
+    end_idx: int | None = None
+    for i, line in enumerate(lines):
+        stripped: str = line.strip()
+        if begin_idx is None and stripped == _BEGIN:
+            begin_idx = i
+        elif begin_idx is not None and stripped == _END:
+            end_idx = i
+            break
+
+    if begin_idx is None or end_idx is None:
+        raise ValueError(
+            f"Config markers not found in '{source_file}'. Expected '{_BEGIN}' and '{_END}'."
+        )
+
+    return "\n".join(lines[begin_idx + 1 : end_idx])
+
+
+def write_run_log(output_dir: Path, summary_lines: List[str]) -> bool:
+    """Write the verbatim config block plus a run summary into *output_dir*.
+
+    The sidecar is named after :data:`SUMMARY_FILENAME` (same stem,
+    ``_runlog.txt`` suffix) per CONTRIBUTING.md.
+
+    Args:
+        output_dir: Directory that received this run's outputs.
+        summary_lines: Human-readable lines describing what the run did.
+
+    Returns:
+        ``True`` if the log was written successfully, ``False`` otherwise.
+    """
+    log_path = output_dir / f"{Path(SUMMARY_FILENAME).stem}_runlog.txt"
+
+    source_file = resolve_source_file()
+    if source_file is None:
+        config_text = "(config block unavailable: interactive session, no __file__ on disk)"
+        source_display = "<interactive>"
+    else:
+        try:
+            config_text = extract_config_block(source_file)
+        except (OSError, ValueError) as exc:
+            logging.error("Could not extract config block for run log: %s", exc)
+            return False
+        source_display = str(source_file)
+
+    lines: List[str] = [
+        "=" * 72,
+        "ROUTE DIRECTION CLASSIFIER RUN LOG",
+        "=" * 72,
+        f"Run timestamp:    {datetime.now().isoformat(timespec='seconds')}",
+        f"Output directory: {output_dir}",
+        f"Source script:    {source_display}",
+        "",
+        "-" * 72,
+        "RUN SUMMARY",
+        "-" * 72,
+        *summary_lines,
+        "",
+        "-" * 72,
+        "CONFIGURATION (verbatim from source)",
+        "-" * 72,
+        config_text,
+        "=" * 72,
+    ]
+    try:
+        log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except OSError as exc:
+        logging.error("Could not write run log '%s': %s", log_path, exc)
+        return False
+    logging.info("Run log written to '%s'.", log_path)
+    return True
+
+
+def notebook_safe_argv(argv: Optional[Sequence[str]]) -> Optional[List[str]]:
+    """Return the argv to parse, shielding notebook kernels from stray flags.
+
+    When a script's ``main()`` runs with no explicit ``argv`` inside a
+    Jupyter/IPython kernel, ``sys.argv`` holds kernel plumbing (for example
+    ``-f /path/kernel.json``) rather than flags meant for the script, and
+    strict ``argparse.parse_args`` would reject it and abort.  This helper
+    detects the notebook case and substitutes an empty argument list so the
+    CONFIGURATION constants stay in charge, while shell runs keep strict
+    parsing (a typo in a flag fails loudly instead of being silently ignored).
+
+    Canonical implementation: ``utils/cli_helpers.py``.
+
+    Args:
+        argv: Explicit argument list passed to ``main()``, or ``None`` to
+            fall back to ``sys.argv``.
+
+    Returns:
+        ``list(argv)`` when *argv* was provided; ``[]`` when running inside a
+        notebook kernel; otherwise ``None`` so argparse reads ``sys.argv[1:]``.
+    """
+    if argv is not None:
+        return list(argv)
+    if "ipykernel" in sys.modules:
+        return []
+    return None
 
 
 # =============================================================================
-# MAIN
+# PIPELINE
 # =============================================================================
 
 
-def main() -> int:
-    """Primary entry point for GTFS direction classification.
+def run(
+    gtfs_path: str,
+    output_dir: Path,
+    routes_include: Sequence[str] = (),
+    routes_exclude: Sequence[str] = (),
+    projected_crs: str = PROJECTED_CRS,
+    loop_threshold: float = LOOP_THRESHOLD,
+    export_xlsx: bool = True,
+    export_jpeg: bool = True,
+    map_only_dominant_shape: bool = True,
+) -> pd.DataFrame:
+    """Classify every shape, flag inconsistencies, and write the requested outputs.
 
     1. Reads GTFS files (routes, trips, stop_times, shapes, stops).
-    2. Filters the routes according to user-defined inclusion/exclusion lists.
-    3. Merges shape data with trip data, creating LineString geometries and classifying them.
-    4. Identifies first/last stops for each trip, merges stop names, and sets aside
-       trips with broken references.
+    2. Filters the routes according to the include/exclude lists.
+    3. Builds a line for each shape, projects it, and classifies its direction.
+    4. Identifies first/last stops for each trip, merges stop names, and sets
+       aside trips with broken references.
     5. Determines dominant shapes within each route/direction based on trip counts.
-    6. Flags suspicious data where shape_direction and direction_id seem inconsistent.
-    7. Exports summarized results, per-route files, and review workbooks to Excel, if enabled.
+    6. Flags data where shape_direction and direction_id seem inconsistent.
+    7. Exports summaries, per-route files, and review workbooks to Excel, if enabled.
     8. Exports JPEG maps of dominant (or all) shapes, if enabled.
+
+    Returns:
+        The pattern summary (one row per route/direction/shape/terminal pattern).
+
+    Raises:
+        OSError: The feed cannot be read or an output cannot be written.
+        ValueError: The feed is malformed.
+        RuntimeError: The run log could not be written while
+            ``REQUIRE_RUN_LOG`` is True.
+    """
+    # Step 1: Read GTFS
+    routes, trips, stop_times, shapes, stops = read_gtfs_data(gtfs_path)
+
+    # Step 2: Filter routes
+    routes_filtered = add_route_labels(filter_routes(routes, routes_include, routes_exclude))
+
+    # Step 3: Build shape geometries and classify directions
+    gdf_shapes = create_lines_from_shapes(shapes)
+    trips_merged = merge_and_classify_shapes(
+        trips, routes_filtered, gdf_shapes, projected_crs, loop_threshold
+    )
+
+    # Step 4: Identify first and last stops; set aside trips with broken references
+    final_data = identify_first_last_stops(trips_merged, stop_times, stops)
+    final_data, exceptions = split_trip_exceptions(final_data, trips, routes, stops)
+    excluded_trips = exceptions.loc[exceptions["excluded"], "trip_id"].nunique()
+    if not exceptions.empty:
+        logging.warning(
+            "%d trip problem(s) found; %d trip(s) excluded from the analysis.",
+            len(exceptions),
+            excluded_trips,
+        )
+
+    # Step 5: Determine dominant shapes (every shape stays in the analysis)
+    final_data = determine_dominant_shapes(final_data)
+    summary = summarize_patterns(final_data)
+
+    # Step 6: Flag suspicious data
+    flagged = flag_suspicious_data(summary)
+    if flagged.empty:
+        logging.info("No suspicious route/direction combos found.")
+    else:
+        logging.warning("%d suspicious route/direction combination(s) flagged.", len(flagged))
+
+    if not (export_xlsx or export_jpeg):
+        return summary
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Step 7: Export to Excel
+    if export_xlsx:
+        export_excel_summaries(summary, final_data, flagged, exceptions, output_dir)
+
+    # Step 8: Export JPEGs
+    if export_jpeg:
+        export_jpegs(summary, gdf_shapes, output_dir, map_only_dominant_shape)
+
+    summary_lines = [
+        f"GTFS feed:               {gtfs_path}",
+        f"Route include/exclude:   {list(routes_include)} / {list(routes_exclude)}",
+        f"Projected CRS:           {projected_crs}",
+        f"Loop threshold:          {loop_threshold}",
+        f"Excel / JPEG export:     {export_xlsx} / {export_jpeg}",
+        f"Map only dominant shape: {map_only_dominant_shape}",
+        f"Routes analyzed:         {final_data['route_id'].nunique()}",
+        f"Trips analyzed:          {len(final_data)}",
+        f"Trips excluded:          {excluded_trips}",
+        f"Patterns:                {len(summary)}",
+        f"Suspicious combinations: {len(flagged)}",
+    ]
+    if not write_run_log(output_dir, summary_lines) and REQUIRE_RUN_LOG:
+        raise RuntimeError(
+            "Run log could not be written. Set REQUIRE_RUN_LOG = False to suppress this "
+            "check when writing to a read-only location."
+        )
+    return summary
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    """Create the command-line argument parser."""
+    parser = argparse.ArgumentParser(
+        description=(
+            "Classify GTFS shape directions, mark each route's dominant shape, "
+            "and flag direction inconsistencies."
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--gtfs", default=GTFS_PATH, help="GTFS feed: a folder of .txt files or a .zip archive."
+    )
+    parser.add_argument("--output-dir", default=OUTPUT_DIR, help="Directory for all outputs.")
+    parser.add_argument(
+        "--routes-include",
+        nargs="*",
+        default=ROUTE_FILTER_IN,
+        help="route_short_name values to keep; omit to keep all.",
+    )
+    parser.add_argument(
+        "--routes-exclude",
+        nargs="*",
+        default=ROUTE_FILTER_OUT,
+        help="route_short_name values to drop.",
+    )
+    parser.add_argument(
+        "--projected-crs",
+        default=PROJECTED_CRS,
+        help="Projected coordinate system used for distances, e.g. EPSG:26985.",
+    )
+    parser.add_argument(
+        "--loop-threshold",
+        type=float,
+        default=LOOP_THRESHOLD,
+        help="Shapes whose ends are closer than this (projected units) are loops.",
+    )
+    parser.add_argument(
+        "--export-xlsx",
+        action=argparse.BooleanOptionalAction,
+        default=EXPORT_XLSX,
+        help="Write the Excel summaries, review workbooks, and departure files.",
+    )
+    parser.add_argument(
+        "--export-jpeg",
+        action=argparse.BooleanOptionalAction,
+        default=EXPORT_JPEG,
+        help="Write JPEG maps of route shapes.",
+    )
+    parser.add_argument(
+        "--map-only-dominant-shape",
+        action=argparse.BooleanOptionalAction,
+        default=MAP_ONLY_DOMINANT_SHAPE,
+        help="Map only each route/direction's dominant shape instead of every shape.",
+    )
+    return parser
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """Entry point. Validates placeholder paths before doing any work.
+
+    Args:
+        argv: Optional explicit argument list (used by tests); ``None``
+            reads ``sys.argv`` outside notebook kernels.
 
     Returns:
         Process exit code: 0 on success, 1 on failure, 2 if required
@@ -728,80 +1067,33 @@ def main() -> int:
         format="%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-    if (
-        GTFS_FOLDER == r"/path/to/your/gtfs_folder"
-        or OUTPUT_FOLDER == r"/path/to/your/output_folder"
-    ):
+    args = build_arg_parser().parse_args(notebook_safe_argv(argv))
+
+    if args.gtfs == _PLACEHOLDER_GTFS or args.output_dir == _PLACEHOLDER_OUTPUT:
         logging.warning(
-            "GTFS_FOLDER and/or OUTPUT_FOLDER are still set to placeholder values. "
-            "Please update them in the CONFIGURATION section before running."
+            "GTFS_PATH and/or OUTPUT_DIR are still set to placeholder values. "
+            "Update the CONFIGURATION section (or pass --gtfs / --output-dir) before running."
         )
         return 2
+
+    output_dir = Path(args.output_dir).expanduser()
     try:
-        os.makedirs(OUTPUT_FOLDER, exist_ok=True)
-
-        # Step 1: Read GTFS
-        routes, trips, stop_times, shapes, stops = read_gtfs_data()
-
-        # Step 2: Filter routes
-        routes_filtered = add_route_labels(filter_routes(routes))
-
-        # Step 3: Build shape geometries and classify directions
-        gdf_shapes = create_lines_from_shapes(shapes)
-        trips_merged = merge_and_classify_shapes(trips, routes_filtered, gdf_shapes)
-
-        # Step 4: Identify first and last stops; set aside trips with broken references
-        final_data = identify_first_last_stops(trips_merged, stop_times, stops)
-        final_data, exceptions = split_trip_exceptions(final_data, trips, routes, stops)
-        if not exceptions.empty:
-            logging.warning(
-                "%d trip problem(s) found; %d trip(s) excluded from the analysis.",
-                len(exceptions),
-                exceptions.loc[exceptions["excluded"], "trip_id"].nunique(),
-            )
-
-        # Step 5: Determine dominant shapes (every shape stays in the analysis)
-        final_data = determine_dominant_shapes(final_data)
-
-        summary = (
-            final_data.groupby(
-                [
-                    "route_id",
-                    "route_short_name",
-                    "route_label",
-                    "direction_id",
-                    "shape_id",
-                    "shape_direction",
-                    "is_dominant",
-                    "first_stop_name",
-                    "last_stop_name",
-                ],
-                dropna=False,
-            )
-            .size()
-            .reset_index(name="trip_count")
+        run(
+            gtfs_path=args.gtfs,
+            output_dir=output_dir,
+            routes_include=args.routes_include,
+            routes_exclude=args.routes_exclude,
+            projected_crs=args.projected_crs,
+            loop_threshold=args.loop_threshold,
+            export_xlsx=args.export_xlsx,
+            export_jpeg=args.export_jpeg,
+            map_only_dominant_shape=args.map_only_dominant_shape,
         )
-
-        # Step 6: Flag suspicious data
-        flagged = flag_suspicious_data(summary)
-        if flagged.empty:
-            logging.info("No suspicious route/direction combos found.")
-        else:
-            logging.warning("%d suspicious route/direction combination(s) flagged.", len(flagged))
-
-        # Step 7: Export to Excel
-        if EXPORT_XLSX:
-            export_excel_summaries(summary, final_data)
-            write_review_workbooks(flagged, exceptions)
-
-        # Step 8: Export JPEGs
-        if EXPORT_JPEG:
-            export_jpegs(summary, gdf_shapes, dominant_only=MAP_ONLY_DOMINANT_SHAPE)
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, RuntimeError) as exc:
         logging.error("%s", exc)
         return 1
 
-    logging.info("Script completed successfully. Outputs are in %s.", OUTPUT_FOLDER)
+    logging.info("Script completed successfully. Outputs are in %s.", output_dir)
     return 0
 
 

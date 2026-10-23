@@ -329,9 +329,8 @@ def test_flag_suspicious_data_flags_minority_shape_running_the_other_way() -> No
 # ---------------------------------------------------------------------------
 
 
-def _record_plots(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> list[str]:
+def _record_plots(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     names: list[str] = []
-    monkeypatch.setattr(mod, "OUTPUT_FOLDER", str(tmp_path))
     monkeypatch.setattr(mod, "plot_route_shape", lambda *args: names.append(Path(args[3]).name))
     return names
 
@@ -339,7 +338,7 @@ def _record_plots(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> list[str]:
 def test_export_jpegs_maps_shared_shape_for_each_route(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    names = _record_plots(monkeypatch, tmp_path)
+    names = _record_plots(monkeypatch)
     summary = pd.DataFrame(
         {
             "route_id": ["A", "B"],
@@ -349,14 +348,14 @@ def test_export_jpegs_maps_shared_shape_for_each_route(
             "is_dominant": [True, True],
         }
     )
-    export_jpegs(summary, gpd.GeoDataFrame({"shape_id": []}), dominant_only=True)
+    export_jpegs(summary, gpd.GeoDataFrame({"shape_id": []}), tmp_path, dominant_only=True)
     assert names == ["Route_1_Dir_0_DominantShape.jpeg", "Route_2_Dir_0_DominantShape.jpeg"]
 
 
 def test_export_jpegs_all_shapes_get_distinct_files(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    names = _record_plots(monkeypatch, tmp_path)
+    names = _record_plots(monkeypatch)
     summary = pd.DataFrame(
         {
             "route_id": ["A", "A"],
@@ -366,7 +365,7 @@ def test_export_jpegs_all_shapes_get_distinct_files(
             "is_dominant": [True, False],
         }
     )
-    export_jpegs(summary, gpd.GeoDataFrame({"shape_id": []}), dominant_only=False)
+    export_jpegs(summary, gpd.GeoDataFrame({"shape_id": []}), tmp_path, dominant_only=False)
     assert names == ["Route_1-X_Dir_0_Shape_S1.jpeg", "Route_1-X_Dir_0_Shape_S2.jpeg"]
 
 
@@ -404,50 +403,64 @@ def _write_feed(folder: Path, sequence_column: str = "1,2,10") -> None:
     )
 
 
+def _argv(feed: Path, out: Path, *extra: str) -> list[str]:
+    return ["--gtfs", str(feed), "--output-dir", str(out), "--routes-exclude", *extra]
+
+
 @pytest.fixture()
-def configured(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+def feed(tmp_path: Path) -> Path:
     _write_feed(tmp_path / "gtfs")
+    return tmp_path / "gtfs"
+
+
+def test_main_end_to_end(feed: Path, tmp_path: Path) -> None:
     out = tmp_path / "out"
-    monkeypatch.setattr(mod, "GTFS_FOLDER", str(tmp_path / "gtfs"))
-    monkeypatch.setattr(mod, "OUTPUT_FOLDER", str(out))
-    monkeypatch.setattr(mod, "ROUTE_FILTER_OUT", [])
-    monkeypatch.setattr(mod, "EXPORT_JPEG", False)
-    return out
-
-
-def test_main_end_to_end(configured: Path) -> None:
-    assert mod.main() == 0
-    summary = pd.read_excel(configured / "Directions_Summary.xlsx", dtype=str)
+    assert mod.main(_argv(feed, out, "--no-export-jpeg")) == 0
+    summary = pd.read_excel(out / "Directions_Summary.xlsx", dtype=str)
     assert summary[["shape_id", "shape_direction", "trip_count"]].to_numpy().tolist() == [
         ["S1", "NB", "2"]
     ]
-    departures = pd.read_excel(configured / "Route_1_Dir_0_departures.xlsx", dtype=str)
+    departures = pd.read_excel(out / "Route_1_Dir_0_departures.xlsx", dtype=str)
     assert departures["departure_time"].tolist() == ["9:00:00", "10:00:00"]
-    exceptions = pd.read_excel(configured / "Trip_Exceptions.xlsx", dtype=str)
+    exceptions = pd.read_excel(out / "Trip_Exceptions.xlsx", dtype=str)
     assert exceptions["trip_id"].tolist() == ["T3"]
+    run_log = (out / "Directions_Summary_runlog.txt").read_text(encoding="utf-8")
+    assert "GTFS_PATH = " in run_log
+    assert "Trips excluded:          1" in run_log
 
 
-def test_main_rewrites_suspicious_workbook_on_clean_run(configured: Path) -> None:
-    configured.mkdir()
+def test_main_rewrites_suspicious_workbook_on_clean_run(feed: Path, tmp_path: Path) -> None:
+    out = tmp_path / "out"
+    out.mkdir()
     stale = pd.DataFrame({"problem": ["from an earlier run"]})
-    stale.to_excel(configured / "Suspicious_RouteDirections.xlsx", index=False)
-    assert mod.main() == 0
-    assert pd.read_excel(configured / "Suspicious_RouteDirections.xlsx").empty
+    stale.to_excel(out / "Suspicious_RouteDirections.xlsx", index=False)
+    assert mod.main(_argv(feed, out, "--no-export-jpeg")) == 0
+    assert pd.read_excel(out / "Suspicious_RouteDirections.xlsx").empty
 
 
-def test_main_skips_workbooks_when_xlsx_export_off(
-    configured: Path, monkeypatch: pytest.MonkeyPatch
+def test_main_maps_without_workbooks_when_xlsx_export_off(
+    feed: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(mod, "EXPORT_XLSX", False)
-    assert mod.main() == 0
-    assert list(configured.iterdir()) == []
+    names = _record_plots(monkeypatch)
+    out = tmp_path / "out"
+    assert mod.main(_argv(feed, out, "--no-export-xlsx")) == 0
+    assert names == ["Route_1_Dir_0_DominantShape.jpeg"]
+    assert [p.name for p in out.iterdir()] == ["Directions_Summary_runlog.txt"]
+
+
+def test_main_writes_nothing_when_all_exports_off(feed: Path, tmp_path: Path) -> None:
+    out = tmp_path / "out"
+    assert mod.main(_argv(feed, out, "--no-export-xlsx", "--no-export-jpeg")) == 0
+    assert not out.exists()
+
+
+def test_main_returns_2_for_placeholder_paths() -> None:
+    assert mod.main([]) == 2
 
 
 def test_main_reports_non_numeric_sequence(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     _write_feed(tmp_path / "bad", sequence_column="1,2,x")
-    monkeypatch.setattr(mod, "GTFS_FOLDER", str(tmp_path / "bad"))
-    monkeypatch.setattr(mod, "OUTPUT_FOLDER", str(tmp_path / "out"))
-    assert mod.main() == 1
+    assert mod.main(_argv(tmp_path / "bad", tmp_path / "out")) == 1
     assert "non-numeric 'stop_sequence'" in caplog.text
