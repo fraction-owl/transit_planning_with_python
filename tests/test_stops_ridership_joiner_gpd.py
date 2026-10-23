@@ -775,3 +775,252 @@ def test_generate_route_plots_exits_for_non_gtfs_input(tmp_path: Path) -> None:
         pytest.raises(SystemExit),
     ):
         target.generate_route_plots()
+
+
+# ---------------------------------------------------------------------------
+# ID / route normalization
+# ---------------------------------------------------------------------------
+
+
+def _write_excel(path: Path, rows: dict) -> Path:
+    pd.DataFrame(rows).to_excel(path, index=False)
+    return path
+
+
+def test_safe_to_str_drops_float_suffix_and_strips() -> None:
+    result = target._safe_to_str(pd.Series([123.0, " 00123 ", "", None], dtype=object))
+    assert result.iloc[0] == "123"
+    assert result.iloc[1] == "00123"
+    assert pd.isna(result.iloc[2])
+    assert pd.isna(result.iloc[3])
+
+
+def test_gtfs_blank_stop_code_does_not_break_matching(tmp_path: Path) -> None:
+    (tmp_path / "stops.txt").write_text(
+        "stop_code,stop_id,stop_name,stop_lat,stop_lon\n"
+        "123,a,A,38.9,-77.0\n,b,B,38.9,-77.0\n00456,c,C,38.8,-77.0\n",
+        encoding="utf-8",
+    )
+    excel = _write_excel(
+        tmp_path / "r.xlsx",
+        {
+            "STOP_ID": [123, "00456"],
+            "ROUTE_NAME": ["1", "1"],
+            "XBOARDINGS": [5.0, 6.0],
+            "XALIGHTINGS": [1.0, 1.0],
+        },
+    )
+    with (
+        patch("stops_ridership_joiner_gpd.BUS_STOPS_INPUT", tmp_path),
+        patch("stops_ridership_joiner_gpd.EXCEL_FILE", excel),
+    ):
+        stops, key = target.load_bus_stops()
+        per_stop = target.aggregate_excel_per_stop(target.read_and_filter_excel())
+        matched = target.merge_ridership(stops, per_stop, key)
+        coords = target.load_stop_coords(tmp_path)
+    assert sorted(matched["stop_code"]) == ["00456", "123"]
+    # The plotting lookup uses the same keys as the vector pipeline.
+    assert set(matched["stop_code"]) <= set(coords["stop_code"])
+
+
+def test_numeric_route_names_filter_and_sort(tmp_path: Path) -> None:
+    excel = _write_excel(
+        tmp_path / "r.xlsx",
+        {
+            "STOP_ID": ["1", "2", "3"],
+            "ROUTE_NAME": [798, "RIBS4", 10],
+            "XBOARDINGS": [1.0, 2.0, 3.0],
+            "XALIGHTINGS": [0.0, 0.0, 0.0],
+        },
+    )
+    with patch("stops_ridership_joiner_gpd.EXCEL_FILE", excel):
+        all_rows = target.read_and_filter_excel()
+        with patch("stops_ridership_joiner_gpd.ROUTE_FILTER_LIST", ["798"]):
+            filtered = target.read_and_filter_excel()
+    assert sorted(pd.unique(all_rows["ROUTE_NAME"].dropna())) == ["10", "798", "RIBS4"]
+    assert filtered["STOP_ID"].tolist() == ["1"]
+
+
+def test_missing_alightings_count_as_zero_in_total(tmp_path: Path) -> None:
+    excel = _write_excel(
+        tmp_path / "r.xlsx",
+        {
+            "STOP_ID": ["1", "1"],
+            "ROUTE_NAME": ["1", "1"],
+            "XBOARDINGS": [10.0, 20.0],
+            "XALIGHTINGS": [5.0, None],
+        },
+    )
+    with patch("stops_ridership_joiner_gpd.EXCEL_FILE", excel):
+        row = target.aggregate_excel_per_stop(target.read_and_filter_excel()).iloc[0]
+    assert row["XBOARDINGS"] == pytest.approx(30.0)
+    assert row["XALIGHTINGS"] == pytest.approx(5.0)
+    assert row["TOTAL"] == pytest.approx(35.0)
+
+
+# ---------------------------------------------------------------------------
+# Duplicate stop keys / polygon IDs
+# ---------------------------------------------------------------------------
+
+
+def _dup_stops_gdf() -> gpd.GeoDataFrame:
+    return gpd.GeoDataFrame(
+        {"stop_code": ["1001", "2002", "2002", "9999", "9999"]},
+        geometry=[Point(0, 0), Point(1, 0), Point(2, 0), Point(3, 0), Point(4, 0)],
+        crs="EPSG:4326",
+    )
+
+
+def test_merge_ignores_duplicate_keys_without_ridership() -> None:
+    result = target.merge_ridership(_dup_stops_gdf(), _agg_excel_df().iloc[[0]], "stop_code")
+    assert result["stop_code"].tolist() == ["1001"]
+
+
+def test_merge_duplicate_key_with_ridership_errors_by_default() -> None:
+    with pytest.raises(ValueError, match="2002"):
+        target.merge_ridership(_dup_stops_gdf(), _agg_excel_df(), "stop_code")
+
+
+def test_merge_split_policy_preserves_totals() -> None:
+    with patch("stops_ridership_joiner_gpd.DUPLICATE_STOP_POLICY", "split"):
+        result = target.merge_ridership(_dup_stops_gdf(), _agg_excel_df(), "stop_code")
+    rows_2002 = result[result["stop_code"] == "2002"]
+    assert rows_2002["XBOARDINGS"].tolist() == pytest.approx([2.5, 2.5])
+    assert result["XBOARDINGS"].sum() == pytest.approx(35.0)
+
+
+def test_aggregate_by_polygon_rejects_repeated_ids() -> None:
+    repeated = gpd.GeoDataFrame(
+        {"GEOID": ["P1", "P1"]},
+        geometry=[Polygon([(0, 0), (1, 0), (1, 1)]), Polygon([(5, 0), (6, 0), (6, 1)])],
+        crs="EPSG:4326",
+    )
+    with pytest.raises(ValueError, match="repeats"):
+        target.aggregate_by_polygon(_matched_with_geoid(), repeated)
+
+
+# ---------------------------------------------------------------------------
+# Reconciliation
+# ---------------------------------------------------------------------------
+
+
+def test_build_reconciliation_accounts_for_every_boarding() -> None:
+    df_excel = pd.DataFrame(
+        {
+            "STOP_ID": ["1001", None, "5555"],
+            "ROUTE_NAME": ["1", "1", "1"],
+            "XBOARDINGS": [10.0, 70.0, 20.0],
+            "XALIGHTINGS": [0.0, 0.0, 0.0],
+            "TOTAL": [10.0, 70.0, 20.0],
+        }
+    )
+    matched = target.merge_ridership(
+        _stops_gdf(), target.aggregate_excel_per_stop(df_excel), "stop_code"
+    )
+    recon, unmatched = target.build_reconciliation(df_excel, matched, "stop_code", False)
+    totals = recon.set_index("category")["XBOARDINGS"]
+    assert totals["matched_to_stops"] == pytest.approx(10.0)
+    assert totals["no_stop_match"] == pytest.approx(20.0)
+    assert totals["blank_stop_id"] == pytest.approx(70.0)
+    assert totals["grand_total"] == pytest.approx(100.0)
+    assert sorted(unmatched["reason"]) == ["blank_stop_id", "no_stop_match"]
+
+
+def test_build_reconciliation_reports_boundary_stop_outside_polygons() -> None:
+    stops = gpd.GeoDataFrame(
+        {"stop_code": ["1001", "2002"]},
+        geometry=[Point(0.5, 0.5), Point(2.0, 0.5)],  # 2002 sits on P1's east edge
+        crs="EPSG:4326",
+    )
+    polygons = gpd.GeoDataFrame(
+        {"GEOID": ["P1"]}, geometry=[Polygon([(0, 0), (2, 0), (2, 1), (0, 1)])], crs="EPSG:4326"
+    )
+    df_excel = _agg_excel_df().assign(ROUTE_NAME="1")
+    with patch("stops_ridership_joiner_gpd.POLYGON_LAYER", Path("polys.shp")):
+        with patch("geopandas.read_file", return_value=polygons):
+            joined, polys = target.spatial_join_to_polygons(stops)
+    matched = target.merge_ridership(joined, df_excel, "stop_code")
+    recon, _ = target.build_reconciliation(df_excel, matched, "stop_code", True)
+    totals = recon.set_index("category")["XBOARDINGS"]
+    assert totals["matched_in_polygon"] == pytest.approx(30.0)
+    assert totals["matched_outside_polygons"] == pytest.approx(5.0)
+    poly_out = target.aggregate_by_polygon(matched, polys)
+    assert poly_out["XBOARD_SUM"].sum() == pytest.approx(totals["matched_in_polygon"])
+
+
+# ---------------------------------------------------------------------------
+# Map colors
+# ---------------------------------------------------------------------------
+
+
+def test_color_for_value_missing_and_negative_use_no_data_color() -> None:
+    assert target.color_for_value(float("nan")) == target.PLOT_NO_DATA_COLOR
+    assert target.color_for_value(-1.0) == target.PLOT_NO_DATA_COLOR
+
+
+# ---------------------------------------------------------------------------
+# main(): end to end
+# ---------------------------------------------------------------------------
+
+
+def _main_inputs(tmp_path: Path) -> tuple[Path, Path, Path]:
+    gtfs_dir = tmp_path / "gtfs"
+    _write_min_gtfs(gtfs_dir)
+    excel = _write_excel(
+        tmp_path / "r.xlsx",
+        {
+            "STOP_ID": ["1001", "2002", None, "7777"],
+            "ROUTE_NAME": ["10A", "20", "20", "20"],
+            "XBOARDINGS": [10.0, 30.0, 50.0, 10.0],
+            "XALIGHTINGS": [3.0, 7.0, 0.0, 1.0],
+        },
+    )
+    return gtfs_dir, excel, tmp_path / "out"
+
+
+def _patch_main(gtfs_dir: Path, excel: Path, out: Path, split: bool) -> list:
+    return [
+        patch("stops_ridership_joiner_gpd.BUS_STOPS_INPUT", gtfs_dir),
+        patch("stops_ridership_joiner_gpd.EXCEL_FILE", excel),
+        patch("stops_ridership_joiner_gpd.POLYGON_LAYER", None),
+        patch("stops_ridership_joiner_gpd.OUTPUT_FOLDER", out),
+        patch("stops_ridership_joiner_gpd.VECTOR_DIR", out / "vector"),
+        patch("stops_ridership_joiner_gpd.SPLIT_BY_ROUTE", split),
+        patch("stops_ridership_joiner_gpd.DRAW_PLOTS", False),
+    ]
+
+
+@pytest.mark.parametrize("split", [False, True])
+def test_main_writes_reconciliation(tmp_path: Path, split: bool) -> None:
+    gtfs_dir, excel, out = _main_inputs(tmp_path)
+    patches = _patch_main(gtfs_dir, excel, out, split)
+    for p in patches:
+        p.start()
+    try:
+        assert target.main() == 0
+    finally:
+        for p in patches:
+            p.stop()
+    recon = pd.read_csv(out / "ridership_reconciliation.csv").set_index("category")
+    assert recon.loc["matched_to_stops", "XBOARDINGS"] == pytest.approx(40.0)
+    assert recon.loc["blank_stop_id", "XBOARDINGS"] == pytest.approx(50.0)
+    assert recon.loc["no_stop_match", "XBOARDINGS"] == pytest.approx(10.0)
+    assert recon.loc["grand_total", "XBOARDINGS"] == pytest.approx(100.0)
+    assert len(pd.read_csv(out / "unmatched_ridership.csv")) == 2
+
+
+def test_main_removes_outputs_when_run_log_fails(tmp_path: Path) -> None:
+    gtfs_dir, excel, out = _main_inputs(tmp_path)
+    patches = [
+        *_patch_main(gtfs_dir, excel, out, False),
+        patch("stops_ridership_joiner_gpd.OUT_FORMAT", "shp"),
+        patch("stops_ridership_joiner_gpd.write_run_log", return_value=False),
+    ]
+    for p in patches:
+        p.start()
+    try:
+        assert target.main() == 1
+    finally:
+        for p in patches:
+            p.stop()
+    assert [p for p in out.rglob("*") if p.is_file()] == []
