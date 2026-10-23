@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime as dt
 from pathlib import Path
 
 import numpy as np
@@ -9,11 +10,12 @@ import pytest
 import scripts.gtfs_exports.route_transfer_calculator as rtc
 from scripts.gtfs_exports.route_transfer_calculator import (
     build_output_tables,
+    compatible_service_ids,
     compute_transfers,
     distance_to_meters,
     has_timed_connection,
     parse_gtfs_time,
-    service_ids_active_on_day,
+    weekdays_for_filter,
 )
 
 GTFS_BASIC = Path(__file__).parent / "fixtures" / "gtfs_basic"
@@ -54,47 +56,36 @@ def test_distance_to_meters_rejects_unknown_unit() -> None:
 
 
 # ---------------------------------------------------------------------------
-# service_ids_active_on_day
+# weekdays_for_filter / compatible_service_ids
 # ---------------------------------------------------------------------------
 
-
-def test_service_ids_active_on_day_reads_calendar_flags() -> None:
-    calendar = pd.DataFrame(
-        {
-            "service_id": ["weekday", "weekend"],
-            "monday": ["1", "0"],
-            "saturday": ["0", "1"],
-        }
-    )
-    assert service_ids_active_on_day(calendar, "monday") == {"weekday"}
-    assert service_ids_active_on_day(calendar, "saturday") == {"weekend"}
+MON_JAN_5 = dt.date(2026, 1, 5)
+FRI_JAN_9 = dt.date(2026, 1, 9)
+SAT_JAN_10 = dt.date(2026, 1, 10)
 
 
-def test_service_ids_active_on_day_weekday_keeps_any_monday_to_friday_service() -> None:
-    calendar = pd.DataFrame(
-        {
-            "service_id": ["weekday", "friday_only", "weekend", "daily"],
-            "monday": ["1", "0", "0", "1"],
-            "tuesday": ["1", "0", "0", "1"],
-            "wednesday": ["1", "0", "0", "1"],
-            "thursday": ["1", "0", "0", "1"],
-            "friday": ["1", "1", "0", "1"],
-            "saturday": ["0", "0", "1", "1"],
-            "sunday": ["0", "0", "1", "1"],
-        }
-    )
-    # Daily service runs on weekdays too; weekend-only service is excluded.
-    assert service_ids_active_on_day(calendar, "weekday") == {"weekday", "friday_only", "daily"}
-
-
-def test_service_ids_active_on_day_none_calendar_returns_none() -> None:
-    assert service_ids_active_on_day(None, "monday") is None
-    assert service_ids_active_on_day(None, "weekday") is None
-
-
-def test_service_ids_active_on_day_invalid_day_raises() -> None:
+def test_weekdays_for_filter() -> None:
+    assert weekdays_for_filter("weekday") == {0, 1, 2, 3, 4}
+    assert weekdays_for_filter("Friday") == {4}
+    assert weekdays_for_filter(None) == set(range(7))
     with pytest.raises(ValueError):
-        service_ids_active_on_day(None, "someday")
+        weekdays_for_filter("someday")
+
+
+def test_compatible_service_ids_needs_a_common_date() -> None:
+    active = {
+        "MON": {MON_JAN_5},
+        "FRI": {FRI_JAN_9},
+        "DAILY": {MON_JAN_5, FRI_JAN_9, SAT_JAN_10},
+        "SAT": {SAT_JAN_10},
+    }
+    weekday = compatible_service_ids(active, weekdays_for_filter("weekday"))
+    # Monday-only and Friday-only service never run on the same date.
+    assert weekday["MON"] == {"MON", "DAILY"}
+    assert weekday["FRI"] == {"FRI", "DAILY"}
+    # Saturday's common date with DAILY is not a weekday.
+    assert "SAT" not in weekday
+    assert compatible_service_ids(active, weekdays_for_filter(None))["SAT"] == {"SAT", "DAILY"}
 
 
 # ---------------------------------------------------------------------------
@@ -161,15 +152,19 @@ def _stops_gdf() -> pd.DataFrame:
     )
 
 
-def _events() -> pd.DataFrame:
+def _events(services: tuple[str, str, str] = ("WK", "WK", "WK")) -> pd.DataFrame:
     return pd.DataFrame(
         {
             "stop_id": ["S1", "S2", "S3"],
             "route_id": ["A", "B", "C"],
+            "service_id": list(services),
             "arrival_sec": [28800.0, 29100.0, 29100.0],
             "departure_sec": [28800.0, 29100.0, 29100.0],
         }
     )
+
+
+WK_ONLY = {"WK": {"WK"}}
 
 
 def test_compute_transfers_finds_timed_connection(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -177,7 +172,9 @@ def test_compute_transfers_finds_timed_connection(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(rtc, "MAX_TRANSFER_WAIT_MINUTES", 30.0)
     monkeypatch.setattr(rtc, "WALK_SPEED_MPH", 3.0)
 
-    results = compute_transfers(_stops_gdf(), _events(), _routes_table(), radius_m=400.0)
+    results = compute_transfers(
+        _stops_gdf(), _events(), _routes_table(), radius_m=400.0, compatible=WK_ONLY
+    )
 
     # A can transfer to B (100 m, 5 min later) but not C (2 km away).
     assert set(results.keys()) == {"A"}
@@ -191,14 +188,34 @@ def test_compute_transfers_respects_max_wait(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(rtc, "MAX_TRANSFER_WAIT_MINUTES", 2.0)
     monkeypatch.setattr(rtc, "WALK_SPEED_MPH", 3.0)
 
-    results = compute_transfers(_stops_gdf(), _events(), _routes_table(), radius_m=400.0)
+    results = compute_transfers(
+        _stops_gdf(), _events(), _routes_table(), radius_m=400.0, compatible=WK_ONLY
+    )
     assert results == {}
 
 
 def test_compute_transfers_spatial_only_ignores_time(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(rtc, "ENABLE_TIME_CHECK", False)
-    results = compute_transfers(_stops_gdf(), _events(), _routes_table(), radius_m=400.0)
+    results = compute_transfers(
+        _stops_gdf(), _events(), _routes_table(), radius_m=400.0, compatible=WK_ONLY
+    )
     assert set(results["A"].keys()) == {"B"}
+
+
+@pytest.mark.parametrize("time_check", [True, False])
+def test_compute_transfers_needs_services_on_a_common_date(
+    monkeypatch: pytest.MonkeyPatch, time_check: bool
+) -> None:
+    # A arrives under Monday-only service and B departs under Friday-only service.
+    monkeypatch.setattr(rtc, "ENABLE_TIME_CHECK", time_check)
+    monkeypatch.setattr(rtc, "MAX_TRANSFER_WAIT_MINUTES", 30.0)
+    compatible = {"MON": {"MON"}, "FRI": {"FRI"}}
+    events = _events(services=("MON", "FRI", "FRI"))
+
+    results = compute_transfers(
+        _stops_gdf(), events, _routes_table(), radius_m=400.0, compatible=compatible
+    )
+    assert results == {}
 
 
 def test_build_output_tables_includes_zero_transfer_targets() -> None:
@@ -285,3 +302,147 @@ def test_main_end_to_end_on_gtfs_basic(tmp_path: Path) -> None:
     assert row["qualifying_stop_pairs"] == 3  # S3, S4, S5
     assert row["nearest_walk_distance_m"] == 0.0
     assert row["min_transfer_wait_min"] == 25.0
+
+
+# ---------------------------------------------------------------------------
+# main — service dates from calendar.txt / calendar_dates.txt
+# ---------------------------------------------------------------------------
+
+_DAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+
+
+def _calendar_row(service_id: str, days: set[str], start: str, end: str) -> dict[str, str]:
+    row = {"service_id": service_id, "start_date": start, "end_date": end}
+    row.update({day: "1" if day in days else "0" for day in _DAYS})
+    return row
+
+
+def _write_two_route_feed(
+    folder: Path,
+    calendar: list[dict[str, str]] | None,
+    calendar_dates: list[dict[str, str]] | None = None,
+) -> Path:
+    """Route A arrives at S1 at 08:00 (service SA); route B leaves S2, ~10 m away, at 08:05 (SB)."""
+    folder.mkdir()
+    pd.DataFrame(
+        {
+            "stop_id": ["S1", "S2"],
+            "stop_name": ["S1", "S2"],
+            "stop_lat": ["38.90000", "38.90009"],
+            "stop_lon": ["-77.03000", "-77.03000"],
+        }
+    ).to_csv(folder / "stops.txt", index=False)
+    pd.DataFrame(
+        {"route_id": ["A", "B"], "route_short_name": ["A", "B"], "route_type": ["3", "3"]}
+    ).to_csv(folder / "routes.txt", index=False)
+    pd.DataFrame(
+        {"route_id": ["A", "B"], "service_id": ["SA", "SB"], "trip_id": ["TA", "TB"]}
+    ).to_csv(folder / "trips.txt", index=False)
+    pd.DataFrame(
+        {
+            "trip_id": ["TA", "TB"],
+            "arrival_time": ["08:00:00", "08:05:00"],
+            "departure_time": ["08:00:00", "08:05:00"],
+            "stop_id": ["S1", "S2"],
+            "stop_sequence": ["1", "1"],
+        }
+    ).to_csv(folder / "stop_times.txt", index=False)
+    if calendar is not None:
+        pd.DataFrame(calendar).to_csv(folder / "calendar.txt", index=False)
+    if calendar_dates is not None:
+        pd.DataFrame(calendar_dates).to_csv(folder / "calendar_dates.txt", index=False)
+    return folder
+
+
+def _a_transfers(tmp_path: Path, feed: Path, day: str = "weekday") -> str:
+    out = tmp_path / "out"
+    assert rtc.main(["--gtfs-dir", str(feed), "--output-dir", str(out), "--day", day]) == 0
+    summary = pd.read_csv(out / "route_transfers_summary.csv", keep_default_na=False)
+    return str(summary.set_index("route_id").loc["A", "transfer_routes"])
+
+
+@pytest.mark.parametrize("day", ["weekday", "all"])
+def test_main_monday_only_arrival_never_meets_friday_only_departure(
+    tmp_path: Path, day: str
+) -> None:
+    feed = _write_two_route_feed(
+        tmp_path / "feed",
+        [
+            _calendar_row("SA", {"monday"}, "20260105", "20260130"),
+            _calendar_row("SB", {"friday"}, "20260105", "20260130"),
+        ],
+    )
+    assert _a_transfers(tmp_path, feed, day) == ""
+
+
+def test_main_same_weekday_service_does_transfer(tmp_path: Path) -> None:
+    feed = _write_two_route_feed(
+        tmp_path / "feed",
+        [
+            _calendar_row("SA", {"monday"}, "20260105", "20260130"),
+            _calendar_row("SB", {"monday", "friday"}, "20260105", "20260130"),
+        ],
+    )
+    assert _a_transfers(tmp_path, feed) == "B"
+
+
+def test_main_respects_calendar_date_ranges(tmp_path: Path) -> None:
+    # Both run on Mondays, but SA ends in January and SB starts in February.
+    feed = _write_two_route_feed(
+        tmp_path / "feed",
+        [
+            _calendar_row("SA", {"monday"}, "20260105", "20260131"),
+            _calendar_row("SB", {"monday"}, "20260201", "20260228"),
+        ],
+    )
+    assert _a_transfers(tmp_path, feed) == ""
+
+
+def test_main_applies_calendar_dates_additions(tmp_path: Path) -> None:
+    # Friday-only SB is added on Monday 2026-01-12, a date Monday-only SA also runs.
+    feed = _write_two_route_feed(
+        tmp_path / "feed",
+        [
+            _calendar_row("SA", {"monday"}, "20260105", "20260130"),
+            _calendar_row("SB", {"friday"}, "20260105", "20260130"),
+        ],
+        [{"service_id": "SB", "date": "20260112", "exception_type": "1"}],
+    )
+    assert _a_transfers(tmp_path, feed) == "B"
+
+
+def test_main_applies_calendar_dates_removals(tmp_path: Path) -> None:
+    # The only Monday both run (2026-01-05) is removed from SB.
+    feed = _write_two_route_feed(
+        tmp_path / "feed",
+        [
+            _calendar_row("SA", {"monday"}, "20260105", "20260109"),
+            _calendar_row("SB", {"monday"}, "20260105", "20260109"),
+        ],
+        [{"service_id": "SB", "date": "20260105", "exception_type": "2"}],
+    )
+    assert _a_transfers(tmp_path, feed) == ""
+
+
+def test_main_reads_calendar_dates_only_feed(tmp_path: Path) -> None:
+    feed = _write_two_route_feed(
+        tmp_path / "feed",
+        None,
+        [
+            {"service_id": "SA", "date": "20260105", "exception_type": "1"},
+            {"service_id": "SB", "date": "20260105", "exception_type": "1"},
+        ],
+    )
+    assert _a_transfers(tmp_path, feed) == "B"
+
+
+def test_main_rejects_feed_without_any_calendar(tmp_path: Path) -> None:
+    feed = _write_two_route_feed(tmp_path / "feed", None)
+    out = tmp_path / "out"
+    assert rtc.main(["--gtfs-dir", str(feed), "--output-dir", str(out)]) == 1
+    assert not (out / "route_transfers_summary.csv").exists()
+
+
+def test_main_rejects_unknown_day(tmp_path: Path) -> None:
+    feed = _write_two_route_feed(tmp_path / "feed", None)
+    assert rtc.main(["--gtfs-dir", str(feed), "--output-dir", str(tmp_path), "--day", "x"]) == 2

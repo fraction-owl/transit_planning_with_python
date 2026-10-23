@@ -20,18 +20,23 @@ get off, and board route B. The time check uses A's arrival times at the
 alighting stop and B's departure times at the (possibly different) nearby
 boarding stop.
 
-By default only regular weekday service is considered: ``DAY_OF_WEEK`` is
-``"weekday"``, which keeps trips whose calendar.txt service runs on at least one
-of Monday–Friday. Weekend-only service is excluded, and because
-``calendar_dates.txt`` exceptions are never consulted, holiday-exception service
-never enters the pool either. Set a single day name to filter to that day, or
-``None`` / ``--day all`` to pool every trip regardless of service day (which can
-pair trips that never run on the same day — inflating counts).
+Connections are evaluated on actual service dates. ``calendar.txt`` (each
+service's weekly pattern within its ``start_date``–``end_date`` range) and
+``calendar_dates.txt`` (dates added or removed) are expanded into the dates each
+``service_id`` operates, and a feeder trip and a connector trip pair up only when
+both operate on at least one common date. ``DAY_OF_WEEK`` limits which dates
+count: ``"weekday"`` (the default) needs a common Monday–Friday date, a single
+day name needs that day, and ``None`` / ``--day all`` accepts any date. A
+Monday-only arrival therefore never connects to a Friday-only departure. Times
+are compared within one service date, so a connection after midnight to the next
+service date's trips is not counted.
 
 Inputs:
     - A GTFS feed folder with stops.txt, routes.txt, trips.txt, and
       stop_times.txt (a single agency's feed, or a merged multi-agency feed
-      from gtfs_feed_merger.py). calendar.txt is used when a day filter is set.
+      from gtfs_feed_merger.py), plus calendar.txt and/or calendar_dates.txt to
+      give each service's dates. A feed with neither is rejected rather than
+      treated as running every trip together.
 
 Outputs:
     - A summary CSV keyed on ``route_id``: one row per target route with a
@@ -52,11 +57,12 @@ Typical usage:
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import logging
 import os
 import sys
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import List, Mapping, Optional, Sequence
 
 import geopandas as gpd
 import numpy as np
@@ -115,12 +121,12 @@ MIN_TRANSFER_BUFFER_MINUTES: float = 0.0
 # Longest a rider will wait at the connector stop, in minutes.
 MAX_TRANSFER_WAIT_MINUTES: float = 30.0
 
-# Service-day filter. "weekday" (the default) keeps trips whose calendar.txt
-# service runs on at least one of Monday-Friday — regular weekday service, with
-# weekend-only service excluded and holiday exceptions naturally absent because
-# calendar_dates.txt is never consulted. A single day name (e.g., "monday")
-# keeps only that day's service. None keeps all trips regardless of service day.
-# Feeds without calendar.txt fall back to all trips with a warning.
+# Service-day filter. A transfer only counts when the feeder and connector trips
+# both operate on a common service date (from calendar.txt date ranges and
+# calendar_dates.txt additions/removals). "weekday" (the default) requires that
+# common date to be Monday-Friday; a single day name (e.g., "monday") requires
+# that day; None accepts any date. Feeds with neither calendar.txt nor
+# calendar_dates.txt are rejected.
 DAY_OF_WEEK: Optional[str] = "weekday"
 
 # --- Output ---------------------------------------------------------------
@@ -192,39 +198,174 @@ def distance_to_meters(distance: float, unit: str) -> float:
     return distance * factors[key]
 
 
-def service_ids_active_on_day(calendar_df: Optional[pd.DataFrame], day: str) -> Optional[set[str]]:
-    """Return the set of service_ids whose regular service runs on the given day.
+def expand_service_active_dates(
+    calendar_df: Optional[pd.DataFrame],
+    calendar_dates_df: Optional[pd.DataFrame] = None,
+    max_days_per_service: int = 1830,
+    today: Optional[dt.date] = None,
+) -> dict[str, set[dt.date]]:
+    """Expand each service_id into its real set of active calendar dates.
 
-    Only ``calendar.txt`` weekly flags are consulted; date-specific exceptions in
-    ``calendar_dates.txt`` are not mapped to weekdays, so holiday-exception
-    service never qualifies. When the calendar is unavailable, None is returned
-    to signal "do not filter".
+    Builds the base date set from each ``calendar.txt`` row (day-of-week
+    pattern × ``start_date``–``end_date`` range), then applies
+    ``calendar_dates.txt`` exceptions (``exception_type`` 1 adds a date,
+    2 removes it). Handles calendar_dates-only feeds (*calendar_df* empty or
+    ``None``), redundant additions, and fully negated base patterns — the
+    returned sets reflect only the dates a service truly operates.
+
+    Rows with unparseable or reversed dates are skipped with a warning.
+    A date range longer than *max_days_per_service* (a common placeholder
+    pattern, e.g. 2000–2099) is clamped to a window of that length centred
+    on *today* and logged, so expansion stays fast and downstream per-year
+    statistics stay meaningful.
 
     Args:
-        calendar_df: Parsed calendar.txt, or None if the feed has none.
-        day: Lowercase day name (e.g. ``"monday"``), or ``"weekday"`` to keep
-            every service_id that runs on at least one of Monday-Friday.
+        calendar_df: Parsed ``calendar.txt``, or ``None`` if the feed has
+            none. Expected columns: ``service_id``, the seven day-of-week
+            flags, ``start_date``, ``end_date``.
+        calendar_dates_df: Parsed ``calendar_dates.txt`` or ``None``.
+            Expected columns: ``service_id``, ``date``, ``exception_type``.
+        max_days_per_service: Longest date range expanded per service before
+            clamping kicks in. The default (1830 ≈ 5 years) is far beyond
+            any real service span but well short of placeholder ranges.
+        today: Anchor date for clamping oversized ranges. Defaults to the
+            current date; pass a fixed date for deterministic tests.
 
     Returns:
-        A set of service_id strings active on ``day``, or None when no calendar is
-        available to filter on.
+        Mapping of ``service_id`` (as ``str``) to the set of dates the
+        service operates. Services whose dates never parse map to an empty
+        set rather than being dropped, so callers can report them.
+
+    Raises:
+        ValueError: If *calendar_df* is provided but lacks ``service_id``,
+            ``start_date``, or ``end_date`` columns.
     """
-    key = day.lower()
-    if key != "weekday" and key not in _DAY_COLUMNS:
-        raise ValueError(f"DAY_OF_WEEK must be 'weekday' or one of {_DAY_COLUMNS}, got '{day}'.")
-    if calendar_df is None or calendar_df.empty:
-        return None
+    day_cols = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+    anchor = dt.date.today() if today is None else today
+    active: dict[str, set[dt.date]] = {}
 
-    day_cols = _DAY_COLUMNS[:5] if key == "weekday" else (key,)
-    present = [c for c in day_cols if c in calendar_df.columns]
-    if not present:
-        return None
+    if calendar_df is not None and not calendar_df.empty:
+        required = {"service_id", "start_date", "end_date"}
+        missing = required - set(calendar_df.columns)
+        if missing:
+            raise ValueError(f"calendar.txt is missing required column(s): {sorted(missing)}")
+        for _, row in calendar_df.iterrows():
+            sid = str(row["service_id"]).strip()
+            try:
+                start = dt.datetime.strptime(str(row["start_date"]).strip(), "%Y%m%d").date()
+                end = dt.datetime.strptime(str(row["end_date"]).strip(), "%Y%m%d").date()
+            except ValueError:
+                logging.warning("Service %s: unparseable start/end date — skipping row.", sid)
+                active.setdefault(sid, set())
+                continue
+            if end < start:
+                logging.warning(
+                    "Service %s: end_date %s precedes start_date %s — skipping row.",
+                    sid,
+                    end,
+                    start,
+                )
+                active.setdefault(sid, set())
+                continue
+            if (end - start).days + 1 > max_days_per_service:
+                half = max_days_per_service // 2
+                clamped_start = max(start, anchor - dt.timedelta(days=half))
+                clamped_end = min(end, anchor + dt.timedelta(days=half))
+                logging.warning(
+                    "Service %s: date range %s–%s looks like a placeholder; "
+                    "clamping expansion to %s–%s.",
+                    sid,
+                    start,
+                    end,
+                    clamped_start,
+                    clamped_end,
+                )
+                start, end = clamped_start, clamped_end
+            pattern = [str(row.get(c, "0")).strip() == "1" for c in day_cols]
+            dates = active.setdefault(sid, set())
+            d = start
+            while d <= end:
+                if pattern[d.weekday()]:
+                    dates.add(d)
+                d += dt.timedelta(days=1)
 
-    mask = pd.Series(False, index=calendar_df.index)
-    for col in present:
-        mask |= calendar_df[col].astype(str) == "1"
-    active = calendar_df.loc[mask, "service_id"]
-    return {str(s) for s in active}
+    if calendar_dates_df is not None and not calendar_dates_df.empty:
+        bad_rows = 0
+        for _, row in calendar_dates_df.iterrows():
+            sid = str(row["service_id"]).strip()
+            try:
+                d = dt.datetime.strptime(str(row["date"]).strip(), "%Y%m%d").date()
+            except ValueError:
+                bad_rows += 1
+                continue
+            etype = str(row.get("exception_type", "")).strip()
+            dates = active.setdefault(sid, set())
+            if etype == "1":
+                dates.add(d)
+            elif etype == "2":
+                dates.discard(d)
+            else:
+                bad_rows += 1
+        if bad_rows:
+            logging.warning(
+                "calendar_dates.txt: skipped %d row(s) with unparseable date/exception_type.",
+                bad_rows,
+            )
+
+    return active
+
+
+def weekdays_for_filter(day: Optional[str]) -> set[int]:
+    """Return the weekday numbers (Monday = 0) a ``DAY_OF_WEEK`` value allows.
+
+    Args:
+        day: ``"weekday"``, a lowercase day name (e.g. ``"monday"``), or None
+            for every day.
+
+    Returns:
+        The allowed ``datetime.date.weekday()`` values.
+
+    Raises:
+        ValueError: If ``day`` is not recognized.
+    """
+    if day is None:
+        return set(range(7))
+    key = day.strip().lower()
+    if key == "weekday":
+        return set(range(5))
+    if key in _DAY_COLUMNS:
+        return {_DAY_COLUMNS.index(key)}
+    raise ValueError(f"DAY_OF_WEEK must be 'weekday' or one of {_DAY_COLUMNS}, got '{day}'.")
+
+
+def compatible_service_ids(
+    active_dates: Mapping[str, set[dt.date]], weekdays: set[int]
+) -> dict[str, set[str]]:
+    """Map each service_id to the service_ids sharing an active date on *weekdays*.
+
+    Trip times repeat on every date a service operates, so a feeder trip and a
+    connector trip can meet exactly when their services share an active date.
+
+    Args:
+        active_dates: Output of :func:`expand_service_active_dates`.
+        weekdays: Allowed weekday numbers, from :func:`weekdays_for_filter`.
+
+    Returns:
+        Mapping of service_id to the service_ids (itself included) operating on
+        at least one common allowed date. Services with no allowed date are
+        absent.
+    """
+    by_date: dict[dt.date, set[str]] = {}
+    for sid, dates in active_dates.items():
+        for d in dates:
+            if d.weekday() in weekdays:
+                by_date.setdefault(d, set()).add(sid)
+
+    compatible: dict[str, set[str]] = {}
+    for sids in {frozenset(ids) for ids in by_date.values()}:
+        for sid in sids:
+            compatible.setdefault(sid, set()).update(sids)
+    return compatible
 
 
 def has_timed_connection(
@@ -265,18 +406,22 @@ def has_timed_connection(
     return best_wait is not None, best_wait
 
 
-def _read_feed(folder: str) -> tuple[dict[str, pd.DataFrame], Optional[pd.DataFrame]]:
+def _read_feed(
+    folder: str,
+) -> tuple[dict[str, pd.DataFrame], Optional[pd.DataFrame], Optional[pd.DataFrame]]:
     """Load the GTFS tables this script needs from one feed folder.
 
     Args:
         folder: Path to the GTFS feed folder.
 
     Returns:
-        A tuple ``(tables, calendar)``: ``stops``, ``routes``, ``trips`` and
-        ``stop_times`` frames, and calendar.txt (None when the feed has none).
+        A tuple ``(tables, calendar, calendar_dates)``: ``stops``, ``routes``,
+        ``trips`` and ``stop_times`` frames, then calendar.txt and
+        calendar_dates.txt (each None when the feed lacks it).
 
     Raises:
-        FileNotFoundError: If a required GTFS file is missing.
+        FileNotFoundError: If a required GTFS file is missing, or the feed has
+            neither calendar.txt nor calendar_dates.txt.
     """
     for filename in _REQUIRED_FILES:
         if not os.path.exists(os.path.join(folder, filename)):
@@ -285,18 +430,21 @@ def _read_feed(folder: str) -> tuple[dict[str, pd.DataFrame], Optional[pd.DataFr
     def _read(name: str) -> pd.DataFrame:
         return pd.read_csv(os.path.join(folder, name), dtype=str, low_memory=False)
 
+    def _read_optional(name: str) -> Optional[pd.DataFrame]:
+        return _read(name) if os.path.exists(os.path.join(folder, name)) else None
+
     stops = _read("stops.txt")
     routes = _read("routes.txt")
     trips = _read("trips.txt")
     stop_times = _read("stop_times.txt")
 
-    calendar_path = os.path.join(folder, "calendar.txt")
-    calendar: Optional[pd.DataFrame] = None
-    if os.path.exists(calendar_path):
-        try:
-            calendar = pd.read_csv(calendar_path, dtype=str)
-        except (OSError, ValueError, pd.errors.ParserError) as exc:
-            logging.warning("Could not read calendar.txt (%s).", exc)
+    calendar = _read_optional("calendar.txt")
+    calendar_dates = _read_optional("calendar_dates.txt")
+    if calendar is None and calendar_dates is None:
+        raise FileNotFoundError(
+            f"Missing calendar.txt and calendar_dates.txt in {folder}; service dates are "
+            "needed to pair only trips that run on the same date."
+        )
 
     logging.info(
         "Feed: %d stops, %d routes, %d trips, %d stop_times.",
@@ -306,7 +454,7 @@ def _read_feed(folder: str) -> tuple[dict[str, pd.DataFrame], Optional[pd.DataFr
         len(stop_times),
     )
     tables = {"stops": stops, "routes": routes, "trips": trips, "stop_times": stop_times}
-    return tables, calendar
+    return tables, calendar, calendar_dates
 
 
 def _build_route_table(routes: pd.DataFrame) -> pd.DataFrame:
@@ -373,29 +521,30 @@ def _project_stops(stops: pd.DataFrame) -> gpd.GeoDataFrame:
 
 
 def _build_stop_events(
-    stop_times: pd.DataFrame, trips: pd.DataFrame, keep_service_ids: Optional[set[str]]
+    stop_times: pd.DataFrame, trips: pd.DataFrame, keep_service_ids: set[str]
 ) -> pd.DataFrame:
     """Join stop_times to trips and resolve feeder/connector event times.
 
     Args:
         stop_times: Parsed stop_times.txt.
         trips: Parsed trips.txt.
-        keep_service_ids: service_ids to keep (day filter), or None to keep
-            every trip.
+        keep_service_ids: service_ids operating on at least one selected date;
+            other trips are dropped.
 
     Returns:
-        A frame with ``stop_id``, ``route_id``, ``arrival_sec`` (feeder time),
-        and ``departure_sec`` (connector time).
+        A frame with ``stop_id``, ``route_id``, ``service_id``, ``arrival_sec``
+        (feeder time), and ``departure_sec`` (connector time).
     """
     trip_cols = trips[["trip_id", "route_id", "service_id"]].astype(str)
+    # Calendar service_ids are whitespace-stripped (expand_service_active_dates).
+    trip_cols["service_id"] = trip_cols["service_id"].str.strip()
     events = stop_times.astype({"trip_id": str, "stop_id": str}).merge(
         trip_cols, on="trip_id", how="inner"
     )
 
-    if keep_service_ids is not None:
-        mask = events["service_id"].isin(keep_service_ids)
-        logging.info("Day-of-week filter kept %d/%d stop events.", int(mask.sum()), len(events))
-        events = events.loc[mask].copy()
+    mask = events["service_id"].isin(keep_service_ids)
+    logging.info("Service-date filter kept %d/%d stop events.", int(mask.sum()), len(events))
+    events = events.loc[mask].copy()
 
     arrival = events["arrival_time"].map(parse_gtfs_time)
     departure = events["departure_time"].map(parse_gtfs_time)
@@ -403,10 +552,10 @@ def _build_stop_events(
     # (fall back to arrival) so single-time rows still participate.
     events["arrival_sec"] = arrival.fillna(departure)
     events["departure_sec"] = departure.fillna(arrival)
-    return events[["stop_id", "route_id", "arrival_sec", "departure_sec"]]
+    return events[["stop_id", "route_id", "service_id", "arrival_sec", "departure_sec"]]
 
 
-_StopRouteArrays = dict[tuple[str, str], np.ndarray]
+_StopRouteArrays = dict[tuple[str, str], dict[str, np.ndarray]]
 
 
 def _index_events(
@@ -420,22 +569,25 @@ def _index_events(
     Returns:
         A tuple ``(serves, arrivals, departures)`` where ``serves`` maps a
         ``stop_id`` to the set of routes serving it, ``arrivals`` maps
-        ``(stop_id, route_id)`` to a sorted array of feeder arrival seconds, and
-        ``departures`` maps it to a sorted array of connector departure seconds.
+        ``(stop_id, route_id)`` to ``{service_id: sorted feeder arrival
+        seconds}``, and ``departures`` maps it to ``{service_id: sorted
+        connector departure seconds}``.
     """
     serves: dict[str, set[str]] = {}
     for stop_id, route_id in zip(events["stop_id"], events["route_id"]):
         serves.setdefault(stop_id, set()).add(route_id)
 
-    arrivals: dict[tuple[str, str], np.ndarray] = {}
-    departures: dict[tuple[str, str], np.ndarray] = {}
-    for (stop_id, route_id), group in events.groupby(["stop_id", "route_id"], sort=False):
+    arrivals: _StopRouteArrays = {}
+    departures: _StopRouteArrays = {}
+    for (stop_id, route_id, service_id), group in events.groupby(
+        ["stop_id", "route_id", "service_id"], sort=False
+    ):
         arr = group["arrival_sec"].dropna().to_numpy(dtype=float)
         dep = group["departure_sec"].dropna().to_numpy(dtype=float)
         arr.sort()
         dep.sort()
-        arrivals[(stop_id, route_id)] = arr
-        departures[(stop_id, route_id)] = dep
+        arrivals.setdefault((stop_id, route_id), {})[service_id] = arr
+        departures.setdefault((stop_id, route_id), {})[service_id] = dep
     return serves, arrivals, departures
 
 
@@ -444,14 +596,20 @@ def compute_transfers(
     events: pd.DataFrame,
     routes: pd.DataFrame,
     radius_m: float,
+    compatible: Mapping[str, set[str]],
 ) -> dict[str, dict[str, dict[str, float]]]:
     """Compute feasible transfers from each target route to connector routes.
+
+    A stop pair only counts when the feeder and connector serve it under
+    services sharing an active date (per *compatible*); with the time check on,
+    the timed connection must also work between such services.
 
     Args:
         stops_gdf: Projected unique stops with ``x``/``y`` in meters.
         events: Stop events from :func:`_build_stop_events`.
         routes: Route table indexed by ``route_id`` with ``is_target``.
         radius_m: Space buffer in meters.
+        compatible: Output of :func:`compatible_service_ids`.
 
     Returns:
         A nested mapping ``target_route_id -> connector_route_id -> stats``,
@@ -486,20 +644,32 @@ def compute_transfers(
             min_wait_sec = distance / walk_mps + buffer_sec if walk_mps > 0 else buffer_sec
 
             for route_a in targets_here:
+                arr_by_service = arrivals.get((stop_a, route_a), {})
                 for route_b in routes_b:
                     if route_b == route_a:
                         continue
-                    wait: Optional[float]
+                    dep_by_service = departures.get((stop_b, route_b), {})
+                    # Service pairs that operate on a common date at these stops.
+                    service_pairs = [
+                        (sid_a, sid_b)
+                        for sid_a in arr_by_service
+                        for sid_b in dep_by_service.keys() & compatible.get(sid_a, set())
+                    ]
+                    if not service_pairs:
+                        continue
+                    wait: Optional[float] = None
                     if ENABLE_TIME_CHECK:
-                        arr = arrivals.get((stop_a, route_a))
-                        dep = departures.get((stop_b, route_b))
-                        if arr is None or dep is None:
+                        for sid_a, sid_b in service_pairs:
+                            _, pair_wait = has_timed_connection(
+                                arr_by_service[sid_a],
+                                dep_by_service[sid_b],
+                                min_wait_sec,
+                                max_wait_sec,
+                            )
+                            if pair_wait is not None and (wait is None or pair_wait < wait):
+                                wait = pair_wait
+                        if wait is None:
                             continue
-                        feasible, wait = has_timed_connection(arr, dep, min_wait_sec, max_wait_sec)
-                        if not feasible:
-                            continue
-                    else:
-                        wait = None
 
                     conn = results.setdefault(route_a, {}).setdefault(
                         route_b,
@@ -660,8 +830,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--day",
         default=DAY_OF_WEEK if DAY_OF_WEEK is not None else "all",
         help=(
-            "Service-day filter: 'weekday' (any Mon-Fri service), a single "
-            "day name (monday..sunday), or 'all' to keep every trip."
+            "Service-day filter for the common service date both trips must run on: "
+            "'weekday' (Mon-Fri), a single day name (monday..sunday), or 'all' (any date)."
         ),
     )
     parser.add_argument(
@@ -698,9 +868,15 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     day_token = str(args.day).strip().lower()
     day_filter: Optional[str] = None if day_token in ("", "all", "none") else day_token
+    try:
+        weekdays = weekdays_for_filter(day_filter)
+    except ValueError as exc:
+        logging.error("%s Use --day all for any date.", exc)
+        return 2
 
     try:
-        feed, calendar = _read_feed(gtfs_dir)
+        feed, calendar, calendar_dates = _read_feed(gtfs_dir)
+        active_dates = expand_service_active_dates(calendar, calendar_dates)
     except (FileNotFoundError, ValueError, pd.errors.ParserError) as exc:
         logging.error("Failed to load feed '%s': %s", gtfs_dir, exc)
         return 1
@@ -712,17 +888,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
     logging.info("Identified %d target route(s).", n_targets)
 
-    keep_service_ids: Optional[set[str]] = None
-    if day_filter is not None:
-        logging.info("Service-day filter: %s.", day_filter)
-        keep_service_ids = service_ids_active_on_day(calendar, day_filter)
-        if keep_service_ids is None:
-            logging.warning("No usable calendar.txt for the day filter; keeping all trips.")
-    else:
-        logging.info("No service-day filter: pooling all trips regardless of service day.")
+    compatible = compatible_service_ids(active_dates, weekdays)
+    if not compatible:
+        logging.error(
+            "No service in calendar.txt / calendar_dates.txt operates on a %s date.",
+            day_filter or "service",
+        )
+        return 1
+    unscheduled = set(feed["trips"]["service_id"].astype(str).str.strip()) - set(active_dates)
+    if unscheduled:
+        logging.warning(
+            "Trips with service_id(s) absent from calendar.txt and calendar_dates.txt are "
+            "excluded: %s",
+            ", ".join(sorted(unscheduled)),
+        )
+    logging.info(
+        "Service-day filter: %s. Transfers need both trips on a common service date.",
+        day_filter or "all",
+    )
 
     stops_gdf = _project_stops(feed["stops"])
-    events = _build_stop_events(feed["stop_times"], feed["trips"], keep_service_ids)
+    events = _build_stop_events(feed["stop_times"], feed["trips"], set(compatible))
 
     radius_m = distance_to_meters(MAX_TRANSFER_DISTANCE, MAX_TRANSFER_DISTANCE_UNIT)
     logging.info(
@@ -731,7 +917,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "on" if ENABLE_TIME_CHECK else "off",
     )
 
-    results = compute_transfers(stops_gdf, events, routes, radius_m)
+    results = compute_transfers(stops_gdf, events, routes, radius_m, compatible)
     summary, detail = build_output_tables(results, routes)
 
     os.makedirs(output_dir, exist_ok=True)
