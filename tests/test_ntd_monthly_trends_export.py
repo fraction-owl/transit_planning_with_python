@@ -681,9 +681,45 @@ def test_systemwide_perday_warns_on_interior_gap_but_not_route_start(
     assert weekday[datetime(2024, 8, 1)] == pytest.approx(2400 / 20)
     assert weekday[datetime(2024, 9, 1)] == pytest.approx(170.0)
     warnings = [r.getMessage() for r in caplog.records]
-    assert len(warnings) == 1
-    assert "Weekday Aug-2024" in warnings[0]
+    assert all("Weekday Aug-2024" in w for w in warnings)
     assert "202 (missing_service_period)" in warnings[0]
+    # 202 carried 1000/3000 of boardings in Jul and 1000/3400 in Sep.
+    assert "about 31.4% of systemwide boardings" in warnings[1]
+
+
+@pytest.mark.parametrize("threshold,expect_share_warning", [(5.0, True), (50.0, False)])
+def test_systemwide_perday_warns_when_missing_routes_carry_large_share(
+    threshold: float, expect_share_warning: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    # 202 carries a third of boardings in Jul and Sep and is missing in Aug.
+    both = [("101", "Weekday", 2000.0, 20.0), ("202", "Weekday", 1000.0, 20.0)]
+    raw = pd.concat(
+        [
+            _raw_rows("Jul-2024", both),
+            _raw_rows("Aug-2024", [("101", "Weekday", 2000.0, 20.0)]),
+            _raw_rows("Sep-2024", both),
+        ],
+        ignore_index=True,
+    )
+
+    with (
+        patch.object(mod, "SYSTEMWIDE_MISSING_SHARE_WARN_PCT", threshold),
+        caplog.at_level(logging.WARNING),
+    ):
+        mod.compute_systemwide_perday_by_sp(raw, {})
+
+    assert ("202 33.3%" in caplog.text) is expect_share_warning
+    assert "202 (missing_service_period)" in caplog.text
+
+
+def test_nearby_share_averages_nearest_month_on_each_side() -> None:
+    history = pd.Series(
+        [0.10, 0.20, 0.40],
+        index=pd.DatetimeIndex([datetime(2024, 1, 1), datetime(2024, 3, 1), datetime(2024, 6, 1)]),
+    )
+    assert mod._nearby_share(history, datetime(2024, 4, 1)) == pytest.approx(0.30)
+    assert mod._nearby_share(history, datetime(2024, 8, 1)) == pytest.approx(0.40)
+    assert mod._nearby_share(None, datetime(2024, 4, 1)) is None
 
 
 def test_systemwide_perday_uses_manual_fixes() -> None:

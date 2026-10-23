@@ -150,6 +150,15 @@ MIN_ROLLING_MONTHS: Final[int] = 1
 # way too; add the route to SYSTEMWIDE_EXCLUDE_ROUTES_REGEX to silence them.
 INCLUDE_SYSTEMWIDE_COMPARISON: Final[bool] = True
 
+# Log an additional warning when the routes missing from a systemwide month
+# carried at least this percent of that service period's systemwide boardings in
+# the nearest months they reported. Missing routes carrying s% of boardings put
+# that month's systemwide YoY about s points low and the same month a year later
+# about s points high. Once the rolling window is full, each moves the rolling
+# line about s / ROLLING_WINDOW_MONTHS points for the months after it (more while
+# the window is still filling at the start of the data).
+SYSTEMWIDE_MISSING_SHARE_WARN_PCT: Final[float] = 5.0
+
 # Half-width, in percentage points, of the shaded band drawn around the
 # systemwide rolling line. A route trending outside systemwide +/- this band is
 # notably over/under-performing. Set to 0 to draw the line with no band.
@@ -963,6 +972,21 @@ def month_service_days(days: pd.Series) -> float:
     return float(counts[counts == counts.max()].index.max())
 
 
+def _nearby_share(history: pd.Series | None, month: datetime) -> float | None:
+    """Mean of a route's systemwide share in the nearest clean month on each side.
+
+    ``history`` is the route's share of its service period's systemwide
+    boardings, indexed by month. Returns ``None`` when the route has no clean
+    month before or after ``month``.
+    """
+    if history is None:
+        return None
+    before = history[history.index < month]
+    after = history[history.index > month]
+    near = [*before.iloc[-1:], *after.iloc[:1]]
+    return float(sum(near) / len(near)) if near else None
+
+
 def compute_systemwide_perday_by_sp(
     raw_all: pd.DataFrame,
     holiday_counts: dict[str, int],
@@ -986,10 +1010,12 @@ def compute_systemwide_perday_by_sp(
     it is from the route YoY math. The month is still computed, but a warning
     names those routes, plus any route that has entries for that service period
     in earlier and later months but none in this one, since the total likely
-    understates that month. When ``holiday_counts`` is non-empty, the month's
-    weekday holidays are subtracted once from the Weekday service days,
-    matching the route series. Returns ``{service_period: Series indexed by
-    month-start}``.
+    understates that month. A second warning follows when those routes carried
+    at least SYSTEMWIDE_MISSING_SHARE_WARN_PCT of the service period's
+    boardings in the nearest months they reported (see :func:`_nearby_share`).
+    When ``holiday_counts`` is non-empty, the month's weekday holidays are
+    subtracted once from the Weekday service days, matching the route series.
+    Returns ``{service_period: Series indexed by month-start}``.
     """
     if raw_all.empty:
         return {}
@@ -1036,22 +1062,50 @@ def compute_systemwide_perday_by_sp(
     )
     gaps = gaps[gaps["gap"]].assign(reason="missing_service_period")
 
-    # (service_period, period_dt) -> "route (reason)" for every route not counted.
-    missing: dict[tuple[str, datetime], list[str]] = {}
+    valid = entries[reasons.eq("")]
+
+    # Each route's share of its service period's systemwide boardings in the
+    # months it reported cleanly, to size what a missing route leaves out.
+    share = valid["mth_board"] / valid.groupby(["service_period", "period_dt"])[
+        "mth_board"
+    ].transform("sum")
+    share_history: dict[tuple[str, str], pd.Series] = {
+        key: grp.set_index("period_dt")["share"].sort_index()
+        for key, grp in valid.assign(share=share).groupby(["route", "service_period"])
+    }
+
+    # (service_period, period_dt) -> (route, reason) for every route not counted.
+    missing: dict[tuple[str, datetime], list[tuple[str, str]]] = {}
     for frame in (flagged, gaps):
         for r, sp, dt, why in zip(
             frame["route"], frame["service_period"], frame["period_dt"], frame["reason"]
         ):
-            missing.setdefault((sp, dt), []).append(f"{r} ({why})")
+            missing.setdefault((sp, dt), []).append((r, why))
     for (sp, dt), routes in sorted(missing.items()):
         logging.warning(
             "Systemwide %s %s may understate ridership; routes missing from the total: %s",
             sp,
             format_month(dt),
-            "; ".join(sorted(routes)),
+            "; ".join(f"{r} ({why})" for r, why in sorted(routes)),
         )
+        shares = {r: _nearby_share(share_history.get((r, sp)), dt) for r, _ in sorted(routes)}
+        known = {r: s for r, s in shares.items() if s is not None}
+        pct = 100 * sum(known.values())
+        if known and pct >= SYSTEMWIDE_MISSING_SHARE_WARN_PCT:
+            logging.warning(
+                "Systemwide %s %s: the missing routes carried about %.1f%% of systemwide "
+                "boardings in nearby months (%s). Expect that month's YoY about %.0f points low "
+                "and the same month next year about as high; with a full %d-month window, the "
+                "rolling line shifts about %.1f points for the months after each.",
+                sp,
+                format_month(dt),
+                pct,
+                ", ".join(f"{r} {100 * s:.1f}%" for r, s in known.items()),
+                pct,
+                ROLLING_WINDOW_MONTHS,
+                pct / ROLLING_WINDOW_MONTHS,
+            )
 
-    valid = entries[reasons.eq("")]
     g = valid.groupby(["service_period", "period_dt"]).agg(
         b=("mth_board", "sum"), dd=("days", month_service_days)
     )
