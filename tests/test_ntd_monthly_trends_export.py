@@ -139,6 +139,29 @@ def test_normalise_columns_strips_leading_trailing_whitespace() -> None:
 
 
 # ---------------------------------------------------------------------------
+# read_month_workbook
+# ---------------------------------------------------------------------------
+
+
+def test_read_month_workbook_converts_numbers_under_unnormalised_headers(tmp_path: Path) -> None:
+    path = tmp_path / "Jan 2026.xlsx"
+    pd.DataFrame(
+        {
+            "Route Name": ["101", "101"],
+            "Service Period": ["Weekday", "Weekday"],
+            "Mth Board": ["1,000", "2,000"],
+            "Days": ["10", "n/a"],
+        }
+    ).to_excel(path, index=False)
+
+    df = mod.read_month_workbook("Jan-2026", path)
+
+    assert df["MTH_BOARD"].tolist() == [1000.0, 2000.0]
+    assert df["DAYS"].iloc[0] == 10.0
+    assert pd.isna(df["DAYS"].iloc[1])
+
+
+# ---------------------------------------------------------------------------
 # aggregate_monthly_long
 # ---------------------------------------------------------------------------
 
@@ -199,6 +222,31 @@ def test_aggregate_monthly_long_computes_daily_avg(fixture_df: pd.DataFrame) -> 
     assert not wd.empty
     # Fixture: MTH_BOARD=6278, DAYS=22
     assert float(wd["daily_avg"].iloc[0]) == pytest.approx(6278 / 22, rel=1e-3)
+
+
+def _weekday_rows(rows: list[tuple[str, float | None, float | None]]) -> pd.DataFrame:
+    """Build Jan-2026 Weekday raw rows from (route, boardings, days)."""
+    df = pd.DataFrame(rows, columns=["ROUTE_NAME", "MTH_BOARD", "DAYS"])
+    df["SERVICE_PERIOD"] = "Weekday"
+    df["period"] = "Jan-2026"
+    df["period_dt"] = datetime(2026, 1, 1)
+    return df
+
+
+def test_aggregate_monthly_long_keeps_all_blank_entry_blank() -> None:
+    dt = datetime(2026, 1, 1)
+    raw = _weekday_rows([("101", None, None), ("101", None, None)])
+
+    with (
+        patch.object(mod, "ROUTES", ["101"]),
+        patch.object(mod, "SERVICE_PERIODS", ["Weekday"]),
+    ):
+        monthly_long, observed_keys = mod.aggregate_monthly_long(raw, [dt])
+        flags = mod.flag_outages(monthly_long, [dt], observed_keys, {dt})
+
+    assert pd.isna(monthly_long["mth_board"].iloc[0])
+    assert pd.isna(monthly_long["days"].iloc[0])
+    assert flags["flag"].tolist() == ["missing_entry"]
 
 
 # ---------------------------------------------------------------------------
@@ -301,6 +349,88 @@ def test_flag_outages_clean_data_no_flags() -> None:
     assert flags.empty
 
 
+def test_flag_outages_flags_partly_blank_entry_and_excludes_it_from_yoy() -> None:
+    # Two schedule rows for the month; the second has no boardings, so the sum
+    # understates the month.
+    dt = datetime(2026, 1, 1)
+    raw = _weekday_rows([("101", 1000.0, 10.0), ("101", None, 12.0)])
+
+    with (
+        patch.object(mod, "ROUTES", ["101"]),
+        patch.object(mod, "SERVICE_PERIODS", ["Weekday"]),
+    ):
+        monthly_long, observed_keys = mod.aggregate_monthly_long(raw, [dt])
+        flags = mod.flag_outages(monthly_long, [dt], observed_keys, {dt})
+
+    assert monthly_long["missing_value_rows"].iloc[0] == 1
+    assert flags["flag"].tolist() == ["incomplete_entry"]
+    assert pd.isna(mod.clean_daily_avg(monthly_long, flags)["daily_avg"].iloc[0])
+
+
+@pytest.mark.parametrize(
+    "board,days,flag",
+    [(-50.0, 21.0, "negative_boardings"), (500.0, -1.0, "negative_days")],
+)
+def test_flag_outages_flags_negative_values(board: float, days: float, flag: str) -> None:
+    dt = datetime(2026, 1, 1)
+    raw = _weekday_rows([("101", board, days)])
+
+    with (
+        patch.object(mod, "ROUTES", ["101"]),
+        patch.object(mod, "SERVICE_PERIODS", ["Weekday"]),
+    ):
+        monthly_long, observed_keys = mod.aggregate_monthly_long(raw, [dt])
+        flags = mod.flag_outages(monthly_long, [dt], observed_keys, {dt})
+
+    assert flags["flag"].tolist() == [flag]
+
+
+# ---------------------------------------------------------------------------
+# apply_manual_fixes
+# ---------------------------------------------------------------------------
+
+
+def test_manual_fix_of_missing_entry_clears_its_flag_and_keeps_its_average() -> None:
+    dt = datetime(2026, 1, 1)
+    raw = _weekday_rows([("101", 5000.0, 21.0)])
+
+    with (
+        patch.object(mod, "ROUTES", ["101"]),
+        patch.object(mod, "SERVICE_PERIODS", ["Weekday", "Saturday"]),
+        patch.object(mod, "PROMPT_FOR_FIXES", True),
+        patch("builtins.input", side_effect=["800", "4"]),
+    ):
+        monthly_long, observed_keys = mod.aggregate_monthly_long(raw, [dt])
+        flags = mod.flag_outages(monthly_long, [dt], observed_keys, {dt})
+        monthly_long, fixed_keys = mod.apply_manual_fixes(monthly_long, flags)
+        flags = mod.flag_outages(monthly_long, [dt], observed_keys | fixed_keys, {dt})
+
+    assert fixed_keys == {("101", dt, "Saturday")}
+    assert flags.empty
+    cleaned = mod.clean_daily_avg(monthly_long, flags)
+    sat = cleaned[cleaned["service_period"] == "Saturday"]
+    assert float(sat["daily_avg"].iloc[0]) == pytest.approx(200.0)
+
+
+def test_manual_fix_skipped_entry_stays_flagged() -> None:
+    dt = datetime(2026, 1, 1)
+    raw = _weekday_rows([("101", 1000.0, 10.0), ("101", None, 12.0)])
+
+    with (
+        patch.object(mod, "ROUTES", ["101"]),
+        patch.object(mod, "SERVICE_PERIODS", ["Weekday"]),
+        patch.object(mod, "PROMPT_FOR_FIXES", True),
+        patch("builtins.input", side_effect=["", ""]),
+    ):
+        monthly_long, observed_keys = mod.aggregate_monthly_long(raw, [dt])
+        flags = mod.flag_outages(monthly_long, [dt], observed_keys, {dt})
+        monthly_long, fixed_keys = mod.apply_manual_fixes(monthly_long, flags)
+        flags = mod.flag_outages(monthly_long, [dt], observed_keys | fixed_keys, {dt})
+
+    assert fixed_keys == set()
+    assert flags["flag"].tolist() == ["incomplete_entry"]
+
+
 # ---------------------------------------------------------------------------
 # to_wide
 # ---------------------------------------------------------------------------
@@ -378,12 +508,32 @@ def test_to_wide_values_match_long(fixture_df: pd.DataFrame) -> None:
     assert wide["sunday_total"].iloc[0] == pytest.approx(556.0)
 
 
+def test_to_wide_keeps_wholly_missing_month() -> None:
+    months = [datetime(2026, 1, 1), datetime(2026, 2, 1), datetime(2026, 3, 1)]
+    monthly_long = pd.DataFrame(
+        {
+            "route": ["101"] * 3,
+            "period_dt": months,
+            "period": ["Jan-2026", "Feb-2026", "Mar-2026"],
+            "service_period": ["Weekday"] * 3,
+            "mth_board": [1000.0, None, 1100.0],
+            "daily_avg": [50.0, None, 52.4],
+        }
+    )
+
+    wide = mod.to_wide(monthly_long)
+
+    assert list(wide["period"]) == ["Jan-2026", "Feb-2026", "Mar-2026"]
+    assert pd.isna(wide["weekday_total"].iloc[1])
+    assert pd.isna(wide["weekday_avg"].iloc[1])
+
+
 # ---------------------------------------------------------------------------
 # compute_systemwide_perday_by_sp
 # ---------------------------------------------------------------------------
 
 
-def _raw_rows(period: str, rows: list[tuple[str, str, float, float]]) -> pd.DataFrame:
+def _raw_rows(period: str, rows: list[tuple[str, str, float | None, float]]) -> pd.DataFrame:
     """Build raw_all-shaped rows from (route, service_period, boardings, days)."""
     df = pd.DataFrame(rows, columns=["ROUTE_NAME", "SERVICE_PERIOD", "MTH_BOARD", "DAYS"])
     df["period"] = period
@@ -465,6 +615,148 @@ def test_systemwide_perday_excludes_total_rows() -> None:
     )
     result = mod.compute_systemwide_perday_by_sp(raw, {})
     assert result["Weekday"][datetime(2024, 7, 1)] == pytest.approx(6000 / 20)
+
+
+@pytest.mark.parametrize(
+    "board,days",
+    [(0.0, 20.0), (None, 20.0), (-10.0, 20.0)],
+    ids=["zero_boardings", "blank_boardings", "negative_boardings"],
+)
+def test_systemwide_perday_blanks_month_with_flagged_route(
+    board: float | None, days: float
+) -> None:
+    raw = _raw_rows(
+        "Jul-2024",
+        [("101", "Weekday", 2000.0, 20.0), ("202", "Weekday", board, days)],
+    )
+    result = mod.compute_systemwide_perday_by_sp(raw, {})
+    assert "Weekday" not in result
+
+
+def test_systemwide_perday_skips_route_with_no_service() -> None:
+    raw = _raw_rows(
+        "Jul-2024",
+        [("101", "Sunday", 400.0, 4.0), ("202", "Sunday", 0.0, 0.0)],
+    )
+    result = mod.compute_systemwide_perday_by_sp(raw, {})
+    assert result["Sunday"][datetime(2024, 7, 1)] == pytest.approx(100.0)
+
+
+def test_systemwide_perday_blanks_interior_gap_but_not_route_start() -> None:
+    # 202 reports Jul and Sep but not Aug (a gap); 303 starts in Aug (not a gap).
+    raw = pd.concat(
+        [
+            _raw_rows(
+                "Jul-2024", [("101", "Weekday", 2000.0, 20.0), ("202", "Weekday", 1000.0, 20.0)]
+            ),
+            _raw_rows(
+                "Aug-2024", [("101", "Weekday", 2000.0, 20.0), ("303", "Weekday", 400.0, 20.0)]
+            ),
+            _raw_rows(
+                "Sep-2024",
+                [
+                    ("101", "Weekday", 2000.0, 20.0),
+                    ("202", "Weekday", 1000.0, 20.0),
+                    ("303", "Weekday", 400.0, 20.0),
+                ],
+            ),
+        ],
+        ignore_index=True,
+    )
+
+    weekday = mod.compute_systemwide_perday_by_sp(raw, {})["Weekday"]
+
+    assert weekday[datetime(2024, 7, 1)] == pytest.approx(150.0)
+    assert datetime(2024, 8, 1) not in weekday.index
+    assert weekday[datetime(2024, 9, 1)] == pytest.approx(170.0)
+
+
+def test_systemwide_perday_uses_manual_fixes() -> None:
+    raw = _raw_rows(
+        "Jul-2024",
+        [("101", "Weekday", 2000.0, 20.0), ("202", "Weekday", 0.0, 20.0)],
+    )
+    fixed = pd.DataFrame(
+        {
+            "route": ["202"],
+            "period_dt": [datetime(2024, 7, 1)],
+            "service_period": ["Weekday"],
+            "mth_board": [1000.0],
+            "days": [20.0],
+        }
+    )
+
+    result = mod.compute_systemwide_perday_by_sp(raw, {}, fixed)
+
+    assert result["Weekday"][datetime(2024, 7, 1)] == pytest.approx(3000 / 20)
+
+
+def test_systemwide_perday_sums_schedule_rows_before_counting_service_days() -> None:
+    # A mid-month pick splits every route into two schedule rows (10 + 12 days);
+    # the month still has 22 service days, not 12.
+    raw = _raw_rows(
+        "Jul-2024",
+        [
+            ("101", "Weekday", 1000.0, 10.0),
+            ("101", "Weekday", 1200.0, 12.0),
+            ("202", "Weekday", 500.0, 10.0),
+            ("202", "Weekday", 600.0, 12.0),
+        ],
+    )
+    result = mod.compute_systemwide_perday_by_sp(raw, {})
+    assert result["Weekday"][datetime(2024, 7, 1)] == pytest.approx(3300 / 22)
+
+
+# ---------------------------------------------------------------------------
+# Stale outputs
+# ---------------------------------------------------------------------------
+
+
+def test_plot_route_change_removes_stale_chart_when_nothing_to_draw(tmp_path: Path) -> None:
+    stale = tmp_path / "plots" / "yoy_percent_change.png"
+    stale.parent.mkdir()
+    stale.write_bytes(b"old")
+    change = pd.DataFrame(
+        {
+            "period_dt": [datetime(2026, 1, 1)],
+            "weekday_yoy_pct": [float("nan")],
+            "weekday_yoy_rolling_pct": [float("nan")],
+        }
+    )
+
+    with patch.object(mod, "SERVICE_PERIODS", ["Weekday"]):
+        mod.plot_route_change(tmp_path, "101", change)
+
+    assert not stale.exists()
+
+
+def test_export_route_removes_stale_change_outputs_when_disabled(tmp_path: Path) -> None:
+    route_dir = tmp_path / "route_101"
+    (route_dir / "plots").mkdir(parents=True)
+    stale_csv = route_dir / "yoy_percent_change.csv"
+    stale_png = route_dir / "plots" / "yoy_percent_change.png"
+    stale_csv.write_text("old")
+    stale_png.write_bytes(b"old")
+    dt = datetime(2026, 1, 1)
+    monthly_long = pd.DataFrame(
+        {
+            "route": ["101"],
+            "period_dt": [dt],
+            "period": ["Jan-2026"],
+            "service_period": ["Weekday"],
+            "mth_board": [1000.0],
+            "days": [20.0],
+            "daily_avg": [50.0],
+        }
+    )
+    flags = pd.DataFrame(columns=["route", "period", "service_period", "flag", "mth_board", "days"])
+
+    with patch.object(mod, "OUTPUT_ROOT", tmp_path):
+        mod.export_route("101", monthly_long, mod.to_wide(monthly_long), flags, None)
+
+    assert not stale_csv.exists()
+    assert not stale_png.exists()
+    assert (route_dir / "plots" / "monthly_totals.png").exists()
 
 
 # ---------------------------------------------------------------------------
