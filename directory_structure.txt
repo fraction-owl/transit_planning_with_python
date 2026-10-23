@@ -46,8 +46,8 @@ transit_planning_with_python/
 │   │   ├── gtfs_skipped_stop_flagger_gpd.py
 │   │   ├── gtfs_stop_proximity_qc.py
 │   │   ├── gtfs_timepoint_interval_flagger.py
-│   │   ├── route_direction_classifier.py
 │   │   ├── route_direction_classifier_arcpy.py
+│   │   ├── route_direction_classifier_pd.py
 │   │   ├── stop_v_conflict_checker_arcpy.py
 │   │   ├── stop_v_conflict_checker_gpd.py
 │   │   ├── stop_vs_roadname_checker_arcpy.py
@@ -282,8 +282,8 @@ transit_planning_with_python/
 │   ├── test_private_shuttle_coverage_by_route_gpd.py
 │   ├── test_ridership_from_tides.py
 │   ├── test_ridership_ml_model.py
-│   ├── test_route_direction_classifier.py
 │   ├── test_route_direction_classifier_arcpy.py
+│   ├── test_route_direction_classifier_pd.py
 │   ├── test_route_performance_model.py
 │   ├── test_route_stops_exporter.py
 │   ├── test_route_transfer_calculator.py

@@ -8,8 +8,8 @@ import pandas as pd
 import pytest
 from shapely.geometry import LineString
 
-import scripts.gtfs_data_quality.route_direction_classifier as mod
-from scripts.gtfs_data_quality.route_direction_classifier import (
+import scripts.gtfs_data_quality.route_direction_classifier_pd as mod
+from scripts.gtfs_data_quality.route_direction_classifier_pd import (
     add_route_labels,
     classify_direction,
     create_lines_from_shapes,

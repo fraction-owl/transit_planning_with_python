@@ -1,6 +1,6 @@
 """Classify GTFS route directions and find each route's dominant shape, using ArcPy.
 
-ArcPy twin of ``route_direction_classifier.py``. ArcPy only projects the shapes,
+ArcPy twin of ``route_direction_classifier_pd.py``. ArcPy only projects the shapes,
 so the script runs in ArcGIS Pro's stock Python environment without GeoPandas or
 Shapely; the classification, flags, and outputs match the GeoPandas script.
 
