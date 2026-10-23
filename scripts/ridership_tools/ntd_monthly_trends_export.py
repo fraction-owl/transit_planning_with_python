@@ -18,6 +18,15 @@ It logs warnings when:
 
 Optionally prompts users for manual fixes (enter corrected MTH_BOARD and/or DAYS).
 
+Inputs:
+    - DATA_ROOT: monthly NTD ridership workbooks with ROUTE_NAME,
+      SERVICE_PERIOD, MTH_BOARD, and DAYS columns.
+    - SERVICE_CHANGES_CSV (optional): the service_changes.csv written by
+      scripts/field_tools/gtfs_service_change_dates.py. This script does not
+      read GTFS itself: run that script on your GTFS feed archive first, then
+      point SERVICE_CHANGES_CSV at its output to mark each change date on the
+      plots.
+
 Outputs:
     Per route (folder: OUTPUT_ROOT/route_<ROUTE>/):
     - monthly_long.csv (month x service_period rows)
@@ -42,6 +51,16 @@ Outputs:
 Typical usage:
     Update the paths in the CONFIGURATION section and run from a shell, ArcGIS
     Pro's Python window, or a Jupyter notebook.
+
+Notes:
+    The service change markers are the dates gtfs_service_change_dates.py
+    found in the GTFS calendars: days when the weekly service pattern changes
+    across the system. They are not confirmed changes to the plotted route,
+    and that script misses a pick that changes only trip times under the same
+    service_ids. A mid-month change affects only part of that month's
+    figures. A lasting change shows in the YoY points for about 12 months,
+    until both years compared fall after it, and the rolling line rises and
+    falls more gradually.
 """
 
 from __future__ import annotations
@@ -49,6 +68,7 @@ from __future__ import annotations
 import calendar
 import logging
 import re
+from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Final
@@ -56,6 +76,7 @@ from typing import Any, Final
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import pandas as pd
+from matplotlib.axes import Axes
 
 # Sentinel markers used by extract_config_block / write_run_log to identify
 # the configuration block within this file's source. Each string must appear
@@ -120,14 +141,13 @@ ROLLING_WINDOW_MONTHS: Final[int] = 12
 MIN_ROLLING_MONTHS: Final[int] = 1
 
 # Overlay a systemwide rolling YoY line (aggregated over EVERY route discovered
-# on disk, not just ROUTES) as a point of comparison in each panel. Every route is
-# checked with the same rules as the route flags, and a service period's month is
-# left out of the systemwide line (with a warning naming the routes) when any
-# route's entry for it is blank, partly blank, negative, or zero boardings on
-# service days, or when a route that reports that service period in earlier and
-# later months is missing from it: a total missing those riders would understate
-# the month. A seasonal route's off-season months count as missing, so add such a
-# route to SYSTEMWIDE_EXCLUDE_ROUTES_REGEX if it blanks the line.
+# on disk, not just ROUTES) as a point of comparison in each panel. Route entries
+# the route flags would exclude (blank, partly blank, negative, or zero boardings
+# on service days) are left out of the systemwide total too. The month is still
+# drawn, but a warning names those routes, plus any route missing from a month
+# between months where it reports that service period, since the total likely
+# understates that month. A seasonal route's off-season months are reported this
+# way too; add the route to SYSTEMWIDE_EXCLUDE_ROUTES_REGEX to silence them.
 INCLUDE_SYSTEMWIDE_COMPARISON: Final[bool] = True
 
 # Half-width, in percentage points, of the shaded band drawn around the
@@ -157,6 +177,18 @@ SYSTEMWIDE_EXCLUDE_ROUTES_REGEX: Final[str] = r"^(TOTAL|TOTALS|SYSTEM|SYSTEMWIDE
 #     datetime(2024, 1, 1),    # New Year's Day
 #     datetime(2024, 7, 4),    # Independence Day
 HOLIDAYS: Final[list[datetime]] = []
+
+# -----------------------------------------------------------------------------
+#  Service change markers
+# -----------------------------------------------------------------------------
+
+# The service_changes.csv written by scripts/field_tools/gtfs_service_change_dates.py
+# (that script's CHANGES_CSV_FILENAME). Run it on your GTFS feed archive first,
+# then point this at its output to draw a dotted vertical line at each change
+# date on every route's plots. Only the change_date column (YYYY-MM-DD) is read,
+# and every date within the plotted months is drawn, so delete a row from the
+# file to drop its marker. Leave as None to draw no markers.
+SERVICE_CHANGES_CSV: Final[Path | None] = None  # e.g. Path(r"C:\Data\service_changes.csv")
 
 # Logging level (INFO recommended; DEBUG if troubleshooting).
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
@@ -425,6 +457,67 @@ def load_raw(workbooks: dict[str, Path], periods: list[str]) -> pd.DataFrame:
         return pd.DataFrame(columns=[*REQUIRED_COLS, "period", "period_dt"])
 
     return pd.concat(frames, ignore_index=True)
+
+
+def load_service_change_dates(
+    path: Path | None, first_month: datetime, last_month: datetime
+) -> list[datetime]:
+    """Read change dates from the service_changes.csv of gtfs_service_change_dates.py.
+
+    Args:
+        path: SERVICE_CHANGES_CSV, or ``None`` to draw no markers.
+        first_month: First plotted month (month start).
+        last_month: Last plotted month (month start); dates through the end of
+            this month are kept.
+
+    Returns:
+        The distinct ``change_date`` values within the plotted months, oldest
+        first. Empty, after a warning, when the file cannot be read or has no
+        ``change_date`` column, so the plots are still drawn.
+    """
+    if path is None:
+        return []
+    try:
+        changes = pd.read_csv(path, dtype=str)
+    except (OSError, ValueError) as exc:
+        logging.warning(
+            "Could not read SERVICE_CHANGES_CSV '%s'; plots will have no service change "
+            "markers: %s",
+            path,
+            exc,
+        )
+        return []
+    if "change_date" not in changes.columns:
+        logging.warning(
+            "SERVICE_CHANGES_CSV '%s' has no change_date column; expected the "
+            "service_changes.csv written by scripts/field_tools/gtfs_service_change_dates.py. "
+            "Plots will have no service change markers.",
+            path,
+        )
+        return []
+
+    raw_dates = changes["change_date"].dropna().str.strip()
+    dates = pd.to_datetime(raw_dates, format="%Y-%m-%d", errors="coerce")
+    unparsed = raw_dates[dates.isna()]
+    if not unparsed.empty:
+        logging.warning(
+            "Ignoring %d change_date value(s) in '%s' that are not YYYY-MM-DD: %s",
+            len(unparsed),
+            path,
+            ", ".join(unparsed.head(5)),
+        )
+    window_end = pd.Timestamp(last_month) + pd.offsets.MonthBegin(1)
+    in_window = dates[(dates >= pd.Timestamp(first_month)) & (dates < window_end)]
+    kept = sorted({d.to_pydatetime() for d in in_window})
+    logging.info(
+        "Marking %d of %d service change date(s) from '%s' that fall within %s..%s.",
+        len(kept),
+        int(dates.notna().sum()),
+        path,
+        format_month(first_month),
+        format_month(last_month),
+    )
+    return kept
 
 
 def aggregate_entries(raw: pd.DataFrame) -> pd.DataFrame:
@@ -889,13 +982,14 @@ def compute_systemwide_perday_by_sp(
     the days it ran, and an entry with no service days and no boardings is
     skipped.
 
-    A service period's month is left out when any entry in it carries an
-    :func:`entry_flags` flag, or when a route that has entries for that service
-    period in earlier and later months has none in it, because the total would
-    then understate the month; a warning names the routes. When
-    ``holiday_counts`` is non-empty, the month's weekday holidays are subtracted
-    once from the Weekday service days, matching the route series. Returns
-    ``{service_period: Series indexed by month-start}``.
+    An entry carrying an :func:`entry_flags` flag is left out of the total, as
+    it is from the route YoY math. The month is still computed, but a warning
+    names those routes, plus any route that has entries for that service period
+    in earlier and later months but none in this one, since the total likely
+    understates that month. When ``holiday_counts`` is non-empty, the month's
+    weekday holidays are subtracted once from the Weekday service days,
+    matching the route series. Returns ``{service_period: Series indexed by
+    month-start}``.
     """
     if raw_all.empty:
         return {}
@@ -931,7 +1025,7 @@ def compute_systemwide_perday_by_sp(
     flagged = entries.loc[is_problem, keys].assign(reason=reasons[is_problem])
 
     # A route missing from a month between months where it reports this service
-    # period is treated as missing data, not as a route that started or ended.
+    # period is reported as missing, unlike a route that started or ended.
     present = pd.crosstab([entries["route"], entries["service_period"]], entries["period_dt"]) > 0
     seen_before = present.cummax(axis=1)
     seen_after = present.iloc[:, ::-1].cummax(axis=1).iloc[:, ::-1]
@@ -942,16 +1036,16 @@ def compute_systemwide_perday_by_sp(
     )
     gaps = gaps[gaps["gap"]].assign(reason="missing_service_period")
 
-    # (service_period, period_dt) -> "route (reason)" for every problem entry.
-    blocked: dict[tuple[str, datetime], list[str]] = {}
+    # (service_period, period_dt) -> "route (reason)" for every route not counted.
+    missing: dict[tuple[str, datetime], list[str]] = {}
     for frame in (flagged, gaps):
         for r, sp, dt, why in zip(
             frame["route"], frame["service_period"], frame["period_dt"], frame["reason"]
         ):
-            blocked.setdefault((sp, dt), []).append(f"{r} ({why})")
-    for (sp, dt), routes in sorted(blocked.items()):
+            missing.setdefault((sp, dt), []).append(f"{r} ({why})")
+    for (sp, dt), routes in sorted(missing.items()):
         logging.warning(
-            "Systemwide %s %s left blank; these routes would understate the total: %s",
+            "Systemwide %s %s may understate ridership; routes missing from the total: %s",
             sp,
             format_month(dt),
             "; ".join(sorted(routes)),
@@ -961,7 +1055,6 @@ def compute_systemwide_perday_by_sp(
     g = valid.groupby(["service_period", "period_dt"]).agg(
         b=("mth_board", "sum"), dd=("days", month_service_days)
     )
-    g = g[~g.index.isin(list(blocked))]
     if holiday_counts:
         holidays = [
             holiday_counts.get(format_month(dt), 0) if sp == "Weekday" else 0 for sp, dt in g.index
@@ -1022,7 +1115,22 @@ def compute_route_change(
 # =============================================================================
 
 
-def plot_route_totals(route_dir: Path, route: str, wide: pd.DataFrame) -> None:
+def draw_service_changes(ax: Axes, change_dates: Sequence[datetime]) -> None:
+    """Draw a dotted vertical line at each service change date (one legend entry)."""
+    for i, date in enumerate(change_dates):
+        ax.axvline(
+            date,
+            color="0.4",
+            linestyle=":",
+            linewidth=1.2,
+            zorder=1,
+            label="GTFS service change" if i == 0 else "_nolegend_",
+        )
+
+
+def plot_route_totals(
+    route_dir: Path, route: str, wide: pd.DataFrame, change_dates: Sequence[datetime] = ()
+) -> None:
     """Plot monthly totals for a single route."""
     df = wide[wide["route"] == route].copy()
     out_path = route_dir / "plots" / "monthly_totals.png"
@@ -1045,6 +1153,8 @@ def plot_route_totals(route_dir: Path, route: str, wide: pd.DataFrame) -> None:
                 label=col,
             )
 
+    draw_service_changes(plt.gca(), change_dates)
+
     plt.title(f"Monthly Ridership Totals – Route {route}")
     plt.xlabel("Month")
     plt.ylabel("Boardings (Monthly Total)")
@@ -1058,7 +1168,9 @@ def plot_route_totals(route_dir: Path, route: str, wide: pd.DataFrame) -> None:
     plt.close()
 
 
-def plot_route_avgs(route_dir: Path, route: str, wide: pd.DataFrame) -> None:
+def plot_route_avgs(
+    route_dir: Path, route: str, wide: pd.DataFrame, change_dates: Sequence[datetime] = ()
+) -> None:
     """Plot per-day averages for a single route."""
     df = wide[wide["route"] == route].copy()
     out_path = route_dir / "plots" / "daily_averages.png"
@@ -1080,6 +1192,8 @@ def plot_route_avgs(route_dir: Path, route: str, wide: pd.DataFrame) -> None:
                 linestyle=PLOT_STYLE["linestyle"],
                 label=col,
             )
+
+    draw_service_changes(plt.gca(), change_dates)
 
     plt.title(f"Per-Day Ridership Averages – Route {route}")
     plt.xlabel("Month")
@@ -1105,7 +1219,9 @@ def _panels_with_data(change: pd.DataFrame) -> list[str]:
     return panels
 
 
-def plot_route_change(route_dir: Path, route: str, change: pd.DataFrame) -> None:
+def plot_route_change(
+    route_dir: Path, route: str, change: pd.DataFrame, change_dates: Sequence[datetime] = ()
+) -> None:
     """Plot the per-route YoY percent-change chart as stacked small multiples.
 
     One panel per service period that has data (so partial-week routes show only
@@ -1182,6 +1298,8 @@ def plot_route_change(route_dir: Path, route: str, change: pd.DataFrame) -> None
             zorder=2,
         )
 
+        draw_service_changes(ax, change_dates)
+
         ax.set_title(sp, loc="left", fontsize=10, fontweight="bold")
         ax.set_ylabel("YoY %")
         ax.grid(PLOT_STYLE["grid"])
@@ -1205,8 +1323,13 @@ def export_route(
     wide: pd.DataFrame,
     flags: pd.DataFrame,
     change: pd.DataFrame | None,
+    change_dates: Sequence[datetime] = (),
 ) -> None:
-    """Export CSVs and plots into a per-route folder."""
+    """Export CSVs and plots into a per-route folder.
+
+    ``change_dates`` (from :func:`load_service_change_dates`) are marked on
+    every plot.
+    """
     route_dir = OUTPUT_ROOT / f"route_{route}"
     route_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1214,12 +1337,12 @@ def export_route(
     wide[wide["route"] == route].to_csv(route_dir / "monthly_wide.csv", index=False)
     flags[flags["route"] == route].to_csv(route_dir / "outage_flags.csv", index=False)
 
-    plot_route_totals(route_dir, route, wide)
-    plot_route_avgs(route_dir, route, wide)
+    plot_route_totals(route_dir, route, wide, change_dates)
+    plot_route_avgs(route_dir, route, wide, change_dates)
 
     if change is not None:
         change.to_csv(route_dir / "yoy_percent_change.csv", index=False)
-        plot_route_change(route_dir, route, change)
+        plot_route_change(route_dir, route, change, change_dates)
     else:
         # Change charts are disabled: remove a previous run's outputs.
         (route_dir / "yoy_percent_change.csv").unlink(missing_ok=True)
@@ -1374,6 +1497,7 @@ def main() -> int:
         return 1
 
     expected_months = month_range(start_dt, end_dt)
+    change_dates = load_service_change_dates(SERVICE_CHANGES_CSV, start_dt, end_dt)
 
     periods = periods_in_range(workbooks, start_bound, end_bound)
     start_label = (
@@ -1432,7 +1556,7 @@ def main() -> int:
             )
 
     for route in ROUTES:
-        export_route(route, monthly_long, wide, flags, change_by_route.get(route))
+        export_route(route, monthly_long, wide, flags, change_by_route.get(route), change_dates)
 
     combined_dir = OUTPUT_ROOT / "_combined"
     combined_dir.mkdir(parents=True, exist_ok=True)

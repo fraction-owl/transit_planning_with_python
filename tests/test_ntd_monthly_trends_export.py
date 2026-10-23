@@ -1,10 +1,13 @@
-from datetime import datetime
+import logging
+from datetime import date, datetime
 from pathlib import Path
 from unittest.mock import patch
 
+import matplotlib.pyplot as plt
 import pandas as pd
 import pytest
 
+from scripts.field_tools import gtfs_service_change_dates as change_dates_mod
 from scripts.ridership_tools import ntd_monthly_trends_export as mod
 
 FIXTURE_CSV = Path("tests/fixtures/ntd_monthly_multi_month.csv")
@@ -622,15 +625,20 @@ def test_systemwide_perday_excludes_total_rows() -> None:
     [(0.0, 20.0), (None, 20.0), (-10.0, 20.0)],
     ids=["zero_boardings", "blank_boardings", "negative_boardings"],
 )
-def test_systemwide_perday_blanks_month_with_flagged_route(
-    board: float | None, days: float
+def test_systemwide_perday_leaves_out_flagged_route_and_warns(
+    board: float | None, days: float, caplog: pytest.LogCaptureFixture
 ) -> None:
     raw = _raw_rows(
         "Jul-2024",
         [("101", "Weekday", 2000.0, 20.0), ("202", "Weekday", board, days)],
     )
-    result = mod.compute_systemwide_perday_by_sp(raw, {})
-    assert "Weekday" not in result
+
+    with caplog.at_level(logging.WARNING):
+        result = mod.compute_systemwide_perday_by_sp(raw, {})
+
+    assert result["Weekday"][datetime(2024, 7, 1)] == pytest.approx(2000 / 20)
+    assert "Systemwide Weekday Jul-2024" in caplog.text
+    assert "202 (" in caplog.text
 
 
 def test_systemwide_perday_skips_route_with_no_service() -> None:
@@ -642,7 +650,9 @@ def test_systemwide_perday_skips_route_with_no_service() -> None:
     assert result["Sunday"][datetime(2024, 7, 1)] == pytest.approx(100.0)
 
 
-def test_systemwide_perday_blanks_interior_gap_but_not_route_start() -> None:
+def test_systemwide_perday_warns_on_interior_gap_but_not_route_start(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     # 202 reports Jul and Sep but not Aug (a gap); 303 starts in Aug (not a gap).
     raw = pd.concat(
         [
@@ -664,11 +674,16 @@ def test_systemwide_perday_blanks_interior_gap_but_not_route_start() -> None:
         ignore_index=True,
     )
 
-    weekday = mod.compute_systemwide_perday_by_sp(raw, {})["Weekday"]
+    with caplog.at_level(logging.WARNING):
+        weekday = mod.compute_systemwide_perday_by_sp(raw, {})["Weekday"]
 
     assert weekday[datetime(2024, 7, 1)] == pytest.approx(150.0)
-    assert datetime(2024, 8, 1) not in weekday.index
+    assert weekday[datetime(2024, 8, 1)] == pytest.approx(2400 / 20)
     assert weekday[datetime(2024, 9, 1)] == pytest.approx(170.0)
+    warnings = [r.getMessage() for r in caplog.records]
+    assert len(warnings) == 1
+    assert "Weekday Aug-2024" in warnings[0]
+    assert "202 (missing_service_period)" in warnings[0]
 
 
 def test_systemwide_perday_uses_manual_fixes() -> None:
@@ -705,6 +720,78 @@ def test_systemwide_perday_sums_schedule_rows_before_counting_service_days() -> 
     )
     result = mod.compute_systemwide_perday_by_sp(raw, {})
     assert result["Weekday"][datetime(2024, 7, 1)] == pytest.approx(3300 / 22)
+
+
+# ---------------------------------------------------------------------------
+# Service change markers
+# ---------------------------------------------------------------------------
+
+
+def test_load_service_change_dates_reads_gtfs_service_change_dates_output(
+    tmp_path: Path,
+) -> None:
+    # Written by the producing script's own table builder, so a change to its
+    # CSV layout breaks this test.
+    changes = [
+        change_dates_mod.MergedChange(
+            date(2024, 6, 9), "Service change", frozenset({"A"}), frozenset(), ("f1",), ()
+        ),
+        change_dates_mod.MergedChange(
+            date(2025, 1, 12), "Service change", frozenset({"B"}), frozenset({"A"}), ("f2",), ()
+        ),
+        change_dates_mod.MergedChange(
+            date(2025, 3, 30), "New service period", frozenset(), frozenset(), ("f3",), ()
+        ),
+    ]
+    csv_path = tmp_path / "service_changes.csv"
+    change_dates_mod.build_changes_table(changes).to_csv(csv_path, index=False)
+
+    result = mod.load_service_change_dates(csv_path, datetime(2024, 7, 1), datetime(2025, 3, 1))
+
+    # Jun-2024 is before the window; 30 Mar 2025 falls inside its last month.
+    assert result == [datetime(2025, 1, 12), datetime(2025, 3, 30)]
+
+
+def test_load_service_change_dates_none_draws_no_markers() -> None:
+    assert mod.load_service_change_dates(None, datetime(2024, 1, 1), datetime(2025, 1, 1)) == []
+
+
+def test_load_service_change_dates_warns_on_unreadable_or_wrong_file(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    wrong = tmp_path / "wrong.csv"
+    wrong.write_text("date,notes\n2025-01-12,x\n")
+    bounds = (datetime(2024, 1, 1), datetime(2025, 12, 1))
+
+    with caplog.at_level(logging.WARNING):
+        assert mod.load_service_change_dates(tmp_path / "missing.csv", *bounds) == []
+        assert mod.load_service_change_dates(wrong, *bounds) == []
+
+    assert "Could not read SERVICE_CHANGES_CSV" in caplog.text
+    assert "no change_date column" in caplog.text
+
+
+def test_load_service_change_dates_skips_unparseable_dates(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    csv_path = tmp_path / "service_changes.csv"
+    csv_path.write_text("change_date\n2025-01-12\n1/26/2025\n2025-01-12\n")
+
+    with caplog.at_level(logging.WARNING):
+        result = mod.load_service_change_dates(csv_path, datetime(2025, 1, 1), datetime(2025, 1, 1))
+
+    assert result == [datetime(2025, 1, 12)]
+    assert "1/26/2025" in caplog.text
+
+
+def test_draw_service_changes_adds_one_line_per_date_and_one_legend_entry() -> None:
+    fig, ax = plt.subplots()
+    try:
+        mod.draw_service_changes(ax, [datetime(2025, 1, 12), datetime(2025, 3, 30)])
+        assert len(ax.lines) == 2
+        assert ax.get_legend_handles_labels()[1] == ["GTFS service change"]
+    finally:
+        plt.close(fig)
 
 
 # ---------------------------------------------------------------------------
@@ -787,7 +874,12 @@ def test_main_integration(fixture_df: pd.DataFrame, tmp_path: Path) -> None:
         period_df["period_dt"] = dt
         return period_df
 
+    changes_csv = tmp_path / "service_changes.csv"
+    changes_csv.write_text("change_date,change_type\n2026-01-12,Service change\n")
+
     with (
+        patch.object(mod, "SERVICE_CHANGES_CSV", changes_csv),
+        patch.object(mod, "draw_service_changes", wraps=mod.draw_service_changes) as draw,
         patch.object(mod, "discover_workbooks", return_value=test_workbooks),
         patch.object(mod, "START_MONTH", "Dec-2025"),
         patch.object(mod, "END_MONTH", "Feb-2026"),
@@ -797,6 +889,10 @@ def test_main_integration(fixture_df: pd.DataFrame, tmp_path: Path) -> None:
         patch.object(mod, "read_month_workbook", side_effect=mock_read_month_workbook),
     ):
         assert mod.main() == 0
+
+    # Totals and averages plots for both routes marked the change date.
+    assert draw.call_count == 4
+    assert all(list(call.args[1]) == [datetime(2026, 1, 12)] for call in draw.call_args_list)
 
     # Only configured routes get output directories
     assert (tmp_path / "route_101").exists()
