@@ -49,6 +49,7 @@ Jupyter notebook.
 from __future__ import annotations
 
 import argparse
+import datetime as datetime_module  # arcpy can rebind a from-imported `datetime` to the module
 import logging
 import math
 import os
@@ -56,7 +57,6 @@ import re
 import sys
 import zipfile
 from collections.abc import Mapping, Sequence
-from datetime import datetime
 from pathlib import Path
 from typing import Any, List, Optional
 
@@ -866,7 +866,7 @@ def write_run_log(output_dir: Path, summary_lines: List[str]) -> bool:
         "=" * 72,
         "ROUTE DIRECTION CLASSIFIER (ARCPY) RUN LOG",
         "=" * 72,
-        f"Run timestamp:    {datetime.now().isoformat(timespec='seconds')}",
+        f"Run timestamp:    {datetime_module.datetime.now().isoformat(timespec='seconds')}",
         f"Output directory: {output_dir}",
         f"Source script:    {source_display}",
         "",

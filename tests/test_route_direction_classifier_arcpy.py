@@ -196,6 +196,21 @@ def test_main_end_to_end(mod: types.ModuleType, tmp_path: Path) -> None:
     assert "Trips excluded:          1" in run_log
 
 
+def test_main_survives_arcpy_rebinding_datetime(
+    mod: types.ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # In ArcGIS Pro, arcpy can replace a script's `datetime` name with the datetime
+    # module, so `datetime.now()` fails. The run log must not depend on that name.
+    import datetime
+
+    monkeypatch.setattr(mod, "datetime", datetime, raising=False)
+    _write_feed(tmp_path / "gtfs")
+    out = tmp_path / "out"
+    argv = ["--gtfs", str(tmp_path / "gtfs"), "--output-dir", str(out), "--no-export-jpeg"]
+    assert mod.main(argv) == 0
+    assert (out / "Directions_Summary_runlog.txt").exists()
+
+
 def test_main_writes_header_only_review_workbooks_for_clean_feed(
     mod: types.ModuleType, tmp_path: Path
 ) -> None:
