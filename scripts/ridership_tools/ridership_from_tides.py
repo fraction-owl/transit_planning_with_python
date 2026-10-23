@@ -42,8 +42,9 @@ Outputs
   1) One tidy long table per exported grain -- ``ridership_by_month_and_period``
      / ``ridership_by_month`` / ``ridership_by_period`` / ``ridership_total``
      ``.csv`` -- each with one row per (level, group, *temporal keys*) carrying
-     boardings, alightings, net boardings, observed stop visits, observed
-     trips, and average boardings per observed trip.
+     boardings, alightings, net boardings, observed stop visits, stop visits
+     with unknown boardings, observed trips, and average boardings per
+     observed trip.
   2) ``ridership_by_route_and_stop.csv`` - the ``route_stop`` level (at the
      finest exported grain) reshaped into a vendor-style export (``TIME_PERIOD``
      / ``ROUTE_ID`` / ``STOP_ID`` / ``BOARD_ALL`` / ``ALIGHT_ALL``) so it can
@@ -59,8 +60,19 @@ carried working APC units on each performed trip; they are *not* expansion-
 factored systemwide estimates the way many vendor ridecheck products are. The
 observed stop-visit and trip counts are reported alongside the sums so a cell
 backed by very little data can be spotted and, if desired, expanded downstream.
-Both doors are summed (``boarding_1 + boarding_2``); single-door counters simply
-leave the door-2 column at zero.
+Both doors are summed (``boarding_1 + boarding_2``). A blank, non-numeric, or
+negative count is *unknown*, not zero: a stop visit with an unknown count on any
+counted door has unknown boardings (or alightings), which are left out of the
+sums, and the observed stop-visit and trip counts -- the denominators of the
+per-trip average -- cover only visits with known boardings. A group with no
+known counts reports blank boardings rather than an observed zero. A door with
+no counter at all (e.g. door 2 on single-door vehicles) is listed in
+``UNUSED_DOOR_COUNTERS`` so its blank columns are skipped instead of making
+every visit unknown.
+
+A performed trip is identified by ``(service_date, trip_id_performed)``: TIDES
+may reuse a ``trip_id_performed`` on other dates, so the join and the trip
+counts use both.
 
 Typical usage
 -------------
@@ -128,6 +140,12 @@ EXPORT_GRAINS: Sequence[str] = ("month_and_period", "month", "period", "total")
 ROUTES_TO_INCLUDE: Sequence[str] = ()
 ROUTES_TO_EXCLUDE: Sequence[str] = ()
 
+# Per-door APC count columns that are intentionally unused because that door has
+# no counter, e.g. ("boarding_2", "alighting_2") for single-door vehicles. They
+# are left out of the sums. Every other door column must hold a count: a blank or
+# invalid value there makes that stop visit's ridership unknown (never zero).
+UNUSED_DOOR_COUNTERS: Sequence[str] = ()
+
 LOG_LEVEL: int = logging.INFO
 
 # Filenames.
@@ -155,6 +173,7 @@ class Config:
     export_grains: Sequence[str] = EXPORT_GRAINS
     routes_to_include: Sequence[str] = ()
     routes_to_exclude: Sequence[str] = ()
+    unused_door_counters: Sequence[str] = ()
 
 
 # Aggregation levels: name -> grouping columns (besides month / time_period).
@@ -187,9 +206,18 @@ GRAIN_FILENAME: Dict[str, str] = {
 _BOARDING_COLS: List[str] = ["boarding_1", "boarding_2"]
 _ALIGHTING_COLS: List[str] = ["alighting_1", "alighting_2"]
 
+# TIDES identifies a performed trip by (service_date, trip_id_performed): the same
+# trip_id_performed may recur on other dates, so the join and trip counts use both.
+TRIP_KEY: List[str] = ["service_date", "trip_id_performed"]
+
 # =============================================================================
 # LOADING & JOINING
 # =============================================================================
+
+
+def _parse_service_date(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy of *df* with ``service_date`` parsed, so both tables key alike."""
+    return df.assign(service_date=pd.to_datetime(df["service_date"], errors="coerce"))
 
 
 def load_stop_visits(path: Path) -> pd.DataFrame:
@@ -201,7 +229,8 @@ def load_stop_visits(path: Path) -> pd.DataFrame:
     Returns:
         DataFrame with ``service_date`` and the departure/arrival timestamp
         columns parsed to datetimes and the per-door boarding/alighting columns
-        coerced to numeric (missing counts become 0).
+        coerced to numeric. A blank, non-numeric, or negative count stays NaN
+        (unknown) rather than becoming 0, and a missing column is all NaN.
     """
     df = pd.read_csv(path, dtype=str)
     for col in ("actual_departure_time", "schedule_departure_time", "actual_arrival_time"):
@@ -210,9 +239,10 @@ def load_stop_visits(path: Path) -> pd.DataFrame:
     df["service_date"] = pd.to_datetime(df["service_date"], errors="coerce")
     for col in _BOARDING_COLS + _ALIGHTING_COLS:
         if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+            counts = pd.to_numeric(df[col], errors="coerce")
+            df[col] = counts.where(counts >= 0)
         else:
-            df[col] = 0.0
+            df[col] = float("nan")
     return df
 
 
@@ -246,7 +276,8 @@ def join_trip_attributes(
 
     Trips that were Canceled (or not in revenue service) in ``trips_performed``
     are dropped, since their stop visits carry no meaningful ridership. The join
-    key is ``trip_id_performed``, unique per performed trip in TIDES.
+    key is ``TRIP_KEY`` (``service_date`` + ``trip_id_performed``), since TIDES
+    may reuse a ``trip_id_performed`` on other dates.
 
     Args:
         stop_visits: Output of :func:`load_stop_visits`.
@@ -255,16 +286,16 @@ def join_trip_attributes(
     Returns:
         Stop visits with the ``_TRIP_ATTR_COLS`` attributes joined on.
     """
-    trips = trips_performed.copy()
+    trips = _parse_service_date(trips_performed)
     if "schedule_relationship" in trips.columns:
         trips = trips.loc[trips["schedule_relationship"].fillna("Scheduled") != "Canceled"]
     if "trip_type" in trips.columns:
         trips = trips.loc[trips["trip_type"].fillna("In service") == "In service"]
 
     attr_cols = [c for c in _TRIP_ATTR_COLS if c in trips.columns]
-    trips = trips[["trip_id_performed", *attr_cols]].drop_duplicates("trip_id_performed")
+    trips = trips[[*TRIP_KEY, *attr_cols]].drop_duplicates(TRIP_KEY)
 
-    return stop_visits.merge(trips, on="trip_id_performed", how="inner")
+    return _parse_service_date(stop_visits).merge(trips, on=TRIP_KEY, how="inner")
 
 
 # =============================================================================
@@ -291,18 +322,68 @@ def filter_for_ridership(df: pd.DataFrame) -> pd.DataFrame:
     return out.copy()
 
 
-def add_ridership_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Add total ``boardings`` and ``alightings`` columns (both doors summed).
+def counted_door_columns(unused_door_counters: Sequence[str] = ()) -> Dict[str, List[str]]:
+    """Return the per-door columns summed into ``boardings`` and ``alightings``.
+
+    Args:
+        unused_door_counters: Per-door count columns to leave out (doors with
+            no APC counter; see ``UNUSED_DOOR_COUNTERS``).
+
+    Returns:
+        Mapping of ``"boardings"`` / ``"alightings"`` -> the door columns counted.
+
+    Raises:
+        ValueError: If *unused_door_counters* names a column that is not a
+            per-door count column, or leaves no boarding or alighting door.
+    """
+    unused = set(unused_door_counters)
+    unknown = unused - set(_BOARDING_COLS + _ALIGHTING_COLS)
+    if unknown:
+        raise ValueError(
+            f"UNUSED_DOOR_COUNTERS has unknown column(s) {sorted(unknown)}; "
+            f"use names from {_BOARDING_COLS + _ALIGHTING_COLS}."
+        )
+    counted: Dict[str, List[str]] = {}
+    for total, door_cols in (("boardings", _BOARDING_COLS), ("alightings", _ALIGHTING_COLS)):
+        counted[total] = [c for c in door_cols if c not in unused]
+        if not counted[total]:
+            raise ValueError(f"UNUSED_DOOR_COUNTERS leaves no door counted for {total}.")
+    return counted
+
+
+def add_ridership_columns(
+    df: pd.DataFrame,
+    unused_door_counters: Sequence[str] = (),
+) -> pd.DataFrame:
+    """Add total ``boardings``, ``alightings``, and ``net_boardings`` per stop visit.
+
+    The per-door counts are summed, skipping the doors in
+    *unused_door_counters*. A visit's total is NaN (unknown) when any counted
+    door's count is unknown, so a blank count never reads as an observed zero.
 
     Args:
         df: Stop visits carrying the per-door count columns.
+        unused_door_counters: Per-door count columns to leave out (doors with
+            no APC counter; see ``UNUSED_DOOR_COUNTERS``).
 
     Returns:
-        Copy of ``df`` with float ``boardings`` and ``alightings`` columns.
+        Copy of ``df`` with float ``boardings``, ``alightings``, and
+        ``net_boardings`` columns, NaN where unknown.
     """
     df = df.copy()
-    df["boardings"] = df[_BOARDING_COLS].sum(axis=1)
-    df["alightings"] = df[_ALIGHTING_COLS].sum(axis=1)
+    for total, cols in counted_door_columns(unused_door_counters).items():
+        blank = [c for c in cols if len(df) and df[c].isna().all()]
+        if blank == cols:
+            logging.warning("No %s counts: %s blank or invalid throughout.", total, ", ".join(cols))
+        elif blank:
+            logging.warning(
+                "%s blank or invalid on every stop visit, so %s are unknown. If a door has no "
+                "counter, add its columns to UNUSED_DOOR_COUNTERS.",
+                ", ".join(blank),
+                total,
+            )
+        df[total] = df[cols].sum(axis=1, skipna=False)
+    df["net_boardings"] = df["boardings"] - df["alightings"]
     return df
 
 
@@ -411,6 +492,12 @@ def resolve_grains(
 # =============================================================================
 
 
+def _counted_trip_key(df: pd.DataFrame) -> pd.Series:
+    """Return each visit's ``TRIP_KEY`` as one string, NaN where boardings are unknown."""
+    key = df["service_date"].astype(str) + " | " + df["trip_id_performed"].astype(str)
+    return key.where(df["boardings"].notna())
+
+
 def aggregate_ridership(
     df: pd.DataFrame,
     group_cols: Sequence[str],
@@ -418,8 +505,15 @@ def aggregate_ridership(
 ) -> pd.DataFrame:
     """Aggregate ridership to boardings/alightings counts per group.
 
+    Unknown (NaN) counts are left out of the sums, and a group with no known
+    count for a measure reports NaN rather than 0. ``stop_visits`` and
+    ``trips`` -- the latter the denominator of ``avg_boardings_per_trip`` --
+    count only visits with known boardings, trips being distinct
+    ``TRIP_KEY`` values; ``unknown_stop_visits`` counts the rest.
+
     Args:
-        df: Stop visits with ``boardings``, ``alightings``, ``month``, and
+        df: Stop visits with ``boardings``, ``alightings``, ``net_boardings``,
+            ``service_date``, ``trip_id_performed``, ``month``, and
             ``time_period`` columns.
         group_cols: Grouping columns in addition to the temporal keys (may be
             empty for a system-wide aggregation).
@@ -429,36 +523,31 @@ def aggregate_ridership(
     Returns:
         Tidy DataFrame with one row per (``*group_cols``, ``*temporal_keys``)
         and columns ``boardings``, ``alightings``, ``net_boardings``,
-        ``stop_visits``, ``trips``, and ``avg_boardings_per_trip``.
+        ``stop_visits``, ``unknown_stop_visits``, ``trips``, and
+        ``avg_boardings_per_trip``.
     """
     keys = list(group_cols) + list(temporal_keys)
-    work = df
+    work = df.assign(_counted_trip=_counted_trip_key(df))
     group_on: List[str] = keys
     if not keys:
         # System-wide single-row aggregation: group on a constant helper column.
-        work = df.assign(_all=0)
+        work = work.assign(_all=0)
         group_on = ["_all"]
 
-    out = work.groupby(group_on, dropna=False).agg(
-        boardings=("boardings", "sum"),
-        alightings=("alightings", "sum"),
-        stop_visits=("boardings", "size"),
-        trips=("trip_id_performed", "nunique"),
+    grouped = work.groupby(group_on, dropna=False)
+    out = pd.DataFrame(
+        {
+            "boardings": grouped["boardings"].sum(min_count=1),
+            "alightings": grouped["alightings"].sum(min_count=1),
+            "net_boardings": grouped["net_boardings"].sum(min_count=1),
+            "stop_visits": grouped["boardings"].count(),
+            "unknown_stop_visits": grouped.size() - grouped["boardings"].count(),
+            "trips": grouped["_counted_trip"].nunique(),
+        }
     )
-    out["net_boardings"] = out["boardings"] - out["alightings"]
     out["avg_boardings_per_trip"] = (out["boardings"] / out["trips"].where(out["trips"] > 0)).round(
         2
     )
-    out = out[
-        [
-            "boardings",
-            "alightings",
-            "net_boardings",
-            "stop_visits",
-            "trips",
-            "avg_boardings_per_trip",
-        ]
-    ]
     out = out.reset_index()
     if not keys:
         out = out.drop(columns="_all")
@@ -655,7 +744,9 @@ def plot_levels(long_table: pd.DataFrame, out_dir: Path, x_field: str) -> List[P
         if not categories:
             continue
         for group, g in sub.groupby("group"):
-            series = g.groupby(x_field)["boardings"].sum().reindex(categories, fill_value=0)
+            series = (
+                g.groupby(x_field)["boardings"].sum(min_count=1).reindex(categories, fill_value=0)
+            )
             if series.sum() == 0:
                 continue
             plt.figure()
@@ -786,6 +877,12 @@ def _pick_chart_grain(grains: Sequence[str]) -> str | None:
     return None
 
 
+def _total_or_unknown(values: pd.Series) -> str:
+    """Format a run-log total, saying "unknown" when no value is known."""
+    total = values.sum(min_count=1)
+    return "unknown (no APC counts)" if pd.isna(total) else str(int(total))
+
+
 def run(cfg: Config) -> Dict[str, pd.DataFrame]:
     """Execute the full ridership pipeline and write all artifacts.
 
@@ -808,10 +905,18 @@ def run(cfg: Config) -> Dict[str, pd.DataFrame]:
 
     prepared = (
         joined.pipe(filter_for_ridership)
-        .pipe(add_ridership_columns)
+        .pipe(add_ridership_columns, cfg.unused_door_counters)
         .pipe(assign_time_period, cfg.time_periods)
         .pipe(add_month)
     )
+    n_unknown = int(prepared["boardings"].isna().sum())
+    if n_unknown:
+        logging.warning(
+            "%d of %d stop visits have unknown boardings (blank or invalid APC counts); "
+            "they count toward neither the totals nor the per-trip averages.",
+            n_unknown,
+            len(prepared),
+        )
 
     grains = resolve_grains(cfg.export_grains, cfg.time_periods)
     if not grains:
@@ -839,10 +944,11 @@ def run(cfg: Config) -> Dict[str, pd.DataFrame]:
         logging.info("Wrote %d ridership charts to %s", len(plot_paths), cfg.output_dir / "plots")
 
     summary_lines = [
-        f"Total boardings:    {int(prepared['boardings'].sum())}",
-        f"Total alightings:   {int(prepared['alightings'].sum())}",
-        f"Stop visits used:   {len(prepared)}",
-        f"Trips observed:     {prepared['trip_id_performed'].nunique()}",
+        f"Total boardings:    {_total_or_unknown(prepared['boardings'])}",
+        f"Total alightings:   {_total_or_unknown(prepared['alightings'])}",
+        f"Stop visits used:   {len(prepared)} ({n_unknown} with unknown boardings)",
+        f"Trips performed:    {len(prepared[TRIP_KEY].drop_duplicates())}",
+        f"Trips observed:     {_counted_trip_key(prepared).nunique()} (with known boardings)",
         f"Months in panel:    {prepared['month'].nunique()}",
         f"Time periods:       {', '.join(sorted(prepared['time_period'].unique()))}",
         f"Grains exported:    {', '.join(grains)}",
@@ -933,7 +1039,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         export_grains=EXPORT_GRAINS,
         routes_to_include=ROUTES_TO_INCLUDE,
         routes_to_exclude=ROUTES_TO_EXCLUDE,
+        unused_door_counters=UNUSED_DOOR_COUNTERS,
     )
+    try:
+        counted_door_columns(cfg.unused_door_counters)
+    except ValueError as exc:
+        logging.warning("%s", exc)
+        return 2
 
     if not cfg.stop_visits_path.exists():
         logging.warning("stop_visits not found: %s", cfg.stop_visits_path)

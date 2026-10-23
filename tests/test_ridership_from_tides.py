@@ -171,3 +171,162 @@ def test_run_writes_all_grain_files(tmp_path: Path) -> None:
         assert (tmp_path / target.GRAIN_FILENAME[grain]).exists()
     assert (tmp_path / target.BY_ROUTE_AND_STOP_FILENAME).exists()
     assert (tmp_path / "ridership_from_tides_runlog.txt").exists()
+
+
+# ---------------------------------------------------------------------------
+# Unknown APC counts and (service_date, trip_id_performed) trip identity
+# ---------------------------------------------------------------------------
+
+
+def _write_tides(
+    tmp_path: Path, visits: list[dict[str, str]], trips: list[dict[str, str]]
+) -> tuple[Path, Path]:
+    """Write minimal stop_visits / trips_performed CSVs and return their paths."""
+    sv_path = tmp_path / "stop_visits.csv"
+    tp_path = tmp_path / "trips_performed.csv"
+    pd.DataFrame(visits).to_csv(sv_path, index=False)
+    pd.DataFrame(trips).to_csv(tp_path, index=False)
+    return sv_path, tp_path
+
+
+def _visit(
+    date: str, trip: str, stop: str, b1: str, b2: str = "0", a1: str = "0", a2: str = "0"
+) -> dict[str, str]:
+    return {
+        "service_date": date,
+        "trip_id_performed": trip,
+        "stop_id": stop,
+        "actual_departure_time": f"{date}T07:00:00",
+        "boarding_1": b1,
+        "boarding_2": b2,
+        "alighting_1": a1,
+        "alighting_2": a2,
+    }
+
+
+def _trip(date: str, trip: str, route: str = "101") -> dict[str, str]:
+    return {
+        "service_date": date,
+        "trip_id_performed": trip,
+        "route_id": route,
+        "direction_id": "0",
+        "route_type_agency": "LOCAL",
+    }
+
+
+def _prepare(sv_path: Path, tp_path: Path, unused_doors: tuple[str, ...] = ()) -> pd.DataFrame:
+    joined = target.join_trip_attributes(
+        target.load_stop_visits(sv_path), target.load_trips_performed(tp_path)
+    )
+    return (
+        joined.pipe(target.filter_for_ridership)
+        .pipe(target.add_ridership_columns, unused_doors)
+        .pipe(target.assign_time_period, target.TIME_PERIODS)
+        .pipe(target.add_month)
+    )
+
+
+def test_load_stop_visits_keeps_missing_and_invalid_counts_unknown(tmp_path: Path) -> None:
+    """Blank, non-numeric, and negative counts load as NaN, not 0; real zeros stay 0."""
+    sv_path, _ = _write_tides(
+        tmp_path,
+        [
+            _visit("2025-01-02", "T1", "S1", b1=""),
+            _visit("2025-01-02", "T1", "S2", b1="n/a"),
+            _visit("2025-01-02", "T1", "S3", b1="-3"),
+            _visit("2025-01-02", "T1", "S4", b1="0"),
+        ],
+        [_trip("2025-01-02", "T1")],
+    )
+    sv = target.load_stop_visits(sv_path)
+    assert sv["boarding_1"].isna().tolist() == [True, True, True, False]
+    assert sv["boarding_1"].iloc[3] == 0.0
+
+
+def test_entirely_blank_apc_is_unknown_not_observed_zero(tmp_path: Path) -> None:
+    """With no APC counts at all, ridership is reported unknown, never as zero."""
+    blank = {"b1": "", "b2": "", "a1": "", "a2": ""}
+    sv_path, tp_path = _write_tides(
+        tmp_path,
+        [_visit("2025-01-02", "T1", "S1", **blank), _visit("2025-01-02", "T1", "S2", **blank)],
+        [_trip("2025-01-02", "T1")],
+    )
+    overall = target.aggregate_ridership(_prepare(sv_path, tp_path), [], [])
+    row = overall.iloc[0]
+    assert pd.isna(row["boardings"])
+    assert pd.isna(row["alightings"])
+    assert pd.isna(row["net_boardings"])
+    assert pd.isna(row["avg_boardings_per_trip"])
+    assert (row["stop_visits"], row["unknown_stop_visits"], row["trips"]) == (0, 2, 0)
+
+    out_dir = tmp_path / "out"
+    target.run(
+        target.Config(
+            stop_visits_path=sv_path,
+            trips_performed_path=tp_path,
+            output_dir=out_dir,
+            time_periods=target.TIME_PERIODS,
+        )
+    )
+    total = pd.read_csv(out_dir / target.GRAIN_FILENAME["total"])
+    assert total.loc[total["level"] == "overall", "boardings"].isna().all()
+    run_log = (out_dir / "ridership_from_tides_runlog.txt").read_text(encoding="utf-8")
+    assert "Total boardings:    unknown" in run_log
+
+
+def test_observed_zero_is_kept_apart_from_unknown(tmp_path: Path) -> None:
+    """An observed zero counts as data; an unknown visit stays out of sums and denominators."""
+    sv_path, tp_path = _write_tides(
+        tmp_path,
+        [
+            _visit("2025-01-02", "T1", "S1", b1="0"),
+            _visit("2025-01-02", "T2", "S1", b1="", b2=""),
+            _visit("2025-01-02", "T2", "S2", b1="6"),
+        ],
+        [_trip("2025-01-02", "T1"), _trip("2025-01-02", "T2")],
+    )
+    by_stop = target.aggregate_ridership(_prepare(sv_path, tp_path), ["stop_id"], [])
+    s1 = by_stop.set_index("stop_id").loc["S1"]
+    # S1: one observed zero (T1) plus one unknown visit (T2) -> 0 boardings over 1 trip.
+    assert s1["boardings"] == 0.0
+    assert (s1["stop_visits"], s1["unknown_stop_visits"], s1["trips"]) == (1, 1, 1)
+    assert s1["avg_boardings_per_trip"] == 0.0
+
+
+def test_unused_door_counters_are_skipped_explicitly(tmp_path: Path) -> None:
+    """A door declared unused is left out; an undeclared blank door makes counts unknown."""
+    sv_path, tp_path = _write_tides(
+        tmp_path,
+        [_visit("2025-01-02", "T1", "S1", b1="4", b2="", a1="1", a2="")],
+        [_trip("2025-01-02", "T1")],
+    )
+    undeclared = _prepare(sv_path, tp_path)
+    assert undeclared["boardings"].isna().all()
+
+    declared = _prepare(sv_path, tp_path, ("boarding_2", "alighting_2"))
+    assert declared["boardings"].tolist() == [4.0]
+    assert declared["alightings"].tolist() == [1.0]
+
+    with pytest.raises(ValueError):
+        target.counted_door_columns(("boarding_3",))
+    with pytest.raises(ValueError):
+        target.counted_door_columns(("boarding_1", "boarding_2"))
+
+
+def test_same_trip_id_on_two_dates_is_two_trips(tmp_path: Path) -> None:
+    """A trip_id_performed reused on two dates counts as two trips, each joined to its date."""
+    sv_path, tp_path = _write_tides(
+        tmp_path,
+        [_visit("2025-01-02", "T1", "S1", b1="10"), _visit("2025-01-03", "T1", "S1", b1="10")],
+        [_trip("2025-01-02", "T1", route="101"), _trip("2025-01-03", "T1", route="202")],
+    )
+    prepared = _prepare(sv_path, tp_path)
+    overall = target.aggregate_ridership(prepared, [], []).iloc[0]
+    assert overall["boardings"] == 20.0
+    assert overall["trips"] == 2
+    assert overall["avg_boardings_per_trip"] == 10.0
+
+    # Each date's visit takes that date's trip attributes.
+    by_route = target.aggregate_ridership(prepared, ["route_id"], []).set_index("route_id")
+    assert by_route["boardings"].to_dict() == {"101": 10.0, "202": 10.0}
+    assert by_route["trips"].to_dict() == {"101": 1, "202": 1}
