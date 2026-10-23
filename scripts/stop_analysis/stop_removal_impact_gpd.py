@@ -573,6 +573,16 @@ def stop_to_stop_network(
             total = a_cost + middle + b_cost
             candidates.append((total, (a_end, b_end), (a_is_u, b_is_u)))
 
+    if eid_a == eid_b:
+        # Stops on one segment can walk straight along it between their offsets;
+        # take that unless a route through the network is shorter.
+        direct_ft = abs(s_a - s_b)
+        if not candidates or direct_ft <= min(c[0] for c in candidates):
+            coords = list(linestring_substring(seg_a, s_a, s_b).coords)
+            if s_a > s_b:
+                coords.reverse()
+            return direct_ft, LineString(coords if len(coords) > 1 else coords * 2)
+
     if not candidates:
         return math.inf, None
 

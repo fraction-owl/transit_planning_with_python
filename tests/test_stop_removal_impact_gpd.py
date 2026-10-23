@@ -5,15 +5,19 @@ import networkx as nx
 import pytest
 from shapely.geometry import LineString, Point
 
+import scripts.stop_analysis.stop_removal_impact_gpd as sri
 from scripts.stop_analysis.stop_removal_impact_gpd import (
     NODE_GRID_FT,
     build_graph,
+    build_segment_index,
     coverage_polygon,
     explode_segments,
     linestring_length,
     linestring_substring,
     quantize_node,
     resolve_deleted_stop_ids,
+    snap_stops_to_segments,
+    stop_to_stop_network,
 )
 
 # ---------------------------------------------------------------------------
@@ -255,3 +259,45 @@ def test_coverage_polygon_larger_buffer_gives_larger_area() -> None:
     small = coverage_polygon(stops, buffer_miles=0.1).area.sum()
     large = coverage_polygon(stops, buffer_miles=0.5).area.sum()
     assert large > small
+
+
+# ---------------------------------------------------------------------------
+# stop_to_stop_network
+# ---------------------------------------------------------------------------
+
+
+def _network_between(lines: list[LineString], stops: dict[str, Point]) -> tuple[float, LineString]:
+    """Snap *stops* onto a network of *lines* and route stop A to stop B."""
+    sri._node_dist_cache.clear()  # node keys repeat across tests' synthetic networks
+    segments = explode_segments(gpd.GeoDataFrame(geometry=lines, crs="EPSG:6447"))
+    G, edge_endpoints = build_graph(segments)
+    seg_index, _, wkb_to_eid = build_segment_index(segments)
+    stops_gdf = gpd.GeoDataFrame(
+        {"stop_id": list(stops)}, geometry=list(stops.values()), crs="EPSG:6447"
+    )
+    snap_map = snap_stops_to_segments(stops_gdf, seg_index, wkb_to_eid, segments, edge_endpoints)
+    dist_ft, geom = stop_to_stop_network(G, segments, edge_endpoints, snap_map, "A", "B")
+    assert geom is not None
+    return dist_ft, geom
+
+
+def test_stop_to_stop_network_same_segment_walks_directly() -> None:
+    # Stops 400 ft and 600 ft along one 1,000-ft segment are 200 ft apart, not
+    # 1,000 ft via either endpoint.
+    dist_ft, geom = _network_between(
+        [LineString([(0, 0), (1000, 0)])], {"A": Point(400, 10), "B": Point(600, 10)}
+    )
+    assert dist_ft == pytest.approx(200.0)
+    assert geom.length == pytest.approx(200.0)
+    assert geom.coords[0] == pytest.approx((400.0, 0.0))
+    assert geom.coords[-1] == pytest.approx((600.0, 0.0))
+
+
+def test_stop_to_stop_network_same_segment_keeps_shorter_network_route() -> None:
+    # A 1,100-ft U-shaped segment whose ends are also joined by a 100-ft segment:
+    # stops 10 ft from either end walk 10 + 100 + 10 ft, not 1,080 ft along the U.
+    u_shape = LineString([(0, 0), (0, 500), (100, 500), (100, 0)])
+    shortcut = LineString([(0, 0), (100, 0)])
+    dist_ft, geom = _network_between([u_shape, shortcut], {"A": Point(-5, 10), "B": Point(105, 10)})
+    assert dist_ft == pytest.approx(120.0)
+    assert geom.bounds[3] < 500  # the path takes the shortcut, not the U
