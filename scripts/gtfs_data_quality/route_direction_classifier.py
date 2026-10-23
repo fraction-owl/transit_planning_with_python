@@ -288,21 +288,22 @@ def plot_route_shape(
     ax.plot(start_lon, start_lat, "go", label="Start")
     ax.plot(end_lon, end_lat, "ro", label="End")
 
+    # "N" sits just above the arrow's tip so the two never overlap.
     ax.text(
         0.05,
-        0.95,
+        0.94,
         "N",
         transform=ax.transAxes,
         fontsize=14,
         fontweight="bold",
-        va="top",
+        va="bottom",
         ha="center",
         rotation=0,
     )
     ax.annotate(
         "",
-        xy=(0.05, 0.94),
-        xytext=(0.05, 0.90),
+        xy=(0.05, 0.93),
+        xytext=(0.05, 0.85),
         xycoords="axes fraction",
         arrowprops=dict(facecolor="black", width=1, headwidth=6),
     )
