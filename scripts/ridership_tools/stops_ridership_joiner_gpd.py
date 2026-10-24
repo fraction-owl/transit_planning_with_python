@@ -5,8 +5,16 @@ This script merges stop-level ridership data from an Excel file with stop locati
 a spatial join to polygons (e.g., Census Blocks) for geographic aggregation.
 
 Outputs:
+Each run writes into a new OUTPUT_FOLDER/stops_ridership_<timestamp> folder,
+starting with the run log, which is written before anything is exported.
 - Stops with ridership attributes (one file, or split by route)
 - CSV summaries (per-stop and optional per-polygon aggregation)
+- ridership_reconciliation.csv (matched vs. unmatched vs. blank-STOP_ID totals;
+  in-polygon, on-boundary, and outside-polygon totals when polygons are used;
+  and the sum of negative values included) and unmatched_ridership.csv (the
+  ridership rows that matched no stop)
+- ridership_value_issues.csv (every blank, malformed, or negative
+  boardings/alightings cell, with its original value and the value used)
 - Optional polygon layer with aggregated ridership
 - Optional per-route boardings/alightings maps from GTFS shapes (see DRAW_PLOTS)
 
@@ -19,10 +27,11 @@ from __future__ import annotations
 
 import logging
 import math
+import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Any, Iterable, Optional
 
 import geopandas as gpd
 import pandas as pd
@@ -53,18 +62,19 @@ CONFIG_END_MARKER: str = "# === END CONFIG ==="
 BUS_STOPS_INPUT = Path(r"Your\File\Path\To\GTFS_folder")  # folder, stops.txt, or vector file
 EXCEL_FILE = Path(r"Your\File\Path\To\STOP_USAGE_(BY_STOP_ID).XLSX")
 
+# Route names are compared as trimmed text, so a numeric Excel route 798
+# matches "798".
 ROUTE_FILTER_LIST: list[str] = []
 SPLIT_BY_ROUTE = False
 
+# Each run writes into its own new folder, OUTPUT_FOLDER/stops_ridership_<timestamp>,
+# so earlier outputs are never overwritten.
 OUTPUT_FOLDER = Path(r"Your\Folder\Path\To\Output")
 
-# Subfolder names (under OUTPUT_FOLDER) for the two bulky output types.
-# CSVs and the run log stay at the OUTPUT_FOLDER root.
+# Subfolder names (under the run folder) for the two bulky output types.
+# CSVs and the run log stay at the run folder root.
 VECTOR_SUBDIR: str = "vector"
 PLOT_SUBDIR: str = "plots"
-
-VECTOR_DIR = OUTPUT_FOLDER / VECTOR_SUBDIR
-PLOT_DIR = OUTPUT_FOLDER / PLOT_SUBDIR
 
 # Optional polygons (set to None to disable)
 POLYGON_LAYER: Optional[Path] = Path(r"Your\File\Path\To\census_blocks.shp")
@@ -95,6 +105,29 @@ EXCEL_ALIGHT_FIELD = "XALIGHTINGS"
 OUT_BOARD = "XBOARD"
 OUT_ALIGHT = "XALIGHT"
 OUT_TOTAL = "XTOTAL"
+# 1 = stop lies on a polygon boundary and inside no polygon (polygon joins use
+# "within", so such stops get no polygon); 0 otherwise. Only when POLYGON_LAYER is set.
+OUT_ON_EDGE = "POLY_EDGE"
+
+# RIDERSHIP VALUES ----------------------------------------------------------
+# Every blank, malformed, or negative boardings/alightings cell is listed in
+# ridership_value_issues.csv (Excel row, field, original value, value used).
+# Malformed = not blank but not a number (e.g. "n/a", "12 boards").
+# "error" — stop and list them.  "zero" — count them as 0.
+MALFORMED_VALUE_POLICY: str = "error"
+BLANK_VALUE_POLICY: str = "zero"
+# Negative values are kept as-is (they may be legitimate adjustments or errors)
+# and reported with counts and sums in the log, the issues file, and the
+# reconciliation's of_which_negative_values row.
+
+# DUPLICATES ----------------------------------------------------------------
+# What to do when a stop that has ridership matches more than one row after
+# the joins: its key is on several points in the stop layer, or the stop is
+# inside overlapping polygons. Duplicated keys without ridership are ignored.
+# "error" — stop and list the affected keys.
+# "split" — divide that stop's ridership evenly across its rows, so stop,
+#           polygon, and reconciliation totals still add up.
+DUPLICATE_STOP_POLICY: str = "error"
 
 # PLOTTING ------------------------------------------------------------------
 # Master switch for per-route boardings/alightings maps. Requires BUS_STOPS_INPUT
@@ -110,6 +143,10 @@ RIDERSHIP_BINS: list[tuple[float, float, str, str]] = [
     (5.0, 25.0, "yellow", "5–24.9"),
     (25.0, math.inf, "red", "25+"),
 ]
+# Missing and negative values get their own colors and legend entries instead
+# of a ridership bin color. Other values outside the bins take the nearest bin.
+PLOT_NO_DATA_COLOR: str = "lightgray"
+PLOT_NEGATIVE_COLOR: str = "purple"
 
 # Draw every shape_id for a route (all patterns/directions) vs. only the single
 # longest representative shape. Ridership ROUTE_NAME is matched to GTFS routes on
@@ -146,8 +183,9 @@ ROUTE_LINEWIDTH: float = 1.2
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
 
-# When True, a failed run-log write aborts the script so the analyst is never
-# left with outputs that lack a matching configuration record.
+# The run log is written first, before any export. When True, a failed run-log
+# write removes the (still empty) run folder and exits 1, so the analyst is
+# never left with outputs that lack a matching configuration record.
 REQUIRE_RUN_LOG: bool = True
 
 # In a Jupyter kernel __file__ is undefined, so the run log cannot read this
@@ -197,9 +235,24 @@ def resolve_stops_table(path: Path) -> Path:
     return path
 
 
+def _clean_id(value: Any) -> Optional[str]:
+    """Render one identifier as a trimmed string; missing or blank -> None.
+
+    Integral floats lose their trailing '.0' (a numeric column holding a blank
+    reads 123 as 123.0), so the same ID matches whether it was read as a number
+    or as text. Leading zeros in text IDs are kept.
+    """
+    if pd.isna(value):
+        return None
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    text = str(value).strip()
+    return text or None
+
+
 def _safe_to_str(series: pd.Series) -> pd.Series:
-    """Convert values to string, preserving NaNs."""
-    return series.astype("string").astype(object)
+    """Normalize identifier values with _clean_id, preserving NaNs."""
+    return series.map(_clean_id).astype(object)
 
 
 def _require_columns(df: pd.DataFrame, required: Iterable[str], context: str) -> None:
@@ -226,11 +279,39 @@ def _to_common_crs(
     return points, polygons
 
 
-def output_path(base: str, route: Optional[str] = None) -> Path:
-    """Build an output file path (under VECTOR_DIR) for the chosen output format."""
+def _require_unique_polygon_ids(polygons: gpd.GeoDataFrame) -> None:
+    """Raise if POLYGON_JOIN_FIELD repeats across polygon features.
+
+    Ridership is summed per ID and attached to every feature carrying that ID,
+    so a repeated ID would report the same total on each of its features.
+    """
+    ids = polygons[POLYGON_JOIN_FIELD].dropna()
+    repeated = sorted(ids[ids.duplicated()].astype(str).unique())
+    if repeated:
+        raise ValueError(
+            f"POLYGON_JOIN_FIELD '{POLYGON_JOIN_FIELD}' repeats across polygon features "
+            f"({len(repeated)} ID(s), e.g. {repeated[:10]}); each would report the same "
+            "ridership total. Dissolve the polygon layer by that field before running."
+        )
+
+
+def output_path(run_dir: Path, base: str, route: Optional[str] = None) -> Path:
+    """Build an output file path (under run_dir/VECTOR_SUBDIR) for the chosen output format."""
     suffix = ".gpkg" if OUT_FORMAT.lower() == "gpkg" else ".shp"
     name = f"{base}_{route}{suffix}" if route else f"{base}{suffix}"
-    return VECTOR_DIR / name
+    return run_dir / VECTOR_SUBDIR / name
+
+
+def new_run_dir(output_folder: Path) -> Path:
+    """Create and return a new, empty folder for this run under *output_folder*.
+
+    Raises:
+        FileExistsError: A folder with this run's timestamp already exists
+            (two runs started within the same second).
+    """
+    run_dir = output_folder / f"stops_ridership_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    run_dir.mkdir(parents=True, exist_ok=False)
+    return run_dir
 
 
 def _drop_case_insensitive_duplicate_fields(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
@@ -273,16 +354,31 @@ def write_vector(gdf: gpd.GeoDataFrame, path: Path, layer: Optional[str] = None)
         raise ValueError(f"Unsupported output format: {path.suffix}")
 
 
+def _write_csv(df: pd.DataFrame, path: Path) -> None:
+    """Write *df* to *path* as CSV and log it."""
+    df.to_csv(path, index=False)
+    logging.info("Wrote %s", path)
+
+
 # =============================================================================
 # CORE STEPS
 # =============================================================================
 
 
 def load_bus_stops() -> tuple[gpd.GeoDataFrame, str]:
-    """Load bus stop points as a GeoDataFrame and return (gdf, key_field)."""
+    """Load bus stop points as a GeoDataFrame and return (gdf, key_field).
+
+    GTFS ID columns are read as text, so leading zeros survive and a blank
+    code cannot turn the others into floats ("123.0").
+    """
     if is_gtfs_input(BUS_STOPS_INPUT):
         stops_table = resolve_stops_table(BUS_STOPS_INPUT)
-        df = pd.read_csv(stops_table)
+        df = pd.read_csv(
+            stops_table,
+            dtype={GTFS_KEY_FIELD: str, GTFS_SECONDARY_ID_FIELD: str},
+            keep_default_na=False,
+            na_values=[""],
+        )
         _require_columns(
             df,
             [GTFS_KEY_FIELD, GTFS_SECONDARY_ID_FIELD, "stop_name", GTFS_LON_FIELD, GTFS_LAT_FIELD],
@@ -310,13 +406,18 @@ def load_bus_stops() -> tuple[gpd.GeoDataFrame, str]:
 def spatial_join_to_polygons(
     stops: gpd.GeoDataFrame,
 ) -> tuple[gpd.GeoDataFrame, Optional[gpd.GeoDataFrame]]:
-    """Optionally spatial-join stops to polygons; returns (stops_joined, polygons_or_none)."""
+    """Optionally spatial-join stops to polygons; returns (stops_joined, polygons_or_none).
+
+    Adds OUT_ON_EDGE (1/0) flagging stops that lie on a polygon boundary but
+    inside no polygon, so the reconciliation can report them separately.
+    """
     if not POLYGON_LAYER:
         logging.info("POLYGON_LAYER is None; skipping spatial join.")
         return stops, None
 
     polygons = gpd.read_file(POLYGON_LAYER)
     _require_columns(polygons, [POLYGON_JOIN_FIELD], context=f"polygon layer {POLYGON_LAYER}")
+    _require_unique_polygon_ids(polygons)
 
     keep = list(dict.fromkeys(POLYGON_FIELDS_TO_KEEP + [POLYGON_JOIN_FIELD]))
     keep = [c for c in keep if c in polygons.columns]
@@ -325,7 +426,12 @@ def spatial_join_to_polygons(
     stops, polygons = _to_common_crs(stops, polygons)
 
     # "within" = point must lie inside polygon. Use "intersects" if you want boundary hits.
+    # Stops exactly on a boundary therefore get no polygon; they are flagged in
+    # OUT_ON_EDGE and reported as matched_on_polygon_boundary in the reconciliation.
     joined = gpd.sjoin(stops, polygons, how="left", predicate="within")
+    not_within = stops.loc[joined.index[joined["index_right"].isna()].unique()]
+    on_edge = gpd.sjoin(not_within, polygons, how="inner", predicate="touches").index
+    joined[OUT_ON_EDGE] = joined.index.isin(on_edge).astype(int)
     joined = joined.drop(
         columns=[c for c in joined.columns if c.startswith("index_")], errors="ignore"
     )
@@ -334,27 +440,136 @@ def spatial_join_to_polygons(
     return joined, polygons
 
 
-def read_and_filter_excel() -> pd.DataFrame:
-    """Read ridership data from Excel and optionally filter by routes; adds TOTAL."""
-    df = pd.read_excel(EXCEL_FILE)
+def find_value_issues(df: pd.DataFrame) -> pd.DataFrame:
+    """List blank, malformed, and negative boardings/alightings cells in *df*.
+
+    Returns:
+        One row per affected cell: excel_row (sheet row, header on row 1),
+        STOP_ID, ROUTE_NAME, field, issue ("blank" / "malformed" /
+        "negative"), original_value as read, and value_used (0 for blank or
+        malformed, the value itself for negative).
+    """
+    columns = [
+        "excel_row",
+        EXCEL_STOP_ID_FIELD,
+        EXCEL_ROUTE_FIELD,
+        "field",
+        "issue",
+        "original_value",
+        "value_used",
+    ]
+    parts: list[pd.DataFrame] = []
+    for col in (EXCEL_BOARD_FIELD, EXCEL_ALIGHT_FIELD):
+        original = df[col]
+        values = pd.to_numeric(original, errors="coerce")
+        blank = original.isna()
+        checks = {"blank": blank, "malformed": values.isna() & ~blank, "negative": values < 0}
+        for issue, mask in checks.items():
+            if not mask.any():
+                continue
+            parts.append(
+                pd.DataFrame(
+                    {
+                        "excel_row": mask[mask].index + 2,
+                        EXCEL_STOP_ID_FIELD: df.loc[mask, EXCEL_STOP_ID_FIELD].to_numpy(),
+                        EXCEL_ROUTE_FIELD: df.loc[mask, EXCEL_ROUTE_FIELD].to_numpy(),
+                        "field": col,
+                        "issue": issue,
+                        "original_value": original[mask].to_numpy(),
+                        "value_used": values[mask].fillna(0.0).to_numpy(),
+                    }
+                )
+            )
+    if not parts:
+        return pd.DataFrame(columns=columns)
+    return pd.concat(parts, ignore_index=True)[columns].sort_values(
+        ["excel_row", "field"], kind="stable", ignore_index=True
+    )
+
+
+def read_and_filter_excel() -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Read ridership data from Excel and optionally filter by routes; adds TOTAL.
+
+    STOP_ID and ROUTE_NAME are read as text (only blank cells count as
+    missing) and normalized with _clean_id, so "00123" keeps its zeros and a
+    numeric route 798 matches "798". Rows with a blank STOP_ID are kept (as
+    NaN) so the reconciliation can account for them.
+
+    Boardings/alightings are checked with find_value_issues after the route
+    filter. Malformed and blank values raise or count as 0 per
+    MALFORMED_VALUE_POLICY / BLANK_VALUE_POLICY; negative values are kept. Each
+    kind is logged with its count and sum. TOTAL is computed afterwards, so it
+    always equals boardings + alightings.
+
+    Returns:
+        (ridership rows, value issues from find_value_issues).
+
+    Raises:
+        ValueError: A policy is invalid, or values its "error" policy covers
+            are present.
+    """
+    df = pd.read_excel(
+        EXCEL_FILE,
+        dtype={EXCEL_STOP_ID_FIELD: str, EXCEL_ROUTE_FIELD: str},
+        keep_default_na=False,
+        na_values=[""],
+    )
 
     _require_columns(
         df,
         [EXCEL_STOP_ID_FIELD, EXCEL_ROUTE_FIELD, EXCEL_BOARD_FIELD, EXCEL_ALIGHT_FIELD],
         context=f"Excel ridership file {EXCEL_FILE}",
     )
+    df[EXCEL_STOP_ID_FIELD] = _safe_to_str(df[EXCEL_STOP_ID_FIELD])
+    df[EXCEL_ROUTE_FIELD] = _safe_to_str(df[EXCEL_ROUTE_FIELD])
 
     if ROUTE_FILTER_LIST:
         before = len(df)
-        df = df[df[EXCEL_ROUTE_FIELD].isin(ROUTE_FILTER_LIST)].copy()
+        wanted = {_clean_id(r) for r in ROUTE_FILTER_LIST}
+        df = df[df[EXCEL_ROUTE_FIELD].isin(wanted)].copy()
         logging.info("Route filter applied. Records: %d -> %d", before, len(df))
     else:
         logging.info("No route filter applied.")
 
-    df["TOTAL"] = df[EXCEL_BOARD_FIELD] + df[EXCEL_ALIGHT_FIELD]
-    df[EXCEL_STOP_ID_FIELD] = _safe_to_str(df[EXCEL_STOP_ID_FIELD])
+    issues = find_value_issues(df)
+    for issue, policy, setting in (
+        ("malformed", MALFORMED_VALUE_POLICY, "MALFORMED_VALUE_POLICY"),
+        ("blank", BLANK_VALUE_POLICY, "BLANK_VALUE_POLICY"),
+    ):
+        if policy not in ("error", "zero"):
+            raise ValueError(f"{setting} must be 'error' or 'zero', got {policy!r}.")
+        found = issues[issues["issue"] == issue]
+        if policy == "error" and not found.empty:
+            sample = found.head(10)[["excel_row", "field", "original_value"]].to_dict("records")
+            raise ValueError(
+                f"{len(found)} {issue} boardings/alightings value(s) in {EXCEL_FILE}, e.g. "
+                f"{sample}. Fix them, or set {setting} = 'zero' to count them as 0 (they are "
+                "then listed in ridership_value_issues.csv)."
+            )
+    for (field, issue), grp in issues.groupby(["field", "issue"]):
+        logging.warning(
+            "%s: %d %s value(s); sum of values used = %.1f (see ridership_value_issues.csv).",
+            field,
+            len(grp),
+            issue,
+            float(grp["value_used"].sum()),
+        )
 
-    return df
+    for col in (EXCEL_BOARD_FIELD, EXCEL_ALIGHT_FIELD):
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+    df["TOTAL"] = df[EXCEL_BOARD_FIELD] + df[EXCEL_ALIGHT_FIELD]
+
+    blank_ids = df[EXCEL_STOP_ID_FIELD].isna()
+    if blank_ids.any():
+        logging.warning(
+            "%d ridership row(s) have a blank %s (boardings %.1f); they are listed in "
+            "unmatched_ridership.csv and counted in the reconciliation.",
+            int(blank_ids.sum()),
+            EXCEL_STOP_ID_FIELD,
+            float(df.loc[blank_ids, EXCEL_BOARD_FIELD].sum()),
+        )
+
+    return df, issues
 
 
 def aggregate_excel_per_stop(df_excel: pd.DataFrame) -> pd.DataFrame:
@@ -373,20 +588,51 @@ def merge_ridership(
     df_excel: pd.DataFrame,
     stops_key_field: str,
 ) -> gpd.GeoDataFrame:
-    """Inner-join ridership to stops on STOP_ID vs the chosen stop key field."""
+    """Inner-join per-stop ridership to stops on STOP_ID vs the chosen stop key field.
+
+    *df_excel* must have one row per STOP_ID (aggregate_excel_per_stop). A
+    stop with ridership that matches more than one row — its key is on several
+    points, or it is inside overlapping polygons — is handled per
+    DUPLICATE_STOP_POLICY: "error" raises and lists the keys; "split" divides
+    its ridership evenly across those rows so totals are preserved. Duplicated
+    keys without ridership never match, so they do not matter.
+    """
     if stops_key_field not in stops.columns:
         raise ValueError(f"Stop key field '{stops_key_field}' not found in stops layer.")
+    if DUPLICATE_STOP_POLICY not in ("error", "split"):
+        raise ValueError(
+            f"DUPLICATE_STOP_POLICY must be 'error' or 'split', got {DUPLICATE_STOP_POLICY!r}."
+        )
 
     stops_copy = stops.copy()
     stops_copy[stops_key_field] = _safe_to_str(stops_copy[stops_key_field])
 
     out = stops_copy.merge(
-        df_excel,
+        df_excel[df_excel[EXCEL_STOP_ID_FIELD].notna()],
         left_on=stops_key_field,
         right_on=EXCEL_STOP_ID_FIELD,
         how="inner",
-        validate="one_to_one" if df_excel[EXCEL_STOP_ID_FIELD].is_unique else "many_to_one",
+        validate="many_to_one",
     )
+
+    rows_per_stop = out[stops_key_field].map(out[stops_key_field].value_counts())
+    dup_keys = sorted(out.loc[rows_per_stop > 1, stops_key_field].unique())
+    if dup_keys:
+        if DUPLICATE_STOP_POLICY == "error":
+            raise ValueError(
+                f"{len(dup_keys)} stop(s) with ridership match more than one row (the key is "
+                "on several points in the stop layer, or the stop is inside overlapping "
+                f"polygons): {dup_keys[:10]}. Fix the inputs, or set DUPLICATE_STOP_POLICY = "
+                "'split' to divide each such stop's ridership evenly across its rows."
+            )
+        for col in (EXCEL_BOARD_FIELD, EXCEL_ALIGHT_FIELD, "TOTAL"):
+            out[col] = out[col] / rows_per_stop
+        logging.warning(
+            "DUPLICATE_STOP_POLICY = 'split': ridership for %d stop(s) divided evenly across "
+            "their matching rows: %s",
+            len(dup_keys),
+            dup_keys[:10],
+        )
 
     logging.info("Matched stops after join: %d", len(out))
     return gpd.GeoDataFrame(out, geometry="geometry", crs=stops.crs)
@@ -405,12 +651,18 @@ def aggregate_by_polygon(
     matched_stops: gpd.GeoDataFrame,
     polygons: gpd.GeoDataFrame,
 ) -> gpd.GeoDataFrame:
-    """Aggregate stop ridership by POLYGON_JOIN_FIELD and join to polygons."""
+    """Aggregate stop ridership by POLYGON_JOIN_FIELD and join to polygons.
+
+    Raises:
+        ValueError: The join field is missing from *matched_stops*, or it
+            repeats across polygon features (see _require_unique_polygon_ids).
+    """
     if POLYGON_JOIN_FIELD not in matched_stops.columns:
         raise ValueError(
             f"Matched stops missing polygon join field '{POLYGON_JOIN_FIELD}'. "
             "Confirm the spatial join ran and that field was kept."
         )
+    _require_unique_polygon_ids(polygons)
 
     df_agg = matched_stops.groupby(POLYGON_JOIN_FIELD, as_index=False).agg(
         {EXCEL_BOARD_FIELD: "sum", EXCEL_ALIGHT_FIELD: "sum", "TOTAL": "sum"}
@@ -431,58 +683,157 @@ def aggregate_by_polygon(
     return gpd.GeoDataFrame(polygons_out, geometry="geometry", crs=polygons.crs)
 
 
+def build_reconciliation(
+    df_excel: pd.DataFrame,
+    matched: gpd.GeoDataFrame,
+    stops_key_field: str,
+    polygons_joined: bool,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Account for all filtered ridership and list the rows that matched no stop.
+
+    Args:
+        df_excel: Filtered row-level ridership from read_and_filter_excel.
+        matched: merge_ridership output over all of *df_excel*.
+        stops_key_field: Stop key the ridership was matched on.
+        polygons_joined: Whether the polygon spatial join ran.
+
+    Returns:
+        (reconciliation, unmatched_rows). reconciliation has one row per
+        category with boardings/alightings/TOTAL sums: matched_to_stops
+        (split into matched_in_polygon / matched_on_polygon_boundary /
+        matched_outside_polygons when polygons were joined), no_stop_match,
+        blank_stop_id, and grand_total (the filtered input). A last row,
+        of_which_negative_values, sums only the negative boardings and
+        alightings already included above; it is not a separate category.
+        unmatched_rows holds the input rows behind no_stop_match and
+        blank_stop_id, with a 'reason' column.
+    """
+    metrics = [EXCEL_BOARD_FIELD, EXCEL_ALIGHT_FIELD, "TOTAL"]
+    stop_ids = df_excel[EXCEL_STOP_ID_FIELD]
+    blank = stop_ids.isna()
+    no_match = ~blank & ~stop_ids.isin(set(matched[stops_key_field]))
+
+    rows = [{"category": "matched_to_stops", **matched[metrics].sum().to_dict()}]
+    if polygons_joined:
+        in_polygon = matched[POLYGON_JOIN_FIELD].notna()
+        on_edge = ~in_polygon & (matched[OUT_ON_EDGE] == 1)
+        for category, mask in (
+            ("matched_in_polygon", in_polygon),
+            ("matched_on_polygon_boundary", on_edge),
+            ("matched_outside_polygons", ~in_polygon & ~on_edge),
+        ):
+            rows.append({"category": category, **matched.loc[mask, metrics].sum().to_dict()})
+    rows.append({"category": "no_stop_match", **df_excel.loc[no_match, metrics].sum().to_dict()})
+    rows.append({"category": "blank_stop_id", **df_excel.loc[blank, metrics].sum().to_dict()})
+    rows.append({"category": "grand_total", **df_excel[metrics].sum().to_dict()})
+    negative_board = float(df_excel[EXCEL_BOARD_FIELD].clip(upper=0).sum())
+    negative_alight = float(df_excel[EXCEL_ALIGHT_FIELD].clip(upper=0).sum())
+    rows.append(
+        {
+            "category": "of_which_negative_values",
+            EXCEL_BOARD_FIELD: negative_board,
+            EXCEL_ALIGHT_FIELD: negative_alight,
+            "TOTAL": negative_board + negative_alight,
+        }
+    )
+    reconciliation = pd.DataFrame(rows, columns=["category", *metrics])
+
+    parts = reconciliation.set_index("category").loc[
+        ["matched_to_stops", "no_stop_match", "blank_stop_id"], metrics
+    ]
+    gap = (parts.sum() - df_excel[metrics].sum()).abs().max()
+    if gap > 1e-6:
+        logging.warning("Reconciliation categories differ from grand_total by %.6f.", gap)
+
+    unmatched = df_excel[blank | no_match].copy()
+    unmatched["reason"] = blank[blank | no_match].map(
+        {True: "blank_stop_id", False: "no_stop_match"}
+    )
+    return reconciliation, unmatched
+
+
+def write_reconciliation(
+    run_dir: Path,
+    df_excel: pd.DataFrame,
+    matched: gpd.GeoDataFrame,
+    stops_key_field: str,
+    polygons_joined: bool,
+) -> None:
+    """Write ridership_reconciliation.csv and unmatched_ridership.csv, and log the totals."""
+    reconciliation, unmatched = build_reconciliation(
+        df_excel, matched, stops_key_field, polygons_joined
+    )
+    _write_csv(reconciliation, run_dir / "ridership_reconciliation.csv")
+    _write_csv(unmatched, run_dir / "unmatched_ridership.csv")
+    for _, row in reconciliation.iterrows():
+        logging.info(
+            "Reconciliation | %-27s boardings=%.1f alightings=%.1f total=%.1f",
+            row["category"],
+            row[EXCEL_BOARD_FIELD],
+            row[EXCEL_ALIGHT_FIELD],
+            row["TOTAL"],
+        )
+    if not unmatched.empty:
+        logging.warning(
+            "%d ridership row(s) matched no stop; see unmatched_ridership.csv.", len(unmatched)
+        )
+
+
 # =============================================================================
 # PIPELINES
 # =============================================================================
 
 
-def run_single() -> None:
+def run_single(run_dir: Path) -> None:
     """Run the non-split pipeline (one output for all matched stops)."""
-    OUTPUT_FOLDER.mkdir(parents=True, exist_ok=True)
     stops, stops_key_field = load_bus_stops()
     stops_joined, polygons = spatial_join_to_polygons(stops)
 
-    df_excel = read_and_filter_excel()
+    df_excel, value_issues = read_and_filter_excel()
+    _write_csv(value_issues, run_dir / "ridership_value_issues.csv")
     df_excel_stop = aggregate_excel_per_stop(df_excel)
 
-    agg_per_stop_csv = OUTPUT_FOLDER / "agg_ridership_per_stop.csv"
-    df_excel_stop.to_csv(agg_per_stop_csv, index=False)
-    logging.info("Wrote %s", agg_per_stop_csv)
+    _write_csv(df_excel_stop, run_dir / "agg_ridership_per_stop.csv")
 
     matched = merge_ridership(stops_joined, df_excel_stop, stops_key_field)
     matched = add_output_ridership_fields(matched)
 
-    stops_out = output_path("bus_stops_matched")
+    stops_out = output_path(run_dir, "bus_stops_matched")
     layer = "bus_stops_matched" if stops_out.suffix.lower() == ".gpkg" else None
     write_vector(matched, stops_out, layer=layer)
     logging.info("Wrote %s", stops_out)
 
-    matched_csv = OUTPUT_FOLDER / "bus_stops_with_polygon.csv"
-    matched.drop(columns="geometry").to_csv(matched_csv, index=False)
-    logging.info("Wrote %s", matched_csv)
+    _write_csv(matched.drop(columns="geometry"), run_dir / "bus_stops_with_polygon.csv")
+    write_reconciliation(run_dir, df_excel, matched, stops_key_field, polygons is not None)
 
     if polygons is not None:
         poly_out = aggregate_by_polygon(matched, polygons)
 
-        poly_out_path = output_path("polygon_with_ridership")
+        poly_out_path = output_path(run_dir, "polygon_with_ridership")
         layer = "polygon_with_ridership" if poly_out_path.suffix.lower() == ".gpkg" else None
         write_vector(poly_out, poly_out_path, layer=layer)
         logging.info("Wrote %s", poly_out_path)
 
-        poly_csv = OUTPUT_FOLDER / "agg_ridership_by_polygon.csv"
-        poly_out.drop(columns="geometry").to_csv(poly_csv, index=False)
-        logging.info("Wrote %s", poly_csv)
+        _write_csv(poly_out.drop(columns="geometry"), run_dir / "agg_ridership_by_polygon.csv")
 
 
-def run_split_by_route() -> None:
+def run_split_by_route(run_dir: Path) -> None:
     """Run the split-by-route pipeline (one output per route)."""
-    OUTPUT_FOLDER.mkdir(parents=True, exist_ok=True)
     stops, stops_key_field = load_bus_stops()
     stops_joined, polygons = spatial_join_to_polygons(stops)
 
-    df_excel = read_and_filter_excel()
+    df_excel, value_issues = read_and_filter_excel()
+    _write_csv(value_issues, run_dir / "ridership_value_issues.csv")
     unique_routes = sorted(pd.unique(df_excel[EXCEL_ROUTE_FIELD].dropna()))
     logging.info("Found %d routes.", len(unique_routes))
+    n_blank_route = int(df_excel[EXCEL_ROUTE_FIELD].isna().sum())
+    if n_blank_route:
+        logging.warning(
+            "%d ridership row(s) have a blank %s; they get no per-route output but are "
+            "included in the polygon totals and the reconciliation.",
+            n_blank_route,
+            EXCEL_ROUTE_FIELD,
+        )
 
     for route in unique_routes:
         df_route = df_excel[df_excel[EXCEL_ROUTE_FIELD] == route].copy()
@@ -498,30 +849,30 @@ def run_split_by_route() -> None:
 
         matched = add_output_ridership_fields(matched)
 
-        stops_out = output_path("bus_stops_matched", route=str(route))
+        stops_out = output_path(run_dir, "bus_stops_matched", route=str(route))
         layer = f"bus_stops_matched_{route}" if stops_out.suffix.lower() == ".gpkg" else None
         write_vector(matched, stops_out, layer=layer)
         logging.info("Wrote %s", stops_out)
 
-        matched_csv = OUTPUT_FOLDER / f"bus_stops_with_polygon_{route}.csv"
-        matched.drop(columns="geometry").to_csv(matched_csv, index=False)
-        logging.info("Wrote %s", matched_csv)
+        _write_csv(
+            matched.drop(columns="geometry"),
+            run_dir / f"bus_stops_with_polygon_{route}.csv",
+        )
 
-    # Optional: aggregate polygons across ALL filtered Excel records (not per-route)
+    # Reconciliation and polygon totals cover ALL filtered Excel records (not per-route)
+    df_all_stop = aggregate_excel_per_stop(df_excel)
+    matched_all = merge_ridership(stops_joined, df_all_stop, stops_key_field)
+    matched_all = add_output_ridership_fields(matched_all)
+    write_reconciliation(run_dir, df_excel, matched_all, stops_key_field, polygons is not None)
+
     if polygons is not None:
-        df_all_stop = aggregate_excel_per_stop(df_excel)
-        matched_all = merge_ridership(stops_joined, df_all_stop, stops_key_field)
-        matched_all = add_output_ridership_fields(matched_all)
-
         poly_out = aggregate_by_polygon(matched_all, polygons)
-        poly_out_path = output_path("polygon_with_ridership")
+        poly_out_path = output_path(run_dir, "polygon_with_ridership")
         layer = "polygon_with_ridership" if poly_out_path.suffix.lower() == ".gpkg" else None
         write_vector(poly_out, poly_out_path, layer=layer)
         logging.info("Wrote %s", poly_out_path)
 
-        poly_csv = OUTPUT_FOLDER / "agg_ridership_by_polygon.csv"
-        poly_out.drop(columns="geometry").to_csv(poly_csv, index=False)
-        logging.info("Wrote %s", poly_csv)
+        _write_csv(poly_out.drop(columns="geometry"), run_dir / "agg_ridership_by_polygon.csv")
 
 
 # =============================================================================
@@ -631,7 +982,7 @@ def load_stop_coords(gtfs_dir: Path) -> pd.DataFrame:
     stops = stops.dropna(subset=[GTFS_KEY_FIELD, GTFS_LAT_FIELD, GTFS_LON_FIELD]).copy()
     stops["stop_lat"] = stops[GTFS_LAT_FIELD].astype(float)
     stops["stop_lon"] = stops[GTFS_LON_FIELD].astype(float)
-    stops[GTFS_KEY_FIELD] = stops[GTFS_KEY_FIELD].astype(str)
+    stops[GTFS_KEY_FIELD] = _safe_to_str(stops[GTFS_KEY_FIELD])
     return stops[[GTFS_KEY_FIELD, "stop_lon", "stop_lat"]]
 
 
@@ -709,10 +1060,21 @@ def _roads_in_extent(
 
 
 def color_for_value(value: float) -> str:
-    """Return the RIDERSHIP_BINS color for a ridership *value* (half-open bins)."""
+    """Return the RIDERSHIP_BINS color for a ridership *value* (half-open bins).
+
+    Missing values get PLOT_NO_DATA_COLOR and negative values
+    PLOT_NEGATIVE_COLOR, each with its own legend entry. Other values outside
+    the bins take the nearest bin's color.
+    """
+    if value is None or math.isnan(value):
+        return PLOT_NO_DATA_COLOR
+    if value < 0:
+        return PLOT_NEGATIVE_COLOR
     for lower, upper, color, _label in RIDERSHIP_BINS:
         if lower <= value < upper:
             return color
+    if value < min(b[0] for b in RIDERSHIP_BINS):
+        return min(RIDERSHIP_BINS)[2]
     return RIDERSHIP_BINS[-1][2]
 
 
@@ -791,10 +1153,11 @@ def plot_route_ridership(
     stops_df = stops_df.sort_values("value", na_position="first", kind="stable")
 
     # Stops on top, colored by bin
+    colors = stops_df["value"].map(color_for_value)
     ax.scatter(
         stops_df["lon"],
         stops_df["lat"],
-        c=stops_df["value"].map(color_for_value),
+        c=colors,
         s=PLOT_MARKER_SIZE,
         edgecolor="black",
         linewidth=0.3,
@@ -834,6 +1197,23 @@ def plot_route_ridership(
         )
         for _lo, _hi, color, label in RIDERSHIP_BINS
     ]
+    for extra_color, extra_label in (
+        (PLOT_NO_DATA_COLOR, "Missing"),
+        (PLOT_NEGATIVE_COLOR, "Negative (< 0)"),
+    ):
+        if (colors == extra_color).any():
+            handles.append(
+                Line2D(
+                    [0],
+                    [0],
+                    marker="o",
+                    linestyle="",
+                    markerfacecolor=extra_color,
+                    markeredgecolor="black",
+                    markersize=8,
+                    label=extra_label,
+                )
+            )
     if PLOT_LEGEND_LOC == "outside":
         ax.legend(
             handles=handles,
@@ -856,8 +1236,8 @@ def plot_route_ridership(
     logging.info("Saved plot: %s", out_path)
 
 
-def generate_route_plots() -> None:
-    """Render per-route boardings and alightings maps from GTFS shapes.
+def generate_route_plots(run_dir: Path) -> None:
+    """Render per-route boardings and alightings maps into run_dir/PLOT_SUBDIR.
 
     Fails loud (sys.exit(1)) if BUS_STOPS_INPUT is not a GTFS folder/stops.txt or
     if a required GTFS file is missing. Routes with no matching shape or no matching
@@ -871,7 +1251,8 @@ def generate_route_plots() -> None:
         )
         sys.exit(1)
 
-    PLOT_DIR.mkdir(parents=True, exist_ok=True)
+    plot_dir = run_dir / PLOT_SUBDIR
+    plot_dir.mkdir(parents=True, exist_ok=True)
 
     name_to_polylines, name_to_color = build_route_shape_lookup(gtfs_dir)
     stop_coords = load_stop_coords(gtfs_dir)
@@ -879,9 +1260,10 @@ def generate_route_plots() -> None:
     # Optional roads basemap, read once and reused (bbox-filtered per route).
     roads_indexed = load_road_polylines(ROADS_SHAPEFILE) if ROADS_SHAPEFILE else None
 
-    # Route-level ridership (before the network-wide per-stop collapse used elsewhere)
-    ridership = read_and_filter_excel()
-    ridership[EXCEL_STOP_ID_FIELD] = ridership[EXCEL_STOP_ID_FIELD].astype(str)
+    # Route-level ridership (before the network-wide per-stop collapse used elsewhere).
+    # IDs are already normalized the same way as load_stop_coords; blank IDs or
+    # routes cannot be placed on a route map and drop out of the groupby.
+    ridership, _issues = read_and_filter_excel()
     ridership = ridership.groupby([EXCEL_ROUTE_FIELD, EXCEL_STOP_ID_FIELD], as_index=False).agg(
         {EXCEL_BOARD_FIELD: "sum", EXCEL_ALIGHT_FIELD: "sum"}
     )
@@ -917,7 +1299,7 @@ def generate_route_plots() -> None:
                     "value": merged[value_col].astype(float).to_numpy(),
                 }
             )
-            out_path = PLOT_DIR / f"route_{safe}_{value_name.lower()}.png"
+            out_path = plot_dir / f"route_{safe}_{value_name.lower()}.png"
             plot_route_ridership(
                 str(route_name),
                 stops_df,
@@ -1070,6 +1452,10 @@ def write_run_log(output_folder: Path) -> bool:
 def main() -> int:
     """Main entry point.
 
+    Creates a new run folder under OUTPUT_FOLDER and writes the run log into it
+    before exporting anything, so earlier outputs are never overwritten and a
+    run that cannot be logged produces no outputs.
+
     Returns:
         Process exit code: 0 on success, 1 on failure, 2 if required
         CONFIGURATION values are still placeholders.
@@ -1100,22 +1486,38 @@ def main() -> int:
     logging.info("Split by route: %s", SPLIT_BY_ROUTE)
     logging.info("Output format: %s", OUT_FORMAT)
 
-    if SPLIT_BY_ROUTE:
-        run_split_by_route()
-    else:
-        run_single()
+    run_dir = new_run_dir(OUTPUT_FOLDER)
+    logging.info("Run folder: %s", run_dir)
 
-    # Per-route ridership maps (independent of SPLIT_BY_ROUTE).
-    if DRAW_PLOTS:
-        logging.info("DRAW_PLOTS = True. Generating per-route ridership maps.")
-        generate_route_plots()
-
-    if not write_run_log(OUTPUT_FOLDER) and REQUIRE_RUN_LOG:
+    # The run log records only the configuration, so it is written before any
+    # export. The run folder is new, so removing it touches nothing else.
+    if not write_run_log(run_dir) and REQUIRE_RUN_LOG:
+        try:
+            shutil.rmtree(run_dir)
+            cleanup = f"removed the run folder {run_dir}"
+        except OSError as exc:
+            cleanup = f"could not remove the run folder {run_dir} ({exc})"
         logging.error(
-            "Run log could not be written. Set REQUIRE_RUN_LOG = False to "
-            "suppress this error when a sidecar file is genuinely impossible."
+            "Run log could not be written; nothing was exported and %s. Set "
+            "REQUIRE_RUN_LOG = False to suppress this error when a sidecar file is "
+            "genuinely impossible.",
+            cleanup,
         )
         return 1
+
+    try:
+        if SPLIT_BY_ROUTE:
+            run_split_by_route(run_dir)
+        else:
+            run_single(run_dir)
+
+        # Per-route ridership maps (independent of SPLIT_BY_ROUTE).
+        if DRAW_PLOTS:
+            logging.info("DRAW_PLOTS = True. Generating per-route ridership maps.")
+            generate_route_plots(run_dir)
+    except Exception:
+        logging.error("Run failed; outputs in %s are incomplete.", run_dir)
+        raise
 
     logging.info("Done. Script completed successfully.")
     return 0
