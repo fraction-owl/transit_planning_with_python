@@ -2,7 +2,7 @@
 
 The fixture exists so a "serves the CBD" route flag gets both answers on the
 mock DC feed (tests/fixtures/mock_gtfs_dc.zip). These tests pin which mock
-routes cross it and keep the others more than half a mile away.
+routes cross it and keep route 40 more than a quarter mile away.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ CBD_ZIP = FIXTURES / "mock_cbd_dc.zip"
 GTFS_ZIP = FIXTURES / "mock_gtfs_dc.zip"
 
 DC_CRS_FT = "EPSG:2248"
-HALF_MILE_FT = 2640.0
+QUARTER_MILE_FT = 1320.0
 
 
 def _read_gtfs(name: str) -> pd.DataFrame:
@@ -78,15 +78,14 @@ def test_fixture_matches_generator() -> None:
     assert committed.normalize().equals_exact(built.normalize(), tolerance=1e-9)
 
 
-def test_routes_30_and_50h_serve_the_cbd_and_the_rest_stay_clear() -> None:
-    """Routes 30 and 50H have stops inside the CBD; 10, 20, and 40 are over half a mile out."""
+def test_route_40_misses_the_cbd_and_the_other_routes_serve_it() -> None:
+    """Routes 10, 20, 30, and 50H have stops inside the CBD; 40 is over a quarter mile out."""
     cbd = load_shapefile(str(CBD_ZIP)).to_crs(DC_CRS_FT).geometry.iloc[0]
     shapes, stops = _route_geometry()
 
     stops_inside = stops[stops.within(cbd)].groupby("route_id").size()
-    assert set(stops_inside.index) == {"DC_R30", "DC_R50H"}
+    assert set(stops_inside.index) == {"DC_R10", "DC_R20", "DC_R30", "DC_R50H"}
     assert (stops_inside >= 2).all()
 
-    for route_id in ("DC_R10", "DC_R20", "DC_R40"):
-        assert shapes.loc[shapes["route_id"] == route_id].distance(cbd).min() > HALF_MILE_FT
-        assert stops.loc[stops["route_id"] == route_id].distance(cbd).min() > HALF_MILE_FT
+    assert shapes.loc[shapes["route_id"] == "DC_R40"].distance(cbd).min() > QUARTER_MILE_FT
+    assert stops.loc[stops["route_id"] == "DC_R40"].distance(cbd).min() > QUARTER_MILE_FT

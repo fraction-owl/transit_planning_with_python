@@ -1,25 +1,25 @@
 """Generate a mock central business district (CBD) polygon (zipped shapefile) for DC.
 
 This is a companion to the mock GTFS / road / points-of-interest fixtures. It
-writes a single polygon shaped like a downtown boundary drawn along streets: a
-straight west edge, an avenue cutting diagonally across the north side, and a
-stepped south edge. Route-profiling tools can use it to flag whether each route
-serves the CBD without the repo shipping a real agency's boundary. The outline
-is hand-drawn and roughly the size of DC's CBD (about 2.3 by 1.9 miles); it is
-not traced from any published layer.
+writes a single polygon: a rectangle with its southeast corner cut off on a
+diagonal. Route-profiling tools can use it to flag whether each route serves
+the CBD without the repo shipping a real agency's boundary. The outline is
+hand-drawn and roughly the size of DC's CBD (about 2.4 by 1.9 miles); it is not
+traced from any published layer.
 
 Coherence with the GTFS frame
 -----------------------------
 The mock DC feed from ``generate_mock_gtfs.py`` is hub-and-spoke: routes 10,
 20, 30, and 40 all cross at the center of ``DEFAULT_BBOX_DC``, and the 50H
 holiday loop's east leg runs through the same point. Every route would serve a
-CBD drawn around that hub, so a "serves the CBD" flag would never be False.
-The polygon is drawn in the hub's northwest quadrant instead, where:
+CBD that contains the hub, so a "serves the CBD" flag would never be False.
+The rectangle instead sits mostly northwest of the hub, and its cut corner runs
+parallel to route 40 (NE-SW diagonal), 1,500 ft from it:
 
-    - Route 30 (NW-SE crosstown) runs diagonally through it.
-    - Route 50H (holiday loop) runs through it on its west leg.
-    - Routes 10, 20, and 40 stay more than half a mile away (about 0.6 mile at
-      the closest), so they are not counted even with a half-mile buffer.
+    - Routes 10, 20, 30, and 50H run through it (4 to 7 stops inside each).
+    - Route 40 stays 1,500 ft away, so it is not counted when checking stops
+      inside the polygon or with a quarter-mile (1,320 ft) buffer. A buffer
+      wider than 1,500 ft would count it.
 
 The outline's vertices are feet east/north of the hub. They are laid out in DC
 State Plane (EPSG:2248) and written in WGS84, like the other mock layers.
@@ -70,19 +70,14 @@ PROJECTED_CRS = "EPSG:2248"
 OUTPUT_CRS = "EPSG:4326"
 
 # CBD outline as (feet east, feet north) of the hub, walked clockwise from the SW corner.
-# Route 30 runs along y = -1.28 * x through this quadrant and route 50H's west leg along
-# x = -13,440 ft; routes 10 (x = 0) and 20 (y = 0) pass 3,300 ft from the nearest edges.
+# Routes 10 and 50H (x = 0) and 20 (y = 0) cross the rectangle and route 30 (y = -1.28 * x)
+# cuts its northwest part. The diagonal edge runs parallel to route 40 (y = 1.28 * x),
+# 1,500 ft northwest of it, so the hub itself is just outside the polygon.
 CBD_OUTLINE_FT: tuple[tuple[float, float], ...] = (
-    (-15400.0, 6200.0),  # SW corner
-    (-15400.0, 13400.0),  # NW corner (straight west edge)
-    (-12800.0, 13400.0),  # short north edge, then the diagonal avenue
-    (-7200.0, 11000.0),  # bend in the avenue
-    (-3300.0, 8600.0),  # NE corner
-    (-3300.0, 3300.0),  # SE corner (straight east edge)
-    (-7500.0, 3300.0),  # south edge, eastern section
-    (-7500.0, 4000.0),  # jog
-    (-9600.0, 4000.0),
-    (-9600.0, 6200.0),  # step up to the western section of the south edge
+    (-9000.0, -3000.0),  # SW corner
+    (-9000.0, 7000.0),  # NW corner
+    (3550.0, 7000.0),  # NE corner, then the diagonal down past the hub
+    (-4250.0, -3000.0),  # back to the south edge
 )
 
 CBD_GIS_ID = "MOCK_CBD_1"
