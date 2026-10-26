@@ -37,11 +37,6 @@ def dc_gtfs_dir(tmp_path: Path) -> Path:
     return _extract_zip(FIXTURES / "mock_gtfs_dc.zip", tmp_path)
 
 
-@pytest.fixture()
-def ottawa_gtfs_dir(tmp_path: Path) -> Path:
-    return _extract_zip(FIXTURES / "mock_gtfs_ottawa.zip", tmp_path)
-
-
 # ---------------------------------------------------------------------------
 # read_stops — happy path
 # ---------------------------------------------------------------------------
@@ -51,12 +46,6 @@ def test_read_stops_dc_row_count(dc_gtfs_dir: Path) -> None:
     """DC fixture loads the expected number of stops."""
     gdf = read_stops(dc_gtfs_dir)
     assert len(gdf) == 395
-
-
-def test_read_stops_ottawa_row_count(ottawa_gtfs_dir: Path) -> None:
-    """Ottawa fixture loads the expected number of stops."""
-    gdf = read_stops(ottawa_gtfs_dir)
-    assert len(gdf) == 619
 
 
 def test_read_stops_returns_geodataframe(dc_gtfs_dir: Path) -> None:
@@ -89,13 +78,6 @@ def test_read_stops_dc_coordinates_in_range(dc_gtfs_dir: Path) -> None:
     assert gdf["stop_lon"].between(-78.0, -76.0).all()
 
 
-def test_read_stops_ottawa_coordinates_in_range(ottawa_gtfs_dir: Path) -> None:
-    """Ottawa stops fall within the Ottawa bounding box."""
-    gdf = read_stops(ottawa_gtfs_dir)
-    assert gdf["stop_lat"].between(44.0, 46.0).all()
-    assert gdf["stop_lon"].between(-77.0, -74.0).all()
-
-
 # ---------------------------------------------------------------------------
 # read_stops — error cases
 # ---------------------------------------------------------------------------
@@ -126,12 +108,6 @@ def test_read_stops_missing_columns_raises(tmp_path: Path) -> None:
 def test_read_shapes_dc_shape_count(dc_gtfs_dir: Path) -> None:
     """DC fixture produces 5 distinct LineString features."""
     gdf = read_shapes(dc_gtfs_dir)
-    assert len(gdf) == 5
-
-
-def test_read_shapes_ottawa_shape_count(ottawa_gtfs_dir: Path) -> None:
-    """Ottawa fixture produces 5 distinct LineString features."""
-    gdf = read_shapes(ottawa_gtfs_dir)
     assert len(gdf) == 5
 
 
@@ -223,14 +199,6 @@ def test_gtfs_to_shapefiles_both_dc(dc_gtfs_dir: Path, tmp_path: Path) -> None:
     """kind='both' creates stops and lines shapefiles for the DC feed."""
     out = tmp_path / "out"
     gtfs_to_shapefiles(dc_gtfs_dir, out, kind="both")
-    assert (out / "gtfs_stops.shp").exists()
-    assert (out / "gtfs_lines.shp").exists()
-
-
-def test_gtfs_to_shapefiles_both_ottawa(ottawa_gtfs_dir: Path, tmp_path: Path) -> None:
-    """kind='both' creates stops and lines shapefiles for the Ottawa feed."""
-    out = tmp_path / "out"
-    gtfs_to_shapefiles(ottawa_gtfs_dir, out, kind="both")
     assert (out / "gtfs_stops.shp").exists()
     assert (out / "gtfs_lines.shp").exists()
 

@@ -22,11 +22,6 @@ pre-commit                   # Local git hooks (ruff)
 # unplanned upgrade. Bump deliberately and re-run `ty check scripts`.
 ty==0.0.92                   # Type checks; error-level rules block CI
 
-# Data Processing
-# Required only by the dev fixture builders (dev_tools/build_cacensus_fixtures.py);
-# no runtime script uses polars.
-polars==0.20.31              # Columnar DataFrame engine for large fixture extracts
-
 # ------------- Typing stubs (temporary) -------------------------------------
 pandas-stubs==2.2.*
 types-openpyxl>=3.1,<5
