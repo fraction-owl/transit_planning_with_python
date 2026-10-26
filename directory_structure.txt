@@ -14,7 +14,6 @@ transit_planning_with_python/
 ├── dev_tools/
 │   ├── audit_helper_functions.py
 │   ├── audit_python_floor.py
-│   ├── build_cacensus_fixtures.py
 │   ├── build_schools_fixtures.py
 │   ├── build_uscensus_fixtures.py
 │   ├── check_style.py
@@ -78,7 +77,6 @@ transit_planning_with_python/
 │   │   ├── ridership_ml_model.py
 │   │   └── route_performance_model.py
 │   ├── national_data_tools/
-│   │   ├── cacensus_da_join_gpd.py
 │   │   ├── clean_eia_gas_prices.py
 │   │   ├── clean_fred_unrate.py
 │   │   ├── clean_noaa_weather.py
@@ -181,7 +179,6 @@ transit_planning_with_python/
 │   │   │   ├── School_Facilities.zip
 │   │   │   └── Urgent_Care_Facilities.zip
 │   │   ├── 4331222_sample.csv
-│   │   ├── 98-401-X2021006_eng_CSV.zip
 │   │   ├── ACSDT5Y2024.B01001_2026-05-23T135534.zip
 │   │   ├── ACSDT5Y2024.B08201_2026-05-23T135430.zip
 │   │   ├── ACSDT5Y2024.B19001_2026-05-23T135307.zip
@@ -204,14 +201,11 @@ transit_planning_with_python/
 │   │   ├── effy2019_sample.csv
 │   │   ├── express_origin_stops.txt
 │   │   ├── express_routes.txt
-│   │   ├── lda_000b21a_e_sample.zip
 │   │   ├── md_wac_S000_JT00_2023.csv.gz
 │   │   ├── mock_cbd_dc.zip
 │   │   ├── mock_gtfs_dc.zip
-│   │   ├── mock_gtfs_ottawa.zip
 │   │   ├── ntd_monthly_multi_month.csv
 │   │   ├── output_road_shps_dc.zip
-│   │   ├── output_road_shps_ottawa.zip
 │   │   ├── private_shuttles_sample.csv
 │   │   ├── ridership_by_route_and_stop.csv
 │   │   ├── sample_block_geoids.csv
@@ -232,7 +226,6 @@ transit_planning_with_python/
 │   ├── test_block_timeline_helpers.py
 │   ├── test_bus_block_exporter.py
 │   ├── test_cabi_coverage_by_route_gpd.py
-│   ├── test_cacensus_da_join_gpd.py
 │   ├── test_calendar_helpers.py
 │   ├── test_cli_helpers.py
 │   ├── test_clean_eia_gas_prices.py

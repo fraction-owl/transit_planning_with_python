@@ -79,7 +79,6 @@ OUTPUT_DIR = Path(r"Path\To\Your\Output_Folder")
 # Region extents (WGS84): (min_lon, min_lat, max_lon, max_lat). Kept in sync with
 # the mock GTFS generator so the road network and the GTFS shapes share a frame.
 DEFAULT_BBOX_DC = (-77.120, 38.790, -76.910, 39.000)
-DEFAULT_BBOX_OTTAWA = (-76.000, 45.300, -75.500, 45.550)
 
 # Inset the drawing area inside each bbox so geometry does not sit on the boundary.
 BBOX_INSET_FRACTION = 0.05
@@ -310,8 +309,7 @@ _CLASS_TABLE: Dict[str, Tuple[str, str, int]] = {
 # name decomposition: (prefix, name, type_us, suffix, route_alias). FULLNAME is
 # composed from these (see RoadDef.full_name). Stored uppercase to match source.
 # The set exercises the typo checker: directional prefixes (N/S), quadrant
-# suffixes (SE/NW), a multi-word name (RHODE ISLAND), an apostrophe (O'CONNOR),
-# and varied street types.
+# suffixes (SE/NW), a multi-word name (RHODE ISLAND), and varied street types.
 _NAME_TABLES: Dict[str, Dict[str, Tuple[str, str, str, str, str]]] = {
     "dc": {
         "A1": ("", "CAPITOL", "ST", "", "801"),
@@ -323,25 +321,14 @@ _NAME_TABLES: Dict[str, Dict[str, Tuple[str, str, str, str, str]]] = {
         "C3": ("", "VIRGINIA", "RD", "", ""),
         "C4": ("", "RHODE ISLAND", "DR", "", ""),
     },
-    "ottawa": {
-        "A1": ("", "BANK", "ST", "", "417"),
-        "A2": ("", "WELLINGTON", "ST", "", "418"),
-        "A3": ("", "RIDEAU", "ST", "", "419"),
-        "A4": ("", "LAURIER", "AVE", "", "420"),
-        "C1": ("", "ELGIN", "ST", "", ""),
-        "C2": ("", "KENT", "ST", "", ""),
-        "C3": ("", "O'CONNOR", "ST", "", ""),
-        "C4": ("", "GLADSTONE", "AVE", "", ""),
-    },
 }
 
 # Per-region Virginia FIPS for V_FIPS. The source schema is Virginia-specific;
 # for a non-VA region the field is realistically left blank.
-_V_FIPS: Dict[str, str] = {"dc": "51059", "ottawa": ""}
+_V_FIPS: Dict[str, str] = {"dc": "51059"}
 
 REGION_BBOXES: Dict[str, Tuple[float, float, float, float]] = {
     "dc": DEFAULT_BBOX_DC,
-    "ottawa": DEFAULT_BBOX_OTTAWA,
 }
 
 

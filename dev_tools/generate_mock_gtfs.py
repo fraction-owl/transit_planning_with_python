@@ -1,6 +1,6 @@
 """Generate mock GTFS feeds (composed of .txt files) for development and testing.
 
-Produces one self-contained GTFS feed per region (DC and Ottawa by default).
+Produces one self-contained GTFS feed per region (DC by default).
 Each feed exercises a range of route archetypes, service profiles, headways,
 stop spacings, and block lengths to serve as fixture data for downstream
 scripts in this repository (e.g., schedule exporters, stop-spacing flaggers,
@@ -28,14 +28,14 @@ bounding box, with a small inset so they sit inside the study area.
 
 Inputs:
     - OUTPUT_DIR: Folder where the feeds will be written.
-    - DC_FIXTURE_PATH, OTTAWA_FIXTURE_PATH (optional): Paths to any
-      geopandas-readable file (.shp, .geojson, .gpkg, ...) used to derive
-      the region bounding box. Geopandas is imported lazily — the script
-      runs fine without it when no fixture path is configured.
+    - DC_FIXTURE_PATH (optional): Path to any geopandas-readable file
+      (.shp, .geojson, .gpkg, ...) used to derive the region bounding box.
+      Geopandas is imported lazily — the script runs fine without it when
+      no fixture path is configured.
 
 Outputs:
-    - Two GTFS sub-folders under OUTPUT_DIR (dc/ and ottawa/), each holding
-      the .txt files listed above.
+    - One GTFS sub-folder per region under OUTPUT_DIR (dc/), holding the
+      .txt files listed above.
 """
 
 from __future__ import annotations
@@ -56,12 +56,10 @@ OUTPUT_DIR = Path(r"Path\To\Your\Output_Folder")
 # Optional fixture paths. Any geopandas-readable file is fine. Leave as the
 # placeholder strings to skip fixture lookup and use the hardcoded bboxes.
 DC_FIXTURE_PATH: Optional[Path] = None
-OTTAWA_FIXTURE_PATH: Optional[Path] = None
 
 # Hardcoded fallback bounding boxes (WGS84): (min_lon, min_lat, max_lon, max_lat).
 # Approximate metro envelopes — replace with fixture-derived bboxes when available.
 DEFAULT_BBOX_DC = (-77.120, 38.790, -76.910, 39.000)
-DEFAULT_BBOX_OTTAWA = (-76.000, 45.300, -75.500, 45.550)
 
 # Inset the drawing area inside each bbox so shapes do not sit on the boundary.
 BBOX_INSET_FRACTION = 0.05
@@ -79,7 +77,7 @@ FEED_END_DATE = "20261231"
 FEED_VERSION = "2026.05-mock"
 FEED_LANG = "en"
 
-# A small set of representative U.S./Canada holidays falling in the FEED window.
+# A small set of representative U.S. holidays falling in the FEED window.
 # Used to (a) populate the "holiday" service with active dates, and
 # (b) remove those dates from the regular "weekday" service via calendar_dates.txt.
 HOLIDAYS = (
@@ -155,15 +153,6 @@ REGIONS: Tuple[Region, ...] = (
         agency_timezone="America/New_York",
         fixture_path=DC_FIXTURE_PATH,
         default_bbox=DEFAULT_BBOX_DC,
-    ),
-    Region(
-        key="ottawa",
-        agency_id="MOCK_OTW",
-        agency_name="Mock Ottawa Transit",
-        agency_url="https://example.org/mock-ottawa",
-        agency_timezone="America/Toronto",
-        fixture_path=OTTAWA_FIXTURE_PATH,
-        default_bbox=DEFAULT_BBOX_OTTAWA,
     ),
 )
 
