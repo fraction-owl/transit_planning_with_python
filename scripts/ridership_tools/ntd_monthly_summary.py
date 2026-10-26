@@ -1,64 +1,57 @@
-"""Analyze and summarize NTD monthly ridership data.
+r"""Analyze NTD monthly ridership using a plain-text config or a previous run log.
 
-This script loads NTD Excel files, cleans and validates the data,
-classifies routes, calculates key metrics, and exports summaries
-and plots by month, route, and service type.
+Set CONFIG_PATH below, then run the script from a notebook, IDE, or shell:
+    python ntd_monthly_summary.py
+    python ntd_monthly_summary.py --config "C:\\reports\\ntd_monthly_config.txt"
+    python ntd_monthly_summary.py --config "C:\\reports\\ntd_monthly_summary_runlog.txt"
+    python ntd_monthly_summary.py --validate-config
 
-Features:
-    - Reads and processes all configured Excel files.
-    - Derives indicators like passengers per hour, trip, and mile.
-    - Aggregates results by route and service type.
-    - Supports user-defined time windows (e.g., fiscal years).
-    - Exports Excel and CSV files, plus optional plots.
+From a notebook or ArcGIS Python window:
+    import ntd_monthly_summary as ntd
+    ntd.main(r"C:\reports\ntd_monthly_config.txt")
 
-Outputs:
-    All files land in OUTPUT_DIR.
+The config uses INI sections, read by Python's standard-library configparser.
+No configuration content is executed. Requires Python 3.9+ and the original
+analysis dependencies: pandas, matplotlib, and an Excel engine such as openpyxl.
+Relative paths resolve against the configuration file's directory. Replaying a
+run log retains that original directory, even if the log has been moved.
+Run-log input creates a new timestamped output folder beside the recorded output
+folder, preserving the earlier results. The workbooks themselves must still exist.
 
-    - DetailedAllPeriods_for_plotting.csv: master tidy CSV covering every period.
-    - MonthlySheets.xlsx: convenience workbook with one sheet per month.
-    - RouteLevelSummary_<Combined|Weekday|Saturday|Sunday>.xlsx: route-level
-      summaries (the Weekday one adds holiday-free columns when applicable).
-    - plots/<metric>/<metric>_route_<route>.png: per-route time-series plots.
-    - NegativeTrendFlags.txt: routes flagged by the 12-month trend check.
-    - One subfolder per TIME_WINDOWS entry holding detailed_<label>_for_plotting.csv,
-      RouteLevelSummary_<subset>.xlsx files, and AggByServiceType_<label>.xlsx.
-    - ntd_monthly_summary_runlog.txt: run-log sidecar capturing the verbatim
-      CONFIGURATION block.
-
-Typical usage:
-    Update the paths in the CONFIGURATION section and run from a shell, ArcGIS
-    Pro's Python window, or a Jupyter notebook.
+Outputs retain the original master CSV, monthly workbook, route summaries,
+service-type summaries, plots, trend flags, and time-window folders. The run log
+records the loaded configuration text and resolved paths. Optional garage
+assignments add metadata to detailed data and route summaries.
 """
 
 from __future__ import annotations
 
+import argparse
+import calendar
+import configparser
 import logging
 import math
 import re
-from dataclasses import dataclass
+import sys
+from dataclasses import dataclass, replace
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, Final, Iterable
 
 import matplotlib.pyplot as plt
 import pandas as pd
+from matplotlib.markers import MarkerStyle
 from matplotlib.ticker import FixedFormatter, FixedLocator
 
-# Sentinel markers used by extract_config_block / write_run_log to identify
-# the configuration block within this file's source. Each string must appear
-# exactly once in this file as a stand-alone comment line (other than these
-# constant definitions themselves). Edit with care.
-CONFIG_BEGIN_MARKER: str = "# === BEGIN CONFIG ==="
-CONFIG_END_MARKER: str = "# === END CONFIG ==="
+# Full config OR previous run-log location. Join filenames with /.
+# A UNC path starts with exactly two backslashes. No __file__ is needed in notebooks.
+CONFIG_PATH: Final[Path] = Path(r"Path\To\Your\Config_Folder") / "ntd_monthly_config.txt"
 
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
-# === BEGIN CONFIG ===
+RUN_LOG_TITLE: Final[str] = "NTD MONTHLY SUMMARY RUN LOG"
+REPLAY_CONFIG_BEGIN: Final[str] = "# === BEGIN REPLAY CONFIG ==="
+REPLAY_CONFIG_END: Final[str] = "# === END REPLAY CONFIG ==="
 
-DATA_ROOT: Final[Path] = Path(r"Path\To\Your\NTD_Folder")  # input files
-OUTPUT_DIR: Final[Path] = Path(r"Path\To\Your\Output\Folder")  # results
-
+# Workbook schema and supported service periods belong to the analysis code.
 REQUIRED_NUMERIC_COLS: Final[list[str]] = [
     "MTH_BOARD",
     "MTH_REV_HOURS",
@@ -67,178 +60,462 @@ REQUIRED_NUMERIC_COLS: Final[list[str]] = [
     "DAYS",
     "REV_MILES",
 ]
-
-# -----------------------------------------------------------------------------
-#  Workbook catalogue
-# -----------------------------------------------------------------------------
+SERVICE_PERIODS: Final[list[str]] = ["Weekday", "Saturday", "Sunday"]
+MONTH_NAMES: Final[tuple[str, ...]] = (
+    "Jan",
+    "Feb",
+    "Mar",
+    "Apr",
+    "May",
+    "Jun",
+    "Jul",
+    "Aug",
+    "Sep",
+    "Oct",
+    "Nov",
+    "Dec",
+)
+PLOT_FLAGS: Final[tuple[str, ...]] = (
+    "plot_total_ridership",
+    "plot_weekday_avg",
+    "plot_saturday_avg",
+    "plot_sunday_avg",
+    "plot_revenue_hours",
+    "plot_trips",
+    "plot_revenue_miles",
+    "plot_pph",
+    "plot_ppt",
+    "plot_ppm",
+)
 
 
 @dataclass(frozen=True)
 class PeriodSpec:
-    """Workbook name and destination sheet."""
+    """Workbook filename and source worksheet."""
 
     filename: str
     sheet: str
 
 
-PERIODS: Final[dict[str, PeriodSpec]] = {
-    "Jul-2024": PeriodSpec("JULY 2024 NTD RIDERSHIP BY ROUTE.xlsx", "Temporary_Query_N"),
-    "Aug-2024": PeriodSpec("AUGUST 2024  NTD RIDERSHIP REPORT BY ROUTE.xlsx", "Temporary_Query_N"),
-    "Sep-2024": PeriodSpec("SEPTEMBER 2024 NTD RIDERSHIP BY ROUTE.xlsx", "Sep.2024 Finals"),
-    "Oct-2024": PeriodSpec("NTD RIDERSHIP BY ROUTE _ OCTOBER _2024.xlsx", "Temporary_Query_N"),
-    "Nov-2024": PeriodSpec("NTD RIDERSHIP BY ROUTE-NOVEMBER 2024.xlsx", "Temporary_Query_N"),
-    "Dec-2024": PeriodSpec("NTD RIDERSHIP BY MONTH_DECEMBER 2024.xlsx", "Dec. 2024"),
-    "Jan-2025": PeriodSpec("NTD RIDERSHIP BY MONTH-JANUARY 2025.xlsx", "Jan. 2025"),
-    "Feb-2025": PeriodSpec("NTD RIDERSHIP BY MONTH-FEBRUARY 2025.xlsx", "Feb. 2025"),
-    "Mar-2025": PeriodSpec("MARCH 2025 NTD MONTHLY RIDERSHIP.xlsx", "March 2025"),
-    "Apr-2025": PeriodSpec("APRIL 2025 NTD MONTHLY RIDERSHIP.xlsx", "April 2025"),
-    "May-2025": PeriodSpec("May 2025 NTD MONTHLY RIDERSHIP.xlsx", "May 2025"),
-    # "Jun-2025": PeriodSpec("JUNE 2025 NTD RIDERSHIP BY MONTH.xlsx",          "Jun. 2025"),
-}
-ORDERED_PERIODS: Final[list[str]] = list(PERIODS)
-SERVICE_PERIODS: Final[list[str]] = ["Weekday", "Saturday", "Sunday"]
+@dataclass(frozen=True)
+class TimeWindow:
+    """Inclusive whole-month span to aggregate."""
 
-# -----------------------------------------------------------------------------
-#  Optional user-defined time windows
-# -----------------------------------------------------------------------------
+    label: str
+    start: datetime
+    end: datetime
 
 
 @dataclass(frozen=True)
-class TimeWindow:
-    """Named span of dates over which to aggregate results."""
+class PlotStyle:
+    """Validated presentation settings."""
 
-    label: str  # e.g. "FY25" or "Summer2024"
-    start: datetime  # inclusive
-    end: datetime  # inclusive
-
-
-# Analysts can edit or append to this list without touching code elsewhere.
-TIME_WINDOWS: Final[list[TimeWindow]] = [
-    TimeWindow("FY21", datetime(2020, 7, 1), datetime(2021, 6, 30)),
-    TimeWindow("FY22", datetime(2021, 7, 1), datetime(2022, 6, 30)),
-    TimeWindow("FY23", datetime(2022, 7, 1), datetime(2023, 6, 30)),
-    TimeWindow("FY24", datetime(2023, 7, 1), datetime(2024, 6, 30)),
-    TimeWindow("FY25", datetime(2024, 7, 1), datetime(2025, 6, 30)),
-    TimeWindow("FY26", datetime(2025, 7, 1), datetime(2026, 6, 30)),
-    # TimeWindow("Summer2024", datetime(2024, 6, 1), datetime(2024, 8, 31)),
-]
-
-# -----------------------------------------------------------------------------
-#  Holiday calendar & service-day accounting
-# -----------------------------------------------------------------------------
-# NTD workbooks report service days only as Weekday / Saturday / Sunday and do
-# not flag holidays separately. List holiday dates here so the script can
-# (a) report how many weekday holidays fell in each month and (b) when any
-# weekday holiday falls inside the covered months, add DAYS_EX_HOLIDAYS and
-# DAILY_AVG_EX_HOLIDAYS columns to the weekday route summary. Only holidays that
-# fall on a weekday are considered; holidays landing on a Saturday or Sunday are
-# ignored.
-
-HOLIDAYS: Final[list[datetime]] = [
-    datetime(2026, 1, 19),  # Martin Luther King, Jr. Day
-    datetime(2026, 2, 16),  # George Washington Day
-    datetime(2026, 5, 25),  # Memorial Day
-    datetime(2026, 6, 19),  # Juneteenth
-    datetime(2026, 7, 3),  # Independence Day (observed)
-    datetime(2026, 9, 7),  # Labor Day
-    datetime(2026, 10, 12),  # Columbus Day / Indigenous Peoples' Day
-    datetime(2026, 11, 3),  # Election Day
-    datetime(2026, 11, 11),  # Veterans Day
-    datetime(2026, 11, 26),  # Thanksgiving
-    datetime(2026, 11, 27),  # Day after Thanksgiving
-    datetime(2026, 12, 25),  # Christmas Day
-    datetime(2026, 12, 31),  # New Year's Eve
-    datetime(2027, 1, 1),  # New Year's Day
-]
-
-# -----------------------------------------------------------------------------
-#  Classification dictionaries
-# -----------------------------------------------------------------------------
-
-SERVICE_TYPE_DICT: Final[dict[str, list[str]]] = {
-    "local": [
-        "101",
-        "202",
-    ],
-    "express": [
-        "303",
-        "404",
-    ],
-    "circulator": [
-        "505",
-        "606",
-    ],
-    "feeder": [
-        "707",
-        "808",
-    ],
-}
-
-CORRIDOR_DICT: Final[dict[str, list[str]]] = {
-    "route_one_corridor": ["101", "202"],
-    "i_2_corridor": ["303", "404"],
-    "route_three_corridor": ["505", "606"],
-    "i_4_corridor": ["707", "808"],
-}
-
-# -----------------------------------------------------------------------------
-#  Trend‑analysis settings
-# -----------------------------------------------------------------------------
-
-ROLLING_WINDOW: int = 12  # months in the baseline
-MIN_COVERAGE: float = 0.75  # ≥ 75 % of window must be valid
-DECLINE_THRESH_PCT: float = 10.0  # % drop vs. baseline that triggers a flag
-REQUIRE_TWO_MONTHS: bool = True  # True = need latest AND prev month below baseline
-
-# Months to ignore (e.g. strikes, data outages).
-# Keys are "MMM-YYYY" strings; values are "*" for all routes
-# or a list/tuple of specific route names.
-EXCLUDE_DATA: dict[str, str | Iterable[str]] = {
-    # "Sep-2024": "*",                    # entire system
-    # "Jan-2025": ["101", "202", "303"], # only listed routes
-}
-
-# -----------------------------------------------------------------------------
-#  Plot behaviour
-# -----------------------------------------------------------------------------
-
-PLOT_CONFIG: Final[dict[str, bool]] = {
-    "plot_total_ridership": False,
-    "plot_weekday_avg": True,
-    "plot_saturday_avg": True,
-    "plot_sunday_avg": True,
-    "plot_revenue_hours": False,
-    "plot_trips": False,
-    "plot_revenue_miles": False,
-    "plot_pph": False,
-    "plot_ppt": False,
-    "plot_ppm": False,
-}
-
-PLOT_STYLE: Final[dict[str, Any]] = {
-    "figsize": (9, 5),
-    "marker": "o",
-    "linestyle": "-",
-    "rotation": 45,
-    "grid": True,
-}
-
-LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
-
-# When True, a failed run-log write aborts the script so the analyst is never
-# left with an output directory that lacks a matching configuration record.
-REQUIRE_RUN_LOG: bool = True
-
-# === END CONFIG ===
-
-# =============================================================================
-# FUNCTIONS
-# =============================================================================
+    figsize: tuple[float, float]
+    marker: str
+    linestyle: str
+    rotation: float
+    grid: bool
 
 
-def _is_excluded(period: str, route: str) -> bool:
+@dataclass(frozen=True)
+class AppConfig:
+    """Parsed settings passed explicitly to the analysis functions."""
+
+    source_path: Path
+    source_text: str
+    data_root: Path
+    output_dir: Path
+    periods: dict[str, PeriodSpec]
+    time_windows: list[TimeWindow]
+    holidays: list[datetime]
+    service_types: dict[str, list[str]]
+    corridors: dict[str, list[str]]
+    garage_assignments: dict[str, list[str]]
+    rolling_window: int
+    min_coverage: float
+    decline_thresh_pct: float
+    require_two_months: bool
+    exclude_data: dict[str, str | list[str]]
+    plots: dict[str, bool]
+    plot_style: PlotStyle
+    log_level: int
+    require_run_log: bool
+    from_run_log: bool = False
+    config_base_dir: Path | None = None
+
+    @property
+    def ordered_periods(self) -> list[str]:
+        """Return catalogue months in chronological order."""
+        return list(self.periods)
+
+    @property
+    def timeline(self) -> list[str]:
+        """Keep absent catalogue months as gaps, not compressed time."""
+        start = parse_period(self.ordered_periods[0])
+        end = parse_period(self.ordered_periods[-1])
+        months = pd.date_range(start, end, freq="MS")
+        return [f"{MONTH_NAMES[d.month - 1]}-{d.year:04d}" for d in months]
+
+
+class ConfigError(ValueError):
+    """An invalid analyst-supplied setting."""
+
+
+class CasePreservingConfigParser(configparser.ConfigParser):
+    """Keep month keys, group labels, and option names exactly as written."""
+
+    def optionxform(self, optionstr: str) -> str:
+        """Return *optionstr* unchanged instead of lower-casing it."""
+        return optionstr
+
+
+def parse_period(value: str) -> datetime:
+    """Parse an English MMM-YYYY month without relying on the host locale."""
+    match = re.fullmatch(r"([A-Z][a-z]{2})-(\d{4})", value)
+    if not match or match[1] not in MONTH_NAMES:
+        raise ConfigError(f"Invalid period {value!r}; use MMM-YYYY, e.g. Jul-2024.")
+    try:
+        return datetime(int(match[2]), MONTH_NAMES.index(match[1]) + 1, 1)
+    except ValueError as exc:
+        raise ConfigError(f"Invalid period {value!r}: {exc}") from exc
+
+
+def parse_date(value: str, context: str) -> datetime:
+    """Read a strict ISO date and identify the offending setting on failure."""
+    try:
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+            raise ValueError("use YYYY-MM-DD")
+        return datetime.strptime(value, "%Y-%m-%d")
+    except ValueError as exc:
+        raise ConfigError(f"{context}: invalid date {value!r}; use YYYY-MM-DD.") from exc
+
+
+def split_list(value: str, context: str) -> list[str]:
+    """Read a comma-separated list; an entirely blank value means no entries."""
+    if not value.strip():
+        return []
+    items = [item.strip() for item in value.split(",")]
+    if any(not item for item in items):
+        raise ConfigError(f"{context}: empty list entry; remove the extra comma.")
+    return items
+
+
+def split_pair(value: str, context: str) -> tuple[str, str]:
+    """Read exactly two nonempty pipe-separated values."""
+    parts = [part.strip() for part in value.split("|")]
+    if len(parts) != 2 or not all(parts):
+        raise ConfigError(f"{context}: expected two nonempty values separated by |.")
+    return parts[0], parts[1]
+
+
+def normalize_route(value: str) -> str:
+    """Match the workbook route normalization without converting IDs to numbers."""
+    return re.sub(r"\.0$", "", value.strip().upper().replace(" ", ""))
+
+
+def route_list(value: str, context: str) -> list[str]:
+    """Read route IDs and reject duplicates after normalization."""
+    routes = [normalize_route(item) for item in split_list(value, context)]
+    if any(not re.fullmatch(r"[A-Z0-9][A-Z0-9_.-]*", route) for route in routes):
+        raise ConfigError(f"{context}: route IDs must be unquoted letters/numbers, ., _, or -.")
+    if len(routes) != len(set(routes)):
+        raise ConfigError(f"{context}: duplicate route ID after normalization.")
+    return routes
+
+
+def read_groups(
+    parser: configparser.ConfigParser, section: str, *, exclusive: bool
+) -> dict[str, list[str]]:
+    """Read classification lists, permitting corridor overlap only."""
+    if not parser.has_section(section):
+        return {}
+    result: dict[str, list[str]] = {}
+    assigned: dict[str, str] = {}
+    for label, value in parser.items(section):
+        if label.casefold() in {"unknown", "total"}:
+            raise ConfigError(f"[{section}]: label {label!r} is reserved.")
+        routes = route_list(value, f"[{section}] {label}")
+        if not routes:
+            raise ConfigError(f"[{section}] {label}: supply routes or remove this entry.")
+        for route in routes:
+            if exclusive and route in assigned:
+                raise ConfigError(
+                    f"[{section}]: route {route} appears in both {assigned[route]!r} and {label!r}."
+                )
+            assigned[route] = label
+        result[label] = routes
+    return result
+
+
+def config_path(value: str, base: Path) -> Path:
+    """Preserve Windows/UNC literals and resolve relative paths beside the config."""
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        value = value[1:-1]
+    if not value or "\n" in value or "\r" in value:
+        raise ConfigError("[paths]: paths must be nonempty, single-line values.")
+    windows = PureWindowsPath(value)
+    if windows.drive and not windows.is_absolute():
+        raise ConfigError(f"[paths]: drive-relative path {value!r} is ambiguous.")
+    path = Path(value).expanduser()
+    if path.is_absolute() or windows.is_absolute():
+        return path
+    return (base / path).resolve()
+
+
+def extract_replay_config(text: str) -> tuple[str, dict[str, str]]:
+    """Extract INI settings from a new log or the previous unmarked log format."""
+    lines = text.splitlines()
+    header = "CONFIGURATION (text loaded for this run)"
+    if lines.count(header) != 1:
+        raise ConfigError("Run log must contain one INI configuration section.")
+    heading = lines.index(header)
+    metadata = {}
+    for line in lines[:heading]:
+        key, separator, value = line.partition(":")
+        if separator:
+            key = key.strip()
+            if key in metadata:
+                raise ConfigError(f"Run log contains duplicate metadata: {key}.")
+            metadata[key] = value.strip()
+
+    if REPLAY_CONFIG_BEGIN in lines or REPLAY_CONFIG_END in lines:
+        if lines.count(REPLAY_CONFIG_BEGIN) != 1 or lines.count(REPLAY_CONFIG_END) != 1:
+            raise ConfigError("Run log has missing or duplicate configuration markers.")
+        start = lines.index(REPLAY_CONFIG_BEGIN) + 1
+        end = lines.index(REPLAY_CONFIG_END)
+        if not heading < start <= end:
+            raise ConfigError("Run-log configuration markers are out of order.")
+    else:
+        # Backward compatibility with the log produced before replay was supported.
+        if heading + 1 >= len(lines) or lines[heading + 1] != "-" * 72:
+            raise ConfigError("Run-log configuration header is incomplete.")
+        start = heading + 2
+        footers = [
+            i
+            for i in range(start, len(lines))
+            if lines[i] == "=" * 72
+            or (
+                lines[i] == "-" * 72
+                and i + 1 < len(lines)
+                and lines[i + 1] == "SERVICE-DAY COUNTS PER MONTH"
+            )
+        ]
+        if not footers:
+            raise ConfigError("Run log is truncated: no end of the configuration was found.")
+        end = footers[0]
+
+    config_text = "\n".join(lines[start:end]).strip("\n") + "\n"
+    if not config_text.strip():
+        raise ConfigError("Run-log configuration section is empty.")
+    return config_text, metadata
+
+
+def replay_base_directory(metadata: dict[str, str]) -> Path:
+    """Recover the original base for relative paths without needing the old config file."""
+    base_text = metadata.get("Config base directory")
+    if base_text:
+        base = config_path(base_text, Path.cwd())
+        if not Path(base_text).is_absolute() and not PureWindowsPath(base_text).is_absolute():
+            raise ConfigError("Run-log config base directory must be absolute.")
+        return base
+    original = metadata.get("Config file", "")
+    if PureWindowsPath(original).is_absolute():
+        return Path(str(PureWindowsPath(original).parent))
+    if Path(original).is_absolute():
+        return Path(original).parent
+    raise ConfigError("Run log is missing the original absolute Config file path.")
+
+
+def load_config(path: str | Path) -> AppConfig:
+    """Load and validate all settings without opening Excel files or writing output."""
+    source_path = Path(path).expanduser().resolve()
+    try:
+        source_text = source_path.read_text(encoding="utf-8-sig")
+        from_run_log = RUN_LOG_TITLE in source_text.splitlines()[:3]
+        base_dir = source_path.parent
+        if from_run_log:
+            source_text, metadata = extract_replay_config(source_text)
+            base_dir = replay_base_directory(metadata)
+        parser = CasePreservingConfigParser(
+            interpolation=None,
+            delimiters=("=",),
+            strict=True,
+            inline_comment_prefixes=None,
+            empty_lines_in_values=False,
+        )
+        parser.read_string(source_text, source=str(source_path))
+        config = parse_config(parser, source_path, source_text, base_dir=base_dir)
+        return replace(config, from_run_log=from_run_log, config_base_dir=base_dir)
+    except (OSError, UnicodeError, configparser.Error, ValueError) as exc:
+        raise ConfigError(f"{source_path}: {exc}") from exc
+
+
+def parse_config(
+    parser: configparser.ConfigParser,
+    source_path: Path,
+    source_text: str,
+    *,
+    base_dir: Path | None = None,
+) -> AppConfig:
+    """Convert a ConfigParser into a typed configuration with no silent defaults."""
+    fixed_keys = {
+        "paths": {"data_root", "output_dir"},
+        "holidays": {"dates"},
+        "trend": {"rolling_window", "min_coverage", "decline_thresh_pct", "require_two_months"},
+        "plots": set(PLOT_FLAGS),
+        "plot_style": {"figsize", "marker", "linestyle", "rotation", "grid"},
+        "logging": {"level", "require_run_log"},
+    }
+    required_sections = set(fixed_keys) | {
+        "periods",
+        "time_windows",
+        "service_types",
+        "corridors",
+        "exclude_data",
+    }
+    if parser.defaults():
+        raise ConfigError("[DEFAULT] entries are not supported; use the named sections.")
+    missing_sections = required_sections - set(parser.sections())
+    extra_sections = set(parser.sections()) - required_sections - {"garage_assignments"}
+    if missing_sections or extra_sections:
+        raise ConfigError(
+            f"Sections: missing={sorted(missing_sections)}, unknown={sorted(extra_sections)}."
+        )
+    for section, expected in fixed_keys.items():
+        actual = set(parser[section])
+        if actual != expected:
+            raise ConfigError(
+                f"[{section}]: missing settings={sorted(expected - actual)}, "
+                f"unknown settings={sorted(actual - expected)}."
+            )
+
+    periods: dict[str, PeriodSpec] = {}
+    for label, value in sorted(parser.items("periods"), key=lambda item: parse_period(item[0])):
+        filename, sheet = split_pair(value, f"[periods] {label}")
+        periods[label] = PeriodSpec(filename, sheet)
+    if not periods:
+        raise ConfigError("[periods]: configure at least one workbook.")
+
+    windows: list[TimeWindow] = []
+    seen_labels: set[str] = set()
+    reserved = {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        *(f"COM{i}" for i in range(1, 10)),
+        *(f"LPT{i}" for i in range(1, 10)),
+        "PLOTS",
+    }
+    for label, value in parser.items("time_windows"):
+        if (
+            not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", label)
+            or label.upper() in reserved
+            or label.casefold() in seen_labels
+        ):
+            raise ConfigError(
+                f"[time_windows]: unsafe, reserved, or duplicate folder label {label!r}."
+            )
+        seen_labels.add(label.casefold())
+        start_text, end_text = split_pair(value, f"[time_windows] {label}")
+        start = parse_date(start_text, label)
+        end = parse_date(end_text, label)
+        if start > end:
+            raise ConfigError(f"[time_windows] {label}: start must be on or before end.")
+        if start.day != 1 or end.day != calendar.monthrange(end.year, end.month)[1]:
+            raise ConfigError(
+                f"[time_windows] {label}: use complete months (first day to last day)."
+            )
+        windows.append(TimeWindow(label, start, end))
+
+    holidays = [
+        parse_date(item, "[holidays] dates")
+        for item in split_list(parser.get("holidays", "dates"), "[holidays] dates")
+    ]
+    if len(holidays) != len(set(holidays)):
+        raise ConfigError("[holidays]: duplicate dates would subtract service days twice.")
+
+    exclusions: dict[str, str | list[str]] = {}
+    for label, value in parser.items("exclude_data"):
+        parse_period(label)
+        if label not in periods:
+            raise ConfigError(f"[exclude_data] {label}: period is absent from [periods].")
+        exclusions[label] = (
+            "*" if value.strip() == "*" else route_list(value, f"[exclude_data] {label}")
+        )
+        if not exclusions[label]:
+            raise ConfigError(f"[exclude_data] {label}: supply * or route IDs.")
+
+    window = parser.getint("trend", "rolling_window")
+    coverage = parser.getfloat("trend", "min_coverage")
+    threshold = parser.getfloat("trend", "decline_thresh_pct")
+    if window < 1 or not 0 < coverage <= 1 or not 0 < threshold <= 100:
+        raise ConfigError("[trend]: require window >= 1, 0 < coverage <= 1, 0 < decline <= 100.")
+
+    size = split_list(parser.get("plot_style", "figsize"), "[plot_style] figsize")
+    if len(size) != 2:
+        raise ConfigError("[plot_style] figsize: supply width, height in inches.")
+    width, height = float(size[0]), float(size[1])
+    rotation = parser.getfloat("plot_style", "rotation")
+    if not all(math.isfinite(x) and x > 0 for x in (width, height)) or not math.isfinite(rotation):
+        raise ConfigError("[plot_style]: size must be positive/finite and rotation must be finite.")
+    marker = parser.get("plot_style", "marker")
+    MarkerStyle(marker)
+    linestyle = parser.get("plot_style", "linestyle")
+    if linestyle not in {"-", "--", "-.", ":", "solid", "dashed", "dashdot", "dotted", "None", ""}:
+        raise ConfigError(f"[plot_style]: unsupported linestyle {linestyle!r}.")
+
+    levels = {
+        "DEBUG": logging.DEBUG,
+        "INFO": logging.INFO,
+        "WARNING": logging.WARNING,
+        "ERROR": logging.ERROR,
+        "CRITICAL": logging.CRITICAL,
+    }
+    level = parser.get("logging", "level").upper()
+    if level not in levels:
+        raise ConfigError(f"[logging] level: choose one of {', '.join(levels)}.")
+
+    return AppConfig(
+        source_path=source_path,
+        source_text=source_text,
+        data_root=config_path(parser.get("paths", "data_root"), base_dir or source_path.parent),
+        output_dir=config_path(parser.get("paths", "output_dir"), base_dir or source_path.parent),
+        periods=periods,
+        time_windows=windows,
+        holidays=holidays,
+        service_types=read_groups(parser, "service_types", exclusive=True),
+        corridors=read_groups(parser, "corridors", exclusive=False),
+        garage_assignments=read_groups(parser, "garage_assignments", exclusive=True),
+        rolling_window=window,
+        min_coverage=coverage,
+        decline_thresh_pct=threshold,
+        require_two_months=parser.getboolean("trend", "require_two_months"),
+        exclude_data=exclusions,
+        plots={flag: parser.getboolean("plots", flag) for flag in PLOT_FLAGS},
+        plot_style=PlotStyle(
+            (width, height), marker, linestyle, rotation, parser.getboolean("plot_style", "grid")
+        ),
+        log_level=levels[level],
+        require_run_log=parser.getboolean("logging", "require_run_log"),
+    )
+
+
+def check_input_files(config: AppConfig) -> None:
+    """Report all missing workbook paths before creating the output folder."""
+    missing = [
+        f"{period}: {config.data_root / spec.filename}"
+        for period, spec in config.periods.items()
+        if not (config.data_root / spec.filename).is_file()
+    ]
+    if missing:
+        raise FileNotFoundError("Missing input workbooks:\n" + "\n".join(missing))
+
+
+def _is_excluded(period: str, route: str, config: AppConfig) -> bool:
     """Return True if (*period*, *route*) is in EXCLUDE_DATA."""
-    spec = EXCLUDE_DATA.get(period)
+    spec = config.exclude_data.get(period)
     if spec is None:  # period not excluded
         return False
     if spec == "*":  # whole system excluded
@@ -250,7 +527,7 @@ def slice_for_window(df: pd.DataFrame, window: TimeWindow) -> pd.DataFrame:
     """Return rows in *df* whose month-start date falls inside *window*."""
     if "period_dt" not in df.columns:
         # Parse once – assumes "Jul-2024", "Aug-2024", …
-        df = df.assign(period_dt=pd.to_datetime(df["period"], format="%b-%Y", errors="coerce"))
+        df = df.assign(period_dt=pd.to_datetime(df["period"].map(parse_period), errors="coerce"))
     mask = (df["period_dt"] >= window.start) & (df["period_dt"] <= window.end)
     return df.loc[mask].copy()
 
@@ -293,23 +570,29 @@ def normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def read_excel_data() -> dict[str, pd.DataFrame]:
+def read_excel_data(config: AppConfig) -> dict[str, pd.DataFrame]:
     """Load, clean, and filter every monthly workbook."""
     # Cast converters to Any to bypass MyPy strictness on Mapping/Dict variance
     converters: Any = {col: safe_float for col in REQUIRED_NUMERIC_COLS}
     data: dict[str, pd.DataFrame] = {}
 
-    for period in ORDERED_PERIODS:
-        spec = PERIODS[period]
-        path: Path = DATA_ROOT / spec.filename
+    for period in config.ordered_periods:
+        spec = config.periods[period]
+        path: Path = config.data_root / spec.filename
         logging.info("→ Reading %s (%s) … ", period, spec.filename)
 
         # --- load ---------------------------------------------------------- #
-        df = pd.read_excel(path, sheet_name=spec.sheet, converters=converters)
+        try:
+            df = pd.read_excel(path, sheet_name=spec.sheet, converters=converters)
+        except ValueError as exc:
+            raise ValueError(
+                f"{period}: cannot read {spec.filename!r}, sheet {spec.sheet!r}: {exc}"
+            ) from exc
         df = normalise_columns(df)
 
         # --- guard-rail ---------------------------------------------------- #
-        missing = [c for c in REQUIRED_NUMERIC_COLS if c not in df.columns]
+        required = [*REQUIRED_NUMERIC_COLS, "ROUTE_NAME", "SERVICE_PERIOD"]
+        missing = [c for c in required if c not in df.columns]
         if missing:
             raise KeyError(
                 f"{period}: workbook '{spec.filename}' is missing "
@@ -335,17 +618,17 @@ def read_excel_data() -> dict[str, pd.DataFrame]:
     return data
 
 
-def classify_route(route_name: str) -> str:
+def classify_route(route_name: str, config: AppConfig) -> str:
     """Return the first matching service-type label for *route_name*."""
-    for stype, lst in SERVICE_TYPE_DICT.items():
+    for stype, lst in config.service_types.items():
         if route_name in lst:
             return stype
     return "unknown"
 
 
-def classify_corridor(route_name: str) -> list[str]:
+def classify_corridor(route_name: str, config: AppConfig) -> list[str]:
     """Return all corridor labels containing *route_name*."""
-    matches = [c for c, lst in CORRIDOR_DICT.items() if route_name in lst]
+    matches = [c for c, lst in config.corridors.items() if route_name in lst]
     return matches or ["other"]
 
 
@@ -422,7 +705,10 @@ def route_level_summary(df: pd.DataFrame) -> pd.DataFrame:
         "MTH_REV_MILES": "sum",
         "TOTAL_TRIPS": "sum",
     }
-    totals = df.groupby(["service_type", "ROUTE_NAME"], as_index=False).agg(agg_cols)
+    group_columns = ["service_type", "ROUTE_NAME"]
+    if "garage" in df.columns:
+        group_columns.append("garage")
+    totals = df.groupby(group_columns, as_index=False).agg(agg_cols)
 
     totals["BOARDS_PER_HOUR"] = safe_div_vec(totals["MTH_BOARD"], totals["MTH_REV_HOURS"])
     totals["PASSENGERS_PER_TRIP"] = safe_div_vec(totals["MTH_BOARD"], totals["TOTAL_TRIPS"])
@@ -475,19 +761,20 @@ def with_weekday_ex_holiday_columns(
 
 def detect_negative_trends_12m(
     df_time: pd.DataFrame,
-    window: int = ROLLING_WINDOW,
-    pct_threshold: float = DECLINE_THRESH_PCT,
-    min_coverage: float = MIN_COVERAGE,
-    confirm_prev: bool = REQUIRE_TWO_MONTHS,
+    config: AppConfig,
 ) -> pd.DataFrame:
     """Flag routes with two‑month declines vs. 12‑month baseline.
 
     Returns one row per route flagged.
     """
+    window = config.rolling_window
+    pct_threshold = config.decline_thresh_pct
+    min_coverage = config.min_coverage
+    confirm_prev = config.require_two_months
     flags: list[dict[str, Any]] = []
 
     metrics = ["weekday_avg", "pph", "ppt", "ppm"]  # adjust if desired
-    periods = ORDERED_PERIODS  # already chronologically sorted
+    periods = config.timeline  # include missing calendar months as gaps
 
     for route, grp in df_time.groupby("route"):
         grp = grp.set_index("period").reindex(periods)  # align to master timeline
@@ -496,7 +783,7 @@ def detect_negative_trends_12m(
             vals = pd.to_numeric(grp[metric], errors="coerce")
 
             # Build exclusion mask
-            excl_mask = [_is_excluded(p, str(route)) for p in periods]
+            excl_mask = [_is_excluded(p, str(route), config) for p in periods]
             vals = vals.mask(pd.Series(excl_mask, index=vals.index))  # convert excluded to NaN
 
             if vals.notna().sum() < window + 1:
@@ -535,7 +822,7 @@ def detect_negative_trends_12m(
     return pd.DataFrame(flags)
 
 
-def write_trend_log(df_flags: pd.DataFrame, output_dir: Path = OUTPUT_DIR) -> Path:
+def write_trend_log(df_flags: pd.DataFrame, output_dir: Path) -> Path:
     """Write a plain‑text summary of flagged routes. Return the file path."""
     out_path = output_dir / "NegativeTrendFlags.txt"
 
@@ -577,13 +864,14 @@ def weekday_holiday_counts(holidays: Iterable[datetime]) -> dict[str, int]:
     for holiday in holidays:
         if holiday.weekday() >= 5:  # Saturday=5, Sunday=6
             continue
-        period = holiday.strftime("%b-%Y")
+        period = f"{MONTH_NAMES[holiday.month - 1]}-{holiday.year:04d}"
         counts[period] = counts.get(period, 0) + 1
     return counts
 
 
 def summarize_service_days(
     all_data: pd.DataFrame,
+    config: AppConfig,
     holiday_counts: dict[str, int] | None = None,
 ) -> pd.DataFrame:
     """Build one systemwide row per month of reported service-day counts.
@@ -595,7 +883,7 @@ def summarize_service_days(
     ``Holidays`` is the number of weekday holidays configured for that month.
     """
     rows: list[dict[str, Any]] = []
-    for period in ORDERED_PERIODS:
+    for period in config.ordered_periods:
         dfp = all_data[all_data["period"] == period]
         row: dict[str, Any] = {"period": period}
         for service_period in SERVICE_PERIODS:
@@ -608,10 +896,10 @@ def summarize_service_days(
             row[service_period] = int(modal.max()) if not days.empty else 0
         row["Holidays"] = int((holiday_counts or {}).get(period, 0))
         rows.append(row)
-    return pd.DataFrame(rows, columns=["period", *SERVICE_PERIODS, "Holidays"])
+    return pd.DataFrame(rows, columns=pd.Index(["period", *SERVICE_PERIODS, "Holidays"]))
 
 
-def build_monthly_timeseries(all_data: pd.DataFrame) -> pd.DataFrame:
+def build_monthly_timeseries(all_data: pd.DataFrame, config: AppConfig) -> pd.DataFrame:
     """Convert the year-to-date table into a plotting-ready time series.
 
     The result has one row per (period, route) plus a *SYSTEMWIDE* row,
@@ -680,9 +968,9 @@ def build_monthly_timeseries(all_data: pd.DataFrame) -> pd.DataFrame:
     df_time = pd.DataFrame(rows)
 
     # 2. Add systemwide rows
-    service_days = summarize_service_days(all_data).set_index("period").to_dict("index")
+    service_days = summarize_service_days(all_data, config).set_index("period").to_dict("index")
     sys_rows: list[dict[str, Any]] = []
-    for period in ORDERED_PERIODS:
+    for period in config.ordered_periods:
         dfp = df_time[df_time["period"] == period]
         tr = dfp["total_ridership"].sum()
         hrs = dfp["revenue_hours"].sum()
@@ -714,9 +1002,9 @@ def build_monthly_timeseries(all_data: pd.DataFrame) -> pd.DataFrame:
     return pd.concat([df_time, pd.DataFrame(sys_rows)], ignore_index=True)
 
 
-def plot_metric_over_time(df_time: pd.DataFrame, metric: str) -> None:
+def plot_metric_over_time(df_time: pd.DataFrame, metric: str, config: AppConfig) -> None:
     """Create a line plot of *metric* by month for every route."""
-    plot_dir = OUTPUT_DIR / "plots" / metric
+    plot_dir = config.output_dir / "plots" / metric
     plot_dir.mkdir(parents=True, exist_ok=True)
 
     df_m = df_time[["period", "route", metric]].copy()
@@ -725,33 +1013,29 @@ def plot_metric_over_time(df_time: pd.DataFrame, metric: str) -> None:
     # INFO messages for every chart. Plot against positions instead and label them
     # with a fixed locator/formatter; plt.xticks(ticks, labels) would also stretch
     # the x-axis to every month, even for a route with no data at the start or end.
-    x_pos = range(len(ORDERED_PERIODS))
+    periods = config.timeline
+    x_pos = range(len(periods))
 
     for route in sorted(df_m["route"].unique()):
         df_r = df_m[df_m["route"] == route]
-        y_vals = [
-            df_r.loc[df_r["period"] == p, metric].squeeze()
-            if p in df_r["period"].to_numpy()
-            else None
-            for p in ORDERED_PERIODS
-        ]
-        if all(v is None or pd.isna(v) for v in y_vals):
+        y_vals = df_r.set_index("period")[metric].reindex(periods).to_numpy(dtype=float)
+        if pd.isna(y_vals).all():
             continue  # nothing to plot
 
-        plt.figure(figsize=PLOT_STYLE["figsize"])
+        plt.figure(figsize=config.plot_style.figsize)
         plt.plot(
             x_pos,
             y_vals,
-            marker=PLOT_STYLE["marker"],
-            linestyle=PLOT_STYLE["linestyle"],
+            marker=config.plot_style.marker,
+            linestyle=config.plot_style.linestyle,
         )
         plt.gca().xaxis.set_major_locator(FixedLocator(x_pos))
-        plt.gca().xaxis.set_major_formatter(FixedFormatter(ORDERED_PERIODS))
+        plt.gca().xaxis.set_major_formatter(FixedFormatter(periods))
         plt.title(f"{metric.replace('_', ' ').title()} – Route {route}")
         plt.xlabel("Month")
         plt.ylabel(metric.replace("_", " ").title())
-        plt.xticks(rotation=PLOT_STYLE["rotation"])
-        plt.grid(PLOT_STYLE["grid"])
+        plt.xticks(rotation=config.plot_style.rotation)
+        plt.grid(config.plot_style.grid)
 
         numeric = [v for v in y_vals if v is not None and not pd.isna(v)]
         if numeric:
@@ -762,8 +1046,8 @@ def plot_metric_over_time(df_time: pd.DataFrame, metric: str) -> None:
         plt.close()
 
 
-def generate_all_plots(df_time: pd.DataFrame) -> None:
-    """Iterate over :pydata:`PLOT_CONFIG` and generate enabled plots."""
+def generate_all_plots(df_time: pd.DataFrame, config: AppConfig) -> None:
+    """Generate the plots enabled in the external configuration."""
     metric_map = {
         "plot_total_ridership": "total_ridership",
         "plot_weekday_avg": "weekday_avg",
@@ -777,43 +1061,14 @@ def generate_all_plots(df_time: pd.DataFrame) -> None:
         "plot_ppm": "ppm",
     }
     for flag, col in metric_map.items():
-        if PLOT_CONFIG.get(flag, False):
+        if config.plots[flag]:
             logging.info("Plotting %s …", col)
-            plot_metric_over_time(df_time, col)
+            plot_metric_over_time(df_time, col, config)
 
 
 # =============================================================================
 # RUN LOG
 # =============================================================================
-
-
-# Canonical version lives in utils/run_log.py — keep this copy in sync.
-def extract_config_block(source_file: Path) -> str:
-    """Return the text between the CONFIG markers in *source_file*.
-
-    Raises:
-        ValueError: If either marker is missing or they appear out of order.
-        OSError: If ``source_file`` cannot be read.
-    """
-    lines: list[str] = source_file.read_text(encoding="utf-8").splitlines()
-
-    begin_idx: int | None = None
-    end_idx: int | None = None
-    for i, line in enumerate(lines):
-        stripped: str = line.strip()
-        if begin_idx is None and stripped == CONFIG_BEGIN_MARKER:
-            begin_idx = i
-        elif begin_idx is not None and stripped == CONFIG_END_MARKER:
-            end_idx = i
-            break
-
-    if begin_idx is None or end_idx is None:
-        raise ValueError(
-            f"Config markers not found in '{source_file}'. "
-            f"Expected '{CONFIG_BEGIN_MARKER}' and '{CONFIG_END_MARKER}'."
-        )
-
-    return "\n".join(lines[begin_idx + 1 : end_idx])
 
 
 def resolve_source_file() -> Path | None:
@@ -825,10 +1080,12 @@ def resolve_source_file() -> Path | None:
 
 
 def write_run_log(
-    output_dir: Path,
+    config: AppConfig,
     service_days: pd.DataFrame | None = None,
+    *,
+    status: str = "complete",
 ) -> bool:
-    """Write a run log of the configuration block into *output_dir*.
+    """Record the loaded external configuration and processing status.
 
     If *service_days* is provided (see :func:`summarize_service_days`), a table
     of the number of weekdays, Saturdays, Sundays, and weekday holidays in
@@ -838,32 +1095,31 @@ def write_run_log(
     Returns:
         ``True`` if the log was written successfully, ``False`` otherwise.
     """
-    log_path = output_dir / "ntd_monthly_summary_runlog.txt"
+    log_path = config.output_dir / "ntd_monthly_summary_runlog.txt"
 
     source_file = resolve_source_file()
-    if source_file is None:
-        config_text = "(config block unavailable: interactive session, no __file__ on disk)"
-        source_display = "<interactive>"
-    else:
-        try:
-            config_text = extract_config_block(source_file)
-        except (OSError, ValueError) as exc:
-            logging.error("Could not extract config block for run log: %s", exc)
-            return False
-        source_display = str(source_file)
+    source_display = str(source_file) if source_file else "<interactive>"
 
     lines: list[str] = [
         "=" * 72,
-        "NTD MONTHLY SUMMARY RUN LOG",
+        RUN_LOG_TITLE,
         "=" * 72,
         f"Run timestamp:    {datetime.now().isoformat(timespec='seconds')}",
-        f"Output directory: {output_dir}",
+        f"Output directory: {config.output_dir}",
         f"Source script:    {source_display}",
+        f"Run status:       {status}",
+        f"Config file:      {config.source_path}",
+        f"Config base directory: {config.config_base_dir or config.source_path.parent}",
+        f"Configuration source: {'previous run log' if config.from_run_log else 'config file'}",
+        f"Input directory:  {config.data_root}",
+        f"Period order:     {', '.join(config.ordered_periods)}",
         "",
         "-" * 72,
-        "CONFIGURATION (verbatim from source)",
+        "CONFIGURATION (text loaded for this run)",
         "-" * 72,
-        config_text,
+        REPLAY_CONFIG_BEGIN,
+        config.source_text,
+        REPLAY_CONFIG_END,
     ]
 
     if service_days is not None and not service_days.empty:
@@ -894,51 +1150,46 @@ def write_run_log(
 # =============================================================================
 
 
-def main() -> int:
-    """Run the end-to-end NTD performance workflow.
-
-    Export policy
-    -------------
-    * "Complete" tables (all periods combined, or any full fiscal-year slice)
-      → **CSV only** – lightweight and ready for BI/plotting ingestion.
-    * All other deliverables (route-level, service-type, monthly workbooks, etc.)
-      → **XLSX only** – analyst-friendly, no redundant CSV versions.
-
-    Returns:
-        Process exit code: 0 on success, 1 on failure, 2 if required
-        CONFIGURATION values are still placeholders.
-    """
-    logging.basicConfig(
-        level=LOG_LEVEL,
-        format="%(asctime)s | %(levelname)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-
-    _DEFAULT_DATA_ROOT = r"Path\To\Your\NTD_Folder"
-    _DEFAULT_OUTPUT_DIR = r"Path\To\Your\Output\Folder"
-    if str(DATA_ROOT) == _DEFAULT_DATA_ROOT or str(OUTPUT_DIR) == _DEFAULT_OUTPUT_DIR:
-        logging.warning(
-            "File paths are still set to their defaults. Update DATA_ROOT and "
-            "OUTPUT_DIR in the CONFIGURATION section before running."
-        )
-        return 2
-
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+def run_analysis(config: AppConfig) -> int:
+    """Execute the original reports using one validated external configuration."""
+    check_input_files(config)
+    if config.from_run_log:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        output_dir = config.output_dir.with_name(f"{config.output_dir.name}_rerun_{stamp}")
+        config = replace(config, output_dir=output_dir)
+        # Exclusive creation prevents a rerun from overwriting an existing run.
+        config.output_dir.mkdir(parents=True, exist_ok=False)
+        logging.info("Replaying configuration from %s", config.source_path)
+        logging.info("New rerun output folder: %s", config.output_dir)
+    else:
+        config.output_dir.mkdir(parents=True, exist_ok=True)
+    if not write_run_log(config, status="started") and config.require_run_log:
+        return 1
 
     # === STEP 1: READ EXCEL FILES ============================================
     logging.info("=== STEP 1: READ EXCEL FILES ===")
-    data_dict = read_excel_data()
+    data_dict = read_excel_data(config)
 
     # === STEP 2: CLASSIFY & DERIVE ===========================================
     logging.info("\n=== STEP 2: CLASSIFY & DERIVE ===")
     for period, df in data_dict.items():
-        df["service_type"] = df["ROUTE_NAME"].apply(classify_route)
-        df["corridors"] = df["ROUTE_NAME"].apply(classify_corridor)
+        df["service_type"] = df["ROUTE_NAME"].apply(lambda route: classify_route(route, config))
+        df["corridors"] = df["ROUTE_NAME"].apply(lambda route: classify_corridor(route, config))
+        if config.garage_assignments:
+            garages = {
+                route: garage
+                for garage, routes in config.garage_assignments.items()
+                for route in routes
+            }
+            df["garage"] = df["ROUTE_NAME"].map(garages).fillna("unknown")
         df = calculate_derived_columns(df)
         df["period"] = period
         data_dict[period] = df
 
     all_data = pd.concat(data_dict.values(), ignore_index=True)
+
+    if all_data.empty:
+        raise ValueError("No rows remain after the original workbook filters.")
 
     unknown = (
         all_data.loc[all_data["service_type"] == "unknown", "ROUTE_NAME"]
@@ -953,22 +1204,22 @@ def main() -> int:
 
     # 3.1  Master CSV (all periods) – single file for pipelines
     all_data.to_csv(
-        OUTPUT_DIR / "DetailedAllPeriods_for_plotting.csv",
+        config.output_dir / "DetailedAllPeriods_for_plotting.csv",
         index=False,
     )
     logging.info("Combined CSV exported.")
 
     # 3.2  Convenience workbook – one sheet per month (no giant sheet)
-    with pd.ExcelWriter(OUTPUT_DIR / "MonthlySheets.xlsx") as xw:
-        for period in ORDERED_PERIODS:
+    with pd.ExcelWriter(config.output_dir / "MonthlySheets.xlsx") as xw:
+        for period in config.ordered_periods:
             data_dict[period].to_excel(xw, sheet_name=period, index=False)
     logging.info("Monthly workbook exported.")
 
     # Weekday holidays per month, reused for the run log and the holiday-free
     # weekday summaries below.
-    holiday_counts = weekday_holiday_counts(HOLIDAYS)
+    holiday_counts = weekday_holiday_counts(config.holidays)
 
-    # === STEP 4: ROUTE-LEVEL SUMMARIES (FULL FY-25) ==========================
+    # === STEP 4: ROUTE-LEVEL SUMMARIES (ALL LOADED MONTHS) ==========================
     logging.info("\n=== STEP 4: ROUTE-LEVEL SUMMARIES ===")
     subsets = {
         "Combined": all_data,
@@ -982,25 +1233,24 @@ def main() -> int:
         # holiday falls inside the covered months.
         if label == "Weekday":
             out = with_weekday_ex_holiday_columns(out, subset, holiday_counts)
-        with pd.ExcelWriter(OUTPUT_DIR / f"RouteLevelSummary_{label}.xlsx") as xw:
+        with pd.ExcelWriter(config.output_dir / f"RouteLevelSummary_{label}.xlsx") as xw:
             out.to_excel(xw, sheet_name=f"{label}_Route_Level", index=False)
         logging.info("%s summary exported.", label)
 
     # === STEP 5: TIME-SERIES PLOTS ===========================================
     logging.info("\n=== STEP 5: TIME-SERIES PLOTS ===")
-    ts = build_monthly_timeseries(all_data)
-    generate_all_plots(ts)
+    ts = build_monthly_timeseries(all_data, config)
+    generate_all_plots(ts, config)
 
     # === STEP 5B: TREND FLAGGING (12‑mo baseline) ============================
     logging.info("\n=== TREND FLAGGING (12‑mo baseline) ===")
-    flags = detect_negative_trends_12m(ts)
-    write_trend_log(flags)
+    flags = detect_negative_trends_12m(ts, config)
+    write_trend_log(flags, config.output_dir)
 
     # === STEP 6: USER-DEFINED TIME WINDOWS ===================================
     logging.info("\n=== STEP 6: TIME-WINDOW OUTPUTS ===")
-    for tw in TIME_WINDOWS:
-        w_dir = OUTPUT_DIR / tw.label
-        w_dir.mkdir(parents=True, exist_ok=True)
+    for tw in config.time_windows:
+        w_dir = config.output_dir / tw.label
 
         subset = slice_for_window(all_data, tw)
         if subset.empty:
@@ -1011,6 +1261,14 @@ def main() -> int:
                 tw.end.strftime("%Y-%m-%d"),
             )
             continue
+
+        w_dir.mkdir(parents=True, exist_ok=True)
+        expected = (tw.end.year - tw.start.year) * 12 + tw.end.month - tw.start.month + 1
+        available = subset["period"].nunique()
+        if available < expected:
+            logging.warning(
+                "%s is partial: %d of %d months available.", tw.label, available, expected
+            )
 
         # 6.1  Raw slice (complete FY etc.) → CSV only
         subset.to_csv(
@@ -1039,12 +1297,14 @@ def main() -> int:
             index=False,
         )
 
-        logging.info("%s: %d rows → %s", tw.label, len(subset), w_dir.relative_to(OUTPUT_DIR))
+        logging.info(
+            "%s: %d rows → %s", tw.label, len(subset), w_dir.relative_to(config.output_dir)
+        )
 
-    service_days = summarize_service_days(all_data, holiday_counts)
-    if not write_run_log(OUTPUT_DIR, service_days) and REQUIRE_RUN_LOG:
+    service_days = summarize_service_days(all_data, config, holiday_counts)
+    if not write_run_log(config, service_days) and config.require_run_log:
         logging.error(
-            "Run log could not be written. Set REQUIRE_RUN_LOG = False to "
+            "Run log could not be written. Set [logging] require_run_log = false to "
             "suppress this error when a sidecar file is genuinely impossible."
         )
         return 1
@@ -1053,5 +1313,66 @@ def main() -> int:
     return 0
 
 
+def main(config_file: str | Path = CONFIG_PATH, *, validate_only: bool = False) -> int:
+    """Load a config and run; return 0 on success, 1 on analysis error, 2 on config error."""
+    try:
+        config = load_config(config_file)
+    except ConfigError as exc:
+        logging.error("Configuration error: %s", exc)
+        return 2
+
+    logging.basicConfig(
+        level=config.log_level,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    # Honor the configured level when an IDE or notebook already has handlers.
+    logging.getLogger().setLevel(config.log_level)
+    if validate_only:
+        # print, not logging: the result must show even when [logging] level hides INFO.
+        print(  # noqa: T201
+            f"Configuration valid: {len(config.periods)} months, "
+            f"{len(config.time_windows)} time windows. No workbook files were checked."
+        )
+        return 0
+    try:
+        return run_analysis(config)
+    except Exception:
+        logging.exception("NTD analysis failed.")
+        return 1
+
+
+def cli() -> int:
+    """Parse shell arguments separately from programmatic main() calls."""
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=CONFIG_PATH,
+        help="INI-style .txt config or previous run log (default: CONFIG_PATH near the top)",
+    )
+    parser.add_argument(
+        "--validate-config",
+        action="store_true",
+        help="Validate settings only; do not access workbooks or create output",
+    )
+    args = parser.parse_args()
+    return main(args.config, validate_only=args.validate_config)
+
+
+def launched_by_notebook() -> bool:
+    """Recognize a kernel's arguments while retaining explicit %run script arguments."""
+    # %run changes argv[0] to the script name, so its --config arguments still work.
+    launcher = PureWindowsPath(sys.argv[0]).name if sys.argv else ""
+    return launcher in {"ipykernel_launcher.py", "ipykernel_launcher"}
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    if launched_by_notebook():
+        # Kernel arguments (including -f kernel-....json) do not belong to this script.
+        # Calling main directly also avoids a SystemExit traceback in a notebook cell.
+        main(CONFIG_PATH)
+    else:
+        raise SystemExit(cli())

@@ -1,0 +1,112 @@
+# Example configuration for ntd_monthly_summary.py.
+#
+# Copy this file, edit the copy, and point CONFIG_PATH (or --config) at it.
+# Read by Python's configparser: "key = value" lines under [section] headers.
+# Comments must be on their own line (no trailing comments), and a value may
+# continue onto indented lines. Every section except [garage_assignments] is
+# required, even when it has no entries. Relative paths resolve against the
+# directory holding this file.
+
+[paths]
+data_root = Path\To\Your\NTD_Folder
+output_dir = Path\To\Your\Output\Folder
+
+# Workbook catalogue: MMM-YYYY = workbook filename | worksheet name
+[periods]
+Jul-2024 = JULY 2024 NTD RIDERSHIP BY ROUTE.xlsx | Temporary_Query_N
+Aug-2024 = AUGUST 2024  NTD RIDERSHIP REPORT BY ROUTE.xlsx | Temporary_Query_N
+Sep-2024 = SEPTEMBER 2024 NTD RIDERSHIP BY ROUTE.xlsx | Sep.2024 Finals
+Oct-2024 = NTD RIDERSHIP BY ROUTE _ OCTOBER _2024.xlsx | Temporary_Query_N
+Nov-2024 = NTD RIDERSHIP BY ROUTE-NOVEMBER 2024.xlsx | Temporary_Query_N
+Dec-2024 = NTD RIDERSHIP BY MONTH_DECEMBER 2024.xlsx | Dec. 2024
+Jan-2025 = NTD RIDERSHIP BY MONTH-JANUARY 2025.xlsx | Jan. 2025
+Feb-2025 = NTD RIDERSHIP BY MONTH-FEBRUARY 2025.xlsx | Feb. 2025
+Mar-2025 = MARCH 2025 NTD MONTHLY RIDERSHIP.xlsx | March 2025
+Apr-2025 = APRIL 2025 NTD MONTHLY RIDERSHIP.xlsx | April 2025
+May-2025 = May 2025 NTD MONTHLY RIDERSHIP.xlsx | May 2025
+# Jun-2025 = JUNE 2025 NTD RIDERSHIP BY MONTH.xlsx | Jun. 2025
+
+# Output folder label = first day | last day (whole months, YYYY-MM-DD)
+[time_windows]
+FY21 = 2020-07-01 | 2021-06-30
+FY22 = 2021-07-01 | 2022-06-30
+FY23 = 2022-07-01 | 2023-06-30
+FY24 = 2023-07-01 | 2024-06-30
+FY25 = 2024-07-01 | 2025-06-30
+FY26 = 2025-07-01 | 2026-06-30
+# Summer2024 = 2024-06-01 | 2024-08-31
+
+# NTD workbooks report service days only as Weekday / Saturday / Sunday. Holidays
+# that fall on a weekday are counted per month in the run log and, when any falls
+# inside the covered months, add DAYS_EX_HOLIDAYS and DAILY_AVG_EX_HOLIDAYS columns
+# to the weekday route summary. Holidays on a Saturday or Sunday are ignored.
+# 2026: MLK Day, Washington's Birthday, Memorial Day, Juneteenth, Independence Day
+# (observed), Labor Day, Columbus / Indigenous Peoples' Day, Election Day, Veterans
+# Day, Thanksgiving, day after Thanksgiving, Christmas, New Year's Eve.
+# 2027: New Year's Day.
+[holidays]
+dates = 2026-01-19, 2026-02-16, 2026-05-25, 2026-06-19, 2026-07-03,
+    2026-09-07, 2026-10-12, 2026-11-03, 2026-11-11, 2026-11-26,
+    2026-11-27, 2026-12-25, 2026-12-31, 2027-01-01
+
+# Each route may belong to only one service type.
+[service_types]
+local = 101, 202
+express = 303, 404
+circulator = 505, 606
+feeder = 707, 808
+
+# A route may belong to several corridors.
+[corridors]
+route_one_corridor = 101, 202
+i_2_corridor = 303, 404
+route_three_corridor = 505, 606
+i_4_corridor = 707, 808
+
+# Optional: uncomment to add a garage column to the detailed data and route
+# summaries. Each route may belong to only one garage.
+# [garage_assignments]
+# north_garage = 101, 202, 303, 404
+# south_garage = 505, 606, 707, 808
+
+[trend]
+# Months in the baseline.
+rolling_window = 12
+# Share of the baseline window that must hold valid data.
+min_coverage = 0.75
+# Percent drop vs. baseline that triggers a flag.
+decline_thresh_pct = 10.0
+# true = the latest AND previous month must both be below the baseline.
+require_two_months = true
+
+# Months to ignore in trend flagging (e.g. strikes, data outages):
+# MMM-YYYY = * for all routes, or a list of route IDs.
+[exclude_data]
+# Sep-2024 = *
+# Jan-2025 = 101, 202, 303
+
+[plots]
+plot_total_ridership = false
+plot_weekday_avg = true
+plot_saturday_avg = true
+plot_sunday_avg = true
+plot_revenue_hours = false
+plot_trips = false
+plot_revenue_miles = false
+plot_pph = false
+plot_ppt = false
+plot_ppm = false
+
+[plot_style]
+figsize = 9, 5
+marker = o
+linestyle = -
+rotation = 45
+grid = true
+
+[logging]
+# DEBUG / INFO / WARNING / ERROR / CRITICAL
+level = INFO
+# true = a failed run-log write aborts the run, so an output folder never lacks
+# a matching configuration record.
+require_run_log = true

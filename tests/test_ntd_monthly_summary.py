@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import logging
+import re
+import shutil
+from collections.abc import Iterator
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
@@ -13,6 +17,7 @@ import pytest
 import scripts.ridership_tools.ntd_monthly_summary as mod
 
 FIXTURE_CSV = Path("tests/fixtures/ridership_by_route_and_stop.csv")
+EXAMPLE_CONFIG = Path("scripts/ridership_tools/ntd_monthly_config_example.txt")
 
 
 # ---------------------------------------------------------------------------
@@ -23,6 +28,18 @@ FIXTURE_CSV = Path("tests/fixtures/ridership_by_route_and_stop.csv")
 @pytest.fixture
 def fixture_df() -> pd.DataFrame:
     return pd.read_csv(FIXTURE_CSV)
+
+
+@pytest.fixture
+def config() -> mod.AppConfig:
+    """The shipped example configuration."""
+    return mod.load_config(EXAMPLE_CONFIG)
+
+
+def _with_periods(config: mod.AppConfig, periods: list[str], **overrides: object) -> mod.AppConfig:
+    """Return *config* covering *periods* (in chronological order) plus *overrides*."""
+    specs = {period: mod.PeriodSpec(f"{period}.xlsx", "Sheet1") for period in periods}
+    return replace(config, periods=specs, **overrides)
 
 
 @pytest.fixture
@@ -151,14 +168,16 @@ def test_normalise_columns_on_fixture(fixture_df: pd.DataFrame) -> None:
         ("999", "unknown"),
     ],
 )
-def test_classify_route(route: str, expected: str) -> None:
-    assert mod.classify_route(route) == expected
+def test_classify_route(route: str, expected: str, config: mod.AppConfig) -> None:
+    assert mod.classify_route(route, config) == expected
 
 
-def test_classify_route_fixture_routes_all_unknown(fixture_df: pd.DataFrame) -> None:
-    """No route in the stop-level fixture is in SERVICE_TYPE_DICT."""
+def test_classify_route_fixture_routes_all_unknown(
+    fixture_df: pd.DataFrame, config: mod.AppConfig
+) -> None:
+    """No route in the stop-level fixture is in [service_types]."""
     for route in fixture_df["ROUTE_NAME"].unique():
-        assert mod.classify_route(str(route)) == "unknown"
+        assert mod.classify_route(str(route), config) == "unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -166,24 +185,26 @@ def test_classify_route_fixture_routes_all_unknown(fixture_df: pd.DataFrame) -> 
 # ---------------------------------------------------------------------------
 
 
-def test_classify_corridor_known_route() -> None:
-    result = mod.classify_corridor("101")
+def test_classify_corridor_known_route(config: mod.AppConfig) -> None:
+    result = mod.classify_corridor("101", config)
     assert "route_one_corridor" in result
 
 
-def test_classify_corridor_multi_match() -> None:
-    # Route 303 belongs to i_2_corridor
-    result = mod.classify_corridor("303")
-    assert "i_2_corridor" in result
+def test_classify_corridor_multi_match(config: mod.AppConfig) -> None:
+    corridors = {"i_2_corridor": ["303", "404"], "downtown": ["101", "303"]}
+    result = mod.classify_corridor("303", replace(config, corridors=corridors))
+    assert result == ["i_2_corridor", "downtown"]
 
 
-def test_classify_corridor_unknown_route_returns_other() -> None:
-    assert mod.classify_corridor("999") == ["other"]
+def test_classify_corridor_unknown_route_returns_other(config: mod.AppConfig) -> None:
+    assert mod.classify_corridor("999", config) == ["other"]
 
 
-def test_classify_corridor_fixture_routes_all_other(fixture_df: pd.DataFrame) -> None:
+def test_classify_corridor_fixture_routes_all_other(
+    fixture_df: pd.DataFrame, config: mod.AppConfig
+) -> None:
     for route in fixture_df["ROUTE_NAME"].unique():
-        assert mod.classify_corridor(str(route)) == ["other"]
+        assert mod.classify_corridor(str(route), config) == ["other"]
 
 
 # ---------------------------------------------------------------------------
@@ -191,25 +212,24 @@ def test_classify_corridor_fixture_routes_all_other(fixture_df: pd.DataFrame) ->
 # ---------------------------------------------------------------------------
 
 
-def test_is_excluded_no_exclusions() -> None:
-    with patch.object(mod, "EXCLUDE_DATA", {}):
-        assert mod._is_excluded("Jul-2024", "101") is False
+def test_is_excluded_no_exclusions(config: mod.AppConfig) -> None:
+    assert mod._is_excluded("Jul-2024", "101", replace(config, exclude_data={})) is False
 
 
-def test_is_excluded_wildcard_excludes_any_route() -> None:
-    with patch.object(mod, "EXCLUDE_DATA", {"Jul-2024": "*"}):
-        assert mod._is_excluded("Jul-2024", "101") is True
+def test_is_excluded_wildcard_excludes_any_route(config: mod.AppConfig) -> None:
+    cfg = replace(config, exclude_data={"Jul-2024": "*"})
+    assert mod._is_excluded("Jul-2024", "101", cfg) is True
 
 
-def test_is_excluded_specific_route_in_list() -> None:
-    with patch.object(mod, "EXCLUDE_DATA", {"Jul-2024": ["101", "202"]}):
-        assert mod._is_excluded("Jul-2024", "101") is True
-        assert mod._is_excluded("Jul-2024", "303") is False
+def test_is_excluded_specific_route_in_list(config: mod.AppConfig) -> None:
+    cfg = replace(config, exclude_data={"Jul-2024": ["101", "202"]})
+    assert mod._is_excluded("Jul-2024", "101", cfg) is True
+    assert mod._is_excluded("Jul-2024", "303", cfg) is False
 
 
-def test_is_excluded_different_period_not_excluded() -> None:
-    with patch.object(mod, "EXCLUDE_DATA", {"Jul-2024": "*"}):
-        assert mod._is_excluded("Aug-2024", "101") is False
+def test_is_excluded_different_period_not_excluded(config: mod.AppConfig) -> None:
+    cfg = replace(config, exclude_data={"Jul-2024": "*"})
+    assert mod._is_excluded("Aug-2024", "101", cfg) is False
 
 
 # ---------------------------------------------------------------------------
@@ -431,6 +451,21 @@ def test_route_level_summary_with_fixture_routes(fixture_df: pd.DataFrame) -> No
     assert set(result["ROUTE_NAME"]) == fixture_routes
 
 
+def test_route_level_summary_keeps_garage_column_when_present(
+    minimal_ntd_df: pd.DataFrame,
+) -> None:
+    df = minimal_ntd_df.assign(
+        TOTAL_TRIPS=minimal_ntd_df["ASCH_TRIPS"] * minimal_ntd_df["DAYS"],
+        MTH_REV_MILES=minimal_ntd_df["REV_MILES"] * minimal_ntd_df["DAYS"],
+        garage=["north"] * 3 + ["unknown"] * 3,
+    )
+    result = mod.route_level_summary(df)
+    assert dict(zip(result["ROUTE_NAME"], result["garage"], strict=True)) == {
+        "101": "north",
+        "202": "unknown",
+    }
+
+
 # ---------------------------------------------------------------------------
 # build_monthly_timeseries
 # ---------------------------------------------------------------------------
@@ -451,20 +486,23 @@ def _timeseries_input(**overrides: object) -> pd.DataFrame:
     return pd.DataFrame(base)
 
 
-def test_build_monthly_timeseries_has_systemwide_row() -> None:
-    with patch.object(mod, "ORDERED_PERIODS", ["Jul-2024"]):
-        result = mod.build_monthly_timeseries(_timeseries_input())
+@pytest.fixture
+def july_config(config: mod.AppConfig) -> mod.AppConfig:
+    return _with_periods(config, ["Jul-2024"])
+
+
+def test_build_monthly_timeseries_has_systemwide_row(july_config: mod.AppConfig) -> None:
+    result = mod.build_monthly_timeseries(_timeseries_input(), july_config)
     assert "SYSTEMWIDE" in result["route"].to_numpy()
 
 
-def test_build_monthly_timeseries_per_route_rows_exist() -> None:
-    with patch.object(mod, "ORDERED_PERIODS", ["Jul-2024"]):
-        result = mod.build_monthly_timeseries(_timeseries_input())
+def test_build_monthly_timeseries_per_route_rows_exist(july_config: mod.AppConfig) -> None:
+    result = mod.build_monthly_timeseries(_timeseries_input(), july_config)
     route_rows = result[result["route"] != "SYSTEMWIDE"]
     assert set(route_rows["route"]) == {"101", "202"}
 
 
-def test_build_monthly_timeseries_weekday_avg() -> None:
+def test_build_monthly_timeseries_weekday_avg(july_config: mod.AppConfig) -> None:
     df = pd.DataFrame(
         {
             "period": ["Jul-2024"],
@@ -477,13 +515,12 @@ def test_build_monthly_timeseries_weekday_avg() -> None:
             "MTH_REV_MILES": [11440.0],
         }
     )
-    with patch.object(mod, "ORDERED_PERIODS", ["Jul-2024"]):
-        result = mod.build_monthly_timeseries(df)
+    result = mod.build_monthly_timeseries(df, july_config)
     row = result[result["route"] == "101"]
     assert row["weekday_avg"].iloc[0] == pytest.approx(round(6600 / 22, 1))
 
 
-def test_build_monthly_timeseries_pph() -> None:
+def test_build_monthly_timeseries_pph(july_config: mod.AppConfig) -> None:
     df = pd.DataFrame(
         {
             "period": ["Jul-2024"],
@@ -496,19 +533,19 @@ def test_build_monthly_timeseries_pph() -> None:
             "MTH_REV_MILES": [400.0],
         }
     )
-    with patch.object(mod, "ORDERED_PERIODS", ["Jul-2024"]):
-        result = mod.build_monthly_timeseries(df)
+    result = mod.build_monthly_timeseries(df, july_config)
     row = result[result["route"] == "101"]
     assert row["pph"].iloc[0] == pytest.approx(round(1000 / 100, 1))
 
 
-def _systemwide_row(df: pd.DataFrame) -> pd.Series:
-    with patch.object(mod, "ORDERED_PERIODS", ["Jul-2024"]):
-        result = mod.build_monthly_timeseries(df)
+def _systemwide_row(df: pd.DataFrame, config: mod.AppConfig) -> pd.Series:
+    result = mod.build_monthly_timeseries(df, config)
     return result[result["route"] == "SYSTEMWIDE"].iloc[0]
 
 
-def test_build_monthly_timeseries_systemwide_avgs_divide_by_month_service_days() -> None:
+def test_build_monthly_timeseries_systemwide_avgs_divide_by_month_service_days(
+    july_config: mod.AppConfig,
+) -> None:
     # Both routes run the same 20 weekdays, 4 Saturdays and 4 Sundays, so the
     # systemwide averages divide by those counts, not by the summed route-days.
     df = pd.DataFrame(
@@ -523,13 +560,15 @@ def test_build_monthly_timeseries_systemwide_avgs_divide_by_month_service_days()
             "MTH_REV_MILES": [400.0] * 6,
         }
     )
-    row = _systemwide_row(df)
+    row = _systemwide_row(df, july_config)
     assert row["weekday_avg"] == pytest.approx(6000 / 20)
     assert row["saturday_avg"] == pytest.approx(1200 / 4)
     assert row["sunday_avg"] == pytest.approx(800 / 4)
 
 
-def test_build_monthly_timeseries_systemwide_avg_with_partial_month_route() -> None:
+def test_build_monthly_timeseries_systemwide_avg_with_partial_month_route(
+    july_config: mod.AppConfig,
+) -> None:
     # Route 303 ran 10 of the month's 20 weekdays: its boardings count toward the
     # 20-day month instead of adding 10 route-days to the denominator.
     df = pd.DataFrame(
@@ -544,7 +583,7 @@ def test_build_monthly_timeseries_systemwide_avg_with_partial_month_route() -> N
             "MTH_REV_MILES": [400.0] * 3,
         }
     )
-    assert _systemwide_row(df)["weekday_avg"] == pytest.approx(7000 / 20)
+    assert _systemwide_row(df, july_config)["weekday_avg"] == pytest.approx(7000 / 20)
 
 
 # ---------------------------------------------------------------------------
@@ -553,20 +592,17 @@ def test_build_monthly_timeseries_systemwide_avg_with_partial_month_route() -> N
 
 
 def test_plot_metric_over_time_labels_months_without_category_logging(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, config: mod.AppConfig
 ) -> None:
     periods = ["Jul-2024", "Aug-2024", "Sep-2024"]
+    cfg = _with_periods(config, periods, output_dir=tmp_path)
     # The route has no Jul-2024 row, so its line starts at Aug-2024.
     df_time = pd.DataFrame(
         {"period": ["Aug-2024", "Sep-2024"], "route": ["101"] * 2, "weekday_avg": [100.0, 120.0]}
     )
     caplog.set_level(logging.INFO, logger="matplotlib.category")
-    with (
-        patch.object(mod, "ORDERED_PERIODS", periods),
-        patch.object(mod, "OUTPUT_DIR", tmp_path),
-        patch.object(mod.plt, "close"),  # keep the figure open for inspection
-    ):
-        mod.plot_metric_over_time(df_time, "weekday_avg")
+    with patch.object(mod.plt, "close"):  # keep the figure open for inspection
+        mod.plot_metric_over_time(df_time, "weekday_avg", cfg)
     ax = mod.plt.gca()
     labels = [label.get_text() for label in ax.get_xticklabels()]
     x_min = ax.get_xlim()[0]
@@ -577,6 +613,24 @@ def test_plot_metric_over_time_labels_months_without_category_logging(
     assert x_min > 0
     assert not [r for r in caplog.records if r.name == "matplotlib.category"]
     assert (tmp_path / "plots" / "weekday_avg" / "weekday_avg_route_101.png").exists()
+
+
+def test_plot_metric_over_time_keeps_missing_catalogue_month_as_gap(
+    tmp_path: Path, config: mod.AppConfig
+) -> None:
+    cfg = _with_periods(config, ["Jul-2024", "Sep-2024"], output_dir=tmp_path)
+    df_time = pd.DataFrame(
+        {"period": ["Jul-2024", "Sep-2024"], "route": ["101"] * 2, "weekday_avg": [100.0, 120.0]}
+    )
+    with patch.object(mod.plt, "close"):
+        mod.plot_metric_over_time(df_time, "weekday_avg", cfg)
+    ax = mod.plt.gca()
+    labels = [label.get_text() for label in ax.get_xticklabels()]
+    x_data = list(ax.get_lines()[0].get_xdata())
+    mod.plt.close("all")
+
+    assert labels == ["Jul-2024", "Aug-2024", "Sep-2024"]
+    assert x_data == [0, 1, 2]
 
 
 # ---------------------------------------------------------------------------
@@ -610,9 +664,10 @@ def test_weekday_holiday_counts_empty() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_summarize_service_days_representative_days(minimal_ntd_df: pd.DataFrame) -> None:
-    with patch.object(mod, "ORDERED_PERIODS", ["Jul-2024"]):
-        result = mod.summarize_service_days(minimal_ntd_df, {"Jul-2024": 1})
+def test_summarize_service_days_representative_days(
+    minimal_ntd_df: pd.DataFrame, july_config: mod.AppConfig
+) -> None:
+    result = mod.summarize_service_days(minimal_ntd_df, july_config, {"Jul-2024": 1})
     row = result[result["period"] == "Jul-2024"].iloc[0]
     assert row["Weekday"] == 22
     assert row["Saturday"] == 4
@@ -620,25 +675,26 @@ def test_summarize_service_days_representative_days(minimal_ntd_df: pd.DataFrame
     assert row["Holidays"] == 1
 
 
-def test_summarize_service_days_no_holidays_defaults_zero(minimal_ntd_df: pd.DataFrame) -> None:
-    with patch.object(mod, "ORDERED_PERIODS", ["Jul-2024"]):
-        result = mod.summarize_service_days(minimal_ntd_df)
+def test_summarize_service_days_no_holidays_defaults_zero(
+    minimal_ntd_df: pd.DataFrame, july_config: mod.AppConfig
+) -> None:
+    result = mod.summarize_service_days(minimal_ntd_df, july_config)
     assert result["Holidays"].iloc[0] == 0
 
 
 @pytest.mark.parametrize("days", [[10.0, 20.0], [20.0, 10.0]])
-def test_summarize_service_days_tie_goes_to_larger_count(days: list[float]) -> None:
+def test_summarize_service_days_tie_goes_to_larger_count(
+    days: list[float], july_config: mod.AppConfig
+) -> None:
     df = pd.DataFrame({"period": ["Jul-2024"] * 2, "SERVICE_PERIOD": ["Weekday"] * 2, "DAYS": days})
-    with patch.object(mod, "ORDERED_PERIODS", ["Jul-2024"]):
-        result = mod.summarize_service_days(df)
+    result = mod.summarize_service_days(df, july_config)
     assert result["Weekday"].iloc[0] == 20
 
 
-def test_summarize_service_days_columns() -> None:
-    with patch.object(mod, "ORDERED_PERIODS", ["Jul-2024"]):
-        result = mod.summarize_service_days(
-            pd.DataFrame(columns=["period", "SERVICE_PERIOD", "DAYS"])
-        )
+def test_summarize_service_days_columns(july_config: mod.AppConfig) -> None:
+    result = mod.summarize_service_days(
+        pd.DataFrame(columns=["period", "SERVICE_PERIOD", "DAYS"]), july_config
+    )
     assert list(result.columns) == ["period", "Weekday", "Saturday", "Sunday", "Holidays"]
 
 
@@ -706,7 +762,20 @@ def test_with_weekday_ex_holiday_columns_empty_input() -> None:
 # detect_negative_trends_12m
 # ---------------------------------------------------------------------------
 
-_TREND_PERIODS = [f"M{i:02d}-2024" for i in range(1, 15)]  # 14 fake periods
+# 14 consecutive months: Jan-2024 .. Feb-2025.
+_TREND_PERIODS = [f"{mod.MONTH_NAMES[i % 12]}-{2024 + i // 12}" for i in range(14)]
+
+
+def _trend_config(config: mod.AppConfig, *, confirm_prev: bool = True) -> mod.AppConfig:
+    return _with_periods(
+        config,
+        _TREND_PERIODS,
+        rolling_window=12,
+        decline_thresh_pct=10.0,
+        min_coverage=0.75,
+        require_two_months=confirm_prev,
+        exclude_data={},
+    )
 
 
 def _trend_df(vals: list[float], route: str = "101") -> pd.DataFrame:
@@ -724,61 +793,57 @@ def _trend_df(vals: list[float], route: str = "101") -> pd.DataFrame:
     )
 
 
-def test_detect_negative_trends_flags_large_decline() -> None:
+def test_detect_negative_trends_flags_large_decline(config: mod.AppConfig) -> None:
     # Baseline months 1-12 = 100, month 13 (prev) = 80, month 14 (latest) = 70
     vals = [100.0] * 12 + [80.0, 70.0]
     df = _trend_df(vals)
-    with (
-        patch.object(mod, "ORDERED_PERIODS", _TREND_PERIODS),
-        patch.object(mod, "EXCLUDE_DATA", {}),
-    ):
-        result = mod.detect_negative_trends_12m(
-            df, window=12, pct_threshold=10.0, min_coverage=0.75, confirm_prev=True
-        )
+    result = mod.detect_negative_trends_12m(df, _trend_config(config))
     flagged = result[result["route"] == "101"]
     assert not flagged.empty
     assert "weekday_avg" in flagged["metric"].to_numpy()
 
 
-def test_detect_negative_trends_no_flag_below_threshold() -> None:
+def test_detect_negative_trends_no_flag_below_threshold(config: mod.AppConfig) -> None:
     # Only 5% decline — below 10% threshold
     vals = [100.0] * 13 + [95.0]
     df = _trend_df(vals)
-    with (
-        patch.object(mod, "ORDERED_PERIODS", _TREND_PERIODS),
-        patch.object(mod, "EXCLUDE_DATA", {}),
-    ):
-        result = mod.detect_negative_trends_12m(
-            df, window=12, pct_threshold=10.0, min_coverage=0.75, confirm_prev=False
-        )
+    result = mod.detect_negative_trends_12m(df, _trend_config(config, confirm_prev=False))
     assert result.empty or "101" not in result["route"].to_numpy()
 
 
-def test_detect_negative_trends_confirm_prev_blocks_single_month_drop() -> None:
+def test_detect_negative_trends_confirm_prev_blocks_single_month_drop(
+    config: mod.AppConfig,
+) -> None:
     # Latest is far below baseline, but previous month is NOT below baseline
     vals = [100.0] * 13 + [70.0]
     df = _trend_df(vals)
-    with (
-        patch.object(mod, "ORDERED_PERIODS", _TREND_PERIODS),
-        patch.object(mod, "EXCLUDE_DATA", {}),
-    ):
-        result = mod.detect_negative_trends_12m(
-            df, window=12, pct_threshold=10.0, min_coverage=0.75, confirm_prev=True
-        )
+    result = mod.detect_negative_trends_12m(df, _trend_config(config))
     # confirm_prev=True: month 13 == 100 == baseline, so prev is not below — no flag
     assert result.empty or "101" not in result["route"].to_numpy()
 
 
-def test_detect_negative_trends_returns_empty_dataframe_on_no_flags() -> None:
+def test_detect_negative_trends_returns_empty_dataframe_on_no_flags(
+    config: mod.AppConfig,
+) -> None:
     vals = [100.0] * 14
     df = _trend_df(vals)
-    with (
-        patch.object(mod, "ORDERED_PERIODS", _TREND_PERIODS),
-        patch.object(mod, "EXCLUDE_DATA", {}),
-    ):
-        result = mod.detect_negative_trends_12m(df)
+    result = mod.detect_negative_trends_12m(df, _trend_config(config))
     assert isinstance(result, pd.DataFrame)
     assert result.empty
+
+
+def test_detect_negative_trends_counts_missing_catalogue_month_as_gap(
+    config: mod.AppConfig,
+) -> None:
+    # Without Jun-2024 in the catalogue, the 12-month baseline still spans that
+    # calendar month, so only 11 of its 12 months hold data and full coverage fails.
+    df = _trend_df([100.0] * 12 + [80.0, 70.0])
+    full = replace(_trend_config(config), min_coverage=1.0)
+    assert not mod.detect_negative_trends_12m(df, full).empty
+
+    gapped = replace(full, periods={p: s for p, s in full.periods.items() if p != "Jun-2024"})
+    assert gapped.timeline == _TREND_PERIODS
+    assert mod.detect_negative_trends_12m(df[df["period"] != "Jun-2024"], gapped).empty
 
 
 # ---------------------------------------------------------------------------
@@ -816,34 +881,87 @@ def test_write_trend_log_returns_path(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# extract_config_block
+# load_config / parse_config
 # ---------------------------------------------------------------------------
 
 
-def test_extract_config_block_reads_from_script() -> None:
-    source = Path("scripts/ridership_tools/ntd_monthly_summary.py")
-    block = mod.extract_config_block(source)
-    assert "DATA_ROOT" in block
-    assert "OUTPUT_DIR" in block
+def _write_variant(tmp_path: Path, old: str, new: str) -> Path:
+    """Write the example config with *old* (which must occur once) replaced by *new*."""
+    text = EXAMPLE_CONFIG.read_text(encoding="utf-8")
+    assert text.count(old) == 1
+    path = tmp_path / "ntd_monthly_config.txt"
+    path.write_text(text.replace(old, new), encoding="utf-8")
+    return path
 
 
-def test_extract_config_block_excludes_marker_lines() -> None:
-    source = Path("scripts/ridership_tools/ntd_monthly_summary.py")
-    block = mod.extract_config_block(source)
-    assert mod.CONFIG_BEGIN_MARKER not in block
-    assert mod.CONFIG_END_MARKER not in block
+def test_load_config_reads_example(config: mod.AppConfig) -> None:
+    assert config.ordered_periods[0] == "Jul-2024"
+    assert config.ordered_periods[-1] == "May-2025"
+    assert config.periods["Aug-2024"] == mod.PeriodSpec(
+        "AUGUST 2024  NTD RIDERSHIP REPORT BY ROUTE.xlsx", "Temporary_Query_N"
+    )
+    assert [w.label for w in config.time_windows] == [
+        "FY21",
+        "FY22",
+        "FY23",
+        "FY24",
+        "FY25",
+        "FY26",
+    ]
+    assert len(config.holidays) == 14
+    assert config.service_types["express"] == ["303", "404"]
+    assert config.garage_assignments == {}
+    assert config.plot_style == mod.PlotStyle((9.0, 5.0), "o", "-", 45.0, True)
+    assert config.log_level == logging.INFO
+    assert config.from_run_log is False
 
 
-def test_extract_config_block_raises_on_missing_markers(tmp_path: Path) -> None:
-    f = tmp_path / "no_markers.py"
-    f.write_text("# just a comment\n")
-    with pytest.raises(ValueError, match="Config markers not found"):
-        mod.extract_config_block(f)
+def test_load_config_sorts_periods_chronologically(tmp_path: Path) -> None:
+    path = _write_variant(tmp_path, "[periods]\n", "[periods]\nJun-2025 = june.xlsx | Jun. 2025\n")
+    assert mod.load_config(path).ordered_periods[-1] == "Jun-2025"
 
 
-def test_extract_config_block_raises_on_missing_file(tmp_path: Path) -> None:
-    with pytest.raises(OSError):
-        mod.extract_config_block(tmp_path / "does_not_exist.py")
+def test_load_config_resolves_relative_paths_beside_config(tmp_path: Path) -> None:
+    path = _write_variant(tmp_path, r"data_root = Path\To\Your\NTD_Folder", "data_root = workbooks")
+    assert mod.load_config(path).data_root == (tmp_path / "workbooks").resolve()
+
+
+@pytest.mark.parametrize("value", [r"\\server\share\ntd", r"C:\reports\ntd"])
+def test_load_config_keeps_windows_absolute_paths(tmp_path: Path, value: str) -> None:
+    path = _write_variant(tmp_path, r"data_root = Path\To\Your\NTD_Folder", f"data_root = {value}")
+    assert str(mod.load_config(path).data_root) == value
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "message"),
+    [
+        ("[corridors]", "[corridor]", "Sections: missing"),
+        ("grid = true", "grid = true\ncolour = red", "unknown settings"),
+        ("express = 303, 404", "express = 101, 404", "appears in both"),
+        ("FY26 = 2025-07-01 | 2026-06-30", "FY26 = 2025-07-01 | 2026-06-29", "complete months"),
+        ("FY21 = 2020-07-01", "plots = 2020-07-01", "reserved"),
+        ("# Sep-2024 = *", "Jun-2025 = *", "absent from [periods]"),
+        ("2027-01-01", "2026-12-31", "duplicate dates"),
+        ("Jul-2024 = JULY", "July-2024 = JULY", "Invalid period"),
+        ("level = INFO", "level = LOUD", "choose one of"),
+        (r"data_root = Path\To\Your\NTD_Folder", r"data_root = C:reports", "drive-relative"),
+    ],
+)
+def test_load_config_rejects_invalid_settings(
+    tmp_path: Path, old: str, new: str, message: str
+) -> None:
+    with pytest.raises(mod.ConfigError, match=re.escape(message)):
+        mod.load_config(_write_variant(tmp_path, old, new))
+
+
+def test_load_config_missing_file_raises_config_error(tmp_path: Path) -> None:
+    with pytest.raises(mod.ConfigError):
+        mod.load_config(tmp_path / "missing.txt")
+
+
+def test_timeline_keeps_missing_catalogue_months(config: mod.AppConfig) -> None:
+    cfg = _with_periods(config, ["Nov-2024", "Feb-2025"])
+    assert cfg.timeline == ["Nov-2024", "Dec-2024", "Jan-2025", "Feb-2025"]
 
 
 # ---------------------------------------------------------------------------
@@ -851,36 +969,48 @@ def test_extract_config_block_raises_on_missing_file(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_write_run_log_returns_true_on_success(tmp_path: Path) -> None:
-    assert mod.write_run_log(tmp_path) is True
+def _run_log_text(output_dir: Path) -> str:
+    return (output_dir / "ntd_monthly_summary_runlog.txt").read_text(encoding="utf-8")
 
 
-def test_write_run_log_creates_log_file(tmp_path: Path) -> None:
-    mod.write_run_log(tmp_path)
-    log_path = tmp_path / "ntd_monthly_summary_runlog.txt"
-    assert log_path.exists()
+def test_write_run_log_returns_true_on_success(tmp_path: Path, config: mod.AppConfig) -> None:
+    assert mod.write_run_log(replace(config, output_dir=tmp_path)) is True
 
 
-def test_write_run_log_content_includes_header(tmp_path: Path) -> None:
-    mod.write_run_log(tmp_path)
-    content = (tmp_path / "ntd_monthly_summary_runlog.txt").read_text()
-    assert "NTD MONTHLY SUMMARY RUN LOG" in content
+def test_write_run_log_returns_false_when_folder_missing(
+    tmp_path: Path, config: mod.AppConfig
+) -> None:
+    assert mod.write_run_log(replace(config, output_dir=tmp_path / "missing")) is False
 
 
-def test_write_run_log_content_includes_config(tmp_path: Path) -> None:
-    mod.write_run_log(tmp_path)
-    content = (tmp_path / "ntd_monthly_summary_runlog.txt").read_text()
-    assert "DATA_ROOT" in content
+def test_write_run_log_content_includes_header_and_status(
+    tmp_path: Path, config: mod.AppConfig
+) -> None:
+    mod.write_run_log(replace(config, output_dir=tmp_path), status="started")
+    content = _run_log_text(tmp_path)
+    assert content.splitlines()[1] == "NTD MONTHLY SUMMARY RUN LOG"
+    assert "Run status:       started" in content
+    assert "Configuration source: config file" in content
 
 
-def test_write_run_log_omits_service_day_section_when_none(tmp_path: Path) -> None:
-    mod.write_run_log(tmp_path)
-    content = (tmp_path / "ntd_monthly_summary_runlog.txt").read_text()
-    assert "SERVICE-DAY COUNTS PER MONTH" not in content
+def test_write_run_log_content_includes_config_between_markers(
+    tmp_path: Path, config: mod.AppConfig
+) -> None:
+    mod.write_run_log(replace(config, output_dir=tmp_path))
+    content = _run_log_text(tmp_path)
+    expected = f"{mod.REPLAY_CONFIG_BEGIN}\n{config.source_text}\n{mod.REPLAY_CONFIG_END}"
+    assert expected in content
 
 
-def test_write_run_log_includes_service_day_table(tmp_path: Path) -> None:
-    service_days = pd.DataFrame(
+def test_write_run_log_omits_service_day_section_when_none(
+    tmp_path: Path, config: mod.AppConfig
+) -> None:
+    mod.write_run_log(replace(config, output_dir=tmp_path))
+    assert "SERVICE-DAY COUNTS PER MONTH" not in _run_log_text(tmp_path)
+
+
+def _service_days() -> pd.DataFrame:
+    return pd.DataFrame(
         {
             "period": ["Jul-2024"],
             "Weekday": [22],
@@ -889,8 +1019,268 @@ def test_write_run_log_includes_service_day_table(tmp_path: Path) -> None:
             "Holidays": [1],
         }
     )
-    mod.write_run_log(tmp_path, service_days)
-    content = (tmp_path / "ntd_monthly_summary_runlog.txt").read_text()
+
+
+def test_write_run_log_includes_service_day_table(tmp_path: Path, config: mod.AppConfig) -> None:
+    mod.write_run_log(replace(config, output_dir=tmp_path), _service_days())
+    content = _run_log_text(tmp_path)
     assert "SERVICE-DAY COUNTS PER MONTH" in content
     assert "Holidays" in content
     assert "Jul-2024" in content
+
+
+# ---------------------------------------------------------------------------
+# Run-log replay
+# ---------------------------------------------------------------------------
+
+
+def test_load_config_replays_run_log(tmp_path: Path, config: mod.AppConfig) -> None:
+    mod.write_run_log(replace(config, output_dir=tmp_path), _service_days())
+    replayed = mod.load_config(tmp_path / "ntd_monthly_summary_runlog.txt")
+    assert replayed.from_run_log is True
+    assert replayed.source_text == config.source_text
+    assert replayed.periods == config.periods
+    assert replayed.data_root == config.data_root
+    assert replayed.config_base_dir == EXAMPLE_CONFIG.resolve().parent
+
+
+def test_load_config_replays_moved_run_log_against_original_directory(
+    tmp_path: Path, config: mod.AppConfig
+) -> None:
+    mod.write_run_log(replace(config, output_dir=tmp_path))
+    moved = tmp_path / "archive" / "old_runlog.txt"
+    moved.parent.mkdir()
+    shutil.move(tmp_path / "ntd_monthly_summary_runlog.txt", moved)
+    # The example's data_root is relative, so it must still resolve beside the
+    # original config file rather than beside the moved log.
+    assert mod.load_config(moved).data_root == config.data_root
+
+
+def test_load_config_replays_unmarked_legacy_run_log(tmp_path: Path, config: mod.AppConfig) -> None:
+    mod.write_run_log(replace(config, output_dir=tmp_path), _service_days())
+    log_path = tmp_path / "ntd_monthly_summary_runlog.txt"
+    new_only = (
+        mod.REPLAY_CONFIG_BEGIN,
+        mod.REPLAY_CONFIG_END,
+        "Config base",
+        "Configuration source",
+    )
+    legacy = [
+        line for line in _run_log_text(tmp_path).splitlines() if not line.startswith(new_only)
+    ]
+    log_path.write_text("\n".join(legacy) + "\n", encoding="utf-8")
+
+    replayed = mod.load_config(log_path)
+    assert replayed.source_text == config.source_text
+    assert replayed.data_root == config.data_root
+
+
+def test_extract_replay_config_rejects_duplicate_markers(
+    tmp_path: Path, config: mod.AppConfig
+) -> None:
+    mod.write_run_log(replace(config, output_dir=tmp_path))
+    text = _run_log_text(tmp_path) + mod.REPLAY_CONFIG_BEGIN + "\n"
+    with pytest.raises(mod.ConfigError, match="missing or duplicate"):
+        mod.extract_replay_config(text)
+
+
+def test_extract_replay_config_rejects_truncated_legacy_log() -> None:
+    text = "\n".join(
+        [
+            "=" * 72,
+            mod.RUN_LOG_TITLE,
+            "=" * 72,
+            "Config file:      /reports/ntd_monthly_config.txt",
+            "-" * 72,
+            "CONFIGURATION (text loaded for this run)",
+            "-" * 72,
+            "[paths]",
+        ]
+    )
+    with pytest.raises(mod.ConfigError, match="truncated"):
+        mod.extract_replay_config(text)
+
+
+# ---------------------------------------------------------------------------
+# main / cli (end to end)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def restore_root_log_level() -> Iterator[None]:
+    """main() sets the root logger level from the config; undo it after the test."""
+    root = logging.getLogger()
+    level = root.level
+    yield
+    root.setLevel(level)
+
+
+def _write_workbook(path: Path, boards_per_day: float) -> None:
+    rows = [
+        {
+            "Route Name": route,
+            "Service Period": service_period,
+            "MTH_BOARD": boards_per_day * days,
+            "MTH_REV_HOURS": 10.0 * days,
+            "MTH_PASS_MILES": 4 * boards_per_day * days,
+            "ASCH_TRIPS": 50,
+            "DAYS": days,
+            "REV_MILES": 400.0,
+        }
+        for route in (101, 202)
+        for service_period, days in (("Weekday", 22), ("Saturday", 4), ("Sunday", 5))
+    ]
+    pd.DataFrame(rows).to_excel(path, sheet_name="Sheet1", index=False)
+
+
+def _write_project(tmp_path: Path) -> Path:
+    """Create two monthly workbooks and a config that refers to them relatively."""
+    workbooks = tmp_path / "workbooks"
+    workbooks.mkdir()
+    _write_workbook(workbooks / "jul.xlsx", 100.0)
+    _write_workbook(workbooks / "aug.xlsx", 90.0)
+    plots = "\n".join(f"{flag} = {flag == 'plot_weekday_avg'}" for flag in mod.PLOT_FLAGS)
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    path = config_dir / "ntd_monthly_config.txt"
+    path.write_text(
+        f"""\
+[paths]
+data_root = ../workbooks
+output_dir = ../out
+
+[periods]
+Jul-2024 = jul.xlsx | Sheet1
+Aug-2024 = aug.xlsx | Sheet1
+
+[time_windows]
+FY25 = 2024-07-01 | 2025-06-30
+
+[holidays]
+dates = 2024-07-04
+
+[service_types]
+local = 101, 202
+
+[corridors]
+main_street = 101
+
+[garage_assignments]
+north = 101
+
+[trend]
+rolling_window = 12
+min_coverage = 0.75
+decline_thresh_pct = 10
+require_two_months = true
+
+[exclude_data]
+
+[plots]
+{plots}
+
+[plot_style]
+figsize = 9, 5
+marker = o
+linestyle = -
+rotation = 45
+grid = true
+
+[logging]
+level = INFO
+require_run_log = true
+""",
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_main_writes_all_outputs(tmp_path: Path, restore_root_log_level: None) -> None:
+    assert mod.main(_write_project(tmp_path)) == 0
+
+    out = tmp_path / "out"
+    for name in (
+        "DetailedAllPeriods_for_plotting.csv",
+        "MonthlySheets.xlsx",
+        "RouteLevelSummary_Combined.xlsx",
+        "NegativeTrendFlags.txt",
+        "FY25/detailed_FY25_for_plotting.csv",
+        "FY25/AggByServiceType_FY25.xlsx",
+        "plots/weekday_avg/weekday_avg_route_SYSTEMWIDE.png",
+    ):
+        assert (out / name).exists(), name
+    weekday = pd.read_excel(out / "RouteLevelSummary_Weekday.xlsx", dtype={"ROUTE_NAME": str})
+    assert dict(zip(weekday["ROUTE_NAME"], weekday["garage"], strict=True)) == {
+        "101": "north",
+        "202": "unknown",
+    }
+    # Jul 4 2024 is a Thursday, so the weekday summary gains holiday-free columns.
+    assert "DAYS_EX_HOLIDAYS" in weekday.columns
+    log = _run_log_text(out)
+    assert "Run status:       complete" in log
+    assert "SERVICE-DAY COUNTS PER MONTH" in log
+
+
+def test_main_replays_run_log_into_new_folder(tmp_path: Path, restore_root_log_level: None) -> None:
+    config_path = _write_project(tmp_path)
+    assert mod.main(config_path) == 0
+    out = tmp_path / "out"
+    original_log = _run_log_text(out)
+
+    # Replay from a moved copy of the log with the original config file gone.
+    moved = tmp_path / "archive" / "runlog.txt"
+    moved.parent.mkdir()
+    shutil.copy(out / "ntd_monthly_summary_runlog.txt", moved)
+    config_path.unlink()
+    assert mod.main(moved) == 0
+
+    reruns = list(tmp_path.glob("out_rerun_*"))
+    assert len(reruns) == 1
+    rerun_log = _run_log_text(reruns[0])
+    assert "Configuration source: previous run log" in rerun_log
+    assert f"Config base directory: {config_path.resolve().parent}" in rerun_log
+    pd.testing.assert_frame_equal(
+        pd.read_csv(reruns[0] / "DetailedAllPeriods_for_plotting.csv"),
+        pd.read_csv(out / "DetailedAllPeriods_for_plotting.csv"),
+    )
+    assert _run_log_text(out) == original_log
+
+
+def test_main_missing_workbook_fails_before_creating_output(
+    tmp_path: Path, restore_root_log_level: None
+) -> None:
+    config_path = _write_project(tmp_path)
+    (tmp_path / "workbooks" / "aug.xlsx").unlink()
+    assert mod.main(config_path) == 1
+    assert not (tmp_path / "out").exists()
+
+
+def test_main_returns_2_on_config_error(tmp_path: Path) -> None:
+    assert mod.main(tmp_path / "missing.txt") == 2
+
+
+def test_cli_validate_config_only(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], restore_root_log_level: None
+) -> None:
+    config_path = _write_project(tmp_path)
+    with patch.object(
+        mod.sys,
+        "argv",
+        ["ntd_monthly_summary.py", "--config", str(config_path), "--validate-config"],
+    ):
+        assert mod.cli() == 0
+    assert "Configuration valid: 2 months, 1 time windows" in capsys.readouterr().out
+    assert not (tmp_path / "out").exists()
+
+
+@pytest.mark.parametrize(
+    ("argv0", "expected"),
+    [
+        ("/env/lib/ipykernel_launcher.py", True),
+        (r"C:\env\Lib\site-packages\ipykernel_launcher.py", True),
+        ("ntd_monthly_summary.py", False),
+    ],
+)
+def test_launched_by_notebook(argv0: str, expected: bool) -> None:
+    with patch.object(mod.sys, "argv", [argv0, "-f", "kernel.json"]):
+        assert mod.launched_by_notebook() is expected
