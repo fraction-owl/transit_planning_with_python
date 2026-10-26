@@ -2,7 +2,8 @@
 
 The fixture exists so a "serves the CBD" route flag gets both answers on the
 mock DC feed (tests/fixtures/mock_gtfs_dc.zip). These tests pin which mock
-routes cross it and keep route 40 more than a quarter mile away.
+routes stop in each of its two polygons, and that route 40 crosses the annex
+without stopping in it.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ from pathlib import Path
 import geopandas as gpd
 import pandas as pd
 from shapely.geometry import LineString
+from shapely.geometry.base import BaseGeometry
 
 from dev_tools.generate_mock_cbd import build_cbd_gdf
 from utils.shapefile_helpers import load_shapefile
@@ -59,33 +61,51 @@ def _route_geometry() -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
     return shape_gdf.to_crs(DC_CRS_FT), stop_gdf.to_crs(DC_CRS_FT)
 
 
-def test_fixture_is_one_valid_polygon() -> None:
-    """The fixture loads from its zip as a single valid WGS84 polygon."""
+def _load_cbd_ft() -> dict[str, BaseGeometry]:
+    """Return the fixture's polygons by GIS_ID, in DC State Plane feet."""
+    cbd = load_shapefile(str(CBD_ZIP)).to_crs(DC_CRS_FT)
+    return dict(zip(cbd["GIS_ID"], cbd.geometry))
+
+
+def test_fixture_is_two_valid_polygons() -> None:
+    """The fixture loads from its zip as two valid WGS84 polygons."""
     cbd = load_shapefile(str(CBD_ZIP))
 
-    assert len(cbd) == 1
     assert cbd.crs.to_epsg() == 4326
     assert list(cbd.columns) == ["GIS_ID", "NAME", "geometry"]
-    assert cbd.geometry.iloc[0].geom_type == "Polygon"
-    assert cbd.geometry.iloc[0].is_valid
+    assert cbd["GIS_ID"].tolist() == ["MOCK_CBD_1", "MOCK_CBD_2"]
+    assert (cbd.geometry.geom_type == "Polygon").all()
+    assert cbd.geometry.is_valid.all()
 
 
 def test_fixture_matches_generator() -> None:
     """The committed zip is what the generator currently builds (regenerate if this fails)."""
-    committed = load_shapefile(str(CBD_ZIP)).geometry.iloc[0]
-    built = build_cbd_gdf().geometry.iloc[0]
+    committed = load_shapefile(str(CBD_ZIP)).geometry
+    built = build_cbd_gdf().geometry
 
-    assert committed.normalize().equals_exact(built.normalize(), tolerance=1e-9)
+    assert len(committed) == len(built)
+    for kept, fresh in zip(committed, built):
+        assert kept.normalize().equals_exact(fresh.normalize(), tolerance=1e-9)
 
 
-def test_route_40_misses_the_cbd_and_the_other_routes_serve_it() -> None:
-    """Routes 10, 20, 30, and 50H have stops inside the CBD; 40 is over a quarter mile out."""
-    cbd = load_shapefile(str(CBD_ZIP)).to_crs(DC_CRS_FT).geometry.iloc[0]
+def test_four_routes_stop_downtown_and_none_stop_in_the_annex() -> None:
+    """Routes 10, 20, 30, and 50H stop in downtown only; no route stops in the annex."""
+    polygons = _load_cbd_ft()
+    _, stops = _route_geometry()
+
+    downtown = stops[stops.intersects(polygons["MOCK_CBD_1"])].groupby("route_id").size()
+    assert set(downtown.index) == {"DC_R10", "DC_R20", "DC_R30", "DC_R50H"}
+    assert (downtown >= 2).all()
+    assert not stops.intersects(polygons["MOCK_CBD_2"]).any()
+
+
+def test_route_40_crosses_the_annex_without_stopping_in_any_polygon() -> None:
+    """Route 40's line cuts the annex, but every route 40 stop is outside both polygons."""
+    polygons = _load_cbd_ft()
     shapes, stops = _route_geometry()
+    r40_shapes = shapes[shapes["route_id"] == "DC_R40"]
+    r40_stops = stops[stops["route_id"] == "DC_R40"]
 
-    stops_inside = stops[stops.within(cbd)].groupby("route_id").size()
-    assert set(stops_inside.index) == {"DC_R10", "DC_R20", "DC_R30", "DC_R50H"}
-    assert (stops_inside >= 2).all()
-
-    assert shapes.loc[shapes["route_id"] == "DC_R40"].distance(cbd).min() > QUARTER_MILE_FT
-    assert stops.loc[stops["route_id"] == "DC_R40"].distance(cbd).min() > QUARTER_MILE_FT
+    assert r40_shapes.intersects(polygons["MOCK_CBD_2"]).any()
+    assert r40_stops.distance(polygons["MOCK_CBD_2"]).min() > 50.0
+    assert r40_shapes.distance(polygons["MOCK_CBD_1"]).min() > QUARTER_MILE_FT

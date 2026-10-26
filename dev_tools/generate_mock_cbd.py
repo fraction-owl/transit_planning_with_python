@@ -1,11 +1,15 @@
-"""Generate a mock central business district (CBD) polygon (zipped shapefile) for DC.
+"""Generate mock central business district (CBD) polygons (zipped shapefile) for DC.
 
 This is a companion to the mock GTFS / road / points-of-interest fixtures. It
-writes a single polygon: a rectangle with its southeast corner cut off on a
-diagonal. Route-profiling tools can use it to flag whether each route serves
-the CBD without the repo shipping a real agency's boundary. The outline is
-hand-drawn and roughly the size of DC's CBD (about 2.4 by 1.9 miles); it is not
-traced from any published layer.
+writes one shapefile holding two polygons, so route-profiling tools can flag
+whether each route serves the CBD without the repo shipping a real agency's
+boundary:
+
+    - Downtown: a rectangle with its southeast corner cut off on a diagonal,
+      roughly the size of DC's CBD (about 2.4 by 1.9 miles).
+    - Annex: a 2,000 ft square northeast of downtown.
+
+Both outlines are hand-drawn; neither is traced from any published layer.
 
 Coherence with the GTFS frame
 -----------------------------
@@ -13,24 +17,29 @@ The mock DC feed from ``generate_mock_gtfs.py`` is hub-and-spoke: routes 10,
 20, 30, and 40 all cross at the center of ``DEFAULT_BBOX_DC``, and the 50H
 holiday loop's east leg runs through the same point. Every route would serve a
 CBD that contains the hub, so a "serves the CBD" flag would never be False.
-The rectangle instead sits mostly northwest of the hub, and its cut corner runs
-parallel to route 40 (NE-SW diagonal), 1,500 ft from it:
+The downtown rectangle instead sits mostly northwest of the hub, and its cut
+corner runs parallel to route 40 (NE-SW diagonal), 1,500 ft from it:
 
-    - Routes 10, 20, 30, and 50H run through it (4 to 7 stops inside each).
-    - Route 40 stays 1,500 ft away, so it is not counted when checking stops
-      inside the polygon or with a quarter-mile (1,320 ft) buffer. A buffer
-      wider than 1,500 ft would count it.
+    - Routes 10, 20, 30, and 50H run through downtown (4 to 7 stops inside
+      each) and stay more than a mile from the annex.
+    - Route 40 stays 1,500 ft from downtown and cuts across the annex's
+      southeast corner between two of its stops, so it passes through a CBD
+      polygon without stopping in one.
 
-The outline's vertices are feet east/north of the hub. They are laid out in DC
+The layout is built for a stops-inside test: routes 10, 20, 30, and 50H have a
+stop in a CBD polygon and route 40 does not. A test that buffers stops or
+counts route lines crossing a polygon would count route 40 as well.
+
+The outlines' vertices are feet east/north of the hub. They are laid out in DC
 State Plane (EPSG:2248) and written in WGS84, like the other mock layers.
 
 Schema
 ------
 ``GIS_ID`` (the id field name DC's open-data CBD layer uses) and ``NAME``,
-plus polygon geometry.
+plus polygon geometry; one row per polygon.
 
 Inputs:
-    - None. The hub location and outline are set in the CONFIGURATION block.
+    - None. The hub location and outlines are set in the CONFIGURATION block.
 
 Outputs:
     - ``<OUTPUT_DIR>/mock_cbd_dc.zip`` containing the shapefile components at
@@ -69,19 +78,35 @@ HUB_LAT = 38.895
 PROJECTED_CRS = "EPSG:2248"
 OUTPUT_CRS = "EPSG:4326"
 
-# CBD outline as (feet east, feet north) of the hub, walked clockwise from the SW corner.
-# Routes 10 and 50H (x = 0) and 20 (y = 0) cross the rectangle and route 30 (y = -1.28 * x)
-# cuts its northwest part. The diagonal edge runs parallel to route 40 (y = 1.28 * x),
-# 1,500 ft northwest of it, so the hub itself is just outside the polygon.
-CBD_OUTLINE_FT: tuple[tuple[float, float], ...] = (
-    (-9000.0, -3000.0),  # SW corner
-    (-9000.0, 7000.0),  # NW corner
-    (3550.0, 7000.0),  # NE corner, then the diagonal down past the hub
-    (-4250.0, -3000.0),  # back to the south edge
+# CBD polygons as (GIS_ID, NAME, outline). Each outline is (feet east, feet north) of the
+# hub, walked clockwise from the SW corner.
+#   Downtown: routes 10 and 50H (x = 0) and 20 (y = 0) cross the rectangle and route 30
+#   (y = -1.28 * x) cuts its northwest part. The diagonal edge runs parallel to route 40
+#   (y = 1.28 * x), 1,500 ft northwest of it, so the hub itself is just outside the polygon.
+#   Annex: route 40 (stops every 500 ft) cuts across the square's SE corner for about
+#   240 ft, midway between two of its stops, which stay about 110 ft outside the square.
+CBD_POLYGONS: tuple[tuple[str, str, tuple[tuple[float, float], ...]], ...] = (
+    (
+        "MOCK_CBD_1",
+        "Mock Central Business District",
+        (
+            (-9000.0, -3000.0),  # SW corner
+            (-9000.0, 7000.0),  # NW corner
+            (3550.0, 7000.0),  # NE corner, then the diagonal down past the hub
+            (-4250.0, -3000.0),  # back to the south edge
+        ),
+    ),
+    (
+        "MOCK_CBD_2",
+        "Mock Central Business District Annex",
+        (
+            (5750.0, 9730.0),  # SW corner
+            (5750.0, 11730.0),  # NW corner
+            (7750.0, 11730.0),  # NE corner
+            (7750.0, 9730.0),  # SE corner, just across route 40
+        ),
+    ),
 )
-
-CBD_GIS_ID = "MOCK_CBD_1"
-CBD_NAME = "Mock Central Business District"
 
 LOG_LEVEL = logging.INFO
 
@@ -93,16 +118,17 @@ LOG_LEVEL = logging.INFO
 def build_cbd_gdf(
     hub_lon: float = HUB_LON,
     hub_lat: float = HUB_LAT,
-    outline_ft: Sequence[tuple[float, float]] = CBD_OUTLINE_FT,
+    polygons: Sequence[tuple[str, str, Sequence[tuple[float, float]]]] = CBD_POLYGONS,
     projected_crs: str = PROJECTED_CRS,
     output_crs: str = OUTPUT_CRS,
 ) -> gpd.GeoDataFrame:
-    """Build the one-row CBD GeoDataFrame from *outline_ft* offsets around the hub.
+    """Build the CBD GeoDataFrame, one row per polygon, from offsets around the hub.
 
     Args:
         hub_lon: Hub longitude (WGS84) the offsets are measured from.
         hub_lat: Hub latitude (WGS84) the offsets are measured from.
-        outline_ft: Polygon vertices as ``(feet east, feet north)`` of the hub.
+        polygons: ``(GIS_ID, NAME, outline)`` per polygon, each outline a sequence of
+            ``(feet east, feet north)`` vertices relative to the hub.
         projected_crs: Foot-based projected CRS the offsets are applied in.
         output_crs: CRS of the returned GeoDataFrame.
 
@@ -110,16 +136,17 @@ def build_cbd_gdf(
         A GeoDataFrame with columns ``["GIS_ID", "NAME", "geometry"]``.
 
     Raises:
-        ValueError: The outline does not form a valid polygon.
+        ValueError: An outline does not form a valid polygon.
     """
     hub = gpd.GeoSeries([Point(hub_lon, hub_lat)], crs="EPSG:4326").to_crs(projected_crs).iloc[0]
-    polygon = Polygon([(hub.x + dx, hub.y + dy) for dx, dy in outline_ft])
-    if not polygon.is_valid:
-        raise ValueError("CBD_OUTLINE_FT does not form a valid polygon (check vertex order).")
+    records: list[dict[str, object]] = []
+    for gis_id, name, outline_ft in polygons:
+        polygon = Polygon([(hub.x + dx, hub.y + dy) for dx, dy in outline_ft])
+        if not polygon.is_valid:
+            raise ValueError(f"The {gis_id} outline does not form a valid polygon.")
+        records.append({"GIS_ID": gis_id, "NAME": name, "geometry": polygon})
 
-    gdf = gpd.GeoDataFrame(
-        {"GIS_ID": [CBD_GIS_ID], "NAME": [CBD_NAME]}, geometry=[polygon], crs=projected_crs
-    )
+    gdf = gpd.GeoDataFrame(records, geometry="geometry", crs=projected_crs)
     return gdf.to_crs(output_crs)
 
 
@@ -151,8 +178,8 @@ def generate(output_dir: str | Path, output_filename: str = OUTPUT_FILENAME) -> 
     gdf = build_cbd_gdf()
     out_zip = output_dir / output_filename
     write_layer_zip(gdf, out_zip)
-    area_sq_mi = gdf.to_crs(PROJECTED_CRS).geometry.iloc[0].area / 5280.0**2
-    logging.info("Wrote %s (1 polygon, %.2f sq mi)", out_zip, area_sq_mi)
+    area_sq_mi = gdf.to_crs(PROJECTED_CRS).geometry.area.sum() / 5280.0**2
+    logging.info("Wrote %s (%d polygons, %.2f sq mi)", out_zip, len(gdf), area_sq_mi)
     return out_zip
 
 
