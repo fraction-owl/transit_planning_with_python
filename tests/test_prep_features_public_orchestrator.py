@@ -320,9 +320,9 @@ def test_run_log_records_registry_scripts_not_found(tmp_path: Path) -> None:
         timed_out=False,
         output_files=["out.csv"],
     )
-    ok = pf.write_run_log(tmp_path, [], [run], missing_scripts=["gtfs_route_features.py"])
+    ok = pf.write_run_log(tmp_path, [], [run], missing_scripts=["gtfs_route_features_gpd.py"])
     assert ok
     text = (tmp_path / "prep_features_public_runlog.txt").read_text(encoding="utf-8")
     assert "present.py" in text
-    assert "gtfs_route_features.py  NOT FOUND" in text
+    assert "gtfs_route_features_gpd.py  NOT FOUND" in text
     assert "missing from every bundle" in text

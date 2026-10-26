@@ -41,7 +41,7 @@
   ],
   "scripts": [
     {
-      "script": "gtfs_route_features.py",
+      "script": "gtfs_route_features_gpd.py",
       "cmd": ["{python}", "{script}", "--gtfs-dir", "{input}/gtfs",
               "--output-dir", "{output}"],
       "outputs": [
