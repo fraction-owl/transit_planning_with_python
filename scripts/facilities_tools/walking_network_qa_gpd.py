@@ -63,7 +63,7 @@ import sys
 import time
 import zipfile
 from collections import Counter, defaultdict
-from collections.abc import Iterator, Sequence
+from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
@@ -393,7 +393,7 @@ class Issue(NamedTuple):
 
 
 @contextmanager
-def timed_stage(name: str, timings: dict[str, float]) -> Iterator[None]:
+def timed_stage(name: str, timings: dict[str, float]) -> Generator[None, None, None]:
     """Log a stage's start and duration, and record the duration in *timings*."""
     logging.info("START: %s", name)
     started = time.perf_counter()

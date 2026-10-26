@@ -82,7 +82,7 @@ import tempfile
 import time
 import zipfile
 from collections import Counter, OrderedDict, defaultdict
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Generator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -3755,7 +3755,7 @@ def write_workbook(path: Path, sheets: Sequence[Tuple[str, DataFrame]]) -> None:
 
 # Canonical version lives in utils/block_timeline_helpers.py -- keep this copy in sync.
 @contextmanager
-def open_report_workbook(path: str) -> Iterator[pd.ExcelWriter]:
+def open_report_workbook(path: str) -> Generator[pd.ExcelWriter, None, None]:
     """Open an openpyxl workbook writer whose cleanup never hides a writing error.
 
     Build every sheet's data before entering, so a failed calculation never

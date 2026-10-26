@@ -15,7 +15,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Optional
@@ -434,7 +434,7 @@ def read_timeline_files(folder: str, combined_name: str) -> DataFrame:
 
 
 @contextmanager
-def open_report_workbook(path: str) -> Iterator[pd.ExcelWriter]:
+def open_report_workbook(path: str) -> Generator[pd.ExcelWriter, None, None]:
     """Open an openpyxl workbook writer whose cleanup never hides a writing error.
 
     Build every sheet's data before entering, so a failed calculation never
