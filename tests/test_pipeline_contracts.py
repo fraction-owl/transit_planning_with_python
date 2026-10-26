@@ -42,7 +42,7 @@ CANONICAL_KEY_FILES = [
     "scripts/modeling/monthly_ridership_model.py",
     "scripts/modeling/prep_features_public.py",
     "scripts/modeling/prep_features_private.py",
-    "scripts/gtfs_exports/gtfs_route_features.py",
+    "scripts/gtfs_exports/gtfs_route_features_gpd.py",
 ]
 
 NORMALISE_ROUTE_FILES = [
