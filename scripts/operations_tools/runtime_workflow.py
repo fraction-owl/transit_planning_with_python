@@ -16,8 +16,13 @@ Select stages with STAGES below, or at the command line:
 In an ArcGIS Pro notebook:
     %run "C:/path/to/runtime_workflow.py"
 
-Outputs are unchanged: one workbook per route/direction, plus run.log and
-settings.json, under OUTPUT_DIR/runtime_workflow/run_<timestamp>/.
+Outputs: one workbook per route/direction, plus run.log and settings.json,
+under OUTPUT_DIR/runtime_workflow/run_<timestamp>/. Its data/ subfolder holds
+the same results as CSV tables for scripts and AI tools, including one row per
+service date for pooling trips into periods. People edit the workbooks; the
+CSVs are read-only copies and do not pick up those edits. A possible later
+step reverses this: a long CSV becomes the editable source and the workbooks
+are regenerated from it.
 Stage 1 needs only GTFS; Stage 4 calculates Stage 3 statistics internally.
 Recommendations include intermediate destination dwell/holding. Do not add
 Stage 1 holding again. Segment percentiles are not an OTP guarantee.
@@ -1095,6 +1100,8 @@ def display_trip_table(summary: pd.DataFrame, route: str) -> pd.DataFrame:
 # STAGE 3: OBSERVED SEGMENT RUNTIMES
 # =============================================================================
 
+SEGMENT_KEYS = ["route", "direction", "day_type", "start", "end", "profile", "pattern_key", "seq"]
+
 
 def build_observations(
     cfg: Settings,
@@ -1107,6 +1114,7 @@ def build_observations(
     arrival. Generic Actual Time is a marked fallback. A uniquely identified
     runtime-export endpoint can fill a missing endpoint only, using date, route,
     direction and scheduled start/end, not assuming the two exports share IDs.
+    Duplicate daily rows are removed here, so CSV exports and summaries share a sample.
     """
     frame = load_clever(
         cfg.timepoint_path,
@@ -1192,7 +1200,8 @@ def build_observations(
             positions = (enriched.seq - 1).astype(int).tolist()
             start, end = float(trip.start), float(trip.end)
             pattern, gtfs_direction = trip.pattern, trip.direction
-            pattern_key = json.dumps(full.stop_id.tolist())
+            stop_ids = full.stop_id.tolist()
+            pattern_key = json.dumps(stop_ids)
         else:
             event_minutes = raw_minutes
             holding = [minutes_between(row["_sched_dep"], row["_sched_arr"]) for row in data]
@@ -1200,7 +1209,8 @@ def build_observations(
             gtfs_trip = ""
             positions = list(range(len(data)))
             pattern, gtfs_direction = "Unmatched", ""
-            pattern_key = json.dumps(source_codes)
+            stop_ids = source_codes
+            pattern_key = json.dumps(stop_ids)
         fallback = runtime_groups.get((date, route, direction), pd.DataFrame())
         if not fallback.empty:
             fallback = fallback.loc[
@@ -1259,6 +1269,8 @@ def build_observations(
                     "seq": i,
                     "from": names[i - 1],
                     "to": names[i],
+                    "from_id": stop_ids[i - 1],
+                    "to_id": stop_ids[i],
                     "actual": elapsed,
                     "scheduled": scheduled_elapsed,
                     "scheduled_holding": holding[i] if i < len(event_minutes) - 1 else 0.0,
@@ -1273,27 +1285,30 @@ def build_observations(
         matched_count,
         source_count,
     )
-    return pd.DataFrame(rows)
+    observations = pd.DataFrame(rows)
+    if observations.empty:
+        return observations
+    return distinct_daily_rows(
+        observations, ["date", *SEGMENT_KEYS], ["actual", "scheduled", "observed_dwell"]
+    )
 
 
 def summarize_segments(observations: pd.DataFrame, cfg: Settings) -> pd.DataFrame:
     """Trim and describe each trip/segment sample separately, keeping partial trips usable."""
     if observations.empty:
         return pd.DataFrame()
-    keys = ["route", "direction", "day_type", "start", "end", "profile", "pattern_key", "seq"]
-    observations = distinct_daily_rows(
-        observations, ["date", *keys], ["actual", "scheduled", "observed_dwell"]
-    )
     records = []
-    for key, group in observations.groupby(keys, sort=True, dropna=False):
+    for key, group in observations.groupby(SEGMENT_KEYS, sort=True, dropna=False):
         retained = trim_sample(group, "actual", cfg.trim)
         stats = describe(retained.actual, cfg.percentile)
         first = group.iloc[0]
         records.append(
             {
-                **dict(zip(keys, cast("tuple[Any, ...]", key))),
+                **dict(zip(SEGMENT_KEYS, cast("tuple[Any, ...]", key))),
                 "from": first["from"],
                 "to": first["to"],
+                "from_id": first.from_id,
+                "to_id": first.to_id,
                 "scheduled": first.scheduled,
                 "median": stats["median"],
                 "p85": stats["p85"],
@@ -1378,6 +1393,13 @@ def display_segment_table(summary: pd.DataFrame, route: str) -> pd.DataFrame:
 # =============================================================================
 
 
+def recommended_minutes(target: Any, n: Any, cfg: Settings) -> float:
+    """Round the target percentile up; leave it blank below the observation minimum."""
+    if n >= cfg.min_observations and np.isfinite(target):
+        return math.ceil((target - 1e-10) / cfg.rounding) * cfg.rounding
+    return np.nan
+
+
 def build_recommendation_sheets(summary: pd.DataFrame, route: str, cfg: Settings) -> list[Sheet]:
     """Recommend each supported segment independently; do not create periods or cap increases.
 
@@ -1421,11 +1443,7 @@ def build_recommendation_sheets(summary: pd.DataFrame, route: str, cfg: Settings
                 "; ".join(notes),
             ]
             for seg in cast("Iterable[Any]", trip.itertuples()):
-                recommended = (
-                    math.ceil((seg.target - 1e-10) / cfg.rounding) * cfg.rounding
-                    if seg.n >= cfg.min_observations and np.isfinite(seg.target)
-                    else np.nan
-                )
+                recommended = recommended_minutes(seg.target, seg.n, cfg)
                 current_col, rec_col = len(values) + 1, len(values) + 2
                 values += [
                     seg.scheduled,
@@ -1452,6 +1470,187 @@ def build_recommendation_sheets(summary: pd.DataFrame, route: str, cfg: Settings
         day = {"Weekday": "WK", "Saturday": "SA", "Sunday": "SU"}[day_type]
         sheets.append(Sheet(f"Recommend_{day}_{pattern}", columns, rows))
     return sheets
+
+
+# =============================================================================
+# CSV OUTPUT: READ-ONLY COPIES FOR SCRIPTS AND AI TOOLS
+# =============================================================================
+
+
+def snake_case(label: str) -> str:
+    """Turn a worksheet label into a CSV column name; '+/-' becomes 'change'."""
+    return re.sub(r"[^0-9a-z]+", "_", label.replace("+/-", "change").lower()).strip("_")
+
+
+def lead_columns(table: pd.DataFrame, first: Sequence[str]) -> pd.DataFrame:
+    """Move identifying columns to the front, keeping the rest in their sheet order."""
+    return table[[*first, *(c for c in table.columns if c not in first)]]
+
+
+def gtfs_segment_table(schedule: dict[str, pd.DataFrame], route: str) -> pd.DataFrame:
+    """List Stage 1 movement and intermediate holding per GTFS trip segment, with stop IDs."""
+    trips = schedule["trips"].loc[schedule["trips"].route.eq(route)]
+    points = schedule["points"].loc[schedule["points"].trip_id.isin(trips.trip_id)]
+    points = points.sort_values(["trip_id", "seq"])
+    previous = points.groupby("trip_id")[["stop_id", "stop_name", "departure"]].shift()
+    table = pd.DataFrame(
+        {
+            "trip_id": points.trip_id,
+            "segment": points.seq - 1,
+            "from": previous.stop_name.str.strip(),
+            "from_stop_id": previous.stop_id,
+            "to": points.stop_name.str.strip(),
+            "to_stop_id": points.stop_id,
+            "movement_min": points.arrival - previous.departure,
+            # Terminal dwell is outside the trip runtime, so it stays blank.
+            "holding_min": points.holding.where(points.seq.lt(points["count"])),
+        }
+    ).loc[points.seq.gt(1)]
+    names = {
+        "route": "route",
+        "direction": "direction",
+        "pattern": "pattern",
+        "block": "block",
+        "start": "start_min",
+        "runtime": "runtime_min",
+        "layover": "layover_min",
+        "layover_status": "layover_status",
+    }
+    trip_info = trips.set_index("trip_id")[list(names)].rename(columns=names)
+    table = table.merge(trip_info, left_on="trip_id", right_index=True, validate="many_to_one")
+    table["start"] = table.start_min.map(minutes_to_hhmm)
+    table = table.sort_values(["direction", "pattern", "start_min", "trip_id", "segment"])
+    return lead_columns(
+        table, ["route", "direction", "pattern", "block", "trip_id", "start", "start_min"]
+    )
+
+
+def trip_summary_table(trips: pd.DataFrame, route: str) -> pd.DataFrame:
+    """Return the Stage 2 sheet as a table with numeric start and finish minutes."""
+    table = display_trip_table(trips, route)
+    table.columns = [snake_case(c) for c in table.columns]
+    rows = trips.loc[table.index]
+    table = table.assign(route=route, start_min=rows.start, end_min=rows.end)
+    return lead_columns(table, ["route", "direction", "day_type", "start", "start_min", "end_min"])
+
+
+def segment_summary_table(segments: pd.DataFrame, route: str, cfg: Settings) -> pd.DataFrame:
+    """Return the Stage 3 sheet with stop IDs and Stage 4 recommendations as plain numbers.
+
+    target_percentile_min is the observed value at RECOMMEND_PERCENTILE before
+    rounding. recommended_min is blank where the Recommend sheets leave it blank.
+    """
+    table = display_segment_table(segments, route)
+    table.columns = [snake_case(c) for c in table.columns]
+    rows = segments.loc[table.index]
+    recommended = [
+        recommended_minutes(target, n, cfg) if 4 in cfg.stages and basis == "GTFS" else np.nan
+        for target, n, basis in zip(rows.target, rows.n, rows.basis)
+    ]
+    table = table.assign(
+        route=route,
+        gtfs_direction=rows.gtfs_direction,
+        start_min=rows.start,
+        end_min=rows.end,
+        from_stop_id=rows.from_id,
+        to_stop_id=rows.to_id,
+        target_percentile_min=rows.target,
+        recommended_min=pd.Series(recommended, index=table.index, dtype=float),
+    )
+    table["recommended_change_min"] = table.recommended_min - table.scheduled_interval_min
+    first = ["route", "direction", "gtfs_direction", "day_type", "pattern", "start", "start_min"]
+    first += ["end_min", "segment", "from", "from_stop_id", "to", "to_stop_id"]
+    return lead_columns(table, first)
+
+
+def trip_observation_table(runtime: pd.DataFrame) -> pd.DataFrame:
+    """List Stage 2 runtimes per service date before trimming, for pooling trips into periods."""
+    names = {
+        "date": "date",
+        "route": "route",
+        "direction": "direction",
+        "day_type": "day_type",
+        "trip_id": "trip_id",
+        "start": "start_min",
+        "end": "end_min",
+        "scheduled": "scheduled_min",
+        "actual": "actual_min",
+    }
+    table = runtime[list(names)].rename(columns=names)
+    table = table.assign(
+        date=table.date.dt.strftime("%Y-%m-%d"), start=table.start_min.map(minutes_to_hhmm)
+    )
+    table = table.sort_values(["route", "direction", "day_type", "start_min", "date", "trip_id"])
+    return lead_columns(table, ["date", "route", "direction", "day_type", "trip_id", "start"])
+
+
+def segment_observation_table(observations: pd.DataFrame) -> pd.DataFrame:
+    """List Stage 3 intervals per service date before trimming, for pooling trips into periods."""
+    names = {
+        "date": "date",
+        "route": "route",
+        "direction": "direction",
+        "gtfs_direction": "gtfs_direction",
+        "day_type": "day_type",
+        "pattern": "pattern",
+        "trip_id": "trip_id",
+        "gtfs_trip": "gtfs_trip",
+        "start": "start_min",
+        "end": "end_min",
+        "seq": "segment",
+        "from": "from",
+        "from_id": "from_stop_id",
+        "to": "to",
+        "to_id": "to_stop_id",
+        "scheduled": "scheduled_interval_min",
+        "actual": "observed_interval_min",
+        "scheduled_holding": "scheduled_holding_included_min",
+        "observed_dwell": "observed_dwell_min",
+        "generic": "generic_event",
+        "basis": "basis",
+    }
+    table = observations[list(names)].rename(columns=names)
+    table = table.assign(
+        date=table.date.dt.strftime("%Y-%m-%d"), start=table.start_min.map(minutes_to_hhmm)
+    )
+    order = ["route", "direction", "day_type", "pattern", "start_min", "segment", "date", "trip_id"]
+    table = table.sort_values(order)
+    first = ["date", "route", "direction", "gtfs_direction", "day_type", "pattern", "trip_id"]
+    return lead_columns(table, [*first, "gtfs_trip", "start"])
+
+
+def csv_tables(
+    cfg: Settings,
+    route: str,
+    schedule: dict[str, pd.DataFrame] | None,
+    trips: pd.DataFrame,
+    segments: pd.DataFrame,
+) -> dict[str, pd.DataFrame]:
+    """Return one workbook's summary results as long tables keyed by CSV file name."""
+    tables = {}
+    if 1 in cfg.stages and schedule is not None and not schedule["trips"].empty:
+        tables["1_gtfs_segments"] = gtfs_segment_table(schedule, route)
+    if 2 in cfg.stages and not trips.empty:
+        tables["2_observed_trips"] = trip_summary_table(trips, route)
+    if not segments.empty:
+        tables["3_observed_segments"] = segment_summary_table(segments, route, cfg)
+    return tables
+
+
+def write_csv_data(folder: Path, tables: dict[str, list[pd.DataFrame]]) -> list[Path]:
+    """Write each nonempty table once for all routes, with minutes rounded to 0.01."""
+    written = []
+    for name, parts in tables.items():
+        parts = [part for part in parts if not part.empty]
+        if not parts:
+            continue
+        frame = pd.concat(parts, ignore_index=True)
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"{name}.csv"
+        frame.to_csv(path, index=False, encoding="utf-8", float_format="%.2f")
+        logging.info("Wrote %s (%d rows)", path, len(frame))
+        written.append(path)
+    return written
 
 
 # =============================================================================
@@ -1562,6 +1761,15 @@ def notes(cfg: Settings, route: str, direction: str, status: dict[int, str]) -> 
                 "cells can be edited; change/total formulas update. Every run creates a new "
                 "folder.",
             ],
+            [
+                "CSV data",
+                "The run folder's data/ subfolder holds these results as CSV tables for scripts "
+                "and AI tools, one file per table for all routes, with plain minutes and stop IDs "
+                "(GTFS, or CLEVER timepoint IDs where Basis is not GTFS). *_by_date files list "
+                "every service date before trimming: to test a planner period, pool its trips' "
+                "rows and recompute the percentile. The CSVs are read-only; edits here are not "
+                "written back.",
+            ],
         ],
     )
 
@@ -1658,8 +1866,10 @@ def run(cfg: Settings) -> dict[str, object]:
     handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
     logger.addHandler(handler)
     schedule, runtime, trips, segments = None, None, pd.DataFrame(), pd.DataFrame()
+    observations = pd.DataFrame()
     status = {}
     files = []
+    tables: dict[str, list[pd.DataFrame]] = {}
     try:
         logging.info(
             "Routes: %s | stages %s | trim %.0f%% each tail.", routes, cfg.stages, cfg.trim * 100
@@ -1737,15 +1947,25 @@ def run(cfg: Settings) -> dict[str, object]:
             write_book(path, sheets)
             files.append(path)
             logging.info("Wrote %s", path)
+            selected = csv_tables(cfg, route, selected_schedule, selected_trips, selected_segments)
+            for name, table in selected.items():
+                tables.setdefault(name, []).append(table.assign(workbook=path.name))
+        if 2 in cfg.stages and runtime is not None and not runtime.empty:
+            tables["2_observed_trips_by_date"] = [trip_observation_table(runtime)]
+        if not observations.empty:
+            tables["3_observed_segments_by_date"] = [segment_observation_table(observations)]
         (output / "settings.json").write_text(
             json.dumps(asdict(cfg), indent=2, default=str), encoding="utf-8"
         )
+        data_files = write_csv_data(output / "data", tables)
         return {
             "files": files,
+            "data_files": data_files,
             "status": status,
             "schedule": schedule,
             "trips": trips,
             "segments": segments,
+            "observations": observations,
             "output": output,
             "failed": any(value.startswith("FAILED") for value in status.values()),
         }
