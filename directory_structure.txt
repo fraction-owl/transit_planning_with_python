@@ -103,6 +103,7 @@ transit_planning_with_python/
 │   │   ├── load_factor_monitor.py
 │   │   ├── max_load_from_tides.py
 │   │   ├── ntd_anchor_builder.py
+│   │   ├── ntd_monthly_config_example.txt
 │   │   ├── ntd_monthly_summary.py
 │   │   ├── ntd_monthly_trends_export.py
 │   │   ├── ridership_by_hour.py
