@@ -226,10 +226,25 @@ def check_no_utils_import(src: str, path: Path) -> list[Violation]:
 
 
 def check_config_section(src: str) -> list[Violation]:
-    """Flag a missing or incomplete CONFIGURATION section."""
-    has_header = bool(re.search(r"#[^\n]*\bCONFIGURATION\b", src, re.IGNORECASE))
+    """Flag a missing or incomplete CONFIGURATION section.
+
+    CONTRIBUTING.md asks for "a clear configuration section at the top" without
+    mandating how the banner is spelled, so a section headed ``# CONFIG`` or
+    ``# Config`` counts as present — the finding then becomes the accurate one
+    about its BEGIN/END markers rather than a false claim that no section
+    exists. A block already delimited by both markers also counts as present,
+    with or without a banner.
+    """
     has_begin = "# === BEGIN CONFIG ===" in src
     has_end = "# === END CONFIG ===" in src
+    # A banner is a comment whose text, once any rule characters are stripped,
+    # starts with CONFIG or CONFIGURATION. That accepts `# CONFIG`, `# Config`,
+    # `# ==== CONFIGURATION ====` and `# CONFIG -- notes`, while rejecting prose
+    # that merely mentions config ("# Full config OR previous run-log location").
+    has_banner = bool(
+        re.search(r"^[ \t]*#[ \t=\-]*CONFIG(?:URATION)?\b", src, re.IGNORECASE | re.MULTILINE)
+    )
+    has_header = has_banner or has_begin or has_end
 
     if not has_header:
         return [
