@@ -1,9 +1,10 @@
 """Compute route-level GTFS supply & competition features (PART A feature generator).
 
 This is a feature-generation script for the cross-sectional route boardings model
-(engine 1). It reads a GTFS feed directly — no arcpy, no geospatial deps beyond a
-haversine — and emits one row per route, keyed so the result joins straight onto the
-NTD boardings anchor consumed by ``route_performance_model.py`` (PART B).
+(engine 1). It reads a GTFS feed directly — no arcpy; distances are haversine, and
+GeoPandas is used only to read the optional CBD polygon layer — and emits one row per
+route, keyed so the result joins straight onto the NTD boardings anchor consumed by
+``route_performance_model.py`` (PART B).
 
 Where this sits in the pipeline:
 
@@ -35,9 +36,14 @@ Features produced (one row per route, keyed on ``route_id`` = GTFS route_short_n
         competitor_trips_at_shared_stops summed competitor trip pressure at shared stops
         competition_intensity            competitor trips at shared stops / this route's trips
 
+    Location (only when CBD_PATH is set):
+        serves_cbd            1 if the route stops inside or on the edge of any polygon in
+                              the CBD layer, on any schedule in the feed; otherwise 0
+
 PHASE 2 (deferred to a separate spatial feature script): WMATA cross-agency competition
 and Metrorail proximity both need an external feed and spatial stop matching, so they
-belong with the geospatial features, not in this pure-GTFS extractor.
+belong with the geospatial features rather than here. serves_cbd is the exception: it
+only tests this feed's own stops against a polygon layer.
 
 Caveats worth knowing before you read the coefficients:
     - median_headway_min is a coarse all-day, all-direction route-level median; it mixes
@@ -61,9 +67,17 @@ Caveats worth knowing before you read the coefficients:
       is the length of the shape variant the most trips run (the *typical* one-way trip).
       They diverge when a route has short-turns or occasional extensions. stops_per_mile
       still pairs with route_length_mi (the all-shapes distinct-stop count needs the extent).
+    - serves_cbd ignores the analysis weekday: a route is 1 if any of its trips, on any
+      service in the feed, stops in the CBD. It tests stops, not the route line, so a
+      route that passes through the CBD without stopping there is 0. A stop exactly on a
+      polygon's edge counts as inside. When several GTFS route_ids share a public route
+      number, the number is 1 if any of them stops in the CBD.
 
 Inputs:
     A GTFS feed folder containing routes/trips/calendar/stop_times/shapes (.txt).
+    Optionally, CBD_PATH: a polygon layer (.shp, or a .zip holding one) of the central
+    business district. It may hold several polygons; a stop in any of them counts.
+    stops.txt is also read when it is set.
 
 Outputs:
     OUTPUT_DIR / OUTPUT_CSV_NAME : the route-keyed feature table.
@@ -72,8 +86,8 @@ Outputs:
 
 Typical usage:
     Update the paths in the CONFIGURATION block (or pass ``--gtfs-dir`` /
-    ``--output-dir`` / ``--analysis-weekday``) and run from a shell or a
-    Jupyter notebook.
+    ``--output-dir`` / ``--analysis-weekday`` / ``--cbd-path``) and run from a
+    shell or a Jupyter notebook.
 """
 
 from __future__ import annotations
@@ -82,10 +96,13 @@ import argparse
 import datetime as dt
 import hashlib
 import logging
+import os
 import sys
+import zipfile
 from pathlib import Path
 from typing import Final, List, Optional, Sequence
 
+import geopandas as gpd
 import numpy as np
 import pandas as pd
 
@@ -113,6 +130,12 @@ GTFS_DIR: Final[Path] = INPUT_DIR / "your_gtfs_name"  # <<< EDIT ME
 # Weekday to characterize (monday..friday). The script picks the date with the
 # most active weekday service_ids so a holiday-skewed date isn't used.
 ANALYSIS_WEEKDAY: Final[str] = "tuesday"  # <<< EDIT ME
+
+# Optional central business district (CBD) layer: a polygon shapefile (.shp) or a .zip
+# holding one, with a defined coordinate system. It may hold several polygons. When set,
+# the output gains serves_cbd (1 if the route stops inside or on the edge of any polygon,
+# on any schedule; otherwise 0). Leave as None to skip the column.
+CBD_PATH: Final[Optional[Path]] = None
 
 # Where the feature CSV and run log are written (the bundle dir PART B reads).
 OUTPUT_DIR: Final[Path] = Path(r"Path\To\Your\prepped_features")  # <<< EDIT ME
@@ -688,6 +711,158 @@ def compute_competition_metrics(
 
 
 # =============================================================================
+# CBD FLAG (optional; needs CBD_PATH)
+# =============================================================================
+
+
+# Canonical implementation: utils/shapefile_helpers.py.
+def load_shapefile(path: str, member: Optional[str] = None) -> gpd.GeoDataFrame:
+    """Load a shapefile given a direct ``.shp`` path or a ``.zip`` archive.
+
+    Args:
+        path: Path to a ``.shp`` file, or to a ``.zip`` archive containing
+            one. A zipped shapefile is opened directly via GDAL's ``zip://``
+            virtual filesystem, so the archive is never extracted to disk.
+        member: For a ``.zip`` containing more than one ``.shp``, the name
+            of the one to load (matched case-insensitively against its
+            base filename, e.g. ``"Hospitals.shp"``). Ignored when *path*
+            is a direct ``.shp`` file. Required when the archive contains
+            more than one shapefile.
+
+    Returns:
+        The loaded :class:`geopandas.GeoDataFrame`.
+
+    Raises:
+        OSError: *path* does not exist.
+        ValueError: *path* is neither a ``.shp`` nor a ``.zip`` file; the
+            zip is unreadable/corrupt; the zip contains no shapefile; the
+            zip contains more than one shapefile and *member* was not
+            supplied; or *member* does not match any shapefile in the zip.
+    """
+    if not os.path.exists(path):
+        raise OSError(f"The path '{path}' does not exist.")
+
+    lower_path = path.lower()
+    if lower_path.endswith(".shp"):
+        logging.info("Reading %s", path)
+        return gpd.read_file(path)
+
+    if not lower_path.endswith(".zip"):
+        raise ValueError(f"'{path}' is neither a .shp nor a .zip file.")
+
+    try:
+        with zipfile.ZipFile(path) as archive:
+            shp_members = [name for name in archive.namelist() if name.lower().endswith(".shp")]
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"'{path}' is not a valid zip archive.") from exc
+
+    if not shp_members:
+        raise ValueError(f"No .shp file found inside '{path}'.")
+
+    if member is not None:
+        matches = [name for name in shp_members if os.path.basename(name).lower() == member.lower()]
+        if not matches:
+            raise ValueError(f"'{member}' not found inside '{path}'. Available: {shp_members}")
+        chosen = matches[0]
+    elif len(shp_members) == 1:
+        chosen = shp_members[0]
+    else:
+        raise ValueError(
+            f"'{path}' contains {len(shp_members)} shapefiles; pass `member=` to "
+            f"choose one of: {shp_members}"
+        )
+
+    source = f"zip://{path}!{chosen}"
+    logging.info("Reading %s", source)
+    return gpd.read_file(source)
+
+
+def load_cbd_area(cbd_path: Path) -> gpd.GeoSeries:
+    """Read the CBD layer and return the union of its polygons as a one-row GeoSeries.
+
+    The result keeps the layer's own coordinate system, so stops are projected into it
+    (rather than the polygons out of it) and a stop on a polygon's edge stays on it.
+
+    Raises:
+        OSError: *cbd_path* does not exist.
+        ValueError: The layer cannot be read, has no coordinate system, holds no
+            polygons, or holds features that are not polygons.
+    """
+    layer = load_shapefile(str(cbd_path))
+    if layer.crs is None:
+        raise ValueError(f"CBD layer '{cbd_path}' has no coordinate system (missing .prj?).")
+    geoms = layer.geometry[layer.geometry.notna() & ~layer.geometry.is_empty]
+    if geoms.empty:
+        raise ValueError(f"CBD layer '{cbd_path}' holds no polygons.")
+    other_types = sorted(set(geoms.geom_type) - {"Polygon", "MultiPolygon"})
+    if other_types:
+        raise ValueError(f"CBD layer '{cbd_path}' must hold polygons; found {other_types}.")
+    logging.info("CBD layer: %d polygon feature(s) from '%s'.", len(geoms), cbd_path)
+    return gpd.GeoSeries([geoms.make_valid().union_all()], crs=layer.crs)
+
+
+def find_cbd_stop_ids(stops: pd.DataFrame, cbd_area: gpd.GeoSeries) -> set[str]:
+    """Return the stop_ids located inside or on the edge of *cbd_area*.
+
+    Stops without usable coordinates (e.g. generic nodes) are skipped.
+    """
+    lat = pd.to_numeric(stops["stop_lat"], errors="coerce")
+    lon = pd.to_numeric(stops["stop_lon"], errors="coerce")
+    located = lat.notna() & lon.notna()
+    points = gpd.GeoSeries(
+        gpd.points_from_xy(lon[located], lat[located]),
+        index=stops.index[located],
+        crs="EPSG:4326",
+    ).to_crs(cbd_area.crs)
+    # intersects, not within: a point on the polygon boundary counts as inside.
+    inside = points.intersects(cbd_area.iloc[0])
+    return set(stops.loc[inside[inside].index, "stop_id"].astype(str))
+
+
+def compute_serves_cbd(
+    stop_times_path: Path,
+    all_trips: pd.DataFrame,
+    routes: pd.DataFrame,
+    cbd_stop_ids: set[str],
+    chunksize: int,
+) -> pd.DataFrame:
+    """Flag each public route number that stops in the CBD on any schedule.
+
+    Streams stop_times.txt for every trip in the feed (not just the analysis weekday's),
+    so a route whose only CBD stops are on, say, Saturday trips is still flagged.
+
+    Args:
+        stop_times_path: Path to stop_times.txt.
+        all_trips: Every trip in the feed, with string ``route_id`` and ``trip_id``.
+        routes: routes.txt with string ``route_id`` and ``route_short_name``.
+        cbd_stop_ids: stop_ids inside or on the edge of the CBD.
+        chunksize: Rows per stop_times.txt chunk.
+
+    Returns:
+        ``[route_id, serves_cbd]`` keyed like the feature table (canonical
+        route_short_name), with ``serves_cbd`` 1 or 0.
+    """
+    cbd_trip_ids: set[str] = set()
+    if cbd_stop_ids:
+        for chunk in pd.read_csv(
+            stop_times_path,
+            dtype=str,
+            usecols=["trip_id", "stop_id"],
+            encoding="utf-8-sig",
+            low_memory=False,
+            chunksize=chunksize,
+        ):
+            in_cbd = chunk["stop_id"].astype(str).isin(cbd_stop_ids)
+            cbd_trip_ids.update(chunk.loc[in_cbd, "trip_id"].astype(str))
+    cbd_route_ids = set(all_trips.loc[all_trips["trip_id"].isin(cbd_trip_ids), "route_id"])
+
+    flags = routes[["route_id", "route_short_name"]].dropna(subset=["route_short_name"]).copy()
+    flags["serves_cbd"] = flags["route_id"].isin(cbd_route_ids).astype(int)
+    flags["route_id"] = _canonical_key(flags["route_short_name"])
+    return flags.groupby("route_id")["serves_cbd"].max().reset_index()
+
+
+# =============================================================================
 # COLLAPSE GTFS route_id -> public route number (route_short_name)
 # =============================================================================
 
@@ -821,10 +996,12 @@ def write_run_log(
     n_routes: int,
     gtfs_dir: Path = GTFS_DIR,
     analysis_weekday: str = ANALYSIS_WEEKDAY,
+    cbd_path: Optional[Path] = CBD_PATH,
 ) -> None:
     """Write a run-log sidecar capturing config, feed provenance, and selected date."""
     log_path = output_dir / "gtfs_route_features_runlog.txt"
     provenance = [f"  {name}  sha256={digest}" for name, digest in sorted(feed_files.items())]
+    cbd_line = f"{cbd_path}  sha256={_sha256_file(cbd_path)}" if cbd_path else "(none)"
     lines = [
         "=" * 72,
         "GTFS ROUTE FEATURE EXTRACTION RUN LOG (PART A)",
@@ -832,6 +1009,7 @@ def write_run_log(
         f"Run timestamp:   {dt.datetime.now().isoformat(timespec='seconds')}",
         f"GTFS feed:       {gtfs_dir}",
         f"Analysis date:   {analysis_date.isoformat()} ({analysis_weekday})",
+        f"CBD layer:       {cbd_line}",
         f"Routes emitted:  {n_routes}",
         "",
         "-" * 72,
@@ -858,6 +1036,7 @@ def run(
     gtfs_dir: Path | None = None,
     output_dir: Path | None = None,
     analysis_weekday: str | None = None,
+    cbd_path: Path | None = None,
 ) -> Optional[pd.DataFrame]:
     """Build the route-level GTFS feature table and write it to ``output_dir``.
 
@@ -874,10 +1053,14 @@ def run(
     gtfs_dir = GTFS_DIR if gtfs_dir is None else Path(gtfs_dir)
     output_dir = OUTPUT_DIR if output_dir is None else Path(output_dir)
     analysis_weekday = ANALYSIS_WEEKDAY if analysis_weekday is None else analysis_weekday
+    cbd_path = CBD_PATH if cbd_path is None else Path(cbd_path)
 
     if "Path\\To\\Your" in str(gtfs_dir) or "Path\\To\\Your" in str(output_dir):
         logging.warning("Set GTFS_DIR and OUTPUT_DIR (marked '# <<< EDIT ME') before running.")
         return None
+
+    # Read the CBD layer first so a bad path or layer fails before the slow GTFS work.
+    cbd_area = load_cbd_area(cbd_path) if cbd_path is not None else None
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -895,6 +1078,8 @@ def run(
     for col in ("route_id", "trip_id", "service_id", "shape_id"):
         if col not in trips.columns:
             raise ValueError(f"trips.txt missing required column: {col}")
+    # Every trip on every service, kept for the CBD flag (which ignores the weekday filter).
+    all_trips = trips[["route_id", "trip_id"]].fillna("").astype(str)
     trips = trips[trips["service_id"].astype(str).isin(active_sids)].copy()
     for col in ("route_id", "trip_id", "shape_id"):
         trips[col] = trips[col].fillna("").astype(str)
@@ -931,6 +1116,34 @@ def run(
 
     features = collapse_to_route_number(metrics, route_col="route_short_name")
     features["route_id"] = _canonical_key(features["route_id"])
+
+    if cbd_area is not None:
+        stops = _read_gtfs_csv(
+            _gtfs_path(gtfs_dir, "stops.txt"), usecols=["stop_id", "stop_lat", "stop_lon"]
+        )
+        cbd_stop_ids = find_cbd_stop_ids(stops, cbd_area)
+        if not cbd_stop_ids:
+            logging.warning(
+                "No stops fall inside the CBD layer, so every route gets serves_cbd = 0. "
+                "Check that the layer covers this feed's area and has the right "
+                "coordinate system."
+            )
+        serves_cbd = compute_serves_cbd(
+            _gtfs_path(gtfs_dir, "stop_times.txt"),
+            all_trips,
+            routes,
+            cbd_stop_ids,
+            STOP_TIMES_CHUNKSIZE,
+        )
+        features = features.merge(serves_cbd, on="route_id", how="left")
+        features["serves_cbd"] = features["serves_cbd"].fillna(0).astype(int)
+        logging.info(
+            "serves_cbd: %d of %d route(s) stop at one of %d CBD stop(s).",
+            int(features["serves_cbd"].sum()),
+            len(features),
+            len(cbd_stop_ids),
+        )
+
     if ROUTE_KEY_OUT != "route_id":
         features = features.rename(columns={"route_id": ROUTE_KEY_OUT})
 
@@ -952,6 +1165,7 @@ def run(
         "n_competitor_routes",
         "competitor_trips_at_shared_stops",
         "competition_intensity",
+        "serves_cbd",
     ]
     features = features[[c for c in ordered if c in features.columns]]
     for col in features.columns:
@@ -963,13 +1177,20 @@ def run(
     logging.info("Wrote %d routes x %d features to '%s'.", *features.shape, out_csv)
 
     if WRITE_RUN_LOG:
+        feed_names = ["routes.txt", "trips.txt", "calendar.txt", "stop_times.txt", "shapes.txt"]
+        if cbd_path is not None:
+            feed_names.append("stops.txt")
         feed_files = {
-            name: _sha256_file(gtfs_dir / name)
-            for name in ("routes.txt", "trips.txt", "calendar.txt", "stop_times.txt", "shapes.txt")
-            if (gtfs_dir / name).exists()
+            name: _sha256_file(gtfs_dir / name) for name in feed_names if (gtfs_dir / name).exists()
         }
         write_run_log(
-            output_dir, feed_files, analysis_date, len(features), gtfs_dir, analysis_weekday
+            output_dir,
+            feed_files,
+            analysis_date,
+            len(features),
+            gtfs_dir,
+            analysis_weekday,
+            cbd_path,
         )
 
     logging.info("Done.")
@@ -1031,6 +1252,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Weekday to characterize (monday..friday).",
     )
     parser.add_argument(
+        "--cbd-path",
+        type=Path,
+        default=CBD_PATH,
+        help=(
+            "Optional CBD polygon layer (.shp, or a .zip holding one). Adds the serves_cbd "
+            "column; leave unset to skip it."
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         default=logging.getLevelName(LOG_LEVEL),
         help="DEBUG / INFO / WARNING / ERROR.",
@@ -1062,6 +1292,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         gtfs_dir=args.gtfs_dir,
         output_dir=args.output_dir,
         analysis_weekday=args.analysis_weekday,
+        cbd_path=args.cbd_path,
     )
     return 0
 

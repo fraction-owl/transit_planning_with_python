@@ -8,24 +8,19 @@
 
 # Testing
 faker==25.8.0                # Fake data generation for tests
-pytest==9.1.1                # Unit testing framework
+pytest==8.3.5                # Unit testing framework
 pytest-cov                   # Test coverage reporting
 
 # Linting & formatting
 # Keep this version in sync with `rev` in .pre-commit-config.yaml.
-ruff==0.17.1                 # Linting & formatting
+ruff==0.17.2                 # Linting & formatting
 pre-commit                   # Local git hooks (ruff)
 
 # Type checking
 # Pinned while [tool.ty.rules] entries are promoted to "error": ty is pre-1.0
 # and new releases add or reclassify diagnostics, which would break CI on an
 # unplanned upgrade. Bump deliberately and re-run `ty check scripts`.
-ty==0.0.89                   # Type checks; error-level rules block CI
-
-# Data Processing
-# Required only by the dev fixture builders (dev_tools/build_cacensus_fixtures.py);
-# no runtime script uses polars.
-polars==0.20.31              # Columnar DataFrame engine for large fixture extracts
+ty==0.0.92                   # Type checks; error-level rules block CI
 
 # ------------- Typing stubs (temporary) -------------------------------------
 pandas-stubs==2.2.*

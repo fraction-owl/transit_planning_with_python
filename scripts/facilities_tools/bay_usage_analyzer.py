@@ -54,7 +54,7 @@ import json
 import logging
 import os
 import re
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -1152,7 +1152,7 @@ def _is_placeholder_path(p: str) -> bool:
 
 # Canonical version lives in utils/block_timeline_helpers.py -- keep this copy in sync.
 @contextmanager
-def open_report_workbook(path: str) -> Iterator[pd.ExcelWriter]:
+def open_report_workbook(path: str) -> Generator[pd.ExcelWriter, None, None]:
     """Open an openpyxl workbook writer whose cleanup never hides a writing error.
 
     Build every sheet's data before entering, so a failed calculation never

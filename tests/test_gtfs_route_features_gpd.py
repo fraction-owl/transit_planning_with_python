@@ -1,18 +1,28 @@
 from __future__ import annotations
 
+import shutil
+import zipfile
 from pathlib import Path
 
+import geopandas as gpd
 import pandas as pd
 import pytest
+from shapely.geometry import Point, box
 
-from scripts.gtfs_exports.gtfs_route_features import (
+from scripts.gtfs_exports.gtfs_route_features_gpd import (
     _service_day_coverage,
     collapse_to_route_number,
     compute_route_supply_metrics,
+    compute_serves_cbd,
+    find_cbd_stop_ids,
+    load_cbd_area,
     main,
 )
 
-GTFS_BASIC = Path(__file__).parent / "fixtures" / "gtfs_basic"
+FIXTURES = Path(__file__).parent / "fixtures"
+GTFS_BASIC = FIXTURES / "gtfs_basic"
+MOCK_GTFS_DC_ZIP = FIXTURES / "mock_gtfs_dc.zip"
+MOCK_CBD_ZIP = FIXTURES / "mock_cbd_dc.zip"
 
 
 def _two_stop_times(spec: list[tuple[str, str, str]]) -> pd.DataFrame:
@@ -285,3 +295,120 @@ def test_main_end_to_end_on_gtfs_basic(tmp_path: Path) -> None:
     assert features.loc["R1", "shared_stop_share"] == pytest.approx(4 / 6, abs=1e-4)
     assert features["n_competitor_routes"].tolist() == [2, 2, 2]
     assert features.loc["R1", "competition_intensity"] == pytest.approx(1.1)
+    # No CBD layer configured: the column is left out rather than filled with zeros.
+    assert "serves_cbd" not in features.columns
+    runlog = (tmp_path / "gtfs_route_features_runlog.txt").read_text(encoding="utf-8")
+    assert "CBD layer:       (none)" in runlog
+
+
+# ---------------------------------------------------------------------------
+# serves_cbd  (optional CBD polygon layer)
+# ---------------------------------------------------------------------------
+
+
+def _write_layer(gdf: gpd.GeoDataFrame, path: Path) -> Path:
+    gdf.to_file(path)
+    return path
+
+
+def test_serves_cbd_on_the_mock_dc_feed_and_cbd_fixture(tmp_path: Path) -> None:
+    # Routes 10, 20, and 30 stop in the downtown polygon only (none stop in the annex).
+    # Route 40 has no stop in either polygon, although its line cuts across the annex.
+    # Holiday-only route 50H has no weekday service, so it has no row at all.
+    with zipfile.ZipFile(MOCK_GTFS_DC_ZIP) as zf:
+        zf.extractall(tmp_path / "feed")
+    out_dir = tmp_path / "out"
+    argv = ["--gtfs-dir", str(tmp_path / "feed" / "dc"), "--output-dir", str(out_dir)]
+
+    assert main([*argv, "--cbd-path", str(MOCK_CBD_ZIP)]) == 0
+
+    features = pd.read_csv(out_dir / "gtfs_route_features.csv", dtype={"route_id": str})
+    assert dict(zip(features["route_id"], features["serves_cbd"])) == {
+        "10": 1,
+        "20": 1,
+        "30": 1,
+        "40": 0,
+    }
+    runlog = (out_dir / "gtfs_route_features_runlog.txt").read_text(encoding="utf-8")
+    assert f"CBD layer:       {MOCK_CBD_ZIP}  sha256=" in runlog
+
+
+def test_serves_cbd_counts_a_stop_served_only_on_another_schedule(tmp_path: Path) -> None:
+    # R2's only CBD stop (S11) is on a Saturday trip; the weekday supply features still
+    # come from the Tuesday trips, but the flag counts every schedule in the feed.
+    feed = tmp_path / "feed"
+    shutil.copytree(GTFS_BASIC, feed)
+    with (feed / "calendar.txt").open("a", encoding="utf-8") as fh:
+        fh.write("SAT,0,0,0,0,0,1,0,20260101,20261231\n")
+    with (feed / "stops.txt").open("a", encoding="utf-8") as fh:
+        fh.write("S11,1011,Saturday Market,38.7600,-77.0700\n")
+    with (feed / "trips.txt").open("a", encoding="utf-8") as fh:
+        fh.write("R2,SAT,T10,0,B7,SHP_R2\n")
+    with (feed / "stop_times.txt").open("a", encoding="utf-8") as fh:
+        fh.write("T10,09:00:00,09:00:00,S7,1\nT10,09:10:00,09:10:00,S11,2\n")
+    cbd = gpd.GeoDataFrame(
+        {"NAME": ["CBD"]}, geometry=[Point(-77.0700, 38.7600).buffer(0.001)], crs="EPSG:4326"
+    )
+    cbd_path = _write_layer(cbd, tmp_path / "cbd.shp")
+
+    argv = ["--gtfs-dir", str(feed), "--output-dir", str(tmp_path / "out")]
+    assert main([*argv, "--cbd-path", str(cbd_path)]) == 0
+
+    features = pd.read_csv(tmp_path / "out" / "gtfs_route_features.csv").set_index("route_id")
+    assert features["serves_cbd"].to_dict() == {"R1": 0, "R2": 1, "R3": 0}
+    assert features.loc["R2", "trips_per_day"] == 3
+
+
+def test_stop_on_a_polygon_edge_counts_as_inside() -> None:
+    stops = pd.DataFrame(
+        {
+            "stop_id": ["inside", "on_edge", "on_corner", "outside", "no_coords"],
+            "stop_lat": ["38.745", "38.745", "38.750", "38.745", ""],
+            "stop_lon": ["-77.085", "-77.080", "-77.080", "-77.0799", ""],
+        }
+    )
+    area = gpd.GeoSeries([box(-77.09, 38.74, -77.08, 38.75)], crs="EPSG:4326")
+
+    assert find_cbd_stop_ids(stops, area) == {"inside", "on_edge", "on_corner"}
+
+
+def test_any_polygon_in_the_layer_counts(tmp_path: Path) -> None:
+    layer = gpd.GeoDataFrame(
+        {"NAME": ["Downtown", "Annex"]},
+        geometry=[box(-77.09, 38.74, -77.08, 38.75), box(-77.06, 38.76, -77.05, 38.77)],
+        crs="EPSG:4326",
+    )
+    area = load_cbd_area(_write_layer(layer, tmp_path / "cbd.shp"))
+    stops = pd.DataFrame(
+        {
+            "stop_id": ["downtown", "annex", "between"],
+            "stop_lat": ["38.745", "38.765", "38.755"],
+            "stop_lon": ["-77.085", "-77.055", "-77.070"],
+        }
+    )
+
+    assert find_cbd_stop_ids(stops, area) == {"downtown", "annex"}
+
+
+def test_serves_cbd_collapses_route_ids_onto_the_public_number(tmp_path: Path) -> None:
+    # Two route_ids publish as route 5; only the second stops in the CBD, which is
+    # enough to flag route 5. Route 6 never stops there.
+    stop_times = tmp_path / "stop_times.txt"
+    stop_times.write_text("trip_id,stop_id\nT1,A\nT1,B\nT2,B\nT2,CBD\nT3,A\n", encoding="utf-8")
+    all_trips = pd.DataFrame({"route_id": ["5a", "5b", "6"], "trip_id": ["T1", "T2", "T3"]})
+    routes = pd.DataFrame({"route_id": ["5a", "5b", "6"], "route_short_name": ["5", "5", "6"]})
+
+    flags = compute_serves_cbd(stop_times, all_trips, routes, {"CBD"}, chunksize=2)
+
+    assert flags.set_index("route_id")["serves_cbd"].to_dict() == {"5": 1, "6": 0}
+
+
+@pytest.mark.filterwarnings("ignore:'crs' was not provided")
+def test_cbd_layer_must_be_polygons_with_a_coordinate_system(tmp_path: Path) -> None:
+    points = gpd.GeoDataFrame({"NAME": ["x"]}, geometry=[Point(-77.0, 38.9)], crs="EPSG:4326")
+    with pytest.raises(ValueError, match="must hold polygons"):
+        load_cbd_area(_write_layer(points, tmp_path / "points.shp"))
+
+    no_crs = gpd.GeoDataFrame({"NAME": ["x"]}, geometry=[box(-77.1, 38.8, -77.0, 38.9)])
+    with pytest.raises(ValueError, match="no coordinate system"):
+        load_cbd_area(_write_layer(no_crs, tmp_path / "no_crs.shp"))

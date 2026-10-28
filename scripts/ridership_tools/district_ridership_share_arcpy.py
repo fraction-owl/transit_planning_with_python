@@ -5,8 +5,9 @@ stop locations, determines which district contains each stop via an ArcPy
 point-in-polygon spatial join, and writes an Excel workbook of total and
 percent ridership by district. A reconciliation sheet accounts for every
 unallocated unit — ridership at stops outside all districts, STOP_IDs with no
-GTFS match, and (under "full" boundary allocation) ridership double-counted
-across districts — so discrepancies are auditable rather than silently hidden.
+GTFS match, rows with a blank STOP_ID, and (under "full" boundary allocation)
+ridership double-counted across districts — so discrepancies are auditable
+rather than silently hidden.
 
 A stop exactly coincident with a shared district boundary joins every touching
 district; BOUNDARY_ALLOCATION decides whether its ridership is divided evenly
@@ -34,7 +35,8 @@ Outputs
 - ``district_ridership_share.xlsx`` — sheets ``district_ridership`` (totals
   and percent shares per district), ``ridership_allocation`` (per
   stop-district allocation detail), and ``reconciliation`` (allocated vs.
-  outside-district vs. unmatched totals).
+  outside-district vs. unmatched vs. missing-STOP_ID totals). Values are
+  stored unrounded; APPLY_ROUNDING sets display formats only.
 - ``district_ridership_share_runlog.txt`` — run-log sidecar capturing the
   verbatim CONFIGURATION block, the effective settings, and SHA-256
   fingerprints of the inputs.
@@ -104,7 +106,8 @@ ROUTES_EXCLUDE: list[str] = []  # drop these (empty drops none)
 # (no rollup row), so an empty list sums every row — the daily total, the
 # same treatment as data_request_by_stop_processor.py's "All Time Periods"
 # sheet. A non-empty list keeps only those periods (compared
-# uppercased/stripped). NOTE: this rests on the periods being disjoint; a
+# uppercased/stripped); naming periods when the file has no TIME_PERIOD_FIELD
+# column fails loud. NOTE: this rests on the periods being disjoint; a
 # feed variant that adds a rollup row would double-count under the
 # empty-list default.
 TIME_PERIOD_FIELD: str = "TIME_PERIOD"
@@ -129,8 +132,8 @@ BOUNDARY_ALLOCATION: str = "split"
 #                 district, so shares sum below 100 by exactly the outside
 #                 share.
 # "grand_total" — the full ridership file: additionally counts STOP_IDs with
-#                 no GTFS match (join failures, not geography — use with
-#                 care).
+#                 no GTFS match and rows with a blank STOP_ID (join
+#                 failures, not geography — use with care).
 PCT_BASE: str = "allocated"
 
 # District polygons and the field carrying the district identifier/name.
@@ -140,10 +143,12 @@ DISTRICT_FIELD = "DISTRICT"
 # SPATIAL ---------------------------------------------------------------------
 # Stops are projected into the district layer's own spatial reference before
 # the containment join, so no target EPSG is configured and the districts
-# layer itself is never reprojected. If the WGS84-to-district-datum shift
-# matters at your stop locations, name an explicit geographic transformation
-# (e.g. "WGS_1984_(ITRF00)_To_NAD_1983"); None applies no datum
-# transformation.
+# layer itself is never reprojected. When the district datum differs from
+# WGS84 a geographic transformation is applied: name one explicitly (e.g.
+# "WGS_1984_(ITRF00)_To_NAD_1983"), or leave None to use the first one
+# arcpy.ListTransformations lists for the stops' extent. None does NOT mean
+# "no transformation". The transformation actually applied (or "none" when
+# none is listed, e.g. same datum) is recorded in the run log.
 GEO_TRANSFORMATION: Optional[str] = None
 
 # WORKSPACE -------------------------------------------------------------------
@@ -160,10 +165,13 @@ LOG_DIR = r"Path\To\Your\Logs"
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
 
 # ROUNDING --------------------------------------------------------------------
-# Per-stop values are rounded to ROUND_DECIMALS after the per-stop collapse,
-# BEFORE allocation/summing, so the district totals on the summary sheet
-# equal sums of the rounded per-stop rows on the allocation sheet — the
-# workbook stays internally consistent at the displayed precision.
+# Values are written unrounded, so every sheet reconciles exactly (district
+# totals = sums of the allocation rows = the reconciliation's allocated row,
+# and total = boardings + alightings). APPLY_ROUNDING only sets Excel number
+# formats so cells DISPLAY ROUND_DECIMALS places (PCT_DECIMALS for pct_*
+# columns). Each cell displays its own rounding, so displayed parts can
+# differ from a displayed total in the last digit; SUM() over the cells
+# uses the unrounded values.
 APPLY_ROUNDING: bool = True
 ROUND_DECIMALS: int = 1
 PCT_DECIMALS: int = 1
@@ -186,6 +194,11 @@ SOURCE_FILE_OVERRIDE: str = r""
 # Metrics carried through allocation. Keys of the per-stop ridership dicts and
 # column stems in the output ("boardings", "pct_boardings", ...).
 METRICS: tuple[str, ...] = ("boardings", "alightings", "total")
+
+# Key under which load_stop_ridership keeps ridership rows whose STOP_ID is
+# blank, so their totals reach the reconciliation's missing_stop_id row.
+# filter_stops drops blank GTFS keys, so this never matches a real stop.
+MISSING_STOP_ID_KEY: str = ""
 
 
 # =============================================================================
@@ -335,7 +348,10 @@ def filter_stops(stops: pd.DataFrame, join_key: str = GTFS_JOIN_KEY) -> pd.DataF
 
     The join key is the stops.txt field the ridership STOP_ID column matches
     ("stop_id" or "stop_code"). Keeps location_type 0/blank rows, drops rows
-    missing the key or coordinates, and warns on duplicate key values.
+    missing the key, drops rows whose coordinates are missing, non-numeric,
+    non-finite, or outside latitude [-90, 90] / longitude [-180, 180] (with a
+    warning; their ridership lands in unmatched_to_gtfs), and warns on
+    duplicate key values.
     Duplicates are retained: each point participates in the containment join
     and the districts found are unioned per key, so a key whose points land
     in different districts is treated like a boundary-coincident stop and
@@ -377,9 +393,21 @@ def filter_stops(stops: pd.DataFrame, join_key: str = GTFS_JOIN_KEY) -> pd.DataF
         )
     df = df[df["stop_key"] != ""]
 
-    df = df.dropna(subset=["stop_lat", "stop_lon"])
-    df["stop_lat"] = df["stop_lat"].astype(float)
-    df["stop_lon"] = df["stop_lon"].astype(float)
+    # between() is False for NaN and +/-inf, so one range test also rejects
+    # blank, non-numeric, and non-finite coordinates.
+    lat = pd.to_numeric(df["stop_lat"], errors="coerce")
+    lon = pd.to_numeric(df["stop_lon"], errors="coerce")
+    valid = lat.between(-90.0, 90.0) & lon.between(-180.0, 180.0)
+    n_bad_coords = int((~valid).sum())
+    if n_bad_coords:
+        logging.warning(
+            "Dropping %d stop(s) with missing or invalid coordinates (sample %s: %s); "
+            "their ridership is reported as unmatched_to_gtfs.",
+            n_bad_coords,
+            join_key,
+            df.loc[~valid, "stop_key"].head(5).tolist(),
+        )
+    df = df[valid].assign(stop_lat=lat[valid], stop_lon=lon[valid])
 
     n_dupe = int(df["stop_key"].duplicated().sum())
     if n_dupe:
@@ -468,13 +496,18 @@ def project_stops_to_district_sr(
     districts_fc: str,
     out_gdb: str,
     transformation: Optional[str] = GEO_TRANSFORMATION,
-) -> str:
+) -> tuple[str, str]:
     """Project the stops into the district layer's own spatial reference.
 
     Containment is evaluated in the district layer's native spatial reference
     (read via arcpy.Describe), so the polygons are never reprojected — only
-    the points move. When *transformation* is named it is applied; otherwise
-    no datum transformation is used.
+    the points move. A named *transformation* is applied as given. Left
+    empty, what Project applies depends on the session (its own default, the
+    Geographic Transformations environment, or map settings), so the first
+    transformation arcpy.ListTransformations lists for the stops' extent is
+    passed explicitly instead; when none is listed (e.g. same datum), none is
+    applied. Project runs with the extent environment set to MAXOF so an
+    extent inherited from an ArcGIS Pro session cannot drop stops.
 
     Args:
         stops_fc: WGS84 stops point feature class.
@@ -483,7 +516,8 @@ def project_stops_to_district_sr(
         transformation: Optional geographic (datum) transformation name.
 
     Returns:
-        The full path to the projected stops feature class.
+        Tuple of (projected stops feature class path, description of the
+        transformation applied, for the run log).
 
     Raises:
         ValueError: The district layer's spatial reference cannot be read or
@@ -500,18 +534,39 @@ def project_stops_to_district_sr(
             "(missing/unknown .prj). Define its projection before running."
         )
 
+    if transformation:
+        applied = transformation
+    else:
+        candidates = arcpy.ListTransformations(
+            arcpy.SpatialReference(4326), target_sr, arcpy.Describe(stops_fc).extent
+        )
+        if candidates:
+            transformation = candidates[0]
+            applied = (
+                f"{transformation} (GEO_TRANSFORMATION unset: first of "
+                f"{len(candidates)} listed by arcpy.ListTransformations)"
+            )
+            logging.warning(
+                "GEO_TRANSFORMATION unset; WGS84 -> '%s' needs a datum transformation. "
+                "Using the first listed, '%s'. Candidates: %s",
+                target_sr.name,
+                transformation,
+                candidates,
+            )
+        else:
+            applied = "none (arcpy.ListTransformations lists none for WGS84 -> district SR)"
+
     out_fc = os.path.join(out_gdb, safe_name("stops_proj", out_gdb))
     logging.info(
-        "Projecting stops into district SR '%s'%s",
-        target_sr.name,
-        f" (transformation: {transformation})" if transformation else "",
+        "Projecting stops into district SR '%s' (transformation: %s)", target_sr.name, applied
     )
-    if transformation:
-        arcpy.management.Project(stops_fc, out_fc, target_sr, transformation)
-    else:
-        arcpy.management.Project(stops_fc, out_fc, target_sr)
+    with arcpy.EnvManager(extent="MAXOF"):
+        if transformation:
+            arcpy.management.Project(stops_fc, out_fc, target_sr, transformation)
+        else:
+            arcpy.management.Project(stops_fc, out_fc, target_sr)
     log_arcpy_messages()
-    return out_fc
+    return out_fc, applied
 
 
 def containment_join_stops_to_districts(
@@ -525,7 +580,10 @@ def containment_join_stops_to_districts(
     with a shared district boundary produces one output row per district —
     the precondition for boundary allocation. No search radius: this is
     containment, unlike the proximity join used by
-    ``gtfs_service_by_district_arcpy.py``.
+    ``gtfs_service_by_district_arcpy.py``. The join runs with the extent
+    environment set to MAXOF and the output coordinate system pinned to the
+    stops' (district) SR, so environment settings inherited from an ArcGIS
+    Pro session can neither drop stops nor reproject the join.
 
     Args:
         stops_fc: Projected stops point feature class (carries stop_key).
@@ -537,14 +595,18 @@ def containment_join_stops_to_districts(
     """
     out_fc = os.path.join(out_gdb, safe_name("stops_districts_contains", out_gdb))
     logging.info("SpatialJoin INTERSECT (containment, one-to-many)")
-    arcpy.analysis.SpatialJoin(
-        target_features=stops_fc,
-        join_features=districts_fc,
-        out_feature_class=out_fc,
-        join_operation="JOIN_ONE_TO_MANY",
-        join_type="KEEP_COMMON",
-        match_option="INTERSECT",
-    )
+    with arcpy.EnvManager(
+        extent="MAXOF",
+        outputCoordinateSystem=arcpy.Describe(stops_fc).spatialReference,
+    ):
+        arcpy.analysis.SpatialJoin(
+            target_features=stops_fc,
+            join_features=districts_fc,
+            out_feature_class=out_fc,
+            join_operation="JOIN_ONE_TO_MANY",
+            join_type="KEEP_COMMON",
+            match_option="INTERSECT",
+        )
     log_arcpy_messages()
     return out_fc
 
@@ -560,15 +622,29 @@ def extract_stop_districts(fc: str, district_field: str) -> dict[str, set[str]]:
         A dictionary mapping stop_key strings to a set of district ID strings.
 
     Raises:
-        ValueError: The join produced zero stop-district pairs (silent-zero
+        ValueError: A stop falls inside a polygon whose district field is
+            blank (it would otherwise be reported as outside all districts),
+            or the join produced zero stop-district pairs (silent-zero
             guard: an unpopulated DISTRICT_FIELD or a projection mismatch
             would otherwise flow through as an empty report).
     """
     stop_to_districts: dict[str, set[str]] = {}
+    blank_label_stops: set[str] = set()
     with arcpy.da.SearchCursor(fc, ["stop_key", district_field]) as cur:
         for stop_key, dist in cur:
-            if stop_key and dist is not None and str(dist).strip():
-                stop_to_districts.setdefault(str(stop_key), set()).add(str(dist))
+            if not stop_key:
+                continue
+            if dist is None or not str(dist).strip():
+                blank_label_stops.add(str(stop_key))
+                continue
+            stop_to_districts.setdefault(str(stop_key), set()).add(str(dist))
+    if blank_label_stops:
+        raise ValueError(
+            f"{len(blank_label_stops)} stop(s) fall inside district polygon(s) with a "
+            f"blank DISTRICT_FIELD ('{district_field}'), e.g. "
+            f"{sorted(blank_label_stops)[:5]}. Populate the field in the district layer; "
+            "otherwise these stops would be reported as outside all districts."
+        )
     if not stop_to_districts:
         raise ValueError(
             "Containment join produced zero stop-district pairs. Check that "
@@ -623,7 +699,13 @@ def load_stop_ridership(
     total, matching ``data_request_by_stop_processor.py``'s "All Time
     Periods" treatment. A non-empty *time_periods* keeps only those periods;
     values are compared uppercased/stripped, and naming a period absent from
-    the file fails loud.
+    the file (or naming any when the file has no TIME_PERIOD_FIELD column)
+    fails loud.
+
+    The stop ID, route, and time-period columns are read as text with only
+    blank cells treated as missing, so IDs such as "00123" or "NA" survive.
+    Rows with a blank stop ID are kept under MISSING_STOP_ID_KEY so their
+    ridership reaches the reconciliation. Values are not rounded.
 
     Args:
         excel_file: Path to the ridership workbook.
@@ -632,17 +714,28 @@ def load_stop_ridership(
         time_periods: TIME_PERIOD values to keep. Empty/None keeps all.
 
     Returns:
-        Mapping stop ID -> {"boardings", "alightings", "total"} floats.
+        Mapping stop ID -> {"boardings", "alightings", "total"} floats,
+        including a MISSING_STOP_ID_KEY entry when any row has a blank stop
+        ID.
 
     Raises:
         OSError: excel_file does not exist.
         ValueError: A required column is missing, *time_periods* names periods
-            absent from the file, or no rows remain.
+            absent from the file or is given without a TIME_PERIOD_FIELD
+            column, or no rows with a stop ID remain.
     """
     if not os.path.isfile(excel_file):
         raise OSError(f"Ridership Excel not found: {excel_file}")
 
-    df = pd.read_excel(excel_file)
+    id_fields = [
+        f for f in (RIDERSHIP_STOP_ID_FIELD, RIDERSHIP_ROUTE_FIELD, TIME_PERIOD_FIELD) if f
+    ]
+    df = pd.read_excel(
+        excel_file,
+        dtype=dict.fromkeys(id_fields, str),
+        keep_default_na=False,
+        na_values=[""],
+    )
     required = [RIDERSHIP_STOP_ID_FIELD, RIDERSHIP_BOARDINGS_FIELD, RIDERSHIP_ALIGHTINGS_FIELD]
     missing = [c for c in required if c not in df.columns]
     if missing:
@@ -706,6 +799,11 @@ def load_stop_ridership(
                 len(periods_present),
                 periods_present,
             )
+    elif time_periods:
+        raise ValueError(
+            f"TIME_PERIODS given but '{TIME_PERIOD_FIELD}' column not present; "
+            "the filter cannot be applied."
+        )
     elif TIME_PERIOD_FIELD:
         logging.info(
             "No '%s' column in ridership file; skipping time-period filter.",
@@ -721,22 +819,24 @@ def load_stop_ridership(
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
     df["_total"] = df[RIDERSHIP_BOARDINGS_FIELD] + df[RIDERSHIP_ALIGHTINGS_FIELD]
 
-    df = df[df["_stop"] != ""]
-    if df.empty:
+    blank_stop = df["_stop"] == MISSING_STOP_ID_KEY
+    if blank_stop.all():
         raise ValueError(f"No usable ridership rows in '{excel_file}'.")
+    if blank_stop.any():
+        logging.warning(
+            "%d ridership row(s) have a blank %s (boardings %.1f); reported as "
+            "missing_stop_id in the reconciliation.",
+            int(blank_stop.sum()),
+            RIDERSHIP_STOP_ID_FIELD,
+            float(df.loc[blank_stop, RIDERSHIP_BOARDINGS_FIELD].sum()),
+        )
 
     per_stop = df.groupby("_stop", as_index=False).agg(
         {RIDERSHIP_BOARDINGS_FIELD: "sum", RIDERSHIP_ALIGHTINGS_FIELD: "sum", "_total": "sum"}
     )
-    if APPLY_ROUNDING:
-        # Round per-stop values BEFORE allocation so the district totals on
-        # the summary sheet equal sums of the rounded per-stop rows on the
-        # allocation sheet.
-        for col in (RIDERSHIP_BOARDINGS_FIELD, RIDERSHIP_ALIGHTINGS_FIELD, "_total"):
-            per_stop[col] = per_stop[col].round(ROUND_DECIMALS)
     logging.info(
         "Loaded ridership for %d stop(s); boardings total = %.1f.",
-        len(per_stop),
+        int((per_stop["_stop"] != MISSING_STOP_ID_KEY).sum()),
         float(per_stop[RIDERSHIP_BOARDINGS_FIELD].sum()),
     )
     return {
@@ -770,25 +870,27 @@ def allocate_ridership_to_districts(
     allocated total per metric, counting each stop ONCE regardless of mode;
     *pct_base* can widen the denominator to include out-of-district or
     unmatched ridership. The diagnostics expose ridership that landed in no
-    district, never matched GTFS, or was double-counted across boundaries,
-    so every discrepancy is auditable.
+    district, never matched GTFS, had a blank stop ID, or was double-counted
+    across boundaries, so every discrepancy is auditable.
 
     Args:
         stop_to_districts: Mapping stop_key -> set of district IDs.
-        stop_ridership: Mapping stop_key -> {metric: value}.
+        stop_ridership: Mapping stop_key -> {metric: value}; a
+            MISSING_STOP_ID_KEY entry carries rows with a blank stop ID.
         geocoded_stops: stop keys present in the GTFS feed with coordinates,
             used to separate "outside all districts" from "not in GTFS".
         metrics: Metric keys to allocate and report.
         boundary_allocation: "split" or "full" (see above).
         pct_base: Denominator for the pct_* columns — "allocated" (default),
             "geocoded" (adds ridership outside every district), or
-            "grand_total" (also adds ridership unmatched to GTFS).
+            "grand_total" (also adds ridership unmatched to GTFS or with a
+            blank stop ID).
         join_key: The GTFS join key in use, echoed in the mismatch error.
 
     Returns:
         Tuple of (district_df, alloc_df, diagnostics) where diagnostics maps
-        'matched' / 'no_district' / 'unmatched_to_gtfs' / 'boundary_extra'
-        -> {metric: total}.
+        'matched' / 'no_district' / 'unmatched_to_gtfs' / 'missing_stop_id' /
+        'boundary_extra' -> {metric: total}. Values are unrounded.
 
     Raises:
         ValueError: *boundary_allocation* or *pct_base* invalid, or nothing
@@ -808,9 +910,14 @@ def allocate_ridership_to_districts(
     matched = {m: 0.0 for m in metrics}
     no_district = {m: 0.0 for m in metrics}
     unmatched_gtfs = {m: 0.0 for m in metrics}
+    missing_id = {m: 0.0 for m in metrics}
     boundary_extra = {m: 0.0 for m in metrics}  # double-count under "full"
 
     for stop_key, vals in stop_ridership.items():
+        if stop_key == MISSING_STOP_ID_KEY:
+            for m in metrics:
+                missing_id[m] += vals.get(m, 0.0)
+            continue
         if stop_key not in geocoded_stops:
             for m in metrics:
                 unmatched_gtfs[m] += vals.get(m, 0.0)
@@ -838,14 +945,15 @@ def allocate_ridership_to_districts(
         raise ValueError(
             "No ridership allocated to any district. Likely a join-key mismatch "
             f"(GTFS_JOIN_KEY='{join_key}'). Ridership sample: "
-            f"{sorted(stop_ridership)[:5]}; GTFS sample: {sorted(geocoded_stops)[:5]}"
+            f"{sorted(k for k in stop_ridership if k != MISSING_STOP_ID_KEY)[:5]}; "
+            f"GTFS sample: {sorted(geocoded_stops)[:5]}"
         )
 
     pct_denoms = {
         m: (
             matched[m]
             + (no_district[m] if pct_base in ("geocoded", "grand_total") else 0.0)
-            + (unmatched_gtfs[m] if pct_base == "grand_total" else 0.0)
+            + (unmatched_gtfs[m] + missing_id[m] if pct_base == "grand_total" else 0.0)
         )
         for m in metrics
     }
@@ -858,10 +966,6 @@ def allocate_ridership_to_districts(
         district_rows.append(r)
 
     district_df = pd.DataFrame(district_rows)
-    if APPLY_ROUNDING:
-        for m in metrics:
-            district_df[m] = district_df[m].round(ROUND_DECIMALS)
-            district_df[f"pct_{m}"] = district_df[f"pct_{m}"].round(PCT_DECIMALS)
     alloc_cols = ["stop_key", "district", "n_districts"] + [f"{m}_alloc" for m in metrics]
     alloc_df = pd.DataFrame(alloc_rows, columns=alloc_cols).sort_values(
         ["district", "stop_key"], kind="stable", ignore_index=True
@@ -870,6 +974,7 @@ def allocate_ridership_to_districts(
         "matched": matched,
         "no_district": no_district,
         "unmatched_to_gtfs": unmatched_gtfs,
+        "missing_stop_id": missing_id,
         "boundary_extra": boundary_extra,
     }
     return district_df, alloc_df, diagnostics
@@ -889,9 +994,13 @@ def build_reconciliation_frame(
             district (0.0 under "split"). Sum of district totals equals
             allocated_to_districts + this row.
         outside_all_districts: geocoded stops falling in no district polygon.
-        unmatched_to_gtfs: ridership STOP_IDs with no GTFS join-key match.
-        grand_total: allocated + outside + unmatched — the full ridership
-            file, excluding the double-count row.
+        unmatched_to_gtfs: ridership STOP_IDs with no usable GTFS stop (no
+            join-key match, or only missing/invalid coordinates).
+        missing_stop_id: ridership rows whose STOP_ID is blank.
+        grand_total: allocated + outside + unmatched + missing — the full
+            ridership file, excluding the double-count row.
+
+    Values are unrounded; the workbook applies display formats.
 
     Args:
         diagnostics: Output of allocate_ridership_to_districts.
@@ -905,17 +1014,17 @@ def build_reconciliation_frame(
         {"category": "boundary_double_count", **diagnostics["boundary_extra"]},
         {"category": "outside_all_districts", **diagnostics["no_district"]},
         {"category": "unmatched_to_gtfs", **diagnostics["unmatched_to_gtfs"]},
+        {"category": "missing_stop_id", **diagnostics["missing_stop_id"]},
     ]
     grand = {
-        m: sum(diagnostics[k][m] for k in ("matched", "no_district", "unmatched_to_gtfs"))
+        m: sum(
+            diagnostics[k][m]
+            for k in ("matched", "no_district", "unmatched_to_gtfs", "missing_stop_id")
+        )
         for m in metrics
     }
     rows.append({"category": "grand_total", **grand})
-    frame = pd.DataFrame(rows, columns=["category", *metrics])
-    if APPLY_ROUNDING:
-        for m in metrics:
-            frame[m] = frame[m].round(ROUND_DECIMALS)
-    return frame
+    return pd.DataFrame(rows, columns=["category", *metrics])
 
 
 # =============================================================================
@@ -937,6 +1046,34 @@ def apply_font_to_workbook(xlsx_path: str, font_name: str) -> None:
     wb.save(xlsx_path)
 
 
+def apply_number_formats(xlsx_path: str, decimals: int, pct_decimals: int) -> None:
+    """Set display formats on ridership and percent columns; values stay unrounded.
+
+    Columns are recognized by header: ``pct_*`` columns display
+    *pct_decimals* places, and metric columns (``boardings``,
+    ``boardings_alloc``, ...) display *decimals* places.
+    """
+    from openpyxl import load_workbook
+
+    value_fmt = "0." + "0" * decimals if decimals > 0 else "0"
+    pct_fmt = "0." + "0" * pct_decimals if pct_decimals > 0 else "0"
+    metric_headers = set(METRICS) | {f"{m}_alloc" for m in METRICS}
+
+    wb = load_workbook(xlsx_path)
+    for ws in wb.worksheets:
+        for col in ws.iter_cols():
+            header = col[0].value
+            if isinstance(header, str) and header.startswith("pct_"):
+                fmt = pct_fmt
+            elif header in metric_headers:
+                fmt = value_fmt
+            else:
+                continue
+            for cell in col[1:]:
+                cell.number_format = fmt
+    wb.save(xlsx_path)
+
+
 def write_output_workbook(
     out_path: str,
     district_df: pd.DataFrame,
@@ -944,6 +1081,10 @@ def write_output_workbook(
     recon_df: pd.DataFrame,
 ) -> None:
     """Write the multi-sheet output workbook and apply the house font.
+
+    When APPLY_ROUNDING is True, ridership and percent columns get number
+    formats showing ROUND_DECIMALS / PCT_DECIMALS places; stored values are
+    never rounded.
 
     Sheets:
         district_ridership: totals and percent shares per district (summary).
@@ -962,6 +1103,8 @@ def write_output_workbook(
         district_df.to_excel(writer, sheet_name="district_ridership", index=False)
         alloc_df.to_excel(writer, sheet_name="ridership_allocation", index=False)
         recon_df.to_excel(writer, sheet_name="reconciliation", index=False)
+    if APPLY_ROUNDING:
+        apply_number_formats(out_path, ROUND_DECIMALS, PCT_DECIMALS)
     apply_font_to_workbook(out_path, EXCEL_FONT_NAME)
     logging.info("Workbook written to: %s", out_path)
 
@@ -1177,7 +1320,8 @@ def run_analysis(args: argparse.Namespace) -> None:
         ValueError: Invalid settings, empty inputs, or a failed/empty join
             (messages say which and how to fix it).
         RuntimeError: The run log could not be written and REQUIRE_RUN_LOG
-            is True.
+            is True (this run's workbook is removed first, so it is never
+            left without a matching configuration record).
     """
     work_gdb = ensure_work_gdb(args.work_dir, WORK_GDB_NAME)
     arcpy.env.workspace = work_gdb
@@ -1190,7 +1334,7 @@ def run_analysis(args: argparse.Namespace) -> None:
 
     validate_district_field(args.districts_fc, args.district_field)
     stops_wgs84 = stops_to_points(stops_df, work_gdb)
-    stops_proj = project_stops_to_district_sr(
+    stops_proj, transformation_applied = project_stops_to_district_sr(
         stops_wgs84, args.districts_fc, work_gdb, args.geo_transformation
     )
     sj_fc = containment_join_stops_to_districts(stops_proj, args.districts_fc, work_gdb)
@@ -1230,7 +1374,7 @@ def run_analysis(args: argparse.Namespace) -> None:
         f"Routes kept:         {list(args.routes) if args.routes else 'all'}",
         f"Routes dropped:      {list(args.routes_exclude) if args.routes_exclude else 'none'}",
         f"Time periods:        {list(args.time_periods) if args.time_periods else 'all'}",
-        f"Geo transformation:  {args.geo_transformation or 'none'}",
+        f"Geo transformation:  {transformation_applied}",
     ]
     log_ok = write_run_log(
         args.output_dir,
@@ -1238,9 +1382,14 @@ def run_analysis(args: argparse.Namespace) -> None:
         fingerprints=input_fingerprints(args.gtfs_input, args.excel_file, args.districts_fc),
     )
     if not log_ok and REQUIRE_RUN_LOG:
+        try:
+            os.remove(out_xlsx)
+            cleanup = "This run's workbook was removed."
+        except OSError as exc:
+            cleanup = f"This run's workbook '{out_xlsx}' could not be removed ({exc}); discard it."
         raise RuntimeError(
-            "Run log could not be written. Set REQUIRE_RUN_LOG = False to suppress "
-            "this error when a sidecar file is genuinely impossible."
+            f"Run log could not be written. {cleanup} Set REQUIRE_RUN_LOG = False to "
+            "suppress this error when a sidecar file is genuinely impossible."
         )
 
 
@@ -1344,7 +1493,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--geo-transformation",
         default=GEO_TRANSFORMATION,
-        help="Optional geographic (datum) transformation for the stops projection.",
+        help="Geographic (datum) transformation for the stops projection; empty uses the "
+        "first one arcpy.ListTransformations lists. The one applied is recorded in the run log.",
     )
     p.add_argument(
         "--work-dir",

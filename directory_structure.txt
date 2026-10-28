@@ -14,13 +14,13 @@ transit_planning_with_python/
 ├── dev_tools/
 │   ├── audit_helper_functions.py
 │   ├── audit_python_floor.py
-│   ├── build_cacensus_fixtures.py
 │   ├── build_schools_fixtures.py
 │   ├── build_uscensus_fixtures.py
 │   ├── check_style.py
 │   ├── export_repo_file_tree.py
 │   ├── export_requirements.py
 │   ├── generate_mock_bikeshare_trips.py
+│   ├── generate_mock_cbd.py
 │   ├── generate_mock_gtfs.py
 │   ├── generate_mock_points_of_interest.py
 │   ├── generate_mock_roads.py
@@ -46,7 +46,8 @@ transit_planning_with_python/
 │   │   ├── gtfs_skipped_stop_flagger_gpd.py
 │   │   ├── gtfs_stop_proximity_qc.py
 │   │   ├── gtfs_timepoint_interval_flagger.py
-│   │   ├── route_direction_classifier.py
+│   │   ├── route_direction_classifier_arcpy.py
+│   │   ├── route_direction_classifier_pd.py
 │   │   ├── stop_v_conflict_checker_arcpy.py
 │   │   ├── stop_v_conflict_checker_gpd.py
 │   │   ├── stop_vs_roadname_checker_arcpy.py
@@ -55,7 +56,7 @@ transit_planning_with_python/
 │   │   ├── block_status_timeline_exporter.py
 │   │   ├── bus_block_exporter.py
 │   │   ├── gtfs_feed_merger.py
-│   │   ├── gtfs_route_features.py
+│   │   ├── gtfs_route_features_gpd.py
 │   │   ├── gtfs_route_timeline.py
 │   │   ├── gtfs_to_shapefile_arcpy.py
 │   │   ├── gtfs_to_shapefile_gpd.py
@@ -76,7 +77,6 @@ transit_planning_with_python/
 │   │   ├── ridership_ml_model.py
 │   │   └── route_performance_model.py
 │   ├── national_data_tools/
-│   │   ├── cacensus_da_join_gpd.py
 │   │   ├── clean_eia_gas_prices.py
 │   │   ├── clean_fred_unrate.py
 │   │   ├── clean_noaa_weather.py
@@ -179,7 +179,6 @@ transit_planning_with_python/
 │   │   │   ├── School_Facilities.zip
 │   │   │   └── Urgent_Care_Facilities.zip
 │   │   ├── 4331222_sample.csv
-│   │   ├── 98-401-X2021006_eng_CSV.zip
 │   │   ├── ACSDT5Y2024.B01001_2026-05-23T135534.zip
 │   │   ├── ACSDT5Y2024.B08201_2026-05-23T135430.zip
 │   │   ├── ACSDT5Y2024.B19001_2026-05-23T135307.zip
@@ -202,13 +201,11 @@ transit_planning_with_python/
 │   │   ├── effy2019_sample.csv
 │   │   ├── express_origin_stops.txt
 │   │   ├── express_routes.txt
-│   │   ├── lda_000b21a_e_sample.zip
 │   │   ├── md_wac_S000_JT00_2023.csv.gz
+│   │   ├── mock_cbd_dc.zip
 │   │   ├── mock_gtfs_dc.zip
-│   │   ├── mock_gtfs_ottawa.zip
 │   │   ├── ntd_monthly_multi_month.csv
 │   │   ├── output_road_shps_dc.zip
-│   │   ├── output_road_shps_ottawa.zip
 │   │   ├── private_shuttles_sample.csv
 │   │   ├── ridership_by_route_and_stop.csv
 │   │   ├── sample_block_geoids.csv
@@ -229,7 +226,6 @@ transit_planning_with_python/
 │   ├── test_block_timeline_helpers.py
 │   ├── test_bus_block_exporter.py
 │   ├── test_cabi_coverage_by_route_gpd.py
-│   ├── test_cacensus_da_join_gpd.py
 │   ├── test_calendar_helpers.py
 │   ├── test_cli_helpers.py
 │   ├── test_clean_eia_gas_prices.py
@@ -243,11 +239,12 @@ transit_planning_with_python/
 │   ├── test_flag_stop_upgrades.py
 │   ├── test_gbfs_ridership_join.py
 │   ├── test_gbfs_stations_exporter.py
+│   ├── test_generate_mock_cbd.py
 │   ├── test_gtfs_calendar_inspector.py
 │   ├── test_gtfs_feed_merger.py
 │   ├── test_gtfs_linear_diff_gpd.py
 │   ├── test_gtfs_route_diff.py
-│   ├── test_gtfs_route_features.py
+│   ├── test_gtfs_route_features_gpd.py
 │   ├── test_gtfs_route_summary.py
 │   ├── test_gtfs_route_timeline.py
 │   ├── test_gtfs_service_by_district_gpd.py
@@ -281,7 +278,8 @@ transit_planning_with_python/
 │   ├── test_private_shuttle_coverage_by_route_gpd.py
 │   ├── test_ridership_from_tides.py
 │   ├── test_ridership_ml_model.py
-│   ├── test_route_direction_classifier.py
+│   ├── test_route_direction_classifier_arcpy.py
+│   ├── test_route_direction_classifier_pd.py
 │   ├── test_route_performance_model.py
 │   ├── test_route_stops_exporter.py
 │   ├── test_route_transfer_calculator.py
