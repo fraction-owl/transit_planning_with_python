@@ -226,8 +226,17 @@ def check_no_utils_import(src: str, path: Path) -> list[Violation]:
 
 
 def check_config_section(src: str) -> list[Violation]:
-    """Flag a missing or incomplete CONFIGURATION section."""
-    has_header = bool(re.search(r"#[^\n]*\bCONFIGURATION\b", src, re.IGNORECASE))
+    """Flag a missing or incomplete CONFIGURATION section.
+
+    CONTRIBUTING.md fixes the banner's spelling as ``CONFIGURATION`` in full
+    caps, so the test is case-sensitive and anchored to the start of the line.
+    Rule characters around the word are allowed, since the banner's shape is
+    the file's own business: ``# CONFIGURATION``, ``# ==== CONFIGURATION ====``
+    and ``# CONFIGURATION -- notes`` all head a section. Prose does not,
+    because it is not in caps and rarely opens a line: a wrapped comment
+    continuing "# configuration block within this file" is not a banner.
+    """
+    has_header = any(re.match(r"#[ =\-]*CONFIGURATION\b", line) for line in src.splitlines())
     has_begin = "# === BEGIN CONFIG ===" in src
     has_end = "# === END CONFIG ===" in src
 
@@ -238,7 +247,8 @@ def check_config_section(src: str) -> list[Violation]:
                 line=None,
                 message=(
                     "No CONFIGURATION section found — add a config block near the top "
-                    "of the script with `# === BEGIN CONFIG ===` / `# === END CONFIG ===` markers"
+                    "of the script, headed by a `# CONFIGURATION` banner, with "
+                    "`# === BEGIN CONFIG ===` / `# === END CONFIG ===` markers"
                 ),
             )
         ]

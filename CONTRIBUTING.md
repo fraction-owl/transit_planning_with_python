@@ -24,7 +24,12 @@ Participation is welcome from anyone, whether you’re new to Python, an experie
     failure, `2` = configuration error (e.g. placeholder paths still unset). Returning the code —
     rather than calling `sys.exit()` inside `main()` — keeps `main()` traceback-free when called
     from a notebook cell, while shell callers, cron jobs, and Makefiles still see failures.
-- Include a clear **configuration section at the top** of each script.
+- Include a clear **configuration section at the top** of each script, headed by a banner
+  comment spelling out `CONFIGURATION` in full caps (`# CONFIGURATION`). Rule characters and a
+  trailing note are fine — `# ==== CONFIGURATION ====` and `# CONFIGURATION -- notes` both
+  count — but not `# CONFIG` or `# Config`: the abbreviation is reserved for the
+  `# === BEGIN CONFIG ===` / `# === END CONFIG ===` markers inside the section, which
+  `extract_config_block` matches literally.
   - Inline variables are the **primary** interface: notebook users edit constants and never see a flag.
   - New scripts should *additionally* mirror those constants with `argparse` flags whose defaults
     **are** the constants, via a `build_arg_parser()` that sets

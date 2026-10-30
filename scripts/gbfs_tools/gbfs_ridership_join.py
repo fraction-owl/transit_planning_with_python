@@ -53,6 +53,10 @@ from typing import Iterable, List, Optional, Sequence
 import geopandas as gpd
 import pandas as pd
 
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
 # === BEGIN CONFIG ===
 RIDERSHIP_INPUT: str = "output/monthly_station_ridership.csv"
 GEOJSON_INPUT: Optional[str] = "output/gbfs_stations.geojson"

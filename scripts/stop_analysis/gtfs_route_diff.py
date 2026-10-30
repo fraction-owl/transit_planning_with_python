@@ -78,7 +78,7 @@ import numpy as np
 import pandas as pd
 
 # =============================================================================
-# CONFIG
+# CONFIGURATION
 # =============================================================================
 
 BEFORE_GTFS_DIR = Path(r"Path\To\Old\GTFS\Dir")
