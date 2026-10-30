@@ -1,14 +1,16 @@
 """Tests for scripts/service_coverage/gtfs_service_demographics_arcpy.py.
 
-Covers the demographics schema detection and the service-day selection. ArcPy is
-unavailable outside ArcGIS Pro, so a stand-in module answers ``arcpy.ListFields``
-from an in-memory field list and ``arcpy.Exists`` with True; no geoprocessing runs.
+Covers the demographics schema detection, the service-day selection, and where the
+projected buffers are written. ArcPy is unavailable outside ArcGIS Pro, so a stand-in
+module answers ``arcpy.ListFields`` from an in-memory field list and ``arcpy.Exists``
+with True; no geoprocessing runs (the clip tests record the calls instead).
 """
 
 from __future__ import annotations
 
 import importlib
 import logging
+import os
 import sys
 import types
 from collections.abc import Iterator
@@ -198,3 +200,79 @@ def test_run_by_route_skips_route_without_service(
     assert list(result["route_short_name"]) == ["101"]
     assert built == [["S1", "S2"]]
     assert "Skipping route 202" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Projected buffer location
+# ---------------------------------------------------------------------------
+
+
+def _stub_clip(mod: types.ModuleType, buffers_wkid: int = 4326) -> list[tuple[str, str]]:
+    """Stand in for the geoprocessing the clip runs; return the calls it makes."""
+    calls: list[tuple[str, str]] = []
+    wkids = {"buffers": buffers_wkid, "demog.shp": 2248}
+    arcpy = mod.arcpy
+    arcpy.Describe = lambda path: types.SimpleNamespace(
+        spatialReference=types.SimpleNamespace(factoryCode=wkids.get(path, 0), name="")
+    )
+    arcpy.CreateUniqueName = lambda base, folder: os.path.join(folder, base)
+    arcpy.ListTransformations = lambda in_sr, out_sr: []
+    arcpy.ExecuteError = type("ExecuteError", (Exception,), {})
+    arcpy.management = types.SimpleNamespace(
+        Project=lambda in_fc, out_fc, sr, transform: calls.append(("Project", out_fc)),
+        AddSpatialIndex=lambda fc: None,
+        Delete=lambda path: calls.append(("Delete", path)),
+        GetCount=lambda path: types.SimpleNamespace(getOutput=lambda i: "1"),
+    )
+    arcpy.analysis = types.SimpleNamespace(
+        PairwiseClip=lambda in_fc, clip_fc, out_fc: calls.append(("Clip", clip_fc)),
+    )
+    return calls
+
+
+def test_projected_buffers_go_to_scratch_and_are_deleted(
+    mod: types.ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls = _stub_clip(mod)
+    scratch = tmp_path / "scratch"
+    mod.arcpy.env.scratchFolder = str(scratch)
+    monkeypatch.chdir(tmp_path)
+
+    mod.clip_demographics_to_buffers("demog.shp", "buffers", r"in_memory\clip")
+    projected = str(scratch / "proj_buffers_for_clip.shp")
+    assert calls == [("Project", projected), ("Clip", projected), ("Delete", projected)]
+    assert [p.name for p in tmp_path.iterdir()] == ["scratch"]  # nothing under the cwd
+
+
+def test_projected_buffers_kept_in_configured_dir(
+    mod: types.ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls = _stub_clip(mod)
+    keep = tmp_path / "keep"
+    monkeypatch.setattr(mod, "PROJECTED_BUFFERS_DIR", str(keep))
+
+    mod.clip_demographics_to_buffers("demog.shp", "buffers", r"in_memory\clip")
+    projected = str(keep / "proj_buffers_for_clip.shp")
+    assert calls == [("Project", projected), ("Clip", projected)]
+    assert keep.is_dir()
+
+
+def test_scratch_copy_deleted_when_clip_fails(mod: types.ModuleType, tmp_path: Path) -> None:
+    calls = _stub_clip(mod)
+    mod.arcpy.env.scratchFolder = str(tmp_path)
+
+    def fail(*args: object) -> None:
+        raise RuntimeError("clip failed")
+
+    mod.arcpy.analysis.PairwiseClip = fail
+    with pytest.raises(RuntimeError, match="clip failed"):
+        mod.clip_demographics_to_buffers("demog.shp", "buffers", r"in_memory\clip")
+    assert calls[-1] == ("Delete", str(tmp_path / "proj_buffers_for_clip.shp"))
+
+
+def test_buffers_already_in_demographics_sr_are_not_copied_or_deleted(
+    mod: types.ModuleType,
+) -> None:
+    calls = _stub_clip(mod, buffers_wkid=2248)
+    mod.clip_demographics_to_buffers("demog.shp", "buffers", r"in_memory\clip")
+    assert calls == [("Clip", "buffers")]
