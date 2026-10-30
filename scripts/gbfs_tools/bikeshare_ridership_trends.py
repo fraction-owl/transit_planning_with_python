@@ -69,7 +69,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 # ===========================================================================
-# CONFIG  --  notebook users edit these; CLI flags override them
+# CONFIGURATION  --  notebook users edit these; CLI flags override them
 # ===========================================================================
 
 # Input: a directory of ``*-capitalbikeshare-tripdata.csv`` files, or a single

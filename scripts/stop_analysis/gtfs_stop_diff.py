@@ -45,7 +45,7 @@ import pandas as pd
 from scipy.spatial import cKDTree
 
 # =============================================================================
-# Config
+# CONFIGURATION
 # =============================================================================
 
 BEFORE_GTFS_DIR = Path(r"Path\To\GTFS\Dir")

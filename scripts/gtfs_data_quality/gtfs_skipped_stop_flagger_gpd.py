@@ -58,7 +58,7 @@ from shapely.geometry.base import BaseGeometry
 from shapely.ops import substring
 
 # =============================================================================
-# Configuration
+# CONFIGURATION
 # =============================================================================
 
 # Directory containing a single GTFS feed:
