@@ -34,6 +34,9 @@ Outputs:
   - Clipped polygons with area fields and synthetic metrics:
     loinc_hh, total_hh, minor_pop, total_pop, loinc_jobs, all_jobs (+ extras).
   - Final FC/shapefile; optional per-route CSV.
+  - Projected copies of the service-area buffers (proj_buffers_for_clip*.shp),
+    kept only when PROJECTED_BUFFERS_DIR is set; otherwise written to ArcPy's
+    scratch folder and deleted after the clip.
 
 Typical usage:
   Update the paths in the CONFIGURATION section and run from a shell, ArcGIS
@@ -44,6 +47,7 @@ from __future__ import annotations
 
 import logging
 import os
+import tempfile
 import zipfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -93,6 +97,13 @@ DEMOGRAPHICS_FC: str = (
 BUFFERED_STOPS_OUT: str = r""
 DISSOLVED_BUFFERS_OUT: str = r""
 CLIPPED_DEMOGRAPHICS_OUT: str = r""
+
+# Optional folder to keep the projected copy of the service-area buffers
+# (proj_buffers_for_clip*.shp), written when the buffers' spatial reference differs
+# from DEMOGRAPHICS_FC's (the usual case, since GTFS stops arrive in WGS 84).
+# If left as an empty string, the copy goes to ArcPy's scratch folder and is
+# deleted after the clip.
+PROJECTED_BUFFERS_DIR: str = r""
 
 # Final export target:
 #   If this ends with ".gdb", results are written as a feature class into that GDB.
@@ -1009,9 +1020,9 @@ def _log_env() -> None:
 def _project_to_match_sr(in_fc: str, like_fc: str, name_hint: str) -> str:
     """Project *in_fc* to the spatial reference of *like_fc* if they differ.
 
-    Writes to a persistent shapefile in the inspection folder returned by
-    _intermediate_buffer_folder(). This avoids scratch.gdb visibility issues
-    and keeps the intermediate available for manual inspection.
+    Writes a shapefile to the folder returned by _intermediate_buffer_folder()
+    (PROJECTED_BUFFERS_DIR, or ArcPy's scratch folder when that is unset). A
+    folder, rather than scratch.gdb, avoids scratch.gdb visibility issues.
 
     Args:
         in_fc: Input feature class or layer to (maybe) project.
@@ -1043,7 +1054,6 @@ def _project_to_match_sr(in_fc: str, like_fc: str, name_hint: str) -> str:
     if _sr_eq(in_sr, like_sr):
         return in_fc
 
-    # Persistent shapefile path for inspection
     folder = _intermediate_buffer_folder()
     base = f"proj_{_sanitize_name(name_hint)}.shp"
     out_fc = arcpy.CreateUniqueName(base, folder)
@@ -1071,14 +1081,17 @@ def _project_to_match_sr(in_fc: str, like_fc: str, name_hint: str) -> str:
 
 
 def _intermediate_buffer_folder() -> str:
-    """Return a stable folder for projected buffer intermediates (shapefiles).
+    """Return the folder for projected buffer intermediates (shapefiles).
 
-    Uses the user-specified inspection directory so outputs persist for review.
+    Uses PROJECTED_BUFFERS_DIR when set, so the copies persist for review;
+    otherwise ArcPy's scratch folder (or the OS temp folder if that is unavailable).
 
     Returns:
-        Absolute path to the inspection folder, created if missing.
+        Path to the folder, created if missing.
     """
-    folder = r"projects\dot\zkrohmal\census_merge_test_2025_10_31\output_buffer_intermediate"
+    folder = (
+        PROJECTED_BUFFERS_DIR or getattr(arcpy.env, "scratchFolder", None) or tempfile.gettempdir()
+    )
     ensure_dir(folder)
     return folder
 
@@ -1179,6 +1192,13 @@ def clip_demographics_to_buffers(
         except Exception:
             logging.error("Fallback Intersect also failed.\nGP Messages:\n%s", arcpy.GetMessages(2))
             raise
+    finally:
+        # A projected copy in scratch space is not kept; one in PROJECTED_BUFFERS_DIR is.
+        if buffers_for_clip != buffers_fc and not PROJECTED_BUFFERS_DIR:
+            try:
+                arcpy.management.Delete(buffers_for_clip)
+            except Exception as exc:  # noqa: BLE001
+                logging.warning("Could not delete scratch copy '%s' (%s)", buffers_for_clip, exc)
 
     n = _count(result_path)
     logging.info(
