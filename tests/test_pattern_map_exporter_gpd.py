@@ -260,6 +260,25 @@ def test_arrow_segments_point_along_travel() -> None:
     assert len(target.arrow_segments(LineString([(0, 0), (10, 0)]), spacing=30)) == 1
 
 
+def test_describe_difference_wording() -> None:
+    main = {
+        "pattern_id": "P1",
+        "stop_ids": ("A", "B", "C"),
+        "boarding": ("regular",) * 3,
+        "path_key": "SH1",
+        "geometry_source": "shapes.txt",
+    }
+    # A short-turn on its own shape: the stop change explains the shape change.
+    short = {**main, "stop_ids": ("A", "B"), "boarding": ("regular",) * 2, "path_key": "SH2"}
+    assert target.describe_difference(short, main, 0, 1, 0.0) == "vs P1: −1 stop"
+    # Same stops on a separately digitized shape.
+    redrawn = {**main, "path_key": "SH3"}
+    assert (
+        target.describe_difference(redrawn, main, 0, 0, 0.0)
+        == "vs P1: different shape, same streets"
+    )
+
+
 def test_main_exit_codes(tmp_path: Path) -> None:
     assert target.main([]) == 2  # placeholder paths
     feed = _write_feed(tmp_path)

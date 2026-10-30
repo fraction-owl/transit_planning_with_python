@@ -1457,7 +1457,7 @@ def describe_difference(
     parts: list[str] = []
     if added or dropped:
         counts = ([f"+{added}"] if added else []) + ([f"−{dropped}"] if dropped else [])
-        parts.append(" / ".join(counts) + " stops")
+        parts.append(" / ".join(counts) + (" stop" if added + dropped == 1 else " stops"))
     elif row["stop_ids"] != main["stop_ids"]:
         parts.append("same stops, different order")
     if row["geometry_source"] != main["geometry_source"]:
@@ -1467,7 +1467,7 @@ def describe_difference(
             parts.append(f"{main['pattern_id']} has no shape in feed")
     elif not math.isnan(off_path_mi) and off_path_mi >= 0.05:
         parts.append(f"{off_path_mi:.1f} mi off {main['pattern_id']}'s path")
-    elif row["path_key"] != main["path_key"]:
+    elif row["path_key"] != main["path_key"] and row["stop_ids"] == main["stop_ids"]:
         parts.append("different shape, same streets")
     if row["stop_ids"] == main["stop_ids"] and row["boarding"] != main["boarding"]:
         parts.append("different pickup/drop-off rules")
@@ -1999,7 +1999,7 @@ def plot_route_direction(
         n = len(page)
         ncols = max(1, min(n_columns, n))
         nrows = math.ceil(n / ncols)
-        side_in, gap_in, top_in = 0.15, 0.25, 0.4
+        side_in, gap_in, top_in = 0.15, 0.25, 0.45
         width = ncols * PANEL_WIDTH_IN + (ncols - 1) * gap_in + 2 * side_in
         handles = legend_handles(stop_categories(page), has_context=len(rows) > 1)
         legend_cols = min(len(handles), {1: 2, 2: 4}.get(ncols, 7))
@@ -2036,7 +2036,13 @@ def plot_route_direction(
 
         page_note = f" (page {page_no} of {len(pages)})" if len(pages) > 1 else ""
         fig.suptitle(
-            title + page_note, x=side_in / width, ha="left", fontsize=12, fontweight="bold"
+            title + page_note,
+            x=side_in / width,
+            y=1 - 0.05 / height,
+            ha="left",
+            va="top",
+            fontsize=12,
+            fontweight="bold",
         )
         fig.legend(
             handles=handles,
