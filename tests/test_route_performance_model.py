@@ -118,13 +118,15 @@ def test_derive_features_flags_express_and_equity_pct(monkeypatch) -> None:
         {
             "route_id": ["101", "100"],  # 101 is in EXPRESS_ROUTES, 100 is not
             "low_income": [250.0, 100.0],
+            "total_hh": [400.0, 200.0],
             "total_pop": [1000.0, 500.0],
         }
     )
     out = rpm.derive_features(table)
 
     assert out["is_express"].tolist() == [1.0, 0.0]
-    np.testing.assert_allclose(out["pct_low_income"], [0.25, 0.20])
+    # low_income counts households, so it divides by total_hh, not total_pop.
+    np.testing.assert_allclose(out["pct_low_income"], [0.625, 0.50])
 
 
 def test_derive_features_empty_express_flags_nothing() -> None:
