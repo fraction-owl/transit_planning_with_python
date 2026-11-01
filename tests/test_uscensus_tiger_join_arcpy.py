@@ -8,6 +8,7 @@ function is called.
 from __future__ import annotations
 
 import importlib
+import logging
 import sys
 import types
 from collections.abc import Iterator
@@ -178,3 +179,15 @@ def test_tract_and_block_group_of_same_table_are_rejected(
     )
     with pytest.raises(ValueError, match="more than one geography level"):
         mod.build_joined_table_from_folder(tmp_path)
+
+
+def test_block_group_download_missing_part_of_a_tract_warns(
+    mod: types.ModuleType, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Both DC blocks (with residents) sit in block group 1; the download has only group 2.
+    _write_pop(tmp_path)
+    _write_b19001(tmp_path / "ACSDT5Y2024.B19001-Data.csv", ("1500000US110010001002", 40, 30))
+    with caplog.at_level(logging.WARNING):
+        mod.build_joined_table_from_folder(tmp_path, county_fips_filter=["11001"])
+    assert "INCOME_FILES: 1 tract(s) (e.g. 11001000100)" in caplog.text
+    assert "110010001001" in caplog.text and "300 residents" in caplog.text

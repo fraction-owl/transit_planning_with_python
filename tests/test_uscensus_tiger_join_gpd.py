@@ -1083,6 +1083,88 @@ def test_roll_up_to_tracts_rejects_block_and_block_group_in_same_tract() -> None
         mod._roll_up_to_tracts(df, "sum")
 
 
+_TWO_BG_POP = pd.Series(
+    {"110010001001001": 10, "110010001002001": 20, "110010001002002": 5},
+    name="pop",
+)
+
+
+def test_warn_partial_tract_coverage_flags_missing_populated_block_group(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    bg = _write_b19001(tmp_path / "bg.B19001-Data.csv", ("1500000US110010001001", 60, 50))
+    with caplog.at_level(logging.WARNING):
+        mod._warn_partial_tract_coverage({"INCOME_FILES": [bg]}, _TWO_BG_POP)
+    assert "11001000100" in caplog.text
+    assert "110010001002" in caplog.text  # the missing block group
+    assert "25 residents" in caplog.text
+    assert bg in caplog.text
+
+
+def test_warn_partial_tract_coverage_quiet_when_every_populated_part_is_present(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    bg = _write_b19001(
+        tmp_path / "bg.B19001-Data.csv",
+        ("1500000US110010001001", 60, 50),
+        ("1500000US110010001002", 40, 30),
+    )
+    tract = _write_b19001(tmp_path / "tract.B19001-Data.csv", ("1400000US11001000200", 10, 1))
+    # Block group 3 exists in the block layer but has no residents (e.g. water only).
+    pop = pd.concat([_TWO_BG_POP, pd.Series({"110010001003001": 0})])
+    with caplog.at_level(logging.WARNING):
+        mod._warn_partial_tract_coverage({"INCOME_FILES": [bg, tract]}, pop)
+    assert caplog.text == ""
+
+
+def test_warn_partial_tract_coverage_flags_missing_block(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    eth_cols = "P9_001N,P9_002N,P9_005N,P9_006N,P9_007N,P9_008N,P9_009N,P9_010N,P9_011N"
+    p = tmp_path / "DECENNIALDHC2020.P9-Data.csv"
+    _write_plain_csv(
+        p,
+        _census_csv(
+            f"GEO_ID,NAME,{eth_cols}",
+            "Geo,Name," + ",".join(["l"] * 9),
+            "1000000US110010001001001,Block,10,0,10,0,0,0,0,0,0",
+            "1000000US110010001002001,Block,20,0,20,0,0,0,0,0,0",
+        ),
+    )
+    with caplog.at_level(logging.WARNING):
+        mod._warn_partial_tract_coverage({"ETHNICITY_FILES": [str(p)]}, _TWO_BG_POP)
+    assert "were summed from block rows" in caplog.text
+    assert "110010001002002" in caplog.text
+    assert "5 residents" in caplog.text
+
+
+def test_run_warns_when_block_group_download_misses_part_of_a_tract(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    csv_dir = tmp_path / "census"
+    csv_dir.mkdir()
+    shp_dir = tmp_path / "tiger"
+    shp_dir.mkdir()
+    shutil.copy(FIXTURE_DIR / FIXTURE_ZIPS[0], shp_dir / FIXTURE_ZIPS[0])
+    # Tract 11001000201's residents live in block group 2; the download has only group 1.
+    _write_b19001(csv_dir / "ACSDT5Y2024.B19001-Data.csv", ("1500000US110010002011", 60, 50))
+    with caplog.at_level(logging.WARNING):
+        assert (
+            mod.run(
+                input_csv_dir=str(csv_dir),
+                input_shp_dir=str(shp_dir),
+                final_joined_features=str(tmp_path / "out" / "blocks.gpkg"),
+                tiger_input_glob="tl_*_*_*.shp",
+                fips_to_filter=["11001"],
+                intermediate_combined_csv="",
+                intermediate_merged_shp="",
+            )
+            == 0
+        )
+    assert "INCOME_FILES: 1 tract(s) (e.g. 11001000201)" in caplog.text
+    assert "110010002012" in caplog.text
+
+
 def test_build_tract_attributes_rejects_tract_and_block_group_of_same_table(
     tmp_path: Path,
 ) -> None:

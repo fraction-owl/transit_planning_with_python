@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gzip
+import logging
 import zipfile
 from pathlib import Path
 
@@ -914,6 +915,26 @@ def test_build_joined_table_rolls_block_groups_up_to_tract(tmp_path: Path) -> No
     assert len(df) == 2  # no unmatched block-group rows
     assert df["low_income"].tolist() == pytest.approx([20.0, 60.0])  # 80 split 10:30
     assert df["perc_low_income"].tolist() == pytest.approx([0.8, 0.8])
+
+
+def test_build_joined_table_warns_when_block_groups_miss_part_of_a_tract(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The tract's residents live in block groups 1 and 2; the download has only group 1,
+    # so the summed tract total is too low.
+    blocks = [("1000000US110010001001001", 100), ("1000000US110010001002001", 300)]
+    pop_path = tmp_path / "P1-Data.csv"
+    _write_plain_csv(
+        pop_path,
+        _census_csv(
+            "GEO_ID,NAME,P1_001N", "Geo,Name,Total", *[f"{g},Block,{p}" for g, p in blocks]
+        ),
+    )
+    bg = _write_b19001(tmp_path / "bg.B19001-Data.csv", ("1500000US110010001001", 60, 50))
+    with caplog.at_level(logging.WARNING):
+        build_joined_table(pop_files=[str(pop_path)], hh_files=[], jobs_files=[], income_files=[bg])
+    assert "INCOME_FILES: 1 tract(s) (e.g. 11001000100)" in caplog.text
+    assert "110010001002" in caplog.text and "300 residents" in caplog.text
 
 
 def test_build_joined_table_rejects_tract_and_block_group_of_same_table(tmp_path: Path) -> None:

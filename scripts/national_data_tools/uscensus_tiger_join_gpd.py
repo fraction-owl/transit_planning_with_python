@@ -180,7 +180,8 @@ MAX_FIELD_LEN: Final[int] = 10  # DBF column-name limit
 #: product code, e.g. ("ACSDT5Y2024", "B19001"). Files that disagree on the same
 #: geography (two vintages, say) abort the run rather than one being silently kept.
 #: Tract tables may be downloaded at the block-group or block level instead; those rows
-#: are summed to their tract. A tract covered at two levels of the same table (a tract
+#: are summed to their tract, with a warning when a download leaves out populated block
+#: groups of a tract it covers. A tract covered at two levels of the same table (a tract
 #: file plus a block-group file) aborts the run. S0801 must be tract-level.
 TOPIC_SIGNATURES: dict[str, Sequence[str] | str] = {
     "POP_FILES": ("P1",),
@@ -298,6 +299,8 @@ _SOURCE_COL: Final[str] = "_source_file"
 _TRACT_LEVEL: Final[str] = "140"
 #: Summary levels nested inside a tract, which a tract table can also be downloaded at.
 _SUB_TRACT_LEVELS: Final[dict[str, str]] = {"150": "block group", "100": "block"}
+#: FIPS digits after ``US`` in a block-group (12) or block (15) ``GEO_ID``.
+_SUB_TRACT_DIGITS: Final[dict[str, int]] = {"150": 12, "100": 15}
 
 
 def _token_match(name: str, tokens: Sequence[str] | str) -> bool:
@@ -583,6 +586,71 @@ def _roll_up_to_tracts(df: pd.DataFrame, how: Literal["sum", "reject"]) -> pd.Da
         len(summed),
     )
     return pd.concat([df.loc[~below], summed.reset_index(drop=True)], ignore_index=True)
+
+
+def _warn_partial_tract_coverage(
+    tract_files: Mapping[str, Sequence[str]], block_pop: pd.Series
+) -> None:
+    """Warn when a block-group or block download leaves out populated parts of a tract.
+
+    ``_roll_up_to_tracts`` sums a block-group (or block) download to every tract it
+    touches. If the download skipped some of a tract's block groups (one selected by
+    place, say), that tract's total is too low and nothing fails. This compares, tract
+    by tract, the block groups (or blocks) each table supplied with the ones in the
+    block layer that have residents, and logs a warning naming the tracts, the missing
+    parts and the files. Block groups without residents (such as water-only block
+    groups) are not expected. Tracts a download does not touch at all are not checked.
+
+    Args:
+        tract_files: The tract-table files read, by topic (e.g. ``{"INCOME_FILES": [...]}``).
+        block_pop: Residents per block, indexed by 15-digit block FIPS, from the block
+            layer the tract counts are split across.
+    """
+    pop = pd.to_numeric(pd.Series(block_pop), errors="coerce").fillna(0.0)
+    pop.index = pop.index.astype(str)
+    pop = pop[pop > 0]
+    if pop.empty:
+        return
+    for topic, files in tract_files.items():
+        supplied: dict[str, set[str]] = {code: set() for code in _SUB_TRACT_DIGITS}
+        sources: dict[str, set[str]] = {code: set() for code in _SUB_TRACT_DIGITS}
+        for path in files:
+            geo = _read_csv_any(path, usecols=lambda c: c == GEO_ID_COL, dtype=str)
+            if GEO_ID_COL not in geo.columns:
+                continue
+            ids = geo[GEO_ID_COL].dropna().astype(str)
+            for code in _SUB_TRACT_DIGITS:
+                parts = ids[ids.str[:3] == code].str[9:]
+                if not parts.empty:
+                    supplied[code].update(parts)
+                    sources[code].add(str(path))
+        for code, digits in _SUB_TRACT_DIGITS.items():
+            if not supplied[code]:
+                continue
+            touched = {part[:11] for part in supplied[code]}
+            expected = pop.groupby(pop.index.str[:digits]).sum()
+            expected = expected[expected.index.str[:11].isin(touched)]
+            missing = expected[~expected.index.isin(supplied[code])]
+            if missing.empty:
+                continue
+            name = _SUB_TRACT_LEVELS[code]
+            tracts = sorted({part[:11] for part in missing.index})
+            logging.warning(
+                "%s: %d tract(s) (e.g. %s) were summed from %s rows, but %d of their %ss with "
+                "residents in the block layer (e.g. %s; %d residents in all) are missing from "
+                "%s. Those tracts' totals are too low: download every %s of each tract, or "
+                "download the table at the tract level.",
+                topic,
+                len(tracts),
+                ", ".join(tracts[:3]),
+                name,
+                len(missing),
+                name,
+                ", ".join(missing.index[:3]),
+                int(missing.sum()),
+                sorted(sources[code]),
+                name,
+            )
 
 
 def _load_and_concat(
@@ -1192,6 +1260,17 @@ def build_joined_table(
     # on the output and drops any tract row the outer merge left unmatched to a block.
     combined = _apply_fips_filter_df(combined, fips=county_fips_filter)
     _fill_numeric_only(combined)
+    if {"block_id_synth", "total_pop"} <= set(combined.columns):
+        _warn_partial_tract_coverage(
+            {
+                "INCOME_FILES": income_files or [],
+                "ETHNICITY_FILES": ethnicity_files or [],
+                "LANGUAGE_FILES": language_files or [],
+                "VEHICLE_FILES": vehicle_files or [],
+                "AGE_FILES": age_files or [],
+            },
+            combined.set_index("block_id_synth")["total_pop"],
+        )
     combined = disaggregate_tract_counts_to_blocks(
         combined, other_counts=_tract_count_columns(tract_df)
     )
@@ -1250,7 +1329,7 @@ def build_tract_attributes(
     if _clean_columns:
         tract_df = _drop_unfriendly_cols(tract_df)
     tract_df = _apply_fips_filter_df(tract_df, fips=county_fips_filter)
-    tract_df["tract_fips"] = tract_df["tract_id_clean"].astype(str).str[:11]
+    tract_df["tract_fips"] = tract_df["tract_id_clean"].astype(str)
     count_cols = [
         str(c)
         for c in tract_df.columns
@@ -1258,7 +1337,7 @@ def build_tract_attributes(
         and not str(c).startswith("perc_")
         and pd.api.types.is_numeric_dtype(tract_df[c])
     ]
-    return tract_df.groupby("tract_fips", as_index=False)[count_cols].sum()
+    return tract_df[["tract_fips", *count_cols]].sort_values("tract_fips", ignore_index=True)
 
 
 def build_block_jobs(
@@ -2085,6 +2164,20 @@ def run(
 
         # -------- Stage 3: attach demographics onto geometry --------
         logging.info("Stage 3/3: attaching demographics onto block geometry")
+        if "POP20" in blocks_gdf.columns:
+            _warn_partial_tract_coverage(
+                {
+                    topic: discovered[topic]
+                    for topic in (
+                        "INCOME_FILES",
+                        "ETHNICITY_FILES",
+                        "LANGUAGE_FILES",
+                        "VEHICLE_FILES",
+                        "AGE_FILES",
+                    )
+                },
+                blocks_gdf.set_index(LEFT_KEY)["POP20"],
+            )
         joined = attach_demographics_to_blocks(
             blocks_gdf, tract_attrs, block_jobs, block_households=block_households
         )
