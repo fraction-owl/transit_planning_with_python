@@ -1033,6 +1033,201 @@ def test_build_tract_attributes_keys_by_tract_and_drops_perc(tmp_path: Path) -> 
     assert not any(str(c).startswith("perc_") for c in out.columns)
 
 
+def _write_b19001(path: Path, *rows: tuple[str, int, int]) -> str:
+    """Write a B19001 file of (GEO_ID, total households, households under $10k) rows."""
+    bands = ",".join(f"B19001_{n:03d}E" for n in range(1, 12))
+    _write_plain_csv(
+        path,
+        _census_csv(
+            f"GEO_ID,NAME,{bands}",
+            "Geo,Name," + ",".join(["l"] * 11),
+            *[f"{geo},Area,{hh},{low}," + ",".join(["0"] * 9) for geo, hh, low in rows],
+        ),
+    )
+    return str(path)
+
+
+def test_build_tract_attributes_sums_block_groups_to_tract(tmp_path: Path) -> None:
+    bg = _write_b19001(
+        tmp_path / "bg.B19001-Data.csv",
+        ("1500000US110010001001", 60, 50),
+        ("1500000US110010001002", 40, 30),
+    )
+    out = mod.build_tract_attributes(income_files=[bg])
+    assert out["tract_fips"].tolist() == ["11001000100"]
+    assert out["low_income"].tolist() == [80]
+
+
+def test_roll_up_to_tracts_sums_block_rows_and_keeps_other_levels() -> None:
+    df = pd.DataFrame(
+        {
+            "GEO_ID": [
+                "1000000US110010001001001",
+                "1000000US110010001001002",
+                "0500000US11001",
+            ],
+            "NAME": ["Block 1", "Block 2", "County"],
+            "total_pop": [10, 15, 999],
+        }
+    )
+    out = mod._roll_up_to_tracts(df, "sum").sort_values("GEO_ID")
+    assert out["GEO_ID"].tolist() == ["0500000US11001", "1400000US11001000100"]
+    assert out["total_pop"].tolist() == [999, 25]
+
+
+def test_roll_up_to_tracts_rejects_block_and_block_group_in_same_tract() -> None:
+    df = pd.DataFrame(
+        {"GEO_ID": ["1000000US110010001001001", "1500000US110010001002"], "total_pop": [1, 2]}
+    )
+    with pytest.raises(ValueError, match=r"\(block, block group\)"):
+        mod._roll_up_to_tracts(df, "sum")
+
+
+_TWO_BG_POP = pd.Series(
+    {"110010001001001": 10, "110010001002001": 20, "110010001002002": 5},
+    name="pop",
+)
+
+
+def test_warn_partial_tract_coverage_flags_missing_populated_block_group(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    bg = _write_b19001(tmp_path / "bg.B19001-Data.csv", ("1500000US110010001001", 60, 50))
+    with caplog.at_level(logging.WARNING):
+        mod._warn_partial_tract_coverage({"INCOME_FILES": [bg]}, _TWO_BG_POP)
+    assert "11001000100" in caplog.text
+    assert "110010001002" in caplog.text  # the missing block group
+    assert "25 residents" in caplog.text
+    assert bg in caplog.text
+
+
+def test_warn_partial_tract_coverage_quiet_when_every_populated_part_is_present(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    bg = _write_b19001(
+        tmp_path / "bg.B19001-Data.csv",
+        ("1500000US110010001001", 60, 50),
+        ("1500000US110010001002", 40, 30),
+    )
+    tract = _write_b19001(tmp_path / "tract.B19001-Data.csv", ("1400000US11001000200", 10, 1))
+    # Block group 3 exists in the block layer but has no residents (e.g. water only).
+    pop = pd.concat([_TWO_BG_POP, pd.Series({"110010001003001": 0})])
+    with caplog.at_level(logging.WARNING):
+        mod._warn_partial_tract_coverage({"INCOME_FILES": [bg, tract]}, pop)
+    assert caplog.text == ""
+
+
+def test_warn_partial_tract_coverage_flags_missing_block(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    eth_cols = "P9_001N,P9_002N,P9_005N,P9_006N,P9_007N,P9_008N,P9_009N,P9_010N,P9_011N"
+    p = tmp_path / "DECENNIALDHC2020.P9-Data.csv"
+    _write_plain_csv(
+        p,
+        _census_csv(
+            f"GEO_ID,NAME,{eth_cols}",
+            "Geo,Name," + ",".join(["l"] * 9),
+            "1000000US110010001001001,Block,10,0,10,0,0,0,0,0,0",
+            "1000000US110010001002001,Block,20,0,20,0,0,0,0,0,0",
+        ),
+    )
+    with caplog.at_level(logging.WARNING):
+        mod._warn_partial_tract_coverage({"ETHNICITY_FILES": [str(p)]}, _TWO_BG_POP)
+    assert "were summed from block rows" in caplog.text
+    assert "110010001002002" in caplog.text
+    assert "5 residents" in caplog.text
+
+
+def test_run_warns_when_block_group_download_misses_part_of_a_tract(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    csv_dir = tmp_path / "census"
+    csv_dir.mkdir()
+    shp_dir = tmp_path / "tiger"
+    shp_dir.mkdir()
+    shutil.copy(FIXTURE_DIR / FIXTURE_ZIPS[0], shp_dir / FIXTURE_ZIPS[0])
+    # Tract 11001000201's residents live in block group 2; the download has only group 1.
+    _write_b19001(csv_dir / "ACSDT5Y2024.B19001-Data.csv", ("1500000US110010002011", 60, 50))
+    with caplog.at_level(logging.WARNING):
+        assert (
+            mod.run(
+                input_csv_dir=str(csv_dir),
+                input_shp_dir=str(shp_dir),
+                final_joined_features=str(tmp_path / "out" / "blocks.gpkg"),
+                tiger_input_glob="tl_*_*_*.shp",
+                fips_to_filter=["11001"],
+                intermediate_combined_csv="",
+                intermediate_merged_shp="",
+            )
+            == 0
+        )
+    assert "INCOME_FILES: 1 tract(s) (e.g. 11001000201)" in caplog.text
+    assert "110010002012" in caplog.text
+
+
+def test_build_tract_attributes_rejects_tract_and_block_group_of_same_table(
+    tmp_path: Path,
+) -> None:
+    # Issue #181: both files roll up to tract 11001000100, which used to double its
+    # low-income count to 160.
+    tract = _write_b19001(tmp_path / "tract.B19001-Data.csv", (_TRACT_GEO_ID, 100, 80))
+    bg = _write_b19001(
+        tmp_path / "bg.B19001-Data.csv",
+        ("1500000US110010001001", 60, 50),
+        ("1500000US110010001002", 40, 30),
+    )
+    with pytest.raises(ValueError, match="more than one geography level") as err:
+        mod.build_tract_attributes(income_files=[tract, bg])
+    assert "11001000100" in str(err.value)
+    assert tract in str(err.value) and bg in str(err.value)
+
+
+def test_build_tract_attributes_allows_different_levels_for_different_tracts(
+    tmp_path: Path,
+) -> None:
+    tract = _write_b19001(tmp_path / "tract.B19001-Data.csv", (_TRACT_GEO_ID, 100, 80))
+    bg = _write_b19001(
+        tmp_path / "bg.B19001-Data.csv",
+        ("1500000US110010002001", 60, 5),
+        ("1500000US110010002002", 40, 7),
+    )
+    out = mod.build_tract_attributes(income_files=[tract, bg]).sort_values("tract_fips")
+    assert out["tract_fips"].tolist() == ["11001000100", "11001000200"]
+    assert out["low_income"].tolist() == [80, 12]
+
+
+def test_build_tract_attributes_rejects_block_group_commute(tmp_path: Path) -> None:
+    # S0801 holds percentages and a mean, which cannot be summed to a tract.
+    cols = "S0801_C01_001E,S0801_C01_003E,S0801_C01_004E,S0801_C01_009E,S0801_C01_013E"
+    p = tmp_path / "ACSST5Y2024.S0801-Data.csv"
+    _write_plain_csv(
+        p,
+        _census_csv(
+            f"GEO_ID,NAME,{cols},S0801_C01_046E",
+            "Geo,Name," + ",".join(["l"] * 6),
+            "1500000US110010001001,BG,100,80.0,10.0,5.0,4.0,22.5",
+        ),
+    )
+    with pytest.raises(ValueError, match="below the tract level"):
+        mod.build_tract_attributes(commute_files=[str(p)])
+
+
+def test_build_joined_table_rolls_block_groups_up_to_tract(
+    minimal_block_files: dict[str, list[str]], tmp_path: Path
+) -> None:
+    # The legacy block-table path keys tracts on GEO_ID[9:]; a block-group row's 12
+    # digits used to match no block. Summed to the tract first, it now joins.
+    bg = _write_b19001(
+        tmp_path / "bg.B19001-Data.csv",
+        ("1500000US110010001001", 60, 50),
+        ("1500000US110010001002", 40, 30),
+    )
+    df = mod.build_joined_table(**minimal_block_files, income_files=[bg])
+    assert len(df) == 1
+    assert df["low_income"].tolist() == pytest.approx([80.0])
+    assert df["perc_low_income"].tolist() == pytest.approx([0.8])
+
+
 def test_build_block_jobs_keys_on_block_fips(tmp_path: Path) -> None:
     wac = tmp_path / "wac_S000_JT00.csv"
     _write_plain_csv(wac, "w_geocode,C000,CE01,CE02,CE03\n110010001001001,50,10,15,25\n")
