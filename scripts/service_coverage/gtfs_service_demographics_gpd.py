@@ -2437,19 +2437,22 @@ def run(
                 warn_if_distorted_crs(analysis_crs, float(stop_lon), float(stop_lat))
 
         # Route geometry from shapes.txt — required for the "route_buffer"
-        # method, optional otherwise. Loaded opportunistically.
+        # method, optional otherwise. Loaded opportunistically, through
+        # load_gtfs_data so a zipped feed is read the same way as a folder.
         shapes_df: Optional[pd.DataFrame] = None
-        shapes_path = os.path.join(str(gtfs_data_path), ROUTE_GEOMETRY_GTFS_FILE)
-        if os.path.exists(shapes_path):
-            shapes_df = pd.read_csv(shapes_path, dtype=str, low_memory=False)
-            logging.info("Loaded %s (%d records).", ROUTE_GEOMETRY_GTFS_FILE, len(shapes_df))
-        elif service_area_method == "route_buffer":
-            logging.warning(
-                "SERVICE_AREA_METHOD is 'route_buffer' but %s was not found in %s; "
-                "the analysis will fall back to stop buffers.",
-                ROUTE_GEOMETRY_GTFS_FILE,
-                gtfs_data_path,
-            )
+        try:
+            shapes_df = load_gtfs_data(
+                str(gtfs_data_path), files=[ROUTE_GEOMETRY_GTFS_FILE], dtype=str
+            )[ROUTE_GEOMETRY_GTFS_FILE.replace(".txt", "")]
+        except OSError as exc:
+            if service_area_method == "route_buffer":
+                logging.warning(
+                    "SERVICE_AREA_METHOD is 'route_buffer' but %s was not found in %s (%s); "
+                    "the analysis will fall back to stop buffers.",
+                    ROUTE_GEOMETRY_GTFS_FILE,
+                    gtfs_data_path,
+                    exc,
+                )
 
         # --------------------------------------------------------------
         # 1b) PEDESTRIAN NETWORK (only for the "isochrone" method)

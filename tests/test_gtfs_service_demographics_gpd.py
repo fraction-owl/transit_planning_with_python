@@ -668,6 +668,55 @@ def test_run_raises_on_missing_demographics(tmp_path: Path, dc_gtfs_dir: Path) -
         )
 
 
+def test_run_route_buffer_reads_shapes_from_zip(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # shapes.txt used to be looked up with os.path.join(gtfs_data_path, ...),
+    # which never exists for a .zip feed, so route_buffer always fell back to
+    # stop buffers. The archive nests it one folder deep (dc/shapes.txt).
+    with (
+        caplog.at_level(logging.INFO),
+        pytest.raises(FileNotFoundError, match="Demographics shapefile not found"),
+    ):
+        run(
+            analysis_mode="network",
+            service_area_method="route_buffer",
+            gtfs_data_path=str(FIXTURES / "mock_gtfs_dc.zip"),
+            service_ids_to_include=_FIXTURE_SERVICE_IDS,
+            demographics_shp_path=str(tmp_path / "does_not_exist.shp"),
+            output_directory=str(tmp_path / "out"),
+        )
+    assert "Loaded shapes.txt" in caplog.text
+    assert "fall back to stop buffers" not in caplog.text
+
+
+def test_run_route_buffer_warns_when_zip_has_no_shapes(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    no_shapes_zip = tmp_path / "no_shapes.zip"
+    with (
+        zipfile.ZipFile(FIXTURES / "mock_gtfs_dc.zip") as src,
+        zipfile.ZipFile(no_shapes_zip, "w") as dst,
+    ):
+        for name in src.namelist():
+            if not name.endswith("shapes.txt"):
+                dst.writestr(name, src.read(name))
+
+    with (
+        caplog.at_level(logging.WARNING),
+        pytest.raises(FileNotFoundError, match="Demographics shapefile not found"),
+    ):
+        run(
+            analysis_mode="network",
+            service_area_method="route_buffer",
+            gtfs_data_path=str(no_shapes_zip),
+            service_ids_to_include=_FIXTURE_SERVICE_IDS,
+            demographics_shp_path=str(tmp_path / "does_not_exist.shp"),
+            output_directory=str(tmp_path / "out"),
+        )
+    assert "fall back to stop buffers" in caplog.text
+
+
 def test_run_stops_when_service_id_not_in_feed(
     tmp_path: Path, dc_gtfs_dir: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
