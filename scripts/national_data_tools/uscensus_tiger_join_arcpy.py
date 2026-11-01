@@ -103,6 +103,9 @@ FINAL_JOINED_FEATURES: str = str(Path(FINAL_OUTPUT_DIR) / FINAL_JOINED_FEATURES_
 # iteration "B19001A", and "P1" does not match "P12". Pin a vintage by adding its
 # product code, e.g. ("ACSDT5Y2024", "B19001"). Files that disagree on the same
 # geography (two vintages, say) abort the run rather than one being silently kept.
+# Tract tables may be downloaded at the block-group or block level instead; those rows
+# are summed to their tract. A tract covered at two levels of the same table (a tract
+# file plus a block-group file) aborts the run.
 TOPIC_SIGNATURES: dict[str, Sequence[str] | str] = {
     "POP_FILES": ("P1",),
     "HH_FILES": ("H9",),
@@ -202,6 +205,10 @@ GEO_ID_COL = "GEO_ID"
 _UNFRIENDLY_COL_RE = re.compile(r"^[A-Z]{2,}\d{3,}.*")
 #: Temporary per-row record of the input file, used to name files in duplicate errors.
 _SOURCE_COL: Final[str] = "_source_file"
+#: Census summary level of a tract: the first three characters of its ``GEO_ID``.
+_TRACT_LEVEL: Final[str] = "140"
+#: Summary levels nested inside a tract, which a tract table can also be downloaded at.
+_SUB_TRACT_LEVELS: Final[dict[str, str]] = {"150": "block group", "100": "block"}
 
 
 def _token_match(name: str, tokens: Sequence[str] | str) -> bool:
@@ -375,7 +382,8 @@ def _dedupe_topic_rows(df: pd.DataFrame, key: Hashable) -> pd.DataFrame:
     to one. A key that repeats with *different* data is an ambiguous input — keeping
     either row would silently pick a vintage — so it raises, naming the files.
     Inputs keyed on ``GEOID`` instead of ``GEO_ID`` are checked on ``GEOID``. The
-    temporary ``_SOURCE_COL`` added by ``_load_and_concat`` is dropped on return.
+    temporary ``_SOURCE_COL`` added by ``_load_and_concat`` is kept so that
+    ``_roll_up_to_tracts`` can name files too; ``_load_and_concat`` drops it.
 
     Raises:
         ValueError: If any key repeats with conflicting values.
@@ -383,7 +391,7 @@ def _dedupe_topic_rows(df: pd.DataFrame, key: Hashable) -> pd.DataFrame:
     if key == GEO_ID_COL and key not in df.columns and "GEOID" in df.columns:
         key = "GEOID"
     if key not in df.columns:
-        return df.drop(columns=_SOURCE_COL, errors="ignore")
+        return df
     data_cols = [c for c in df.columns if c != _SOURCE_COL and not str(c).startswith("NAME")]
     unique = df.drop_duplicates(subset=data_cols)
     conflicts = unique[unique.duplicated(subset=[key], keep=False)]
@@ -408,7 +416,87 @@ def _dedupe_topic_rows(df: pd.DataFrame, key: Hashable) -> pd.DataFrame:
             dropped,
             key,
         )
-    return unique.drop(columns=_SOURCE_COL, errors="ignore").reset_index(drop=True)
+    return unique.reset_index(drop=True)
+
+
+def _roll_up_to_tracts(df: pd.DataFrame, how: Literal["sum", "reject"]) -> pd.DataFrame:
+    """Sum the block-group and block rows of a tract table up to their tract.
+
+    A ``GEO_ID`` starts with its Census summary level: ``140`` for a tract
+    (``1400000US`` + 11 digits), ``150`` for a block group (12 digits), ``100`` for a
+    block (15 digits). The tract builders key every topic on the 11-digit tract, so
+    block-group and block rows are summed to their tract here, before the
+    ``_derive_*`` step computes totals and percentages from the counts. Rows at any
+    other level pass through unchanged (they match no tract).
+
+    Each level carries the whole tract's count, so a tract covered at two levels (a
+    tract download and a block-group download of the same table) would be counted
+    twice; that raises, naming the files. Different tracts may come at different
+    levels. With ``how="reject"`` (for S0801, whose values are percentages and a
+    mean, which cannot be summed) any row below the tract level raises instead.
+
+    Args:
+        df: One topic's concatenated rows, still carrying ``_SOURCE_COL``.
+        how: ``"sum"`` to roll block-group and block rows up, ``"reject"`` to refuse them.
+
+    Returns:
+        ``df`` with its block-group and block rows replaced by one row per tract
+        (``GEO_ID`` = ``1400000US`` + tract, ``NAME`` empty).
+
+    Raises:
+        ValueError: If a tract is covered at more than one level, or if ``how`` is
+            ``"reject"`` and any row lies below the tract level.
+    """
+    if df.empty or GEO_ID_COL not in df.columns:
+        return df
+    geo = df[GEO_ID_COL].astype(str)
+    level = geo.str[:3]
+    below = level.isin(list(_SUB_TRACT_LEVELS))
+    if not below.any():
+        return df
+
+    def _files(mask: pd.Series) -> list[str]:
+        if _SOURCE_COL not in df.columns:
+            return []
+        return sorted(df.loc[mask, _SOURCE_COL].astype(str).unique())
+
+    if how == "reject":
+        raise ValueError(
+            f"{int(below.sum())} row(s) below the tract level in {_files(below)}. This "
+            "table holds percentages and means, which cannot be summed up to a tract; "
+            "download it at the tract level."
+        )
+
+    tract = geo.str[9:20].rename("_tract")
+    nested = below | level.eq(_TRACT_LEVEL)
+    levels_per_tract = level[nested].groupby(tract[nested]).nunique()
+    mixed = levels_per_tract.index[levels_per_tract > 1].tolist()
+    if mixed:
+        clash = nested & tract.isin(mixed)
+        names = {_TRACT_LEVEL: "tract", **_SUB_TRACT_LEVELS}
+        found = sorted({names[code] for code in level[clash]})
+        raise ValueError(
+            f"{len(mixed)} tract(s) (e.g. {', '.join(mixed[:3])}) are covered at more than "
+            f"one geography level ({', '.join(found)}); files involved: {_files(clash)}. "
+            "Each level holds the whole tract's count, so using both would count it twice. "
+            "Keep one geography level per table: remove the extra file."
+        )
+
+    value_cols = [
+        c
+        for c in df.columns
+        if c not in (GEO_ID_COL, _SOURCE_COL) and not str(c).startswith("NAME")
+    ]
+    counts = df.loc[below, value_cols].apply(pd.to_numeric, errors="coerce")
+    summed = counts.groupby(tract[below]).sum()
+    summed.insert(0, GEO_ID_COL, "1400000US" + summed.index.to_series())
+    logging.info(
+        "Summed %d block-group/block row(s) in %s to %d tract(s).",
+        int(below.sum()),
+        _files(below),
+        len(summed),
+    )
+    return pd.concat([df.loc[~below], summed.reset_index(drop=True)], ignore_index=True)
 
 
 def _load_and_concat(
@@ -420,12 +508,18 @@ def _load_and_concat(
     rename: Mapping[str, str] | None = None,
     compression: Literal["infer", "gzip", "bz2", "zip", "xz", "zstd"] | None = None,
     dedupe_key: Hashable | None = GEO_ID_COL,
+    tract_rollup: Literal["sum", "reject"] | None = None,
 ) -> pd.DataFrame:
     """Read multiple Census CSV / CSV-GZ / ZIP files and concatenate the results.
 
     When ``dedupe_key`` is set (default ``GEO_ID``), rows repeating that key with
     identical data are collapsed and rows repeating it with conflicting data raise
     ``ValueError`` (see ``_dedupe_topic_rows``). Pass ``dedupe_key=None`` to disable.
+
+    For tract tables, ``tract_rollup="sum"`` then sums block-group and block rows
+    to their tract, raising if a tract is covered at two geography levels, and
+    ``"reject"`` refuses them (see ``_roll_up_to_tracts``). ``None`` (the default,
+    for block tables) skips this step.
     """
     from functools import partial
 
@@ -467,6 +561,8 @@ def _load_and_concat(
     combined = pd.concat(frames, ignore_index=True)
     if dedupe_key is not None:
         combined = _dedupe_topic_rows(combined, dedupe_key)
+    if tract_rollup is not None:
+        combined = _roll_up_to_tracts(combined, tract_rollup)
     return combined.drop(columns=_SOURCE_COL, errors="ignore")
 
 
@@ -685,6 +781,7 @@ def _build_tract_df(inp: _TractInputs) -> pd.DataFrame:
         income = _load_and_concat(
             inp.income_files,
             skiprows=[1],
+            tract_rollup="sum",
             rename={
                 "B19001_001E": "total_hh",
                 "B19001_002E": "sub_10k",
@@ -707,6 +804,7 @@ def _build_tract_df(inp: _TractInputs) -> pd.DataFrame:
         ethnicity = _load_and_concat(
             inp.ethnicity_files,
             skiprows=[1],
+            tract_rollup="sum",
             rename={
                 "P9_001N": "total_pop",
                 "P9_002N": "all_hisp",
@@ -727,6 +825,7 @@ def _build_tract_df(inp: _TractInputs) -> pd.DataFrame:
         language = _load_and_concat(
             inp.language_files,
             skiprows=[1],
+            tract_rollup="sum",
             rename={
                 "C16001_001E": "total_lang_pop",
                 "C16001_005E": "spanish_engnwell",
@@ -751,6 +850,7 @@ def _build_tract_df(inp: _TractInputs) -> pd.DataFrame:
         vehicle = _load_and_concat(
             inp.vehicle_files,
             skiprows=[1],
+            tract_rollup="sum",
             rename={
                 "B08201_001E": "all_hhs",
                 "B08201_002E": "veh_0_all_hh",
@@ -775,6 +875,7 @@ def _build_tract_df(inp: _TractInputs) -> pd.DataFrame:
         age = _load_and_concat(
             inp.age_files,
             skiprows=[1],
+            tract_rollup="sum",
             rename={
                 "B01001_001E": "total_pop",
                 "B01001_006E": "m_15_17",

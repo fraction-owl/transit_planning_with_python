@@ -138,3 +138,43 @@ def test_tract_counts_are_split_across_blocks(mod: types.ModuleType, tmp_path: P
     assert df["HH_LOWINC"].tolist() == pytest.approx([20.0, 60.0])  # 80 split 10:30
     assert df["PCT_LOWINC"].tolist() == pytest.approx([0.8, 0.8])  # tract rate kept
     assert set(df[mod.COUNT_ALLOCATION_FIELD]) == {1}
+
+
+def _write_b19001(path: Path, *rows: tuple[str, int, int]) -> None:
+    """Write a B19001 file of (GEO_ID, total households, households under $10k) rows."""
+    bands = ",".join(f"B19001_{n:03d}E" for n in range(1, 12))
+    _write_csv(
+        path,
+        f"GEO_ID,NAME,{bands}",
+        *[f"{geo},Area,{hh},{low}," + ",".join(["0"] * 9) for geo, hh, low in rows],
+    )
+
+
+def test_block_group_rows_roll_up_to_tract(mod: types.ModuleType, tmp_path: Path) -> None:
+    # Issue #181: block-group rows (12-digit key) used to match no block. Summed to
+    # the tract first, they split across the tract's blocks like a tract download.
+    _write_pop(tmp_path)
+    _write_b19001(
+        tmp_path / "ACSDT5Y2024.B19001-Data.csv",
+        ("1500000US110010001001", 60, 50),
+        ("1500000US110010001002", 40, 30),
+    )
+    df = mod.build_joined_table_from_folder(tmp_path, county_fips_filter=["11001"])
+    df = df.sort_values("GEO_ID_blk")
+    # 80 split by block population 100:200 (no H9, so households fall back to population).
+    assert df["HH_LOWINC"].tolist() == pytest.approx([80 / 3, 160 / 3])
+    assert df["PCT_LOWINC"].tolist() == pytest.approx([0.8, 0.8])
+
+
+def test_tract_and_block_group_of_same_table_are_rejected(
+    mod: types.ModuleType, tmp_path: Path
+) -> None:
+    _write_pop(tmp_path)
+    _write_b19001(tmp_path / "tract.B19001-Data.csv", (_TRACTS[0], 100, 80))
+    _write_b19001(
+        tmp_path / "bg.B19001-Data.csv",
+        ("1500000US110010001001", 60, 50),
+        ("1500000US110010001002", 40, 30),
+    )
+    with pytest.raises(ValueError, match="more than one geography level"):
+        mod.build_joined_table_from_folder(tmp_path)

@@ -873,6 +873,65 @@ def test_build_joined_table_splits_tract_counts_across_blocks(tmp_path: Path) ->
     assert df["perc_low_income"].tolist() == pytest.approx([0.8, 0.8])
 
 
+def _write_b19001(path: Path, *rows: tuple[str, int, int]) -> str:
+    """Write a B19001 file of (GEO_ID, total households, households under $10k) rows."""
+    bands = ",".join(f"B19001_{n:03d}E" for n in range(1, 12))
+    _write_plain_csv(
+        path,
+        _census_csv(
+            f"GEO_ID,NAME,{bands}",
+            "Geo,Name," + ",".join(["l"] * 11),
+            *[f"{geo},Area,{hh},{low}," + ",".join(["0"] * 9) for geo, hh, low in rows],
+        ),
+    )
+    return str(path)
+
+
+def test_build_joined_table_rolls_block_groups_up_to_tract(tmp_path: Path) -> None:
+    # Issue #181: block-group rows (12-digit key) used to match no block, leaving the
+    # block at low_income 0 plus an unmatched block-group row. Summed to the tract
+    # first, they now split across the tract's blocks like a tract download.
+    blocks = [("1000000US110010001001001", 100, 10), ("1000000US110010001001002", 300, 30)]
+    pop_path = tmp_path / "P1-Data.csv"
+    hh_path = tmp_path / "H9-Data.csv"
+    _write_plain_csv(
+        pop_path,
+        _census_csv(
+            "GEO_ID,NAME,P1_001N", "Geo,Name,Total", *[f"{g},Block,{p}" for g, p, _ in blocks]
+        ),
+    )
+    _write_plain_csv(
+        hh_path, _census_csv("GEO_ID,H9_001N", "Geo,Total", *[f"{g},{h}" for g, _, h in blocks])
+    )
+    bg = _write_b19001(
+        tmp_path / "bg.B19001-Data.csv",
+        ("1500000US110010001001", 60, 50),
+        ("1500000US110010001002", 40, 30),
+    )
+    df = build_joined_table(
+        pop_files=[str(pop_path)], hh_files=[str(hh_path)], jobs_files=[], income_files=[bg]
+    ).sort_values("total_pop")
+    assert len(df) == 2  # no unmatched block-group rows
+    assert df["low_income"].tolist() == pytest.approx([20.0, 60.0])  # 80 split 10:30
+    assert df["perc_low_income"].tolist() == pytest.approx([0.8, 0.8])
+
+
+def test_build_joined_table_rejects_tract_and_block_group_of_same_table(tmp_path: Path) -> None:
+    pop_path = tmp_path / "P1-Data.csv"
+    _write_plain_csv(pop_path, _make_block_pop_csv())
+    tract = _write_b19001(tmp_path / "tract.B19001-Data.csv", (_TRACT_GEO_ID, 100, 80))
+    bg = _write_b19001(
+        tmp_path / "bg.B19001-Data.csv",
+        ("1500000US110010001001", 60, 50),
+        ("1500000US110010001002", 40, 30),
+    )
+    with pytest.raises(ValueError, match="more than one geography level") as err:
+        build_joined_table(
+            pop_files=[str(pop_path)], hh_files=[], jobs_files=[], income_files=[tract, bg]
+        )
+    assert tract in str(err.value) and bg in str(err.value)
+
+
 def test_build_joined_table_duplicated_inputs_do_not_multiply_rows(tmp_path: Path) -> None:
     # The same block row and the same tract row each supplied twice used to fan out
     # to 2 x 2 = 4 rows for the one block; identical repeats now collapse first.
