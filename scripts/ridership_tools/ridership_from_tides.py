@@ -246,7 +246,11 @@ def join_trip_attributes(
 
     Trips that were Canceled (or not in revenue service) in ``trips_performed``
     are dropped, since their stop visits carry no meaningful ridership. The join
-    key is ``trip_id_performed``, unique per performed trip in TIDES.
+    keys are ``service_date`` and ``trip_id_performed``: TIDES makes
+    ``trip_id_performed`` unique only within a service date, and a bare trip ID
+    repeats every day. Dates are compared parsed, since the two exports may
+    format them differently. Stop visits with no same-day trip are logged and
+    left out.
 
     Args:
         stop_visits: Output of :func:`load_stop_visits`.
@@ -255,16 +259,30 @@ def join_trip_attributes(
     Returns:
         Stop visits with the ``_TRIP_ATTR_COLS`` attributes joined on.
     """
-    trips = trips_performed.copy()
+    keys = ["service_date", "trip_id_performed"]
+    visits = stop_visits.assign(
+        service_date=pd.to_datetime(stop_visits["service_date"], errors="coerce")
+    )
+    trips = trips_performed.assign(
+        service_date=pd.to_datetime(trips_performed["service_date"], errors="coerce")
+    )
+    unmatched = ~pd.MultiIndex.from_frame(visits[keys]).isin(pd.MultiIndex.from_frame(trips[keys]))
+    if unmatched.any():
+        logging.warning(
+            "%d stop visit(s) have no trips_performed row with the same service_date and "
+            "trip_id_performed; they are left out.",
+            int(unmatched.sum()),
+        )
+
     if "schedule_relationship" in trips.columns:
         trips = trips.loc[trips["schedule_relationship"].fillna("Scheduled") != "Canceled"]
     if "trip_type" in trips.columns:
         trips = trips.loc[trips["trip_type"].fillna("In service") == "In service"]
 
     attr_cols = [c for c in _TRIP_ATTR_COLS if c in trips.columns]
-    trips = trips[["trip_id_performed", *attr_cols]].drop_duplicates("trip_id_performed")
+    trips = trips[[*keys, *attr_cols]].drop_duplicates(keys)
 
-    return stop_visits.merge(trips, on="trip_id_performed", how="inner")
+    return visits.merge(trips, on=keys, how="inner")
 
 
 # =============================================================================
@@ -432,18 +450,20 @@ def aggregate_ridership(
         ``stop_visits``, ``trips``, and ``avg_boardings_per_trip``.
     """
     keys = list(group_cols) + list(temporal_keys)
-    work = df
+    # A performed trip is a (service_date, trip_id_performed) pair; the ID alone
+    # may repeat every day.
+    work = df.assign(_trip=df.groupby(["service_date", "trip_id_performed"], dropna=False).ngroup())
     group_on: List[str] = keys
     if not keys:
         # System-wide single-row aggregation: group on a constant helper column.
-        work = df.assign(_all=0)
+        work = work.assign(_all=0)
         group_on = ["_all"]
 
     out = work.groupby(group_on, dropna=False).agg(
         boardings=("boardings", "sum"),
         alightings=("alightings", "sum"),
         stop_visits=("boardings", "size"),
-        trips=("trip_id_performed", "nunique"),
+        trips=("_trip", "nunique"),
     )
     out["net_boardings"] = out["boardings"] - out["alightings"]
     out["avg_boardings_per_trip"] = (out["boardings"] / out["trips"].where(out["trips"] > 0)).round(
@@ -838,11 +858,12 @@ def run(cfg: Config) -> Dict[str, pd.DataFrame]:
         plot_paths = plot_levels(grain_tables[chart_grain], cfg.output_dir, x_field)
         logging.info("Wrote %d ridership charts to %s", len(plot_paths), cfg.output_dir / "plots")
 
+    n_trips = len(prepared[["service_date", "trip_id_performed"]].drop_duplicates())
     summary_lines = [
         f"Total boardings:    {int(prepared['boardings'].sum())}",
         f"Total alightings:   {int(prepared['alightings'].sum())}",
         f"Stop visits used:   {len(prepared)}",
-        f"Trips observed:     {prepared['trip_id_performed'].nunique()}",
+        f"Trips observed:     {n_trips}",
         f"Months in panel:    {prepared['month'].nunique()}",
         f"Time periods:       {', '.join(sorted(prepared['time_period'].unique()))}",
         f"Grains exported:    {', '.join(grains)}",
