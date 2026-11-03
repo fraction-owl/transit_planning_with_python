@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import datetime as dt
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -17,8 +20,10 @@ from scripts.stop_analysis.gtfs_route_diff import (
     detect_splits_merges,
     feed_date_range,
     jaccard,
+    load_feed,
     median_headway_min,
     normalize_text,
+    pick_representative_weekday_services,
     route_day_types,
     route_fare_map,
     route_interline_partners,
@@ -31,6 +36,8 @@ from scripts.stop_analysis.gtfs_route_diff import (
     time_to_seconds,
     trip_endpoints,
 )
+
+FIXTURES = Path(__file__).parent / "fixtures"
 
 # Threshold knobs matching the module defaults, for classifier tests.
 KNOBS = {
@@ -597,6 +604,73 @@ def test_compare_routes_flags_major_alignment() -> None:
     assert results["summary"].alignment_major_count == 1
     r1 = results["overview"].iloc[0]
     assert r1["headline_change"] == "major_alignment"
+
+
+# ---------------------------------------------------------------------------
+# representative weekday selection (issue #254)
+# ---------------------------------------------------------------------------
+# gtfs_route_diff_replacement_day: WK runs Mon-Fri 2026-09-01..2026-12-31, except
+# Tuesday 2026-11-03, the Tuesday nearest the feed's midpoint, when calendar_dates
+# swaps WK for a one-day MOD service. R1 runs only on WK (4 -> 2 trips between the
+# feeds); R2 runs on WK (3 -> 4 trips) and has one MOD trip in both feeds. The
+# fixture is synthetic: it models the suspected cause, not the reported feeds.
+
+_REPLACEMENT_DAY = FIXTURES / "gtfs_route_diff_replacement_day"
+
+
+def test_pick_representative_weekday_skips_replacement_day() -> None:
+    feed = load_feed(_REPLACEMENT_DAY / "before", label="before")
+    day, sids = pick_representative_weekday_services(
+        feed["calendar"], feed["calendar_dates"], "tuesday"
+    )
+    assert day is not None
+    assert day.weekday() == 1
+    assert day != dt.date(2026, 11, 3)
+    assert sids == {"WK"}
+
+
+def test_pick_representative_weekday_ignores_day_with_extra_service_ids() -> None:
+    # One Tuesday drops WK and adds two one-off services. It has more service_ids
+    # than any regular Tuesday but is not a typical day.
+    cal = pd.DataFrame(
+        [
+            _cal("WK", "1111100", "20260901", "20261231"),
+            _cal("MOD", "0000000", "20260901", "20261231"),
+            _cal("EVENT", "0000000", "20260901", "20261231"),
+        ]
+    )
+    cal_dates = pd.DataFrame(
+        [("WK", "20260922", "2"), ("MOD", "20260922", "1"), ("EVENT", "20260922", "1")],
+        columns=["service_id", "date", "exception_type"],
+    )
+    day, sids = pick_representative_weekday_services(cal, cal_dates, "tuesday")
+    assert day != dt.date(2026, 9, 22)
+    assert sids == {"WK"}
+
+
+def test_pick_representative_weekday_none_without_that_weekday() -> None:
+    cal = pd.DataFrame([_cal("SAT", "0000010", "20260901", "20261231")])
+    assert pick_representative_weekday_services(cal, None, "tuesday") == (None, set())
+
+
+def test_pick_representative_weekday_rejects_weekend_name() -> None:
+    cal = pd.DataFrame([_cal("WK", "1111100", "20260901", "20261231")])
+    with pytest.raises(ValueError, match="monday..friday"):
+        pick_representative_weekday_services(cal, None, "saturday")
+
+
+def test_compare_routes_measures_routes_missing_on_replacement_day() -> None:
+    before = load_feed(_REPLACEMENT_DAY / "before", label="before")
+    after = load_feed(_REPLACEMENT_DAY / "after", label="after")
+    results = compare_routes(before, after, weekday="tuesday", knobs=KNOBS)
+    overview = results["overview"].set_index("route_id")
+    # R1 has no trips on the replacement day; it must still be measured.
+    assert overview.loc["R1", "schedule_change"] == "major"
+    assert "trips/day 4->2" in overview.loc["R1", "schedule_detail"]
+    # R2 must be counted from its WK trips, not only its one MOD trip.
+    assert overview.loc["R2", "schedule_change"] == "major"
+    assert "trips/day 3->4" in overview.loc["R2", "schedule_detail"]
+    assert set(results["schedule"]["route_id"]) == {"R1", "R2"}
 
 
 def test_correspondence_is_dataclass() -> None:

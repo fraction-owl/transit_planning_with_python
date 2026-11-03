@@ -29,8 +29,10 @@ Design decisions (all threshold knobs live in the CONFIG block and are CLI flags
   skips the Elm St loop". Shape length is reported as context when ``shapes.txt``
   exists but does not drive the major/minor call.
 - Schedule magnitude is measured on a single **representative weekday** picked per
-  feed (the in-range weekday with the most active service). Weekend gains/losses are
-  still surfaced through the route-level day-type rollup.
+  feed (the median date of the most common set of active service_ids among the feed's
+  dates of that weekday, so a holiday or one-off date with its own service is not
+  picked). Routes with no trips on that date are not measured. Weekend gains/losses
+  are still surfaced through the route-level day-type rollup.
 - Fares cover GTFS-Fares **v1** only (the files the loader already reads).
 
 Outputs (CSV):
@@ -69,7 +71,7 @@ import json
 import logging
 import os
 import sys
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import List, Optional
@@ -85,8 +87,9 @@ BEFORE_GTFS_DIR = Path(r"Path\To\Old\GTFS\Dir")
 AFTER_GTFS_DIR = Path(r"Path\To\New\GTFS\Dir")
 OUTPUT_DIR = Path(r"Path\To\Output\Dir")
 
-# Weekday used to characterize the schedule (monday..friday). The in-range date of
-# this weekday with the most active service is picked independently in each feed.
+# Weekday used to characterize the schedule (monday..friday). Each feed's dates of this
+# weekday are grouped by their set of active service_ids, and the median date of the
+# most common set is picked independently in each feed.
 ANALYSIS_WEEKDAY: str = "tuesday"
 
 # --- Route-identity / rekey matching ---------------------------------------
@@ -371,30 +374,6 @@ def _weekday_name_to_int(name: str) -> int:
     return _WEEKDAY_COLS.index(key)
 
 
-def _active_service_ids_for_date(
-    calendar: Optional[pd.DataFrame],
-    calendar_dates: Optional[pd.DataFrame],
-    day: dt.date,
-) -> set[str]:
-    """Resolve the service_ids active on ``day`` from calendar + calendar_dates."""
-    ds = day.strftime("%Y%m%d")
-    active: set[str] = set()
-
-    if calendar is not None and not calendar.empty:
-        col = _WEEKDAY_COLS[day.weekday()]
-        cal = calendar
-        in_range = (cal["start_date"].str.strip() <= ds) & (cal["end_date"].str.strip() >= ds)
-        runs = cal[col].str.strip() == "1" if col in cal.columns else False
-        active |= set(cal.loc[in_range & runs, "service_id"].astype(str))
-
-    if calendar_dates is not None and not calendar_dates.empty:
-        cd = calendar_dates[calendar_dates["date"].str.strip() == ds]
-        active |= set(cd.loc[cd["exception_type"].str.strip() == "1", "service_id"].astype(str))
-        active -= set(cd.loc[cd["exception_type"].str.strip() == "2", "service_id"].astype(str))
-
-    return active
-
-
 def _feed_date_bounds(
     calendar: Optional[pd.DataFrame], calendar_dates: Optional[pd.DataFrame]
 ) -> tuple[Optional[dt.date], Optional[dt.date]]:
@@ -411,40 +390,280 @@ def _feed_date_bounds(
     return min(dates), max(dates)
 
 
+def expand_service_active_dates(
+    calendar_df: Optional[pd.DataFrame],
+    calendar_dates_df: Optional[pd.DataFrame] = None,
+    max_days_per_service: int = 1830,
+    today: Optional[dt.date] = None,
+) -> dict[str, set[dt.date]]:
+    """Expand each service_id into its real set of active calendar dates.
+
+    Builds the base date set from each ``calendar.txt`` row (day-of-week
+    pattern × ``start_date``–``end_date`` range), then applies
+    ``calendar_dates.txt`` exceptions (``exception_type`` 1 adds a date,
+    2 removes it). Handles calendar_dates-only feeds (*calendar_df* empty or
+    ``None``), redundant additions, and fully negated base patterns — the
+    returned sets reflect only the dates a service truly operates.
+
+    Rows with unparseable or reversed dates are skipped with a warning.
+    A date range longer than *max_days_per_service* (a common placeholder
+    pattern, e.g. 2000–2099) is clamped to a window of that length centred
+    on *today* and logged, so expansion stays fast and downstream per-year
+    statistics stay meaningful.
+
+    Args:
+        calendar_df: Parsed ``calendar.txt``, or ``None`` if the feed has
+            none. Expected columns: ``service_id``, the seven day-of-week
+            flags, ``start_date``, ``end_date``.
+        calendar_dates_df: Parsed ``calendar_dates.txt`` or ``None``.
+            Expected columns: ``service_id``, ``date``, ``exception_type``.
+        max_days_per_service: Longest date range expanded per service before
+            clamping kicks in. The default (1830 ≈ 5 years) is far beyond
+            any real service span but well short of placeholder ranges.
+        today: Anchor date for clamping oversized ranges. Defaults to the
+            current date; pass a fixed date for deterministic tests.
+
+    Returns:
+        Mapping of ``service_id`` (as ``str``) to the set of dates the
+        service operates. Services whose dates never parse map to an empty
+        set rather than being dropped, so callers can report them.
+
+    Raises:
+        ValueError: If *calendar_df* is provided but lacks ``service_id``,
+            ``start_date``, or ``end_date`` columns.
+    """
+    day_cols = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+    anchor = dt.date.today() if today is None else today
+    active: dict[str, set[dt.date]] = {}
+
+    if calendar_df is not None and not calendar_df.empty:
+        required = {"service_id", "start_date", "end_date"}
+        missing = required - set(calendar_df.columns)
+        if missing:
+            raise ValueError(f"calendar.txt is missing required column(s): {sorted(missing)}")
+        for _, row in calendar_df.iterrows():
+            sid = str(row["service_id"]).strip()
+            try:
+                start = dt.datetime.strptime(str(row["start_date"]).strip(), "%Y%m%d").date()
+                end = dt.datetime.strptime(str(row["end_date"]).strip(), "%Y%m%d").date()
+            except ValueError:
+                logging.warning("Service %s: unparseable start/end date — skipping row.", sid)
+                active.setdefault(sid, set())
+                continue
+            if end < start:
+                logging.warning(
+                    "Service %s: end_date %s precedes start_date %s — skipping row.",
+                    sid,
+                    end,
+                    start,
+                )
+                active.setdefault(sid, set())
+                continue
+            if (end - start).days + 1 > max_days_per_service:
+                half = max_days_per_service // 2
+                clamped_start = max(start, anchor - dt.timedelta(days=half))
+                clamped_end = min(end, anchor + dt.timedelta(days=half))
+                logging.warning(
+                    "Service %s: date range %s–%s looks like a placeholder; "
+                    "clamping expansion to %s–%s.",
+                    sid,
+                    start,
+                    end,
+                    clamped_start,
+                    clamped_end,
+                )
+                start, end = clamped_start, clamped_end
+            pattern = [str(row.get(c, "0")).strip() == "1" for c in day_cols]
+            dates = active.setdefault(sid, set())
+            d = start
+            while d <= end:
+                if pattern[d.weekday()]:
+                    dates.add(d)
+                d += dt.timedelta(days=1)
+
+    if calendar_dates_df is not None and not calendar_dates_df.empty:
+        bad_rows = 0
+        for _, row in calendar_dates_df.iterrows():
+            sid = str(row["service_id"]).strip()
+            try:
+                d = dt.datetime.strptime(str(row["date"]).strip(), "%Y%m%d").date()
+            except ValueError:
+                bad_rows += 1
+                continue
+            etype = str(row.get("exception_type", "")).strip()
+            dates = active.setdefault(sid, set())
+            if etype == "1":
+                dates.add(d)
+            elif etype == "2":
+                dates.discard(d)
+            else:
+                bad_rows += 1
+        if bad_rows:
+            logging.warning(
+                "calendar_dates.txt: skipped %d row(s) with unparseable date/exception_type.",
+                bad_rows,
+            )
+
+    return active
+
+
+def service_ids_active_on(
+    active_dates: Mapping[str, set[dt.date]],
+    target_date: dt.date,
+) -> set[str]:
+    """Return the service_ids operating on *target_date*.
+
+    Args:
+        active_dates: Output of :func:`expand_service_active_dates`.
+        target_date: The calendar date to query.
+
+    Returns:
+        Set of service_id strings active on that date (possibly empty).
+    """
+    return {sid for sid, dates in active_dates.items() if target_date in dates}
+
+
+def representative_service_date(
+    active_dates: Mapping[str, set[dt.date]],
+    service_day: str,
+    override_date: Optional[dt.date] = None,
+    exclude_dates: Optional[set[dt.date]] = None,
+) -> tuple[dt.date, set[str]]:
+    """Pick a typical date for *service_day* and the service_ids active on it.
+
+    Rather than trusting any single date or unioning every service whose
+    columns mention a weekday (which double-counts agencies running distinct
+    Monday / midweek / Friday schedules), this scans every candidate date of
+    the requested day type, groups them by their exact set of active
+    service_ids, and returns the median date of the **modal** (most common)
+    set. A few miscoded dates therefore cannot steer the result, and per-day
+    math (headways, spans, trip counts) reflects one real operating day.
+
+    Warnings are logged when the choice is ambiguous: when the modal set
+    covers under half the candidate dates, and — for ``"weekday"`` — when
+    Monday-through-Friday do not all share one service pattern, so the user
+    knows a single representative day cannot speak for the whole week.
+
+    Args:
+        active_dates: Output of :func:`expand_service_active_dates`.
+        service_day: ``"weekday"`` or one of ``"monday"`` … ``"sunday"``.
+        override_date: Skip selection entirely and use this date (the
+            explicit user override). Logged, and a warning is emitted if no
+            service is active on it.
+        exclude_dates: Dates to skip as candidates — typically observed
+            holidays, so a holiday cannot masquerade as a typical day.
+
+    Returns:
+        Tuple of (chosen date, set of service_id strings active on it).
+
+    Raises:
+        ValueError: If *service_day* is not recognised, or no candidate
+            dates exist for it.
+    """
+    day_names = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+    key = service_day.strip().lower()
+    if key == "weekday":
+        allowed = {0, 1, 2, 3, 4}
+    elif key in day_names:
+        allowed = {day_names.index(key)}
+    else:
+        raise ValueError(
+            f"service_day must be 'weekday' or one of {', '.join(day_names)}; got {service_day!r}"
+        )
+
+    if override_date is not None:
+        ids = service_ids_active_on(active_dates, override_date)
+        if not ids:
+            logging.warning("No service is active on override date %s.", override_date)
+        else:
+            logging.info(
+                "Using override date %s (%s): %d service_id(s).",
+                override_date,
+                day_names[override_date.weekday()],
+                len(ids),
+            )
+        return override_date, ids
+
+    skip = exclude_dates or set()
+    candidates = sorted(
+        {d for dates in active_dates.values() for d in dates if d.weekday() in allowed} - skip
+    )
+    if not candidates:
+        raise ValueError(f"No active dates found for service_day={service_day!r}.")
+
+    by_set: dict[frozenset[str], list[dt.date]] = {}
+    for d in candidates:
+        by_set.setdefault(frozenset(service_ids_active_on(active_dates, d)), []).append(d)
+
+    modal_ids = max(by_set, key=lambda ids: (len(by_set[ids]), -min(by_set[ids]).toordinal()))
+    modal_dates = by_set[modal_ids]
+    chosen = modal_dates[len(modal_dates) // 2]
+    share = len(modal_dates) / len(candidates)
+
+    if key == "weekday":
+        per_day: dict[str, frozenset[str]] = {}
+        for dow in sorted({d.weekday() for d in candidates}):
+            day_candidates = [d for d in candidates if d.weekday() == dow]
+            day_sets: dict[frozenset[str], int] = {}
+            for d in day_candidates:
+                s = frozenset(service_ids_active_on(active_dates, d))
+                day_sets[s] = day_sets.get(s, 0) + 1
+            per_day[day_names[dow]] = max(day_sets, key=lambda s: day_sets[s])
+        if len(set(per_day.values())) > 1:
+            detail = "; ".join(
+                f"{day}={sorted(ids) if ids else '{}'}" for day, ids in per_day.items()
+            )
+            logging.warning(
+                "Weekday service varies by day of week (%s). Using %s (%s) as the "
+                "representative weekday; pass an explicit service date to analyse "
+                "a different day.",
+                detail,
+                chosen,
+                day_names[chosen.weekday()],
+            )
+    if share < 0.5:
+        logging.warning(
+            "The chosen service pattern covers only %.0f%% of candidate %s dates — "
+            "this feed's %s service is irregular; consider an explicit service date.",
+            share * 100,
+            service_day,
+            service_day,
+        )
+
+    logging.info(
+        "Representative %s: %s (%s) with %d service_id(s), matching %.0f%% of candidate dates.",
+        service_day,
+        chosen,
+        day_names[chosen.weekday()],
+        len(modal_ids),
+        share * 100,
+    )
+    return chosen, set(modal_ids)
+
+
 def pick_representative_weekday_services(
     calendar: Optional[pd.DataFrame],
     calendar_dates: Optional[pd.DataFrame],
     weekday: str,
-    max_search_days: int = 400,
 ) -> tuple[Optional[dt.date], set[str]]:
-    """Pick the in-range date of ``weekday`` with the most active service_ids.
+    """Pick a typical date of ``weekday`` and the service_ids active on it.
 
-    Scans outward from the midpoint of the feed's date range and returns the date of
-    the requested weekday whose active service_id set is largest. Works from
-    ``calendar.txt`` and/or a ``calendar_dates.txt``-only feed.
+    Expands each service_id to its real active dates, groups the feed's dates of
+    ``weekday`` by their exact set of active service_ids, and takes the median date
+    of the most common set (see :func:`representative_service_date`). A holiday or
+    other one-off date (reduced service, an added event service) therefore cannot be
+    picked for sitting near the middle of the feed or for carrying more service_ids
+    than a regular day. Works from ``calendar.txt`` and/or a
+    ``calendar_dates.txt``-only feed.
 
     Returns:
         ``(date, active_service_ids)``; ``(None, set())`` if no date can be resolved.
     """
     target = _weekday_name_to_int(weekday)
-    lo, hi = _feed_date_bounds(calendar, calendar_dates)
-    if lo is None or hi is None:
+    active = expand_service_active_dates(calendar, calendar_dates)
+    if not any(d.weekday() == target for dates in active.values() for d in dates):
         return None, set()
-
-    anchor = lo + (hi - lo) // 2
-    best_date: Optional[dt.date] = None
-    best_active: set[str] = set()
-    for step in range(max_search_days + 1):
-        for sign in (1, -1):
-            if step == 0 and sign == -1:
-                continue
-            cand = anchor + dt.timedelta(days=step * sign)
-            if cand < lo or cand > hi or cand.weekday() != target:
-                continue
-            active = _active_service_ids_for_date(calendar, calendar_dates, cand)
-            if len(active) > len(best_active):
-                best_date, best_active = cand, active
-    return best_date, best_active
+    return representative_service_date(active, weekday)
 
 
 def service_id_day_types(
@@ -1302,8 +1521,16 @@ def compare_routes(
         after.get("calendar"), after.get("calendar_dates"), weekday
     )
     logging.info("Representative %s: before=%s after=%s", weekday, date_b, date_a)
-    wk_trips_b = trips_b[trips_b["service_id"].astype(str).isin(sids_b)]
-    wk_trips_a = trips_a[trips_a["service_id"].astype(str).isin(sids_a)]
+    for label, picked in (("before", date_b), ("after", date_a)):
+        if picked is None:
+            logging.warning(
+                "%s: no %s with active service found in the calendar; schedule changes "
+                "cannot be measured for this feed.",
+                label,
+                weekday,
+            )
+    wk_trips_b = trips_b[trips_b["service_id"].astype(str).str.strip().isin(sids_b)]
+    wk_trips_a = trips_a[trips_a["service_id"].astype(str).str.strip().isin(sids_a)]
     sched_b = route_schedule_metrics(wk_trips_b, ends_b).set_index("route_id")
     sched_a = route_schedule_metrics(wk_trips_a, ends_a).set_index("route_id")
     fp_b = schedule_fingerprint(wk_trips_b, ends_b)

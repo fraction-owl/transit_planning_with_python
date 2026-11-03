@@ -1,0 +1,8 @@
+route_id,service_id,trip_id,direction_id
+R1,WK,R1_WK_1,0
+R1,WK,R1_WK_2,0
+R2,WK,R2_WK_1,0
+R2,WK,R2_WK_2,0
+R2,WK,R2_WK_3,0
+R2,WK,R2_WK_4,0
+R2,MOD,R2_MOD_1,0
