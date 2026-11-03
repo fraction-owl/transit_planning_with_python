@@ -2017,9 +2017,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     args = parse_args(argv)
     if (
-        _PLACEHOLDER in str(BEFORE_GTFS_DIR)
-        or _PLACEHOLDER in str(AFTER_GTFS_DIR)
-        or _PLACEHOLDER in str(OUTPUT_DIR)
+        _PLACEHOLDER in str(args.before)
+        or _PLACEHOLDER in str(args.after)
+        or _PLACEHOLDER in str(args.out)
     ):
         logging.warning(
             "BEFORE_GTFS_DIR / AFTER_GTFS_DIR / OUTPUT_DIR are still placeholders. Update the "
