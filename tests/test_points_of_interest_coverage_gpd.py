@@ -9,6 +9,7 @@ import geopandas as gpd
 import matplotlib
 import pandas as pd
 import pytest
+from pyproj import Geod
 from shapely.geometry import Point
 
 matplotlib.use("Agg")
@@ -261,6 +262,31 @@ def test_prepare_route_buffers_simplify_reduces_buffer_vertices() -> None:
     assert n_coarse < n_fine
     # Coverage is preserved: simplifying within 50 m barely changes a ~400 m buffer.
     assert coarse.geometry.iloc[0].area == pytest.approx(fine.geometry.iloc[0].area, rel=0.02)
+
+
+@pytest.mark.parametrize("crs", ["EPSG:2283", "EPSG:32618", "EPSG:3857"])
+def test_prepare_route_buffers_reaches_buffer_dist_in_feet_and_meter_crs(crs: str) -> None:
+    """A 1,320 ft buffer reaches 1,200 ft on the ground but not 1,450 ft, whatever the CRS unit.
+
+    EPSG:2283 (Virginia North) is in US survey feet; the others are in meters.
+    """
+    lat, lon = 38.85835, -77.051232  # Crystal City, VA, inside EPSG:2283's zone
+    tables = {
+        "routes": pd.DataFrame({"route_id": ["R1"]}),
+        "trips": pd.DataFrame({"route_id": ["R1"], "trip_id": ["T1"]}),
+        "stop_times": pd.DataFrame({"trip_id": ["T1"], "stop_id": ["S1"], "stop_sequence": [1]}),
+        "stops": pd.DataFrame({"stop_id": ["S1"], "stop_lat": [lat], "stop_lon": [lon]}),
+    }
+    buffer = _prepare_route_buffers(
+        tables, use_shape_buffer=False, buffer_dist_ft=1320.0, projected_crs=crs
+    ).geometry.iloc[0]
+
+    def due_north(feet: float) -> Point:
+        lon2, lat2, _ = Geod(ellps="WGS84").fwd(lon, lat, 0.0, feet * 0.3048)
+        return gpd.GeoSeries([Point(lon2, lat2)], crs="EPSG:4326").to_crs(crs).iloc[0]
+
+    assert buffer.contains(due_north(1200))
+    assert not buffer.contains(due_north(1450))
 
 
 def test_prepare_route_buffers_missing_shape_columns_raises() -> None:
