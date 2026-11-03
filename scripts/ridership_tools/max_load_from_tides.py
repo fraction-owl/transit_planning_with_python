@@ -254,7 +254,8 @@ _TRIP_ATTR_COLS: List[str] = [
 def compute_trip_max_load(stop_visits: pd.DataFrame) -> pd.DataFrame:
     """Reduce stop visits to one maximum-load record per performed trip.
 
-    For each ``trip_id_performed`` the row carrying the largest
+    A performed trip is a (``service_date``, ``trip_id_performed``) pair, since
+    the ID alone may repeat every day. For each one the row carrying the largest
     ``departure_load`` is kept, yielding the trip's maximum load and the stop
     where it occurs (the peak load point). Trips with no usable load reading are
     dropped.
@@ -280,12 +281,13 @@ def compute_trip_max_load(stop_visits: pd.DataFrame) -> pd.DataFrame:
         )
 
     # Sort so idxmax breaks ties on the earliest stop in the sequence.
-    sort_cols = ["trip_id_performed"]
+    trip_keys = ["service_date", "trip_id_performed"]
+    sort_cols = list(trip_keys)
     if "trip_stop_sequence" in usable.columns:
         sort_cols.append("trip_stop_sequence")
     usable = usable.sort_values(sort_cols)
 
-    peak_idx = usable.groupby("trip_id_performed")["departure_load"].idxmax()
+    peak_idx = usable.groupby(trip_keys, dropna=False)["departure_load"].idxmax()
     peak = usable.loc[peak_idx]
 
     out = pd.DataFrame(
@@ -309,7 +311,11 @@ def join_trip_attributes(
     """Attach route/direction/service-type/start-time attributes per trip.
 
     Trips that were Canceled (or not in revenue service) in ``trips_performed``
-    are dropped. The join key is ``trip_id_performed``.
+    are dropped. The join keys are ``service_date`` and ``trip_id_performed``:
+    TIDES makes ``trip_id_performed`` unique only within a service date, and a
+    bare trip ID repeats every day. Dates are compared parsed, since the two
+    exports may format them differently. Trips with no same-day
+    ``trips_performed`` row are logged and left out.
 
     Args:
         trip_max_load: Output of :func:`compute_trip_max_load`.
@@ -318,16 +324,32 @@ def join_trip_attributes(
     Returns:
         Per-trip max-load rows with the ``_TRIP_ATTR_COLS`` attributes joined on.
     """
-    trips = trips_performed.copy()
+    keys = ["service_date", "trip_id_performed"]
+    per_trip = trip_max_load.assign(
+        service_date=pd.to_datetime(trip_max_load["service_date"], errors="coerce")
+    )
+    trips = trips_performed.assign(
+        service_date=pd.to_datetime(trips_performed["service_date"], errors="coerce")
+    )
+    unmatched = ~pd.MultiIndex.from_frame(per_trip[keys]).isin(
+        pd.MultiIndex.from_frame(trips[keys])
+    )
+    if unmatched.any():
+        logging.warning(
+            "%d trip(s) in stop_visits have no trips_performed row with the same "
+            "service_date and trip_id_performed; they are left out.",
+            int(unmatched.sum()),
+        )
+
     if "schedule_relationship" in trips.columns:
         trips = trips.loc[trips["schedule_relationship"].fillna("Scheduled") != "Canceled"]
     if "trip_type" in trips.columns:
         trips = trips.loc[trips["trip_type"].fillna("In service") == "In service"]
 
     attr_cols = [c for c in _TRIP_ATTR_COLS if c in trips.columns]
-    trips = trips[["trip_id_performed", *attr_cols]].drop_duplicates("trip_id_performed")
+    trips = trips[[*keys, *attr_cols]].drop_duplicates(keys)
 
-    return trip_max_load.merge(trips, on="trip_id_performed", how="inner")
+    return per_trip.merge(trips, on=keys, how="inner")
 
 
 def _hhmm_to_minutes(hhmm: str) -> int:

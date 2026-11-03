@@ -171,3 +171,42 @@ def test_run_writes_all_grain_files(tmp_path: Path) -> None:
         assert (tmp_path / target.GRAIN_FILENAME[grain]).exists()
     assert (tmp_path / target.BY_ROUTE_AND_STOP_FILENAME).exists()
     assert (tmp_path / "ridership_from_tides_runlog.txt").exists()
+
+
+def test_join_takes_each_days_trip_attributes() -> None:
+    """A trip ID repeats daily; each day's stop visits get that day's attributes."""
+    visits = pd.DataFrame(
+        {
+            "service_date": pd.to_datetime(["2026-03-02", "2026-03-03"]),
+            "trip_id_performed": ["T100", "T100"],
+            "stop_id": ["1010", "1010"],
+        }
+    )
+    trips = pd.DataFrame(
+        {
+            # Written M/D/YYYY, as a spreadsheet-edited export might be.
+            "service_date": ["3/2/2026", "3/3/2026"],
+            "trip_id_performed": ["T100", "T100"],
+            "route_id": ["101", "102"],
+            "direction_id": ["0", "1"],
+        }
+    )
+    joined = target.join_trip_attributes(visits, trips).sort_values("service_date")
+    assert joined[["route_id", "direction_id"]].to_numpy().tolist() == [["101", "0"], ["102", "1"]]
+
+
+def test_aggregate_counts_each_days_trip_once() -> None:
+    """The same trip ID on two days counts as two trips."""
+    df = pd.DataFrame(
+        {
+            "service_date": pd.to_datetime(["2026-03-02", "2026-03-02", "2026-03-03"]),
+            "trip_id_performed": ["T100", "T100", "T100"],
+            "route_id": ["101", "101", "101"],
+            "month": ["2026-03"] * 3,
+            "boardings": [4.0, 2.0, 6.0],
+            "alightings": [0.0, 1.0, 5.0],
+        }
+    )
+    agg = target.aggregate_ridership(df, ["route_id"], ["month"])
+    assert agg.loc[0, "trips"] == 2
+    assert agg.loc[0, "avg_boardings_per_trip"] == 6.0

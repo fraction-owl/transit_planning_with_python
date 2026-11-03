@@ -280,13 +280,15 @@ def find_cluster(stop_id: str, clusters: list[dict[str, Any]]) -> Optional[str]:
 
 
 def mark_first_and_last_stops(df_in: pd.DataFrame) -> pd.DataFrame:
-    """Mark first and last stops per trip using boolean flags."""
+    """Mark first and last stops per trip using boolean flags.
+
+    Flags follow ``stop_sequence`` order (which must be numeric), not the
+    input row order.
+    """
     df_out = df_in.sort_values(["trip_id", "stop_sequence"]).copy()
-    df_out["is_first_stop"] = False
-    df_out["is_last_stop"] = False
-    for _trip_id, group in df_out.groupby("trip_id"):
-        df_out.loc[group.index.min(), "is_first_stop"] = True
-        df_out.loc[group.index.max(), "is_last_stop"] = True
+    by_trip = df_out.groupby("trip_id")
+    df_out["is_first_stop"] = by_trip.cumcount() == 0
+    df_out["is_last_stop"] = by_trip.cumcount(ascending=False) == 0
     return df_out
 
 
@@ -683,7 +685,7 @@ def _build_schedule_rows(  # type: ignore[override]
                     "Trip ID": stat_trip_id or "",
                     "Stop ID": stop_id or "",
                     "Stop Name": stop_name or "",
-                    "Stop Sequence": stop_seq or "",
+                    "Stop Sequence": "" if stop_seq is None else stop_seq,
                     "Arrival Time": arr_str or "",
                     "Departure Time": dep_str or "",
                     "Status": status,
@@ -762,6 +764,9 @@ def _merge_and_filter_data(
     if CALENDAR_SERVICE_IDS:
         trips_df = trips_df[trips_df["service_id"].isin(CALENDAR_SERVICE_IDS)]
 
+    # GTFS is loaded as text; stop_sequence must order numerically ("10" sorts
+    # before "2" as text, which scrambles every trip with ten or more stops).
+    stop_times_df["stop_sequence"] = pd.to_numeric(stop_times_df["stop_sequence"], errors="raise")
     stop_times_df["arrival_min"] = stop_times_df["arrival_time"].apply(parse_time_to_minutes)
     stop_times_df["departure_min"] = stop_times_df["departure_time"].apply(parse_time_to_minutes)
 

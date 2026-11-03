@@ -445,18 +445,18 @@ def build_index(
     if trips.empty:
         return pd.DataFrame(), {}, {}, {}
 
-    st = (
-        gtfs["stop_times"]
-        .merge(
-            trips[["trip_id", "route_id", "service_id", "direction_id"]],
-            on="trip_id",
-            how="inner",
-        )
-        .sort_values(["trip_id", "stop_sequence"])
+    st = gtfs["stop_times"].merge(
+        trips[["trip_id", "route_id", "service_id", "direction_id"]],
+        on="trip_id",
+        how="inner",
     )
+    # GTFS is loaded as text: sort and compare numerically, or "10" sorts
+    # before "2" and a timepoint of "1" never equals 1.
+    st["stop_sequence"] = pd.to_numeric(st["stop_sequence"], errors="raise")
+    st = st.sort_values(["trip_id", "stop_sequence"])
 
     if EXPORT_TIMEPOINTS_ONLY and "timepoint" in st.columns:
-        st = st[st["timepoint"] == 1]
+        st = st[pd.to_numeric(st["timepoint"], errors="coerce") == 1]
 
     stop_meta = (
         gtfs["stops"][["stop_id", "stop_name", "stop_code"]].set_index("stop_id").to_dict("index")

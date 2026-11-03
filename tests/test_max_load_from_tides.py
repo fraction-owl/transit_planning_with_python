@@ -1,5 +1,6 @@
 """Tests for max_load_from_tides using the repo TIDES fixtures."""
 
+import logging
 import sys
 from pathlib import Path
 
@@ -139,3 +140,70 @@ def test_run_writes_all_grain_files(tmp_path: Path) -> None:
     for grain in ("month_and_period", "month", "period", "total"):
         assert (tmp_path / target.GRAIN_FILENAME[grain]).exists()
     assert (tmp_path / "max_load_from_tides_runlog.txt").exists()
+
+
+def test_join_takes_each_days_trip_attributes() -> None:
+    """A trip ID repeats daily; each day's row gets that day's attributes."""
+    per_trip = pd.DataFrame(
+        {
+            "trip_id_performed": ["T100", "T100"],
+            "service_date": pd.to_datetime(["2026-03-02", "2026-03-03"]),
+            "max_load": [30, 45],
+        }
+    )
+    trips = pd.DataFrame(
+        {
+            # Written M/D/YYYY, as a spreadsheet-edited export might be.
+            "service_date": ["3/2/2026", "3/3/2026"],
+            "trip_id_performed": ["T100", "T100"],
+            "route_id": ["101", "102"],
+            "schedule_trip_start": pd.to_datetime(["2026-03-02 07:00", "2026-03-03 07:15"]),
+        }
+    )
+    joined = target.join_trip_attributes(per_trip, trips).sort_values("service_date")
+    assert joined["route_id"].tolist() == ["101", "102"]
+    assert joined["schedule_trip_start"].tolist() == [
+        pd.Timestamp("2026-03-02 07:00"),
+        pd.Timestamp("2026-03-03 07:15"),
+    ]
+
+
+def test_join_drops_only_the_canceled_day_and_warns_on_unmatched(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    per_trip = pd.DataFrame(
+        {
+            "trip_id_performed": ["T100", "T100", "T200"],
+            "service_date": pd.to_datetime(["2026-03-02", "2026-03-03", "2026-03-02"]),
+            "max_load": [30, 45, 8],
+        }
+    )
+    trips = pd.DataFrame(
+        {
+            "service_date": ["2026-03-02", "2026-03-03"],
+            "trip_id_performed": ["T100", "T100"],
+            "route_id": ["101", "101"],
+            "schedule_relationship": ["Scheduled", "Canceled"],
+        }
+    )
+    with caplog.at_level(logging.WARNING):
+        joined = target.join_trip_attributes(per_trip, trips)
+    # T100 ran on 03-02 only; T200 has no trips_performed row at all.
+    assert list(zip(joined["trip_id_performed"], joined["service_date"].dt.day)) == [("T100", 2)]
+    assert "1 trip(s) in stop_visits have no trips_performed row" in caplog.text
+
+
+def test_compute_trip_max_load_keeps_each_day_separate() -> None:
+    """The same trip ID on two days is two trips, each with its own max load."""
+    sv = pd.DataFrame(
+        {
+            "trip_id_performed": ["T100"] * 4,
+            "trip_stop_sequence": [1, 2, 1, 2],
+            "stop_id": ["s1", "s2", "s1", "s2"],
+            "departure_load": [7, 3, 2, 11],
+            "service_date": pd.to_datetime(["2026-03-02"] * 2 + ["2026-03-03"] * 2),
+        }
+    )
+    out = target.compute_trip_max_load(sv).sort_values("service_date")
+    assert out["max_load"].tolist() == [7, 11]
+    assert out["peak_stop_id"].tolist() == ["s1", "s2"]

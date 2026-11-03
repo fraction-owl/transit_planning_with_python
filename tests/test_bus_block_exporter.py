@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 import openpyxl
@@ -111,6 +112,15 @@ def test_mark_first_last_sets_last_flag() -> None:
     df = mark_first_and_last_stops(_two_trip_df())
     assert df.loc[df["stop_id"] == "S2", "is_last_stop"].all()
     assert df.loc[df["stop_id"] == "S4", "is_last_stop"].all()
+
+
+def test_mark_first_last_follows_sequence_not_row_order() -> None:
+    df = pd.DataFrame(
+        {"trip_id": ["T1", "T1", "T1"], "stop_sequence": [3, 1, 2], "stop_id": ["C", "A", "B"]}
+    )
+    out = mark_first_and_last_stops(df)
+    assert out.loc[out["is_first_stop"], "stop_id"].tolist() == ["A"]
+    assert out.loc[out["is_last_stop"], "stop_id"].tolist() == ["C"]
 
 
 # ---------------------------------------------------------------------------
@@ -264,3 +274,28 @@ def test_run_writes_real_block_workbooks(tmp_path: Path, monkeypatch: pytest.Mon
     # list the other as interlined.
     assert ("R1", "R2") in pairs
     assert ("R2", "R1") in pairs
+
+
+def test_run_walks_ten_stop_trip_in_sequence_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import scripts.gtfs_exports.bus_block_exporter as mod
+
+    # gtfs_basic with T1 (block B1) replaced by a 10-stop trip, one stop every
+    # 2 minutes from 07:02. stop_sequence loads as text, where "10" sorts before "2".
+    feed = tmp_path / "gtfs"
+    shutil.copytree(FIXTURES / "gtfs_basic", feed)
+    (feed / "stop_times.txt").write_text(
+        "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+        + "".join(f"T1,07:{2 * n:02d}:00,07:{2 * n:02d}:00,S{n},{n}\n" for n in range(1, 11))
+    )
+    monkeypatch.setattr(mod, "GTFS_FOLDER_PATH", str(feed))
+    monkeypatch.setattr(mod, "OUTPUT_FOLDER", str(tmp_path / "out"))
+    monkeypatch.setattr(mod, "CALENDAR_SERVICE_IDS", ["WKDY"])
+
+    mod.run()
+
+    rows = pd.read_excel(tmp_path / "out" / "block_B1.xlsx", dtype=str).set_index("Timestamp")
+    for n in range(2, 10):
+        row = rows.loc[f"07:{2 * n:02d}"]
+        assert (row["Status"], row["Stop ID"]) == ("ARRIVE/DEPART", f"S{n}")

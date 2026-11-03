@@ -13,6 +13,7 @@ from scripts.gtfs_exports.segment_speed_exporter import (
     build_index,
     convert_distance,
     export_excel,
+    load_gtfs_data,
     minutes_to_hhmm,
     mph,
     parse_time_to_minutes,
@@ -379,3 +380,61 @@ def test_main_writes_real_speed_workbooks(tmp_path: Path, monkeypatch: pytest.Mo
     # R1 gets the same Pattern ID the time-band workbook gives it.
     r1 = openpyxl.load_workbook(out_dir / "route_R1_calWKDY_speed_table.xlsx")
     assert r1["Dir_0"]["A2"].value == "92da08bf"
+
+
+# ---------------------------------------------------------------------------
+# build_index — stop_times read from text, as a real run loads them
+# ---------------------------------------------------------------------------
+
+
+def _load_twelve_stop_feed(folder: Path) -> dict:
+    """Write and load one 12-stop trip with timepoints at stops 1, 5, 10, and 12."""
+    timepoints = {1, 5, 10, 12}
+    (folder / "routes.txt").write_text("route_id,route_short_name\nR1,101\n")
+    (folder / "trips.txt").write_text("trip_id,route_id,service_id,direction_id\nT1,R1,4,0\n")
+    (folder / "stops.txt").write_text(
+        "stop_id,stop_name,stop_code\n" + "".join(f"S{n},Stop {n},{n}\n" for n in range(1, 13))
+    )
+    rows = [
+        "trip_id,stop_id,stop_sequence,arrival_time,departure_time,shape_dist_traveled,timepoint"
+    ]
+    for n in range(1, 13):
+        time = f"07:{2 * n:02d}:00"
+        rows.append(f"T1,S{n},{n},{time},{time},{(n - 1) * 500},{int(n in timepoints)}")
+    (folder / "stop_times.txt").write_text("\n".join(rows) + "\n")
+    return load_gtfs_data(
+        str(folder), files=["routes.txt", "trips.txt", "stops.txt", "stop_times.txt"]
+    )
+
+
+def test_build_index_keeps_timepoints_read_as_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import scripts.gtfs_exports.segment_speed_exporter as mod
+
+    monkeypatch.setattr(mod, "FILTER_IN_ROUTE_SHORT_NAMES", [])
+    monkeypatch.setattr(mod, "FILTER_IN_SERVICE_IDS", [])
+    monkeypatch.setattr(mod, "EXPORT_TIMEPOINTS_ONLY", True)
+
+    idx, pat_lut, _, _ = build_index(_load_twelve_stop_feed(tmp_path))
+
+    # timepoint loads as the string "1"; it must still select the four timepoints.
+    assert len(idx) == 1
+    assert pat_lut[idx.iloc[0]["pattern_hash"]] == ("S1", "S5", "S10", "S12")
+
+
+def test_build_index_orders_stops_by_numeric_sequence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import scripts.gtfs_exports.segment_speed_exporter as mod
+
+    monkeypatch.setattr(mod, "FILTER_IN_ROUTE_SHORT_NAMES", [])
+    monkeypatch.setattr(mod, "FILTER_IN_SERVICE_IDS", [])
+    monkeypatch.setattr(mod, "EXPORT_TIMEPOINTS_ONLY", False)
+
+    idx, pat_lut, _, header_lut = build_index(_load_twelve_stop_feed(tmp_path))
+
+    # As text, stop_sequence would sort 1, 10, 11, 12, 2, ...
+    pattern_hash = idx.iloc[0]["pattern_hash"]
+    assert pat_lut[pattern_hash] == tuple(f"S{n}" for n in range(1, 13))
+    assert header_lut[pattern_hash][:3] == ["Stop 1 (1)", "Stop 2 (2)", "Stop 3 (3)"]
