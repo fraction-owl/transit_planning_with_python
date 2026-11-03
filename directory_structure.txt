@@ -161,6 +161,19 @@ transit_planning_with_python/
 │   │   │   ├── stop_times.txt
 │   │   │   ├── stops.txt
 │   │   │   └── trips.txt
+│   │   ├── gtfs_route_diff_replacement_day/
+│   │   │   ├── after/
+│   │   │   │   ├── calendar.txt
+│   │   │   │   ├── calendar_dates.txt
+│   │   │   │   ├── routes.txt
+│   │   │   │   ├── stop_times.txt
+│   │   │   │   └── trips.txt
+│   │   │   └── before/
+│   │   │       ├── calendar.txt
+│   │   │       ├── calendar_dates.txt
+│   │   │       ├── routes.txt
+│   │   │       ├── stop_times.txt
+│   │   │       └── trips.txt
 │   │   ├── gtfs_split_weekday/
 │   │   │   ├── agency.txt
 │   │   │   ├── calendar.txt
