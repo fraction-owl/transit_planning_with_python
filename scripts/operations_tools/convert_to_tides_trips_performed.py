@@ -10,8 +10,11 @@ Key behaviors:
 - Parses scheduled and actual timestamps robustly (tolerates AM/PM and extra
   whitespace). Missing start/end times are permitted; rows are not dropped solely
   for partial timing data.
-- Derives `service_date` from Scheduled Start Time when available, otherwise
-  falls back to Actual Start Time. Rows that cannot be dated are excluded.
+- Derives `service_date`, the operating day, from Scheduled Start Time when
+  available, otherwise from Actual Start Time. A trip that starts before
+  SERVICE_DAY_START_HOUR belongs to the previous date's service day, so
+  post-midnight trips keep the operating date. Rows that cannot be dated are
+  excluded.
 - Requires `vehicle_id` (as per schema). Rows with missing or unusable vehicle
   identifiers are excluded and counted in logs.
 - Extracts `route_id` from the human-readable Route field by taking the token to
@@ -76,6 +79,12 @@ KEEP_TRIP_TYPE: str | None = "Revenue"
 # - "hashed": trip_id_performed = stable hash of (service_date, TripID, vehicle_id)
 #   for every trip
 TRIP_ID_MODE: str = "token"  # "token" | "hashed"
+
+# Hour (0-23) at which your agency's service day starts. TIDES service_date is
+# the operating day, as in GTFS, so a trip that starts before this hour belongs
+# to the previous date's service: with 3, an owl trip starting at 00:30 on the
+# 16th is dated the 15th. 0 dates every trip by its calendar start date.
+SERVICE_DAY_START_HOUR: int = 3
 
 # Map generic field roles to actual column names in your input file.
 # Defaults are set for CLEVER "Event Runtime Analysis" exports.
@@ -223,6 +232,29 @@ def direction_id_from_text(series: pd.Series) -> pd.Series:
 def dt_to_iso(series: pd.Series) -> pd.Series:
     """Datetime -> ISO string (YYYY-MM-DDTHH:MM:SS); NaT -> NaN."""
     return series.dt.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def service_date_from_start(start_dt: pd.Series, day_start_hour: int) -> pd.Series:
+    """Date each trip by the service day it starts in, as ``YYYY-MM-DD`` text.
+
+    A trip that starts before ``day_start_hour`` belongs to the previous
+    date's service day, so an owl trip starting after midnight keeps the date
+    its service day began.
+
+    Raises:
+        ValueError: If ``day_start_hour`` is not a whole hour from 0 to 23.
+    """
+    if day_start_hour not in range(24):
+        raise ValueError(f"SERVICE_DAY_START_HOUR must be 0-23; got {day_start_hour!r}.")
+    service_day = (start_dt - pd.Timedelta(hours=day_start_hour)).dt.date
+    n_moved = int((service_day != start_dt.dt.date).sum())
+    if n_moved:
+        logging.info(
+            "%d trip(s) start before %02d:00 and are dated to the previous service day.",
+            n_moved,
+            day_start_hour,
+        )
+    return service_day.astype("string")
 
 
 def summarize_trip_type_drops(
@@ -392,7 +424,7 @@ def convert_to_tides(df: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame(index=df.index)
 
     # Required schema fields
-    out["service_date"] = best_start_dt.dt.date.astype("string")
+    out["service_date"] = service_date_from_start(best_start_dt, SERVICE_DAY_START_HOUR)
     out["vehicle_id"] = vehicle_id
 
     # GTFS trip_id from source trip_id field
