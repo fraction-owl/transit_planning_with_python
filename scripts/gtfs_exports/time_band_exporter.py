@@ -5,6 +5,8 @@ time-points *and* identical segment run-times. For each unique
 (time-point pattern + segment runtimes) combination it produces a single
 row with:
 
+- **Pattern** – 8-character ID of the time-point sequence, the same on
+  every run (see ``stop_pattern_id``)
 - **FrTime / ToTime** – earliest and latest first-stop departures
 - **Segment columns** – runtime (minutes) from the previous time-point
   (first cell is ``MISSING_TIME``)
@@ -22,8 +24,11 @@ Pro's Python window, or a Jupyter notebook.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import re
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -120,6 +125,30 @@ def safe_sheet(name: str) -> str:
         A sanitized sheet name that is never empty.
     """
     return re.sub(r"[:\\/*?\[\]]", "_", name)[:31] or "Sheet"
+
+
+def stop_pattern_id(stop_ids: Iterable[object]) -> str:
+    """Return a short text ID for an ordered stop pattern that is stable across runs.
+
+    Python's built-in ``hash()`` is salted per process, so it gives the same
+    pattern a different value on every run. This SHA-1 digest gives the same
+    ID for the same stop sequence on every run, in every feed, and in every
+    script that copies this helper, so outputs from different runs can be
+    matched up by pattern.
+
+    Args:
+        stop_ids: Ordered ``stop_id`` values for one trip pattern. Order
+            matters: the reversed sequence gets a different ID. Values are
+            coerced to ``str``, so ``1`` and ``"1"`` give the same ID.
+
+    Returns:
+        The first 8 lowercase hex characters of the digest, e.g.
+        ``"3f9a1c2e"``. Write it to Excel as text, not as a number.
+    """
+    # JSON-encode the list so a stop_id containing a separator can't collide
+    # with a different split of the same characters (["a,b"] vs ["a", "b"]).
+    payload = json.dumps([str(stop_id) for stop_id in stop_ids])
+    return hashlib.sha1(payload.encode("utf-8"), usedforsecurity=False).hexdigest()[:8]
 
 
 # ─────────────────────────  LOAD GTFS  ────────────────────────────── #
@@ -315,7 +344,8 @@ def export_excel(
 
     Args:
         bands: Output from make_bands().
-        stop_dict: Pattern hash lookup from build_index().
+        stop_dict: Pattern hash → stop_id tuple from build_index(); used to
+            write each row's run-stable Pattern ID.
         seg_dict: Segment hash lookup from build_index().
         header_names: Column headers keyed by pattern hash.
         routes: Original routes.txt table (for short names).
@@ -343,7 +373,7 @@ def export_excel(
                 segs = seg_dict[r["seg_hash"]]
                 ws.append(
                     [
-                        r["pattern_hash"],
+                        stop_pattern_id(stop_dict[r["pattern_hash"]]),
                         minutes_to_hhmm(int(r["FrTime"]), MISSING_TIME),
                         minutes_to_hhmm(int(r["ToTime"]), MISSING_TIME),
                         r["Total"],

@@ -6,10 +6,12 @@ across transit data processing scripts.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import zipfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Any, Optional
 
 import pandas as pd
@@ -265,3 +267,27 @@ def load_express_route_ids(
     Thin wrapper kept for readable call sites and backwards compatibility.
     """
     return load_id_set(inline_ids, txt_path, kind="express route")
+
+
+def stop_pattern_id(stop_ids: Iterable[object]) -> str:
+    """Return a short text ID for an ordered stop pattern that is stable across runs.
+
+    Python's built-in ``hash()`` is salted per process, so it gives the same
+    pattern a different value on every run. This SHA-1 digest gives the same
+    ID for the same stop sequence on every run, in every feed, and in every
+    script that copies this helper, so outputs from different runs can be
+    matched up by pattern.
+
+    Args:
+        stop_ids: Ordered ``stop_id`` values for one trip pattern. Order
+            matters: the reversed sequence gets a different ID. Values are
+            coerced to ``str``, so ``1`` and ``"1"`` give the same ID.
+
+    Returns:
+        The first 8 lowercase hex characters of the digest, e.g.
+        ``"3f9a1c2e"``. Write it to Excel as text, not as a number.
+    """
+    # JSON-encode the list so a stop_id containing a separator can't collide
+    # with a different split of the same characters (["a,b"] vs ["a", "b"]).
+    payload = json.dumps([str(stop_id) for stop_id in stop_ids])
+    return hashlib.sha1(payload.encode("utf-8"), usedforsecurity=False).hexdigest()[:8]

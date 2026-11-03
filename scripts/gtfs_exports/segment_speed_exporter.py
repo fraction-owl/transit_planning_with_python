@@ -15,6 +15,8 @@ outputs for operations or service planning.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import re
@@ -209,6 +211,30 @@ def safe_sheet(name: str) -> str:
 def _sum_numeric(seq: Iterable[object]) -> float:
     """Return the sum of numeric items, ignoring non-numeric elements."""
     return float(sum(x for x in seq if isinstance(x, (int, float))))
+
+
+def stop_pattern_id(stop_ids: Iterable[object]) -> str:
+    """Return a short text ID for an ordered stop pattern that is stable across runs.
+
+    Python's built-in ``hash()`` is salted per process, so it gives the same
+    pattern a different value on every run. This SHA-1 digest gives the same
+    ID for the same stop sequence on every run, in every feed, and in every
+    script that copies this helper, so outputs from different runs can be
+    matched up by pattern.
+
+    Args:
+        stop_ids: Ordered ``stop_id`` values for one trip pattern. Order
+            matters: the reversed sequence gets a different ID. Values are
+            coerced to ``str``, so ``1`` and ``"1"`` give the same ID.
+
+    Returns:
+        The first 8 lowercase hex characters of the digest, e.g.
+        ``"3f9a1c2e"``. Write it to Excel as text, not as a number.
+    """
+    # JSON-encode the list so a stop_id containing a separator can't collide
+    # with a different split of the same characters (["a,b"] vs ["a", "b"]).
+    payload = json.dumps([str(stop_id) for stop_id in stop_ids])
+    return hashlib.sha1(payload.encode("utf-8"), usedforsecurity=False).hexdigest()[:8]
 
 
 def load_gtfs_data(
@@ -546,9 +572,10 @@ def export_excel(
 
             for _, row in grp_dir.iterrows():
                 speed_rec = speed_lut[cast("int", row["speed_hash"])]
+                pattern = pat_lut[cast("int", row["pattern_hash"])]
                 ws.append(
                     [
-                        row["pattern_hash"],
+                        stop_pattern_id(pattern),
                         row["FrTime"],
                         row["ToTime"],
                         speed_rec["mean_mph"],
