@@ -92,9 +92,10 @@ ROUTE_FILTER: list[str] = []
 # stops. Set True (or pass --buffer-shape) to buffer the whole route shape.
 USE_SHAPE_BUFFER = False
 BUFFER_DIST_FT = 1320.0  # ¼ mile in feet
-# Simplify each route's geometry (Douglas-Peucker, in projected meters) before
-# buffering. Buffering full-resolution shapes (GTFS shapes can carry thousands
-# of vertices per route) is the slowest step here; a tolerance this small is
+# Simplify each route's geometry (Douglas-Peucker, in PROJECTED_CRS units:
+# meters for the default EPSG:3857, feet for a feet CRS) before buffering.
+# Buffering full-resolution shapes (GTFS shapes can carry thousands of
+# vertices per route) is the slowest step here; a tolerance this small is
 # negligible against a 402 m (1/4 mile) buffer but cuts buffer time many-fold.
 # Set to 0.0 to disable simplification.
 SIMPLIFY_TOLERANCE_M = 10.0
@@ -198,6 +199,17 @@ def _build_stop_geoms(stops_df: pd.DataFrame, projected_crs: str) -> gpd.GeoData
     return stops_gdf
 
 
+def _crs_is_metric(crs: CRS | None) -> bool:
+    """Return True when *crs* measures distance in meters (best-effort)."""
+    if crs is None:
+        return True  # default GTFS reprojection target (3857) is metric
+    try:
+        unit = crs.axis_info[0].unit_name.lower()
+    except (AttributeError, IndexError):
+        return True  # default GTFS reprojection target (3857) is metric
+    return "metre" in unit or "meter" in unit
+
+
 def _web_mercator_ground_scale(crs: object, latitudes: pd.Series) -> float:
     """Return the Web Mercator map-per-ground distance factor, or 1.0 elsewhere.
 
@@ -251,15 +263,16 @@ def _prepare_route_buffers(
     Depending on *use_shape_buffer*, the buffer is built around the union of
     (a) the route's shape(s) or (b) all its stops.
 
-    The returned GDF is in the CRS of the original GTFS shapes; if that CRS
-    uses meters, the function converts *buffer_dist_ft* accordingly.
+    The returned GDF is in *projected_crs*. If that CRS uses meters, the
+    function converts *buffer_dist_ft* accordingly; a feet CRS uses it as-is.
 
     Args:
         tables: GTFS tables keyed by name (needs ``shapes``, ``trips``,
             ``stops``, and ``stop_times`` for stop-buffer mode).
         use_shape_buffer: Buffer the route's shape geometry when True, else the
             union of its stops.
-        buffer_dist_ft: Buffer distance in feet (converted to meters internally).
+        buffer_dist_ft: Buffer distance in feet (converted to meters when
+            *projected_crs* is metric).
         route_filter: Only build buffers for these route_ids; empty/None means all.
         projected_crs: CRS used for buffering and the returned geometries.
         simplify_tolerance_m: Douglas-Peucker tolerance (in the projected CRS's
@@ -273,8 +286,12 @@ def _prepare_route_buffers(
             ``shape_id`` column or shapes.txt is missing one of its required
             columns.
     """
-    buff_dist_m = buffer_dist_ft * 0.3048  # convert to meters
-    buff_dist_m *= _web_mercator_ground_scale(projected_crs, tables["stops"]["stop_lat"])
+    # The buffer is drawn in projected_crs units: meters, or feet for a
+    # state-plane feet CRS such as EPSG:2283.
+    metric = _crs_is_metric(CRS.from_user_input(projected_crs))
+    buff_dist = buffer_dist_ft * 0.3048 if metric else buffer_dist_ft
+    buff_dist *= _web_mercator_ground_scale(projected_crs, tables["stops"]["stop_lat"])
+    unit = "m" if metric else "ft"
 
     # Resolve, once, the source geometries each route's buffer is built from and
     # a route_id -> [geometry ids] map; the loop is then pure lookups. Stop mode
@@ -310,11 +327,13 @@ def _prepare_route_buffers(
 
     selected_routes = [rid for rid in route_to_ids.index if not route_filter or rid in route_filter]
     logging.info(
-        "Buffering %d route(s) (buffer=%.1f ft -> %.1f m, simplify=%.1f m, mode=%s)...",
+        "Buffering %d route(s) (buffer=%.1f ft -> %.1f %s, simplify=%.1f %s, mode=%s)...",
         len(selected_routes),
         buffer_dist_ft,
-        buff_dist_m,
+        buff_dist,
+        unit,
         simplify_tolerance_m,
+        unit,
         "shape" if use_shape_buffer else "stops",
     )
     log_every = max(1, len(selected_routes) // 20)  # ~20 progress lines
@@ -337,7 +356,7 @@ def _prepare_route_buffers(
         # tiny next to the buffer.
         if simplify_tolerance_m > 0:
             geom = geom.simplify(simplify_tolerance_m)
-        buf = geom.buffer(buff_dist_m)
+        buf = geom.buffer(buff_dist)
         buffers.append({"route_id": route_id, "geometry": buf})
 
         if processed % log_every == 0 or processed == len(selected_routes):
