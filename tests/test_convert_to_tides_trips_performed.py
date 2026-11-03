@@ -244,6 +244,35 @@ def test_convert_to_tides_falls_back_to_actual_start_for_dating() -> None:
     assert out.iloc[0]["service_date"] == "2025-01-15"
 
 
+def test_convert_to_tides_dates_owl_trip_to_previous_service_day() -> None:
+    """A trip starting at 00:30 on the 16th runs on the 15th's service day."""
+    df = _input_df()
+    df.loc[0, "Scheduled Start Time"] = "1/16/2025 12:30:00 AM"
+    df.loc[0, "Actual Start Time"] = "1/16/2025 12:31:00 AM"
+    out = target.convert_to_tides(df)
+    assert list(out["service_date"]) == ["2025-01-15", "2025-01-15"]
+    # Timestamps keep their real calendar date.
+    assert out.iloc[0]["schedule_trip_start"] == "2025-01-16T00:30:00"
+
+
+def test_service_date_from_start_splits_at_the_day_start_hour() -> None:
+    starts = pd.to_datetime(["2025-01-16 02:59", "2025-01-16 03:00", "2025-01-16 23:59"])
+    out = target.service_date_from_start(pd.Series(starts), 3)
+    assert list(out) == ["2025-01-15", "2025-01-16", "2025-01-16"]
+
+
+def test_service_date_from_start_zero_uses_calendar_date() -> None:
+    starts = pd.Series(pd.to_datetime(["2025-01-16 00:30"]))
+    assert list(target.service_date_from_start(starts, 0)) == ["2025-01-16"]
+
+
+@pytest.mark.parametrize("hour", [-1, 24, 2.5])
+def test_service_date_from_start_rejects_invalid_hour(hour) -> None:
+    starts = pd.Series(pd.to_datetime(["2025-01-16 00:30"]))
+    with pytest.raises(ValueError, match="SERVICE_DAY_START_HOUR"):
+        target.service_date_from_start(starts, hour)
+
+
 def test_convert_to_tides_warns_on_repeated_trip_and_vehicle(caplog) -> None:
     """Two rows with the same date, TripID, and vehicle cannot get distinct IDs."""
     df = pd.concat([_input_df().iloc[[0]]] * 2, ignore_index=True)

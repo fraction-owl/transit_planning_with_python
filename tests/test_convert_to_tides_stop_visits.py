@@ -292,6 +292,31 @@ def test_trip_ids_match_trips_performed_converter(monkeypatch, mode: str) -> Non
     assert visit_ids == trip_ids
 
 
+@pytest.mark.parametrize("mode", ["token", "hashed"])
+def test_owl_trip_gets_same_service_date_and_id_in_both_converters(monkeypatch, mode: str) -> None:
+    """A trip starting at 00:30 on the 16th, which the stop visit export dates the 15th."""
+    trips_raw, visits_raw = _split_trip_exports()
+    trips_raw = trips_raw.iloc[[0]].assign(
+        **{
+            "Scheduled Start Time": "1/16/2025 12:30:00 AM",
+            "Scheduled Finish Time": "1/16/2025 12:46:00 AM",
+            "Actual Start Time": "1/16/2025 12:31:00 AM",
+            "Actual Finish Time": "1/16/2025 12:48:00 AM",
+        }
+    )
+    visits_raw = visits_raw.assign(Vehicle="7906", Trip="00:30 1550064")
+    for col in ("Actual Time", "Arrival Time", "Departure Time", "Scheduled Passing Time"):
+        visits_raw[col] = visits_raw[col].str.replace("1/15/2025 4:", "1/16/2025 12:", regex=False)
+    monkeypatch.setattr(target, "TRIP_ID_MODE", mode)
+    monkeypatch.setattr(trips_target, "TRIP_ID_MODE", mode)
+
+    keys = ["service_date", "trip_id_performed"]
+    trip_keys = trips_target.convert_to_tides(trips_raw)[keys].drop_duplicates()
+    visit_keys = target.convert_to_tides(visits_raw)[keys].drop_duplicates()
+    assert trip_keys.to_numpy().tolist() == visit_keys.to_numpy().tolist()
+    assert trip_keys["service_date"].tolist() == ["2025-01-15"]
+
+
 def test_single_vehicle_trip_keeps_token_in_both_converters() -> None:
     trips_raw, visits_raw = _split_trip_exports()
     trip_ids = trips_target.convert_to_tides(trips_raw.iloc[[0]])["trip_id_performed"]
