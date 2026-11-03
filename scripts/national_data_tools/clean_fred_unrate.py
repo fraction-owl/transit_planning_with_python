@@ -41,7 +41,10 @@ from typing import List, Optional, Sequence
 
 import pandas as pd
 
-# --- <<< EDIT ME -------------------------------------------------------------
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+# === BEGIN CONFIG ===
 # Set these to use them directly. Leave as None to be prompted (notebook) or to
 # pass --input / --output on the command line.
 INPUT_PATH: Path | None = None
@@ -52,7 +55,7 @@ WRITE_LOG = True  # also write a .txt processing log next to the output
 LOG_PATH: Path | None = None  # None = derive from output path
 NA_VALUES = ["."]  # FRED's legacy missing marker; blank cells are NaN already.
 DATE_COL_CANDIDATES = ("observation_date", "DATE")  # modern web download, then legacy
-# --- EDIT ME >>> -------------------------------------------------------------
+# === END CONFIG ===
 
 logger = logging.getLogger(__name__)
 

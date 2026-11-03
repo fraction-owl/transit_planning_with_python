@@ -38,7 +38,10 @@ from typing import Any, List, Optional, Sequence
 
 import pandas as pd
 
-# --- <<< EDIT ME -------------------------------------------------------------
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+# === BEGIN CONFIG ===
 # Set these to use them directly. Leave as None to be prompted (notebook) or to
 # pass --input / --output on the command line.
 INPUT_PATH: Path | None = None
@@ -52,7 +55,7 @@ WRITE_LOG = True  # also write a .txt processing log next to the output
 LOG_PATH: Path | None = None  # None = derive from output path
 WT_PREFIX = "WT"  # NOAA weather-type occurrence flags: blank == did not occur.
 ID_COLS = ["STATION", "NAME", "DATE"]
-# --- EDIT ME >>> -------------------------------------------------------------
+# === END CONFIG ===
 
 logger = logging.getLogger(__name__)
 
