@@ -18,6 +18,7 @@ from scripts.gtfs_exports.segment_speed_exporter import (
     parse_time_to_minutes,
     safe_sheet,
     segment_metrics,
+    stop_pattern_id,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -306,6 +307,8 @@ def test_export_excel_writes_real_workbook(tmp_path: Path, monkeypatch: pytest.M
     assert wb.sheetnames == ["Dir_0"]
     rows = list(wb["Dir_0"].iter_rows(values_only=True))
     assert rows[0][:4] == ("Pattern", "FrTime", "ToTime", "Mean_mph")
+    # Pattern is the stable text ID of the stop sequence, not a per-run hash().
+    assert rows[1][0] == stop_pattern_id(("S1", "S2")) == "c7ce4c05"
     # Single trip: 1 mile in 10 minutes = 6 mph, band spans 07:00 only.
     assert rows[1][1] == "07:00"
     assert rows[1][2] == "07:00"
@@ -366,8 +369,13 @@ def test_main_writes_real_speed_workbooks(tmp_path: Path, monkeypatch: pytest.Mo
     )
     # R2's three trips share one pattern and speed profile, so they form one band.
     assert len(rows) == 1
+    # Pattern ID of S7 → S3 → S4 → S5 → S8, the same on every run.
+    assert rows[0][0] == "823ebc55"
     assert rows[0][1:3] == ("07:30", "17:30")
     # Every segment takes 5 minutes, so the 960 m and 900 m end segments run
-    # faster than the 690 m middle ones. (Column 0, the pattern hash, varies by
-    # process.)
+    # faster than the 690 m middle ones.
     assert rows[0][3:] == (6.0, MISSING_VAL, 7.2, 5.1, 5.1, 6.7)
+
+    # R1 gets the same Pattern ID the time-band workbook gives it.
+    r1 = openpyxl.load_workbook(out_dir / "route_R1_calWKDY_speed_table.xlsx")
+    assert r1["Dir_0"]["A2"].value == "92da08bf"

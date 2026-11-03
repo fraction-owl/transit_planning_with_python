@@ -307,4 +307,6 @@ def test_export_excel_full_pipeline_writes_real_workbooks(
     # from the 07:00 trip to the 17:00 trip with 5-minute segments.
     assert len(rows) == 2
     assert rows[1][1:4] == ("07:00", "17:00", 3)
+    # Pattern is the stable text ID of S1 → … → S6, not a per-run hash().
+    assert rows[1][0] == "92da08bf"
     assert rows[1][5] == 5
