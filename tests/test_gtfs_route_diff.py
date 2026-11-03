@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import datetime as dt
+import logging
+from collections.abc import Iterator
 from pathlib import Path
 
 import numpy as np
@@ -21,6 +23,7 @@ from scripts.stop_analysis.gtfs_route_diff import (
     feed_date_range,
     jaccard,
     load_feed,
+    main,
     median_headway_min,
     normalize_text,
     pick_representative_weekday_services,
@@ -671,6 +674,51 @@ def test_compare_routes_measures_routes_missing_on_replacement_day() -> None:
     assert overview.loc["R2", "schedule_change"] == "major"
     assert "trips/day 3->4" in overview.loc["R2", "schedule_detail"]
     assert set(results["schedule"]["route_id"]) == {"R1", "R2"}
+
+
+# ---------------------------------------------------------------------------
+# main() placeholder check
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def restore_root_logging() -> Iterator[None]:
+    # run_compare() replaces the root handlers and opens a log file in the output
+    # folder; put the root logger back so later tests don't log into tmp_path.
+    root = logging.getLogger()
+    saved_handlers, saved_level = root.handlers[:], root.level
+    yield
+    for handler in root.handlers:
+        if handler not in saved_handlers:
+            handler.close()
+    root.handlers[:] = saved_handlers
+    root.setLevel(saved_level)
+
+
+def test_main_returns_2_on_placeholder_paths() -> None:
+    assert main([]) == 2
+
+
+def test_main_returns_2_when_out_is_still_placeholder() -> None:
+    before = str(_REPLACEMENT_DAY / "before")
+    after = str(_REPLACEMENT_DAY / "after")
+    assert main(["--before", before, "--after", after]) == 2
+
+
+def test_main_cli_flags_override_placeholders(tmp_path: Path, restore_root_logging: None) -> None:
+    out = tmp_path / "out"
+    rc = main(
+        [
+            "--before",
+            str(_REPLACEMENT_DAY / "before"),
+            "--after",
+            str(_REPLACEMENT_DAY / "after"),
+            "--out",
+            str(out),
+        ]
+    )
+    assert rc == 0
+    assert (out / "routes_overview.csv").exists()
 
 
 def test_correspondence_is_dataclass() -> None:
