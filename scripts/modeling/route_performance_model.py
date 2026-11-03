@@ -245,9 +245,11 @@ OVERLAY_COLS: Final[tuple[str, ...]] = (
     "pct_day_with_service",  # span coverage completeness               [GTFS]
     "competitor_trips_at_shared_stops",  # raw competing supply at shared stops [GTFS]
 )
-# Equity percentages derived as count / denominator (both from demographics).
+# Equity percentages derived as count / denominator (both from demographics). The
+# denominator must share the count's universe: household counts (low_income from
+# B19001, lo_veh_hh from B08201) divide by total_hh, person counts by total_pop.
 EQUITY_PCT_SPEC: Final[tuple[tuple[str, str, str], ...]] = (
-    ("pct_low_income", "low_income", "total_pop"),
+    ("pct_low_income", "low_income", "total_hh"),
     ("pct_minority", "minority", "total_pop"),
     ("pct_lep", "lep", "total_pop"),
     ("pct_lo_veh_hh", "lo_veh_hh", "total_hh"),
