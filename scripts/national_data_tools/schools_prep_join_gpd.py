@@ -74,7 +74,10 @@ from typing import List, Optional, Sequence
 import geopandas as gpd
 import pandas as pd
 
-# --- <<< EDIT ME -------------------------------------------------------------
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+# === BEGIN CONFIG ===
 # Set these to use them directly. Leave as None to be prompted (notebook) or to
 # pass --input-dir / --output-dir on the command line.
 INPUT_DIR: Path | None = None  # folder holding the distribution files
@@ -91,7 +94,7 @@ DEFAULT_ENROLLMENT_SOURCE = "auto"  # "auto" | "ccd" | "elsi"
 STATE_ABBRS = {"VA", "MD", "DC"}  # jurisdictions to keep
 STATE_COL = "STATE"  # postal-abbrev column in the EDGE geocode file
 OUTPUT_CRS = 6487  # NAD83(2011) / DC-MD-VA region (meters)
-# --- EDIT ME >>> -------------------------------------------------------------
+# === END CONFIG ===
 
 logger = logging.getLogger(__name__)
 

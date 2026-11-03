@@ -43,9 +43,16 @@ import pandas as pd
 from matplotlib.markers import MarkerStyle
 from matplotlib.ticker import FixedFormatter, FixedLocator
 
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+# === BEGIN CONFIG ===
+
 # Full config OR previous run-log location. Join filenames with /.
 # A UNC path starts with exactly two backslashes. No __file__ is needed in notebooks.
 CONFIG_PATH: Final[Path] = Path(r"Path\To\Your\Config_Folder") / "ntd_monthly_config.txt"
+
+# === END CONFIG ===
 
 RUN_LOG_TITLE: Final[str] = "NTD MONTHLY SUMMARY RUN LOG"
 REPLAY_CONFIG_BEGIN: Final[str] = "# === BEGIN REPLAY CONFIG ==="

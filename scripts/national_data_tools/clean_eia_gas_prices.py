@@ -55,7 +55,10 @@ from typing import List, Optional, Sequence
 
 import pandas as pd
 
-# --- <<< EDIT ME -------------------------------------------------------------
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+# === BEGIN CONFIG ===
 # Set these to use them directly. Leave as None to be prompted (notebook) or to
 # pass --input / --output on the command line.
 INPUT_PATH: Path | None = None
@@ -67,7 +70,7 @@ LOG_PATH: Path | None = None  # None = derive from output path
 WRITE_WEEKLY = False  # also dump the cleaned weekly frame next to the output
 ROUND_DECIMALS: int | None = 4  # round monthly price means to N decimals; None = off
 ID_COLS = ["MONTH_START", "YEAR", "MONTH", "N_WEEKS"]  # non-price columns in output
-# --- EDIT ME >>> -------------------------------------------------------------
+# === END CONFIG ===
 
 logger = logging.getLogger(__name__)
 

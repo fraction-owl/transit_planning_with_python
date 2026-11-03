@@ -1,6 +1,6 @@
 """Run all four runtime-analysis stages from one self-contained Python script.
 
-Edit USER SETTINGS below, then run this file with Python 3.9 or later.
+Edit the CONFIGURATION section below, then run this file with Python 3.9 or later.
 Dependencies: pandas, numpy, openpyxl. No other workflow .py files are needed.
 
 Stages:
@@ -65,8 +65,9 @@ from openpyxl.utils import get_column_letter
 from openpyxl.workbook.properties import CalcProperties
 
 # =============================================================================
-# USER SETTINGS
+# CONFIGURATION
 # =============================================================================
+# === BEGIN CONFIG ===
 
 PROJECT_DIR = r"Path\To\Your\Project_Folder"
 GTFS_PATH = r"Path\To\Your\GTFS_Folder"  # folder of .txt files or a .zip
@@ -89,6 +90,8 @@ GTFS_MATCH_TOLERANCE_MIN = 1.0  # Optional segment schedule enrichment; not an e
 CSV_ENCODING = "auto"
 PREPARED_SHEET = 0
 CACHE_PREPARED_EXCEL = True
+
+# === END CONFIG ===
 
 
 @dataclass(frozen=True)
@@ -1986,7 +1989,7 @@ def main(stages: Sequence[int] | None = None, argv: Sequence[str] | None = None)
         type=int,
         nargs="+",
         choices=(1, 2, 3, 4),
-        help="Stages to run; defaults to STAGES in USER SETTINGS.",
+        help="Stages to run; defaults to STAGES in CONFIGURATION.",
     )
     interactive = "ipykernel" in sys.modules or "IPython" in sys.modules
     args = parser.parse_args([] if argv is None and interactive else argv)
