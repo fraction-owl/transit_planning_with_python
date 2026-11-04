@@ -23,6 +23,19 @@ Route archetypes per region (five routes each):
 Fares (FARE_ATTRIBUTES): routes 10, 30 and 40 take the LOCAL fare, route 20
 the EXPRESS fare and route 50H the FREE fare, one fare_rules row per route.
 
+Feed archive
+------------
+Each region also gets dated copies of its feed (ARCHIVE_EDITIONS), one per
+calendar year, for scripts that compare a sequence of feeds
+(gtfs_route_diff.py, gtfs_route_timeline.py, gtfs_service_change_dates.py).
+The DC copies are:
+    dc_2024  no Sunday service; route 30 every 20 min on weekdays; $1.75
+             local fare and no free fare (route 50H charges the local fare)
+    dc_2025  service change only: Sunday service starts and route 30 runs
+             every 15 min on weekdays; fares unchanged
+    dc_2026  fare change only: local fare $2.00, FREE fare added and route
+             50H moved to it; identical to the single dc/ feed
+
 Geographic basis
 ----------------
 Each region's bounding box is taken from a Census shapefile fixture if one is
@@ -40,6 +53,8 @@ Inputs:
 Outputs:
     - One GTFS sub-folder per region under OUTPUT_DIR (dc/), holding the
       .txt files listed above.
+    - One archive folder per region under OUTPUT_DIR (dc_archive/), holding
+      one dated feed sub-folder per ARCHIVE_EDITIONS entry (dc_2024/, ...).
 """
 
 from __future__ import annotations
@@ -47,7 +62,7 @@ from __future__ import annotations
 import csv
 import logging
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -117,6 +132,25 @@ FARE_ATTRIBUTES: Tuple[Dict[str, str], ...] = (
         "price": "0.00",
         "payment_method": "0",
         "transfers": "",
+        "transfer_duration": "",
+    },
+)
+
+# Fares before the archive's fare change (the 2024 and 2025 copies; see
+# ARCHIVE_EDITIONS): a lower local fare, the same express fare, and no FREE fare.
+PRIOR_FARE_ATTRIBUTES: Tuple[Dict[str, str], ...] = (
+    {
+        "fare_id": "LOCAL",
+        "price": "1.75",
+        "payment_method": "0",
+        "transfers": "",
+        "transfer_duration": "7200",
+    },
+    {
+        "fare_id": "EXPRESS",
+        "price": "4.00",
+        "payment_method": "1",
+        "transfers": "0",
         "transfer_duration": "",
     },
 )
@@ -309,6 +343,100 @@ def _route_specs() -> Tuple[RouteSpec, ...]:
     )
 
 
+# --------------------------------------------------------------------------------------------------
+# FEED EDITIONS
+# --------------------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class FeedEdition:
+    """One dated version of a region's feed.
+
+    Attributes:
+        year: Calendar year the feed covers. FEED_START_DATE, FEED_END_DATE,
+            FEED_VERSION and HOLIDAYS are moved by the number of years between
+            FEED_START_DATE's year and this one, so HOLIDAYS should hold
+            fixed-date holidays only.
+        fares: The fare_attributes.txt rows.
+        route_fares: Route short_name -> fare_id, overriding ``RouteSpec.fare_id``.
+        sunday_service: When False, the feed has no "sunday" service and every
+            route's Sunday windows are dropped.
+        headway_overrides: ``(route short_name, service_id)`` -> headway in
+            minutes, applied to every window of that route and service.
+    """
+
+    year: int
+    fares: Tuple[Dict[str, str], ...] = FARE_ATTRIBUTES
+    route_fares: Dict[str, str] = field(default_factory=dict)
+    sunday_service: bool = True
+    headway_overrides: Dict[Tuple[str, str], int] = field(default_factory=dict)
+
+
+# The single feed written to OUTPUT_DIR/<region>/ (tests/fixtures/mock_gtfs_dc.zip).
+BASE_EDITION = FeedEdition(year=int(FEED_START_DATE[:4]))
+
+# Dated copies written to OUTPUT_DIR/<region>_archive/<region>_<year>/, oldest
+# first (tests/fixtures/mock_gtfs_dc_archive.zip). Consecutive copies differ in
+# either service or fares, never both, so each change can be traced to one
+# transition. Set to () to skip the archive.
+ARCHIVE_EDITIONS: Tuple[FeedEdition, ...] = (
+    # Before both changes: no Sunday service, route 30 every 20 min on weekdays,
+    # prior fares with route 50H on the local fare.
+    FeedEdition(
+        year=2024,
+        fares=PRIOR_FARE_ATTRIBUTES,
+        route_fares={"50H": "LOCAL"},
+        sunday_service=False,
+        headway_overrides={("30", "weekday"): 20},
+    ),
+    # Service change only: Sunday service starts and route 30 goes to every
+    # 15 min on weekdays. Fares are unchanged.
+    FeedEdition(year=2025, fares=PRIOR_FARE_ATTRIBUTES, route_fares={"50H": "LOCAL"}),
+    # Fare change only: local fare $1.75 -> $2.00, FREE fare added and route 50H
+    # moved to it; express fare unchanged. Service is unchanged.
+    BASE_EDITION,
+)
+
+
+def _shift_years(yyyymmdd: str, edition: FeedEdition) -> str:
+    """Move a YYYYMMDD date (or a version string starting YYYY) into an edition's year."""
+    offset = edition.year - int(FEED_START_DATE[:4])
+    return f"{int(yyyymmdd[:4]) + offset:04d}{yyyymmdd[4:]}"
+
+
+def _edition_specs(edition: FeedEdition) -> Tuple[RouteSpec, ...]:
+    """Return the route lineup with one edition's service and fare changes applied.
+
+    Raises:
+        ValueError: If an override names a route or route/service not in the lineup.
+    """
+    base_specs = _route_specs()
+    windows_known = {(s.short_name, sid) for s in base_specs for sid in s.windows_by_service}
+    unknown = sorted(set(edition.route_fares) - {s.short_name for s in base_specs})
+    unknown += [f"{r}/{sid}" for r, sid in sorted(set(edition.headway_overrides) - windows_known)]
+    if unknown:
+        raise ValueError(f"FeedEdition {edition.year} names unknown routes or services: {unknown}")
+
+    specs: List[RouteSpec] = []
+    for spec in base_specs:
+        windows = {
+            sid: [
+                (start, end, edition.headway_overrides.get((spec.short_name, sid), headway))
+                for start, end, headway in wins
+            ]
+            for sid, wins in spec.windows_by_service.items()
+            if edition.sunday_service or sid != "sunday"
+        }
+        specs.append(
+            replace(
+                spec,
+                windows_by_service=windows,
+                fare_id=edition.route_fares.get(spec.short_name, spec.fare_id),
+            )
+        )
+    return tuple(specs)
+
+
 # ==================================================================================================
 # GEOGRAPHIC HELPERS
 # ==================================================================================================
@@ -472,13 +600,13 @@ def _round_up_to_5(seconds: int) -> int:
 # ==================================================================================================
 
 
-def _build_calendar_rows() -> List[Dict[str, str]]:
-    """Return calendar.txt rows for the four base services."""
+def _build_calendar_rows(edition: FeedEdition) -> List[Dict[str, str]]:
+    """Return calendar.txt rows for the four base services (three without Sunday)."""
     base = {
-        "start_date": FEED_START_DATE,
-        "end_date": FEED_END_DATE,
+        "start_date": _shift_years(FEED_START_DATE, edition),
+        "end_date": _shift_years(FEED_END_DATE, edition),
     }
-    return [
+    rows = [
         {
             "service_id": "weekday",
             "monday": "1",
@@ -525,12 +653,15 @@ def _build_calendar_rows() -> List[Dict[str, str]]:
             **base,
         },
     ]
+    if not edition.sunday_service:
+        rows = [row for row in rows if row["service_id"] != "sunday"]
+    return rows
 
 
-def _build_calendar_dates_rows() -> List[Dict[str, str]]:
+def _build_calendar_dates_rows(edition: FeedEdition) -> List[Dict[str, str]]:
     """Return calendar_dates.txt rows turning weekday service off and holiday on."""
     rows: List[Dict[str, str]] = []
-    for date in HOLIDAYS:
+    for date in (_shift_years(holiday, edition) for holiday in HOLIDAYS):
         rows.append({"service_id": "weekday", "date": date, "exception_type": "2"})
         rows.append({"service_id": "holiday", "date": date, "exception_type": "1"})
     return rows
@@ -782,7 +913,7 @@ def _write_agency(region: Region, out_dir: Path) -> None:
     )
 
 
-def _write_calendar(out_dir: Path) -> None:
+def _write_calendar(out_dir: Path, edition: FeedEdition) -> None:
     """Write calendar.txt and calendar_dates.txt."""
     _write_csv(
         out_dir / "calendar.txt",
@@ -798,16 +929,16 @@ def _write_calendar(out_dir: Path) -> None:
             "start_date",
             "end_date",
         ],
-        _build_calendar_rows(),
+        _build_calendar_rows(edition),
     )
     _write_csv(
         out_dir / "calendar_dates.txt",
         ["service_id", "date", "exception_type"],
-        _build_calendar_dates_rows(),
+        _build_calendar_dates_rows(edition),
     )
 
 
-def _write_feed_info(region: Region, out_dir: Path) -> None:
+def _write_feed_info(region: Region, out_dir: Path, edition: FeedEdition) -> None:
     """Write feed_info.txt."""
     _write_csv(
         out_dir / "feed_info.txt",
@@ -824,9 +955,9 @@ def _write_feed_info(region: Region, out_dir: Path) -> None:
                 "feed_publisher_name": region.agency_name,
                 "feed_publisher_url": region.agency_url,
                 "feed_lang": FEED_LANG,
-                "feed_start_date": FEED_START_DATE,
-                "feed_end_date": FEED_END_DATE,
-                "feed_version": FEED_VERSION,
+                "feed_start_date": _shift_years(FEED_START_DATE, edition),
+                "feed_end_date": _shift_years(FEED_END_DATE, edition),
+                "feed_version": _shift_years(FEED_VERSION, edition),
             }
         ],
     )
@@ -852,16 +983,21 @@ def _write_routes(region: Region, specs: Sequence[RouteSpec], out_dir: Path) -> 
     )
 
 
-def _write_fares(region: Region, specs: Sequence[RouteSpec], out_dir: Path) -> None:
+def _write_fares(
+    region: Region,
+    specs: Sequence[RouteSpec],
+    out_dir: Path,
+    fares: Sequence[Dict[str, str]],
+) -> None:
     """Write fare_attributes.txt and fare_rules.txt (GTFS-Fares v1).
 
     Raises:
-        ValueError: If a route spec names a fare_id missing from FARE_ATTRIBUTES.
+        ValueError: If a route spec names a fare_id missing from ``fares``.
     """
-    known = {fare["fare_id"] for fare in FARE_ATTRIBUTES}
+    known = {fare["fare_id"] for fare in fares}
     unknown = sorted({spec.fare_id for spec in specs} - known)
     if unknown:
-        raise ValueError(f"Route specs name fare_id(s) missing from FARE_ATTRIBUTES: {unknown}")
+        raise ValueError(f"Route specs name fare_id(s) missing from the fare table: {unknown}")
     _write_csv(
         out_dir / "fare_attributes.txt",
         [
@@ -873,10 +1009,7 @@ def _write_fares(region: Region, specs: Sequence[RouteSpec], out_dir: Path) -> N
             "agency_id",
             "transfer_duration",
         ],
-        [
-            {**fare, "currency_type": FARE_CURRENCY, "agency_id": region.agency_id}
-            for fare in FARE_ATTRIBUTES
-        ],
+        [{**fare, "currency_type": FARE_CURRENCY, "agency_id": region.agency_id} for fare in fares],
     )
     _write_csv(
         out_dir / "fare_rules.txt",
@@ -1027,18 +1160,19 @@ def _write_trips_and_stop_times(trips: Sequence[TripPlan], out_dir: Path) -> Non
 # ==================================================================================================
 
 
-def _build_region_feed(region: Region, out_dir: Path) -> None:
-    """Build and write a complete GTFS feed for one region."""
+def _build_region_feed(
+    region: Region, region_dir: Path, edition: FeedEdition = BASE_EDITION
+) -> None:
+    """Build and write one edition of a region's GTFS feed into ``region_dir``."""
     import json  # noqa: PLC0415
 
     import generate_mock_roads as roads  # noqa: PLC0415 — couples geometry to the road network
 
-    logging.info("Building feed for region: %s", region.key)
+    logging.info("Building %d feed for region %s: %s", edition.year, region.key, region_dir)
 
-    region_dir = out_dir / region.key
     region_dir.mkdir(parents=True, exist_ok=True)
 
-    specs = _route_specs()
+    specs = _edition_specs(edition)
 
     # Build the shared N-S stop sequence first (the holiday loop reuses it on its
     # east leg). The shape *is* the traced A1 centerline, so stops sit on the road.
@@ -1094,10 +1228,10 @@ def _build_region_feed(region: Region, out_dir: Path) -> None:
 
     # Write all GTFS tables.
     _write_agency(region, region_dir)
-    _write_calendar(region_dir)
-    _write_feed_info(region, region_dir)
+    _write_calendar(region_dir, edition)
+    _write_feed_info(region, region_dir, edition)
     _write_routes(region, specs, region_dir)
-    _write_fares(region, specs, region_dir)
+    _write_fares(region, specs, region_dir, edition.fares)
     _write_stops(stops_by_route, region.key, region_dir, stop_meta)
     _write_shapes(shape_vertices_by_id, region_dir)
     _write_trips_and_stop_times(all_trips, region_dir)
@@ -1210,7 +1344,10 @@ def main() -> None:
     try:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         for region in REGIONS:
-            _build_region_feed(region, OUTPUT_DIR)
+            _build_region_feed(region, OUTPUT_DIR / region.key)
+            archive_dir = OUTPUT_DIR / f"{region.key}_archive"
+            for edition in ARCHIVE_EDITIONS:
+                _build_region_feed(region, archive_dir / f"{region.key}_{edition.year}", edition)
         logging.info("Script completed successfully.")
     except (OSError, ValueError, RuntimeError) as err:
         logging.error("%s", err)
