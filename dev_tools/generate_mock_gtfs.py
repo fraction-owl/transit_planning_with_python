@@ -10,7 +10,8 @@ Outputs
 -------
 For each region, a complete GTFS package containing:
     agency.txt, stops.txt, routes.txt, trips.txt, stop_times.txt,
-    calendar.txt, calendar_dates.txt, shapes.txt, feed_info.txt
+    calendar.txt, calendar_dates.txt, shapes.txt, feed_info.txt,
+    fare_attributes.txt, fare_rules.txt (GTFS-Fares v1)
 
 Route archetypes per region (five routes each):
     10  N-S Local         — all-day weekday/Sat/Sun, weekday late-night tail
@@ -18,6 +19,9 @@ Route archetypes per region (five routes each):
     30  NW-SE Crosstown   — all-day weekday/Sat/Sun
     40  NE-SW Diagonal    — all-day weekday/Sat/Sun, close stop spacing
     50H Holiday Loop      — holiday only, clockwise; shares east leg with R10
+
+Fares (FARE_ATTRIBUTES): routes 10, 30 and 40 take the LOCAL fare, route 20
+the EXPRESS fare and route 50H the FREE fare, one fare_rules row per route.
 
 Geographic basis
 ----------------
@@ -83,6 +87,38 @@ FEED_LANG = "en"
 HOLIDAYS = (
     "20260101",  # New Year's Day
     "20261225",  # Christmas Day
+)
+
+# Fares (GTFS-Fares v1), written to fare_attributes.txt. Each RouteSpec names one
+# fare_id below, written to fare_rules.txt. The fares cover three v1
+# cases: unlimited transfers within a window (blank transfers), no transfers,
+# and a $0 fare. payment_method: 0 = paid on board, 1 = paid before boarding.
+FARE_CURRENCY = "USD"
+FARE_ATTRIBUTES: Tuple[Dict[str, str], ...] = (
+    # Local: paid on board, unlimited transfers within 2 hours.
+    {
+        "fare_id": "LOCAL",
+        "price": "2.00",
+        "payment_method": "0",
+        "transfers": "",
+        "transfer_duration": "7200",
+    },
+    # Express: paid before boarding, no transfers.
+    {
+        "fare_id": "EXPRESS",
+        "price": "4.00",
+        "payment_method": "1",
+        "transfers": "0",
+        "transfer_duration": "",
+    },
+    # Holiday loop: fare-free.
+    {
+        "fare_id": "FREE",
+        "price": "0.00",
+        "payment_method": "0",
+        "transfers": "",
+        "transfer_duration": "",
+    },
 )
 
 # Stop-spacing standards exposed by archetype, in feet.
@@ -180,6 +216,7 @@ class RouteSpec:
         windows_by_service: Maps service_id to a list of operating windows.
         direction_pattern: ``"both"`` (alternating 0/1 trips), ``"am_in_pm_out"``
             (peak express convention), or ``"cw_only"`` (loop, direction 0 only).
+        fare_id: The route's fare, a ``fare_id`` from ``FARE_ATTRIBUTES``.
     """
 
     short_name: str
@@ -189,6 +226,7 @@ class RouteSpec:
     avg_speed_mph: float
     windows_by_service: Dict[str, List[ServiceWindow]] = field(default_factory=dict)
     direction_pattern: str = "both"
+    fare_id: str = "LOCAL"
 
 
 def _route_specs() -> Tuple[RouteSpec, ...]:
@@ -225,6 +263,7 @@ def _route_specs() -> Tuple[RouteSpec, ...]:
                 ],
             },
             direction_pattern="am_in_pm_out",
+            fare_id="EXPRESS",
         ),
         # ------- Route 30: NW-SE Crosstown ------------------------------------------------------
         RouteSpec(
@@ -265,6 +304,7 @@ def _route_specs() -> Tuple[RouteSpec, ...]:
                 "holiday": [("08:00", "20:00", 60)],
             },
             direction_pattern="cw_only",
+            fare_id="FREE",
         ),
     )
 
@@ -812,6 +852,42 @@ def _write_routes(region: Region, specs: Sequence[RouteSpec], out_dir: Path) -> 
     )
 
 
+def _write_fares(region: Region, specs: Sequence[RouteSpec], out_dir: Path) -> None:
+    """Write fare_attributes.txt and fare_rules.txt (GTFS-Fares v1).
+
+    Raises:
+        ValueError: If a route spec names a fare_id missing from FARE_ATTRIBUTES.
+    """
+    known = {fare["fare_id"] for fare in FARE_ATTRIBUTES}
+    unknown = sorted({spec.fare_id for spec in specs} - known)
+    if unknown:
+        raise ValueError(f"Route specs name fare_id(s) missing from FARE_ATTRIBUTES: {unknown}")
+    _write_csv(
+        out_dir / "fare_attributes.txt",
+        [
+            "fare_id",
+            "price",
+            "currency_type",
+            "payment_method",
+            "transfers",
+            "agency_id",
+            "transfer_duration",
+        ],
+        [
+            {**fare, "currency_type": FARE_CURRENCY, "agency_id": region.agency_id}
+            for fare in FARE_ATTRIBUTES
+        ],
+    )
+    _write_csv(
+        out_dir / "fare_rules.txt",
+        ["fare_id", "route_id"],
+        [
+            {"fare_id": spec.fare_id, "route_id": f"{region.key.upper()}_R{spec.short_name}"}
+            for spec in specs
+        ],
+    )
+
+
 def _write_stops(
     stops_by_route: Dict[str, List[Tuple[str, float, float, float]]],
     region_key: str,
@@ -1021,6 +1097,7 @@ def _build_region_feed(region: Region, out_dir: Path) -> None:
     _write_calendar(region_dir)
     _write_feed_info(region, region_dir)
     _write_routes(region, specs, region_dir)
+    _write_fares(region, specs, region_dir)
     _write_stops(stops_by_route, region.key, region_dir, stop_meta)
     _write_shapes(shape_vertices_by_id, region_dir)
     _write_trips_and_stop_times(all_trips, region_dir)
