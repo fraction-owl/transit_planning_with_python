@@ -179,6 +179,33 @@ def test_load_gtfs_data_full_spec_fixture_loads_with_defaults() -> None:
     assert set(result["calendar_dates"]["service_id"]) <= set(result["calendar"]["service_id"])
 
 
+def test_load_gtfs_data_mock_dc_fixture_fares() -> None:
+    """mock_gtfs_dc.zip carries GTFS-Fares v1 with one fare per route.
+
+    The fares come from FARE_ATTRIBUTES in dev_tools/generate_mock_gtfs.py and
+    cover blank (unlimited) transfers within a window, no transfers, and a $0
+    fare.
+    """
+    fixture = Path(__file__).parent / "fixtures" / "mock_gtfs_dc.zip"
+
+    result = load_gtfs_data(
+        str(fixture),
+        files=("agency.txt", "routes.txt", "fare_attributes.txt", "fare_rules.txt"),
+    )
+
+    fares = result["fare_attributes"].set_index("fare_id")
+    rules = result["fare_rules"].set_index("route_id")
+    assert rules.index.is_unique
+    assert sorted(rules.index) == sorted(result["routes"]["route_id"])
+    assert set(rules["fare_id"]) == set(fares.index)
+    assert set(fares["agency_id"]) == set(result["agency"]["agency_id"])
+    assert rules.loc["DC_R20", "fare_id"] == "EXPRESS"
+    assert pd.isna(fares.loc["LOCAL", "transfers"])
+    assert fares.loc["LOCAL", "transfer_duration"] == "7200"
+    assert fares.loc["EXPRESS", "transfers"] == "0"
+    assert float(fares.loc["FREE", "price"]) == 0.0
+
+
 def test_load_gtfs_data_read_oserror_propagates_unwrapped(tmp_path, monkeypatch) -> None:
     """An OS-level read failure propagates as OSError, not a remapped RuntimeError."""
     folder = _mk_gtfs_dir(tmp_path, files=[("stops.txt", "stop_id\n001\n")])
