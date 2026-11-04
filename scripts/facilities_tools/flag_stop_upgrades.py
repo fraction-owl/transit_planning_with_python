@@ -5,12 +5,17 @@ This script reads stop-level ridership and amenity information from one or
 duplicate STOP_IDs, then computes boolean "FLAG_*" columns to highlight where
 usage warrants an upgrade but the amenity is missing.
 
-Amenity values are read as Y/N (Yes/No, True/False and 1/0 are also accepted).
-Where both workbooks carry an amenity, the amenity workbook wins and the
-ridership workbook fills its blanks. Values neither source supplies are
-reported as UNKNOWN and are flagged like a missing amenity. Rows with a blank
-stop ID are dropped, and duplicate amenity records for one stop are collapsed
-(Y if any record says Y) before joining. Set ``AMENITIES_XLSX = None`` to use
+Amenity values are read as Y/N (Yes/No and True/False are also accepted, as
+are counts: above zero means present, zero means absent). Where both workbooks
+carry an amenity, the amenity workbook wins and the ridership workbook fills
+its blanks. Values neither source supplies are reported as UNKNOWN; a stop at
+or above a threshold with an UNKNOWN amenity gets a "REVIEW_*" column instead
+of a flag. Stop IDs are trimmed and a trailing ".0" is removed ("1257.0"
+matches "1257"); rows with a blank stop ID are dropped, and duplicate amenity
+records for one stop are collapsed (Y if any record says Y) before joining.
+The log reports how many stops in each workbook have no match in the other.
+Thousands separators in ridership ("1,250") are removed; other non-numeric
+values are logged and counted as zero. Set ``AMENITIES_XLSX = None`` to use
 the ridership workbook alone.
 
 Outputs
@@ -19,13 +24,13 @@ Both files are written to ``OUTPUT_FOLDER``:
 
     stops_needing_improvement.xlsx:
         Raw Data – Unmodified import of the ridership workbook.
-        All Flags – Every stop plus boolean flag columns for each amenity and a
-        NEEDS_IMPROVEMENT summary flag.
+        All Flags – Every stop plus boolean flag and review columns for each
+        amenity and NEEDS_IMPROVEMENT / NEEDS_REVIEW summary flags.
         Shelter / Bench / TrashCan / Pad – One sheet per amenity, listing only
         the stops that require that specific upgrade.
-    stops_needing_improvement.txt: A concise summary of flagged stops by
-    category, followed by a detailed, human-readable list of all stops
-    identified for improvement.
+        Needs Review – Stops at or above a threshold whose amenity is UNKNOWN.
+    stops_needing_improvement.txt: A concise summary of flagged and review
+    stops by category, followed by a detailed, human-readable list of each.
 
 Typical use-cases include batch reviews of bus-stop needs based on ArcGIS
 outputs, planning reports, or independently maintained amenity inventories.
@@ -40,7 +45,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Set, Tuple
 
 import pandas as pd
 
@@ -94,8 +99,9 @@ _AMENITY_ALIASES: Dict[str, str] = {
     "trashcan": "TRASHCAN",
 }
 
-# Recognised amenity values (compared after strip + uppercase). Blank cells and
-# anything unrecognised are treated as unknown rather than as absent.
+# Recognised amenity values (compared after strip + uppercase). Counts are also
+# accepted: above zero is present, zero is absent. Blank cells and anything
+# unrecognised (including negative counts) are treated as unknown, not absent.
 _PRESENT_VALUES = frozenset({"Y", "YES", "TRUE", "T", "1", "1.0"})
 _ABSENT_VALUES = frozenset({"N", "NO", "FALSE", "F", "0", "0.0"})
 UNKNOWN_VALUE: str = "UNKNOWN"
@@ -112,12 +118,16 @@ def _standardise_yn(series: pd.Series) -> pd.Series:
     not treated as a confirmed absence.
     """
     text = series.astype("string").str.strip().str.upper()
+    counts = pd.to_numeric(text, errors="coerce")
+    is_count = ((counts >= 0) & (counts < float("inf"))).fillna(False)
+    present = text.isin(_PRESENT_VALUES).fillna(False) | (is_count & (counts > 0))
+    absent = text.isin(_ABSENT_VALUES).fillna(False) | (is_count & (counts == 0))
     result = pd.Series(pd.NA, index=series.index, dtype="object")
-    result[text.isin(_PRESENT_VALUES).fillna(False)] = "Y"
-    result[text.isin(_ABSENT_VALUES).fillna(False)] = "N"
+    result[present.fillna(False)] = "Y"
+    result[absent.fillna(False)] = "N"
 
     known = _PRESENT_VALUES | _ABSENT_VALUES | {"", UNKNOWN_VALUE}
-    unrecognised = text.notna() & ~text.isin(known).fillna(False)
+    unrecognised = text.notna() & ~(text.isin(known).fillna(False) | is_count)
     if unrecognised.any():
         logging.warning(
             "Column '%s': unrecognised amenity value(s) %s treated as unknown.",
@@ -138,8 +148,12 @@ def _apply_amenity_aliases(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _drop_missing_ids(df: pd.DataFrame, id_field: str, source: str) -> pd.DataFrame:
-    """Strip stop IDs and drop rows whose ID is blank, so they cannot match each other."""
-    ids = df[id_field].astype("string").str.strip()
+    """Strip stop IDs and drop rows whose ID is blank, so they cannot match each other.
+
+    A trailing ".0" left by a numeric export is removed ("1257.0" -> "1257");
+    leading zeros are kept.
+    """
+    ids = df[id_field].astype("string").str.strip().str.replace(r"^(\d+)\.0+$", r"\1", regex=True)
     missing = ids.isna() | (ids == "")
     if missing.any():
         logging.warning(
@@ -169,8 +183,22 @@ def _prepare_amenity_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _convert_ridership(df: pd.DataFrame) -> pd.DataFrame:
-    """Cast the ridership column to numeric, keeping decimals; non-numerics become zero."""
-    df[RIDERSHIP_FIELD] = pd.to_numeric(df[RIDERSHIP_FIELD], errors="coerce").fillna(0.0)
+    """Cast the ridership column to numeric, keeping decimals; non-numerics become zero.
+
+    Thousands separators ("1,250") are removed first. Values that are still not
+    numbers are logged before being set to zero; blanks become zero silently.
+    """
+    text = df[RIDERSHIP_FIELD].astype("string").str.strip().str.replace(",", "", regex=False)
+    values = pd.to_numeric(text, errors="coerce").astype("float64")
+    invalid = values.isna() & text.fillna("").ne("")
+    if invalid.any():
+        logging.warning(
+            "Column '%s': %d non-numeric value(s) %s treated as zero.",
+            RIDERSHIP_FIELD,
+            int(invalid.sum()),
+            sorted(df.loc[invalid, RIDERSHIP_FIELD].astype(str).unique()),
+        )
+    df[RIDERSHIP_FIELD] = values.fillna(0.0)
     return df
 
 
@@ -205,14 +233,21 @@ def _aggregate_by_stop(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _compute_flags(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
-    """Add FLAG_* columns and a summary NEEDS_IMPROVEMENT column."""
+    """Add FLAG_* / REVIEW_* columns and NEEDS_IMPROVEMENT / NEEDS_REVIEW summaries.
+
+    A stop at or above a threshold is flagged when the amenity is recorded as
+    absent ('N') and marked for review when it is unknown (neither 'Y' nor 'N').
+    """
+    review_cols: List[str] = []
     for name, cfg in AMENITIES.items():
         col = cfg["field"]
-        thresh = cfg["thresh"]
-        flag_col = f"FLAG_{name.upper()}"
-        df[flag_col] = (df[RIDERSHIP_FIELD] >= thresh) & (df[col] != "Y")
+        meets_thresh = df[RIDERSHIP_FIELD] >= cfg["thresh"]
+        df[f"FLAG_{name.upper()}"] = meets_thresh & (df[col] == "N")
+        df[f"REVIEW_{name.upper()}"] = meets_thresh & ~df[col].isin(["Y", "N"])
+        review_cols.append(f"REVIEW_{name.upper()}")
     flag_cols = [c for c in df.columns if c.startswith("FLAG_")]
     df["NEEDS_IMPROVEMENT"] = df[flag_cols].any(axis=1)
+    df["NEEDS_REVIEW"] = df[review_cols].any(axis=1)
     return df, flag_cols
 
 
@@ -224,6 +259,9 @@ def _write_workbook(raw_df: pd.DataFrame, processed_df: pd.DataFrame, out_path: 
         for name in AMENITIES:
             flag_col = f"FLAG_{name.upper()}"
             processed_df[processed_df[flag_col]].to_excel(writer, sheet_name=name, index=False)
+        processed_df[processed_df["NEEDS_REVIEW"]].to_excel(
+            writer, sheet_name="Needs Review", index=False
+        )
 
 
 def _load_amenity_data(path: Path, sheet: int | str) -> pd.DataFrame:
@@ -239,12 +277,36 @@ def _load_amenity_data(path: Path, sheet: int | str) -> pd.DataFrame:
     return df
 
 
+def _log_match_rates(rider_ids: Set[str], amen_ids: Set[str]) -> None:
+    """Log how many unique stop IDs in each workbook have no match in the other."""
+    for source, ids, other_ids, consequence in (
+        (
+            "Ridership",
+            rider_ids,
+            amen_ids,
+            "their amenities are UNKNOWN unless the ridership workbook has them",
+        ),
+        ("Amenity", amen_ids, rider_ids, "they are not in the output"),
+    ):
+        unmatched = len(ids - other_ids)
+        share = 100 * unmatched / len(ids) if ids else 0.0
+        logging.info(
+            "%s stops without a match in the other workbook: %d of %d (%.1f%%); %s.",
+            source,
+            unmatched,
+            len(ids),
+            share,
+            consequence,
+        )
+
+
 def _merge_ridership_and_amenities(rider_df: pd.DataFrame, amen_df: pd.DataFrame) -> pd.DataFrame:
     """Left-join amenity info onto ridership on STOP_ID_FIELD ↔ AMENITY_JOIN_FIELD."""
     if AMENITY_JOIN_FIELD not in amen_df.columns:
         raise ValueError(f"Column '{AMENITY_JOIN_FIELD}' not found in amenity workbook.")
     rider_df = _drop_missing_ids(rider_df, STOP_ID_FIELD, "ridership")
     amen_df = _drop_missing_ids(amen_df, AMENITY_JOIN_FIELD, "amenity")
+    _log_match_rates(set(rider_df[STOP_ID_FIELD]), set(amen_df[AMENITY_JOIN_FIELD]))
 
     fields = [cfg["field"] for cfg in AMENITIES.values() if cfg["field"] in amen_df.columns]
     amen_subset = amen_df[[AMENITY_JOIN_FIELD, *fields]].rename(
@@ -281,7 +343,7 @@ def _merge_ridership_and_amenities(rider_df: pd.DataFrame, amen_df: pd.DataFrame
 
 
 def _write_txt_log(processed_df: pd.DataFrame, flag_cols: List[str], out_path: Path) -> None:
-    """Write a plain-text summary of flagged stops and counts."""
+    """Write a plain-text summary of flagged and review stops and counts."""
     with out_path.open("w", encoding="utf-8") as f:
         f.write(f"Run date: {pd.Timestamp.now():%Y-%m-%d %H:%M}\n\n")
         f.write("Stops needing improvement by category\n")
@@ -291,14 +353,23 @@ def _write_txt_log(processed_df: pd.DataFrame, flag_cols: List[str], out_path: P
             f.write(f"{name:10s}: {processed_df[col].sum():>6}\n")
         f.write(f"\nTotal flagged stops: {processed_df['NEEDS_IMPROVEMENT'].sum()}\n\n")
 
+        f.write("Stops needing review (amenity UNKNOWN) by category\n")
+        f.write("───────────────────────────────────────────────────\n")
+        review_cols = [f"REVIEW_{name.upper()}" for name in AMENITIES]
+        for name, col in zip(AMENITIES, review_cols):
+            f.write(f"{name:10s}: {processed_df[col].sum():>6}\n")
+        f.write(f"\nTotal stops needing review: {processed_df['NEEDS_REVIEW'].sum()}\n\n")
+
         f.write("Detailed list (one row per stop)\n")
         f.write("─────────────────────────────────\n")
-        cols = (
-            [STOP_ID_FIELD, RIDERSHIP_FIELD]
-            + [cfg["field"] for cfg in AMENITIES.values()]
-            + flag_cols
-        )
+        base_cols = [STOP_ID_FIELD, RIDERSHIP_FIELD] + [cfg["field"] for cfg in AMENITIES.values()]
+        cols = base_cols + flag_cols
         f.write(processed_df[processed_df["NEEDS_IMPROVEMENT"]][cols].to_string(index=False))
+
+        f.write("\n\nStops needing review (one row per stop)\n")
+        f.write("────────────────────────────────────────\n")
+        review_rows = processed_df[processed_df["NEEDS_REVIEW"]]
+        f.write(review_rows[base_cols + review_cols].to_string(index=False))
 
 
 # =============================================================================

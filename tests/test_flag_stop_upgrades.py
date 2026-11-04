@@ -1,8 +1,10 @@
+import logging
 import sys
 from pathlib import Path
 from unittest.mock import patch
 
 import pandas as pd
+import pytest
 
 script_dir = Path("scripts/facilities_tools").resolve()
 sys.path.append(str(script_dir))
@@ -116,6 +118,14 @@ def test_standardise_yn_unrecognised_value_is_missing() -> None:
     assert result.iloc[1] == "Y"
 
 
+def test_standardise_yn_accepts_counts() -> None:
+    """Counts above zero are present, zero is absent, and negatives are unknown."""
+    s = pd.Series(["2", "0", "1.5", " 3 ", "-1"])
+    result = target._standardise_yn(s)
+    assert list(result.iloc[:4]) == ["Y", "N", "Y", "Y"]
+    assert pd.isna(result.iloc[4])
+
+
 def test_standardise_yn_empty_series() -> None:
     """An empty series passes through without error."""
     s = pd.Series([], dtype=str)
@@ -170,6 +180,21 @@ def test_convert_ridership_non_numeric_becomes_zero() -> None:
     df = pd.DataFrame({"XBOARDINGS": ["abc", None, "10"]})
     result = target._convert_ridership(df)
     assert result["XBOARDINGS"].tolist() == [0, 0, 10]
+
+
+def test_convert_ridership_removes_thousands_separators() -> None:
+    """Comma-formatted values are read as numbers, not zeroed."""
+    df = pd.DataFrame({"XBOARDINGS": ["1,250", " 2,000.5 ", "7"]})
+    result = target._convert_ridership(df)
+    assert result["XBOARDINGS"].tolist() == [1250, 2000.5, 7]
+
+
+def test_convert_ridership_logs_non_numeric_values(caplog: pytest.LogCaptureFixture) -> None:
+    """Non-numeric values are reported before being zeroed; blanks are not."""
+    df = pd.DataFrame({"XBOARDINGS": ["n/a", "", "10"]})
+    with caplog.at_level(logging.WARNING):
+        target._convert_ridership(df)
+    assert "1 non-numeric value(s) ['n/a']" in caplog.text
 
 
 def test_convert_ridership_fixture_values_are_non_negative_numbers() -> None:
@@ -271,7 +296,9 @@ def test_aggregate_by_stop_unknown_when_no_record_is_known() -> None:
 
 def test_aggregate_by_stop_sums_decimals_before_flagging() -> None:
     """12.8 + 12.8 boardings reach the 25-boarding shelter threshold."""
-    df = pd.DataFrame({"STOP_ID": ["1", "1"], "XBOARDINGS": ["12.8", "12.8"]})
+    df = pd.DataFrame(
+        {"STOP_ID": ["1", "1"], "XBOARDINGS": ["12.8", "12.8"], "SHELTER": ["N", "N"]}
+    )
     df = target._prepare_amenity_columns(df)
     df = target._convert_ridership(df)
     result, _ = target._compute_flags(target._aggregate_by_stop(df))
@@ -332,6 +359,18 @@ def test_compute_flags_amenity_present_suppresses_flag() -> None:
     )
     result, _ = target._compute_flags(df)
     assert not result["NEEDS_IMPROVEMENT"].iloc[0]
+
+
+def test_compute_flags_unknown_amenity_is_review_not_flag() -> None:
+    """An UNKNOWN amenity at or above threshold is marked for review, not flagged."""
+    df = _make_flaggable_df()
+    df["SHELTER"] = ["N", "N", "N", target.UNKNOWN_VALUE, target.UNKNOWN_VALUE]
+    result, _ = target._compute_flags(df)
+    stop_d = result.set_index("STOP_ID").loc["D"]
+    assert not stop_d["FLAG_SHELTER"]
+    assert stop_d["REVIEW_SHELTER"]
+    assert stop_d["NEEDS_REVIEW"]
+    assert not result.set_index("STOP_ID").loc["C", "REVIEW_SHELTER"]  # below threshold
 
 
 def test_compute_flags_needs_improvement_is_any_flag() -> None:
@@ -452,6 +491,26 @@ def test_merge_blank_ids_are_dropped_not_matched() -> None:
     assert result["STOP_ID"].tolist() == ["1257"]
 
 
+def test_merge_ids_with_trailing_decimal_match() -> None:
+    """A stop ID exported as '1257.0' matches '1257'; leading zeros are kept."""
+    rider = pd.DataFrame({"STOP_ID": ["1257", "0042"], "XBOARDINGS": ["4", "5"]})
+    amen = _make_amenity_merge_df()
+    amen["stop_code"] = ["1257.0", "0042"]
+    result = target._merge_ridership_and_amenities(rider, amen).set_index("STOP_ID")
+    assert result.loc["1257", "SHELTER"] == "Y"
+    assert result.loc["0042", "BENCH"] == "Y"
+
+
+def test_merge_logs_match_rates(caplog: pytest.LogCaptureFixture) -> None:
+    """Unmatched stop counts are logged for both workbooks."""
+    rider = _make_ridership_merge_df()
+    amen = _make_amenity_merge_df()
+    with caplog.at_level(logging.INFO):
+        target._merge_ridership_and_amenities(rider, amen)
+    assert "Ridership stops without a match in the other workbook: 1 of 3 (33.3%)" in caplog.text
+    assert "Amenity stops without a match in the other workbook: 0 of 2 (0.0%)" in caplog.text
+
+
 def test_merge_amenity_workbook_missing_column() -> None:
     """An inventory without an amenity column keeps the ridership value."""
     rider = _make_ridership_merge_df()
@@ -497,6 +556,8 @@ def test_main_single_workbook_uses_ridership_aliases(tmp_path: Path) -> None:
     assert flags["XBOARDINGS"].tolist() == ["25.6"]
     assert flags["SHELTER"].tolist() == ["Y"]
     assert flags["FLAG_SHELTER"].tolist() == ["False"]
+    assert flags["REVIEW_BENCH"].tolist() == ["True"]  # no bench column → UNKNOWN
+    assert sheets["Needs Review"]["STOP_ID"].tolist() == ["1"]
 
 
 # =============================================================================
@@ -533,6 +594,17 @@ def test_write_txt_log_total_count_is_accurate(tmp_path: Path) -> None:
     target._write_txt_log(df, flag_cols, out)
     content = out.read_text(encoding="utf-8")
     assert f"Total flagged stops: {expected}" in content
+
+
+def test_write_txt_log_review_count_is_accurate(tmp_path: Path) -> None:
+    """Stops with an UNKNOWN amenity at or above threshold are counted for review."""
+    df = _make_flaggable_df()
+    df["BENCH"] = target.UNKNOWN_VALUE
+    df, flag_cols = target._compute_flags(df)
+    out = tmp_path / "log.txt"
+    target._write_txt_log(df, flag_cols, out)
+    content = out.read_text(encoding="utf-8")
+    assert "Total stops needing review: 3" in content  # C, D, E reach the bench threshold
 
 
 def test_write_txt_log_zero_flagged_when_all_amenities_present(tmp_path: Path) -> None:
