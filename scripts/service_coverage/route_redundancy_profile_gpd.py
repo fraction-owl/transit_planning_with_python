@@ -40,16 +40,40 @@ redundant on weekdays but the only service running on Sundays shows both facts.
 Feeds with no usable calendar files are profiled once under an "All Service"
 label.
 
+**Temporal coverage** (on by default; ``ENABLE_TEMPORAL_COVERAGE``) asks how
+often a rider at one of the route's stops has another route to take instead,
+on one exact service date per schedule label. Each scheduled boarding (a
+trip's stop visit, excluding its final stop and stops with no regular pickup)
+is matched to other routes' departures at stops within walking distance. The
+rider starts at the stop at the scheduled departure and walks straight-line at
+``WALK_SPEED_MPH``. A *later* departure counts when its wait after walking is
+within a threshold in ``TEMPORAL_WAIT_THRESHOLDS_MINUTES`` (30 and 60 minutes
+by default). An *earlier* departure counts when the rider would leave at most
+``TEMPORAL_EARLIER_ALLOWANCE_MINUTES`` sooner to catch it. Each boarding is
+then *alternative available*, a *timing gap* (another route stops nearby that
+day, but not in time), or a *geographic gap* (no other route stops nearby that
+day). Dates come from ``TEMPORAL_DATES`` or, when it is empty, are picked from
+the feed's calendar as the typical date of each schedule label, with federal
+holidays excluded. Counts are schedule-weighted boarding opportunities, not
+riders.
+
 Caveats: distances are straight-line in a projected CRS (no pedestrian
 network), service areas are stop buffers (not parcels reachable on foot), and
 the timed-alternative check compares this route's scheduled arrivals against
 the other route's scheduled departures — it asks "was another bus coming
 soon nearby", not "does the other route continue to my destination".
+Temporal coverage likewise ignores direction and destination: a route leaving
+a nearby stop in the opposite direction, or toward somewhere else, still
+counts as an alternative. That approximation suits networks where most riders
+head to a common hub such as a rail station; elsewhere, read the
+alternative-available shares as upper bounds.
 
 Inputs:
     - A GTFS feed (folder or .zip) with stops.txt, routes.txt, trips.txt, and
       stop_times.txt. calendar.txt / calendar_dates.txt, when present, drive
-      the per-schedule classification.
+      the per-schedule classification and temporal dates. Blank non-timepoint
+      stop times are interpolated for temporal coverage; feeds with a
+      non-empty frequencies.txt skip temporal coverage with a warning.
 
 Outputs:
     - ``route_redundancy_profile.csv``: one row per (schedule, route) with
@@ -58,8 +82,20 @@ Outputs:
       in square miles, declared paired routes, and suggested pairs.
     - ``route_redundancy_partners.csv`` (optional): one row per
       (schedule, route, partner route) pair with shared stop and timepoint
-      counts, the nearest walk distance, the shortest feasible wait, the
-      service-area overlap percentage, and the paired/suggested flags.
+      counts, the nearest walk distance, the shortest feasible wait after
+      walking, the service-area overlap percentage, and the paired/suggested
+      flags.
+    - ``route_temporal_summary.csv`` (temporal coverage): one row per
+      (schedule, route, wait threshold) with counts and shares of boardings
+      that have an alternative available, a timing gap, or a geographic gap,
+      and how many were covered only by an earlier departure.
+    - ``route_temporal_periods.csv`` and ``route_temporal_hourly.csv``: coverage
+      by period/hour; inactive combinations have zero counts and blank percentages.
+    - ``stop_temporal_periods.csv``: stop-level period evidence.
+    - ``temporal_events_*.csv.gz``: each boarding event with its soonest later
+      and nearest earlier departure on another nearby route, and its category
+      per threshold. Actual calendars and adjacent service days are respected,
+      so after-midnight trips and next-day departures count.
     - A run-log sidecar capturing the verbatim CONFIGURATION block.
 
 Typical usage:
@@ -79,7 +115,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, List, NamedTuple, Optional
 
 import geopandas as gpd
 import numpy as np
@@ -111,6 +147,33 @@ WALK_DISTANCE_UNIT: str = "miles"  # "miles" | "feet" | "meters"
 ENABLE_TIME_CHECK: bool = True
 WALK_SPEED_MPH: float = 3.0
 MAX_ALTERNATIVE_WAIT_MINUTES: float = 30.0
+
+# --- Temporal coverage -----------------------------------------------------
+# When True, also measure per-boarding temporal coverage on one exact service
+# date per schedule label (see the module docstring). Feeds that cannot
+# support it (no calendar dates, frequencies.txt trips) skip it with a warning.
+ENABLE_TEMPORAL_COVERAGE: bool = True
+# Analysis dates as {label: "YYYYMMDD"}, e.g. {"Weekday": "20261013",
+# "Saturday": "20261017"}. Empty = pick each schedule label's typical date from
+# the feed's calendar (federal holidays excluded; Holiday uses the first date a
+# holiday-only service runs).
+TEMPORAL_DATES: dict[str, str] = {}
+# Longest waits AFTER walking that still count as an available alternative.
+TEMPORAL_WAIT_THRESHOLDS_MINUTES: list[float] = [30.0, 60.0]
+# An earlier departure also counts when the rider would leave at most this many
+# minutes sooner to catch it (walk included). 0 = only later departures count.
+TEMPORAL_EARLIER_ALLOWANCE_MINUTES: float = 10.0
+# Hours are measured from the GTFS service day, so 25:00 stays in Late night.
+TEMPORAL_PERIODS: list[tuple[str, int, int]] = [
+    ("Early morning", 0, 6),
+    ("AM peak", 6, 9),
+    ("Midday", 9, 15),
+    ("PM peak", 15, 19),
+    ("Evening", 19, 22),
+    ("Late night", 22, 48),
+]
+# Also write one compressed per-boarding evidence file per analysis date.
+WRITE_TEMPORAL_EVENTS: bool = True
 
 # --- Paired routes ------------------------------------------------------------
 # Known direction-split pairs — one-way couplets, or a loop published as two
@@ -154,6 +217,10 @@ PROJECTED_CRS: str = "EPSG:5070"
 SUMMARY_FILENAME: str = r"route_redundancy_profile.csv"
 DETAIL_FILENAME: str = r"route_redundancy_partners.csv"
 WRITE_DETAIL: bool = True
+TEMPORAL_SUMMARY_FILENAME: str = r"route_temporal_summary.csv"
+TEMPORAL_PERIODS_FILENAME: str = r"route_temporal_periods.csv"
+TEMPORAL_HOURLY_FILENAME: str = r"route_temporal_hourly.csv"
+STOP_TEMPORAL_FILENAME: str = r"stop_temporal_periods.csv"
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
 
@@ -480,7 +547,7 @@ class PairStats:
         min_distance_m: Closest observed stop-to-stop walk distance in meters.
         timed_feasible: True when at least one scheduled visit of the route
             can catch a partner departure within the wait window.
-        min_wait_seconds: Shortest qualifying wait observed, or ``None``.
+        min_wait_seconds: Shortest qualifying wait after walking, or ``None``.
     """
 
     shared_stops: set[str] = field(default_factory=set)
@@ -506,7 +573,8 @@ def compute_pair_stats(
     stop is paired with every other route at the second stop. When
     *check_times* is on, each stop pair is also tested for a catchable
     connection: some scheduled arrival of the first route followed by a
-    departure of the second route after the walk and within the wait window.
+    departure of the second route that the rider reaches on foot and boards
+    within the wait window after walking.
 
     Args:
         stops_gdf: Projected stops with ``stop_id``, ``x``, ``y`` (meters).
@@ -518,7 +586,8 @@ def compute_pair_stats(
             *check_times* is True.
         check_times: Whether to evaluate the timed-alternative feasibility.
         walk_speed_mph: Assumed walking speed for stop-to-stop walk time.
-        max_wait_minutes: Longest wait a rider accepts for an alternative.
+        max_wait_minutes: Longest wait, after walking, a rider accepts for an
+            alternative.
 
     Returns:
         Mapping of ``(route_id, partner_route_id)`` → :class:`PairStats`.
@@ -560,11 +629,17 @@ def compute_pair_stats(
                     if arr is None or dep is None:
                         continue
                     walk_sec = distance / walk_mps if walk_mps > 0 else 0.0
-                    feasible, wait = has_timed_connection(arr, dep, walk_sec, max_wait_sec)
+                    feasible, wait = has_timed_connection(
+                        arr, dep, walk_sec, walk_sec + max_wait_sec
+                    )
                     if feasible and wait is not None:
                         stats.timed_feasible = True
-                        if stats.min_wait_seconds is None or wait < stats.min_wait_seconds:
-                            stats.min_wait_seconds = wait
+                        wait_after_walk = wait - walk_sec
+                        if (
+                            stats.min_wait_seconds is None
+                            or wait_after_walk < stats.min_wait_seconds
+                        ):
+                            stats.min_wait_seconds = wait_after_walk
     return pairs
 
 
@@ -1456,6 +1531,199 @@ def classify_service_ids(
     return result
 
 
+def service_ids_active_on(
+    active_dates: Mapping[str, set[dt.date]],
+    target_date: dt.date,
+) -> set[str]:
+    """Return the service_ids operating on *target_date*.
+
+    Args:
+        active_dates: Output of :func:`expand_service_active_dates`.
+        target_date: The calendar date to query.
+
+    Returns:
+        Set of service_id strings active on that date (possibly empty).
+    """
+    return {sid for sid, dates in active_dates.items() if target_date in dates}
+
+
+def representative_service_date(
+    active_dates: Mapping[str, set[dt.date]],
+    service_day: str,
+    override_date: Optional[dt.date] = None,
+    exclude_dates: Optional[set[dt.date]] = None,
+) -> tuple[dt.date, set[str]]:
+    """Pick a typical date for *service_day* and the service_ids active on it.
+
+    Rather than trusting any single date or unioning every service whose
+    columns mention a weekday (which double-counts agencies running distinct
+    Monday / midweek / Friday schedules), this scans every candidate date of
+    the requested day type, groups them by their exact set of active
+    service_ids, and returns the median date of the **modal** (most common)
+    set. A few miscoded dates therefore cannot steer the result, and per-day
+    math (headways, spans, trip counts) reflects one real operating day.
+
+    Warnings are logged when the choice is ambiguous: when the modal set
+    covers under half the candidate dates, and — for ``"weekday"`` — when
+    Monday-through-Friday do not all share one service pattern, so the user
+    knows a single representative day cannot speak for the whole week.
+
+    Args:
+        active_dates: Output of :func:`expand_service_active_dates`.
+        service_day: ``"weekday"`` or one of ``"monday"`` … ``"sunday"``.
+        override_date: Skip selection entirely and use this date (the
+            explicit user override). Logged, and a warning is emitted if no
+            service is active on it.
+        exclude_dates: Dates to skip as candidates — typically observed
+            holidays, so a holiday cannot masquerade as a typical day.
+
+    Returns:
+        Tuple of (chosen date, set of service_id strings active on it).
+
+    Raises:
+        ValueError: If *service_day* is not recognised, or no candidate
+            dates exist for it.
+    """
+    day_names = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+    key = service_day.strip().lower()
+    if key == "weekday":
+        allowed = {0, 1, 2, 3, 4}
+    elif key in day_names:
+        allowed = {day_names.index(key)}
+    else:
+        raise ValueError(
+            f"service_day must be 'weekday' or one of {', '.join(day_names)}; got {service_day!r}"
+        )
+
+    if override_date is not None:
+        ids = service_ids_active_on(active_dates, override_date)
+        if not ids:
+            logging.warning("No service is active on override date %s.", override_date)
+        else:
+            logging.info(
+                "Using override date %s (%s): %d service_id(s).",
+                override_date,
+                day_names[override_date.weekday()],
+                len(ids),
+            )
+        return override_date, ids
+
+    skip = exclude_dates or set()
+    candidates = sorted(
+        {d for dates in active_dates.values() for d in dates if d.weekday() in allowed} - skip
+    )
+    if not candidates:
+        raise ValueError(f"No active dates found for service_day={service_day!r}.")
+
+    by_set: dict[frozenset[str], list[dt.date]] = {}
+    for d in candidates:
+        by_set.setdefault(frozenset(service_ids_active_on(active_dates, d)), []).append(d)
+
+    modal_ids = max(by_set, key=lambda ids: (len(by_set[ids]), -min(by_set[ids]).toordinal()))
+    modal_dates = by_set[modal_ids]
+    chosen = modal_dates[len(modal_dates) // 2]
+    share = len(modal_dates) / len(candidates)
+
+    if key == "weekday":
+        per_day: dict[str, frozenset[str]] = {}
+        for dow in sorted({d.weekday() for d in candidates}):
+            day_candidates = [d for d in candidates if d.weekday() == dow]
+            day_sets: dict[frozenset[str], int] = {}
+            for d in day_candidates:
+                s = frozenset(service_ids_active_on(active_dates, d))
+                day_sets[s] = day_sets.get(s, 0) + 1
+            per_day[day_names[dow]] = max(day_sets, key=lambda s: day_sets[s])
+        if len(set(per_day.values())) > 1:
+            detail = "; ".join(
+                f"{day}={sorted(ids) if ids else '{}'}" for day, ids in per_day.items()
+            )
+            logging.warning(
+                "Weekday service varies by day of week (%s). Using %s (%s) as the "
+                "representative weekday; pass an explicit service date to analyse "
+                "a different day.",
+                detail,
+                chosen,
+                day_names[chosen.weekday()],
+            )
+    if share < 0.5:
+        logging.warning(
+            "The chosen service pattern covers only %.0f%% of candidate %s dates — "
+            "this feed's %s service is irregular; consider an explicit service date.",
+            share * 100,
+            service_day,
+            service_day,
+        )
+
+    logging.info(
+        "Representative %s: %s (%s) with %d service_id(s), matching %.0f%% of candidate dates.",
+        service_day,
+        chosen,
+        day_names[chosen.weekday()],
+        len(modal_ids),
+        share * 100,
+    )
+    return chosen, set(modal_ids)
+
+
+def federal_holidays_observed(year: int) -> set[dt.date]:
+    """Return the observed dates of the U.S. federal holidays of *year*.
+
+    Covers the eleven holidays of 5 U.S.C. 6103: New Year's Day, Birthday of
+    Martin Luther King Jr. (3rd Monday of January), Washington's Birthday
+    (3rd Monday of February), Memorial Day (last Monday of May), Juneteenth
+    (June 19, from its 2021 establishment onward), Independence Day, Labor
+    Day (1st Monday of September), Columbus Day (2nd Monday of October),
+    Veterans Day, Thanksgiving (4th Thursday of November), and Christmas.
+
+    Fixed-date holidays falling on a Saturday are observed on the preceding
+    Friday and those falling on a Sunday on the following Monday, so an
+    observed date can land in the *previous* calendar year (e.g. New Year's
+    Day 2022 was observed on 2021-12-31). Callers classifying a span of dates
+    should therefore union this set over ``range(first_year, last_year + 2)``.
+
+    Args:
+        year: Calendar year whose holidays are computed.
+
+    Returns:
+        The observed dates of *year*'s federal holidays.
+    """
+
+    def nth_weekday(month: int, weekday: int, n: int) -> dt.date:
+        first = dt.date(year, month, 1)
+        offset = (weekday - first.weekday()) % 7
+        return first + dt.timedelta(days=offset + 7 * (n - 1))
+
+    def last_monday(month: int) -> dt.date:
+        next_month = dt.date(year + (month == 12), month % 12 + 1, 1)
+        last = next_month - dt.timedelta(days=1)
+        return last - dt.timedelta(days=last.weekday())
+
+    def observed(day: dt.date) -> dt.date:
+        if day.weekday() == 5:  # Saturday -> preceding Friday
+            return day - dt.timedelta(days=1)
+        if day.weekday() == 6:  # Sunday -> following Monday
+            return day + dt.timedelta(days=1)
+        return day
+
+    fixed = [
+        dt.date(year, 1, 1),  # New Year's Day
+        dt.date(year, 7, 4),  # Independence Day
+        dt.date(year, 11, 11),  # Veterans Day
+        dt.date(year, 12, 25),  # Christmas Day
+    ]
+    if year >= 2021:
+        fixed.append(dt.date(year, 6, 19))  # Juneteenth
+    floating = [
+        nth_weekday(1, 0, 3),  # Birthday of Martin Luther King Jr.
+        nth_weekday(2, 0, 3),  # Washington's Birthday
+        last_monday(5),  # Memorial Day
+        nth_weekday(9, 0, 1),  # Labor Day
+        nth_weekday(10, 0, 2),  # Columbus Day
+        nth_weekday(11, 3, 4),  # Thanksgiving Day
+    ]
+    return {observed(day) for day in fixed} | set(floating)
+
+
 def notebook_safe_argv(argv: Optional[Sequence[str]]) -> Optional[List[str]]:
     """Return the argv to parse, shielding notebook kernels from stray flags.
 
@@ -1485,6 +1753,678 @@ def notebook_safe_argv(argv: Optional[Sequence[str]]) -> Optional[List[str]]:
 
 
 # =============================================================================
+# TEMPORAL COVERAGE
+# =============================================================================
+
+
+class TemporalResult(NamedTuple):
+    """Temporal-coverage tables, per-date boarding evidence, and run-log lines.
+
+    Attributes:
+        tables: Output filename → summary table.
+        events: Schedule label → per-boarding evidence for that date.
+        log_lines: Run-log lines describing dates and assumptions.
+    """
+
+    tables: dict[str, pd.DataFrame]
+    events: dict[str, pd.DataFrame]
+    log_lines: list[str]
+
+
+def parse_service_date(text: str) -> dt.date:
+    """Parse a ``YYYYMMDD`` (or ``YYYY-MM-DD``) service date.
+
+    Args:
+        text: The date text.
+
+    Returns:
+        The parsed date.
+
+    Raises:
+        ValueError: If *text* is not a valid date.
+    """
+    try:
+        return dt.datetime.strptime(str(text).strip().replace("-", ""), "%Y%m%d").date()
+    except ValueError as exc:
+        raise ValueError(f"Temporal dates must be YYYYMMDD; got {text!r}.") from exc
+
+
+def interpolate_untimed_departures(events: pd.DataFrame) -> pd.Series:
+    """Fill blank stop times by linear interpolation between timed stops.
+
+    GTFS allows blank times at non-timepoint stops. Each blank is placed
+    between the trip's previous and next timed stops in proportion to
+    ``shape_dist_traveled`` when the trip has it on every row, otherwise in
+    proportion to stop order. Blanks before a trip's first or after its last
+    timed stop stay blank.
+
+    Args:
+        events: Stop-time rows sorted by trip and stop order, with
+            ``trip_id``, ``departure_sec`` (NaN where untimed) and, optionally,
+            ``shape_dist_traveled``.
+
+    Returns:
+        ``departure_sec`` with interior blanks filled.
+    """
+    times = events["departure_sec"]
+    if not times.isna().any():
+        return times
+    trip = events["trip_id"]
+    position = events.groupby("trip_id").cumcount().astype(float)
+    if "shape_dist_traveled" in events.columns:
+        distance = pd.to_numeric(events["shape_dist_traveled"], errors="coerce")
+        complete = distance.notna().groupby(trip).transform("all")
+        position = position.where(~complete, distance)
+    timed_position = position.where(times.notna())
+    prev_time = times.groupby(trip).ffill()
+    next_time = times.groupby(trip).bfill()
+    prev_position = timed_position.groupby(trip).ffill()
+    next_position = timed_position.groupby(trip).bfill()
+    span = next_position - prev_position
+    share = ((position - prev_position) / span).where(span > 0, 0.0)
+    return times.fillna(prev_time + (next_time - prev_time) * share)
+
+
+def build_boarding_events(stop_times: pd.DataFrame, trips: pd.DataFrame) -> pd.DataFrame:
+    """Build timed, regular boarding events, excluding each trip's final stop.
+
+    Blank stop times are interpolated (:func:`interpolate_untimed_departures`);
+    boardings still untimed afterwards are dropped with a warning.
+
+    Args:
+        stop_times: Raw GTFS stop-time rows.
+        trips: Included trips with route and service identifiers.
+
+    Returns:
+        One row per regular boarding opportunity with service-day seconds.
+
+    Raises:
+        ValueError: If trip_ids repeat in trips.txt, or stop_sequence values
+            are invalid or repeat within a trip.
+    """
+    if trips["trip_id"].duplicated().any():
+        raise ValueError("Temporal coverage requires unique trip_id values.")
+    columns = ["trip_id", "route_id", "service_id"]
+    if "direction_id" in trips.columns:
+        columns.append("direction_id")
+    events = stop_times.merge(trips[columns], on="trip_id", validate="many_to_one")
+    events["sequence_numeric"] = pd.to_numeric(events["stop_sequence"], errors="coerce")
+    if events["sequence_numeric"].isna().any():
+        raise ValueError("Temporal coverage found invalid stop_sequence values.")
+    if events.duplicated(["trip_id", "sequence_numeric"]).any():
+        raise ValueError("Temporal coverage found duplicate trip/stop_sequence values.")
+    events = events.sort_values(["trip_id", "sequence_numeric"], ignore_index=True)
+    departure = events["departure_time"].map(parse_gtfs_time).astype(float)
+    arrival = events["arrival_time"].map(parse_gtfs_time).astype(float)
+    events["departure_sec"] = departure.fillna(arrival)
+    n_blank = int(events["departure_sec"].isna().sum())
+    if n_blank:
+        events["departure_sec"] = interpolate_untimed_departures(events)
+        logging.info(
+            "Temporal coverage interpolated %d untimed stop time(s).",
+            n_blank - int(events["departure_sec"].isna().sum()),
+        )
+    final_sequence = events.groupby("trip_id")["sequence_numeric"].transform("max")
+    pickup = events.get("pickup_type", pd.Series("", index=events.index)).fillna("").astype(str)
+    keep = pickup.isin(["", "0"]) & events["sequence_numeric"].lt(final_sequence)
+    logging.info("Temporal coverage excludes %d terminal/nonregular rows.", int((~keep).sum()))
+    events = events.loc[keep].copy()
+    invalid = events["departure_sec"].isna() | events["departure_sec"].lt(0)
+    if invalid.any():
+        logging.warning(
+            "Temporal coverage dropped %d boarding row(s) with no usable time "
+            "(blank before a trip's first or after its last timed stop).",
+            int(invalid.sum()),
+        )
+        events = events.loc[~invalid]
+    if "direction_id" not in events.columns:
+        events["direction_id"] = ""
+    return events[
+        [
+            "trip_id",
+            "route_id",
+            "service_id",
+            "direction_id",
+            "stop_id",
+            "stop_sequence",
+            "departure_time",
+            "departure_sec",
+        ]
+    ].reset_index(drop=True)
+
+
+def temporal_period(seconds: float) -> str:
+    """Return a configured period while preserving GTFS hours beyond 24.
+
+    Args:
+        seconds: Service-day seconds of a departure.
+
+    Returns:
+        The name of the ``TEMPORAL_PERIODS`` entry covering *seconds*.
+
+    Raises:
+        ValueError: If no configured period covers *seconds*.
+    """
+    for name, start, end in TEMPORAL_PERIODS:
+        if start * 3600 <= seconds < end * 3600:
+            return name
+    raise ValueError(f"No temporal period covers service-day time {seconds / 3600:g} hours.")
+
+
+def match_temporal_events(
+    primary: pd.DataFrame,
+    candidates: pd.DataFrame,
+    stops_gdf: gpd.GeoDataFrame,
+    radius_m: float,
+    walk_speed_mph: float,
+    declared_pairs: set[frozenset[str]],
+) -> pd.DataFrame:
+    """Find each boarding event's nearest later and earlier departures on other routes.
+
+    The passenger starts at the primary stop at its departure time and walks
+    straight-line to each stop within *radius_m*. The *later* side is the
+    soonest departure the passenger can still reach, measured as the wait
+    after walking. The *earlier* side is the last departure before that,
+    measured as how much sooner the passenger would have to leave to catch
+    it. Both sides search every candidate time; thresholds and allowances are
+    applied when summarizing. Direction and destination equivalence are not
+    inferred from GTFS direction_id.
+
+    Args:
+        primary: Boarding events on the selected GTFS service day.
+        candidates: Actual-date alternatives with shifted absolute seconds.
+        stops_gdf: Projected platform points with x/y columns.
+        radius_m: Maximum straight-line walk distance.
+        walk_speed_mph: Positive walking speed.
+        declared_pairs: Complementary routes excluded from alternatives.
+
+    Returns:
+        Primary events with geographic-neighbor and nearest-alternative evidence.
+
+    Raises:
+        ValueError: If *walk_speed_mph* is not positive.
+    """
+    if walk_speed_mph <= 0:
+        raise ValueError("Walking speed must be positive for temporal coverage.")
+    result = primary.reset_index(drop=True).copy()
+    n = len(result)
+    geographic_neighbor = np.zeros(n, dtype=bool)
+    later_wait = np.full(n, np.inf)
+    later_route = np.full(n, "", dtype=object)
+    later_stop = np.full(n, "", dtype=object)
+    later_departure = np.full(n, np.nan)
+    later_walk = np.full(n, np.nan)
+    earlier_shift = np.full(n, np.inf)
+    earlier_route = np.full(n, "", dtype=object)
+    earlier_stop = np.full(n, "", dtype=object)
+    earlier_departure = np.full(n, np.nan)
+    earlier_walk = np.full(n, np.nan)
+    points = stops_gdf.set_index("stop_id")
+    stop_ids = points.index.to_numpy()
+    coords = np.column_stack([points["x"].to_numpy(), points["y"].to_numpy()])
+    neighbors = cKDTree(coords).query_ball_point(coords, r=radius_m, p=2.0)
+    locations = {str(sid): i for i, sid in enumerate(stop_ids)}
+    arrays: dict[str, dict[str, np.ndarray]] = {}
+    for (sid, rid), group in candidates.groupby(["stop_id", "route_id"], sort=True):
+        arrays.setdefault(sid, {})[rid] = np.sort(group["absolute_sec"].to_numpy(float))
+    current_routes = primary.groupby("stop_id")["route_id"].agg(set).to_dict()
+    walk_mps = walk_speed_mph * 1609.344 / 3600
+    for (sid, rid), group in result.groupby(["stop_id", "route_id"], sort=True):
+        idx = group.index.to_numpy()
+        departures = group["departure_sec"].to_numpy(float)
+        i = locations[sid]
+        for j in sorted(neighbors[i]):
+            other_stop = str(stop_ids[j])
+            walk_sec = float(np.linalg.norm(coords[i] - coords[j])) / walk_mps
+            if any(
+                r != rid and frozenset((rid, r)) not in declared_pairs
+                for r in current_routes.get(other_stop, set())
+            ):
+                geographic_neighbor[idx] = True
+            for other_route, times in sorted(arrays.get(other_stop, {}).items()):
+                if other_route == rid or frozenset((rid, other_route)) in declared_pairs:
+                    continue
+                reach = departures + walk_sec
+                positions = np.searchsorted(times, reach, side="left")
+                has_next = positions < len(times)
+                next_times = np.full(len(idx), np.inf)
+                next_times[has_next] = times[positions[has_next]]
+                waits = (next_times - reach) / 60
+                better = waits < later_wait[idx]
+                later_wait[idx[better]] = waits[better]
+                later_route[idx[better]] = other_route
+                later_stop[idx[better]] = other_stop
+                later_departure[idx[better]] = next_times[better]
+                later_walk[idx[better]] = walk_sec / 60
+                has_prev = positions > 0
+                prev_times = np.full(len(idx), -np.inf)
+                prev_times[has_prev] = times[positions[has_prev] - 1]
+                shifts = (reach - prev_times) / 60
+                better = shifts < earlier_shift[idx]
+                earlier_shift[idx[better]] = shifts[better]
+                earlier_route[idx[better]] = other_route
+                earlier_stop[idx[better]] = other_stop
+                earlier_departure[idx[better]] = prev_times[better]
+                earlier_walk[idx[better]] = walk_sec / 60
+    result["geographic_neighbor"] = geographic_neighbor
+    result["min_wait_after_walk_min"] = np.where(np.isfinite(later_wait), later_wait, np.nan)
+    result["alternative_route_id"] = later_route
+    result["alternative_stop_id"] = later_stop
+    result["alternative_departure_sec"] = later_departure
+    result["walk_minutes"] = later_walk
+    result["min_earlier_shift_min"] = np.where(np.isfinite(earlier_shift), earlier_shift, np.nan)
+    result["earlier_alternative_route_id"] = earlier_route
+    result["earlier_alternative_stop_id"] = earlier_stop
+    result["earlier_alternative_departure_sec"] = earlier_departure
+    result["earlier_walk_minutes"] = earlier_walk
+    result["hour_start"] = (result["departure_sec"] // 3600).astype(int)
+    result["period"] = result["departure_sec"].map(temporal_period)
+    return result
+
+
+def temporal_availability(
+    events: pd.DataFrame, threshold: float, earlier_allowance: float
+) -> tuple[pd.Series, pd.Series]:
+    """Flag events whose nearest later or earlier alternative qualifies.
+
+    Args:
+        events: Output of :func:`match_temporal_events`.
+        threshold: Longest wait after walking, in minutes.
+        earlier_allowance: Longest earlier shift, in minutes.
+
+    Returns:
+        ``(later_ok, earlier_ok)`` boolean Series aligned with *events*.
+    """
+    later_ok = events["min_wait_after_walk_min"].le(threshold + 1e-9)
+    earlier_ok = events["min_earlier_shift_min"].le(earlier_allowance + 1e-9)
+    return later_ok, earlier_ok
+
+
+def summarize_temporal_events(
+    events: pd.DataFrame,
+    all_route_ids: Sequence[str],
+    schedule: str,
+    date: dt.date,
+    thresholds: Sequence[float],
+    earlier_allowance: float,
+    hour_count: int,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Summarize mutually exclusive event categories by route, period and hour.
+
+    An event has an *alternative available* when its later alternative is
+    within the threshold or its earlier alternative is within the allowance;
+    otherwise it is a *timing gap* when another route serves a nearby stop
+    that day and a *geographic gap* when none does. Inactive route-period
+    combinations have zero counts and blank percentages. A timely alternative
+    from an adjacent service day takes priority over the geographic category
+    when crossing a service-day boundary.
+
+    Args:
+        events: Output of :func:`match_temporal_events` for one date.
+        all_route_ids: Every included route, so inactive routes get zero rows.
+        schedule: Schedule label of the date.
+        date: The analysis date.
+        thresholds: Longest waits after walking, in minutes.
+        earlier_allowance: Longest earlier shift, in minutes.
+        hour_count: Number of service-day hour bins to report.
+
+    Returns:
+        ``(daily, periods, hourly, by_stop)`` summary tables.
+    """
+    daily_parts: list[pd.DataFrame] = []
+    period_parts: list[pd.DataFrame] = []
+    hour_parts: list[pd.DataFrame] = []
+    stop_parts: list[pd.DataFrame] = []
+    period_names = [period[0] for period in TEMPORAL_PERIODS]
+    for threshold in thresholds:
+        event = events.copy()
+        later_ok, earlier_ok = temporal_availability(event, threshold, earlier_allowance)
+        available = later_ok | earlier_ok
+        nearby = event["geographic_neighbor"].astype(bool)
+        event["geographic_gap_events"] = (~available & ~nearby).astype(int)
+        event["timing_gap_events"] = (~available & nearby).astype(int)
+        event["alternative_available_events"] = available.astype(int)
+        event["earlier_only_alternative_events"] = (earlier_ok & ~later_ok).astype(int)
+        event["no_alternative_events"] = (~available).astype(int)
+        event["boarding_events"] = 1
+        event["timing_gap_stop"] = event["stop_id"].where(event["timing_gap_events"].eq(1))
+        event["no_alternative_stop"] = event["stop_id"].where(event["no_alternative_events"].eq(1))
+        for keys, bins, parts in [
+            (["route_id"], None, daily_parts),
+            (["route_id", "period"], period_names, period_parts),
+            (["route_id", "hour_start"], list(range(hour_count)), hour_parts),
+            (["route_id", "stop_id", "period"], None, stop_parts),
+        ]:
+            grouped = event.groupby(keys, sort=True).agg(
+                boarding_events=("boarding_events", "sum"),
+                active_stops=("stop_id", "nunique"),
+                active_trips=("trip_id", "nunique"),
+                geographic_gap_events=("geographic_gap_events", "sum"),
+                timing_gap_events=("timing_gap_events", "sum"),
+                alternative_available_events=("alternative_available_events", "sum"),
+                earlier_only_alternative_events=("earlier_only_alternative_events", "sum"),
+                no_alternative_events=("no_alternative_events", "sum"),
+                stops_with_timing_gap=("timing_gap_stop", "nunique"),
+                stops_with_no_alternative=("no_alternative_stop", "nunique"),
+            )
+            if len(keys) == 1:
+                grouped = grouped.reindex(pd.Index(all_route_ids, name="route_id"), fill_value=0)
+            elif bins is not None:
+                index = pd.MultiIndex.from_product([all_route_ids, bins], names=keys)
+                grouped = grouped.reindex(index, fill_value=0)
+            grouped["active"] = grouped["boarding_events"].gt(0)
+            denominator = grouped["boarding_events"].replace(0, np.nan)
+            for name in [
+                "geographic_gap",
+                "timing_gap",
+                "alternative_available",
+                "earlier_only_alternative",
+                "no_alternative",
+            ]:
+                grouped[f"pct_{name}"] = 100 * grouped[f"{name}_events"] / denominator
+            grouped["schedule"] = schedule
+            grouped["analysis_date"] = date.isoformat()
+            grouped["max_wait_after_walk_min"] = threshold
+            grouped["earlier_allowance_min"] = earlier_allowance
+            parts.append(grouped.reset_index())
+    return (
+        pd.concat(daily_parts, ignore_index=True),
+        pd.concat(period_parts, ignore_index=True),
+        pd.concat(hour_parts, ignore_index=True),
+        pd.concat(stop_parts, ignore_index=True),
+    )
+
+
+def select_temporal_dates(
+    active_dates: Mapping[str, set[dt.date]],
+    schedules: Mapping[str, set[str]],
+    explicit_dates: Mapping[str, str],
+) -> dict[str, dt.date]:
+    """Choose one exact service date per schedule label.
+
+    Explicit dates are used as given. Otherwise Weekday, Saturday and Sunday
+    take the typical date from :func:`representative_service_date` with
+    federal holidays excluded, and Holiday takes the first date on which one
+    of its holiday-only services runs. Dates with no included service are
+    dropped with a warning.
+
+    Args:
+        active_dates: Active dates of the included service_ids.
+        schedules: Schedule label → service_ids, from
+            :func:`build_schedule_service_ids`.
+        explicit_dates: Label → ``YYYYMMDD`` date; empty picks automatically.
+
+    Returns:
+        Label → analysis date.
+
+    Raises:
+        ValueError: If an explicit date is not a valid date.
+    """
+    chosen: dict[str, dt.date] = {}
+    if explicit_dates:
+        for label, text in explicit_dates.items():
+            chosen[label] = parse_service_date(text)
+    else:
+        all_dates = {d for dates in active_dates.values() for d in dates}
+        holidays: set[dt.date] = set()
+        if all_dates:
+            for year in range(min(all_dates).year, max(all_dates).year + 2):
+                holidays |= federal_holidays_observed(year)
+        day_types = {"Weekday": "weekday", "Saturday": "saturday", "Sunday": "sunday"}
+        for label, ids in schedules.items():
+            if label in day_types:
+                try:
+                    chosen[label], _ = representative_service_date(
+                        active_dates, day_types[label], exclude_dates=holidays
+                    )
+                except ValueError as exc:
+                    logging.warning("Temporal coverage: no %s date picked (%s).", label, exc)
+            elif label == "Holiday":
+                dates = {d for sid in ids for d in active_dates.get(sid, set())}
+                if dates:
+                    chosen[label] = min(dates)
+    for label, date in list(chosen.items()):
+        if not service_ids_active_on(active_dates, date):
+            logging.warning(
+                "Temporal coverage: no included service runs on %s (%s) — label skipped.",
+                date,
+                label,
+            )
+            del chosen[label]
+    return chosen
+
+
+def compute_temporal_profiles(
+    stop_times: pd.DataFrame,
+    trips: pd.DataFrame,
+    active_dates: Mapping[str, set[dt.date]],
+    dates: Mapping[str, dt.date],
+    stops_gdf: gpd.GeoDataFrame,
+    route_lookup: pd.DataFrame,
+    declared_pairs: set[frozenset[str]],
+    thresholds: Sequence[float],
+    earlier_allowance: float,
+    radius_m: float,
+    walk_speed_mph: float,
+) -> TemporalResult:
+    """Compute exact-date temporal coverage without writing anything.
+
+    Args:
+        stop_times: Raw GTFS stop-time rows.
+        trips: Included trips.
+        active_dates: Active dates of the included service_ids.
+        dates: Schedule label → analysis date, from
+            :func:`select_temporal_dates`.
+        stops_gdf: Projected platform stops.
+        route_lookup: Output of :func:`build_route_lookup`.
+        declared_pairs: Declared direction-split pairs.
+        thresholds: Longest waits after walking, in minutes.
+        earlier_allowance: Longest earlier shift, in minutes.
+        radius_m: Walking distance in meters.
+        walk_speed_mph: Walking speed.
+
+    Returns:
+        The summary tables, per-date event evidence, and run-log lines.
+
+    Raises:
+        ValueError: If stop times are malformed or no selected date has
+            regular boardings.
+    """
+    boarding = build_boarding_events(stop_times, trips)
+    known = boarding["stop_id"].isin(set(stops_gdf["stop_id"]))
+    if not known.all():
+        logging.warning(
+            "Temporal coverage dropped %d boarding event(s) at stops with no usable "
+            "coordinates or filtered location types.",
+            int((~known).sum()),
+        )
+        boarding = boarding.loc[known]
+    if boarding.empty:
+        raise ValueError("No regular boarding events remain for temporal coverage.")
+    max_time = float(boarding["departure_sec"].max())
+    hours = int(max_time // 3600) + 1
+    max_walk = radius_m / (walk_speed_mph * 1609.344 / 3600)
+    before = int(np.ceil((max_time + earlier_allowance * 60) / 86400))
+    after = int(np.ceil((max_time + max(thresholds) * 60 + max_walk) / 86400))
+    all_routes = sorted(trips["route_id"].unique())
+    names = route_lookup[["route_short_name", "route_long_name"]].reset_index()
+    result = TemporalResult(tables={}, events={}, log_lines=[])
+    parts: tuple[list[pd.DataFrame], ...] = ([], [], [], [])
+    for schedule, date in dates.items():
+        primary_ids = service_ids_active_on(active_dates, date)
+        primary = boarding.loc[boarding["service_id"].isin(primary_ids)].copy()
+        if primary.empty:
+            logging.warning(
+                "Temporal coverage: no included regular boardings on %s (%s) — skipped.",
+                date,
+                schedule,
+            )
+            continue
+        pieces: list[pd.DataFrame] = []
+        for shift in range(-before, after + 1):
+            ids = service_ids_active_on(active_dates, date + dt.timedelta(days=shift))
+            piece = boarding.loc[boarding["service_id"].isin(ids)].copy()
+            piece["absolute_sec"] = piece["departure_sec"] + shift * 86400
+            pieces.append(piece)
+        candidates = pd.concat(pieces, ignore_index=True)
+        matched = match_temporal_events(
+            primary, candidates, stops_gdf, radius_m, walk_speed_mph, declared_pairs
+        )
+        tables = summarize_temporal_events(
+            matched, all_routes, schedule, date, thresholds, earlier_allowance, hours
+        )
+        for frame, bucket in zip(tables, parts):
+            frame["active_service_ids"] = ", ".join(sorted(primary_ids))
+            bucket.append(frame)
+        matched["schedule"] = schedule
+        matched["analysis_date"] = date.isoformat()
+        for threshold in thresholds:
+            suffix = f"{threshold:g}".replace(".", "_")
+            later_ok, earlier_ok = temporal_availability(matched, threshold, earlier_allowance)
+            matched[f"category_{suffix}_min"] = np.select(
+                [later_ok | earlier_ok, matched["geographic_neighbor"]],
+                ["Alternative available", "Timing gap"],
+                default="Geographic gap",
+            )
+        result.events[schedule] = matched
+        line = (
+            f"Temporal {schedule}: {date.isoformat()}, service_ids={sorted(primary_ids)}, "
+            f"{len(primary):,} boarding events, {primary.route_id.nunique()} routes"
+        )
+        logging.info(line)
+        result.log_lines.append(line)
+    if not result.events:
+        raise ValueError("No selected temporal date has included regular boardings.")
+    for filename, bucket in zip(
+        [
+            TEMPORAL_SUMMARY_FILENAME,
+            TEMPORAL_PERIODS_FILENAME,
+            TEMPORAL_HOURLY_FILENAME,
+            STOP_TEMPORAL_FILENAME,
+        ],
+        parts,
+    ):
+        table = pd.concat(bucket, ignore_index=True).merge(names, on="route_id", how="left")
+        result.tables[filename] = table
+    result.log_lines.extend(
+        [
+            f"Temporal wait thresholds after walking: {list(thresholds)} minutes",
+            f"Temporal earlier-departure allowance: {earlier_allowance:g} minutes",
+            f"Temporal periods, GTFS service-day hours: {TEMPORAL_PERIODS}",
+            "Temporal boardings exclude final stops and pickup_type 1/2/3; blank stop "
+            "times are interpolated.",
+            "Alternatives use actual active dates, including adjacent service days.",
+            "Direction, destination equivalence and pedestrian barriers are not modeled.",
+        ]
+    )
+    return result
+
+
+def write_temporal_outputs(result: TemporalResult, output_dir: Path, write_events: bool) -> None:
+    """Write the temporal tables and, optionally, per-date event evidence.
+
+    Args:
+        result: Output of :func:`compute_temporal_profiles`.
+        output_dir: Directory receiving the files.
+        write_events: Also write one ``temporal_events_<label>.csv.gz`` per date.
+    """
+    for filename, table in result.tables.items():
+        table.to_csv(output_dir / filename, index=False)
+        logging.info("Wrote %d temporal row(s) → %s", len(table), output_dir / filename)
+    if write_events:
+        for schedule, events in result.events.items():
+            safe_label = "".join(c if c.isalnum() else "_" for c in schedule)
+            path = output_dir / f"temporal_events_{safe_label}.csv.gz"
+            events.to_csv(path, index=False)
+            logging.info("Wrote %d boarding event(s) → %s", len(events), path)
+
+
+def try_temporal_coverage(
+    gtfs_path: str,
+    stop_times: pd.DataFrame,
+    trips: pd.DataFrame,
+    calendar: Optional[pd.DataFrame],
+    calendar_dates: Optional[pd.DataFrame],
+    schedules: Mapping[str, set[str]],
+    explicit_dates: Mapping[str, str],
+    stops_gdf: gpd.GeoDataFrame,
+    route_lookup: pd.DataFrame,
+    declared_pairs: set[frozenset[str]],
+    thresholds: Sequence[float],
+    earlier_allowance: float,
+    radius_m: float,
+    walk_speed_mph: float,
+) -> tuple[Optional[TemporalResult], str]:
+    """Run temporal coverage, or explain why this feed cannot support it.
+
+    Feeds with no usable calendar dates, trips defined in frequencies.txt, no
+    usable analysis date, or malformed stop times skip temporal coverage with
+    a warning; the rest of the profile is unaffected.
+
+    Args:
+        gtfs_path: GTFS feed folder or ``.zip`` archive.
+        stop_times: Raw GTFS stop-time rows.
+        trips: Included trips.
+        calendar: Parsed *calendar.txt*, or ``None``.
+        calendar_dates: Parsed *calendar_dates.txt*, or ``None``.
+        schedules: Schedule label → service_ids being profiled.
+        explicit_dates: Label → ``YYYYMMDD`` date; empty picks automatically.
+        stops_gdf: Projected platform stops.
+        route_lookup: Output of :func:`build_route_lookup`.
+        declared_pairs: Declared direction-split pairs.
+        thresholds: Longest waits after walking, in minutes.
+        earlier_allowance: Longest earlier shift, in minutes.
+        radius_m: Walking distance in meters.
+        walk_speed_mph: Walking speed.
+
+    Returns:
+        ``(result, status)``: the result (``None`` when skipped) and a
+        one-line status for the run log.
+    """
+    try:
+        frequencies = load_gtfs_data(gtfs_path, files=("frequencies.txt",))["frequencies"]
+    except (OSError, ValueError):
+        frequencies = pd.DataFrame()
+    try:
+        if not frequencies.empty:
+            raise ValueError(
+                "frequencies.txt defines trips by headway; expand them into scheduled "
+                "trips to analyze this feed"
+            )
+        trip_service_ids = set(trips["service_id"].astype(str))
+        active = {
+            sid: days
+            for sid, days in expand_service_active_dates(calendar, calendar_dates).items()
+            if sid in trip_service_ids
+        }
+        if not any(active.values()):
+            raise ValueError("the feed has no usable calendar dates")
+        dates = select_temporal_dates(active, schedules, explicit_dates)
+        if not dates:
+            raise ValueError("no analysis date has included service")
+        ordered = sorted(dates, key=lambda s: (_LABEL_ORDER.get(s, 9), s))
+        result = compute_temporal_profiles(
+            stop_times,
+            trips,
+            active,
+            {label: dates[label] for label in ordered},
+            stops_gdf,
+            route_lookup,
+            declared_pairs,
+            thresholds,
+            earlier_allowance,
+            radius_m,
+            walk_speed_mph,
+        )
+    except ValueError as exc:
+        reason = str(exc).rstrip(".")
+        logging.warning("Temporal coverage skipped: %s.", reason)
+        return None, f"skipped ({reason})"
+    used = [label for label in ordered if label in result.events]
+    return result, "on (" + ", ".join(f"{label} {dates[label]}" for label in used) + ")"
+
+
+# =============================================================================
 # ORCHESTRATION
 # =============================================================================
 
@@ -1505,6 +2445,11 @@ def run(
     write_detail: bool = WRITE_DETAIL,
     route_pairs: Sequence[Sequence[str]] = (),
     paired_min_overlap_pct: float = PAIRED_ROUTE_MIN_OVERLAP_PCT,
+    temporal_enabled: bool = ENABLE_TEMPORAL_COVERAGE,
+    temporal_dates: Optional[Mapping[str, str]] = None,
+    temporal_thresholds: Sequence[float] = tuple(TEMPORAL_WAIT_THRESHOLDS_MINUTES),
+    temporal_earlier_minutes: float = TEMPORAL_EARLIER_ALLOWANCE_MINUTES,
+    write_temporal_events: bool = WRITE_TEMPORAL_EVENTS,
 ) -> pd.DataFrame:
     """Compute the redundancy profile for every route and write all artifacts.
 
@@ -1515,8 +2460,10 @@ def run(
             service-area buffer radius).
         walk_distance_unit: Unit of *walk_distance*: miles, feet, or meters.
         check_times: Evaluate the timed-alternative check.
-        walk_speed_mph: Assumed walking speed for the time check.
-        max_wait_minutes: Longest acceptable wait for a timed alternative.
+        walk_speed_mph: Assumed walking speed for the time check and
+            temporal coverage.
+        max_wait_minutes: Longest acceptable wait, after walking, for a
+            timed alternative.
         service_labels: Schedule labels to profile; empty profiles all.
         routes_include: Routes to keep (route_id or route_short_name).
         routes_exclude: Routes to drop (route_id or route_short_name).
@@ -1528,17 +2475,23 @@ def run(
             each other's redundancy metrics.
         paired_min_overlap_pct: Mutual service-area overlap (percent) at or
             above which an undeclared pair is suggested.
-
-    Raises:
-        ValueError: Also raised when a route-pair entry does not contain
-            exactly two tokens.
+        temporal_enabled: Also compute exact-date temporal coverage. Feeds
+            that cannot support it skip it with a warning.
+        temporal_dates: Schedule label → ``YYYYMMDD`` analysis date. ``None``
+            uses ``TEMPORAL_DATES``; empty picks typical dates from the feed.
+        temporal_thresholds: Longest waits after walking, in minutes.
+        temporal_earlier_minutes: Longest earlier shift, in minutes, at which
+            an earlier departure still counts as an alternative.
+        write_temporal_events: Also write per-boarding temporal evidence.
 
     Returns:
         The summary DataFrame (also written to disk).
 
     Raises:
         OSError: The feed path or a required file is missing.
-        ValueError: The feed fails column validation or cannot be parsed.
+        ValueError: The feed fails column validation or cannot be parsed, a
+            route-pair entry does not contain exactly two tokens, or a
+            temporal setting is invalid.
         RuntimeError: The run log could not be written while
             ``REQUIRE_RUN_LOG`` is True.
     """
@@ -1546,6 +2499,21 @@ def run(
         gtfs_path, files=("stops.txt", "routes.txt", "trips.txt", "stop_times.txt")
     )
     validate_required_columns(data)
+    if not np.isfinite(walk_distance) or walk_distance < 0:
+        raise ValueError("Walking distance must be finite and nonnegative.")
+    explicit_dates = dict(TEMPORAL_DATES if temporal_dates is None else temporal_dates)
+    if temporal_enabled:
+        if not temporal_thresholds or any(
+            not np.isfinite(x) or x < 0 for x in [*temporal_thresholds, temporal_earlier_minutes]
+        ):
+            raise ValueError(
+                "Temporal wait thresholds and the earlier allowance must be finite and "
+                "nonnegative, with at least one threshold."
+            )
+        if not np.isfinite(walk_speed_mph) or walk_speed_mph <= 0:
+            raise ValueError("Walking speed must be finite and positive.")
+        for date_text in explicit_dates.values():
+            parse_service_date(date_text)
 
     calendar: Optional[pd.DataFrame] = None
     calendar_dates: Optional[pd.DataFrame] = None
@@ -1693,6 +2661,33 @@ def run(
             "; ".join(f"{a} + {b}" for a, b in sorted(suggestions)),
         )
 
+    temporal: Optional[TemporalResult] = None
+    temporal_status = "off"
+    if temporal_enabled:
+        if service_labels:
+            wanted_labels = {str(s).strip().lower() for s in service_labels}
+            explicit_dates = {
+                label: text
+                for label, text in explicit_dates.items()
+                if label.lower() in wanted_labels
+            }
+        temporal, temporal_status = try_temporal_coverage(
+            gtfs_path,
+            data["stop_times"],
+            trips,
+            calendar,
+            calendar_dates,
+            schedules,
+            explicit_dates,
+            stops_gdf,
+            route_lookup,
+            declared_pairs,
+            temporal_thresholds,
+            temporal_earlier_minutes,
+            radius_m,
+            walk_speed_mph,
+        )
+
     ensure_dir(output_dir)
     summary_path = output_dir / SUMMARY_FILENAME
     summary.to_csv(summary_path, index=False)
@@ -1701,18 +2696,31 @@ def run(
         detail_path = output_dir / DETAIL_FILENAME
         detail.to_csv(detail_path, index=False)
         logging.info("Wrote %d partner pair row(s) → %s", len(detail), detail_path)
+    if temporal is not None:
+        write_temporal_outputs(temporal, output_dir, write_temporal_events)
 
     summary_lines = [
         f"GTFS feed:            {gtfs_path}",
         f"Walking distance:     {walk_distance:g} {walk_distance_unit} ({radius_m:.0f} m)",
         f"Timed alternatives:   "
-        f"{f'on (max wait {max_wait_minutes:g} min)' if check_times else 'off'}",
+        f"{f'on (max wait {max_wait_minutes:g} min after walking)' if check_times else 'off'}",
         f"Declared route pairs: {len(declared_pairs)}",
         f"Pair suggestions:     >= {paired_min_overlap_pct:g}% mutual service-area overlap",
         f"Schedules profiled:   {', '.join(ordered_labels)}",
         f"Route profile rows:   {len(summary)}",
         f"Partner pair rows:    {len(detail)}",
     ]
+    summary_lines.append(f"Temporal coverage:    {temporal_status}")
+    if temporal is not None:
+        summary_lines.extend(temporal.log_lines)
+    summary_lines.extend(
+        [
+            f"Included route filter: {list(routes_include)}",
+            f"Excluded route filter: {list(routes_exclude)}",
+            f"Declared pair tokens: {list(route_pairs)}",
+            f"Walking speed: {walk_speed_mph:g} mph",
+        ]
+    )
     if not write_run_log(output_dir, summary_lines) and REQUIRE_RUN_LOG:
         raise RuntimeError(
             "Run log could not be written. Set REQUIRE_RUN_LOG = False to suppress this "
@@ -1763,7 +2771,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--max-wait-minutes",
         type=float,
         default=MAX_ALTERNATIVE_WAIT_MINUTES,
-        help="Longest wait accepted by the timed-alternative check.",
+        help="Longest wait after walking accepted by the timed-alternative check.",
     )
     parser.add_argument(
         "--route-pairs",
@@ -1806,6 +2814,45 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=FILTER_OUT_ROUTES,
         help="Routes to drop, matched on route_id or route_short_name.",
     )
+    parser.add_argument(
+        "--walk-speed-mph",
+        type=float,
+        default=WALK_SPEED_MPH,
+        help="Walking speed for the timed-alternative check and temporal coverage.",
+    )
+    parser.add_argument(
+        "--no-temporal-coverage",
+        action="store_true",
+        default=not ENABLE_TEMPORAL_COVERAGE,
+        help="Skip exact-date temporal coverage outputs.",
+    )
+    parser.add_argument(
+        "--temporal-dates",
+        nargs="*",
+        default=[f"{label}:{date}" for label, date in TEMPORAL_DATES.items()],
+        help="Analysis dates as LABEL:YYYYMMDD (e.g. Weekday:20261013); omit to pick "
+        "each schedule label's typical date from the feed.",
+    )
+    parser.add_argument(
+        "--temporal-waits",
+        nargs="+",
+        type=float,
+        default=TEMPORAL_WAIT_THRESHOLDS_MINUTES,
+        help="Temporal wait thresholds in minutes AFTER walking.",
+    )
+    parser.add_argument(
+        "--temporal-earlier-minutes",
+        type=float,
+        default=TEMPORAL_EARLIER_ALLOWANCE_MINUTES,
+        help="Longest earlier shift (minutes, walk included) at which an earlier "
+        "departure still counts as an alternative; 0 counts later departures only.",
+    )
+    parser.add_argument(
+        "--no-temporal-event-detail",
+        action="store_true",
+        default=not WRITE_TEMPORAL_EVENTS,
+        help="Omit compressed event-level evidence files.",
+    )
     return parser
 
 
@@ -1847,6 +2894,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 2
         route_pairs.append((parts[0], parts[1]))
 
+    temporal_dates: dict[str, str] = {}
+    for token in args.temporal_dates:
+        label, separator, date_text = (part.strip() for part in str(token).partition(":"))
+        if not separator or not label or label in temporal_dates:
+            logging.warning(
+                "--temporal-dates entries must be unique LABEL:YYYYMMDD; got %r.", token
+            )
+            return 2
+        try:
+            parse_service_date(date_text)
+        except ValueError as exc:
+            logging.warning("%s", exc)
+            return 2
+        temporal_dates[label] = date_text
+
     try:
         run(
             gtfs_path=args.gtfs,
@@ -1861,6 +2923,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             service_ids=FILTER_SERVICE_IDS,
             route_pairs=route_pairs,
             paired_min_overlap_pct=args.paired_overlap_pct,
+            walk_speed_mph=args.walk_speed_mph,
+            temporal_enabled=not args.no_temporal_coverage,
+            temporal_dates=temporal_dates,
+            temporal_thresholds=args.temporal_waits,
+            temporal_earlier_minutes=args.temporal_earlier_minutes,
+            write_temporal_events=not args.no_temporal_event_detail,
         )
     except (OSError, ValueError, RuntimeError) as exc:
         logging.error("%s", exc)

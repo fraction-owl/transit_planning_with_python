@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime as dt
 from pathlib import Path
 
 import geopandas as gpd
@@ -10,14 +11,17 @@ from shapely.geometry import Point
 
 import scripts.service_coverage.route_redundancy_profile_gpd as rrp
 from scripts.service_coverage.route_redundancy_profile_gpd import (
+    build_boarding_events,
     build_route_buffers,
     build_schedule_service_ids,
     compute_area_overlap_pcts,
     compute_pair_stats,
     compute_service_areas,
     filter_platform_stops,
+    match_temporal_events,
     resolve_route_pairs,
     run,
+    select_temporal_dates,
 )
 
 # ---------------------------------------------------------------------------
@@ -118,8 +122,11 @@ def test_compute_pair_stats_timed_check_is_directional() -> None:
         max_wait_minutes=30.0,
     )
     # A 08:00 -> B 08:05 is catchable; B 08:05 -> A 08:00 already left.
+    # The reported wait excludes the 100 m walk (~75 s at 3 mph).
     assert pairs[("A", "B")].timed_feasible
-    assert pairs[("A", "B")].min_wait_seconds == pytest.approx(300.0)
+    assert pairs[("A", "B")].min_wait_seconds == pytest.approx(
+        300.0 - 100.0 / (3.0 * 1609.34 / 3600.0)
+    )
     assert not pairs[("B", "A")].timed_feasible
     assert pairs[("B", "A")].min_wait_seconds is None
 
@@ -235,6 +242,108 @@ def test_filter_platform_stops_drops_stations() -> None:
 def test_filter_platform_stops_without_column_is_noop() -> None:
     stops = pd.DataFrame({"stop_id": ["S1"]})
     assert len(filter_platform_stops(stops)) == 1
+
+
+# ---------------------------------------------------------------------------
+# temporal coverage
+# ---------------------------------------------------------------------------
+
+
+def _stop_times(rows: list[tuple[str, str, int, str, str]]) -> pd.DataFrame:
+    columns = ["trip_id", "stop_id", "stop_sequence", "arrival_time", "departure_time"]
+    return pd.DataFrame(rows, columns=columns).astype(str)
+
+
+def _trips(rows: list[tuple[str, str, str]]) -> pd.DataFrame:
+    return pd.DataFrame(rows, columns=["trip_id", "route_id", "service_id"])
+
+
+def test_build_boarding_events_drops_final_stop_and_nonregular_pickup() -> None:
+    stop_times = _stop_times(
+        [
+            ("T1", "S1", 1, "08:00:00", "08:00:00"),
+            ("T1", "S2", 2, "08:05:00", "08:05:00"),
+            ("T1", "S3", 3, "08:10:00", "08:10:00"),
+        ]
+    )
+    stop_times["pickup_type"] = ["0", "1", "0"]
+    events = build_boarding_events(stop_times, _trips([("T1", "A", "wk")]))
+    # S2 has no regular pickup and S3 ends the trip, so only S1 is a boarding.
+    assert list(events["stop_id"]) == ["S1"]
+    assert events["departure_sec"].iloc[0] == pytest.approx(8 * 3600)
+
+
+def test_build_boarding_events_interpolates_untimed_stops() -> None:
+    stop_times = _stop_times(
+        [
+            ("T1", "S1", 1, "08:00:00", "08:00:00"),
+            ("T1", "S2", 2, "", ""),
+            ("T1", "S3", 3, "", ""),
+            ("T1", "S4", 4, "08:09:00", "08:09:00"),
+            ("T1", "S5", 5, "08:20:00", "08:20:00"),
+        ]
+    )
+    events = build_boarding_events(stop_times, _trips([("T1", "A", "wk")]))
+    offsets = events.set_index("stop_id")["departure_sec"] - 8 * 3600
+    # Evenly spaced by stop order between the 08:00 and 08:09 timed stops.
+    assert offsets["S2"] == pytest.approx(180.0)
+    assert offsets["S3"] == pytest.approx(360.0)
+
+    stop_times["shape_dist_traveled"] = ["0", "1", "2", "9", "12"]
+    events = build_boarding_events(stop_times, _trips([("T1", "A", "wk")]))
+    offsets = events.set_index("stop_id")["departure_sec"] - 8 * 3600
+    # With distances, S2 sits 1/9 and S3 2/9 of the way along the timed span.
+    assert offsets["S2"] == pytest.approx(60.0)
+    assert offsets["S3"] == pytest.approx(120.0)
+
+
+def _boardings(rows: list[tuple[str, str, float]]) -> pd.DataFrame:
+    frame = pd.DataFrame(rows, columns=["route_id", "stop_id", "departure_sec"])
+    frame["trip_id"] = [f"t{i}" for i in range(len(frame))]
+    frame["absolute_sec"] = frame["departure_sec"]
+    return frame
+
+
+def test_match_temporal_events_finds_later_and_earlier_alternatives() -> None:
+    # A boards at S1 at 08:00; B leaves S2 (100 m away) at 07:55 and 08:20.
+    events = _boardings([("A", "S1", 28800.0), ("B", "S2", 28500.0), ("B", "S2", 30000.0)])
+    matched = match_temporal_events(events, events, _stops_frame(), 400.0, 3.0, set())
+    a = matched.loc[matched["route_id"] == "A"].iloc[0]
+    walk_min = 100.0 / (3.0 * 1609.344 / 3600.0) / 60.0
+    assert bool(a["geographic_neighbor"])
+    assert a["alternative_route_id"] == "B"
+    assert a["min_wait_after_walk_min"] == pytest.approx(20.0 - walk_min)
+    assert a["earlier_alternative_route_id"] == "B"
+    assert a["min_earlier_shift_min"] == pytest.approx(5.0 + walk_min)
+
+
+def test_match_temporal_events_ignores_declared_pair_and_far_routes() -> None:
+    # B is A's declared other direction; C runs 2 km away.
+    events = _boardings([("A", "S1", 28800.0), ("B", "S2", 28900.0), ("C", "S3", 28900.0)])
+    matched = match_temporal_events(
+        events, events, _stops_frame(), 400.0, 3.0, {frozenset(("A", "B"))}
+    )
+    a = matched.loc[matched["route_id"] == "A"].iloc[0]
+    assert not bool(a["geographic_neighbor"])
+    assert np.isnan(a["min_wait_after_walk_min"])
+    assert np.isnan(a["min_earlier_shift_min"])
+
+
+def test_select_temporal_dates_picks_typical_non_holiday_dates() -> None:
+    active = rrp.expand_service_active_dates(_calendar(), None)
+    dates = select_temporal_dates(active, {"Weekday": {"wk"}, "Saturday": {"sat"}}, {})
+    assert dates["Weekday"].weekday() < 5
+    assert dates["Weekday"] not in rrp.federal_holidays_observed(2025)
+    assert dates["Saturday"].weekday() == 5
+
+
+def test_select_temporal_dates_drops_explicit_date_without_service() -> None:
+    active = rrp.expand_service_active_dates(_calendar(), None)
+    dates = select_temporal_dates(
+        active, {"Weekday": {"wk"}}, {"Weekday": "20250106", "Sunday": "20250105"}
+    )
+    # 2025-01-05 is a Sunday and the calendar has no Sunday service.
+    assert dates == {"Weekday": dt.date(2025, 1, 6)}
 
 
 # ---------------------------------------------------------------------------
@@ -365,7 +474,8 @@ def test_run_end_to_end(tmp_path: Path) -> None:
     assert int(a_to_b["n_shared_timepoints"]) == 1
     assert 100 < a_to_b["nearest_walk_distance_ft"] < 200
     assert str(a_to_b["timed_alternative"]) == "True"
-    assert a_to_b["min_alternative_wait_min"] == pytest.approx(5.0)
+    # B departs 5 min after A arrives; ~0.5 min of that is the walk.
+    assert a_to_b["min_alternative_wait_min"] == pytest.approx(4.5)
     assert a_to_b["area_overlap_pct"] > 90.0
     assert str(a_to_b["paired"]) == "False"
     assert str(a_to_b["suggested_pair"]) == "True"
@@ -413,6 +523,68 @@ def test_run_unknown_service_label_raises(tmp_path: Path) -> None:
         run(gtfs_path=str(feed), output_dir=tmp_path / "out", service_labels=["someday"])
 
 
+def test_run_temporal_coverage_outputs(tmp_path: Path) -> None:
+    feed = tmp_path / "gtfs"
+    out = tmp_path / "out"
+    _write_feed(feed)
+    run(gtfs_path=str(feed), output_dir=out)
+
+    daily = pd.read_csv(out / rrp.TEMPORAL_SUMMARY_FILENAME, dtype={"route_id": str})
+    wk = daily.loc[(daily["schedule"] == "Weekday") & (daily["max_wait_after_walk_min"] == 30)]
+    wk = wk.set_index("route_id")
+    # A's 08:00 boarding at S1 can catch B at 08:05 across the street.
+    assert int(wk.loc["A", "alternative_available_events"]) == 1
+    assert int(wk.loc["A", "earlier_only_alternative_events"]) == 0
+    # B's 08:05 boarding has no later alternative, but leaving ~5.5 min sooner
+    # catches A at 08:00, within the default 10-minute earlier allowance.
+    assert int(wk.loc["B", "alternative_available_events"]) == 1
+    assert int(wk.loc["B", "earlier_only_alternative_events"]) == 1
+    # Saturday: A runs alone, so its boarding is a geographic gap.
+    sat = daily.loc[(daily["schedule"] == "Saturday") & (daily["route_id"] == "A")].iloc[0]
+    assert int(sat["geographic_gap_events"]) == 1
+
+    for name in (
+        rrp.TEMPORAL_PERIODS_FILENAME,
+        rrp.TEMPORAL_HOURLY_FILENAME,
+        rrp.STOP_TEMPORAL_FILENAME,
+        "temporal_events_Weekday.csv.gz",
+        "temporal_events_Saturday.csv.gz",
+    ):
+        assert (out / name).exists()
+
+
+def test_run_temporal_without_earlier_allowance(tmp_path: Path) -> None:
+    feed = tmp_path / "gtfs"
+    out = tmp_path / "out"
+    _write_feed(feed)
+    run(gtfs_path=str(feed), output_dir=out, temporal_earlier_minutes=0.0)
+    daily = pd.read_csv(out / rrp.TEMPORAL_SUMMARY_FILENAME, dtype={"route_id": str})
+    b = daily.loc[(daily["schedule"] == "Weekday") & (daily["route_id"] == "B")].iloc[0]
+    # Later departures only: A stops nearby but has already left, a timing gap.
+    assert int(b["timing_gap_events"]) == 1
+    assert int(b["alternative_available_events"]) == 0
+
+
+def test_run_skips_temporal_for_frequency_feed(tmp_path: Path) -> None:
+    feed = tmp_path / "gtfs"
+    out = tmp_path / "out"
+    _write_feed(feed)
+    pd.DataFrame(
+        {
+            "trip_id": ["A_wk"],
+            "start_time": ["06:00:00"],
+            "end_time": ["09:00:00"],
+            "headway_secs": ["600"],
+        }
+    ).to_csv(feed / "frequencies.txt", index=False)
+    summary = run(gtfs_path=str(feed), output_dir=out)
+    # The rest of the profile still runs and is traced in the run log.
+    assert not summary.empty
+    assert not (out / rrp.TEMPORAL_SUMMARY_FILENAME).exists()
+    runlog = (out / f"{Path(rrp.SUMMARY_FILENAME).stem}_runlog.txt").read_text()
+    assert "Temporal coverage:    skipped" in runlog
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -423,6 +595,8 @@ def test_parse_args_defaults() -> None:
     assert args.walk_distance == pytest.approx(0.25)
     assert args.max_wait_minutes == pytest.approx(30.0)
     assert not args.no_time_check
+    assert args.temporal_dates == []
+    assert args.temporal_earlier_minutes == pytest.approx(10.0)
 
 
 def test_parse_args_rejects_unknown_tokens() -> None:
@@ -433,3 +607,10 @@ def test_parse_args_rejects_unknown_tokens() -> None:
 
 def test_main_placeholder_paths_return_2() -> None:
     assert rrp.main([]) == 2
+
+
+def test_main_rejects_bad_temporal_date(tmp_path: Path) -> None:
+    feed = tmp_path / "gtfs"
+    _write_feed(feed)
+    argv = ["--gtfs", str(feed), "--output-dir", str(tmp_path / "out")]
+    assert rrp.main([*argv, "--temporal-dates", "Weekday:20251340"]) == 2
