@@ -112,7 +112,8 @@ transit_planning_with_python/
 │   │   ├── ridership_from_tides.py
 │   │   ├── stop_ridership_change.py
 │   │   ├── stops_ridership_joiner_arcpy.py
-│   │   └── stops_ridership_joiner_gpd.py
+│   │   ├── stops_ridership_joiner_gpd.py
+│   │   └── trip_cut_savings.py
 │   ├── service_coverage/
 │   │   ├── cabi_coverage_by_route_gpd.py
 │   │   ├── gtfs_service_by_district_arcpy.py
@@ -319,6 +320,7 @@ transit_planning_with_python/
 │   ├── test_time_band_exporter.py
 │   ├── test_time_helpers.py
 │   ├── test_gtfs_timetable_exporter.py
+│   ├── test_trip_cut_savings.py
 │   ├── test_trip_runtime_diagnostics_from_avl.py
 │   ├── test_uscensus_table_build.py
 │   ├── test_uscensus_tiger_join_arcpy.py
