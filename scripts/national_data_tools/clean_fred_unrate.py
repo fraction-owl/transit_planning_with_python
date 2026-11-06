@@ -1,7 +1,7 @@
 """Clean a FRED CSV export into an analysis-ready frame.
 
 Standalone script: edit the config block and call ``run()`` (notebook) or run as
-``python clean_fred_series.py [--input ...] [--output ...] [--long-names]`` (CLI).
+``python clean_fred_unrate.py [--input ...] [--output ...] [--long-names]`` (CLI).
 Cleaning here is deliberately *faithful and non-opinionated*: it repairs
 structural and semantic defects only (blank padding rows, the FRED ``.`` missing
 marker, dtypes, date axis) and adds calendar columns. It does NOT resample, fill,
