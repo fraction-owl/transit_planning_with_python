@@ -178,6 +178,21 @@ Guidelines:
 - Optional sections, when they earn their keep: `Notes`, `Assumptions`, `Limitations`, `Method`,
   `Workflow` (numbered processing steps), `Requires` (software prerequisites, e.g. ArcGIS Pro),
   and `Helpful links` (where to download the input data).
+- `See Also` (optional) lists the other scripts in the same pipeline: those that produce this
+  script's inputs or use its outputs. Put one script per line, named by filename with the `.py`
+  extension. Unlike the sections above, write it in the Google colon form and spell it
+  `See Also`: Ruff treats it as a standard docstring section and requires that capitalization and
+  the colon, so the underlined form doesn't pass.
+
+  ```python
+  See Also:
+      - ``otp_monthly_panel.py``
+      - ``prep_features_private.py``
+  ```
+
+  `dev_tools/check_style.py` (`docstring_script_refs` check) flags any `.py` filename in a module
+  docstring, in this section or elsewhere, that matches no file in the repository, such as a name
+  left behind by a rename.
 - **Length:** most script docstrings land between 15 and 45 lines. Helper modules in `utils/`
   need only a couple of lines — their function docstrings carry the detail. If a module docstring
   grows past ~50 lines, keep what an analyst needs to *run and trust* the tool (inputs, outputs,

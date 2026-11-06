@@ -22,6 +22,9 @@ Checks performed (per-file):
     11. no_dataclasses    – No use of `dataclasses` (import or decorator).
     12. docstring_sections – Module docstring uses the canonical section names
         (`Inputs` / `Outputs` / `Typical usage`) from CONTRIBUTING.md.
+    13. docstring_script_refs – Every `name.py` the module docstring mentions
+        is a file that exists somewhere in the repository (catches names left
+        behind by a rename).
 
 Exit status:
     0 – all enabled checks passed for all files
@@ -35,6 +38,7 @@ from __future__ import annotations
 
 import ast
 import datetime as _dt
+import functools
 import logging
 import os
 import re
@@ -79,6 +83,7 @@ CHECKS_ENABLED: dict[str, bool] = {
     "success_message": True,
     "no_dataclasses": True,
     "docstring_sections": True,
+    "docstring_script_refs": True,
 }
 
 # === END CONFIG ===
@@ -142,7 +147,32 @@ _DOCSTRING_SECTION_VARIANTS: dict[str, str] = {
     "Typical use": "Typical usage",
     "Usage": "Typical usage",
     "RUNNING IT": "Typical usage",
+    "Related scripts": "See Also",
+    "Related": "See Also",
 }
+
+# Repository root (this file lives in dev_tools/). Script names mentioned in module
+# docstrings are resolved against every .py file found under it.
+_REPO_ROOT: Path = Path(__file__).resolve().parent.parent
+
+# Directories never searched when collecting the repository's .py filenames.
+_REPO_SCAN_SKIP_DIRS: frozenset[str] = frozenset(
+    {
+        ".git",
+        "__pycache__",
+        ".ruff_cache",
+        ".mypy_cache",
+        ".pytest_cache",
+        "node_modules",
+        ".venv",
+        "venv",
+    }
+)
+
+# A `name.py` token in docstring prose. The character before it must be the start of
+# the text, whitespace, a quote/backtick, an opening bracket, or a path slash, so
+# glob and template forms such as `*_arcpy.py` or `<stem>.py` are not read as names.
+_PY_FILENAME_PAT: re.Pattern[str] = re.compile(r"(?<![^\s`'\"(\[/])([A-Za-z_]\w*\.py)\b")
 
 
 def _docstring_has_section(doc: str, name: str) -> bool:
@@ -160,6 +190,16 @@ def _docstring_has_section(doc: str, name: str) -> bool:
         re.MULTILINE,
     )
     return bool(pat.search(doc))
+
+
+@functools.lru_cache(maxsize=1)
+def _repo_py_filenames() -> frozenset[str]:
+    """Return the bare filename of every .py file in the repository."""
+    names: set[str] = set()
+    for _dirpath, dirs, files in os.walk(_REPO_ROOT):
+        dirs[:] = [d for d in dirs if d not in _REPO_SCAN_SKIP_DIRS]
+        names.update(f for f in files if f.endswith(".py"))
+    return frozenset(names)
 
 
 def _read_source(path: Path) -> str | None:
@@ -690,6 +730,49 @@ def check_docstring_sections(src: str, path: Path) -> list[Violation]:
     return found
 
 
+def check_docstring_script_refs(
+    src: str, path: Path, known_names: frozenset[str] | None = None
+) -> list[Violation]:
+    """Flag `name.py` mentions in the module docstring that match no file in the repo.
+
+    Only the bare filename is compared, so a reference stays valid when it is
+    written with a path prefix (``scripts/modeling/prep_features_public.py``) or
+    without one. *known_names* defaults to every .py filename in the repository.
+    """
+    try:
+        tree = ast.parse(src, filename=str(path))
+    except SyntaxError:
+        return []
+
+    doc = ast.get_docstring(tree)
+    if doc is None:
+        return []
+
+    known = _repo_py_filenames() if known_names is None else known_names
+    missing = sorted({m for m in _PY_FILENAME_PAT.findall(doc) if m not in known})
+    if not missing:
+        return []
+
+    # Report the first source line of the docstring that mentions each missing name.
+    doc_node = tree.body[0]
+    doc_lines = src.splitlines()[doc_node.lineno - 1 : doc_node.end_lineno]
+    found: list[Violation] = []
+    for name in missing:
+        offset = next((i for i, line in enumerate(doc_lines) if name in line), None)
+        found.append(
+            Violation(
+                check="docstring_script_refs",
+                line=None if offset is None else doc_node.lineno + offset,
+                message=(
+                    f"Module docstring mentions `{name}`, but no file by that name "
+                    "exists in the repository — update the name if the script was "
+                    "renamed or removed"
+                ),
+            )
+        )
+    return found
+
+
 # =============================================================================
 # ORCHESTRATION
 # =============================================================================
@@ -731,6 +814,8 @@ def audit_file(path: Path) -> FileResult:
         violations.extend(check_no_dataclasses(src, path))
     if enabled.get("docstring_sections", True):
         violations.extend(check_docstring_sections(src, path))
+    if enabled.get("docstring_script_refs", True):
+        violations.extend(check_docstring_script_refs(src, path))
 
     return FileResult(path=path, violations=violations)
 
