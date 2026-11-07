@@ -1,344 +1,876 @@
 from __future__ import annotations
 
+import json
+import math
+import zipfile
+from collections.abc import Iterator
+from pathlib import Path
+from typing import Any
+
 import numpy as np
+import openpyxl
 import pandas as pd
 import pytest
 
+from scripts.stop_analysis import gtfs_stop_diff as gsd
 from scripts.stop_analysis.gtfs_stop_diff import (
-    _route_display_label,
-    _route_sort_key,
-    attach_route_context,
-    build_modified_description,
-    build_stop_routes_table,
-    coerce_float,
-    compare_stops,
-    haversine_meters,
-    meters_to_feet,
+    Feed,
+    addition_output_tables,
+    candidate_matches,
+    cli_pairing_options,
+    compare_shared,
+    comparison_inventory,
+    haversine_feet,
+    join_labels,
+    load_route_context,
+    load_stops,
+    main,
+    make_scope,
+    normalize_route_names,
+    normalize_route_pairs,
     normalize_text,
-    pick_attribute_columns,
-    try_build_nearest_matches,
-    validate_stop_ids_unique,
+    normalized_attribute,
+    parse_args,
+    prompt_route_pair,
+    read_gtfs_table,
+    read_pairing_file,
+    route_sort_key,
+    run_compare,
+    stop_id_code_changes,
+    write_outputs,
 )
 
 # ---------------------------------------------------------------------------
-# normalize_text
+# Synthetic feeds
 # ---------------------------------------------------------------------------
 
+# Current feed: route 101 serves B1-B3; route 200 serves only B4.
+BEFORE_STOPS = [
+    {"stop_id": "B1", "stop_code": "1001", "stop_name": "Main St & 1st St",
+     "stop_lat": "38.8000", "stop_lon": "-77.1000", "location_type": ""},
+    {"stop_id": "B2", "stop_code": "1002", "stop_name": "Main St & 2nd St",
+     "stop_lat": "38.8100", "stop_lon": "-77.1000", "location_type": ""},
+    {"stop_id": "B3", "stop_code": "1003", "stop_name": "Oak Ave",
+     "stop_lat": "38.8200", "stop_lon": "-77.1000", "location_type": ""},
+    {"stop_id": "B4", "stop_code": "1004", "stop_name": "Elm St",
+     "stop_lat": "38.8300", "stop_lon": "-77.1000", "location_type": ""},
+]  # fmt: skip
+BEFORE_ROUTES = [
+    {"route_id": "R101", "route_short_name": "101", "route_long_name": "Main"},
+    {"route_id": "R200", "route_short_name": "200", "route_long_name": "Elm"},
+]
+BEFORE_TRIPS = [
+    {"trip_id": "T1", "route_id": "R101"},
+    {"trip_id": "T2", "route_id": "R200"},
+]
+BEFORE_STOP_TIMES = [
+    {"trip_id": "T1", "stop_id": "B1", "stop_sequence": "1"},
+    {"trip_id": "T1", "stop_id": "B2", "stop_sequence": "2"},
+    {"trip_id": "T1", "stop_id": "B3", "stop_sequence": "3"},
+    {"trip_id": "T2", "stop_id": "B4", "stop_sequence": "1"},
+]
 
-def test_normalize_text_strips_whitespace() -> None:
-    s = pd.Series(["  Main St  ", "  Oak Ave"])
-    result = normalize_text(s)
-    assert result.tolist() == ["Main St", "Oak Ave"]
-
-
-def test_normalize_text_fills_nan_with_empty_string() -> None:
-    s = pd.Series([None, "Stop A", float("nan")])
-    result = normalize_text(s)
-    assert result[0] == ""
-    assert result[2] == ""
-
-
-def test_normalize_text_converts_non_string_types() -> None:
-    s = pd.Series([123, 456])
-    result = normalize_text(s)
-    assert result.tolist() == ["123", "456"]
-
-
-# ---------------------------------------------------------------------------
-# coerce_float
-# ---------------------------------------------------------------------------
-
-
-def test_coerce_float_converts_numeric_strings() -> None:
-    s = pd.Series(["38.7", "39.0"])
-    result = coerce_float(s)
-    assert result[0] == pytest.approx(38.7)
-    assert result[1] == pytest.approx(39.0)
-
-
-def test_coerce_float_non_numeric_becomes_nan() -> None:
-    s = pd.Series(["bad", "N/A"])
-    result = coerce_float(s)
-    assert np.isnan(result[0])
-    assert np.isnan(result[1])
-
-
-def test_coerce_float_returns_float_dtype() -> None:
-    s = pd.Series(["1.0", "2.0"])
-    result = coerce_float(s)
-    assert result.dtype == float
-
-
-# ---------------------------------------------------------------------------
-# validate_stop_ids_unique
-# ---------------------------------------------------------------------------
+# Concept feed: route "101" under a generated route_id and new stop_ids.
+# 1001 unchanged (location_type "" vs "0" is equivalent), 1002 renamed,
+# 1003 dropped from the route, 1004 newly used, 2005 a brand-new code
+# placed ~36 ft from B3.
+AFTER_STOPS = [
+    {"stop_id": "A1", "stop_code": "1001", "stop_name": "Main St & 1st St",
+     "stop_lat": "38.8000", "stop_lon": "-77.1000", "location_type": "0"},
+    {"stop_id": "A2", "stop_code": "1002", "stop_name": "Main St & Second St",
+     "stop_lat": "38.8100", "stop_lon": "-77.1000", "location_type": "0"},
+    {"stop_id": "A4", "stop_code": "1004", "stop_name": "Elm St",
+     "stop_lat": "38.8300", "stop_lon": "-77.1000", "location_type": "0"},
+    {"stop_id": "A5", "stop_code": "2005", "stop_name": "Oak Ave (new)",
+     "stop_lat": "38.8201", "stop_lon": "-77.1000", "location_type": "0"},
+]  # fmt: skip
+AFTER_ROUTES = [{"route_id": "X1", "route_short_name": "101", "route_long_name": ""}]
+AFTER_TRIPS = [{"trip_id": "AT1", "route_id": "X1"}]
+AFTER_STOP_TIMES = [
+    {"trip_id": "AT1", "stop_id": stop_id, "stop_sequence": str(seq)}
+    for seq, stop_id in enumerate(["A1", "A2", "A4", "A5"], start=1)
+]
 
 
-def test_validate_stop_ids_unique_keeps_first_occurrence() -> None:
-    df = pd.DataFrame({"stop_id": ["S1", "S1", "S2"], "stop_name": ["Alpha", "Beta", "Gamma"]})
-    result = validate_stop_ids_unique(df, "test")
-    assert len(result) == 2
-    assert result.loc[result.stop_id == "S1", "stop_name"].iloc[0] == "Alpha"
+def write_feed(
+    root: Path,
+    stops: list[dict[str, str]],
+    routes: list[dict[str, str]] | None = None,
+    trips: list[dict[str, str]] | None = None,
+    stop_times: list[dict[str, str]] | None = None,
+) -> Path:
+    """Write a minimal GTFS folder of string columns."""
+    root.mkdir(parents=True, exist_ok=True)
+    tables = {"stops": stops, "routes": routes, "trips": trips, "stop_times": stop_times}
+    for name, rows in tables.items():
+        if rows is not None:
+            pd.DataFrame(rows).to_csv(root / f"{name}.txt", index=False)
+    return root
 
 
-def test_validate_stop_ids_unique_no_duplicates_unchanged() -> None:
-    df = pd.DataFrame({"stop_id": ["S1", "S2"], "stop_name": ["A", "B"]})
-    result = validate_stop_ids_unique(df, "test")
-    assert len(result) == 2
-
-
-def test_validate_stop_ids_unique_raises_when_column_missing() -> None:
-    df = pd.DataFrame({"name": ["A", "B"]})
-    with pytest.raises(ValueError, match="stop_id"):
-        validate_stop_ids_unique(df, "test")
-
-
-# ---------------------------------------------------------------------------
-# haversine_meters
-# ---------------------------------------------------------------------------
-
-
-def test_haversine_meters_same_point_is_zero() -> None:
-    dist = haversine_meters(
-        np.array([38.7]), np.array([-77.0]), np.array([38.7]), np.array([-77.0])
+@pytest.fixture
+def before_feed(tmp_path: Path) -> Path:
+    return write_feed(
+        tmp_path / "before", BEFORE_STOPS, BEFORE_ROUTES, BEFORE_TRIPS, BEFORE_STOP_TIMES
     )
-    assert dist[0] == pytest.approx(0.0, abs=1e-6)
 
 
-def test_haversine_meters_one_degree_latitude() -> None:
-    # 1 degree of latitude ≈ 111,195 m at the equator
-    dist = haversine_meters(np.array([0.0]), np.array([0.0]), np.array([1.0]), np.array([0.0]))
-    assert dist[0] == pytest.approx(111_195.0, rel=0.01)
+@pytest.fixture
+def after_feed(tmp_path: Path) -> Path:
+    return write_feed(tmp_path / "after", AFTER_STOPS, AFTER_ROUTES, AFTER_TRIPS, AFTER_STOP_TIMES)
 
 
-def test_haversine_meters_returns_array() -> None:
-    dist = haversine_meters(
-        np.array([0.0, 1.0]),
-        np.array([0.0, 0.0]),
-        np.array([1.0, 2.0]),
-        np.array([0.0, 0.0]),
+@pytest.fixture(autouse=True)
+def _reset_logger() -> Iterator[None]:
+    """run_compare attaches file handlers; close them so tmp dirs can be removed."""
+    yield
+    for handler in list(gsd.LOGGER.handlers):
+        gsd.LOGGER.removeHandler(handler)
+        handler.close()
+
+
+def stops_frame(rows: list[dict[str, Any]]) -> pd.DataFrame:
+    """Build a loaded-stops-like frame with numeric coordinates and status."""
+    frame = pd.DataFrame(rows)
+    if "coordinate_status" not in frame:
+        frame["coordinate_status"] = "valid"
+    frame["coordinate_status"] = frame["coordinate_status"].fillna("valid")
+    return frame
+
+
+def make_feed(stop_ids: list[str], routes: dict[str, str], pairs: list[tuple[str, str]]) -> Feed:
+    """Build a Feed directly: routes maps route_id -> label; pairs are (stop_id, route_id)."""
+    route_frame = pd.DataFrame({"route_id": list(routes), "route_label": list(routes.values())})
+    pair_frame = pd.DataFrame(pairs, columns=["stop_id", "route_id"]).merge(
+        route_frame, on="route_id"
     )
-    assert len(dist) == 2
-    assert all(d > 0 for d in dist)
+    return Feed(pd.DataFrame({"stop_id": stop_ids}), route_frame, pair_frame, Path("."))
 
 
 # ---------------------------------------------------------------------------
-# meters_to_feet
+# Text and sorting helpers
 # ---------------------------------------------------------------------------
 
 
-def test_meters_to_feet_one_meter() -> None:
-    result = meters_to_feet(np.array([1.0]))
-    assert result[0] == pytest.approx(3.28084, rel=0.001)
+def test_normalize_text_preserves_literal_ids_and_strips() -> None:
+    result = normalize_text(pd.Series(["  0042 ", "NA", None]))
+    assert result.tolist() == ["0042", "NA", ""]
 
 
-def test_meters_to_feet_zero() -> None:
-    result = meters_to_feet(np.array([0.0]))
-    assert result[0] == pytest.approx(0.0)
+def test_normalized_attribute_fills_gtfs_defaults_only() -> None:
+    frame = pd.DataFrame({"location_type": ["", "1"], "stop_name": ["", "Main"]})
+    assert normalized_attribute(frame, "location_type").tolist() == ["0", "1"]
+    assert normalized_attribute(frame, "stop_name").tolist() == ["", "Main"]
 
 
-# ---------------------------------------------------------------------------
-# pick_attribute_columns
-# ---------------------------------------------------------------------------
+def test_normalized_attribute_absent_column_uses_default() -> None:
+    frame = pd.DataFrame({"stop_id": ["S1"]})
+    assert normalized_attribute(frame, "wheelchair_boarding").tolist() == ["0"]
 
 
-def test_pick_attribute_columns_returns_shared_columns() -> None:
-    before = pd.DataFrame(columns=["stop_id", "stop_name", "stop_code", "zone_id"])
-    after = pd.DataFrame(columns=["stop_id", "stop_name", "zone_id", "location_type"])
-    cols = pick_attribute_columns(before, after)
-    assert "stop_name" in cols
-    assert "zone_id" in cols
+def test_route_sort_key_and_join_labels_numeric_first() -> None:
+    assert sorted(["10", "2", "B", "a"], key=route_sort_key) == ["2", "10", "a", "B"]
+    assert join_labels(["10", "2", "2", "Express"]) == "2; 10; Express"
 
 
-def test_pick_attribute_columns_excludes_before_only_columns() -> None:
-    before = pd.DataFrame(columns=["stop_id", "stop_name", "stop_code"])
-    after = pd.DataFrame(columns=["stop_id", "stop_name"])
-    cols = pick_attribute_columns(before, after)
-    assert "stop_code" not in cols
+def test_haversine_feet_one_degree_latitude() -> None:
+    expected = 6_371_000.0 * 3.280839895013123 * math.pi / 180
+    result = haversine_feet(np.array([0.0]), np.array([0.0]), np.array([1.0]), np.array([0.0]))
+    assert result[0] == pytest.approx(expected, rel=1e-9)
 
 
-def test_pick_attribute_columns_excludes_after_only_columns() -> None:
-    before = pd.DataFrame(columns=["stop_id", "stop_name"])
-    after = pd.DataFrame(columns=["stop_id", "stop_name", "location_type"])
-    cols = pick_attribute_columns(before, after)
-    assert "location_type" not in cols
+def test_haversine_feet_identical_points_is_zero() -> None:
+    point = np.array([38.8])
+    assert haversine_feet(point, point, point, point)[0] == pytest.approx(0.0)
 
 
 # ---------------------------------------------------------------------------
-# build_modified_description
+# Reading GTFS (folders and ZIPs)
 # ---------------------------------------------------------------------------
 
 
-def test_build_modified_description_relocated_with_distance() -> None:
-    desc = build_modified_description(relocated=True, changed_fields=[], distance_ft=150.5)
-    assert "150.5" in desc
-    assert "Relocated" in desc
+def test_read_gtfs_table_folder_keeps_strings(tmp_path: Path) -> None:
+    write_feed(tmp_path, [{"stop_id": "007", "stop_name": "NA"}])
+    frame = read_gtfs_table(tmp_path, "stops.txt")
+    assert frame.loc[0, "stop_id"] == "007"
+    assert frame.loc[0, "stop_name"] == "NA"
 
 
-def test_build_modified_description_attr_change_only() -> None:
-    desc = build_modified_description(
-        relocated=False, changed_fields=["stop_name"], distance_ft=None
+def test_read_gtfs_table_nested_zip_ignores_macosx(tmp_path: Path) -> None:
+    archive = tmp_path / "feed.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("wrapper/stops.txt", "stop_id,stop_lat,stop_lon\nS1,38.8,-77.1\n")
+        zf.writestr("__MACOSX/wrapper/stops.txt", "junk")
+    frame = read_gtfs_table(archive, "stops.txt")
+    assert frame["stop_id"].tolist() == ["S1"]
+
+
+def test_read_gtfs_table_ambiguous_zip_raises(tmp_path: Path) -> None:
+    archive = tmp_path / "feed.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("a/stops.txt", "stop_id\nS1\n")
+        zf.writestr("b/stops.txt", "stop_id\nS2\n")
+    with pytest.raises(ValueError, match="ambiguous"):
+        read_gtfs_table(archive, "stops.txt")
+
+
+def test_read_gtfs_table_missing_member_raises(tmp_path: Path) -> None:
+    archive = tmp_path / "feed.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("routes.txt", "route_id\nR1\n")
+    with pytest.raises(FileNotFoundError, match="missing stops.txt"):
+        read_gtfs_table(archive, "stops.txt")
+
+
+def test_read_gtfs_table_rejects_non_gtfs_file(tmp_path: Path) -> None:
+    source = tmp_path / "stops.csv"
+    source.write_text("stop_id\nS1\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="folder or ZIP"):
+        read_gtfs_table(source, "stops.txt")
+
+
+def test_read_gtfs_table_usecols_requires_columns(tmp_path: Path) -> None:
+    write_feed(tmp_path, [{"stop_id": "S1"}], stop_times=[{"trip_id": "T1", "x": "1"}])
+    with pytest.raises(ValueError, match="missing columns"):
+        read_gtfs_table(tmp_path, "stop_times.txt", ["trip_id", "stop_id"])
+
+
+# ---------------------------------------------------------------------------
+# load_stops / load_route_context
+# ---------------------------------------------------------------------------
+
+
+def test_load_stops_classifies_coordinate_status(tmp_path: Path) -> None:
+    rows = [
+        {"stop_id": "OK", "stop_lat": "38.8", "stop_lon": "-77.1", "location_type": ""},
+        {"stop_id": "NODE", "stop_lat": "", "stop_lon": "", "location_type": "3"},
+        {"stop_id": "PART", "stop_lat": "", "stop_lon": "-77.1", "location_type": ""},
+        {"stop_id": "BAD", "stop_lat": "95", "stop_lon": "-77.1", "location_type": ""},
+    ]
+    stops = load_stops(write_feed(tmp_path, rows), "test").set_index("stop_id")
+    assert stops.loc["OK", "coordinate_status"] == "valid"
+    assert stops.loc["NODE", "coordinate_status"] == "not_provided_optional"
+    assert stops.loc["PART", "coordinate_status"] == "missing_required_or_partial"
+    assert stops.loc["BAD", "coordinate_status"] == "invalid_or_out_of_range"
+    assert stops.loc["BAD", "raw_stop_lat"] == "95"
+
+
+def test_load_stops_rejects_duplicate_stop_ids(tmp_path: Path) -> None:
+    rows = [{"stop_id": "S1", "stop_lat": "38.8", "stop_lon": "-77.1"}] * 2
+    with pytest.raises(ValueError, match="duplicate stop_id"):
+        load_stops(write_feed(tmp_path, rows), "test")
+
+
+def test_load_stops_rejects_blank_stop_ids(tmp_path: Path) -> None:
+    rows = [{"stop_id": "", "stop_lat": "38.8", "stop_lon": "-77.1"}]
+    with pytest.raises(ValueError, match="blank IDs"):
+        load_stops(write_feed(tmp_path, rows), "test")
+
+
+def test_load_route_context_pairs_and_label_fallback(tmp_path: Path) -> None:
+    routes = [
+        {"route_id": "R1", "route_short_name": "", "route_long_name": "Crosstown"},
+        {"route_id": "R2", "route_short_name": "", "route_long_name": ""},
+    ]
+    trips = [{"trip_id": "T1", "route_id": "R1"}, {"trip_id": "T2", "route_id": "R2"}]
+    stop_times = [
+        {"trip_id": "T1", "stop_id": "B1"},
+        {"trip_id": "T1", "stop_id": "B1"},
+        {"trip_id": "T2", "stop_id": "B2"},
+    ]
+    feed = write_feed(tmp_path, BEFORE_STOPS, routes, trips, stop_times)
+    routes_out, pairs = load_route_context(feed, load_stops(feed, "test"))
+    assert routes_out["route_label"].tolist() == ["Crosstown", "R2"]
+    assert sorted(map(tuple, pairs[["stop_id", "route_label"]].to_numpy())) == [
+        ("B1", "Crosstown"),
+        ("B2", "R2"),
+    ]
+
+
+def test_load_route_context_rejects_unknown_stop(tmp_path: Path) -> None:
+    stop_times = [{"trip_id": "T1", "stop_id": "GHOST"}]
+    feed = write_feed(tmp_path, BEFORE_STOPS, BEFORE_ROUTES, BEFORE_TRIPS, stop_times)
+    with pytest.raises(ValueError, match="unknown stop_id"):
+        load_route_context(feed, load_stops(feed, "test"))
+
+
+# ---------------------------------------------------------------------------
+# comparison_inventory / stop_id_code_changes
+# ---------------------------------------------------------------------------
+
+
+def test_comparison_inventory_sets_comparison_key() -> None:
+    out = comparison_inventory(
+        pd.DataFrame({"stop_id": ["S1"], "stop_code": [" 0042 "]}), "stop_code", "test"
     )
-    assert "stop_name" in desc
-    assert "Relocated" not in desc
+    assert out.loc[0, "comparison_key"] == "0042"
+    assert out.loc[0, "primary_stop_key"] == "stop_code"
 
 
-def test_build_modified_description_both_changes() -> None:
-    desc = build_modified_description(
-        relocated=True, changed_fields=["stop_name"], distance_ft=50.0
-    )
-    assert "Relocated" in desc
-    assert "stop_name" in desc
+def test_comparison_inventory_blank_key_raises_without_fallback() -> None:
+    frame = pd.DataFrame({"stop_id": ["S1", "S2"], "stop_code": ["1", ""]})
+    with pytest.raises(ValueError, match="blank for 1 records"):
+        comparison_inventory(frame, "stop_code", "test")
 
 
-def test_build_modified_description_no_changes_returns_empty() -> None:
-    desc = build_modified_description(relocated=False, changed_fields=[], distance_ft=None)
-    assert desc == ""
+def test_comparison_inventory_duplicate_key_raises() -> None:
+    frame = pd.DataFrame({"stop_id": ["S1", "S2"], "stop_code": ["1", "1"]})
+    with pytest.raises(ValueError, match="must be unique"):
+        comparison_inventory(frame, "stop_code", "test")
+
+
+def test_comparison_inventory_rejects_unknown_key() -> None:
+    with pytest.raises(ValueError, match="primary stop key"):
+        comparison_inventory(pd.DataFrame({"stop_name": ["x"]}), "stop_name", "test")
+
+
+def test_stop_id_code_changes_flags_reused_ids() -> None:
+    before = pd.DataFrame({"stop_id": ["S1", "S2"], "stop_code": ["1", "2"]})
+    after = pd.DataFrame({"stop_id": ["S1", "S2"], "stop_code": ["9", "2"]})
+    out = stop_id_code_changes(before, after)
+    assert out["stop_id"].tolist() == ["S1"]
+    assert (out.loc[0, "stop_code_before"], out.loc[0, "stop_code_after"]) == ("1", "9")
+
+
+def test_stop_id_code_changes_without_codes_is_empty() -> None:
+    out = stop_id_code_changes(pd.DataFrame({"stop_id": ["S1"]}), pd.DataFrame({"stop_id": ["S1"]}))
+    assert out.empty
+    assert "review_note" in out.columns
 
 
 # ---------------------------------------------------------------------------
-# compare_stops
+# compare_shared
 # ---------------------------------------------------------------------------
 
 
-def _make_stop_df(**kwargs: list) -> pd.DataFrame:
+def shared_pair() -> tuple[pd.DataFrame, pd.DataFrame]:
+    before = stops_frame(
+        [
+            {"stop_id": "B1", "stop_code": "1", "stop_name": "A", "stop_lat": 38.8,
+             "stop_lon": -77.1, "location_type": ""},
+            {"stop_id": "B2", "stop_code": "2", "stop_name": "B", "stop_lat": 38.8,
+             "stop_lon": -77.1, "location_type": ""},
+            {"stop_id": "B3", "stop_code": "3", "stop_name": "C", "stop_lat": 38.8,
+             "stop_lon": -77.1, "location_type": ""},
+            {"stop_id": "B4", "stop_code": "4", "stop_name": "D", "stop_lat": 38.8,
+             "stop_lon": -77.1, "location_type": ""},
+        ]
+    )  # fmt: skip
+    after = stops_frame(
+        [
+            # unchanged (equivalent location_type default, new stop_id)
+            {"stop_id": "A1", "stop_code": "1", "stop_name": "A", "stop_lat": 38.8,
+             "stop_lon": -77.1, "location_type": "0"},
+            # moved ~364 ft
+            {"stop_id": "B2", "stop_code": "2", "stop_name": "B", "stop_lat": 38.801,
+             "stop_lon": -77.1, "location_type": "0"},
+            # renamed
+            {"stop_id": "B3", "stop_code": "3", "stop_name": "C2", "stop_lat": 38.8,
+             "stop_lon": -77.1, "location_type": "0"},
+            # coordinates unusable on the after side
+            {"stop_id": "B4", "stop_code": "4", "stop_name": "D", "stop_lat": np.nan,
+             "stop_lon": np.nan, "location_type": "0",
+             "coordinate_status": "missing_required_or_partial"},
+        ]
+    )  # fmt: skip
+    return before, after
+
+
+def test_compare_shared_classifies_change_types() -> None:
+    before, after = shared_pair()
+    result, _, _, _ = compare_shared(before, after, 25.0, [])
+    by_code = result.set_index("stop_code")
+    assert by_code.loc["1", "change_type"] == "unchanged"
+    assert by_code.loc["2", "change_type"] == "coordinates"
+    assert by_code.loc["2", "distance_ft"] == pytest.approx(364.8, abs=1.0)
+    assert by_code.loc["3", "change_type"] == "attributes"
+    assert by_code.loc["3", "changed_fields"] == "stop_name"
+    assert by_code.loc["4", "change_type"] == "needs_review"
+    assert by_code.loc["4", "location_assessment"] == "unable_to_assess"
+
+
+def test_compare_shared_secondary_id_change_is_not_an_attribute_change() -> None:
+    before, after = shared_pair()
+    result, _, _, _ = compare_shared(before, after, 25.0, [])
+    row = result.set_index("stop_code").loc["1"]
+    assert bool(row["secondary_id_changed"]) is True
+    assert bool(row["attributes_changed"]) is False
+
+
+def test_compare_shared_attribute_summary_counts_equivalent_raw_changes() -> None:
+    before, after = shared_pair()
+    _, summary, details, schema = compare_shared(before, after, 25.0, [])
+    location = summary.set_index("field").loc["location_type"]
+    assert location["changed_count"] == 0
+    assert location["equivalent_raw_changes"] == 4
+    assert details["field"].tolist() == ["stop_name"]
+    assert set(schema["schema_change"]) == {"same"}
+
+
+def test_compare_shared_ignored_attribute_is_not_counted() -> None:
+    before, after = shared_pair()
+    result, _, _, schema = compare_shared(before, after, 25.0, ["stop_name"])
+    assert result.set_index("stop_code").loc["3", "change_type"] == "unchanged"
+    included = schema.set_index("field")["included_in_classification"]
+    assert bool(included["stop_name"]) is False
+
+
+def test_compare_shared_threshold_is_respected() -> None:
+    before, after = shared_pair()
+    result, _, _, _ = compare_shared(before, after, 1000.0, [])
+    assert result.set_index("stop_code").loc["2", "change_type"] == "unchanged"
+
+
+@pytest.mark.parametrize(
+    ("threshold", "ignored", "match"),
+    [(-1.0, [], "nonnegative"), (math.inf, [], "finite"), (25.0, ["bogus"], "IGNORE")],
+)
+def test_compare_shared_rejects_bad_settings(
+    threshold: float, ignored: list[str], match: str
+) -> None:
+    before, after = shared_pair()
+    with pytest.raises(ValueError, match=match):
+        compare_shared(before, after, threshold, ignored)
+
+
+# ---------------------------------------------------------------------------
+# candidate_matches
+# ---------------------------------------------------------------------------
+
+
+def test_candidate_matches_finds_nearby_stop() -> None:
+    before = stops_frame(
+        [{"stop_id": "B3", "stop_code": "1003", "stop_name": "Oak", "stop_lat": 38.82,
+          "stop_lon": -77.1}]
+    )  # fmt: skip
+    after = stops_frame(
+        [{"stop_id": "A5", "stop_code": "2005", "stop_name": "Oak new", "stop_lat": 38.8201,
+          "stop_lon": -77.1}]
+    )  # fmt: skip
+    out = candidate_matches(before, after, 500.0, 3)
+    assert len(out) == 1
+    assert out.loc[0, "before_comparison_key"] == "1003"
+    assert bool(out.loc[0, "within_distance"]) is True
+    assert bool(out.loc[0, "same_stop_code"]) is False
+    assert out.loc[0, "after_candidate_count"] == 1
+
+
+def test_candidate_matches_same_code_far_away_with_stop_id_key() -> None:
+    before = stops_frame(
+        [{"stop_id": "OLD", "stop_code": "77", "stop_name": "X", "stop_lat": 38.8,
+          "stop_lon": -77.1}]
+    )  # fmt: skip
+    after = stops_frame(
+        [{"stop_id": "NEW", "stop_code": "77", "stop_name": "X", "stop_lat": 39.8,
+          "stop_lon": -77.1}]
+    )  # fmt: skip
+    out = candidate_matches(before, after, 500.0, 3, "stop_id")
+    assert len(out) == 1
+    assert bool(out.loc[0, "same_stop_code"]) is True
+    assert bool(out.loc[0, "within_distance"]) is False
+
+
+def test_candidate_matches_never_crosses_location_types() -> None:
+    before = stops_frame(
+        [{"stop_id": "STN", "stop_code": "1", "stop_name": "S", "stop_lat": 38.8,
+          "stop_lon": -77.1, "location_type": "1"}]
+    )  # fmt: skip
+    after = stops_frame(
+        [{"stop_id": "PLT", "stop_code": "2", "stop_name": "S", "stop_lat": 38.8,
+          "stop_lon": -77.1, "location_type": "0"}]
+    )  # fmt: skip
+    assert candidate_matches(before, after, 500.0, 3).empty
+
+
+def test_candidate_matches_rejects_bad_parameters() -> None:
+    empty = stops_frame([])
+    with pytest.raises(ValueError, match="Candidate"):
+        candidate_matches(empty, empty, 500.0, 0)
+
+
+# ---------------------------------------------------------------------------
+# addition_output_tables
+# ---------------------------------------------------------------------------
+
+
+def additions() -> pd.DataFrame:
     return pd.DataFrame(
-        {"stop_id": kwargs["ids"], "stop_lat": kwargs["lats"], "stop_lon": kwargs["lons"]}
+        {"stop_code": ["1004", "2005"], "present_in_before_inventory": [True, False]}
     )
 
 
-def test_compare_stops_identifies_deleted_stops() -> None:
-    before = _make_stop_df(ids=["S1", "S2"], lats=[38.7, 38.8], lons=[-77.0, -77.1])
-    after = _make_stop_df(ids=["S1"], lats=[38.7], lons=[-77.0])
-    _, deleted, _, _, summary, _ = compare_stops(before, after, relocate_threshold_ft=25.0)
-    assert len(deleted) == 1
-    assert deleted["stop_id"].iloc[0] == "S2"
-    assert summary.deleted_count == 1
+def test_addition_output_tables_separate_mode() -> None:
+    tables = addition_output_tables(additions(), "separate")
+    assert set(tables) == {"new_stop_codes", "existing_stops_new_to_scope"}
+    assert tables["new_stop_codes"]["stop_code"].tolist() == ["2005"]
+    assert tables["existing_stops_new_to_scope"]["stop_code"].tolist() == ["1004"]
 
 
-def test_compare_stops_identifies_new_stops() -> None:
-    before = _make_stop_df(ids=["S1"], lats=[38.7], lons=[-77.0])
-    after = _make_stop_df(ids=["S1", "S2"], lats=[38.7, 38.8], lons=[-77.0, -77.1])
-    _, _, new, _, summary, _ = compare_stops(before, after, relocate_threshold_ft=25.0)
-    assert len(new) == 1
-    assert new["stop_id"].iloc[0] == "S2"
-    assert summary.new_count == 1
+def test_addition_output_tables_names_new_ids_for_stop_id_key() -> None:
+    tables = addition_output_tables(additions(), "new_only", "stop_id")
+    assert list(tables) == ["new_stop_ids"]
+    assert tables["new_stop_ids"]["addition_category"].tolist() == ["new_stop_id"]
 
 
-def test_compare_stops_identifies_relocated_stop() -> None:
-    before = _make_stop_df(ids=["S1"], lats=[38.7], lons=[-77.0])
-    # Moved ~1 degree north → many thousands of feet
-    after = _make_stop_df(ids=["S1"], lats=[38.8], lons=[-77.0])
-    modified, _, _, _, summary, _ = compare_stops(before, after, relocate_threshold_ft=25.0)
-    assert summary.modified_count == 1
-    assert summary.relocated_count == 1
+def test_addition_output_tables_combined_mode() -> None:
+    tables = addition_output_tables(additions(), "combined")
+    assert tables["added_to_scope"]["addition_category"].tolist() == [
+        "existing_stop_new_to_scope",
+        "new_stop_code",
+    ]
 
 
-def test_compare_stops_unchanged_stop_not_in_modified() -> None:
-    before = _make_stop_df(ids=["S1"], lats=[38.7], lons=[-77.0])
-    after = _make_stop_df(ids=["S1"], lats=[38.7], lons=[-77.0])
-    modified, _, _, unchanged, summary, _ = compare_stops(before, after, relocate_threshold_ft=25.0)
-    assert len(modified) == 0
-    assert len(unchanged) == 1
-    assert summary.unchanged_count == 1
+def test_addition_output_tables_reads_csv_text_flags() -> None:
+    added = additions().assign(present_in_before_inventory=["True", "False"])
+    tables = addition_output_tables(added, "existing_only")
+    assert tables["existing_stops_new_to_scope"]["stop_code"].tolist() == ["1004"]
 
 
-def test_compare_stops_summary_counts_are_consistent() -> None:
-    before = _make_stop_df(
-        ids=["S1", "S2", "S3"], lats=[38.7, 38.8, 38.9], lons=[-77.0, -77.1, -77.2]
-    )
-    after = _make_stop_df(
-        ids=["S1", "S3", "S4"], lats=[38.7, 38.9, 39.0], lons=[-77.0, -77.2, -77.3]
-    )
-    _, deleted, new, _, summary, _ = compare_stops(before, after, relocate_threshold_ft=25.0)
-    assert summary.deleted_count == len(deleted)
-    assert summary.new_count == len(new)
-    assert summary.before_stop_count == 3
-    assert summary.after_stop_count == 3
+def test_addition_output_tables_rejects_invalid_flags_and_modes() -> None:
+    with pytest.raises(ValueError, match="inventory-presence"):
+        addition_output_tables(
+            additions().assign(present_in_before_inventory=["", "x"]), "separate"
+        )
+    with pytest.raises(ValueError, match="additions output mode"):
+        addition_output_tables(additions(), "everything")
 
 
 # ---------------------------------------------------------------------------
-# route context helpers
+# Route pairing decisions
 # ---------------------------------------------------------------------------
 
 
-def test_route_display_label_prefers_short_name() -> None:
-    row = pd.Series({"route_short_name": "10", "route_long_name": "Elm Line", "route_id": "R1"})
-    assert _route_display_label(row) == "10"
+def test_normalize_route_pairs_accepts_name_or_list() -> None:
+    assert normalize_route_pairs({" New ": "101", "Merged": ["101", "202", "101"]}) == {
+        "new": ["101"],
+        "merged": ["101", "202"],
+    }
 
 
-def test_route_display_label_falls_back_to_long_name() -> None:
-    row = pd.Series({"route_short_name": "", "route_long_name": "Elm Line", "route_id": "R1"})
-    assert _route_display_label(row) == "Elm Line"
+@pytest.mark.parametrize(
+    ("mapping", "error"),
+    [
+        ({"A": []}, ValueError),
+        ({"A": [""]}, ValueError),
+        ({"A": 5}, TypeError),
+        ({"A": "1", "a": "2"}, ValueError),
+        ({"": "1"}, ValueError),
+    ],
+)
+def test_normalize_route_pairs_rejects_invalid(mapping: dict[str, Any], error: type) -> None:
+    with pytest.raises(error):
+        normalize_route_pairs(mapping)
 
 
-def test_route_display_label_falls_back_to_route_id() -> None:
-    row = pd.Series({"route_short_name": "", "route_long_name": "", "route_id": "R1"})
-    assert _route_display_label(row) == "R1"
+def test_normalize_route_names_rejects_bare_string() -> None:
+    with pytest.raises(ValueError, match="list of nonblank"):
+        normalize_route_names("101", "BEFORE_ROUTE_NAMES")
 
 
-def test_route_sort_key_orders_numeric_before_alpha() -> None:
-    labels = ["Red", "2", "10", "1"]
-    assert sorted(labels, key=_route_sort_key) == ["1", "2", "10", "Red"]
+def test_prompt_route_pair_retries_until_known_route(monkeypatch: pytest.MonkeyPatch) -> None:
+    answers = iter(["?", "", "nope", "101, 200"])
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(answers))
+    lookup = {"101": ("R101", "101"), "200": ("R200", "200")}
+    assert prompt_route_pair("101X", lookup) == ["101", "200"]
 
 
-def test_build_stop_routes_table_aggregates_routes_and_count() -> None:
-    pairs = pd.DataFrame(
-        {
-            "stop_id": ["S1", "S1", "S2"],
-            "route_id": ["R2", "R10", "R1"],
-            "route_label": ["2", "10", "1"],
-        }
+def test_prompt_route_pair_none_and_cancel(monkeypatch: pytest.MonkeyPatch) -> None:
+    lookup = {"101": ("R101", "101")}
+    monkeypatch.setattr("builtins.input", lambda _prompt: "None")
+    assert prompt_route_pair("101X", lookup) is None
+    monkeypatch.setattr("builtins.input", lambda _prompt: "cancel")
+    with pytest.raises(ValueError, match="cancelled"):
+        prompt_route_pair("101X", lookup)
+
+
+def test_prompt_route_pair_without_input_explains_cli(monkeypatch: pytest.MonkeyPatch) -> None:
+    def no_input(_prompt: str) -> str:
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", no_input)
+    with pytest.raises(ValueError, match="--route-pair"):
+        prompt_route_pair("101X", {"101": ("R101", "101")})
+
+
+# ---------------------------------------------------------------------------
+# make_scope
+# ---------------------------------------------------------------------------
+
+
+def scope_feeds() -> tuple[Feed, Feed]:
+    before = make_feed(
+        ["B1", "B2", "B3"],
+        {"R101": "101", "R200": "200"},
+        [("B1", "R101"), ("B2", "R101"), ("B3", "R200")],
     )
-    table = build_stop_routes_table(pairs)
-    s1 = table.loc[table.stop_id == "S1"].iloc[0]
-    assert s1["routes"] == "2; 10"  # numeric sort, not lexical
-    assert s1["route_count"] == 2
+    after = make_feed(
+        ["A1", "A2", "A9"],
+        {"X1": "101", "X9": "999"},
+        [("A1", "X1"), ("A2", "X1"), ("A9", "X9")],
+    )
+    return before, after
 
 
-def test_build_stop_routes_table_none_passthrough() -> None:
-    assert build_stop_routes_table(None) is None
+def test_make_scope_same_name_match_and_unresolved_error() -> None:
+    before, after = scope_feeds()
+    with pytest.raises(ValueError, match="Unresolved concept routes"):
+        make_scope(before, after, "after_routes", [], {}, [], "error")
 
 
-def test_attach_route_context_left_join_fills_unserved() -> None:
-    stops = _make_stop_df(ids=["S1", "S2"], lats=[38.7, 38.8], lons=[-77.0, -77.1])
-    table = pd.DataFrame({"stop_id": ["S1"], "routes": ["10"], "route_count": [1]})
-    out = attach_route_context(stops, table, label="test")
-    assert out.loc[out.stop_id == "S1", "route_count"].iloc[0] == 1
-    # S2 has no service → blank routes, zero count (not NaN)
-    assert out.loc[out.stop_id == "S2", "routes"].iloc[0] == ""
-    assert out.loc[out.stop_id == "S2", "route_count"].iloc[0] == 0
+def test_make_scope_warn_keeps_unresolved_route_provisional() -> None:
+    before, after = scope_feeds()
+    scope = make_scope(before, after, "after_routes", [], {}, [], "warn")
+    assert scope.before_ids == {"B1", "B2"}
+    assert scope.after_ids == {"A1", "A2", "A9"}
+    assert scope.unresolved_routes == ["999"]
+    assert scope.resolved_route_pairs == {"101": ["101"]}
+    statuses = dict(zip(scope.route_table["after_route"], scope.route_table["status"]))
+    assert statuses["101"] == "same_name"
+    assert statuses["999"] == "unresolved_concept_route_review"
+    assert any("provisional" in warning for warning in scope.warnings)
 
 
-def test_attach_route_context_none_is_noop() -> None:
-    stops = _make_stop_df(ids=["S1"], lats=[38.7], lons=[-77.0])
-    out = attach_route_context(stops, None, label="test")
-    assert "routes" not in out.columns
-    assert out.equals(stops)
+def test_make_scope_no_match_route_stays_in_after_scope() -> None:
+    before, after = scope_feeds()
+    scope = make_scope(before, after, "after_routes", [], {}, ["999"], "error")
+    assert scope.confirmed_no_match_routes == ["999"]
+    assert "A9" in scope.after_ids
+    assert scope.unresolved_routes == []
 
 
-def test_route_context_does_not_affect_classification() -> None:
-    # Same coords/attrs but different serving routes → still unchanged.
-    before = _make_stop_df(ids=["S1"], lats=[38.7], lons=[-77.0])
-    before["routes"] = ["10"]
-    before["route_count"] = [1]
-    after = _make_stop_df(ids=["S1"], lats=[38.7], lons=[-77.0])
-    after["routes"] = ["10; 20"]
-    after["route_count"] = [2]
-    modified, _, _, unchanged, summary, _ = compare_stops(before, after, relocate_threshold_ft=25.0)
-    assert summary.modified_count == 0
-    assert len(unchanged) == 1
-    # Route columns still carried through to the merged output.
-    assert "routes_before" in unchanged.columns
-    assert "routes_after" in unchanged.columns
+def test_make_scope_merger_pair_unions_before_routes() -> None:
+    before, after = scope_feeds()
+    scope = make_scope(before, after, "after_routes", [], {"999": ["101", "200"]}, [], "error")
+    assert scope.before_ids == {"B1", "B2", "B3"}
+    assert scope.before_route_ids == {"R101", "R200"}
+    assert scope.resolved_route_pairs["999"] == ["101", "200"]
 
 
-def test_nearest_matches_include_routes_when_present() -> None:
-    before = _make_stop_df(ids=["B1"], lats=[38.70000], lons=[-77.00000])
-    before["routes"] = ["10"]
-    after = _make_stop_df(ids=["A1"], lats=[38.70001], lons=[-77.00001])
-    after["routes"] = ["10; 20"]
-    out = try_build_nearest_matches(before, after, max_feet=500.0)
-    assert out is not None
-    assert out["after_routes"].iloc[0] == "10; 20"
-    assert out["nearest_before_routes"].iloc[0] == "10"
+def test_make_scope_explicit_before_route_and_outside_scope_status() -> None:
+    before, after = scope_feeds()
+    scope = make_scope(before, after, "after_routes", ["200"], {}, ["999"], "error")
+    statuses = dict(zip(scope.route_table["before_route"], scope.route_table["status"]))
+    assert statuses["200"] == "explicit_before_only"
+    assert "B3" in scope.before_ids
+    scope = make_scope(before, after, "after_routes", [], {}, ["999"], "error")
+    statuses = dict(zip(scope.route_table["before_route"], scope.route_table["status"]))
+    assert statuses["200"] == "outside_scope"
+
+
+@pytest.mark.parametrize(
+    ("names", "mapping", "no_match", "match"),
+    [
+        ([], {"999": "101"}, ["999"], "both paired and confirmed"),
+        ([], {"nope": "101"}, [], "Unknown concept route"),
+        ([], {"999": "nope"}, [], "Unknown before route"),
+        (["nope"], {}, ["999"], "Unknown before route name"),
+    ],
+)
+def test_make_scope_rejects_inconsistent_decisions(
+    names: list[str], mapping: dict[str, str], no_match: list[str], match: str
+) -> None:
+    before, after = scope_feeds()
+    with pytest.raises(ValueError, match=match):
+        make_scope(before, after, "after_routes", names, mapping, no_match, "error")
+
+
+def test_make_scope_all_stops_rejects_route_selections() -> None:
+    before, after = scope_feeds()
+    scope = make_scope(before, after, "all_stops", [], {}, [], "error")
+    assert scope.before_ids == {"B1", "B2", "B3"}
+    with pytest.raises(ValueError, match="require scope='after_routes'"):
+        make_scope(before, after, "all_stops", ["101"], {}, [], "error")
+
+
+# ---------------------------------------------------------------------------
+# CLI pairing options and saved pairing files
+# ---------------------------------------------------------------------------
+
+
+def test_cli_pairing_options_route_pairs_form_merger() -> None:
+    args = parse_args(
+        ["--route-pair", "353New", "353", "--route-pair", "353New", "354",
+         "--no-route-match", "400X"]
+    )  # fmt: skip
+    mapping, no_match, names = cli_pairing_options(args)
+    assert mapping == {"353new": ["353", "354"]}
+    assert no_match == ["400x"]
+    assert names == []
+
+
+def test_cli_pairing_options_conflict_raises() -> None:
+    args = parse_args(["--route-pair", "A", "1", "--no-route-match", "A"])
+    with pytest.raises(ValueError, match="Conflicting"):
+        cli_pairing_options(args)
+
+
+def test_cli_pairing_options_cli_overrides_saved_file(tmp_path: Path) -> None:
+    saved = tmp_path / "route_pairings.json"
+    saved.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "route_name_map": {"A": ["1"]},
+                "after_routes_with_no_match": ["B"],
+                "before_route_names": ["9"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    args = parse_args(["--route-pairs-file", str(saved), "--route-pair", "B", "2"])
+    mapping, no_match, names = cli_pairing_options(args)
+    assert mapping == {"a": ["1"], "b": ["2"]}
+    assert no_match == []
+    assert names == ["9"]
+
+
+def test_read_pairing_file_validates_schema(tmp_path: Path) -> None:
+    path = tmp_path / "pairs.json"
+    path.write_text(json.dumps({"schema_version": 2, "route_name_map": {}}), encoding="utf-8")
+    with pytest.raises(ValueError, match="schema_version"):
+        read_pairing_file(path)
+    path.write_text(json.dumps({"routes": {}}), encoding="utf-8")
+    with pytest.raises(TypeError, match="route_name_map"):
+        read_pairing_file(path)
+
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+
+
+def test_write_outputs_keeps_leading_equals_as_text(tmp_path: Path) -> None:
+    settings = {
+        "route_name_map": {},
+        "after_routes_with_no_match": [],
+        "before_route_names": [],
+        "unresolved_routes": [],
+    }
+    write_outputs(tmp_path, {"before": pd.DataFrame({"stop_name": ["=1+1"]})}, {}, settings)
+    cell = openpyxl.load_workbook(tmp_path / "stops_comparison.xlsx")["before"]["A2"]
+    assert cell.value == "=1+1"
+    assert cell.data_type == "s"
+    assert (tmp_path / "before.csv").exists()
+    assert json.loads((tmp_path / "route_pairings.json").read_text())["schema_version"] == 1
+
+
+# ---------------------------------------------------------------------------
+# run_compare / main (end to end)
+# ---------------------------------------------------------------------------
+
+
+def test_run_compare_after_routes_end_to_end(
+    before_feed: Path, after_feed: Path, tmp_path: Path
+) -> None:
+    summary = run_compare(
+        before_dir=before_feed,
+        after_dir=after_feed,
+        out_dir=tmp_path / "out",
+        unmatched_policy="error",
+    )
+    assert summary["before_scope_stops"] == 3
+    assert summary["after_scope_stops"] == 4
+    assert summary["before_outside_scope"] == 1
+    assert summary["shared_scope_keys"] == 2
+    assert summary["modified_count"] == 1
+    assert summary["unchanged_count"] == 1
+    assert summary["removed_from_scope_count"] == 1
+    assert summary["added_to_scope_count"] == 2
+    assert summary["added_new_key_count"] == 1
+    assert summary["added_existing_inventory_count"] == 1
+    assert summary["reused_stops_modified_count"] == 0
+    assert summary["shared_secondary_id_changes"] == 2
+    assert summary["candidate_id_pairs"] >= 1
+    assert summary["route_pairing_complete"] is True
+
+    run_dir = Path(summary["output_directory"])
+    for name in (
+        "stops_comparison.xlsx",
+        "summary.json",
+        "run_settings.json",
+        "route_pairings.json",
+        "gtfs_stop_diff.log",
+        "modified.csv",
+        "removed_from_scope.csv",
+        "new_stop_codes.csv",
+        "existing_stops_new_to_scope.csv",
+    ):
+        assert (run_dir / name).exists(), name
+    modified = pd.read_csv(run_dir / "modified.csv", dtype=str)
+    assert modified["stop_code"].tolist() == ["1002"]
+    removed = pd.read_csv(run_dir / "removed_from_scope.csv", dtype=str)
+    assert removed["stop_code"].tolist() == ["1003"]
+    new_codes = pd.read_csv(run_dir / "new_stop_codes.csv", dtype=str)
+    assert new_codes["stop_code"].tolist() == ["2005"]
+    assert new_codes.loc[0, "has_id_match_candidate"] == "True"
+    pairings = json.loads((run_dir / "route_pairings.json").read_text(encoding="utf-8"))
+    assert pairings["route_name_map"] == {"101": ["101"]}
+
+
+def test_run_compare_reuses_saved_route_pairings(
+    before_feed: Path, after_feed: Path, tmp_path: Path
+) -> None:
+    first = run_compare(
+        before_dir=before_feed,
+        after_dir=after_feed,
+        out_dir=tmp_path / "out",
+        route_name_map={"101": ["101", "200"]},
+        unmatched_policy="error",
+    )
+    saved = Path(first["output_directory"]) / "route_pairings.json"
+    second = run_compare(
+        before_dir=before_feed,
+        after_dir=after_feed,
+        out_dir=tmp_path / "out",
+        route_pairs_file=saved,
+        unmatched_policy="error",
+    )
+    assert first["before_scope_stops"] == second["before_scope_stops"] == 4
+    assert second["added_existing_inventory_count"] == 0
+
+
+def test_run_compare_all_stops_with_stop_id_key(
+    before_feed: Path, after_feed: Path, tmp_path: Path
+) -> None:
+    summary = run_compare(
+        before_dir=before_feed,
+        after_dir=after_feed,
+        out_dir=tmp_path / "out",
+        scope_mode="all_stops",
+        primary_stop_key="stop_id",
+        additions_output_mode="combined",
+    )
+    assert summary["shared_scope_keys"] == 0
+    assert summary["removed_from_scope_count"] == 4
+    assert summary["added_new_key_count"] == 4
+    assert summary["stop_id_code_change_count"] == 0
+    assert (Path(summary["output_directory"]) / "added_to_scope.csv").exists()
+
+
+def test_run_compare_blank_primary_key_stops_run(before_feed: Path, tmp_path: Path) -> None:
+    rows = [dict(row, stop_code="") for row in AFTER_STOPS]
+    after = write_feed(tmp_path / "blank", rows, AFTER_ROUTES, AFTER_TRIPS, AFTER_STOP_TIMES)
+    with pytest.raises(ValueError, match="no fallback was applied"):
+        run_compare(before_dir=before_feed, after_dir=after, out_dir=tmp_path / "out")
+
+
+def test_run_compare_after_routes_requires_route_context(
+    before_feed: Path, after_feed: Path, tmp_path: Path
+) -> None:
+    with pytest.raises(ValueError, match="requires route context"):
+        run_compare(
+            before_dir=before_feed,
+            after_dir=after_feed,
+            out_dir=tmp_path / "out",
+            include_route_context=False,
+        )
+
+
+def test_main_returns_zero_on_success(before_feed: Path, after_feed: Path, tmp_path: Path) -> None:
+    argv = ["--before", str(before_feed), "--after", str(after_feed), "--out", str(tmp_path)]
+    assert main([*argv, "--unmatched-routes", "error"]) == 0
+
+
+def test_main_returns_one_for_missing_source(tmp_path: Path) -> None:
+    argv = ["--before", str(tmp_path / "missing"), "--after", str(tmp_path / "missing")]
+    assert main([*argv, "--out", str(tmp_path / "out")]) == 1
