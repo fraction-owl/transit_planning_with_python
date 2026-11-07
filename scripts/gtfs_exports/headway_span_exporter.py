@@ -822,6 +822,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (OSError, ValueError) as exc:
         logging.error("%s", exc)
         return 1
+    logging.info("Script completed successfully.")
     return 0
 
 
