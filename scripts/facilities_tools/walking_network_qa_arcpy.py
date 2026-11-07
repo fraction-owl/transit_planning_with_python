@@ -176,7 +176,7 @@ ROAD_POLYGONS = ""  # Optional: r"C:\GIS\transportation.gdb\road_polygons"
 ROAD_WHERE = ""
 OUTPUT_FOLDER = r"Path\To\Your\Output_Folder"
 
-ANALYSIS_WKID = 2283  # NAD 1983 StatePlane Virginia North, US survey feet
+ANALYSIS_WKID = 2248  # NAD83 / Maryland (ftUS), the DC-area default
 # ANALYSIS_WKID = 0  # 0 = first input CRS; otherwise supply a LOCAL projected WKID.
 GEOGRAPHIC_TRANSFORMATION = ""  # Blank = first valid ArcGIS-listed transformation.
 STOP_BUFFER_MILES = (0.25,)

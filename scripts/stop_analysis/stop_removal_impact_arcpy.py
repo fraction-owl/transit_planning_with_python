@@ -112,7 +112,7 @@ RUN_LOG_NAME: str = "stop_removal_impact_runlog.txt"
 EXPORT_MAPS: bool = True  # write a small PNG map per deleted stop
 
 # ANALYSIS PARAMETERS ---------------------------------------------------------
-PROJECTED_WKID: int = 6447  # VA State Plane (US ft)
+PROJECTED_WKID: int = 2248  # NAD83 / Maryland (ftUS), the DC-area default
 BUFFER_MILES: float = 0.25
 FT_PER_MILE: float = 5280.0
 MAX_SNAP_FT: float = 1500.0  # skip stops farther than this from the network

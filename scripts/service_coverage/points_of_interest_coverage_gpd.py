@@ -109,8 +109,8 @@ PLOT_FIG_DPI = 250  # resolution for PNG exports (only used when MAKE_PLOTS)
 # Projected CRS used for buffering and spatial joins.
 # EPSG:3857 (Web Mercator) works globally; its latitude-dependent scale
 # distortion is corrected automatically when buffering (see
-# _web_mercator_ground_scale). Swap for a local CRS (e.g. "EPSG:2283" for
-# northern Virginia in feet) when higher spatial accuracy is needed.
+# _web_mercator_ground_scale). Swap for a local CRS (e.g. "EPSG:2248" for
+# the DC area in feet) when higher spatial accuracy is needed.
 PROJECTED_CRS = "EPSG:3857"
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
@@ -287,7 +287,7 @@ def _prepare_route_buffers(
             columns.
     """
     # The buffer is drawn in projected_crs units: meters, or feet for a
-    # state-plane feet CRS such as EPSG:2283.
+    # state-plane feet CRS such as EPSG:2248.
     metric = _crs_is_metric(CRS.from_user_input(projected_crs))
     buff_dist = buffer_dist_ft * 0.3048 if metric else buffer_dist_ft
     buff_dist *= _web_mercator_ground_scale(projected_crs, tables["stops"]["stop_lat"])

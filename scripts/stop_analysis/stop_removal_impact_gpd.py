@@ -68,7 +68,7 @@ SIDEWALK_BACKDROP_PAD_FT: float = 300.0  # how far to expand the map view when c
 IDENTIFIER_PRIORITY: Tuple[str, str] = ("stop_code", "stop_id")
 
 # Analysis parameters
-TARGET_CRS = 6447  # VA State Plane (US ft)
+TARGET_CRS = 2248  # NAD83 / Maryland (ftUS), the DC-area default
 BUFFER_MILES = 0.25
 FT_PER_MILE = 5_280
 BUFFER_FT = BUFFER_MILES * FT_PER_MILE
@@ -835,7 +835,7 @@ def main() -> int:
         stops, seg_index, wkb_to_eid, segments, edge_endpoints, MAX_SNAP_FT
     )
 
-    # Coverage (feet buffers; EPSG:6447 in US ft)
+    # Coverage (feet buffers; EPSG:2248 in US ft)
     logging.info("Calculating coverage polygons …")
     orig_cov = coverage_polygon(stops, BUFFER_MILES)
 

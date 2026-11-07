@@ -18,7 +18,7 @@ Method:
       Nearby but noncoincident shapes are not snapped together. Coincident means
       within the XY tolerance (1 mm by default), so opposite directions on one
       street count once only if their shapes trace the same path.
-    * Measure planar miles in ANALYSIS_EPSG (default NAD83 / Virginia North, ftUS).
+    * Measure planar miles in ANALYSIS_EPSG (default NAD83 / Maryland, ftUS).
     * Report either or both length/percentage bases, set by OUTSIDE_LENGTH: full
       route (including outside areas), and district-only (outside length set to
       zero and excluded from the total; the default).
@@ -98,7 +98,7 @@ ROUTES_TO_INCLUDE: Set[str] = set()
 ROUTES_TO_EXCLUDE: Set[str] = set()
 
 # EPSG code of a local projected CRS (ArcGIS lists it as the WKID).
-ANALYSIS_EPSG = 2283
+ANALYSIS_EPSG = 2248
 OUTSIDE_LABEL = "Outside districts"
 
 # Length outside every district polygon in the percentage and detail tables:

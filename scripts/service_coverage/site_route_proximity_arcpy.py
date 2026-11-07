@@ -74,8 +74,8 @@ ENTRANCE_NAME_FIELD = "FACILITY_N"  # preferred display name on the entrance poi
 # Extra attributes to copy to output if present
 LOCATION_EXTRA_FIELDS = ["OWNER", "PARKING", "HANDICAPPE", "BICYCLE", "LIGHTING"]
 
-# ---- Geometry handling & distance (Northern VA state plane feet)
-PROJECTED_CRS_WKID = 2283  # NAD_1983_StatePlane_Virginia_North_FIPS_4501_Feet
+# ---- Geometry handling & distance (Maryland state plane feet, covers DC)
+PROJECTED_CRS_WKID = 2248  # NAD_1983_StatePlane_Maryland_FIPS_1900_Feet
 BUFFER_DISTANCE = 0.25
 BUFFER_UNIT = "miles"  # "miles" | "feet"
 

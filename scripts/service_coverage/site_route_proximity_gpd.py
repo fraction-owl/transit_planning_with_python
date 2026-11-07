@@ -54,7 +54,7 @@ MANUAL_LOCATIONS = [
 ]
 BUFFER_DISTANCE = 0.25  # numeric value
 BUFFER_UNIT = "miles"  # 'miles' | 'feet'
-PROJECTED_CRS = "EPSG:2232"  # NAD83 / DC state plane (ft)
+PROJECTED_CRS = "EPSG:2248"  # NAD83 / Maryland (ftUS), the DC-area default
 
 # stop_code-mode specifics
 STOP_CODE_FILTER: list[str] = []
