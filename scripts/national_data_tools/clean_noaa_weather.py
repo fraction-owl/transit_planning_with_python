@@ -1,7 +1,7 @@
 """Clean a NOAA CDO daily-summaries export into an analysis-ready frame.
 
 Standalone script: edit the config block and call ``run()`` (notebook) or run as
-``python clean_noaa_daily.py [--input ...] [--output ...] [--long-names]`` (CLI).
+``python clean_noaa_weather.py [--input ...] [--output ...] [--long-names]`` (CLI).
 Cleaning here is deliberately *faithful and non-opinionated*: it repairs
 structural and semantic defects only (blank padding rows, WT event-flag
 semantics, dtypes, date axis) and adds calendar columns. Feature engineering and
