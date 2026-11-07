@@ -52,6 +52,7 @@ import pandas as pd
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+# === BEGIN CONFIG ===
 
 # Ridership source workbook
 RIDERSHIP_XLSX: Path = Path(r"Your\File\Path\To\STOP_USAGE_(BY_STOP_ID).xlsx")
@@ -105,6 +106,8 @@ _AMENITY_ALIASES: Dict[str, str] = {
 _PRESENT_VALUES = frozenset({"Y", "YES", "TRUE", "T", "1", "1.0"})
 _ABSENT_VALUES = frozenset({"N", "NO", "FALSE", "F", "0", "0.0"})
 UNKNOWN_VALUE: str = "UNKNOWN"
+
+# === END CONFIG ===
 
 # =============================================================================
 # FUNCTIONS

@@ -149,6 +149,7 @@ except ImportError:
 # =============================================================================
 # CONFIGURATION -- full paths; no arcpy.env.workspace is required.
 # =============================================================================
+# === BEGIN CONFIG ===
 
 NETWORK_SOURCES = [
     {
@@ -219,6 +220,8 @@ PROGRESS_LOG_SECONDS = 30.0
 
 LOG_LEVEL = "INFO"
 SCRIPT_VERSION = "1.2.1"
+
+# === END CONFIG ===
 
 
 # =============================================================================

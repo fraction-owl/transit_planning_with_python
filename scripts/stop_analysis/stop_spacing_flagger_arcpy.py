@@ -43,6 +43,7 @@ import pandas as pd
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+# === BEGIN CONFIG ===
 
 # GTFS source – folder containing *.txt or a .zip GTFS package.
 GTFS_PATH: str = r"Path\To\Your\GTFS_Folder"
@@ -81,6 +82,8 @@ LONG_SPACING_LOG_FILE: str = "long_spacing_segments.txt"  # currently unused (CS
 LONG_SPACING_CSV_FILE: str = "long_spacing_segments.csv"
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
+
+# === END CONFIG ===
 
 # =============================================================================
 # HELPERS – I/O AND BASIC GTFS HANDLING

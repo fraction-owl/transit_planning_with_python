@@ -51,6 +51,7 @@ from shapely.ops import unary_union
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+# === BEGIN CONFIG ===
 
 # Top‑level directories
 GTFS_DIR = Path(r"data/gtfs")  # folder containing GTFS .txt files
@@ -114,6 +115,8 @@ PLOT_FIG_DPI = 250  # resolution for PNG exports (only used when MAKE_PLOTS)
 PROJECTED_CRS = "EPSG:3857"
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
+
+# === END CONFIG ===
 
 # =============================================================================
 # FUNCTIONS

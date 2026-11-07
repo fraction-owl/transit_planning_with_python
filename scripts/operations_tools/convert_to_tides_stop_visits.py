@@ -66,6 +66,7 @@ import pandas as pd
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+# === BEGIN CONFIG ===
 
 INPUT_CSV: Path = Path(r"Path\To\Stop Visit Events.csv")
 OUTPUT_DIR: Path = Path(r"Path\To\Your\Output_Folder")
@@ -158,6 +159,8 @@ OPT_COLS: list[str] = [
 ]
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
+
+# === END CONFIG ===
 
 # =============================================================================
 # HELPERS

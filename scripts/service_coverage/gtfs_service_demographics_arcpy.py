@@ -60,6 +60,7 @@ import pandas as pd
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+# === BEGIN CONFIG ===
 # Overwrite behavior
 OVERWRITE_OUTPUTS: bool = True
 
@@ -134,6 +135,8 @@ BY_ROUTE_WRITE_CSV: bool = True
 BY_ROUTE_EXPORT_FEATURES: bool = False
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
+
+# === END CONFIG ===
 
 # =============================================================================
 # PREFERRED DEMOGRAPHIC FIELD NAMES (from the census-join pipeline)

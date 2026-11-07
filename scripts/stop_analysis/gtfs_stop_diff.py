@@ -89,6 +89,7 @@ if TYPE_CHECKING:
 # =============================================================================
 # CONFIGURATION -- EDIT HERE
 # =============================================================================
+# === BEGIN CONFIG ===
 BEFORE_GTFS_DIR = Path(r"Path\To\Current_GTFS\current_gtfs.zip")
 AFTER_GTFS_DIR = Path(r"Path\To\Concept_GTFS\concept_gtfs.zip")
 OUTPUT_DIR = Path(r"Path\To\Output_Folder")
@@ -127,6 +128,8 @@ ENABLE_ROUTE_CONTEXT = True  # Required in after_routes mode; optional in all_st
 # Attributes explicitly ignored here still appear in the full inventories.
 IGNORE_ATTRIBUTES: list[str] = []
 LOG_LEVEL = logging.INFO
+
+# === END CONFIG ===
 
 # =============================================================================
 # Models and shared helpers

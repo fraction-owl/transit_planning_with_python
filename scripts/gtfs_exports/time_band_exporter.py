@@ -39,6 +39,7 @@ from openpyxl.utils import get_column_letter
 # ==================================================================================================
 # CONFIGURATION
 # ==================================================================================================
+# === BEGIN CONFIG ===
 
 GTFS_FOLDER = Path(r"Path\To\Your\GTFS_Folder")
 OUTPUT_FOLDER = Path(r"Path\To\Your\Output_Folder")
@@ -52,6 +53,8 @@ FILTER_OUT_SERVICE_IDS: List[str] = []
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
 EXPORT_TIMEPOINTS_ONLY = True  # keep only stops where timepoint == 1
 MISSING_TIME = "–"
+
+# === END CONFIG ===
 
 # ==================================================================================================
 # FUNCTIONS

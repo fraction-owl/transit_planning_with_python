@@ -60,6 +60,7 @@ from shapely.ops import substring
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+# === BEGIN CONFIG ===
 
 # Directory containing a single GTFS feed:
 #   - stops.txt
@@ -128,6 +129,8 @@ SEGMENT_MEASURE_PADDING_M = 50.0
 ROUTE_OVERVIEW_BUFFER_M = 30.0
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
+
+# === END CONFIG ===
 
 # =============================================================================
 # Plotting constants

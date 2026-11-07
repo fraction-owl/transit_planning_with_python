@@ -63,6 +63,7 @@ import pandas as pd
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+# === BEGIN CONFIG ===
 
 GTFS_FOLDER: Path = Path(r"Path\To\Your\GTFS_Folder")  # ←–– change me
 OUTPUT_DIR: Path = Path(r"Path\To\Your\Output_Folder")  # ←–– change me
@@ -82,6 +83,8 @@ FILTER_IN_ROUTE_SHORT_NAMES: list[str] = []
 FILTER_OUT_ROUTE_SHORT_NAMES: list[str] = []
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
+
+# === END CONFIG ===
 
 # =============================================================================
 # CONSTANTS

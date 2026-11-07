@@ -57,6 +57,7 @@ from openpyxl.worksheet.properties import PageSetupProperties
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+# === BEGIN CONFIG ===
 
 # REQUIRED: Paste your paths between the quotes on these two lines.
 # Keep the r prefix and omit any trailing backslash.
@@ -119,6 +120,8 @@ COLLECTOR_NAME_HEADER: str = "Name: ________________________________________"
 COLLECTION_DATE_HEADER: str = "Date: ____________________"
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
+
+# === END CONFIG ===
 
 # =============================================================================
 # FUNCTIONS

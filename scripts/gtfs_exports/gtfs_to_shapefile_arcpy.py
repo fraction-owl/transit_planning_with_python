@@ -45,6 +45,7 @@ import pandas as pd
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
+# === BEGIN CONFIG ===
 
 # GTFS source – folder with *.txt OR a .zip file.
 GTFS_PATH: str = r"Path\To\YourGTFS_Folder"
@@ -89,6 +90,8 @@ SHAPE_ID_LEN: int = 64
 PATTERN_MODE_LEN: int = 16
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
+
+# === END CONFIG ===
 
 # ============================================================================
 # HELPERS – I/O AND VALIDATION
