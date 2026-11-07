@@ -9,7 +9,7 @@ Stages:
     3. CLEVER observed timepoint intervals compared with scheduled intervals.
     4. Percentile-based segment recommendations for manual schedule drafting.
 
-Select stages with STAGES below, or at the command line:
+Typical usage: select stages with STAGES below, or at the command line:
     python runtime_workflow.py --stages 1
     python runtime_workflow.py --stages 2 3 4
 

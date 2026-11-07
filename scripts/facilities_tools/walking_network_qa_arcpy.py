@@ -6,7 +6,7 @@ Use file geodatabases/shapefiles with Basic; enterprise geometry checks may requ
 a higher ArcGIS license, according to the input storage type.
 Inputs are never edited. Each run writes a NEW timestamped output directory.
 
-QUICK START
+Typical usage:
     1. Set NETWORK_SOURCES, GTFS_PATH, OUTPUT_FOLDER, and optional ROAD_POLYGONS.
     2. Use a suitable local projected CRS. ANALYSIS_WKID=0 uses the first input's CRS.
     3. Start with all repair options disabled. Inspect issues_points, issues_lines,
@@ -92,7 +92,7 @@ IMPORTANT INTERPRETATION
       SOURCE_KEY. Output network feature classes have a normalized review schema;
       they do NOT carry a configured routing impedance/restriction model.
 
-OUTPUTS
+Outputs:
     review.gdb: gtfs_stops; stop_buffers; study_area; context_area; road_context;
       network_original; network_working; network_components;
       issues_points; issues_lines; network_clip_<radius>; geometry_check_<source>.
