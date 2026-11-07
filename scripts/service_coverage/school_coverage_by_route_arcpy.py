@@ -110,8 +110,8 @@ OUTPUT_CSV_NAME = "school_coverage_by_route.csv"
 # Projected spatial reference (WKID) used for buffering and the point-in-polygon
 # tests. EPSG:3857 (Web Mercator) works globally; its latitude-dependent scale
 # distortion is corrected automatically when buffering (see
-# _buffer_distance_in_sr_units). Swap for a local CRS (e.g. 2283 for northern
-# Virginia in feet) when higher spatial accuracy is needed.
+# _buffer_distance_in_sr_units). Swap for a local CRS (e.g. 2248 for the DC
+# area in feet) when higher spatial accuracy is needed.
 PROJECTED_CRS_WKID = 3857
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR

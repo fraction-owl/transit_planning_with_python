@@ -24,7 +24,7 @@ FIXTURES = Path(__file__).parent / "fixtures"
 
 # A projected CRS in US feet (matches the module's foot-based default walk speed);
 # used when the geometry values themselves don't need to be meaningful.
-PROJECTED_FT_CRS = "EPSG:6447"
+PROJECTED_FT_CRS = "EPSG:2248"
 # UTM 18N (metres) covers Washington, DC; used to reproject the geographic
 # centerlines fixture into a metric CRS before measuring lengths.
 DC_UTM_CRS = "EPSG:32618"

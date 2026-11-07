@@ -153,8 +153,8 @@ ACTIVE_AS_OF: str | None = None
 # Projected CRS used for buffering and the spatial join.
 # EPSG:3857 (Web Mercator) works globally; its latitude-dependent scale
 # distortion is corrected automatically when buffering (see
-# _web_mercator_ground_scale). Swap for a local CRS (e.g. "EPSG:2283" for
-# northern Virginia in feet) when higher spatial accuracy is needed.
+# _web_mercator_ground_scale). Swap for a local CRS (e.g. "EPSG:2248" for
+# the DC area in feet) when higher spatial accuracy is needed.
 PROJECTED_CRS = "EPSG:3857"
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR

@@ -153,7 +153,7 @@ def test_apply_route_filters_no_filters_is_noop() -> None:
 
 def _projected_inputs() -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, pd.DataFrame]:
     """Planar-CRS location/stop layers: one stop 100 ft away, one 10,000 ft away."""
-    crs = "EPSG:2232"
+    crs = "EPSG:2248"
     locations = gpd.GeoDataFrame(
         {"name": ["Site A", "Site B"]},
         geometry=[Point(0, 0), Point(100000, 100000)],
@@ -203,7 +203,7 @@ def test_nearby_routes_includes_extra_columns() -> None:
 
 
 def test_nearby_routes_reports_nearest_stop_per_route_direction() -> None:
-    crs = "EPSG:2232"
+    crs = "EPSG:2248"
     locations = gpd.GeoDataFrame({"name": ["Site A"]}, geometry=[Point(0, 0)], crs=crs)
     # Two stops on the same route/direction; only the closest is reported.
     stops = gpd.GeoDataFrame(

@@ -180,7 +180,7 @@ def test_web_mercator_ground_scale_matches_inverse_cosine() -> None:
     """At 38.9°N the Web Mercator correction is 1/cos(lat); elsewhere it is 1."""
     scale = _web_mercator_ground_scale("EPSG:3857", pd.Series([38.9]))
     assert scale == pytest.approx(1.0 / math.cos(math.radians(38.9)))
-    assert _web_mercator_ground_scale("EPSG:2283", pd.Series([38.9])) == 1.0
+    assert _web_mercator_ground_scale("EPSG:2248", pd.Series([38.9])) == 1.0
     assert _web_mercator_ground_scale("EPSG:3857", pd.Series([], dtype=float)) == 1.0
 
 

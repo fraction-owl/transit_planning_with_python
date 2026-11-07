@@ -264,13 +264,13 @@ def test_prepare_route_buffers_simplify_reduces_buffer_vertices() -> None:
     assert coarse.geometry.iloc[0].area == pytest.approx(fine.geometry.iloc[0].area, rel=0.02)
 
 
-@pytest.mark.parametrize("crs", ["EPSG:2283", "EPSG:32618", "EPSG:3857"])
+@pytest.mark.parametrize("crs", ["EPSG:2248", "EPSG:32618", "EPSG:3857"])
 def test_prepare_route_buffers_reaches_buffer_dist_in_feet_and_meter_crs(crs: str) -> None:
     """A 1,320 ft buffer reaches 1,200 ft on the ground but not 1,450 ft, whatever the CRS unit.
 
-    EPSG:2283 (Virginia North) is in US survey feet; the others are in meters.
+    EPSG:2248 (Maryland) is in US survey feet; the others are in meters.
     """
-    lat, lon = 38.85835, -77.051232  # Crystal City, VA, inside EPSG:2283's zone
+    lat, lon = 38.85835, -77.051232  # Crystal City, VA, in the DC area
     tables = {
         "routes": pd.DataFrame({"route_id": ["R1"]}),
         "trips": pd.DataFrame({"route_id": ["R1"], "trip_id": ["T1"]}),

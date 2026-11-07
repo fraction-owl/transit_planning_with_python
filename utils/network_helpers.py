@@ -38,7 +38,7 @@ FT_PER_MILE: float = 5_280.0
 SECONDS_PER_HOUR: float = 3_600.0
 
 # Default walking speed (~3 mph) expressed in feet per second, matching the
-# project's customary US-foot projected CRS (e.g. EPSG:6447). Override
+# project's customary US-foot projected CRS (e.g. EPSG:2248). Override
 # ``walk_speed`` when the centerline CRS uses different linear units.
 DEFAULT_WALK_SPEED_MPH: float = 3.0
 DEFAULT_WALK_SPEED_FT_PER_S: float = DEFAULT_WALK_SPEED_MPH * FT_PER_MILE / SECONDS_PER_HOUR

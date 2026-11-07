@@ -23,7 +23,7 @@ Method:
     * Project with pyproj, using the most accurate datum transformation installed
       for each input's extent (never a ballpark one). The log names it, and any
       more accurate transformation that needs PROJ grid files.
-    * Measure planar miles in ANALYSIS_EPSG (default NAD83 / Virginia North, ftUS).
+    * Measure planar miles in ANALYSIS_EPSG (default NAD83 / Maryland, ftUS).
     * Report either or both length/percentage bases, set by OUTSIDE_LENGTH: full
       route (including outside areas), and district-only (outside length set to
       zero and excluded from the total; the default).
@@ -112,8 +112,8 @@ DISTRICT_NAME_FIELD: str | None = None
 ROUTES_TO_INCLUDE: set[str] = set()
 ROUTES_TO_EXCLUDE: set[str] = set()
 
-# NAD83 / Virginia North (ftUS), the same default as the arcpy version.
-ANALYSIS_EPSG = 2283
+# NAD83 / Maryland (ftUS), the same default as the arcpy version.
+ANALYSIS_EPSG = 2248
 OUTSIDE_LABEL = "Outside districts"
 
 # Length outside every district polygon in the percentage and detail tables:
