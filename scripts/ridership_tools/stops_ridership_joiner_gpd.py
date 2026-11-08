@@ -80,7 +80,7 @@ PLOT_SUBDIR: str = "plots"
 POLYGON_LAYER: Optional[Path] = Path(r"Your\File\Path\To\census_blocks.shp")
 
 # OUTPUT FORMAT
-OUT_FORMAT = "gpkg"  # "gpkg" | "shp"
+OUT_FORMAT = "shp"  # "shp" | "gpkg"
 
 # FIELDS & JOIN KEYS --------------------------------------------------------
 GTFS_KEY_FIELD = "stop_code"
