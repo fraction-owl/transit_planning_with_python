@@ -387,7 +387,7 @@ def test_compute_flags_needs_improvement_is_any_flag() -> None:
 
 
 def test_is_placeholder_path_default_ridership_path() -> None:
-    """The default RIDERSHIP_XLSX placeholder is detected."""
+    """The default RIDERSHIP_PATH placeholder is detected."""
     p = Path(r"Your\File\Path\To\STOP_USAGE_(BY_STOP_ID).xlsx")
     assert target._is_placeholder_path(p) is True
 
@@ -502,13 +502,13 @@ def test_merge_ids_with_trailing_decimal_match() -> None:
 
 
 def test_merge_logs_match_rates(caplog: pytest.LogCaptureFixture) -> None:
-    """Unmatched stop counts are logged for both workbooks."""
+    """Unmatched stop counts are logged for both files."""
     rider = _make_ridership_merge_df()
     amen = _make_amenity_merge_df()
     with caplog.at_level(logging.INFO):
         target._merge_ridership_and_amenities(rider, amen)
-    assert "Ridership stops without a match in the other workbook: 1 of 3 (33.3%)" in caplog.text
-    assert "Amenity stops without a match in the other workbook: 0 of 2 (0.0%)" in caplog.text
+    assert "Ridership stops without a match in the other file: 1 of 3 (33.3%)" in caplog.text
+    assert "Amenity stops without a match in the other file: 0 of 2 (0.0%)" in caplog.text
 
 
 def test_merge_amenity_workbook_missing_column() -> None:
@@ -536,7 +536,7 @@ def test_merge_join_field_same_as_stop_id_field() -> None:
 
 
 def test_main_single_workbook_uses_ridership_aliases(tmp_path: Path) -> None:
-    """With AMENITIES_XLSX=None, ridership amenity aliases are used; Raw Data is untouched."""
+    """With AMENITIES_PATH=None, ridership amenity aliases are used; Raw Data is untouched."""
     rider = pd.DataFrame(
         {"STOP_ID": ["1", "1"], "XBOARDINGS": ["12.8", "12.8"], "bus_shelte": ["Y", "N"]}
     )
@@ -544,8 +544,8 @@ def test_main_single_workbook_uses_ridership_aliases(tmp_path: Path) -> None:
     rider.to_excel(rider_path, index=False)
     with patch.multiple(
         target,
-        RIDERSHIP_XLSX=rider_path,
-        AMENITIES_XLSX=None,
+        RIDERSHIP_PATH=rider_path,
+        AMENITIES_PATH=None,
         OUTPUT_FOLDER=tmp_path,
         TXT_LOG_PATH=tmp_path / "log.txt",
     ):
@@ -558,6 +558,37 @@ def test_main_single_workbook_uses_ridership_aliases(tmp_path: Path) -> None:
     assert flags["FLAG_SHELTER"].tolist() == ["False"]
     assert flags["REVIEW_BENCH"].tolist() == ["True"]  # no bench column → UNKNOWN
     assert sheets["Needs Review"]["STOP_ID"].tolist() == ["1"]
+
+
+def test_read_table_csv_keeps_ids_as_strings(tmp_path: Path) -> None:
+    """A CSV is read with every column as text, so leading zeros survive."""
+    path = tmp_path / "rider.csv"
+    path.write_text("STOP_ID,XBOARDINGS\n0042,5\n", encoding="utf-8")
+    df = target._read_table(path, sheet="ignored for CSV")
+    assert df["STOP_ID"].tolist() == ["0042"]
+    assert df["XBOARDINGS"].tolist() == ["5"]
+
+
+def test_main_accepts_csv_inputs(tmp_path: Path) -> None:
+    """CSV ridership and amenity files run end to end like workbooks."""
+    rider_path = tmp_path / "rider.csv"
+    rider_path.write_text("STOP_ID,XBOARDINGS\n1257,30\n2169,4\n", encoding="utf-8")
+    amen_path = tmp_path / "amenities.csv"
+    amen_path.write_text(
+        "stop_code,bus_shelte,bench,trash_can,pad\n1257,N,Y,Y,Y\n2169,Y,Y,Y,Y\n",
+        encoding="utf-8",
+    )
+    with patch.multiple(
+        target,
+        RIDERSHIP_PATH=rider_path,
+        AMENITIES_PATH=amen_path,
+        OUTPUT_FOLDER=tmp_path,
+        TXT_LOG_PATH=tmp_path / "log.txt",
+    ):
+        assert target.main() == 0
+    sheets = pd.read_excel(tmp_path / "stops_needing_improvement.xlsx", sheet_name=None, dtype=str)
+    assert sheets["Shelter"]["STOP_ID"].tolist() == ["1257"]
+    assert sheets["Needs Review"].empty
 
 
 # =============================================================================
