@@ -79,7 +79,7 @@ PLOT_SUBDIR: str = "plots"
 # Optional polygons (set to None to disable)
 POLYGON_LAYER: Optional[Path] = Path(r"Your\File\Path\To\census_blocks.shp")
 
-# OUTPUT FORMAT: "gpkg" strongly recommended; "shp" supported
+# OUTPUT FORMAT
 OUT_FORMAT = "gpkg"  # "gpkg" | "shp"
 
 # FIELDS & JOIN KEYS --------------------------------------------------------
