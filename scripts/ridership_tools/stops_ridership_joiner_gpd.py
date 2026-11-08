@@ -79,8 +79,8 @@ PLOT_SUBDIR: str = "plots"
 # Optional polygons (set to None to disable)
 POLYGON_LAYER: Optional[Path] = Path(r"Your\File\Path\To\census_blocks.shp")
 
-# OUTPUT FORMAT: "gpkg" strongly recommended; "shp" supported
-OUT_FORMAT = "gpkg"  # "gpkg" | "shp"
+# OUTPUT FORMAT
+OUT_FORMAT = "shp"  # "shp" | "gpkg"
 
 # FIELDS & JOIN KEYS --------------------------------------------------------
 GTFS_KEY_FIELD = "stop_code"

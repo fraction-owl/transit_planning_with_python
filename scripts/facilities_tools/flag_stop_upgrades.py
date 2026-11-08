@@ -1,29 +1,29 @@
 """Flag stops needing amenity upgrades using ridership thresholds and amenity data.
 
 This script reads stop-level ridership and amenity information from one or
-(optionally) two Excel workbooks. It normalizes and (optionally) aggregates
-duplicate STOP_IDs, then computes boolean "FLAG_*" columns to highlight where
-usage warrants an upgrade but the amenity is missing.
+(optionally) two files, each an Excel workbook or a CSV. It normalizes and
+(optionally) aggregates duplicate STOP_IDs, then computes boolean "FLAG_*"
+columns to highlight where usage warrants an upgrade but the amenity is missing.
 
 Amenity values are read as Y/N (Yes/No and True/False are also accepted, as
-are counts: above zero means present, zero means absent). Where both workbooks
-carry an amenity, the amenity workbook wins and the ridership workbook fills
+are counts: above zero means present, zero means absent). Where both files
+carry an amenity, the amenity file wins and the ridership file fills
 its blanks. Values neither source supplies are reported as UNKNOWN; a stop at
 or above a threshold with an UNKNOWN amenity gets a "REVIEW_*" column instead
 of a flag. Stop IDs are trimmed and a trailing ".0" is removed ("1257.0"
 matches "1257"); rows with a blank stop ID are dropped, and duplicate amenity
 records for one stop are collapsed (Y if any record says Y) before joining.
-The log reports how many stops in each workbook have no match in the other.
+The log reports how many stops in each file have no match in the other.
 Thousands separators in ridership ("1,250") are removed; other non-numeric
-values are logged and counted as zero. Set ``AMENITIES_XLSX = None`` to use
-the ridership workbook alone.
+values are logged and counted as zero. Set ``AMENITIES_PATH = None`` to use
+the ridership file alone.
 
 Outputs
 -------
 Both files are written to ``OUTPUT_FOLDER``:
 
     stops_needing_improvement.xlsx:
-        Raw Data – Unmodified import of the ridership workbook.
+        Raw Data – Unmodified import of the ridership file.
         All Flags – Every stop plus boolean flag and review columns for each
         amenity and NEEDS_IMPROVEMENT / NEEDS_REVIEW summary flags.
         Shelter / Bench / TrashCan / Pad – One sheet per amenity, listing only
@@ -54,13 +54,13 @@ import pandas as pd
 # =============================================================================
 # === BEGIN CONFIG ===
 
-# Ridership source workbook
-RIDERSHIP_XLSX: Path = Path(r"Your\File\Path\To\STOP_USAGE_(BY_STOP_ID).xlsx")
-RIDERSHIP_SHEET: int | str = 0
+# Ridership source: an Excel workbook (.xlsx/.xls) or a CSV
+RIDERSHIP_PATH: Path = Path(r"Your\File\Path\To\STOP_USAGE_(BY_STOP_ID).xlsx")
+RIDERSHIP_SHEET: int | str = 0  # worksheet name or index; ignored for CSV
 # Output folder (Excel + TXT will be written here)
 OUTPUT_FOLDER: Path = Path(r"Your\Folder\Path\To\Output")
 
-# Fields in ridership workbook
+# Fields in ridership file
 RIDERSHIP_FIELD: str = "XBOARDINGS"
 STOP_ID_FIELD: str = "STOP_ID"
 
@@ -76,12 +76,13 @@ AMENITIES: Dict[str, Dict[str, Any]] = {
 AGGREGATE_BY_STOP: bool | str = "auto"
 
 # -----------------------------------------------------------------------------
-# OPTIONAL SECOND WORKBOOK – AMENITY DETAILS
+# OPTIONAL SECOND FILE – AMENITY DETAILS
 # -----------------------------------------------------------------------------
 
-# Set to None to skip the amenity workbook and use only the ridership workbook.
-AMENITIES_XLSX: Path | None = Path(r"Your\File\Path\To\bus_stop_amenities.xlsx")
-AMENITIES_SHEET: int | str = 0
+# An Excel workbook (.xlsx/.xls) or a CSV. Set to None to skip it and use only the
+# ridership file.
+AMENITIES_PATH: Path | None = Path(r"Your\File\Path\To\bus_stop_amenities.xlsx")
+AMENITIES_SHEET: int | str = 0  # worksheet name or index; ignored for CSV
 AMENITY_JOIN_FIELD: str = "stop_code"
 TXT_LOG_PATH: Path = OUTPUT_FOLDER / "stops_needing_improvement.txt"
 
@@ -167,9 +168,20 @@ def _drop_missing_ids(df: pd.DataFrame, id_field: str, source: str) -> pd.DataFr
     return df
 
 
-def _load_ridership_data(path: Path, sheet: int | str) -> pd.DataFrame:
-    """Load ridership workbook, coercing all columns to strings."""
+def _read_table(path: Path, sheet: int | str) -> pd.DataFrame:
+    """Read a CSV or an Excel workbook, coercing all columns to strings.
+
+    A ``.csv`` extension is read as CSV; any other path is read as Excel, and
+    ``sheet`` picks the worksheet (it is ignored for CSV).
+    """
+    if path.suffix.lower() == ".csv":
+        return pd.read_csv(path, dtype=str)
     return pd.read_excel(path, sheet_name=sheet, dtype=str)
+
+
+def _load_ridership_data(path: Path, sheet: int | str) -> pd.DataFrame:
+    """Load the ridership file, coercing all columns to strings."""
+    return _read_table(path, sheet)
 
 
 def _prepare_amenity_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -268,8 +280,8 @@ def _write_workbook(raw_df: pd.DataFrame, processed_df: pd.DataFrame, out_path: 
 
 
 def _load_amenity_data(path: Path, sheet: int | str) -> pd.DataFrame:
-    """Read and sanitise the separate amenities workbook."""
-    df = pd.read_excel(path, sheet_name=sheet, dtype=str)
+    """Read and sanitise the separate amenities file."""
+    df = _read_table(path, sheet)
     # Normalise column names and apply known aliases
     df = _apply_amenity_aliases(df)
     # Standardise any amenity columns present (blanks stay missing)
@@ -281,20 +293,20 @@ def _load_amenity_data(path: Path, sheet: int | str) -> pd.DataFrame:
 
 
 def _log_match_rates(rider_ids: Set[str], amen_ids: Set[str]) -> None:
-    """Log how many unique stop IDs in each workbook have no match in the other."""
+    """Log how many unique stop IDs in each file have no match in the other."""
     for source, ids, other_ids, consequence in (
         (
             "Ridership",
             rider_ids,
             amen_ids,
-            "their amenities are UNKNOWN unless the ridership workbook has them",
+            "their amenities are UNKNOWN unless the ridership file has them",
         ),
         ("Amenity", amen_ids, rider_ids, "they are not in the output"),
     ):
         unmatched = len(ids - other_ids)
         share = 100 * unmatched / len(ids) if ids else 0.0
         logging.info(
-            "%s stops without a match in the other workbook: %d of %d (%.1f%%); %s.",
+            "%s stops without a match in the other file: %d of %d (%.1f%%); %s.",
             source,
             unmatched,
             len(ids),
@@ -306,7 +318,7 @@ def _log_match_rates(rider_ids: Set[str], amen_ids: Set[str]) -> None:
 def _merge_ridership_and_amenities(rider_df: pd.DataFrame, amen_df: pd.DataFrame) -> pd.DataFrame:
     """Left-join amenity info onto ridership on STOP_ID_FIELD ↔ AMENITY_JOIN_FIELD."""
     if AMENITY_JOIN_FIELD not in amen_df.columns:
-        raise ValueError(f"Column '{AMENITY_JOIN_FIELD}' not found in amenity workbook.")
+        raise ValueError(f"Column '{AMENITY_JOIN_FIELD}' not found in amenity file.")
     rider_df = _drop_missing_ids(rider_df, STOP_ID_FIELD, "ridership")
     amen_df = _drop_missing_ids(amen_df, AMENITY_JOIN_FIELD, "amenity")
     _log_match_rates(set(rider_df[STOP_ID_FIELD]), set(amen_df[AMENITY_JOIN_FIELD]))
@@ -320,7 +332,7 @@ def _merge_ridership_and_amenities(rider_df: pd.DataFrame, amen_df: pd.DataFrame
     dup_ct = int(amen_subset[STOP_ID_FIELD].duplicated().sum())
     if dup_ct:
         logging.warning(
-            "Amenity workbook has %d duplicate '%s' row(s); combining them (Y if any record is Y).",
+            "Amenity file has %d duplicate '%s' row(s); combining them (Y if any record is Y).",
             dup_ct,
             AMENITY_JOIN_FIELD,
         )
@@ -410,8 +422,8 @@ def main() -> int:
     )
 
     placeholders = {
-        "RIDERSHIP_XLSX": RIDERSHIP_XLSX,
-        "AMENITIES_XLSX": AMENITIES_XLSX,
+        "RIDERSHIP_PATH": RIDERSHIP_PATH,
+        "AMENITIES_PATH": AMENITIES_PATH,
         "OUTPUT_FOLDER": OUTPUT_FOLDER,
     }
     unset = [name for name, p in placeholders.items() if p is not None and _is_placeholder_path(p)]
@@ -427,18 +439,18 @@ def main() -> int:
     OUTPUT_FOLDER.mkdir(parents=True, exist_ok=True)
 
     # 1–2. LOAD SOURCE FILES (keep an untouched copy for the Raw Data sheet)
-    df_source = _load_ridership_data(RIDERSHIP_XLSX, RIDERSHIP_SHEET)
+    df_source = _load_ridership_data(RIDERSHIP_PATH, RIDERSHIP_SHEET)
     df_rider = _apply_amenity_aliases(df_source.copy())
     for field in (STOP_ID_FIELD, RIDERSHIP_FIELD):
         if field not in df_rider.columns:
-            raise ValueError(f"Column '{field}' not found in workbook.")
+            raise ValueError(f"Column '{field}' not found in ridership file.")
     df_rider = _drop_missing_ids(df_rider, STOP_ID_FIELD, "ridership")
 
-    # 3. MERGE (optional amenity workbook)
-    if AMENITIES_XLSX is None:
+    # 3. MERGE (optional amenity file)
+    if AMENITIES_PATH is None:
         df_merged = df_rider
     else:
-        df_amen = _load_amenity_data(AMENITIES_XLSX, AMENITIES_SHEET)
+        df_amen = _load_amenity_data(AMENITIES_PATH, AMENITIES_SHEET)
         df_merged = _merge_ridership_and_amenities(df_rider, df_amen)
 
     # 4–5. CLEAN & AGGREGATE
