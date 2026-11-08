@@ -34,6 +34,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 # ==== CONFIGURATION ==========================================================
+# === BEGIN CONFIG ===
 
 _DEFAULT_GTFS_FOLDER_PATH = r"Path\To\Your\GTFS_Folder"
 _DEFAULT_BASE_OUTPUT_PATH = r"Path\To\Your\Output_Folder"
@@ -86,6 +87,8 @@ REQUIRED_GTFS_FILES = ["routes.txt", "trips.txt", "stop_times.txt"]
 WEEKDAY_DOW_SHARE: float = 0.80
 MIN_RECURRING_DATES: int = 4
 EXTRA_HOLIDAY_DATES: list[str] = []
+
+# === END CONFIG ===
 
 # ==== FUNCTIONS ==============================================================
 

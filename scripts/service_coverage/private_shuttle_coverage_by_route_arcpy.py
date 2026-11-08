@@ -7,8 +7,10 @@ but agencies rarely hold them in analysis-ready form — the typical source is a
 hand-maintained spreadsheet of operators with partial addresses, partial
 coordinates, blank rows, and free-text notes. This script turns that registry
 into three products so planners can see where private shuttles run and the
-modeling pipeline can test whether they move ridership:
+modeling pipeline can test whether they move ridership.
 
+Outputs
+-------
 1. **Clean registry** (``private_shuttles_clean.csv``) — deduplicated,
    whitespace-trimmed rows with usable WGS84 coordinates, plus a ``category``
    column derived from the notes: ``transit_feeder`` (the shuttle connects to

@@ -56,6 +56,7 @@ from shapely.strtree import STRtree
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+# === BEGIN CONFIG ===
 
 SIDEWALK_SHP = Path(r"Path\To\Your\Sidewalks_Centerline.shp")  # Must be a functional network
 GTFS_DIR = Path(r"Path\To\Your\GTFS_Folder")  # folder path must contain stops.txt
@@ -90,6 +91,8 @@ EXPORT_MAPS: bool = True  # write small PNG map per deleted stop
 
 # Logging
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
+
+# === END CONFIG ===
 
 # -----------------------------------------------------------------------------
 # TYPES

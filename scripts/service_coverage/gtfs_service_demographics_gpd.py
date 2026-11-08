@@ -82,6 +82,7 @@ from shapely.ops import substring, unary_union
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+# === BEGIN CONFIG ===
 
 # Select analysis mode: "network", "route", or "stop"
 ANALYSIS_MODE = "network"  # Options: "network", "route", "stop"
@@ -312,6 +313,8 @@ LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
 
 # Shipped default for SERVICE_IDS_TO_INCLUDE, so an unedited value can be flagged.
 _DEFAULT_SERVICE_IDS: Final[list[str]] = ["4"]
+
+# === END CONFIG ===
 
 # =============================================================================
 # FUNCTIONS

@@ -1,6 +1,6 @@
 r"""Analyze NTD monthly ridership using a plain-text config or a previous run log.
 
-Set CONFIG_PATH below, then run the script from a notebook, IDE, or shell:
+Typical usage: set CONFIG_PATH below, then run from a notebook, IDE, or shell:
     python ntd_monthly_summary.py
     python ntd_monthly_summary.py --config "C:\\reports\\ntd_monthly_config.txt"
     python ntd_monthly_summary.py --config "C:\\reports\\ntd_monthly_summary_runlog.txt"
@@ -18,10 +18,10 @@ run log retains that original directory, even if the log has been moved.
 Run-log input creates a new timestamped output folder beside the recorded output
 folder, preserving the earlier results. The workbooks themselves must still exist.
 
-Outputs retain the original master CSV, monthly workbook, route summaries,
-service-type summaries, plots, trend flags, and time-window folders. The run log
-records the loaded configuration text and resolved paths. Optional garage
-assignments add metadata to detailed data and route summaries.
+Outputs (as in the original script): master CSV, monthly workbook, route
+summaries, service-type summaries, plots, trend flags, and time-window folders.
+The run log records the loaded configuration text and resolved paths. Optional
+garage assignments add metadata to detailed data and route summaries.
 """
 
 from __future__ import annotations

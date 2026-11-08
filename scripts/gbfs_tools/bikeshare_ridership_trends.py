@@ -71,6 +71,7 @@ import pandas as pd
 # ===========================================================================
 # CONFIGURATION  --  notebook users edit these; CLI flags override them
 # ===========================================================================
+# === BEGIN CONFIG ===
 
 # Input: a directory of ``*-capitalbikeshare-tripdata.csv`` files, or a single
 # ``.zip`` archive containing them. Raw string (r"...") so Windows paths paste
@@ -86,6 +87,8 @@ OUTPUT_DIR = r"out/bikeshare_trends"
 MAX_STATION_PLOTS = 0
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
+
+# === END CONFIG ===
 
 # ===========================================================================
 # Constants

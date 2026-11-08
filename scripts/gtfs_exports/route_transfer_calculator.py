@@ -67,6 +67,7 @@ from shapely.geometry import Point
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+# === BEGIN CONFIG ===
 
 # GTFS feed folder containing stops.txt, routes.txt, trips.txt, and
 # stop_times.txt. For transfers between agencies, merge their feeds first with
@@ -142,6 +143,8 @@ _DAY_COLUMNS = (
     "saturday",
     "sunday",
 )
+
+# === END CONFIG ===
 
 # =============================================================================
 # FUNCTIONS

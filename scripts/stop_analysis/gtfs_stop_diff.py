@@ -28,7 +28,7 @@ secondary ID changes are flagged separately and do not count as attribute change
   --route-pairs-file. CLI choices override file/config for each named route.
 - Use 'all_stops' for an intentional inventory comparison of two complete feeds.
 
-Outputs in a new timestamped run folder:
+Outputs (in a new timestamped run folder):
   stops_comparison.xlsx, summary.json, run_settings.json, gtfs_stop_diff.log,
   plus a CSV for each workbook sheet. Primary sheets: summary, route_scope,
   modified, removed_from_scope, new_stop_codes, existing_stops_new_to_scope,
@@ -54,7 +54,7 @@ attribute losses in a concept export are retained and explained, not suppressed.
 No service-date or pickup/drop-off filtering is performed. In route scope,
 parent stations and other unreferenced locations remain in the full inventory.
 
-Examples:
+Typical usage:
     python gtfs_stop_diff.py --before current.zip --after concept.zip --out output
     python gtfs_stop_diff.py --scope all_stops --before a.zip --after b.zip
     python gtfs_stop_diff.py --before-routes 301 305 310
@@ -89,6 +89,7 @@ if TYPE_CHECKING:
 # =============================================================================
 # CONFIGURATION -- EDIT HERE
 # =============================================================================
+# === BEGIN CONFIG ===
 BEFORE_GTFS_DIR = Path(r"Path\To\Current_GTFS\current_gtfs.zip")
 AFTER_GTFS_DIR = Path(r"Path\To\Concept_GTFS\concept_gtfs.zip")
 OUTPUT_DIR = Path(r"Path\To\Output_Folder")
@@ -127,6 +128,8 @@ ENABLE_ROUTE_CONTEXT = True  # Required in after_routes mode; optional in all_st
 # Attributes explicitly ignored here still appear in the full inventories.
 IGNORE_ATTRIBUTES: list[str] = []
 LOG_LEVEL = logging.INFO
+
+# === END CONFIG ===
 
 # =============================================================================
 # Models and shared helpers
