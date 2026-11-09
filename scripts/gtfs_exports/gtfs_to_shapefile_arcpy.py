@@ -606,14 +606,14 @@ def _build_route_patterns(
 
         combos = trips[["route_id", "direction_id", "shape_id"]].drop_duplicates().copy()
 
-        def _length_km(shape_id: str) -> float:
+        def _length_mi(shape_id: str) -> float:
             geom = shape_geoms.get(shape_id)
             if geom is None:
                 return float("nan")
-            return geom.getLength("GEODESIC", "KILOMETERS")
+            return geom.getLength("GEODESIC", "MILES")
 
-        combos["length_km"] = combos["shape_id"].apply(_length_km)
-        combos = combos.dropna(subset=["length_km"])
+        combos["length_mi"] = combos["shape_id"].apply(_length_mi)
+        combos = combos.dropna(subset=["length_mi"])
 
         if combos.empty:
             logging.warning("No valid shape lengths for 'longest' patterns.")
@@ -621,7 +621,7 @@ def _build_route_patterns(
 
         chosen = (
             combos.sort_values(
-                ["route_id", "direction_id", "length_km", "shape_id"],
+                ["route_id", "direction_id", "length_mi", "shape_id"],
                 ascending=[True, True, False, True],
             )
             .groupby(["route_id", "direction_id"], as_index=False)
