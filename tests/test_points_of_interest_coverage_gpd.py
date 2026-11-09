@@ -234,6 +234,63 @@ def test_prepare_route_buffers_route_filter_excludes_unspecified_routes() -> Non
     assert list(result["route_id"]) == ["R1"]
 
 
+def _write_numeric_id_gtfs(gtfs_dir: Path) -> None:
+    """Write a feed with numeric-looking ids, a blank shape_id and an alphanumeric station."""
+    (gtfs_dir / "routes.txt").write_text("route_id\n10\n")
+    (gtfs_dir / "trips.txt").write_text("route_id,trip_id,shape_id\n10,1,12345\n10,2,\n")
+    (gtfs_dir / "stop_times.txt").write_text(
+        "trip_id,stop_id,stop_sequence\n1,001,1\n1,002,2\n2,001,1\n2,002,2\n"
+    )
+    (gtfs_dir / "stops.txt").write_text(
+        "stop_id,stop_lat,stop_lon,parent_station\n"
+        "001,0.0,0.0,\n002,0.01,0.01,STN1\nSTN1,0.01,0.01,\n"
+    )
+    (gtfs_dir / "shapes.txt").write_text(
+        "shape_id,shape_pt_lat,shape_pt_lon,shape_pt_sequence\n12345,0.0,0.0,1\n12345,0.01,0.01,2\n"
+    )
+
+
+def test_load_gtfs_tables_reads_ids_as_text(tmp_path: Path) -> None:
+    """Ids keep leading zeros, and stop_id has one type in stops.txt and stop_times.txt."""
+    gtfs_dir = tmp_path / "gtfs"
+    gtfs_dir.mkdir()
+    _write_numeric_id_gtfs(gtfs_dir)
+    tables = _load_gtfs_tables(gtfs_dir, need_shapes=True)
+    assert tables["stops"]["stop_id"].tolist() == ["001", "002", "STN1"]
+    assert tables["stop_times"]["stop_id"].tolist() == ["001", "002", "001", "002"]
+    assert tables["trips"]["route_id"].tolist() == ["10", "10"]
+    assert pd.api.types.is_float_dtype(tables["stops"]["stop_lat"])
+
+
+@pytest.mark.parametrize("use_shape_buffer", [False, True])
+def test_prepare_route_buffers_numeric_ids_match_string_route_filter(
+    tmp_path: Path, use_shape_buffer: bool
+) -> None:
+    """Numeric-looking ids from disk build a buffer and match a string ROUTE_FILTER."""
+    gtfs_dir = tmp_path / "gtfs"
+    gtfs_dir.mkdir()
+    _write_numeric_id_gtfs(gtfs_dir)
+    tables = _load_gtfs_tables(gtfs_dir, need_shapes=use_shape_buffer)
+    result = _prepare_route_buffers(
+        tables, use_shape_buffer=use_shape_buffer, buffer_dist_ft=1320.0, route_filter=["10"]
+    )
+    assert list(result["route_id"]) == ["10"]
+    assert not result.geometry.iloc[0].is_empty
+
+
+def test_prepare_route_buffers_unmatched_route_filter_returns_empty(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A filter matching no route returns an empty table and names the unmatched ids."""
+    with caplog.at_level(logging.WARNING):
+        result = _prepare_route_buffers(
+            _minimal_tables(), use_shape_buffer=True, buffer_dist_ft=1320.0, route_filter=["R9"]
+        )
+    assert result.empty
+    assert list(result.columns) == ["route_id", "geometry"]
+    assert "R9" in caplog.text
+
+
 def test_prepare_route_buffers_simplify_reduces_buffer_vertices() -> None:
     """A positive tolerance collapses collinear points into a coarser buffer.
 

@@ -24,22 +24,22 @@ from scripts.stop_analysis.stop_removal_impact_gpd import (
 def test_quantize_node_snaps_to_grid() -> None:
     # 12.3 / 5 = 2.46 → rounds to 2 → 2 * 5 = 10.0
     # 47.8 / 5 = 9.56 → rounds to 10 → 10 * 5 = 50.0
-    result = quantize_node(12.3, 47.8, step_ft=5.0)
+    result = quantize_node(12.3, 47.8, step=5.0)
     assert result == (10.0, 50.0)
 
 
 def test_quantize_node_exact_multiple_unchanged() -> None:
-    result = quantize_node(100.0, 200.0, step_ft=5.0)
+    result = quantize_node(100.0, 200.0, step=5.0)
     assert result == (100.0, 200.0)
 
 
 def test_quantize_node_zero_zero() -> None:
-    result = quantize_node(0.0, 0.0, step_ft=5.0)
+    result = quantize_node(0.0, 0.0, step=5.0)
     assert result == (0.0, 0.0)
 
 
 def test_quantize_node_returns_tuple_of_floats() -> None:
-    x, y = quantize_node(7.3, 9.9, step_ft=5.0)
+    x, y = quantize_node(7.3, 9.9, step=5.0)
     assert isinstance(x, float)
     assert isinstance(y, float)
 

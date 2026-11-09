@@ -30,7 +30,8 @@ def load_shapefile(path: str, member: Optional[str] = None) -> gpd.GeoDataFrame:
             of the one to load (matched case-insensitively against its
             base filename, e.g. ``"Hospitals.shp"``). Ignored when *path*
             is a direct ``.shp`` file. Required when the archive contains
-            more than one shapefile.
+            more than one shapefile. macOS metadata entries (anything under
+            ``__MACOSX/`` and ``._*`` files) are not counted as shapefiles.
 
     Returns:
         The loaded :class:`geopandas.GeoDataFrame`.
@@ -55,7 +56,15 @@ def load_shapefile(path: str, member: Optional[str] = None) -> gpd.GeoDataFrame:
 
     try:
         with zipfile.ZipFile(path) as archive:
-            shp_members = [name for name in archive.namelist() if name.lower().endswith(".shp")]
+            # Zips made with macOS Finder add __MACOSX/._<name>.shp metadata
+            # files next to the real ones; they are not shapefiles.
+            shp_members = [
+                name
+                for name in archive.namelist()
+                if name.lower().endswith(".shp")
+                and not name.startswith("__MACOSX/")
+                and not os.path.basename(name).startswith("._")
+            ]
     except zipfile.BadZipFile as exc:
         raise ValueError(f"'{path}' is not a valid zip archive.") from exc
 

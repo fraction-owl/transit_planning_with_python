@@ -168,7 +168,10 @@ def _read_gtfs_tables(gtfs_path: str | Path) -> Dict[str, pd.DataFrame]:
             p = root / name
             if p.exists():
                 logging.info("Reading %s", p)
-                out[key] = pd.read_csv(p)
+                # All text, so ids keep leading zeros and a blank shape_id can't
+                # turn trips.shape_id into floats ("12345.0") that no longer
+                # match shapes.txt. Numeric columns are converted where used.
+                out[key] = pd.read_csv(p, dtype=str, low_memory=False)
             else:
                 logging.warning("GTFS: %s not found at %s", name, p)
         return out
@@ -606,14 +609,14 @@ def _build_route_patterns(
 
         combos = trips[["route_id", "direction_id", "shape_id"]].drop_duplicates().copy()
 
-        def _length_km(shape_id: str) -> float:
+        def _length_mi(shape_id: str) -> float:
             geom = shape_geoms.get(shape_id)
             if geom is None:
                 return float("nan")
-            return geom.getLength("GEODESIC", "KILOMETERS")
+            return geom.getLength("GEODESIC", "MILES")
 
-        combos["length_km"] = combos["shape_id"].apply(_length_km)
-        combos = combos.dropna(subset=["length_km"])
+        combos["length_mi"] = combos["shape_id"].apply(_length_mi)
+        combos = combos.dropna(subset=["length_mi"])
 
         if combos.empty:
             logging.warning("No valid shape lengths for 'longest' patterns.")
@@ -621,7 +624,7 @@ def _build_route_patterns(
 
         chosen = (
             combos.sort_values(
-                ["route_id", "direction_id", "length_km", "shape_id"],
+                ["route_id", "direction_id", "length_mi", "shape_id"],
                 ascending=[True, True, False, True],
             )
             .groupby(["route_id", "direction_id"], as_index=False)
@@ -643,7 +646,7 @@ def _build_route_patterns(
         geom = shape_geoms.get(shape_id)
 
         if geom is None:
-            logging.debug(
+            logging.warning(
                 "Missing geometry for shape_id=%s (route_id=%s, dir=%s); skipping.",
                 shape_id,
                 route_id,
@@ -1006,10 +1009,10 @@ def main() -> int:  # noqa: D401
             shape_geoms = _build_shape_geometries(shapes_df)
 
             route_filter_in_set: Optional[Set[str]] = (
-                set(ROUTE_FILTER_IN) if ROUTE_FILTER_IN else None
+                {str(rid).strip() for rid in ROUTE_FILTER_IN} if ROUTE_FILTER_IN else None
             )
             route_filter_out_set: Optional[Set[str]] = (
-                set(ROUTE_FILTER_OUT) if ROUTE_FILTER_OUT else None
+                {str(rid).strip() for rid in ROUTE_FILTER_OUT} if ROUTE_FILTER_OUT else None
             )
 
             routes = _build_route_patterns(

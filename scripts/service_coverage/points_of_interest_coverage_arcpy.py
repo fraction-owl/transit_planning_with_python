@@ -165,11 +165,19 @@ def _load_gtfs_tables(gtfs_dir: Path) -> Mapping[str, pd.DataFrame]:
     required = ["routes", "trips", "stop_times", "stops", "shapes"]
     tables: Dict[str, pd.DataFrame] = {}
 
+    # Read ids as text: inferred dtypes turn "01" into 1, and can type the same
+    # id column as int in one file but str in another (one alphanumeric
+    # stop_id is enough), so joins and ROUTE_FILTER silently match nothing.
+    id_dtypes = {
+        col: "str"
+        for col in ("route_id", "trip_id", "stop_id", "shape_id", "service_id", "parent_station")
+    }
+
     for fn in required:
         path = gtfs_dir / f"{fn}.txt"
         if not path.exists():
             raise FileNotFoundError(path)
-        df = pd.read_csv(path)
+        df = pd.read_csv(path, dtype=id_dtypes)
         tables[fn] = df
         _add_message(f"Loaded {path} ({len(df)} rows)", "INFO")
 
@@ -725,12 +733,19 @@ def _build_route_buffers_fc(
     )
     arcpy.management.AddField(out_fc, "route_id", "TEXT", field_length=64)
 
-    express_set = set(EXPRESS_ROUTES)
+    express_set = {str(rid).strip() for rid in EXPRESS_ROUTES}
+    route_filter = {str(rid).strip() for rid in ROUTE_FILTER}
+    unmatched = sorted(route_filter - {str(rid) for rid in all_route_ids})
+    if unmatched:
+        _add_message(
+            f"ROUTE_FILTER route_id(s) not used by any trip in the feed: {', '.join(unmatched)}",
+            "WARNING",
+        )
     insert_fields = ["route_id", "SHAPE@"]
 
     with arcpy.da.InsertCursor(out_fc, insert_fields) as icur:
         for route_id in all_route_ids:
-            if ROUTE_FILTER and route_id not in ROUTE_FILTER:
+            if route_filter and route_id not in route_filter:
                 continue
 
             shape_ids = route_shapes.get(route_id, [])
@@ -1347,7 +1362,7 @@ def main() -> int:
                 tables=tables,
                 distance_ft=TRANSFER_DISTANCE_FT,
                 time_window_min=TRANSFER_TIME_MIN,
-                subject_routes=ROUTE_FILTER or None,
+                subject_routes=[str(rid).strip() for rid in ROUTE_FILTER] or None,
                 output_dir=OUTPUT_DIR,
             )
         except Exception as exc:

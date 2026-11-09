@@ -71,6 +71,24 @@ def test_load_shapefile_zip_multiple_members_requires_member(tmp_path: Path) -> 
     assert gdf.loc[0, "NAME"] == "General Hospital"
 
 
+def test_load_shapefile_zip_ignores_macos_metadata(tmp_path: Path) -> None:
+    """A Finder-made zip's __MACOSX/._*.shp entries don't count as extra shapefiles."""
+    shp_dir = tmp_path / "src"
+    shp_dir.mkdir()
+    shp_path = _mk_point_shp(shp_dir, "stops", "Main St")
+    zip_path = tmp_path / "stops_mac.zip"
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for component in sorted(shp_path.parent.glob(f"{shp_path.stem}.*")):
+            zf.write(component, f"stops/{component.name}")
+            zf.writestr(f"__MACOSX/stops/._{component.name}", b"\x00\x05\x16\x07")
+        zf.writestr("stops/._stops.shp", b"\x00\x05\x16\x07")
+
+    gdf = load_shapefile(str(zip_path))
+
+    assert len(gdf) == 1
+    assert gdf.loc[0, "NAME"] == "Main St"
+
+
 def test_load_shapefile_zip_member_not_found_raises(tmp_path: Path) -> None:
     """An explicit `member` that isn't in the zip raises a clear ValueError."""
     shp_dir = tmp_path / "src"

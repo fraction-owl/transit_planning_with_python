@@ -2164,10 +2164,6 @@ def load_id_set(
 ) -> set[str]:
     """Union an inline list and an optional text file of ids into one set.
 
-    Copied verbatim from utils/gtfs_helpers.py so this script stays
-    self-contained (same convention as the helpers above). Keep both copies in
-    sync when updating either.
-
     Used to resolve override lists (express routes, express origin stops, …) that
     a caller may supply inline, in an external file, or both — without repeating
     the parsing for each one.
@@ -2216,8 +2212,7 @@ def load_express_route_ids(
 ) -> set[str]:
     """Resolve the set of express-route ``route_id`` values (see ``load_id_set``).
 
-    Thin wrapper kept for readable call sites and backwards compatibility. Copied
-    verbatim from utils/gtfs_helpers.py — keep both copies in sync.
+    Thin wrapper kept for readable call sites and backwards compatibility.
     """
     return load_id_set(inline_ids, txt_path, kind="express route")
 
