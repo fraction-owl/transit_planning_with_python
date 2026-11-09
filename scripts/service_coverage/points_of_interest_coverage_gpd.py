@@ -39,7 +39,7 @@ import math
 import sys
 import zipfile
 from pathlib import Path
-from typing import Iterable, List, Mapping, Optional, Sequence
+from typing import Hashable, Iterable, List, Mapping, Optional, Sequence
 
 import geopandas as gpd
 import pandas as pd
@@ -140,12 +140,20 @@ def _load_gtfs_tables(gtfs_dir: Path, *, need_shapes: bool) -> Mapping[str, pd.D
     if need_shapes:
         names.append("shapes")
 
+    # Read ids as text: inferred dtypes turn "01" into 1, and can type the same
+    # id column as int in one file but str in another (one alphanumeric
+    # stop_id is enough), so joins and ROUTE_FILTER silently match nothing.
+    id_dtypes: dict[Hashable, str] = {
+        col: "str"
+        for col in ("route_id", "trip_id", "stop_id", "shape_id", "service_id", "parent_station")
+    }
+
     tables = {}
     for fn in names:
         path = gtfs_dir / f"{fn}.txt"
         if not path.exists():
             raise FileNotFoundError(path)
-        tables[fn] = pd.read_csv(path)
+        tables[fn] = pd.read_csv(path, dtype=id_dtypes)
         logging.debug("Loaded %s (%d rows)", fn, len(tables[fn]))
     return tables
 
@@ -328,7 +336,13 @@ def _prepare_route_buffers(
             .apply(list)
         )
 
-    selected_routes = [rid for rid in route_to_ids.index if not route_filter or rid in route_filter]
+    wanted = {str(rid).strip() for rid in route_filter or ()}
+    selected_routes = [rid for rid in route_to_ids.index if not wanted or str(rid) in wanted]
+    unmatched = sorted(wanted - {str(rid) for rid in route_to_ids.index})
+    if unmatched:
+        logging.warning(
+            "ROUTE_FILTER route_id(s) not used by any trip in the feed: %s", ", ".join(unmatched)
+        )
     logging.info(
         "Buffering %d route(s) (buffer=%.1f ft -> %.1f %s, simplify=%.1f %s, mode=%s)...",
         len(selected_routes),
@@ -365,7 +379,10 @@ def _prepare_route_buffers(
         if processed % log_every == 0 or processed == len(selected_routes):
             logging.info("  buffered %d/%d route(s)", processed, len(selected_routes))
 
-    buffer_gdf = gpd.GeoDataFrame(buffers, geometry="geometry", crs=projected_crs)
+    # Name the columns so an empty result (no route matched) still builds.
+    buffer_gdf = gpd.GeoDataFrame(
+        buffers, columns=["route_id", "geometry"], geometry="geometry", crs=projected_crs
+    )
     logging.info("Built %d route buffer(s).", len(buffer_gdf))
     return buffer_gdf
 
