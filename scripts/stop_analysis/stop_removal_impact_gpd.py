@@ -101,6 +101,9 @@ LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
 NodeKey = Tuple[float, float]  # quantized (x, y)
 EdgeID = int
 
+# Default grid step for the canonical quantize_node() copy below.
+DEFAULT_NODE_GRID_FT: float = NODE_GRID_FT
+
 # =============================================================================
 # FUNCTIONS
 # =============================================================================
@@ -232,9 +235,19 @@ def resolve_deleted_stop_ids(
     return resolved, match_map
 
 
-def quantize_node(x: float, y: float, step_ft: float = NODE_GRID_FT) -> NodeKey:
-    """Snap (x, y) to a square grid of size 'step_ft' (feet)."""
-    return (round(float(x) / step_ft) * step_ft, round(float(y) / step_ft) * step_ft)
+def quantize_node(x: float, y: float, step: float = DEFAULT_NODE_GRID_FT) -> NodeKey:
+    """Snap an ``(x, y)`` coordinate to a square grid of size ``step``.
+
+    Args:
+        x: X coordinate in the layer's CRS units.
+        y: Y coordinate in the layer's CRS units.
+        step: Grid size used to merge near-coincident endpoints into a shared
+            node. Expressed in the same linear units as the coordinates.
+
+    Returns:
+        The grid-snapped ``(x, y)`` tuple, suitable as a hashable node key.
+    """
+    return (round(float(x) / step) * step, round(float(y) / step) * step)
 
 
 def linestring_length(line: LineString) -> float:
