@@ -28,10 +28,24 @@ secondary ID changes are flagged separately and do not count as attribute change
   --route-pairs-file. CLI choices override file/config for each named route.
 - Use 'all_stops' for an intentional inventory comparison of two complete feeds.
 
+Change categories (stop_changes sheet; flags, so one stop can carry several):
+  loses_all_service, newly_served, new_stop, loses_routes / gains_routes,
+  loses_days / gains_days (weekday, saturday, sunday at the stop), route_loses_days /
+  route_gains_days (a continuing route serves the stop on fewer / more day types),
+  relocated, renamed, renumbered (stop_id key: same stop_id, new stop_code), and the
+  review-only possible_renumber (a removed and a new key at the same spot or sharing
+  an ID) / possible_relocation (a nearby candidate beyond RELOCATE_THRESHOLD_FEET).
+  Possible renumbers stay counted as loses_all_service + new_stop. Routes outside an
+  after_routes scope are assumed to keep running, so they still count as service
+  after. Route losses and gains follow the route pairing (all_stops: same route_id
+  or name), so a renamed route is not a loss. Day types come from calendar.txt flags
+  plus calendar_dates.txt additions, the same method as gtfs_route_diff.py; date
+  ranges and removals are ignored.
+
 Outputs (in a new timestamped run folder):
   stops_comparison.xlsx, summary.json, run_settings.json, gtfs_stop_diff.log,
   plus a CSV for each workbook sheet. Primary sheets: summary, route_scope,
-  modified, removed_from_scope, new_stop_codes, existing_stops_new_to_scope,
+  stop_changes, modified, removed_from_scope, new_stop_codes, existing_stops_new_to_scope,
   needs_review, attribute_summary. ADDITIONS_OUTPUT_MODE controls addition tables:
   separate (default), combined, new_only, or existing_only. Summary totals always
   retain both categories. "New" means the selected primary key is absent from
@@ -51,7 +65,8 @@ Primary-key matches are exact. Candidate ID changes use stop_code and nearby coo
 these are review suggestions only and never silently revise the counts. Blank
 GTFS defaults are normalized for location_type and wheelchair_boarding. Other
 attribute losses in a concept export are retained and explained, not suppressed.
-No service-date or pickup/drop-off filtering is performed. In route scope,
+No service-date or pickup/drop-off filtering is performed; day types describe
+calendar patterns, not specific dates. In route scope,
 parent stations and other unreferenced locations remain in the full inventory.
 
 Typical usage:
@@ -74,7 +89,7 @@ import logging
 import math
 import sys
 import zipfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -135,7 +150,7 @@ LOG_LEVEL = logging.INFO
 # Models and shared helpers
 # =============================================================================
 LOGGER = logging.getLogger("gtfs_stop_diff")
-VERSION = "2.3.0"
+VERSION = "2.4.0"
 ATTRIBUTES = (
     "stop_name",
     "stop_code",
@@ -152,6 +167,27 @@ ATTRIBUTES = (
     "stop_access",
 )
 DEFAULTS = {"location_type": "0", "wheelchair_boarding": "0"}
+DAY_TYPES = ("weekday", "saturday", "sunday")
+WEEKDAY_COLUMNS = ("monday", "tuesday", "wednesday", "thursday", "friday")
+# stop_changes flags in reporting order, with the label used in change_summary.
+STOP_CHANGE_FLAGS = (
+    ("loses_all_service", "loses all service"),
+    ("newly_served", "newly served"),
+    ("new_stop", "new stop"),
+    ("loses_routes", "loses routes"),
+    ("gains_routes", "gains routes"),
+    ("loses_days", "loses service days"),
+    ("gains_days", "gains service days"),
+    ("route_loses_days", "a continuing route loses days"),
+    ("route_gains_days", "a continuing route gains days"),
+    ("relocated", "relocated"),
+    ("renamed", "renamed"),
+    ("renumbered", "renumbered"),
+    ("possible_renumber", "possible renumber (review)"),
+    ("possible_relocation", "possible relocation with new ID (review)"),
+    ("other_attributes_changed", "other attributes changed"),
+    ("location_needs_review", "location needs review"),
+)
 
 
 @dataclass
@@ -416,8 +452,102 @@ def load_stops(source: Path, label: str) -> pd.DataFrame:
     return stops
 
 
+def read_optional_gtfs_table(source: Path, filename: str) -> pd.DataFrame | None:
+    """Return an optional GTFS table, or None when the feed omits it."""
+    try:
+        return read_gtfs_table(source, filename)
+    except FileNotFoundError:
+        return None
+
+
+def service_day_types(
+    calendar: pd.DataFrame | None, calendar_dates: pd.DataFrame | None
+) -> dict[str, frozenset[str]]:
+    """Map each service_id to the day types it runs: weekday, saturday, sunday.
+
+    Uses calendar.txt day flags plus the weekday of each calendar_dates.txt
+    addition, the same method as gtfs_route_diff.py. Date ranges and removals
+    (exception_type 2) are ignored: this asks which kinds of day a schedule
+    runs, not on which dates.
+    """
+    out: dict[str, set[str]] = {}
+    if calendar is not None:
+        require_columns(calendar, {"service_id"}, "calendar.txt")
+        for row in calendar.to_dict("records"):
+            service_id = str(row.get("service_id", "")).strip()
+            if not service_id:
+                continue
+            types = out.setdefault(service_id, set())
+            if any(str(row.get(column, "")).strip() == "1" for column in WEEKDAY_COLUMNS):
+                types.add("weekday")
+            for day in ("saturday", "sunday"):
+                if str(row.get(day, "")).strip() == "1":
+                    types.add(day)
+    if calendar_dates is not None:
+        require_columns(
+            calendar_dates, {"service_id", "date", "exception_type"}, "calendar_dates.txt"
+        )
+        added = calendar_dates.loc[normalize_text(calendar_dates["exception_type"]).eq("1")]
+        dates = pd.to_datetime(normalize_text(added["date"]), format="%Y%m%d", errors="coerce")
+        invalid = int(dates.isna().sum())
+        if invalid:
+            LOGGER.warning("calendar_dates.txt: %d added dates are not YYYYMMDD; ignored.", invalid)
+        for service_id, weekday in zip(normalize_text(added["service_id"]), dates.dt.weekday):
+            if not service_id or pd.isna(weekday):
+                continue
+            day = "saturday" if weekday == 5 else "sunday" if weekday == 6 else "weekday"
+            out.setdefault(service_id, set()).add(day)
+    return {service_id: frozenset(types) for service_id, types in out.items()}
+
+
+def stop_route_day_types(source: Path, visits: pd.DataFrame) -> pd.DataFrame | None:
+    """Return day types per stop/route pair, or None when calendars are unavailable.
+
+    ``visits`` holds unique trip/stop references joined to route_id and, when
+    trips.txt provides it, service_id.
+    """
+    if "service_id" not in visits:
+        LOGGER.warning("%s: trips.txt has no service_id; day impact not assessed.", source.name)
+        return None
+    calendar = read_optional_gtfs_table(source, "calendar.txt")
+    calendar_dates = read_optional_gtfs_table(source, "calendar_dates.txt")
+    if calendar is None and calendar_dates is None:
+        LOGGER.warning(
+            "%s: no calendar.txt or calendar_dates.txt; day impact not assessed.", source.name
+        )
+        return None
+    lookup = service_day_types(calendar, calendar_dates)
+    unique = pd.DataFrame(
+        {
+            "stop_id": visits["stop_id"],
+            "route_id": visits["route_id"],
+            "service_id": normalize_text(visits["service_id"]),
+        }
+    ).drop_duplicates()
+    unknown = sorted(set(unique["service_id"]) - {key for key, days in lookup.items() if days})
+    if unknown:
+        LOGGER.warning(
+            "%s: %d service_id values have no calendar days; their trips add no day types "
+            "(sample: %s).",
+            source.name,
+            len(unknown),
+            unknown[:10],
+        )
+    pair_days: dict[tuple[str, str], set[str]] = {}
+    for stop_id, route_id, service_id in unique.itertuples(index=False, name=None):
+        pair_days.setdefault((stop_id, route_id), set()).update(lookup.get(service_id, ()))
+    return pd.DataFrame(
+        [(stop_id, route_id, frozenset(days)) for (stop_id, route_id), days in pair_days.items()],
+        columns=pd.Index(["stop_id", "route_id", "day_types"]),
+    )
+
+
 def load_route_context(source: Path, stops: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Validate IDs and build unique stop/route references across all trips."""
+    """Validate IDs and build unique stop/route references across all trips.
+
+    When the feed has calendars, each stop/route pair also carries the day
+    types its trips run (a frozenset in the ``day_types`` column).
+    """
     routes = read_gtfs_table(source, "routes.txt")
     trips = read_gtfs_table(source, "trips.txt")
     stop_times = read_gtfs_table(source, "stop_times.txt", ["trip_id", "stop_id"])
@@ -452,22 +582,25 @@ def load_route_context(source: Path, stops: pd.DataFrame) -> tuple[pd.DataFrame,
     labels = text_column(routes, "route_short_name")
     labels = labels.mask(labels.eq(""), text_column(routes, "route_long_name"))
     routes["route_label"] = labels.mask(labels.eq(""), routes["route_id"])
-    pairs = (
-        stop_times.drop_duplicates()
-        .merge(
-            trips[["trip_id", "route_id"]],
-            on="trip_id",
-            how="left",
-            validate="many_to_one",
-        )[["stop_id", "route_id"]]
-        .drop_duplicates()
+    service_columns = ["service_id"] if "service_id" in trips else []
+    visits = stop_times.drop_duplicates().merge(
+        trips[["trip_id", "route_id", *service_columns]],
+        on="trip_id",
+        how="left",
+        validate="many_to_one",
     )
+    pairs = visits[["stop_id", "route_id"]].drop_duplicates()
     pairs = pairs.merge(
         routes[["route_id", "route_label"]],
         on="route_id",
         how="left",
         validate="many_to_one",
     )
+    day_types = stop_route_day_types(source, visits)
+    if day_types is not None:
+        pairs = pairs.merge(
+            day_types, on=["stop_id", "route_id"], how="left", validate="one_to_one"
+        )
     LOGGER.info("Built %d stop/route pairs for %s", len(pairs), source.name)
     return routes, pairs
 
@@ -1064,6 +1197,270 @@ def candidate_matches(
 
 
 # =============================================================================
+# Stop change categories -- service, routes, days, location, name, and IDs
+# =============================================================================
+def has_day_context(feed: Feed) -> bool:
+    """Return True when the feed's stop/route pairs carry service day types."""
+    return feed.pairs is not None and "day_types" in feed.pairs.columns
+
+
+def route_counterparts(before: Feed, after: Feed, scope: Scope, mode: str) -> set[tuple[str, str]]:
+    """Return (before route_id, after route_id) pairs treated as the same service.
+
+    after_routes uses the resolved pairing (same name or explicit pair, including
+    merges and splits); all_stops pairs routes that keep their route_id or whose
+    labels match, ignoring case.
+    """
+    if mode == "after_routes":
+        table = scope.route_table
+        if table.empty or not {"before_route_id", "after_route_id"} <= set(table.columns):
+            return set()
+        return {
+            (str(before_id), str(after_id))
+            for before_id, after_id in table[["before_route_id", "after_route_id"]].itertuples(
+                index=False, name=None
+            )
+            if str(before_id) and str(after_id)
+        }
+    if before.routes is None or after.routes is None:
+        return set()
+    after_by_label: dict[str, list[str]] = {}
+    for route_id, label in after.routes[["route_id", "route_label"]].itertuples(
+        index=False, name=None
+    ):
+        after_by_label.setdefault(str(label).strip().casefold(), []).append(str(route_id))
+    after_ids = set(after.routes["route_id"].astype(str))
+    pairs: set[tuple[str, str]] = set()
+    for route_id, label in before.routes[["route_id", "route_label"]].itertuples(
+        index=False, name=None
+    ):
+        if str(route_id) in after_ids:
+            pairs.add((str(route_id), str(route_id)))
+        for after_id in after_by_label.get(str(label).strip().casefold(), []):
+            pairs.add((str(route_id), after_id))
+    return pairs
+
+
+def service_by_stop(
+    pairs: pd.DataFrame | None, route_ids: set[str], inside: bool
+) -> dict[str, dict[str, frozenset[str]]]:
+    """Map stop_id to {route_id: day types} for routes inside (or outside) a set."""
+    out: dict[str, dict[str, frozenset[str]]] = {}
+    if pairs is None:
+        return out
+    mask = pairs["route_id"].isin(route_ids)
+    selected = pairs.loc[mask if inside else ~mask]
+    days = selected["day_types"] if "day_types" in selected else [frozenset()] * len(selected)
+    for stop_id, route_id, day_types in zip(selected["stop_id"], selected["route_id"], days):
+        value = day_types if isinstance(day_types, frozenset) else frozenset()
+        out.setdefault(str(stop_id), {})[str(route_id)] = value
+    return out
+
+
+def join_days(days: set[str] | frozenset[str]) -> str:
+    """Return day types in weekday, saturday, sunday order."""
+    return ", ".join(day for day in DAY_TYPES if day in days)
+
+
+def build_stop_changes(
+    before: Feed,
+    after: Feed,
+    scope: Scope,
+    mode: str,
+    full_b: pd.DataFrame,
+    full_a: pd.DataFrame,
+    compared: Sequence[pd.DataFrame],
+    candidates: pd.DataFrame,
+    identifier_changes: pd.DataFrame,
+    threshold: float,
+    primary_stop_key: str,
+) -> pd.DataFrame:
+    """Classify each stop in either comparison scope into planner change categories.
+
+    Categories are flags, not exclusive classes: one stop can lose a route, lose
+    Saturday service, and be renamed. Routes outside an after_routes scope are
+    assumed to keep running unchanged, so they still count as service after.
+    ``compared`` holds compare_shared results (shared stops and existing stops
+    newly used by the after scope). Candidate ID matches only raise the
+    possible_renumber / possible_relocation flags; they never move a stop out of
+    loses_all_service or new_stop.
+    """
+    service_ok = before.pairs is not None and after.pairs is not None
+    days_ok = has_day_context(before) and has_day_context(after)
+    successors: dict[str, set[str]] = {}
+    predecessors: dict[str, set[str]] = {}
+    for before_route, after_route in route_counterparts(before, after, scope, mode):
+        successors.setdefault(before_route, set()).add(after_route)
+        predecessors.setdefault(after_route, set()).add(before_route)
+    in_b = service_by_stop(before.pairs, scope.before_route_ids, inside=True)
+    other_b = service_by_stop(before.pairs, scope.before_route_ids, inside=False)
+    in_a = service_by_stop(after.pairs, scope.after_route_ids, inside=True)
+    labels_b = (
+        dict(zip(before.routes["route_id"], before.routes["route_label"]))
+        if before.routes is not None
+        else {}
+    )
+    labels_a = (
+        dict(zip(after.routes["route_id"], after.routes["route_label"]))
+        if after.routes is not None
+        else {}
+    )
+
+    def lookup(frame: pd.DataFrame, column: str) -> dict[str, str]:
+        return dict(zip(frame["comparison_key"], text_column(frame, column)))
+
+    ids_b, ids_a = lookup(full_b, "stop_id"), lookup(full_a, "stop_id")
+    codes_b, codes_a = lookup(full_b, "stop_code"), lookup(full_a, "stop_code")
+    names_b, names_a = lookup(full_b, "stop_name"), lookup(full_a, "stop_name")
+    scope_b = set(full_b.loc[full_b["in_comparison_scope"], "comparison_key"])
+    scope_a = set(full_a.loc[full_a["in_comparison_scope"], "comparison_key"])
+    attributes: dict[str, dict[Any, Any]] = {}
+    for frame in compared:
+        for row in frame.to_dict("records"):
+            attributes[str(row["comparison_key"])] = row
+
+    # Same spot: within the relocation threshold, or the same stop_code/stop_id.
+    near_b: set[str] = set()
+    near_a: set[str] = set()
+    same_spot_b: set[str] = set()
+    same_spot_a: set[str] = set()
+    if not candidates.empty:
+        distance = pd.to_numeric(candidates["distance_ft"], errors="coerce")
+        same_spot = distance.le(threshold) | candidates["same_stop_code"].eq(True)
+        near_b = set(candidates["before_comparison_key"])
+        near_a = set(candidates["after_comparison_key"])
+        same_spot_b = set(candidates.loc[same_spot, "before_comparison_key"])
+        same_spot_a = set(candidates.loc[same_spot, "after_comparison_key"])
+    if primary_stop_key == "stop_code" and not identifier_changes.empty:
+        same_spot_b |= set(normalize_text(identifier_changes["stop_code_before"]))
+        same_spot_a |= set(normalize_text(identifier_changes["stop_code_after"]))
+
+    def route_list(route_ids: Iterable[str], labels: Mapping[str, str]) -> str:
+        return join_labels([str(labels.get(route_id, route_id)) for route_id in route_ids])
+
+    def route_days(changes: Mapping[str, set[str] | frozenset[str]]) -> str:
+        ordered = sorted(changes, key=route_sort_key)
+        return "; ".join(f"{label}: {join_days(changes[label])}" for label in ordered)
+
+    rows: list[dict[str, Any]] = []
+    for key in sorted(scope_b | scope_a):
+        if key in scope_b and key in scope_a:
+            status = "shared"
+        else:
+            status = "removed_from_scope" if key in scope_b else "added_to_scope"
+        before_id, after_id = ids_b.get(key, ""), ids_a.get(key, "")
+        served_b = in_b.get(before_id, {}) if before_id else {}
+        served_a = in_a.get(after_id, {}) if after_id else {}
+        other = other_b.get(before_id, {}) if before_id else {}
+        has_before = bool(served_b or other)
+        has_after = bool(served_a or other)
+        lost = [route for route in served_b if not successors.get(route, set()) & set(served_a)]
+        gained = [route for route in served_a if not predecessors.get(route, set()) & set(served_b)]
+        days_before = frozenset().union(*served_b.values(), *other.values())
+        days_after = frozenset().union(*served_a.values(), *other.values())
+        route_days_lost: dict[str, set[str] | frozenset[str]] = {}
+        route_days_gained: dict[str, set[str] | frozenset[str]] = {}
+        for route, days in served_b.items():
+            kept = successors.get(route, set()) & set(served_a)
+            missing = days - frozenset().union(*(served_a[match] for match in kept))
+            if kept and missing:
+                route_days_lost[str(labels_b.get(route, route))] = missing
+        for route, days in served_a.items():
+            kept = predecessors.get(route, set()) & set(served_b)
+            extra = days - frozenset().union(*(served_b[match] for match in kept))
+            if kept and extra:
+                route_days_gained[str(labels_a.get(route, route))] = extra
+        attr = attributes.get(key, {})
+        fields = {field for field in str(attr.get("changed_fields", "")).split("; ") if field}
+        new_key_removed = status == "removed_from_scope" and key not in ids_a
+        new_key_added = status == "added_to_scope" and key not in ids_b
+        renumber_candidate = (new_key_removed and key in same_spot_b) or (
+            new_key_added and key in same_spot_a
+        )
+        nearby_candidate = (new_key_removed and key in near_b) or (new_key_added and key in near_a)
+        flags = {
+            "loses_all_service": service_ok and has_before and not has_after,
+            "newly_served": service_ok and key in ids_b and not has_before and has_after,
+            "new_stop": new_key_added,
+            "loses_routes": service_ok and has_after and bool(lost),
+            "gains_routes": service_ok and has_before and bool(gained),
+            "loses_days": days_ok and has_after and bool(days_before - days_after),
+            "gains_days": days_ok and has_before and bool(days_after - days_before),
+            "route_loses_days": days_ok and bool(route_days_lost),
+            "route_gains_days": days_ok and bool(route_days_gained),
+            "relocated": bool(attr.get("coordinate_changed_over_threshold", False)),
+            "renamed": "stop_name" in fields,
+            "renumbered": primary_stop_key == "stop_id"
+            and bool(attr.get("secondary_id_changed", False)),
+            "possible_renumber": renumber_candidate,
+            "possible_relocation": nearby_candidate and not renumber_candidate,
+            "other_attributes_changed": bool(fields - {"stop_name", "stop_code"}),
+            "location_needs_review": bool(attr.get("needs_review", False)),
+        }
+        fallback = {"removed_from_scope": "removed from scope", "added_to_scope": "added to scope"}
+        summary = [label for flag, label in STOP_CHANGE_FLAGS if flags[flag]]
+        rows.append(
+            {
+                "comparison_key": key,
+                "primary_stop_key": primary_stop_key,
+                "comparison_status": status,
+                "change_summary": "; ".join(summary) or fallback.get(status, "unchanged"),
+                "stop_id_before": before_id,
+                "stop_id_after": after_id,
+                "stop_code_before": codes_b.get(key, ""),
+                "stop_code_after": codes_a.get(key, ""),
+                "stop_name_before": names_b.get(key, ""),
+                "stop_name_after": names_a.get(key, ""),
+                **flags,
+                "compared_routes_before": route_list(served_b, labels_b),
+                "compared_routes_after": route_list(served_a, labels_a),
+                "other_current_routes": route_list(other, labels_b),
+                "routes_lost": route_list(lost, labels_b),
+                "routes_gained": route_list(gained, labels_a),
+                "days_before": join_days(days_before) if days_ok else "",
+                "days_after": join_days(days_after) if days_ok else "",
+                "days_lost": join_days(days_before - days_after) if days_ok else "",
+                "days_gained": join_days(days_after - days_before) if days_ok else "",
+                "route_days_lost": route_days(route_days_lost) if days_ok else "",
+                "route_days_gained": route_days(route_days_gained) if days_ok else "",
+                "moved_ft": attr.get("distance_ft", np.nan),
+                "changed_fields": "; ".join(sorted(fields)),
+                "service_assessed": service_ok,
+                "days_assessed": days_ok,
+            }
+        )
+    columns = [
+        "comparison_key",
+        "primary_stop_key",
+        "comparison_status",
+        "change_summary",
+        "stop_id_before",
+        "stop_id_after",
+        "stop_code_before",
+        "stop_code_after",
+        "stop_name_before",
+        "stop_name_after",
+        *(flag for flag, _ in STOP_CHANGE_FLAGS),
+        "compared_routes_before",
+        "compared_routes_after",
+        "other_current_routes",
+        "routes_lost",
+        "routes_gained",
+        "days_before",
+        "days_after",
+        "days_lost",
+        "days_gained",
+        "route_days_lost",
+        "route_days_gained",
+        "moved_ft",
+        "changed_fields",
+        "service_assessed",
+        "days_assessed",
+    ]
+    return pd.DataFrame(rows, columns=pd.Index(columns))
+
+
+# =============================================================================
 # Assemble reports -- scope loss is distinct from a missing inventory record
 # =============================================================================
 ADDITIONS_OUTPUT_MODES = ("separate", "combined", "new_only", "existing_only")
@@ -1208,10 +1605,34 @@ def build_reports(
     added["has_id_match_candidate"] = added["comparison_key"].isin(
         set(candidates["after_comparison_key"])
     )
+    identifier_changes = stop_id_code_changes(full_b, full_a)
+    stop_changes = build_stop_changes(
+        before,
+        after,
+        scope,
+        mode,
+        full_b,
+        full_a,
+        (common, reused),
+        candidates,
+        identifier_changes,
+        threshold,
+        primary_stop_key,
+    )
+    change_lookup = stop_changes.set_index("comparison_key")
+    for frame, columns in (
+        (removed, ("loses_all_service", "possible_renumber", "possible_relocation")),
+        (added, ("newly_served", "possible_renumber", "possible_relocation")),
+    ):
+        for column in columns:
+            frame[column] = frame["comparison_key"].map(change_lookup[column]).eq(True)
     addition_tables = addition_output_tables(added, additions_output_mode, primary_stop_key)
     exported_addition_count = sum(len(frame) for frame in addition_tables.values())
+    # Route pairing decides losses and gains, so a renamed route is not a change.
+    routes_lost = common["comparison_key"].map(change_lookup["routes_lost"]).fillna("")
+    routes_gained = common["comparison_key"].map(change_lookup["routes_gained"]).fillna("")
     route_change_mask = (
-        common["scope_routes_before"].ne(common["scope_routes_after"])
+        (routes_lost.ne("") | routes_gained.ne(""))
         & common["route_context_available_before"]
         & common["route_context_available_after"]
     )
@@ -1226,7 +1647,10 @@ def build_reports(
             "routes_before",
             "routes_after",
         ],
-    ].copy()
+    ].assign(
+        routes_lost=routes_lost[route_change_mask],
+        routes_gained=routes_gained[route_change_mask],
+    )
     quality = pd.concat(
         [
             full_b.loc[full_b["coordinate_status"].ne("valid")].assign(feed="before"),
@@ -1234,7 +1658,6 @@ def build_reports(
         ],
         ignore_index=True,
     )
-    identifier_changes = stop_id_code_changes(full_b, full_a)
     warnings = list(scope.warnings)
     raw_ids_b, raw_ids_a = set(full_b["comparison_key"]), set(full_a["comparison_key"])
     if (
@@ -1255,6 +1678,11 @@ def build_reports(
         warnings.append(
             "Route context unavailable on at least one side; "
             "blank route lists do not establish no service."
+        )
+    elif not (has_day_context(before) and has_day_context(after)):
+        warnings.append(
+            "Service-day context unavailable on at least one side (no calendar.txt / "
+            "calendar_dates.txt, or no trips.service_id); day impact was not assessed."
         )
     summary: dict[str, Any] = {
         "version": VERSION,
@@ -1299,6 +1727,8 @@ def build_reports(
         "shared_secondary_id_changes": int(common["secondary_id_changed"].sum()),
         "stop_id_code_change_count": len(identifier_changes),
         "route_context_changed_count": len(route_changes),
+        "day_context_available": has_day_context(before) and has_day_context(after),
+        **{f"{flag}_count": int(stop_changes[flag].sum()) for flag, _ in STOP_CHANGE_FLAGS},
         "relocation_threshold_feet": threshold,
         "count_reconciliation": (
             "Shared = modified + unchanged + review_only. Needs_review overlaps modified."
@@ -1330,6 +1760,7 @@ def build_reports(
     tables = {
         "summary": table_summary,
         "route_scope": scope.route_table,
+        "stop_changes": stop_changes,
         "modified": common.loc[changed].reset_index(drop=True),
         "removed_from_scope": removed.reset_index(drop=True),
         **addition_tables,
@@ -1528,6 +1959,7 @@ def run_compare(
         "nearest_max_feet": NEAREST_MATCHES_MAX_FEET,
         "nearest_candidates_per_stop": NEAREST_CANDIDATES_PER_STOP,
         "service_date_filter": None,
+        "day_types": list(DAY_TYPES),
     }
     write_outputs(output_dir, tables, summary, settings)
     LOGGER.info(
@@ -1546,6 +1978,19 @@ def run_compare(
         additions_mode,
         summary["exported_addition_count"],
         summary["added_to_scope_count"],
+    )
+    LOGGER.info(
+        "Stop changes: loses all service=%d; loses routes=%d; loses days=%d%s; new stops=%d; "
+        "relocated=%d; renamed=%d; renumbered=%d; possible renumbers=%d (see stop_changes).",
+        summary["loses_all_service_count"],
+        summary["loses_routes_count"],
+        summary["loses_days_count"],
+        "" if summary["day_context_available"] else " (not assessed)",
+        summary["new_stop_count"],
+        summary["relocated_count"],
+        summary["renamed_count"],
+        summary["renumbered_count"],
+        summary["possible_renumber_count"],
     )
     return summary
 

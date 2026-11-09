@@ -34,8 +34,10 @@ from scripts.stop_analysis.gtfs_stop_diff import (
     prompt_route_pair,
     read_gtfs_table,
     read_pairing_file,
+    route_counterparts,
     route_sort_key,
     run_compare,
+    service_day_types,
     stop_id_code_changes,
     write_outputs,
 )
@@ -127,6 +129,19 @@ def _reset_logger() -> Iterator[None]:
     for handler in list(gsd.LOGGER.handlers):
         gsd.LOGGER.removeHandler(handler)
         handler.close()
+
+
+def write_calendar(root: Path, service_days: dict[str, str]) -> None:
+    """Write calendar.txt where each service_id runs weekdays, saturday, or sunday."""
+    rows = []
+    for service_id, day_type in service_days.items():
+        row = {"service_id": service_id, "start_date": "20260101", "end_date": "20261231"}
+        for day in ("monday", "tuesday", "wednesday", "thursday", "friday"):
+            row[day] = "1" if day_type == "weekday" else "0"
+        row["saturday"] = "1" if day_type == "saturday" else "0"
+        row["sunday"] = "1" if day_type == "sunday" else "0"
+        rows.append(row)
+    pd.DataFrame(rows).to_csv(root / "calendar.txt", index=False)
 
 
 def stops_frame(rows: list[dict[str, Any]]) -> pd.DataFrame:
@@ -285,6 +300,50 @@ def test_load_route_context_pairs_and_label_fallback(tmp_path: Path) -> None:
         ("B1", "Crosstown"),
         ("B2", "R2"),
     ]
+
+
+def test_service_day_types_uses_calendar_flags_and_added_dates() -> None:
+    calendar = pd.DataFrame(
+        [
+            {"service_id": "WK", "monday": "1", "tuesday": "1", "wednesday": "1",
+             "thursday": "1", "friday": "1", "saturday": "0", "sunday": "0"},
+            {"service_id": "SA", "monday": "0", "tuesday": "0", "wednesday": "0",
+             "thursday": "0", "friday": "0", "saturday": "1", "sunday": "0"},
+        ]
+    )  # fmt: skip
+    calendar_dates = pd.DataFrame(
+        [
+            {"service_id": "HOL", "date": "20261115", "exception_type": "1"},  # Sunday
+            {"service_id": "WK", "date": "20261114", "exception_type": "2"},  # removal
+            {"service_id": "BAD", "date": "2026-11-15", "exception_type": "1"},
+        ]
+    )
+    assert service_day_types(calendar, calendar_dates) == {
+        "WK": frozenset({"weekday"}),
+        "SA": frozenset({"saturday"}),
+        "HOL": frozenset({"sunday"}),
+    }
+
+
+def test_load_route_context_adds_day_types_only_with_calendars(tmp_path: Path) -> None:
+    trips = [{"trip_id": "T1", "route_id": "R101", "service_id": "WK"},
+             {"trip_id": "T2", "route_id": "R101", "service_id": "SA"}]  # fmt: skip
+    stop_times = [{"trip_id": "T1", "stop_id": "B1"}, {"trip_id": "T2", "stop_id": "B1"},
+                  {"trip_id": "T1", "stop_id": "B2"}]  # fmt: skip
+    feed = write_feed(tmp_path, BEFORE_STOPS, BEFORE_ROUTES, trips, stop_times)
+    _, pairs = load_route_context(feed, load_stops(feed, "test"))
+    assert "day_types" not in pairs
+    write_calendar(feed, {"WK": "weekday", "SA": "saturday"})
+    _, pairs = load_route_context(feed, load_stops(feed, "test"))
+    days = dict(zip(pairs["stop_id"], pairs["day_types"]))
+    assert days == {"B1": {"weekday", "saturday"}, "B2": {"weekday"}}
+
+
+def test_route_counterparts_all_stops_pairs_by_label_or_route_id() -> None:
+    before = make_feed(["B1"], {"R1": "10", "R2": "20", "R3": "30"}, [("B1", "R1")])
+    after = make_feed(["A1"], {"Q1": "10", "Q2": "11", "R3": "30X"}, [("A1", "Q1")])
+    scope = make_scope(before, after, "all_stops", [], {}, [], "error")
+    assert route_counterparts(before, after, scope, "all_stops") == {("R1", "Q1"), ("R3", "R3")}
 
 
 def test_load_route_context_rejects_unknown_stop(tmp_path: Path) -> None:
@@ -800,6 +859,10 @@ def test_run_compare_after_routes_end_to_end(
     assert modified["stop_code"].tolist() == ["1002"]
     removed = pd.read_csv(run_dir / "removed_from_scope.csv", dtype=str)
     assert removed["stop_code"].tolist() == ["1003"]
+    # 2005 sits ~36 ft away: beyond the 25 ft threshold, so relocation, not renumber.
+    assert removed.loc[0, "loses_all_service"] == "True"
+    assert removed.loc[0, "possible_relocation"] == "True"
+    assert removed.loc[0, "possible_renumber"] == "False"
     new_codes = pd.read_csv(run_dir / "new_stop_codes.csv", dtype=str)
     assert new_codes["stop_code"].tolist() == ["2005"]
     assert new_codes.loc[0, "has_id_match_candidate"] == "True"
@@ -864,6 +927,148 @@ def test_run_compare_after_routes_requires_route_context(
             out_dir=tmp_path / "out",
             include_route_context=False,
         )
+
+
+def test_run_compare_classifies_service_route_day_and_identity_changes(tmp_path: Path) -> None:
+    before_stops = [
+        {"stop_id": "B1", "stop_code": "1001", "stop_name": "Main St & 1st St",
+         "stop_lat": "38.8000", "stop_lon": "-77.1000"},
+        {"stop_id": "B2", "stop_code": "1002", "stop_name": "Main St & 2nd St",
+         "stop_lat": "38.8100", "stop_lon": "-77.1000"},
+        {"stop_id": "B3", "stop_code": "1003", "stop_name": "Oak Ave",
+         "stop_lat": "38.8200", "stop_lon": "-77.1000"},
+        {"stop_id": "B4", "stop_code": "1004", "stop_name": "Elm St",
+         "stop_lat": "38.8300", "stop_lon": "-77.1000"},
+        {"stop_id": "B5", "stop_code": "1005", "stop_name": "Pine St",
+         "stop_lat": "38.8400", "stop_lon": "-77.1000"},
+    ]  # fmt: skip
+    before = write_feed(
+        tmp_path / "before",
+        before_stops,
+        [{"route_id": "R101", "route_short_name": "101"},
+         {"route_id": "R200", "route_short_name": "200"},
+         {"route_id": "R300", "route_short_name": "300"}],
+        [{"trip_id": "T1", "route_id": "R101", "service_id": "WK"},
+         {"trip_id": "T2", "route_id": "R101", "service_id": "SA"},
+         {"trip_id": "T3", "route_id": "R200", "service_id": "WK"},
+         {"trip_id": "T4", "route_id": "R300", "service_id": "WK"}],
+        [{"trip_id": trip, "stop_id": stop}
+         for trip, stop in [("T1", "B1"), ("T1", "B2"), ("T1", "B3"), ("T2", "B1"),
+                            ("T2", "B2"), ("T3", "B4"), ("T3", "B2"), ("T4", "B5")]],
+    )  # fmt: skip
+    write_calendar(before, {"WK": "weekday", "SA": "saturday"})
+    # 1001 moves ~109 ft; 1002 renamed; 1003 dropped; 2006 a new code ~11 ft from 1003.
+    # Route 300 is renamed "300 New" and gains a Saturday trip (calendar_dates only).
+    after_stops = [
+        {"stop_id": "A1", "stop_code": "1001", "stop_name": "Main St & 1st St",
+         "stop_lat": "38.8003", "stop_lon": "-77.1000"},
+        {"stop_id": "A2", "stop_code": "1002", "stop_name": "Main St & Second St",
+         "stop_lat": "38.8100", "stop_lon": "-77.1000"},
+        {"stop_id": "A4", "stop_code": "1004", "stop_name": "Elm St",
+         "stop_lat": "38.8300", "stop_lon": "-77.1000"},
+        {"stop_id": "A5", "stop_code": "1005", "stop_name": "Pine St",
+         "stop_lat": "38.8400", "stop_lon": "-77.1000"},
+        {"stop_id": "A6", "stop_code": "2006", "stop_name": "Oak Ave (new)",
+         "stop_lat": "38.82003", "stop_lon": "-77.1000"},
+    ]  # fmt: skip
+    after = write_feed(
+        tmp_path / "after",
+        after_stops,
+        [{"route_id": "X1", "route_short_name": "101"},
+         {"route_id": "X3", "route_short_name": "300 New"}],
+        [{"trip_id": "AT1", "route_id": "X1", "service_id": "WK"},
+         {"trip_id": "AT3", "route_id": "X3", "service_id": "WK"},
+         {"trip_id": "AT4", "route_id": "X3", "service_id": "SA"}],
+        [{"trip_id": trip, "stop_id": stop}
+         for trip, stop in [("AT1", "A1"), ("AT1", "A2"), ("AT1", "A4"), ("AT1", "A6"),
+                            ("AT3", "A5"), ("AT4", "A5")]],
+    )  # fmt: skip
+    write_calendar(after, {"WK": "weekday"})
+    pd.DataFrame([{"service_id": "SA", "date": "20261114", "exception_type": "1"}]).to_csv(
+        after / "calendar_dates.txt", index=False
+    )
+
+    summary = run_compare(
+        before_dir=before,
+        after_dir=after,
+        out_dir=tmp_path / "out",
+        route_name_map={"300 New": "300"},
+        unmatched_policy="error",
+    )
+    run_dir = Path(summary["output_directory"])
+    changes = pd.read_csv(run_dir / "stop_changes.csv", dtype=str, keep_default_na=False)
+    rows = changes.set_index("comparison_key")
+
+    assert rows.loc["1001", "change_summary"] == (
+        "loses service days; a continuing route loses days; relocated"
+    )
+    assert rows.loc["1001", "days_lost"] == "saturday"
+    assert rows.loc["1001", "route_days_lost"] == "101: saturday"
+    # Route 200 (outside the concept) keeps serving 1002 on weekdays only.
+    assert rows.loc["1002", "change_summary"] == (
+        "loses service days; a continuing route loses days; renamed"
+    )
+    assert rows.loc["1002", "other_current_routes"] == "200"
+    assert rows.loc["1003", "comparison_status"] == "removed_from_scope"
+    assert rows.loc["1003", "change_summary"] == "loses all service; possible renumber (review)"
+    assert rows.loc["1003", "routes_lost"] == "101"
+    assert rows.loc["1004", "change_summary"] == "gains routes"
+    assert rows.loc["1004", "routes_gained"] == "101"
+    # The renamed route is paired, so it is neither lost nor gained.
+    assert rows.loc["1005", "change_summary"] == (
+        "gains service days; a continuing route gains days"
+    )
+    assert rows.loc["1005", "routes_lost"] == rows.loc["1005", "routes_gained"] == ""
+    assert rows.loc["1005", "route_days_gained"] == "300 New: saturday"
+    assert rows.loc["2006", "change_summary"] == "new stop; possible renumber (review)"
+
+    assert summary["day_context_available"] is True
+    assert summary["loses_all_service_count"] == 1
+    assert summary["loses_days_count"] == 2
+    assert summary["gains_days_count"] == 1
+    assert summary["relocated_count"] == 1
+    assert summary["renamed_count"] == 1
+    assert summary["possible_renumber_count"] == 2
+    assert summary["route_context_changed_count"] == 0
+    removed = pd.read_csv(run_dir / "removed_from_scope.csv", dtype=str)
+    assert removed.loc[0, "loses_all_service"] == "True"
+    assert removed.loc[0, "possible_renumber"] == "True"
+
+
+def test_run_compare_all_stops_flags_unserved_stop_and_renumber(tmp_path: Path) -> None:
+    stops = [
+        {"stop_id": "S1", "stop_code": "100", "stop_name": "First",
+         "stop_lat": "38.80", "stop_lon": "-77.10"},
+        {"stop_id": "S2", "stop_code": "200", "stop_name": "Second",
+         "stop_lat": "38.81", "stop_lon": "-77.10"},
+    ]  # fmt: skip
+    routes = [{"route_id": "R1", "route_short_name": "1"}]
+    trips = [{"trip_id": "T1", "route_id": "R1"}]
+    before = write_feed(
+        tmp_path / "before", stops, routes, trips,
+        [{"trip_id": "T1", "stop_id": "S1"}, {"trip_id": "T1", "stop_id": "S2"}],
+    )  # fmt: skip
+    # S1 gets a new public code; S2 stays in stops.txt but no trip serves it.
+    after = write_feed(
+        tmp_path / "after", [dict(stops[0], stop_code="101"), stops[1]], routes, trips,
+        [{"trip_id": "T1", "stop_id": "S1"}],
+    )  # fmt: skip
+    summary = run_compare(
+        before_dir=before,
+        after_dir=after,
+        out_dir=tmp_path / "out",
+        scope_mode="all_stops",
+        primary_stop_key="stop_id",
+    )
+    changes = pd.read_csv(
+        Path(summary["output_directory"]) / "stop_changes.csv", dtype=str, keep_default_na=False
+    ).set_index("comparison_key")
+    assert changes.loc["S1", "change_summary"] == "renumbered"
+    assert changes.loc["S2", "comparison_status"] == "shared"
+    assert changes.loc["S2", "change_summary"] == "loses all service"
+    assert summary["removed_from_scope_count"] == 0
+    assert summary["day_context_available"] is False
+    assert any("day impact was not assessed" in warning for warning in summary["warnings"])
 
 
 def test_main_returns_zero_on_success(before_feed: Path, after_feed: Path, tmp_path: Path) -> None:
