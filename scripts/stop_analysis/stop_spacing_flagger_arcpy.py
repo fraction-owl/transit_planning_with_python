@@ -4,11 +4,6 @@ This module converts a General Transit Feed Specification (GTFS) package
 (directory or .zip) into projected ESRI Shapefiles suitable for spatial analysis
 and provides quality assurance (QA) checks on stop spacing.
 
-Outputs:
-    * Shapefiles for served stops, route polylines, and stop-to-stop segments
-    * Logs flagging consecutive served stops that are spaced too closely
-    * CSVs identifying potential “missed” stops located between long stop-to-stop gaps
-
 The long-spacing check examines whether stops from other routes fall within a
 specified buffer distance of unusually long segments and may merit further
 review as possible missed service opportunities.
@@ -19,6 +14,11 @@ local trips sharing a shape are measured separately, and a stop visited twice
 (a loop) keeps both visits. Each stop is placed along the shape from
 ``shape_dist_traveled`` when both files provide it; otherwise the stops are
 matched to the shape in trip order.
+
+Outputs:
+    * Shapefiles for served stops, route polylines, and stop-to-stop segments
+    * Logs flagging consecutive served stops that are spaced too closely
+    * CSVs identifying potential “missed” stops located between long stop-to-stop gaps
 
 Typical usage:
     Update the paths in the CONFIGURATION section and run from ArcGIS Pro's Python

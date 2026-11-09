@@ -6,6 +6,21 @@ Use file geodatabases/shapefiles with Basic; enterprise geometry checks may requ
 a higher ArcGIS license, according to the input storage type.
 Inputs are never edited. Each run writes a NEW timestamped output directory.
 
+Outputs:
+    review.gdb: gtfs_stops; stop_buffers; study_area; context_area; road_context;
+      network_original; network_working; network_components;
+      issues_points; issues_lines; network_clip_<radius>; geometry_check_<source>.
+    Network outputs with Z/M dimensions have _z, _m, or _zm suffixes. Dimension
+      groups are kept separate so missing elevation values are not invented.
+    issues.csv: location, type, confidence, source/part IDs, reason, road context.
+    stop_summary.csv: radius, nearby line length/density, component count,
+      nearest-line distance, and review-issue counts. Overlapping buffers are
+      intentionally summarized separately; never add their lengths together.
+    components.csv; source_attributes.csv; repair_candidates.csv; repair_log.csv;
+      summary.json; timings.csv; run_status.json; run.log. The manifest records
+      assumptions and parameters. study_area_<radius> polygons cache smaller
+      dissolved scopes when map clips are enabled.
+
 Typical usage:
     1. Set NETWORK_SOURCES, GTFS_PATH, OUTPUT_FOLDER, and optional ROAD_POLYGONS.
     2. Use a suitable local projected CRS. ANALYSIS_WKID=0 uses the first input's CRS.
@@ -91,21 +106,6 @@ IMPORTANT INTERPRETATION
       Source attributes are retained in source_attributes.csv as JSON, linked by
       SOURCE_KEY. Output network feature classes have a normalized review schema;
       they do NOT carry a configured routing impedance/restriction model.
-
-Outputs:
-    review.gdb: gtfs_stops; stop_buffers; study_area; context_area; road_context;
-      network_original; network_working; network_components;
-      issues_points; issues_lines; network_clip_<radius>; geometry_check_<source>.
-    Network outputs with Z/M dimensions have _z, _m, or _zm suffixes. Dimension
-      groups are kept separate so missing elevation values are not invented.
-    issues.csv: location, type, confidence, source/part IDs, reason, road context.
-    stop_summary.csv: radius, nearby line length/density, component count,
-      nearest-line distance, and review-issue counts. Overlapping buffers are
-      intentionally summarized separately; never add their lengths together.
-    components.csv; source_attributes.csv; repair_candidates.csv; repair_log.csv;
-      summary.json; timings.csv; run_status.json; run.log. The manifest records
-      assumptions and parameters. study_area_<radius> polygons cache smaller
-      dissolved scopes when map clips are enabled.
 
 Use stable ID_FIELD values where available. Otherwise SOURCE_KEY uses source label
 and original OID and is only stable while the source OIDs remain unchanged.

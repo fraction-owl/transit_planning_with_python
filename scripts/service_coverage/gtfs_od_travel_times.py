@@ -9,6 +9,23 @@ Inputs:
     LOCATIONS and OD_PAIRS; BENCHMARK_ESTIMATES optionally holds reference
     travel times from another method for comparison.
 
+Outputs (CSV, UTF-8 with BOM, suitable for Excel):
+    service_selection.csv / service_inventory.csv: active IDs, modes, trip counts.
+    feed_metadata.csv: publisher, feed version and advertised validity dates.
+    stop_catalog.csv / stop_candidates.csv: IDs, codes, coordinates and matches.
+    resolved_locations.csv / endpoint_connections.csv: endpoint and access audit.
+    od_results.csv / od_summary.csv: sampled results, coverage and statistics.
+    itinerary_legs.csv: ordered WALK / WAIT / RIDE legs and original source IDs.
+    network_transit_segments.csv / network_walk_links.csv: network tables.
+    station_pathways.csv / stop_time_adjustments.csv: pathway/time input audits.
+    benchmark_comparison.csv: GTFS means against reported benchmark totals.
+    benchmark_method_totals.csv / benchmark_method_legs.csv: formula audit.
+    methods.txt, settings.json and run.log: assumptions and diagnostics.
+    gtfs_od_travel_times_runlog.txt: the verbatim CONFIGURATION block, any
+    command-line overrides, the run timestamp and the source script path.
+    station_pathway_minutes is INCLUDED in walk_minutes, not an extra cost.
+    Means and percentiles cover successful samples only; always check coverage.
+
 Typical usage:
     Save this single file and run: python gtfs_od_travel_times.py
     Edit paths, SERVICE_DATE, LOCATIONS and OD_PAIRS in the configuration below,
@@ -68,23 +85,6 @@ Method:
     direction, including where the feed incorrectly marks them bidirectional.
     A transfer buffer is added AFTER physical walking. Any GTFS minimum can
     require more elapsed time. A timed transfer never holds a vehicle.
-
-Outputs (CSV, UTF-8 with BOM, suitable for Excel):
-    service_selection.csv / service_inventory.csv: active IDs, modes, trip counts.
-    feed_metadata.csv: publisher, feed version and advertised validity dates.
-    stop_catalog.csv / stop_candidates.csv: IDs, codes, coordinates and matches.
-    resolved_locations.csv / endpoint_connections.csv: endpoint and access audit.
-    od_results.csv / od_summary.csv: sampled results, coverage and statistics.
-    itinerary_legs.csv: ordered WALK / WAIT / RIDE legs and original source IDs.
-    network_transit_segments.csv / network_walk_links.csv: network tables.
-    station_pathways.csv / stop_time_adjustments.csv: pathway/time input audits.
-    benchmark_comparison.csv: GTFS means against reported benchmark totals.
-    benchmark_method_totals.csv / benchmark_method_legs.csv: formula audit.
-    methods.txt, settings.json and run.log: assumptions and diagnostics.
-    gtfs_od_travel_times_runlog.txt: the verbatim CONFIGURATION block, any
-    command-line overrides, the run timestamp and the source script path.
-    station_pathway_minutes is INCLUDED in walk_minutes, not an extra cost.
-    Means and percentiles cover successful samples only; always check coverage.
 
 Benchmark comparison (optional):
     BENCHMARK_ESTIMATES holds totals from a sketch method: distance / assumed
