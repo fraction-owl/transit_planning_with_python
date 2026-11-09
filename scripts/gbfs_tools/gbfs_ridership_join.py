@@ -1,4 +1,4 @@
-"""Join Capital Bikeshare ridership totals onto station geometries for mapping.
+r"""Join Capital Bikeshare ridership totals onto station geometries for mapping.
 
 This script bridges the two other tools in ``gbfs_tools``:
 
