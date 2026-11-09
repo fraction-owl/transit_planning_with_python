@@ -4,8 +4,8 @@ GeoPandas equivalent of the ArcPy pipeline.  Runs three stages in one process,
 passing DataFrames between stages in memory — no intermediate disk writes are
 required, though they can be enabled via configuration.
 
-Stages
-------
+Workflow
+--------
 1) CSV stage (pandas):
         Discover and merge Census + LODES CSVs into a single block-level
         attribute table, optionally filtered by county FIPS.

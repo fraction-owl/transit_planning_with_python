@@ -17,7 +17,7 @@ bundle per signature plus a manifest -- but they have opposite trust postures:
         and the service-supply predictors are *expected* in these bundles, not
         forbidden. Nothing produced here is meant to leave the secured box.
 
-Pipeline (identical shape to the public half):
+Workflow (identical shape to the public half):
 
     scan -> extract -> run -> collect -> describe -> combine
 
@@ -40,7 +40,7 @@ Pipeline (identical shape to the public half):
     combine   Validate (hygiene only -- no denylist), then ``write_bundles`` ->
               ``write_manifest`` -> ``write_run_log``.
 
-Design notes:
+Notes:
     - One bundle per join-key signature, exactly like the public half. The
       route-level rollups (NTD cross-section anchor + OTP + runtime) merge into a
       single ``route_id`` bundle -- the "one route-level table" the OLS and ML

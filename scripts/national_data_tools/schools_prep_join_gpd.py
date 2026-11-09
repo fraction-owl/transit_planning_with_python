@@ -35,7 +35,7 @@ Outputs:
       total enrollment plus the grade/level breakout joined to each EDGE point
     - va_md_dc_<school_type>_schools_enrollment.csv     attribute-only companion table
 
-Sources:
+Helpful links:
     - CCD school membership (fiscal files):
       https://nces.ed.gov/ccd/files.asp#Fiscal:2,LevelId:7,SchoolYearId:39,Page:1
     - ELSI table generator: https://nces.ed.gov/ccd/elsi/tableGenerator.aspx

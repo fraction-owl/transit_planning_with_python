@@ -5,8 +5,8 @@ each unique (Short Route, Direction, Variation) as its own pattern. It converts 
 a monthly grain (YYYY-MM) to avoid relying on potentially meaningless day-level dates in the
 export.
 
-Core steps
-----------
+Workflow
+--------
 - Normalize key fields (Short Route, Direction, Variation, Timepoint Order).
 - Construct a canonical Year-Month (YYYY-MM) field, row by row:
   - Prefer an existing YYYY-MM column where it is populated.
@@ -21,14 +21,14 @@ Core steps
   - Optional line plots showing on-time/early/late % across stop order, including a dashed
     reference line for a configurable OTP standard.
 
-Important notes
----------------
-- Variations are handled separately because different variants can serve different stops, in
-  different orders, or follow different paths.
-- If a route pattern changes mid-year, run separate month windows (start/end month config) to
-  avoid mixing incompatible patterns.
-- If the export cannot support a reliable YYYY-MM (no usable YYYY-MM field, no parseable dates,
-  and no way to infer year for Month values), the script fails loudly rather than guessing.
+Notes:
+    - Variations are handled separately because different variants can serve different stops, in
+      different orders, or follow different paths.
+    - If a route pattern changes mid-year, run separate month windows (start/end month config) to
+      avoid mixing incompatible patterns.
+    - If the export cannot support a reliable YYYY-MM (no usable YYYY-MM field, no parseable
+      dates, and no way to infer year for Month values), the script fails loudly rather than
+      guessing.
 
 Outputs
 -------

@@ -4,7 +4,8 @@ This script processes General Transit Feed Specification (GTFS) data and perform
 spatial analysis using ArcPy to determine the relationship between transit stops
 and specified districts.
 
-It follows these steps:
+Workflow
+--------
 1. Loads required GTFS files (routes, trips, stops, stop_times).
 2. Filters GTFS stops to include only active boarding locations.
 3. Converts the filtered stops to a point feature class in WGS84 (EPSG:4326).
