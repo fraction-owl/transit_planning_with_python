@@ -1,4 +1,4 @@
-"""Secured-box feature-prep orchestrator (the PRIVATE half of the split).
+"""Orchestrate secured-box feature prep (the PRIVATE half of the split).
 
 This is the secured-box counterpart to ``prep_features_public.py``. The two are
 symmetric at the *interface* -- each runs a set of feature scripts, collects

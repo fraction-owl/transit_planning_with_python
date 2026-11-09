@@ -1,4 +1,4 @@
-"""Cross-sectional route ridership model — ENGINE 1 (secured box).
+"""Fit a cross-sectional route ridership model — ENGINE 1 (secured box).
 
 Fits a single cross-sectional OLS of NTD boardings on route-level fundamentals and
 emits the two reads the strategic deliverable needs:

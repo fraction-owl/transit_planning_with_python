@@ -1,4 +1,4 @@
-"""Classifies GTFS route directions and identifies dominant shapes per route and direction.
+"""Classify GTFS route directions and identify dominant shapes per route and direction.
 
 Determines whether GTFS shapes are cardinal (NB, SB, EB, WB) or looped (CW, CCW, LOOP),
 flags suspicious direction inconsistencies, and optionally exports Excel summaries and

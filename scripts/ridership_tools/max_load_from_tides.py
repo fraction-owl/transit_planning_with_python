@@ -1,4 +1,4 @@
-"""Maximum load (peak passenger load) from TIDES ``stop_visits``.
+"""Compute maximum load (peak passenger load) from TIDES ``stop_visits``.
 
 This is the maximum-load counterpart to ``otp_monthly_panel.py``: it derives
 each performed trip's peak passenger load directly from raw TIDES

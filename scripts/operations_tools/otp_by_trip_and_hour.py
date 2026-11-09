@@ -1,4 +1,4 @@
-"""Trip-level and hour-of-day on-time performance (OTP) from TIDES ``stop_visits``.
+"""Compute trip-level and hour-of-day on-time performance (OTP) from TIDES ``stop_visits``.
 
 This script slices on-time performance two ways that the monthly panel
 (``otp_monthly_panel.py``) does not: by *scheduled trip* (which trips of the

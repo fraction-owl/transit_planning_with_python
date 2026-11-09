@@ -1,4 +1,4 @@
-"""Joins ridership data to bus stop features, optionally with a spatial join to polygon areas.
+"""Join ridership data to bus stop features, optionally with a spatial join to polygon areas.
 
 Designed for ArcGIS Pro workflows, this script merges stop-level ridership data from
 an Excel file with stop locations (from a shapefile or GTFS stops.txt), and optionally

@@ -1,4 +1,4 @@
-"""GTFS route timeline across many feeds (when routes begin and end over time).
+"""Build a GTFS route timeline across many feeds (when routes begin and end over time).
 
 The longitudinal companion to ``gtfs_route_diff.py``. That script answers "what
 changed between these *two* feeds?" in depth; this one takes a whole *sequence*

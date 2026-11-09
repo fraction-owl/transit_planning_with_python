@@ -1,4 +1,4 @@
-"""End-to-end ArcPy pipeline: merge Census CSVs, merge TIGER shapefiles, and join to final output.
+"""Merge Census CSVs, merge TIGER shapefiles, and join to final output (end-to-end ArcPy pipeline).
 
 This single script performs three stages to produce a final feature class / shapefile
 containing Census block geometry joined to a consolidated attribute table

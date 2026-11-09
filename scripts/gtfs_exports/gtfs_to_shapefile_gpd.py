@@ -1,4 +1,4 @@
-"""Converts GTFS `stops.txt` and `shapes.txt` files into ESRI Shapefiles.
+"""Convert GTFS `stops.txt` and `shapes.txt` files into ESRI Shapefiles.
 
 Exports GTFS stops as point features and routes as LineStrings using
 standard WGS 84 coordinates. Designed for notebook workflows.

@@ -1,4 +1,4 @@
-"""Generates Excel-formatted transit timetables from GTFS data.
+"""Generate Excel-formatted transit timetables from GTFS data.
 
 This script processes GTFS files (e.g., trips.txt, stop_times.txt) to export
 Excel timetable sheets by route, direction, and service type. Output mimics

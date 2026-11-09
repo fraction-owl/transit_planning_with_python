@@ -1,4 +1,4 @@
-"""Drop-folder feature-prep orchestrator (the PUBLIC half of the split).
+"""Orchestrate drop-folder feature prep (the PUBLIC half of the split).
 
 This is the unsecured-box half of a split pipeline that keeps proprietary NTD
 data on one machine while feature prep happens elsewhere. Its secured-box

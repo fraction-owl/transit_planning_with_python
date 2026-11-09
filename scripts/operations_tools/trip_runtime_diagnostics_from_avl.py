@@ -1,4 +1,4 @@
-"""Trip-level runtime diagnostics and schedule performance review.
+"""Produce trip-level runtime diagnostics and a schedule performance review.
 
 This module analyzes observed bus trips to evaluate how actual runtime and timing
 deviations compare to scheduled values. It generates both row-level flags and

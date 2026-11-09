@@ -1,4 +1,4 @@
-"""GTFS stop proximity checker.
+"""Flag GTFS stops closer together than a configured distance threshold.
 
 Reads GTFS stops.txt (and optionally stop_times.txt and trips.txt when the
 direction-based filter is enabled) and flags stops closer than a configured

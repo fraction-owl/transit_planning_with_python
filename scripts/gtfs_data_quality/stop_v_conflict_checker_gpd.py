@@ -1,4 +1,4 @@
-"""GTFS Stop Conflict Checker (GeoPandas port).
+"""Identify GTFS stops intersecting roadway, driveway, or building footprints (GeoPandas port).
 
 Uses GeoPandas and pandas to identify GTFS stops that directly INTERSECT
 (spatially overlap) with roadway, driveway, or building footprint layers.

@@ -1,4 +1,4 @@
-"""Generates minute-by-minute transit block status timelines from GTFS data.
+"""Generate minute-by-minute transit block status timelines from GTFS data.
 
 Processes GTFS files to determine each vehicle block's operational status (e.g.
 DWELL, LAYOVER, LOADING, TRAVELING BETWEEN STOPS, LONG BREAK, INACTIVE) at

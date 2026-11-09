@@ -1,4 +1,4 @@
-"""GTFS to GIS pipeline for stop-spacing QA and segment analysis (ArcPy version).
+"""Run a GTFS-to-GIS pipeline for stop-spacing QA and segment analysis (ArcPy version).
 
 This module converts a General Transit Feed Specification (GTFS) package
 (directory or .zip) into projected ESRI Shapefiles suitable for spatial analysis

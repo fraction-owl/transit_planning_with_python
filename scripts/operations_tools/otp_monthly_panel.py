@@ -1,4 +1,4 @@
-"""On-time performance (OTP) over time from TIDES ``stop_visits``.
+"""Compute on-time performance (OTP) over time from TIDES ``stop_visits``.
 
 This script computes monthly on-time performance from a TIDES-style
 ``stop_visits`` table (stop-level arrival/departure events) joined to a

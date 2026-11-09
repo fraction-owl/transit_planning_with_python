@@ -1,4 +1,4 @@
-"""Stop-level OTP and AVL data coverage from TIDES, with cross-route flags.
+"""Compute stop-level OTP and AVL data coverage from TIDES, with cross-route flags.
 
 This script computes on-time performance and AVL data coverage per stop (and
 per stop/route) from TIDES ``stop_visits`` (stop-level arrival/departure

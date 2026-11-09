@@ -1,4 +1,4 @@
-"""End-to-end open-source pipeline: merge Census CSVs, merge TIGER shapefiles, join to output.
+"""Merge Census CSVs, merge TIGER shapefiles, join to output (end-to-end open-source pipeline).
 
 GeoPandas equivalent of the ArcPy pipeline.  Runs three stages in one process,
 passing DataFrames between stages in memory — no intermediate disk writes are

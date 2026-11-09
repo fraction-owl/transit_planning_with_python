@@ -1,4 +1,4 @@
-"""Performs spatial analysis on GTFS transit data and demographic shapefiles.
+"""Perform spatial analysis on GTFS transit data and demographic shapefiles.
 
 Generates a transit *service area* and estimates the population, household, and
 employment characteristics that fall within it. The script offers two

@@ -1,4 +1,4 @@
-"""GTFS route comparison (before vs after) with notebook-friendly execution.
+"""Compare GTFS routes (before vs after) with notebook-friendly execution.
 
 A planner-facing companion to ``gtfs_stop_diff.py``. Point it at two GTFS feeds
 (an *old*/before feed and a *new*/after feed) and it classifies every route into

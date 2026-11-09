@@ -1,4 +1,4 @@
-"""Ridership (boardings/alightings) from TIDES ``stop_visits``.
+"""Compute ridership (boardings/alightings) from TIDES ``stop_visits``.
 
 This is the ridership counterpart to ``otp_monthly_panel.py``: it derives
 ridership directly from raw TIDES automated-passenger-counter (APC) events

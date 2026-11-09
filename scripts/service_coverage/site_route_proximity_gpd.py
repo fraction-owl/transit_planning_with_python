@@ -1,4 +1,4 @@
-"""Identifies nearby GTFS stops and associated routes for given locations or stop codes.
+"""Identify nearby GTFS stops and associated routes for given locations or stop codes.
 
 Supports two input modes:
 - 'location': Uses point shapefile or manual lat/lon coordinates.

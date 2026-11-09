@@ -1,4 +1,4 @@
-"""Segment-level running times from TIDES ``stop_visits``.
+"""Compute segment-level running times from TIDES ``stop_visits``.
 
 A *segment* is the leg between two consecutive timepoint stops on a trip. For
 each segment this script measures the **actual** running time (from the

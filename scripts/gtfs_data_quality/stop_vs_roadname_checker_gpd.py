@@ -1,4 +1,4 @@
-"""Detects potential typos in GTFS stop names using spatial and fuzzy matching.
+"""Detect potential typos in GTFS stop names using spatial and fuzzy matching.
 
 This script buffers GTFS stops, spatially joins them with nearby roadway
 centerlines, and uses fuzzy string comparison to flag discrepancies between

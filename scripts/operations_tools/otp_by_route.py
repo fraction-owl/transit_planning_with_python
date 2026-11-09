@@ -1,4 +1,4 @@
-"""Route-level on-time performance (OTP), windowed for ridership modeling.
+"""Compute route-level on-time performance (OTP), windowed for ridership modeling.
 
 This is the windowed-rollup stage that turns ``otp_monthly_panel.py``'s monthly
 OTP panel into one OTP value per route, so it can join the route-level modeling

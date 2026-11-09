@@ -1,4 +1,4 @@
-"""Generates a matrix showing which public transit routes operate near which districts.
+"""Generate a matrix showing which public transit routes operate near which districts.
 
 This script processes General Transit Feed Specification (GTFS) data and performs a
 spatial analysis using ArcPy to determine the relationship between transit stops
