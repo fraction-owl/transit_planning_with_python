@@ -19,8 +19,8 @@ blank route_id, or a shared route with a blank or invalid direction_id, keeps
 the pair.
 
 Outputs:
-- CSV of close stop pairs (with distance + safe flags)
-- CSV of per-stop summary (count of close neighbors)
+    - CSV of close stop pairs (with distance + safe flags)
+    - CSV of per-stop summary (count of close neighbors)
 
 Typical usage:
     Update the paths in the CONFIGURATION section and run from a shell or a

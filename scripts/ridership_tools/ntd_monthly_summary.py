@@ -1,15 +1,5 @@
 r"""Analyze NTD monthly ridership using a plain-text config or a previous run log.
 
-Typical usage: set CONFIG_PATH below, then run from a notebook, IDE, or shell:
-    python ntd_monthly_summary.py
-    python ntd_monthly_summary.py --config "C:\\reports\\ntd_monthly_config.txt"
-    python ntd_monthly_summary.py --config "C:\\reports\\ntd_monthly_summary_runlog.txt"
-    python ntd_monthly_summary.py --validate-config
-
-From a notebook or ArcGIS Python window:
-    import ntd_monthly_summary as ntd
-    ntd.main(r"C:\reports\ntd_monthly_config.txt")
-
 The config uses INI sections, read by Python's standard-library configparser.
 No configuration content is executed. Requires Python 3.9+ and the original
 analysis dependencies: pandas, matplotlib, and an Excel engine such as openpyxl.
@@ -18,10 +8,22 @@ run log retains that original directory, even if the log has been moved.
 Run-log input creates a new timestamped output folder beside the recorded output
 folder, preserving the earlier results. The workbooks themselves must still exist.
 
-Outputs (as in the original script): master CSV, monthly workbook, route
-summaries, service-type summaries, plots, trend flags, and time-window folders.
-The run log records the loaded configuration text and resolved paths. Optional
-garage assignments add metadata to detailed data and route summaries.
+Outputs (as in the original script):
+    Master CSV, monthly workbook, route summaries, service-type summaries, plots,
+    trend flags, and time-window folders.
+    The run log records the loaded configuration text and resolved paths. Optional
+    garage assignments add metadata to detailed data and route summaries.
+
+Typical usage:
+    Set CONFIG_PATH below, then run from a notebook, IDE, or shell:
+        python ntd_monthly_summary.py
+        python ntd_monthly_summary.py --config "C:\\reports\\ntd_monthly_config.txt"
+        python ntd_monthly_summary.py --config "C:\\reports\\ntd_monthly_summary_runlog.txt"
+        python ntd_monthly_summary.py --validate-config
+
+    From a notebook or ArcGIS Python window:
+        import ntd_monthly_summary as ntd
+        ntd.main(r"C:\reports\ntd_monthly_config.txt")
 """
 
 from __future__ import annotations

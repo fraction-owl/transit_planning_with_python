@@ -3,30 +3,34 @@
 Edit the CONFIGURATION section below, then run this file with Python 3.9 or later.
 Dependencies: pandas, numpy, openpyxl. No other workflow .py files are needed.
 
-Stages:
+Workflow:
     1. GTFS scheduled movement, holding, total runtime, and known layover.
     2. CLEVER observed whole-trip runtime compared with its own schedule.
     3. CLEVER observed timepoint intervals compared with scheduled intervals.
     4. Percentile-based segment recommendations for manual schedule drafting.
 
-Typical usage: select stages with STAGES below, or at the command line:
-    python runtime_workflow.py --stages 1
-    python runtime_workflow.py --stages 2 3 4
+Outputs:
+    One workbook per route/direction, plus run.log and settings.json,
+    under OUTPUT_DIR/runtime_workflow/run_<timestamp>/. Its data/ subfolder holds
+    the same results as CSV tables for scripts and AI tools, including one row per
+    service date for pooling trips into periods. People edit the workbooks; the
+    CSVs are read-only copies and do not pick up those edits. A possible later
+    step reverses this: a long CSV becomes the editable source and the workbooks
+    are regenerated from it.
 
-In an ArcGIS Pro notebook:
-    %run "C:/path/to/runtime_workflow.py"
+Typical usage:
+    Select stages with STAGES below, or at the command line:
+        python runtime_workflow.py --stages 1
+        python runtime_workflow.py --stages 2 3 4
 
-Outputs: one workbook per route/direction, plus run.log and settings.json,
-under OUTPUT_DIR/runtime_workflow/run_<timestamp>/. Its data/ subfolder holds
-the same results as CSV tables for scripts and AI tools, including one row per
-service date for pooling trips into periods. People edit the workbooks; the
-CSVs are read-only copies and do not pick up those edits. A possible later
-step reverses this: a long CSV becomes the editable source and the workbooks
-are regenerated from it.
-Stage 1 needs only GTFS; Stage 4 calculates Stage 3 statistics internally.
-Recommendations include intermediate destination dwell/holding. Do not add
-Stage 1 holding again. Segment percentiles are not an OTP guarantee.
-Planner periods, budget constraints, and revised layovers remain manual.
+    In an ArcGIS Pro notebook:
+        %run "C:/path/to/runtime_workflow.py"
+
+Notes:
+    Stage 1 needs only GTFS; Stage 4 calculates Stage 3 statistics internally.
+    Recommendations include intermediate destination dwell/holding. Do not add
+    Stage 1 holding again. Segment percentiles are not an OTP guarantee.
+    Planner periods, budget constraints, and revised layovers remain manual.
 """
 
 from __future__ import annotations

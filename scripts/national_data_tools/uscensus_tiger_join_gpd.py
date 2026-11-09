@@ -40,11 +40,10 @@ All paths below default into ``OUTPUT_DIR``:
   ""/None to skip.
 
 Notes:
------
-* All TIGER input layers must share the same CRS.
-* Shapefile outputs truncate column names to 10 chars; use a GeoPackage
-  (``.gpkg``) to preserve full names.
-* Zipped TIGER archives are read transparently via the ``zip://`` VFS prefix.
+    * All TIGER input layers must share the same CRS.
+    * Shapefile outputs truncate column names to 10 chars; use a GeoPackage
+      (``.gpkg``) to preserve full names.
+    * Zipped TIGER archives are read transparently via the ``zip://`` VFS prefix.
 
 Helpful links
 -------------

@@ -5,18 +5,19 @@ This script merges stop-level ridership data from an Excel file with stop locati
 a spatial join to polygons (e.g., Census Blocks) for geographic aggregation.
 
 Outputs:
-Each run writes into a new OUTPUT_FOLDER/stops_ridership_<timestamp> folder,
-starting with the run log, which is written before anything is exported.
-- Stops with ridership attributes (one file, or split by route)
-- CSV summaries (per-stop and optional per-polygon aggregation)
-- ridership_reconciliation.csv (matched vs. unmatched vs. blank-STOP_ID totals;
-  in-polygon, on-boundary, and outside-polygon totals when polygons are used;
-  and the sum of negative values included) and unmatched_ridership.csv (the
-  ridership rows that matched no stop)
-- ridership_value_issues.csv (every blank, malformed, or negative
-  boardings/alightings cell, with its original value and the value used)
-- Optional polygon layer with aggregated ridership
-- Optional per-route boardings/alightings maps from GTFS shapes (see DRAW_PLOTS)
+    Each run writes into a new OUTPUT_FOLDER/stops_ridership_<timestamp> folder,
+    starting with the run log, which is written before anything is exported.
+
+    - Stops with ridership attributes (one file, or split by route)
+    - CSV summaries (per-stop and optional per-polygon aggregation)
+    - ridership_reconciliation.csv (matched vs. unmatched vs. blank-STOP_ID totals;
+      in-polygon, on-boundary, and outside-polygon totals when polygons are used;
+      and the sum of negative values included) and unmatched_ridership.csv (the
+      ridership rows that matched no stop)
+    - ridership_value_issues.csv (every blank, malformed, or negative
+      boardings/alightings cell, with its original value and the value used)
+    - Optional polygon layer with aggregated ridership
+    - Optional per-route boardings/alightings maps from GTFS shapes (see DRAW_PLOTS)
 
 Typical usage:
     Update the paths in the CONFIGURATION section and run from a shell or a

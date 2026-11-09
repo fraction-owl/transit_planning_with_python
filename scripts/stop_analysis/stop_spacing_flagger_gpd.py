@@ -5,10 +5,10 @@ This module converts a General Transit Feed Specification (GTFS) package
 analysis and provides quality assurance (QA) checks on stop spacing.
 
 Outputs:
-• GeoDataFrames for served stops, route polylines, and stop-to-stop segments
-• Shapefiles for use in GIS
-• Logs flagging consecutive served stops that are spaced too closely
-• CSVs identifying potential missed stops located between long stop-to-stop gaps
+    • GeoDataFrames for served stops, route polylines, and stop-to-stop segments
+    • Shapefiles for use in GIS
+    • Logs flagging consecutive served stops that are spaced too closely
+    • CSVs identifying potential missed stops located between long stop-to-stop gaps
 
 The long-spacing check examines whether stops from other routes fall within
 a specified buffer distance of unusually long segments and may merit further
@@ -22,8 +22,8 @@ local trips sharing a shape are measured separately, and a stop visited twice
 matched to the shape in trip order.
 
 Typical usage:
-Update the paths in the CONFIGURATION section and run from a shell or a
-Jupyter notebook.
+    Update the paths in the CONFIGURATION section and run from a shell or a
+    Jupyter notebook.
 """
 
 from __future__ import annotations
