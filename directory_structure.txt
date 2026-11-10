@@ -64,6 +64,7 @@ transit_planning_with_python/
 │   │   ├── pattern_map_exporter_gpd.py
 │   │   ├── route_stops_exporter.py
 │   │   ├── route_transfer_calculator.py
+│   │   ├── scheduled_service_hours.py
 │   │   ├── segment_speed_exporter.py
 │   │   ├── stop_pattern_exporter.py
 │   │   ├── time_band_exporter.py
@@ -305,6 +306,7 @@ transit_planning_with_python/
 │   ├── test_runtime_by_route.py
 │   ├── test_runtime_by_segment.py
 │   ├── test_runtime_by_trip.py
+│   ├── test_scheduled_service_hours.py
 │   ├── test_school_coverage_by_route_gpd.py
 │   ├── test_schools_prep_join_gpd.py
 │   ├── test_segment_speed_exporter.py
