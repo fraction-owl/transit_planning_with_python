@@ -401,3 +401,32 @@ def test_run_log_records_info_when_run_is_called_directly(tmp_path: Path) -> Non
         assert root.level == logging.WARNING  # Restored after the run.
     finally:
         root.setLevel(before)
+
+
+def test_main_returns_2_while_paths_are_placeholders(tmp_path: Path) -> None:
+    assert converter.main([]) == 2
+    tsde, _, _, _ = fixtures(tmp_path)
+    # A real TSDE path is not enough: GTFS_PATH and OUTPUT_DIR are still placeholders.
+    assert converter.main(["--tsde", str(tsde)]) == 2
+
+
+def test_main_writes_run_log_sidecar_with_config_block(tmp_path: Path) -> None:
+    tsde, gtfs, _, _ = fixtures(tmp_path)
+    output = tmp_path / "cli"
+    argv = ["--tsde", str(tsde), "--gtfs", str(gtfs), "--output-dir", str(output)]
+    assert converter.main(argv) == 0
+    (out,) = output.iterdir()
+    assert (out / "draft_tods.zip").is_file()
+    run_log = (out / converter.RUN_LOG_FILENAME).read_text(encoding="utf-8")
+    assert "Exported blocks:    1" in run_log
+    assert "MAX_STOP_DISTANCE_FEET: float =" in run_log  # Verbatim CONFIGURATION block.
+
+
+def test_main_audit_only_flag_ignores_gtfs_setting(tmp_path: Path) -> None:
+    tsde, _, _, _ = fixtures(tmp_path)
+    output = tmp_path / "audit"
+    # GTFS_PATH is still its placeholder; --audit-only means it is never read.
+    assert converter.main(["--tsde", str(tsde), "--audit-only", "--output-dir", str(output)]) == 0
+    (out,) = output.iterdir()
+    assert not (out / "draft_tods.zip").exists()
+    assert "(none: audit only)" in (out / converter.RUN_LOG_FILENAME).read_text(encoding="utf-8")

@@ -1,14 +1,48 @@
 """Reconstruct Trapeze TSDE blocks and export conservative TODS 2.1 supplements.
 
-Python 3.9+; standard library only. Edit CONFIG below or use --help.
-Input: TSDE XML ZIP/folder, optionally the corresponding GTFS ZIP/folder.
-Output: timestamped audit folder and, with matched GTFS, draft_tods.zip.
+Reads a Trapeze TSDE XML schedule export, rebuilds each vehicle block's
+movements (pull-out, revenue trips, interlining deadheads, layovers, pull-back)
+and, when the GTFS feed published from the same schedule is supplied, writes
+the nonrevenue movements as TODS 2.1 supplement files keyed to that exact feed.
 
 Event meanings below are inferred from the supplied TSDE 19.0.17 export.
 They have structural checks, but have not been confirmed against Trapeze's ICD.
 Whole blocks with unresolved movements or incomplete GTFS matches are excluded.
 Run pieces/pay components are audited; operator run_events are deferred in v0.1.
-Reference: https://tods-transit.org/spec/ (TODS 2.1).
+Standard library only, so it also runs in ArcGIS Pro's Python (3.9+).
+
+Inputs
+------
+- TSDE_PATH: the TSDE XML export, as a ZIP or folder (``<prefix>_ver.xml``,
+  ``_pnt``, ``_svc``, ``_cal``, ``_lin``, ``_trp``, ``_blk``, ``_deh``, ...).
+- GTFS_PATH (optional): the matching GTFS feed, as a ZIP or folder. Without
+  it the run is audit only and writes no TODS files.
+
+Outputs
+-------
+One timestamped folder per run under OUTPUT_DIR (``tsde_to_tods_<timestamp>/``):
+
+- ``draft_tods.zip`` (matched GTFS only): ``routes_``, ``stops_``, ``trips_``
+  and ``stop_times_supplement.txt`` covering every fully matched block.
+- Audit CSVs: block summary, movements, raw events, trip/stop/service
+  crosswalks, QA issues, deadhead lookup, run pieces and pay components.
+- ``REPORT.md``, ``manifest.json`` (input SHA-256s, summary) and ``run.log``.
+- ``tsde_to_tods_runlog.txt``: run-log sidecar capturing the verbatim
+  CONFIGURATION block.
+
+Typical usage
+-------------
+Update the paths in the CONFIGURATION section (or pass the matching CLI flags;
+see ``--help``) and run from a shell, ArcGIS Pro's Python window, or a Jupyter
+notebook.
+
+Helpful links
+-------------
+- TODS 2.1 specification: https://tods-transit.org/spec/
+
+See Also:
+    - ``convert_to_tides_trips_performed.py``
+    - ``convert_to_tides_stop_visits.py``
 """
 
 from __future__ import annotations
@@ -30,25 +64,44 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import IO, Optional
+from typing import IO, List, Optional, Sequence
 
 # =============================================================================
-# EDIT HERE: absolute paths also work in an IDE, notebook, or from another folder.
-# Relative paths are resolved against this script, NOT the working directory.
+# CONFIGURATION
 # =============================================================================
-SCRIPT_DIR = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
-TSDE_PATH = SCRIPT_DIR / "2026-June.zip"
-GTFS_PATH: Optional[Path] = None  # Set to the corresponding GTFS ZIP or folder.
-OUTPUT_DIR = SCRIPT_DIR / "output"
+# === BEGIN CONFIG ===
+
+# TSDE XML export, as a ZIP or folder. Absolute paths also work from an IDE or
+# notebook; relative paths are resolved against this script, NOT the working
+# directory.
+TSDE_PATH: Path = Path(r"Path\To\Your\TSDE_Export.zip")
+# Matching GTFS feed, as a ZIP or folder. None runs an audit only (no TODS files).
+GTFS_PATH: Optional[Path] = Path(r"Path\To\Your\GTFS.zip")
+# Parent folder; each run writes a new timestamped sub-folder here.
+OUTPUT_DIR: Path = Path(r"Path\To\Your\Output_Folder")
 EXPORT_PREFIX: Optional[str] = None  # e.g. "20260522"; required if several exports.
-STOP_CODE_ATTRIBUTE = ""  # Blank: TSDE stop pid -> GTFS stop_code (verified here).
-GTFS_STOP_KEY = "stop_code"  # Alternative: "stop_id".
-MAX_STOP_DISTANCE_METERS = 75.0
-COORDINATE_SCALE = 1_000_000.0
+STOP_CODE_ATTRIBUTE: str = ""  # Blank: TSDE stop pid -> GTFS stop_code (verified here).
+GTFS_STOP_KEY: str = "stop_code"  # Alternative: "stop_id".
+# A TSDE stop and its GTFS stop must be within this distance to match.
+MAX_STOP_DISTANCE_FEET: float = 250.0
+COORDINATE_SCALE: float = 1_000_000.0
 # Exact timing at endpoints and GTFS timepoint=1 stops; interpolated stops may vary.
-TIME_TOLERANCE_SECONDS = 0
-EVENT_CODES_VERIFIED = False  # Set only after independent ICD/paddle validation.
-REQUIRE_ALL_BLOCKS = False  # True: suppress the ZIP if any block is ineligible.
+TIME_TOLERANCE_SECONDS: int = 0
+EVENT_CODES_VERIFIED: bool = False  # Set only after independent ICD/paddle validation.
+REQUIRE_ALL_BLOCKS: bool = False  # True: suppress the ZIP if any block is ineligible.
+
+LOG_LEVEL: int = logging.INFO
+
+# When True, a failed run-log write aborts the run (and removes draft_tods.zip),
+# so an output is never left without a matching configuration record.
+REQUIRE_RUN_LOG: bool = True
+
+# === END CONFIG ===
+
+SCRIPT_DIR = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
+RUN_LOG_FILENAME = "tsde_to_tods_runlog.txt"
+FEET_PER_METER = 3.28084
+_PLACEHOLDER_MARKERS = ("path\\to\\", "path/to/")
 
 VERSION = "0.1.0"
 EVENT_CODES = {
@@ -78,13 +131,15 @@ BlockKey = tuple[str, str]
 
 @dataclass
 class Config:
+    """Resolved settings for one conversion run (mirrors the CONFIGURATION block)."""
+
     tsde: Path = TSDE_PATH
     gtfs: Optional[Path] = GTFS_PATH
     output: Path = OUTPUT_DIR
     prefix: Optional[str] = EXPORT_PREFIX
     stop_attribute: str = STOP_CODE_ATTRIBUTE
     stop_key: str = GTFS_STOP_KEY
-    max_stop_distance: float = MAX_STOP_DISTANCE_METERS
+    max_stop_distance_ft: float = MAX_STOP_DISTANCE_FEET
     coordinate_scale: float = COORDINATE_SCALE
     time_tolerance: int = TIME_TOLERANCE_SECONDS
     event_codes_verified: bool = EVENT_CODES_VERIFIED
@@ -93,6 +148,8 @@ class Config:
 
 @dataclass
 class Issue:
+    """One QA finding, optionally tied to a service/block and trip."""
+
     severity: str
     code: str
     service_id: str = ""
@@ -103,6 +160,8 @@ class Issue:
 
 @dataclass
 class QA:
+    """Collects QA findings; any block with an ERROR is excluded from export."""
+
     issues: list[Issue] = field(default_factory=list)
 
     def add(
@@ -113,10 +172,12 @@ class QA:
         block: Optional[BlockKey] = None,
         trip: str = "",
     ) -> None:
+        """Record a finding against an optional (service_id, block_id) and trip."""
         sid, bid = block if block is not None else ("", "")
         self.issues.append(Issue(severity, code, sid, bid, trip, detail))
 
     def bad_blocks(self) -> set[BlockKey]:
+        """Return the (service_id, block_id) keys that have at least one ERROR."""
         return {
             (i.service_id, i.block_id) for i in self.issues if i.severity == "ERROR" and i.block_id
         }
@@ -125,7 +186,8 @@ class QA:
 class Source:
     """Read a ZIP or folder without extracting archive members."""
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path) -> None:
+        """Open *path* as a ZIP archive, or index it as a folder."""
         self.path = path
         self.zip = zipfile.ZipFile(path) if path.is_file() else None
         if self.zip is not None:
@@ -136,10 +198,16 @@ class Source:
             raise FileNotFoundError(path)
 
     def close(self) -> None:
+        """Close the underlying ZIP archive, if any."""
         if self.zip is not None:
             self.zip.close()
 
     def find(self, basename: str, required: bool = True) -> Optional[str]:
+        """Return the one member whose file name is *basename* (case-insensitive).
+
+        Raises:
+            ValueError: If several members match, or none does and *required* is True.
+        """
         matches = [n for n in self.names if Path(n).name.lower() == basename.lower()]
         if len(matches) > 1:
             raise ValueError(f"Ambiguous input: multiple {basename} files in {self.path}.")
@@ -151,6 +219,7 @@ class Source:
 
     @contextmanager
     def open(self, name: str) -> Generator[IO[bytes], None, None]:
+        """Yield a binary stream for member *name*, closing it afterwards."""
         stream = self.zip.open(name) if self.zip is not None else (self.path / name).open("rb")
         try:
             yield stream
@@ -158,6 +227,7 @@ class Source:
             stream.close()
 
     def text(self, basename: str) -> str:
+        """Return member *basename* as text, or an empty string if it is absent."""
         name = self.find(basename, required=False)
         if name is None:
             return ""
@@ -165,6 +235,11 @@ class Source:
             return stream.read().decode("utf-8-sig")
 
     def xml(self, prefix: str, tag: str, required: bool = True) -> Iterator[Row]:
+        """Stream ``<prefix>_<tag>.xml`` records as dicts of child-element text.
+
+        Raises:
+            ValueError: If the file's root element is not ``<file>``.
+        """
         name = self.find(f"{prefix}_{tag}.xml", required)
         if name is None:
             return
@@ -179,6 +254,11 @@ class Source:
                     root.clear()
 
     def csv(self, basename: str, required: bool = True) -> list[Row]:
+        """Read member *basename* as CSV rows with keys and values stripped.
+
+        Raises:
+            ValueError: If a row has more or fewer fields than the header.
+        """
         name = self.find(basename, required)
         if name is None:
             return []
@@ -193,6 +273,7 @@ class Source:
 
 
 def number(row: Row, key: str) -> int:
+    """Return ``row[key]`` as an int, naming the row in the error if it is not one."""
     try:
         return int(row[key])
     except (KeyError, ValueError) as exc:
@@ -200,12 +281,14 @@ def number(row: Row, key: str) -> int:
 
 
 def clock(seconds: int) -> str:
+    """Format seconds after service-day start as GTFS ``HH:MM:SS`` (24+ hours allowed)."""
     if seconds < 0:
         raise ValueError("Negative time cannot be formatted as a GTFS time.")
     return f"{seconds // 3600:02d}:{seconds // 60 % 60:02d}:{seconds % 60:02d}"
 
 
 def seconds(value: str) -> int:
+    """Parse a GTFS ``H:MM:SS`` time (24+ hours allowed) into seconds."""
     match = re.fullmatch(r"(\d+):([0-5]\d):([0-5]\d)", value)
     if match is None:
         raise ValueError(f"Invalid or missing GTFS time: {value!r}")
@@ -214,16 +297,19 @@ def seconds(value: str) -> int:
 
 
 def parse_date(value: str) -> date:
+    """Parse a ``YYYYMMDD`` date."""
     return datetime.strptime(value, "%Y%m%d").date()
 
 
 def dates_between(start: date, end: date) -> list[date]:
+    """Return every date from *start* to *end*, inclusive."""
     if end < start or (end - start).days > 3660:
         raise ValueError(f"Unsupported calendar span: {start} to {end}.")
     return [start + timedelta(days=i) for i in range((end - start).days + 1)]
 
 
 def unique(rows: Iterable[Row], key: str) -> dict[str, Row]:
+    """Index *rows* by *key*, rejecting duplicate key values."""
     result: dict[str, Row] = {}
     for row in rows:
         value = row[key]
@@ -234,14 +320,17 @@ def unique(rows: Iterable[Row], key: str) -> dict[str, Row]:
 
 
 def route_name(name: str) -> str:
+    """Normalise a route name for matching: upper case, whitespace removed."""
     return "".join(name.upper().split())
 
 
 def point_key(row: Row, prefix: str = "") -> PointKey:
+    """Return the typed (ptype, pid) key of a row, reading ``<prefix>ptype``/``pid``."""
     return row[f"{prefix}ptype"], row[f"{prefix}pid"]
 
 
 def distance_m(a: tuple[float, float], b: tuple[float, float]) -> float:
+    """Return the great-circle distance in meters between two (lat, lon) points."""
     lat1, lon1, lat2, lon2 = map(math.radians, (*a, *b))
     v = (
         math.sin((lat2 - lat1) / 2) ** 2
@@ -251,6 +340,7 @@ def distance_m(a: tuple[float, float], b: tuple[float, float]) -> float:
 
 
 def write_csv(path: Path, fields: list[str], rows: Iterable[dict]) -> None:
+    """Write *rows* to *path* as UTF-8-BOM CSV, ignoring keys not in *fields*."""
     with path.open("w", encoding="utf-8-sig", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
@@ -259,6 +349,8 @@ def write_csv(path: Path, fields: list[str], rows: Iterable[dict]) -> None:
 
 @dataclass(frozen=True)
 class Call:
+    """One TSDE trip call: sequence position, typed point and departure time."""
+
     sequence: int
     point: PointKey
     time: int
@@ -266,6 +358,8 @@ class Call:
 
 @dataclass
 class Trip:
+    """One TSDE trip with its calls and any structural errors found while reading."""
+
     sid: str
     tid: str
     lid: str
@@ -277,15 +371,19 @@ class Trip:
 
     @property
     def nodes(self) -> list[Call]:
+        """Calls at timing nodes (``ptype == 'no'``), in sequence order."""
         return [c for c in self.calls if c.point[0] == "no"]
 
     @property
     def stops(self) -> list[Call]:
+        """Calls at stops (``ptype == 'st'``), in sequence order."""
         return [c for c in self.calls if c.point[0] == "st"]
 
 
 @dataclass
 class TSDE:
+    """Everything read from one TSDE schedule export."""
+
     version: Row
     prefix: str
     points: dict[PointKey, Row]
@@ -301,6 +399,19 @@ class TSDE:
 # STAGE 1: Source ingestion and calendar interpretation.
 # =============================================================================
 def read_tsde(source: Source, cfg: Config, qa: QA) -> TSDE:
+    """Read one TSDE export: points, calendars, lines, trips and block events.
+
+    Args:
+        source: The opened TSDE ZIP or folder.
+        cfg: Run settings (export prefix and stop-code attribute).
+        qa: Collector for source-level warnings.
+
+    Returns:
+        The parsed export, with each service's active dates resolved.
+
+    Raises:
+        ValueError: If the export is ambiguous or structurally invalid.
+    """
     prefixes = sorted(
         {Path(n).name[:-8] for n in source.names if Path(n).name.lower().endswith("_ver.xml")}
     )
@@ -418,7 +529,10 @@ def read_tsde(source: Source, cfg: Config, qa: QA) -> TSDE:
         qa.add(
             "WARNING",
             "INFERRED_EVENT_CODES",
-            "Event meanings inferred from TSDE 19.0.17 sequences; independently verify before operational use.",
+            (
+                "Event meanings inferred from TSDE 19.0.17 sequences; independently verify before "
+                "operational use."
+            ),
         )
     logging.info(
         "Read %s distinct trips and %s service/block combinations",
@@ -440,6 +554,8 @@ def read_tsde(source: Source, cfg: Config, qa: QA) -> TSDE:
 
 @dataclass
 class Movement:
+    """One vehicle movement within a block (trip, pull-out, deadhead, layover, ...)."""
+
     sid: str
     bid: str
     sequence: int
@@ -454,6 +570,7 @@ class Movement:
 
     @property
     def key(self) -> BlockKey:
+        """The movement's (service_id, block_id)."""
         return self.sid, self.bid
 
 
@@ -461,6 +578,15 @@ class Movement:
 # STAGE 2: Reconstruct movements; quarantine entire ambiguous blocks.
 # =============================================================================
 def reconstruct(data: TSDE, qa: QA) -> dict[BlockKey, list[Movement]]:
+    """Rebuild each block's movement timeline from its paired TSDE events.
+
+    Args:
+        data: The parsed TSDE export.
+        qa: Collector; every structural problem is recorded as a block ERROR.
+
+    Returns:
+        Movements per (service_id, block_id), with derived same-point layovers.
+    """
     result: dict[BlockKey, list[Movement]] = {}
     ownership: dict[TripKey, set[BlockKey]] = defaultdict(set)
     for key, rows in data.blocks.items():
@@ -474,7 +600,10 @@ def reconstruct(data: TSDE, qa: QA) -> dict[BlockKey, list[Movement]]:
             qa.add(
                 "ERROR",
                 "MULTIPLE_BLOCK_EXTENTS",
-                "Expected one pull-out and one pull-in; source may contain variants or split vehicle work.",
+                (
+                    "Expected one pull-out and one pull-in; source may contain variants or split "
+                    "vehicle work."
+                ),
                 key,
             )
         consumed: set[int] = set()
@@ -663,6 +792,8 @@ def reconstruct(data: TSDE, qa: QA) -> dict[BlockKey, list[Movement]]:
 
 @dataclass
 class GTFS:
+    """The parts of a GTFS feed used for matching, with service dates resolved."""
+
     trips: dict[str, Row]
     stops: dict[str, Row]
     routes: dict[str, Row]
@@ -674,6 +805,8 @@ class GTFS:
 
 @dataclass
 class Matches:
+    """TSDE-to-GTFS matches plus the crosswalk rows written to the audit."""
+
     trips: dict[TripKey, str] = field(default_factory=dict)
     blocks: dict[BlockKey, tuple[str, str]] = field(default_factory=dict)
     trip_rows: list[dict] = field(default_factory=list)
@@ -685,6 +818,12 @@ class Matches:
 # STAGE 3: Match dates, stops, trips, and COMPLETE vehicle blocks to GTFS.
 # =============================================================================
 def read_gtfs(source: Source) -> GTFS:
+    """Read and validate the GTFS tables used for matching.
+
+    Raises:
+        ValueError: If the feed uses frequencies.txt or has broken references,
+            duplicate keys, untimed required stops or nonchronological times.
+    """
     if source.csv("frequencies.txt", required=False):
         raise ValueError(
             "Frequency-based GTFS requires explicit trip-instance expansion; unsupported."
@@ -749,6 +888,18 @@ def read_gtfs(source: Source) -> GTFS:
 
 
 def match_gtfs(data: TSDE, gtfs: GTFS, cfg: Config, qa: QA) -> Matches:
+    """Match TSDE services, stops, trips and whole blocks to the GTFS feed.
+
+    Args:
+        data: The parsed TSDE export.
+        gtfs: The parsed GTFS feed.
+        cfg: Matching settings (stop key, distance and time tolerances).
+        qa: Collector for unmatched services and ineligible blocks.
+
+    Returns:
+        One-to-one trip matches and the blocks whose every trip matched a
+        complete GTFS block.
+    """
     matches = Matches()
     code_index: dict[str, list[str]] = defaultdict(list)
     for stop_id, row in gtfs.stops.items():
@@ -767,8 +918,9 @@ def match_gtfs(data: TSDE, gtfs: GTFS, cfg: Config, qa: QA) -> Matches:
             )
             for candidate in candidates:
                 other = gtfs.stops[candidate]
-                distance = distance_m(coord, (float(other["stop_lat"]), float(other["stop_lon"])))
-                if distance <= cfg.max_stop_distance:
+                other_coord = (float(other["stop_lat"]), float(other["stop_lon"]))
+                distance = distance_m(coord, other_coord) * FEET_PER_METER
+                if distance <= cfg.max_stop_distance_ft:
                     close.append((candidate, distance))
         except ValueError:
             close = []
@@ -782,7 +934,7 @@ def match_gtfs(data: TSDE, gtfs: GTFS, cfg: Config, qa: QA) -> Matches:
                 "stop_code": row["stop_code"],
                 "status": status,
                 "gtfs_stop_id": close[0][0] if len(close) == 1 else "",
-                "distance_m": round(close[0][1], 2) if len(close) == 1 else "",
+                "distance_ft": round(close[0][1], 1) if len(close) == 1 else "",
             }
         )
     service_map: dict[str, set[str]] = {}
@@ -955,6 +1107,24 @@ def export_tods(
     cfg: Config,
     qa: QA,
 ) -> dict:
+    """Write the TODS supplement files for every eligible block.
+
+    Args:
+        data: The parsed TSDE export.
+        gtfs: The GTFS feed the supplements are keyed to.
+        matches: Output of :func:`match_gtfs`.
+        movements: Output of :func:`reconstruct`.
+        out: The run's output folder.
+        cfg: Run settings.
+        qa: Collector for blocks rejected during export.
+
+    Returns:
+        Export summary: block and nonrevenue trip counts, exported block keys
+        and the ZIP name (``None`` when nothing was written).
+
+    Raises:
+        ValueError: If generated rows fail the final key/reference checks.
+    """
     prefix = f"TODS_TSDE_{data.version['verid']}_"
     tables: dict[str, list[Row]] = {
         name: []
@@ -1181,6 +1351,7 @@ def write_audit(
     out: Path,
     summary: dict,
 ) -> None:
+    """Write the audit CSVs and REPORT.md into *out*."""
     points = []
     for key, row in sorted(data.points.items()):
         points.append(
@@ -1394,7 +1565,7 @@ def write_audit(
             "stop_code",
             "status",
             "gtfs_stop_id",
-            "distance_m",
+            "distance_ft",
         ],
         matches.point_rows,
     )
@@ -1425,20 +1596,47 @@ def write_audit(
         f"- Blocks exported: {summary.get('exported_blocks', 0):,}.",
         f"- Nonrevenue trips exported: {summary.get('exported_deadheads', 0):,}.",
         "",
-        "This is a **partial draft supplement**, not a complete operational feed. Apply only to the exact GTFS fingerprint in manifest.json.",
-        "No source GTFS rows are overwritten. Missing blocks are documented in block_summary.csv; do not treat their absent deadheads as zero.",
+        (
+            "This is a **partial draft supplement**, not a complete operational feed. Apply only "
+            "to the exact GTFS fingerprint in manifest.json."
+        ),
+        (
+            "No source GTFS rows are overwritten. Missing blocks are documented in "
+            "block_summary.csv; do not treat their absent deadheads as zero."
+        ),
         "",
         "## Interpretation",
         "",
         "- Event meanings are inferred unless explicitly marked verified in the configuration.",
-        "- Scheduled trip durations include internal service; they are not automatically revenue hours.",
-        "- Same-point gaps are labeled layover; paid-break status and actual operator duties are not inferred.",
+        (
+            "- Scheduled trip durations include internal service; they are not automatically "
+            "revenue hours."
+        ),
+        (
+            "- Same-point gaps are labeled layover; paid-break status and actual operator duties "
+            "are not inferred."
+        ),
         "- Deadheads come from paired block events. Lookup entries are not instantiated as trips.",
-        "- Negative lookup durations and zero distances are preserved, not converted to zero travel time or mileage.",
-        "- Stop matching uses the configured code and a coordinate check. Trip matching checks route, all stops in order, dates, terminal times, and published timepoints.",
-        "- Direction numbers are preserved in the crosswalk but not assumed to have the same meaning across systems.",
-        "- Run pieces and pay attributes are included for review; run_events.txt and employee/fleet assignments are not generated in this version.",
-        "- Failed source geometry exports are recorded. No nonrevenue geometry or distance is fabricated.",
+        (
+            "- Negative lookup durations and zero distances are preserved, not converted to zero "
+            "travel time or mileage."
+        ),
+        (
+            "- Stop matching uses the configured code and a coordinate check. Trip matching checks"
+            " route, all stops in order, dates, terminal times, and published timepoints."
+        ),
+        (
+            "- Direction numbers are preserved in the crosswalk but not assumed to have the same "
+            "meaning across systems."
+        ),
+        (
+            "- Run pieces and pay attributes are included for review; run_events.txt and "
+            "employee/fleet assignments are not generated in this version."
+        ),
+        (
+            "- Failed source geometry exports are recorded. No nonrevenue geometry or distance is "
+            "fabricated."
+        ),
         "",
         "## QA counts",
         "",
@@ -1451,8 +1649,14 @@ def write_audit(
             "",
             "## Suggested manual checks",
             "",
-            "Check a weekday block from each garage, an interlined block, and an overnight block against paddles.",
-            "Confirm the 1/15, 16/2, and 17/18 event pairs against Trapeze documentation before relying on the output for operations or savings estimates.",
+            (
+                "Check a weekday block from each garage, an interlined block, and an overnight "
+                "block against paddles."
+            ),
+            (
+                "Confirm the 1/15, 16/2, and 17/18 event pairs against Trapeze documentation "
+                "before relying on the output for operations or savings estimates."
+            ),
             "",
         ]
     )
@@ -1472,9 +1676,23 @@ def fingerprint(source: Source) -> dict[str, str]:
 
 
 def run(cfg: Config) -> Path:
+    """Run one conversion into a new timestamped folder under ``cfg.output``.
+
+    Args:
+        cfg: Run settings.
+
+    Returns:
+        The run's output folder.
+
+    Raises:
+        ValueError: If settings or inputs are invalid.
+        RuntimeError: If the run log is required and could not be written.
+
+    A ``draft_tods.zip`` written before a later failure is deleted.
+    """
     if cfg.stop_key not in {"stop_id", "stop_code"} or cfg.coordinate_scale <= 0:
         raise ValueError("Invalid stop key or coordinate scale.")
-    if cfg.max_stop_distance < 0 or cfg.time_tolerance < 0:
+    if cfg.max_stop_distance_ft < 0 or cfg.time_tolerance < 0:
         raise ValueError("Matching tolerances must be nonnegative.")
     cfg.output.mkdir(parents=True, exist_ok=True)
     out = cfg.output / datetime.now().strftime("tsde_to_tods_%Y%m%d_%H%M%S_%f")
@@ -1485,8 +1703,8 @@ def run(cfg: Config) -> Path:
     previous_level = root.level
     # Called without main() (tests, notebook imports), the root logger is still at
     # WARNING and run.log would stay empty; lower it for this run only.
-    if root.getEffectiveLevel() > logging.INFO:
-        root.setLevel(logging.INFO)
+    if root.getEffectiveLevel() > LOG_LEVEL:
+        root.setLevel(LOG_LEVEL)
     root.addHandler(handler)
     sources: list[Source] = []
     try:
@@ -1498,7 +1716,10 @@ def run(cfg: Config) -> Path:
             qa.add(
                 "WARNING",
                 "SOURCE_PROD_FLAG_N",
-                "Schedule version has prod=N; retained as source metadata, not assumed to invalidate the export.",
+                (
+                    "Schedule version has prod=N; retained as source metadata, not assumed to "
+                    "invalidate the export."
+                ),
             )
         logging.info("Reconstructing vehicle movements")
         movements = reconstruct(data, qa)
@@ -1559,6 +1780,20 @@ def run(cfg: Config) -> Path:
         (out / "manifest.json").write_text(
             json.dumps(manifest, indent=2, default=str) + "\n", encoding="utf-8"
         )
+        summary_lines = [
+            f"TSDE input:         {cfg.tsde}",
+            f"GTFS input:         {cfg.gtfs if cfg.gtfs is not None else '(none: audit only)'}",
+            f"Status:             {manifest['status']}",
+            f"TSDE trips/blocks:  {summary['tsde_trips']} / {summary['tsde_blocks']}",
+            f"Matched trips:      {summary['matched_trips']}",
+            f"Exported blocks:    {summary['exported_blocks']}",
+            f"Nonrevenue trips:   {summary['exported_deadheads']}",
+        ]
+        if not write_run_log(out, summary_lines) and REQUIRE_RUN_LOG:
+            raise RuntimeError(
+                "Run log could not be written. Set REQUIRE_RUN_LOG = False to suppress this "
+                "error when a sidecar file is genuinely impossible."
+            )
         logging.info(
             "Complete: %s blocks, %s nonrevenue trips exported. Output: %s",
             summary["exported_blocks"],
@@ -1579,63 +1814,277 @@ def run(cfg: Config) -> Path:
         handler.close()
 
 
-def parse_args(argv: Optional[list[str]] = None) -> Config:
+# =============================================================================
+# RUN LOG
+# =============================================================================
+
+
+def resolve_source_file() -> Optional[Path]:
+    """Best-effort path to this script's source (``None`` in notebooks)."""
+    try:
+        return Path(__file__).resolve()
+    except NameError:
+        return None
+
+
+def extract_config_block(source_file: Path) -> str:
+    r"""Return the text between the CONFIG markers in *source_file*.
+
+    Reads ``source_file`` as UTF-8 text and slices out the lines strictly
+    *between* the first occurrence of ``# === BEGIN CONFIG ===`` and the first
+    subsequent occurrence of ``# === END CONFIG ===``.  The marker lines
+    themselves are excluded; whitespace and inline comments inside the block
+    are preserved verbatim.
+
+    Args:
+        source_file: Path to the Python source file to scan (typically
+            ``Path(__file__)`` from the calling script).
+
+    Returns:
+        The verbatim text of the configuration block, joined with ``\n``.
+
+    Raises:
+        ValueError: If either marker is missing or they appear out of order.
+        OSError: If ``source_file`` cannot be read.
+    """
+    _BEGIN = "# === BEGIN CONFIG ==="
+    _END = "# === END CONFIG ==="
+
+    lines: list[str] = source_file.read_text(encoding="utf-8").splitlines()
+
+    begin_idx: int | None = None
+    end_idx: int | None = None
+    for i, line in enumerate(lines):
+        stripped: str = line.strip()
+        if begin_idx is None and stripped == _BEGIN:
+            begin_idx = i
+        elif begin_idx is not None and stripped == _END:
+            end_idx = i
+            break
+
+    if begin_idx is None or end_idx is None:
+        raise ValueError(
+            f"Config markers not found in '{source_file}'. Expected '{_BEGIN}' and '{_END}'."
+        )
+
+    return "\n".join(lines[begin_idx + 1 : end_idx])
+
+
+def write_run_log(output_dir: Path, summary_lines: List[str]) -> bool:
+    """Write the verbatim config block plus a run summary into *output_dir*.
+
+    Args:
+        output_dir: The run's timestamped output folder.
+        summary_lines: Pre-formatted lines describing what the run produced.
+
+    Returns:
+        ``True`` if the log was written successfully, ``False`` otherwise.
+    """
+    log_path = output_dir / RUN_LOG_FILENAME
+
+    source_file = resolve_source_file()
+    if source_file is None:
+        config_text = "(config block unavailable: interactive session, no __file__ on disk)"
+        source_display = "<interactive>"
+    else:
+        try:
+            config_text = extract_config_block(source_file)
+        except (OSError, ValueError) as exc:
+            logging.error("Could not extract config block for run log: %s", exc)
+            return False
+        source_display = str(source_file)
+
+    lines: List[str] = [
+        "=" * 72,
+        "TSDE TO TODS RUN LOG",
+        "=" * 72,
+        f"Run timestamp:    {datetime.now().isoformat(timespec='seconds')}",
+        f"Output directory: {output_dir}",
+        f"Source script:    {source_display}",
+        "",
+        "-" * 72,
+        "RUN SUMMARY",
+        "-" * 72,
+        *summary_lines,
+        "",
+        "-" * 72,
+        "CONFIGURATION (verbatim from source)",
+        "-" * 72,
+        config_text,
+        "=" * 72,
+    ]
+
+    try:
+        log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        logging.info("Run log saved to '%s'.", log_path)
+        return True
+    except OSError as exc:
+        logging.error("Error writing run log: %s", exc)
+        return False
+
+
+# =============================================================================
+# CLI / MAIN
+# =============================================================================
+
+
+def notebook_safe_argv(argv: Optional[Sequence[str]]) -> Optional[List[str]]:
+    """Return the argv to parse, shielding notebook kernels from stray flags.
+
+    When a script's ``main()`` runs with no explicit ``argv`` inside a
+    Jupyter/IPython kernel, ``sys.argv`` holds kernel plumbing (for example
+    ``-f /path/kernel.json``) rather than flags meant for the script, and
+    strict ``argparse.parse_args`` would reject it and abort.  This helper
+    detects the notebook case and substitutes an empty argument list so the
+    CONFIGURATION constants stay in charge, while shell runs keep strict
+    parsing (a typo in a flag fails loudly instead of being silently ignored).
+
+    Canonical implementation: ``utils/cli_helpers.py``.
+
+    Args:
+        argv: Explicit argument list passed to ``main()``, or ``None`` to
+            fall back to ``sys.argv``.
+
+    Returns:
+        ``list(argv)`` when *argv* was provided; ``[]`` when running inside a
+        notebook kernel; otherwise ``None`` so argparse reads ``sys.argv[1:]``.
+    """
+    if argv is not None:
+        return list(argv)
+    if "ipykernel" in sys.modules:
+        return []
+    return None
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    """Create the command-line parser; every default is a CONFIGURATION constant."""
     parser = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+        description="Reconstruct Trapeze TSDE blocks and export TODS 2.1 supplements.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--tsde", type=Path, default=TSDE_PATH, help="TSDE XML ZIP or folder")
+    parser.add_argument("--tsde", type=Path, default=TSDE_PATH, help="TSDE XML ZIP or folder.")
     parser.add_argument(
         "--gtfs",
         type=Path,
         default=GTFS_PATH,
-        help="Matching GTFS ZIP or folder; omit for audit only",
+        help="Matching GTFS ZIP or folder.",
     )
-    parser.add_argument("--output", type=Path, default=OUTPUT_DIR, help="Parent output folder")
+    parser.add_argument(
+        "--audit-only",
+        action="store_true",
+        help="Ignore --gtfs/GTFS_PATH and write the audit files only (no TODS ZIP).",
+    )
+    parser.add_argument("--output-dir", type=Path, default=OUTPUT_DIR, help="Parent output folder.")
     parser.add_argument(
         "--prefix",
         default=EXPORT_PREFIX,
-        help="Date prefix if the TSDE folder has several exports",
+        help="Date prefix if the TSDE folder has several exports.",
     )
-    parser.add_argument("--stop-key", choices=("stop_code", "stop_id"), default=GTFS_STOP_KEY)
-    parser.add_argument("--stop-attribute", default=STOP_CODE_ATTRIBUTE)
-    parser.add_argument("--max-stop-distance", type=float, default=MAX_STOP_DISTANCE_METERS)
-    parser.add_argument("--time-tolerance", type=int, default=TIME_TOLERANCE_SECONDS)
-    parser.add_argument("--event-codes-verified", action="store_true", default=EVENT_CODES_VERIFIED)
-    parser.add_argument("--require-all-blocks", action="store_true", default=REQUIRE_ALL_BLOCKS)
-    # Notebook execution uses EDIT HERE values and ignores the kernel's -f argument.
-    if argv is None and "ipykernel" in sys.modules:
-        argv = []
-    args = parser.parse_args(argv)
+    parser.add_argument(
+        "--stop-key",
+        choices=("stop_code", "stop_id"),
+        default=GTFS_STOP_KEY,
+        help="GTFS stops.txt field that holds the TSDE stop code.",
+    )
+    parser.add_argument(
+        "--stop-attribute",
+        default=STOP_CODE_ATTRIBUTE,
+        help="TSDE point attribute holding the stop code; blank uses the stop pid.",
+    )
+    parser.add_argument(
+        "--max-stop-distance-ft",
+        type=float,
+        default=MAX_STOP_DISTANCE_FEET,
+        help="Largest TSDE-to-GTFS stop distance accepted as a match, in feet.",
+    )
+    parser.add_argument(
+        "--time-tolerance",
+        type=int,
+        default=TIME_TOLERANCE_SECONDS,
+        help="Allowed timepoint difference between TSDE and GTFS, in seconds.",
+    )
+    parser.add_argument(
+        "--event-codes-verified",
+        action=argparse.BooleanOptionalAction,
+        default=EVENT_CODES_VERIFIED,
+        help="Record that the TSDE event-code meanings were independently verified.",
+    )
+    parser.add_argument(
+        "--require-all-blocks",
+        action=argparse.BooleanOptionalAction,
+        default=REQUIRE_ALL_BLOCKS,
+        help="Suppress the TODS ZIP if any source block is ineligible.",
+    )
+    return parser
 
-    def resolve(path: Path) -> Path:
-        return (
-            path.expanduser().resolve()
-            if path.is_absolute()
-            else (SCRIPT_DIR / path.expanduser()).resolve()
+
+def is_placeholder_path(path: object) -> bool:
+    """Return True if *path* still points at a default placeholder location."""
+    text = str(path).lower()
+    return any(marker in text for marker in _PLACEHOLDER_MARKERS)
+
+
+def resolve_input_path(path: Path) -> Path:
+    """Resolve *path*, reading relative paths against this script's folder."""
+    path = path.expanduser()
+    return path.resolve() if path.is_absolute() else (SCRIPT_DIR / path).resolve()
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """Entry point. Validates placeholder paths before doing any work.
+
+    Args:
+        argv: Optional argument list; ``None`` reads ``sys.argv`` (or uses the
+            CONFIGURATION constants inside a notebook).
+
+    Returns:
+        Process exit code: 0 on success, 1 on failure, 2 if required
+        CONFIGURATION values are still placeholders.
+    """
+    logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(message)s")
+    args = build_arg_parser().parse_args(notebook_safe_argv(argv))
+    gtfs = None if args.audit_only else args.gtfs
+    placeholders = [
+        name
+        for name, value in (("TSDE_PATH", args.tsde), ("GTFS_PATH", gtfs))
+        if value is not None and is_placeholder_path(value)
+    ]
+    if is_placeholder_path(args.output_dir):
+        placeholders.append("OUTPUT_DIR")
+    if placeholders:
+        logging.warning(
+            "%s still placeholder(s). Update the CONFIGURATION section or pass the matching "
+            "flags (--tsde, --gtfs, --output-dir); use --audit-only or GTFS_PATH = None to "
+            "run without GTFS.",
+            ", ".join(placeholders),
         )
-
-    return Config(
-        resolve(args.tsde),
-        resolve(args.gtfs) if args.gtfs is not None else None,
-        resolve(args.output),
-        args.prefix,
-        args.stop_attribute,
-        args.stop_key,
-        args.max_stop_distance,
-        COORDINATE_SCALE,
-        args.time_tolerance,
-        args.event_codes_verified,
-        args.require_all_blocks,
+        return 2
+    cfg = Config(
+        tsde=resolve_input_path(args.tsde),
+        gtfs=resolve_input_path(gtfs) if gtfs is not None else None,
+        output=resolve_input_path(args.output_dir),
+        prefix=args.prefix,
+        stop_attribute=args.stop_attribute,
+        stop_key=args.stop_key,
+        max_stop_distance_ft=args.max_stop_distance_ft,
+        coordinate_scale=COORDINATE_SCALE,
+        time_tolerance=args.time_tolerance,
+        event_codes_verified=args.event_codes_verified,
+        require_all_blocks=args.require_all_blocks,
     )
-
-
-def main(argv: Optional[list[str]] = None) -> int:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
     try:
-        run(parse_args(argv))
-    except (OSError, ValueError, KeyError, ET.ParseError, zipfile.BadZipFile) as exc:
+        out = run(cfg)
+    except (
+        OSError,
+        ValueError,
+        KeyError,
+        RuntimeError,
+        ET.ParseError,
+        zipfile.BadZipFile,
+    ) as exc:
         logging.error("%s", exc)
         return 1
+    logging.info("Script completed successfully. Results: %s", out)
     return 0
 
 
