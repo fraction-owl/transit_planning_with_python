@@ -12,9 +12,9 @@ Notebook / manual: edit the CONFIG block below, then run the file (or call
 or ``%run``-ing it uses the CONFIG values.
 
 Command line: every CONFIG value has a matching flag that overrides it, e.g.
-    python dev_tools/generate_bikeshare_fixture.py --months 6 --rows 600
-    python dev_tools/generate_bikeshare_fixture.py \\
-        --input-extract "C:\\data\\202604-capitalbikeshare-tripdata.zip" \\
+    python dev_tools/generate_mock_bikeshare_trips.py --months 6 --rows 600
+    python dev_tools/generate_mock_bikeshare_trips.py \
+        --input-extract "C:\\data\\202604-capitalbikeshare-tripdata.zip" \
         --output-dir tests/fixtures/capitalbikeshare
 
 Outputs

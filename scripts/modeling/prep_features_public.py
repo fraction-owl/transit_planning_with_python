@@ -1,4 +1,4 @@
-"""Drop-folder feature-prep orchestrator (the PUBLIC half of the split).
+"""Orchestrate drop-folder feature prep (the PUBLIC half of the split).
 
 This is the unsecured-box half of a split pipeline that keeps proprietary NTD
 data on one machine while feature prep happens elsewhere. Its secured-box
@@ -16,7 +16,7 @@ runtime features that may never cross to this side:
         Loads the NTD anchor, verifies and joins each prepped bundle onto it,
         then fits the regression and exports results.
 
-Pipeline (front half is new; the "combine" back half is unchanged):
+Workflow (front half is new; the "combine" back half is unchanged):
 
     scan -> extract -> run -> collect -> describe -> combine
 
@@ -38,7 +38,7 @@ Pipeline (front half is new; the "combine" back half is unchanged):
               governance), then ``write_bundles`` -> ``write_manifest`` ->
               ``write_run_log``.
 
-Design notes:
+Notes:
     - One bundle per join-key signature. Tables that share a join key (e.g. all
       the ``route_id`` coverage tables) are outer-merged into a single bundle; a
       differently keyed table (e.g. ``period``-keyed exogenous series) goes to

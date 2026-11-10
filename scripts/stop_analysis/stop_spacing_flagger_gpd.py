@@ -1,14 +1,8 @@
-"""GTFS to GIS pipeline for stop-spacing QA and segment analysis.
+"""Run a GTFS-to-GIS pipeline for stop-spacing QA and segment analysis.
 
 This module converts a General Transit Feed Specification (GTFS) package
 (directory or .zip) into projected ESRI Shapefiles suitable for spatial
 analysis and provides quality assurance (QA) checks on stop spacing.
-
-Outputs:
-• GeoDataFrames for served stops, route polylines, and stop-to-stop segments
-• Shapefiles for use in GIS
-• Logs flagging consecutive served stops that are spaced too closely
-• CSVs identifying potential missed stops located between long stop-to-stop gaps
 
 The long-spacing check examines whether stops from other routes fall within
 a specified buffer distance of unusually long segments and may merit further
@@ -21,9 +15,15 @@ local trips sharing a shape are measured separately, and a stop visited twice
 ``shape_dist_traveled`` when both files provide it; otherwise the stops are
 matched to the shape in trip order.
 
+Outputs:
+    • GeoDataFrames for served stops, route polylines, and stop-to-stop segments
+    • Shapefiles for use in GIS
+    • Logs flagging consecutive served stops that are spaced too closely
+    • CSVs identifying potential missed stops located between long stop-to-stop gaps
+
 Typical usage:
-Update the paths in the CONFIGURATION section and run from a shell or a
-Jupyter notebook.
+    Update the paths in the CONFIGURATION section and run from a shell or a
+    Jupyter notebook.
 """
 
 from __future__ import annotations

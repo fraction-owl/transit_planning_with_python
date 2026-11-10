@@ -1,11 +1,11 @@
-"""End-to-end open-source pipeline: merge Census CSVs, merge TIGER shapefiles, join to output.
+"""Merge Census CSVs, merge TIGER shapefiles, join to output (end-to-end open-source pipeline).
 
 GeoPandas equivalent of the ArcPy pipeline.  Runs three stages in one process,
 passing DataFrames between stages in memory — no intermediate disk writes are
 required, though they can be enabled via configuration.
 
-Stages
-------
+Workflow
+--------
 1) CSV stage (pandas):
         Discover and merge Census + LODES CSVs into a single block-level
         attribute table, optionally filtered by county FIPS.
@@ -40,11 +40,10 @@ All paths below default into ``OUTPUT_DIR``:
   ""/None to skip.
 
 Notes:
------
-* All TIGER input layers must share the same CRS.
-* Shapefile outputs truncate column names to 10 chars; use a GeoPackage
-  (``.gpkg``) to preserve full names.
-* Zipped TIGER archives are read transparently via the ``zip://`` VFS prefix.
+    * All TIGER input layers must share the same CRS.
+    * Shapefile outputs truncate column names to 10 chars; use a GeoPackage
+      (``.gpkg``) to preserve full names.
+    * Zipped TIGER archives are read transparently via the ``zip://`` VFS prefix.
 
 Helpful links
 -------------

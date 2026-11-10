@@ -1,4 +1,4 @@
-"""Identifies nearby GTFS stops and associated routes for given locations or stop codes.
+"""Identify nearby GTFS stops and associated routes for given locations or stop codes.
 
 Supports two input modes:
 - 'location': Uses point shapefile or manual lat/lon coordinates.
@@ -7,9 +7,9 @@ Supports two input modes:
 Applies optional route filters and returns closest routes and directions per input.
 Outputs results to a CSV file with customizable location metadata.
 
-Typical usage:
-    - Evaluate transit accessibility near proposed schools, facilities, or sites.
-    - Summarize GTFS route presence at selected stop codes.
+Use it to:
+- Evaluate transit accessibility near proposed schools, facilities, or sites.
+- Summarize GTFS route presence at selected stop codes.
 
 Inputs:
     - GTFS files: stops.txt, stop_times.txt, trips.txt, routes.txt.
@@ -17,6 +17,10 @@ Inputs:
 
 Outputs:
     - CSV listing stops or locations with nearby GTFS routes and directions.
+
+Typical usage:
+    Update the paths in the CONFIGURATION section and run from a shell or a
+    Jupyter notebook.
 """
 
 from __future__ import annotations

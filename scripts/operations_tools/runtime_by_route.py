@@ -1,4 +1,4 @@
-"""Route-level running-time features from TIDES, windowed for ridership modeling.
+"""Compute route-level running-time features from TIDES, windowed for ridership modeling.
 
 This is the *modeling-feature* counterpart to ``runtime_by_trip.py``. Where
 that script diagnoses individual scheduled trips (per-trip stats, variation

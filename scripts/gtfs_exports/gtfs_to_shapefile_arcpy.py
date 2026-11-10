@@ -1,4 +1,4 @@
-"""GTFS stops + route patterns to WGS84 shapefiles (ArcPy version).
+"""Export GTFS stops + route patterns to WGS84 shapefiles (ArcPy version).
 
 This script converts a GTFS feed into two outputs:
 

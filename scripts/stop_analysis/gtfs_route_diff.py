@@ -1,4 +1,4 @@
-"""GTFS route comparison (before vs after) with notebook-friendly execution.
+"""Compare GTFS routes (before vs after) with notebook-friendly execution.
 
 A planner-facing companion to ``gtfs_stop_diff.py``. Point it at two GTFS feeds
 (an *old*/before feed and a *new*/after feed) and it classifies every route into
@@ -35,32 +35,30 @@ Design decisions (all threshold knobs live in the CONFIG block and are CLI flags
   are still surfaced through the route-level day-type rollup.
 - Fares cover GTFS-Fares **v1** only (the files the loader already reads).
 
-Outputs (CSV):
-- routes_overview.csv         : one row per route with flags + a plain-English summary
-- routes_eliminated.csv       : routes only in the before feed (true eliminations)
-- routes_added.csv            : routes only in the after feed (true additions)
-- routes_alignment_changes.csv
-- routes_schedule_changes.csv
-- routes_reblocked.csv
-- routes_name_attr_changes.csv
-- routes_daytype_changes.csv  : routes that gained/lost weekday/Saturday/Sunday service
-- routes_split_merge_candidates.csv : heuristic split (1->2+) / merge (2+->1) candidates
-- calendar_changes.csv        : service_ids added/removed/redefined (the "calendar approach")
-- fare_attribute_changes.csv  : fare_id prices/attributes added/removed/changed
-- route_fare_changes.csv      : routes whose fare_rules mapping changed
-- summary.json
-
-Also outputs:
-- routes_comparison.xlsx (one sheet per table above + summary)
-- gtfs_route_diff.log
+Outputs:
+    - routes_overview.csv         : one row per route with flags + a plain-English summary
+    - routes_eliminated.csv       : routes only in the before feed (true eliminations)
+    - routes_added.csv            : routes only in the after feed (true additions)
+    - routes_alignment_changes.csv
+    - routes_schedule_changes.csv
+    - routes_reblocked.csv
+    - routes_name_attr_changes.csv
+    - routes_daytype_changes.csv  : routes that gained/lost weekday/Saturday/Sunday service
+    - routes_split_merge_candidates.csv : heuristic split (1->2+) / merge (2+->1) candidates
+    - calendar_changes.csv        : service_ids added/removed/redefined (the "calendar approach")
+    - fare_attribute_changes.csv  : fare_id prices/attributes added/removed/changed
+    - route_fare_changes.csv      : routes whose fare_rules mapping changed
+    - summary.json
+    - routes_comparison.xlsx (one sheet per table above + summary)
+    - gtfs_route_diff.log
 
 No arcpy / geopandas. pandas + numpy only.
 
 Typical usage:
-Update the paths in the CONFIG block (or pass ``--before``, ``--after`` and ``--out``,
-plus the threshold flags) and run from a shell or a Jupyter notebook — arguments are
-parsed strictly, with ``notebook_safe_argv`` shielding notebook kernels from their
-injected argv so ``main()`` also runs cleanly inside a notebook.
+    Update the paths in the CONFIG block (or pass ``--before``, ``--after`` and ``--out``,
+    plus the threshold flags) and run from a shell or a Jupyter notebook — arguments are
+    parsed strictly, with ``notebook_safe_argv`` shielding notebook kernels from their
+    injected argv so ``main()`` also runs cleanly inside a notebook.
 """
 
 from __future__ import annotations

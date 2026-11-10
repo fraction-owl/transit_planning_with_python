@@ -1,4 +1,4 @@
-"""GTFS Stop Conflict Checker.
+"""Identify GTFS stops intersecting roadway, driveway, or building footprints.
 
 Uses ArcPy and pandas to identify GTFS stops that directly INTERSECT
 (spatially overlap) with roadway, driveway, or building footprint layers.

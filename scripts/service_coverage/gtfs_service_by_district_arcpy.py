@@ -1,10 +1,11 @@
-"""Generates a matrix showing which public transit routes operate near which districts.
+"""Generate a matrix showing which public transit routes operate near which districts.
 
 This script processes General Transit Feed Specification (GTFS) data and performs a
 spatial analysis using ArcPy to determine the relationship between transit stops
 and specified districts.
 
-It follows these steps:
+Workflow
+--------
 1. Loads required GTFS files (routes, trips, stops, stop_times).
 2. Filters GTFS stops to include only active boarding locations.
 3. Converts the filtered stops to a point feature class in WGS84 (EPSG:4326).

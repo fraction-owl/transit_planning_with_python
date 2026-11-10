@@ -30,16 +30,15 @@ Outputs
   ``trip_count``.
 
 Notes:
------
-Service selection is date-based: ``calendar.txt`` and ``calendar_dates.txt``
-are expanded into each service_id's real set of active dates, and metrics
-are computed for a single representative date of the requested day type
-(the median date of the most common service pattern, skipping observed
-federal holidays). This keeps holiday-only services out of weekday
-headways and avoids double-counting agencies that run distinct Monday /
-midweek / Friday schedules — the script warns when it detects that split.
-Feeds whose calendar lacks usable dates fall back to the day-of-week
-columns with a warning; ``SERVICE_DATE`` overrides selection entirely.
+    Service selection is date-based: ``calendar.txt`` and ``calendar_dates.txt``
+    are expanded into each service_id's real set of active dates, and metrics
+    are computed for a single representative date of the requested day type
+    (the median date of the most common service pattern, skipping observed
+    federal holidays). This keeps holiday-only services out of weekday
+    headways and avoids double-counting agencies that run distinct Monday /
+    midweek / Friday schedules — the script warns when it detects that split.
+    Feeds whose calendar lacks usable dates fall back to the day-of-week
+    columns with a warning; ``SERVICE_DATE`` overrides selection entirely.
 
 Typical usage
 -------------

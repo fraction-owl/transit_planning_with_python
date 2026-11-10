@@ -1,4 +1,4 @@
-"""GTFS stop proximity checker.
+"""Flag GTFS stops closer together than a configured distance threshold.
 
 Reads GTFS stops.txt (and optionally stop_times.txt and trips.txt when the
 direction-based filter is enabled) and flags stops closer than a configured
@@ -19,8 +19,8 @@ blank route_id, or a shared route with a blank or invalid direction_id, keeps
 the pair.
 
 Outputs:
-- CSV of close stop pairs (with distance + safe flags)
-- CSV of per-stop summary (count of close neighbors)
+    - CSV of close stop pairs (with distance + safe flags)
+    - CSV of per-stop summary (count of close neighbors)
 
 Typical usage:
     Update the paths in the CONFIGURATION section and run from a shell or a

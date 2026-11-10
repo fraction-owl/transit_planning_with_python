@@ -1,4 +1,4 @@
-"""GTFS proximity to sites (points, polygons, or points+parcels) with ArcPy.
+"""Find GTFS routes near sites (points, polygons, or points+parcels) with ArcPy.
 
 This script finds nearby GTFS routes for user-specified locations. It supports:
   - A single input feature class of points (e.g., access/entrance points), or

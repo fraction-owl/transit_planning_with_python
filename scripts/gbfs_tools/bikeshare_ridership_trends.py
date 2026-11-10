@@ -6,15 +6,19 @@ named ``YYYYMM-capitalbikeshare-tripdata.csv``, as produced by
 ``.zip`` archive, and exports tables and charts describing how ridership
 changes over time, both system-wide and for each individual station.
 
-Typical usage
--------------
-Notebook / manual: edit the CONFIG block below, then run the file (or call
-``run()``). No command-line arguments are needed.
+Station ridership counts both departures (trips whose start station is the
+station) and arrivals (trips whose end station is the station); ``total`` is
+their sum. The per-station table and charts span every month in the data so
+trends include months with zero activity rather than skipping them.
 
-Command line: every CONFIG value has a matching flag that overrides it, e.g.
-    python scripts/gbfs_tools/bikeshare_ridership_trends.py \\
-        --input tests/fixtures/capitalbikeshare_fixtures_24mo.zip \\
-        --output-dir out/bikeshare_trends
+Day-type averages divide each station's total activity on weekday / Saturday /
+Sunday dates by the number of such dates in the covered calendar (every day of
+every month present in the data, so zero-activity days count). HOLIDAY RULE:
+observed U.S. federal holidays are classified as Sunday-equivalent -- the
+standard transit convention (holidays run Sunday service) -- so
+``avg_weekday_riders`` covers non-holiday weekdays only, matching the
+weekday posture of the GTFS-side feature scripts. A trip is attributed to the
+day type of its start date.
 
 Outputs
 -------
@@ -35,19 +39,15 @@ In OUTPUT_DIR:
   * ``plots/system_ridership_trend.png`` -- system-wide trips per month.
   * ``plots/stations/station_<id>.png`` -- one trend chart per station.
 
-Station ridership counts both departures (trips whose start station is the
-station) and arrivals (trips whose end station is the station); ``total`` is
-their sum. The per-station table and charts span every month in the data so
-trends include months with zero activity rather than skipping them.
+Typical usage
+-------------
+Notebook / manual: edit the CONFIG block below, then run the file (or call
+``run()``). No command-line arguments are needed.
 
-Day-type averages divide each station's total activity on weekday / Saturday /
-Sunday dates by the number of such dates in the covered calendar (every day of
-every month present in the data, so zero-activity days count). HOLIDAY RULE:
-observed U.S. federal holidays are classified as Sunday-equivalent -- the
-standard transit convention (holidays run Sunday service) -- so
-``avg_weekday_riders`` covers non-holiday weekdays only, matching the
-weekday posture of the GTFS-side feature scripts. A trip is attributed to the
-day type of its start date.
+Command line: every CONFIG value has a matching flag that overrides it, e.g.
+    python scripts/gbfs_tools/bikeshare_ridership_trends.py \
+        --input tests/fixtures/capitalbikeshare_fixtures_24mo.zip \
+        --output-dir out/bikeshare_trends
 """
 
 from __future__ import annotations

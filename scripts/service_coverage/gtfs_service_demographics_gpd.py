@@ -1,4 +1,4 @@
-"""Performs spatial analysis on GTFS transit data and demographic shapefiles.
+"""Perform spatial analysis on GTFS transit data and demographic shapefiles.
 
 Generates a transit *service area* and estimates the population, household, and
 employment characteristics that fall within it. The script offers two
@@ -41,7 +41,7 @@ more than 2% at the feed's location (e.g. World Mercator away from the equator)
 triggers a warning. Stops, route shapes, and demographics are all built in that
 one CRS.
 
-Typical inputs:
+Inputs:
     - GTFS folder containing: trips.txt, stop_times.txt, routes.txt,
       stops.txt, calendar.txt (and shapes.txt for the ``route_buffer`` method).
     - Demographic shapefile with fields to estimate.

@@ -1,4 +1,4 @@
-"""Per-trip running-time statistics, variation flags, and data diagnostics.
+"""Compute per-trip running-time statistics, variation flags, and data diagnostics.
 
 This script derives observed trip running times from a TIDES ``stop_visits``
 table, joins route/direction context from ``trips_performed``, and summarizes

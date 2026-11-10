@@ -1,4 +1,4 @@
-"""GTFS skipped-stop flagger.
+"""Flag likely skipped-stop errors between overlapping routes in a GTFS feed.
 
 This module detects likely skipped-stop errors between overlapping routes in a
 single GTFS feed using stop sequences only (no geometry).

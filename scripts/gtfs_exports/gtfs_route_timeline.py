@@ -1,4 +1,4 @@
-"""GTFS route timeline across many feeds (when routes begin and end over time).
+"""Build a GTFS route timeline across many feeds (when routes begin and end over time).
 
 The longitudinal companion to ``gtfs_route_diff.py``. That script answers "what
 changed between these *two* feeds?" in depth; this one takes a whole *sequence*
@@ -14,19 +14,18 @@ across the entire span:
   so a renumbered route stays one row instead of ending and "starting" again.
   A route_id that disappears and later returns rejoins its old row with a gap.
 
-Outputs (CSV):
-- route_timeline.csv        : one row per route, one column per feed holding the
-                              route_id served in that feed ("" = not in service),
-                              plus first/last active dates and gap flags
-- route_timeline_events.csv : dated added / removed / reappeared / rekeyed events
-- feed_periods.csv          : each feed's label, folder, effective start/end and
-                              where the start date came from
-
-Also outputs:
-- route_timeline.png  : Gantt-style chart -- routes down the left side, year/month
-                        along the bottom, a bar wherever the route was in service
-- route_timeline.xlsx : the three tables above as sheets
-- route_timeline_runlog.txt (configuration sidecar)
+Outputs:
+    - route_timeline.csv        : one row per route, one column per feed holding the
+                                  route_id served in that feed ("" = not in service),
+                                  plus first/last active dates and gap flags
+    - route_timeline_events.csv : dated added / removed / reappeared / rekeyed events
+    - feed_periods.csv          : each feed's label, folder, effective start/end and
+                                  where the start date came from
+    - route_timeline.png        : Gantt-style chart -- routes down the left side,
+                                  year/month along the bottom, a bar wherever the
+                                  route was in service
+    - route_timeline.xlsx       : the three tables above as sheets
+    - route_timeline_runlog.txt (configuration sidecar)
 
 No arcpy / geopandas. pandas + numpy + matplotlib only.
 

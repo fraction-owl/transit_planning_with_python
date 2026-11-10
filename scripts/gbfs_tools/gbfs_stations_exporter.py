@@ -1,4 +1,4 @@
-"""Exports GBFS static station information to ESRI Shapefile and GeoJSON.
+"""Export GBFS static station information to ESRI Shapefile and GeoJSON.
 
 Reads a GBFS feed's ``station_information.json`` (the static docked-station
 inventory) and writes the stations as WGS 84 point features. The source may

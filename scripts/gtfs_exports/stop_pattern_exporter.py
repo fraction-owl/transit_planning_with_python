@@ -8,12 +8,12 @@ Each route/service pair is exported to a separate Excel file, with each
 direction as a separate sheet. A “master” trip is chosen to define the
 canonical stop order for each direction.
 
+Outputs:
+    - Excel files written to OUTPUT_DIR with subfolders for each service_id.
+
 Typical usage:
     Adjust paths and options in the CONFIGURATION section, then run in
     ArcPro or standalone Python notebook.
-
-Outputs:
-    - Excel files written to OUTPUT_DIR with subfolders for each service_id.
 """
 
 from __future__ import annotations

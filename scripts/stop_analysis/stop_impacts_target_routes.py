@@ -1,4 +1,4 @@
-"""GTFS Stop Impact Analyzer.
+"""Analyze GTFS stop impacts of removing specific target routes.
 
 Parses GTFS data to evaluate the service impact of removing specific target routes
 (defined in configuration). For every stop served by a target route, the script

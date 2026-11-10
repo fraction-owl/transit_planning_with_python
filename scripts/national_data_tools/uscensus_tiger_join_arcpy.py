@@ -1,12 +1,10 @@
-"""End-to-end ArcPy pipeline: merge Census CSVs, merge TIGER shapefiles, and join to final output.
+"""Merge Census CSVs, merge TIGER shapefiles, and join to final output (end-to-end ArcPy pipeline).
 
-Overview
---------
 This single script performs three stages to produce a final feature class / shapefile
 containing Census block geometry joined to a consolidated attribute table
 (population, households, jobs, income, ethnicity, language, vehicles, age).
 
-Stages:
+Workflow:
     1) CSV stage (pandas): discover, read, and merge Census + LODES CSV inputs into
        a single attribute table (one row per block). Optional tract-level inputs
        are merged to blocks on tract ID, and each tract count is split across the
@@ -27,12 +25,11 @@ Outputs
   to the attribute table from stage 3 (shapefile or FileGDB feature class).
 
 Notes:
------
-* ZIPped TIGER shapefiles are NOT read directly—unzip first.
-* All TIGER inputs should be in the same coordinate system.
-* Shapefile outputs will truncate field names to 10 chars; use a FileGDB to retain names.
-* The CSV merger expects files that match the table codes configured below (e.g., P1, H9, etc.).
-* GEO_ID vs GEOID differences are handled; GEO_ID is synthesized from GEOID if needed.
+    * ZIPped TIGER shapefiles are NOT read directly—unzip first.
+    * All TIGER inputs should be in the same coordinate system.
+    * Shapefile outputs will truncate field names to 10 chars; use a FileGDB to retain names.
+    * The CSV merger expects files that match the table codes configured below (e.g., P1, H9, etc.).
+    * GEO_ID vs GEOID differences are handled; GEO_ID is synthesized from GEOID if needed.
 
 Helpful links
 -------------

@@ -43,11 +43,10 @@ Outputs
   an optimized assignment. Requires openpyxl only when this export is on.
 
 Notes:
-------
-Unlike the twin, polygons are checked against Esri's geometry rules (the
-Check Geometry tool) rather than OGC validity, the point-in-polygon and
-overlap tests use ArcGIS's geometry engine, and stops are projected with no
-datum transformation unless GEO_TRANSFORMATION names one.
+    Unlike the twin, polygons are checked against Esri's geometry rules (the
+    Check Geometry tool) rather than OGC validity, the point-in-polygon and
+    overlap tests use ArcGIS's geometry engine, and stops are projected with no
+    datum transformation unless GEO_TRANSFORMATION names one.
 
 Typical usage
 -------------

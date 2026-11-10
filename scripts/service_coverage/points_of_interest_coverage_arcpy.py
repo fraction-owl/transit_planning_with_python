@@ -8,13 +8,13 @@ Optionally, it computes inter-route transfer opportunities from GTFS stop_times,
 including same-stop and nearby-stop transfers within configured distance and
 time windows.
 
-Typical usage:
-    Run as a script after updating the CONFIGURATION section.
-
 Outputs:
     - File geodatabase feature classes (route buffers; optional parcel-buffered facilities)
     - Per-route facility summary CSVs and an all-routes summary CSV
     - Optional per-route transfer CSVs and an all-routes transfer summary CSV
+
+Typical usage:
+    Run as a script after updating the CONFIGURATION section.
 """
 
 from __future__ import annotations

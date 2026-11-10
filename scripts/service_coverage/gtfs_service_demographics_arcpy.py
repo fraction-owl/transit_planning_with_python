@@ -5,7 +5,7 @@ clips a demographics layer, and produces area-weighted counts for equity and
 employment metrics. Supports whole-network and per-route runs and optional CSV
 and feature exports.
 
-Pipeline:
+Workflow:
   1) Create stops layer (GTFS filter by service_id and route_short_name, or
      shapefile).
   2) Buffer and dissolve (optional processing CRS for stability).
