@@ -466,6 +466,8 @@ def reconstruct(data: TSDE, qa: QA) -> dict[BlockKey, list[Movement]]:
     for key, rows in data.blocks.items():
         sid, bid = key
         movements: list[Movement] = []
+        if sid not in data.services:
+            qa.add("ERROR", "UNKNOWN_SERVICE", f"Block service {sid} is not in svc.", key)
         if len({r["snum"] for r in rows}) != len(rows):
             qa.add("ERROR", "DUPLICATE_BLOCK_SEQUENCE", "Duplicate sequence numbers.", key)
         if sum(r["etype"] == "1" for r in rows) != 1 or sum(r["etype"] == "2" for r in rows) != 1:
@@ -1215,6 +1217,9 @@ def write_audit(
         if issue.block_id:
             block_issues[issue.service_id, issue.block_id].add(issue.code)
     for key, rows in data.blocks.items():
+        # A block may name a service missing from svc; it is rejected upstream
+        # (UNKNOWN_SERVICE) but must still be audited rather than crash the run.
+        service_name = data.services.get(key[0], {}).get("sname", "")
         for row in rows:
             raw_events.append(
                 {
@@ -1230,7 +1235,7 @@ def write_audit(
             movement_rows.append(
                 {
                     "tsde_service_id": key[0],
-                    "service_name": data.services[key[0]]["sname"],
+                    "service_name": service_name,
                     "tsde_block_id": key[1],
                     "block_number": rows[0]["bnum"],
                     "timeline_sequence": n,
@@ -1257,7 +1262,7 @@ def write_audit(
         block_rows.append(
             {
                 "tsde_service_id": key[0],
-                "service_name": data.services[key[0]]["sname"],
+                "service_name": service_name,
                 "tsde_block_id": key[1],
                 "block_number": rows[0]["bnum"],
                 "division_id": rows[0]["did"],
@@ -1476,7 +1481,13 @@ def run(cfg: Config) -> Path:
     out.mkdir()
     handler = logging.FileHandler(out / "run.log", encoding="utf-8")
     handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
-    logging.getLogger().addHandler(handler)
+    root = logging.getLogger()
+    previous_level = root.level
+    # Called without main() (tests, notebook imports), the root logger is still at
+    # WARNING and run.log would stay empty; lower it for this run only.
+    if root.getEffectiveLevel() > logging.INFO:
+        root.setLevel(logging.INFO)
+    root.addHandler(handler)
     sources: list[Source] = []
     try:
         qa = QA()
@@ -1563,7 +1574,8 @@ def run(cfg: Config) -> Path:
     finally:
         for item in sources:
             item.close()
-        logging.getLogger().removeHandler(handler)
+        root.removeHandler(handler)
+        root.setLevel(previous_level)
         handler.close()
 
 

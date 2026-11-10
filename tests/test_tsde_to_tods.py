@@ -372,3 +372,32 @@ def test_intermediate_point_identifier_types_remain_distinct(tmp_path: Path) -> 
     assert ("no", "00100") in data.points
     assert ("ga", "00100") in data.points
     assert data.points["st", "00100"]["stop_code"] == "00100"
+
+
+def test_block_with_unknown_service_is_rejected_not_fatal(tmp_path: Path) -> None:
+    tsde, gtfs, source, feed = fixtures(tmp_path)
+    # A block naming a service absent from svc used to crash the audit step.
+    source["blk"].extend({**row, "sid": "X", "bid": "B2"} for row in list(source["blk"]))
+    save_inputs(tsde, gtfs, source, feed)
+    out, summary = execute(tmp_path, tsde, gtfs)
+    assert summary["exported_blocks"] == 1
+    assert summary["qa_counts"]["UNKNOWN_SERVICE"] == 1
+    blocks = list(csv.DictReader((out / "block_summary.csv").open(encoding="utf-8-sig")))
+    unknown = next(r for r in blocks if r["tsde_service_id"] == "X")
+    assert unknown["service_name"] == ""
+    assert unknown["exported"] == "False"
+
+
+def test_run_log_records_info_when_run_is_called_directly(tmp_path: Path) -> None:
+    import logging
+
+    root = logging.getLogger()
+    before = root.level
+    root.setLevel(logging.WARNING)
+    try:
+        tsde, gtfs, _, _ = fixtures(tmp_path)
+        out, _ = execute(tmp_path, tsde, gtfs)
+        assert "Reconstructing vehicle movements" in (out / "run.log").read_text()
+        assert root.level == logging.WARNING  # Restored after the run.
+    finally:
+        root.setLevel(before)
