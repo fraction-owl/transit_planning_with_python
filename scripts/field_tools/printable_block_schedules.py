@@ -37,6 +37,11 @@ Key Features
 - Adds a writable row for positive gaps between trips, with scheduled times,
   duration, actual times, and location/activity notes. Different endpoint stops
   are labeled "Between trips" because the gap may include travel.
+- With ``TODS_PATH`` (TODS supplement files for the same feed, e.g. from
+  ``tsde_to_tods.py``), lists each block's scheduled pull-out, pull-in and
+  deadheads, and splits a gap that a deadhead covers into the deadhead and the
+  layover before or after it, so "Between trips" is left only for gaps the
+  TODS files do not explain.
 """
 
 from __future__ import annotations
@@ -90,6 +95,12 @@ STOP_ID_FIELD: str = "stop_code"
 # Add observation rows for positive scheduled gaps between trips in a block.
 INCLUDE_LAYOVER_ROWS: bool = True  # False → stop events only.
 
+# Optional: TODS supplement files for the same GTFS feed (folder or .zip). Adds
+# each block's scheduled pull-out, pull-in and deadhead rows (trips with a
+# TODS_trip_type) and splits deadhead-covered gaps into deadhead + layover.
+# TODS rows that modify or delete GTFS trips are not applied. Blank: GTFS only.
+TODS_PATH = r""
+
 # Placeholder values for printing:
 MISSING_TIME = "________"
 MISSING_VALUE = "_____"
@@ -122,6 +133,14 @@ COLLECTION_DATE_HEADER: str = "Date: ____________________"
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
 
 # === END CONFIG ===
+
+# TODS_trip_type -> Event Type label; other types are shown capitalized.
+TODS_EVENT_LABELS: dict[str, str] = {
+    "pull-out": "Pull-out",
+    "pull-back": "Pull-in",
+    "pull-in": "Pull-in",
+    "deadhead": "Deadhead",
+}
 
 # =============================================================================
 # FUNCTIONS
@@ -539,18 +558,113 @@ def build_block_filename(block_df: pd.DataFrame, service_labels: Mapping[str, st
     return "_".join(safe_parts) + ".xlsx"
 
 
-def add_layover_rows(schedule_df: pd.DataFrame, block_df: pd.DataFrame) -> pd.DataFrame:
+def load_tods_movements(
+    tods_path: str, stops_df: Optional[pd.DataFrame] = None
+) -> dict[tuple[str, str], list[dict[str, Any]]]:
+    """Read TODS nonrevenue trips, keyed by ``(block_id, service_id)``.
+
+    Args:
+        tods_path: Folder or ``.zip`` holding ``trips_supplement.txt`` and
+            ``stop_times_supplement.txt`` (``stops_supplement.txt`` optional).
+        stops_df: GTFS ``stops.txt``, used to name the movements' end stops.
+
+    Returns:
+        Per block and service, the movements sorted by start: ``trip_id``,
+        ``label`` (Event Type), ``start``/``end`` seconds and the ``from_*`` /
+        ``to_*`` stop IDs and names. Only rows with a ``TODS_trip_type`` count.
+
+    Raises:
+        OSError: If the TODS files are missing.
+        ValueError: If a nonrevenue trip has no stop times or no end times.
+    """
+    tods = load_gtfs_data(
+        tods_path, files=["trips_supplement.txt", "stop_times_supplement.txt"], dtype=str
+    )
+    try:
+        extra = load_gtfs_data(tods_path, files=["stops_supplement.txt"], dtype=str)
+        tods_stops = extra["stops_supplement"]
+    except OSError:
+        tods_stops = pd.DataFrame(columns=["stop_id", "stop_name"])
+    names: dict[str, str] = {}
+    for frame in (stops_df, tods_stops):
+        if frame is not None and {"stop_id", "stop_name"} <= set(frame.columns):
+            names.update(zip(frame["stop_id"].astype(str), frame["stop_name"].fillna("")))
+
+    trips = tods["trips_supplement"].fillna("")
+    if "TODS_trip_type" not in trips.columns:
+        trips["TODS_trip_type"] = ""
+    nonrevenue = trips.loc[trips["TODS_trip_type"].str.strip() != ""]
+    ignored = len(trips) - len(nonrevenue)
+    if ignored:
+        logging.warning(
+            "%d TODS trip row(s) without TODS_trip_type (edits to GTFS trips) are not applied.",
+            ignored,
+        )
+    stop_times = tods["stop_times_supplement"].fillna("")
+    stop_times = stop_times.assign(_seq=pd.to_numeric(stop_times["stop_sequence"]))
+    calls = {trip: g.sort_values("_seq") for trip, g in stop_times.groupby("trip_id")}
+
+    movements: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for trip in nonrevenue.to_dict("records"):
+        rows = calls.get(trip["trip_id"])
+        if rows is None or rows.empty:
+            raise ValueError(f"TODS trip {trip['trip_id']} has no stop times.")
+        first, last = rows.iloc[0], rows.iloc[-1]
+        start = time_to_seconds(first["departure_time"] or first["arrival_time"])
+        end = time_to_seconds(last["arrival_time"] or last["departure_time"])
+        if pd.isna(start) or pd.isna(end):
+            raise ValueError(f"TODS trip {trip['trip_id']} lacks a first or last stop time.")
+        kind = trip["TODS_trip_type"].strip()
+        movements.setdefault((trip.get("block_id", ""), trip["service_id"]), []).append(
+            {
+                "trip_id": trip["trip_id"],
+                "label": TODS_EVENT_LABELS.get(kind.lower(), kind[:1].upper() + kind[1:]),
+                "start": start,
+                "end": end,
+                "from_stop": first["stop_id"],
+                "to_stop": last["stop_id"],
+                "from_name": names.get(first["stop_id"], first["stop_id"]),
+                "to_name": names.get(last["stop_id"], last["stop_id"]),
+            }
+        )
+    for legs in movements.values():
+        legs.sort(key=lambda m: (m["start"], m["end"]))
+    logging.info("Loaded %d TODS nonrevenue trip(s) from %s.", len(nonrevenue), tods_path)
+    return movements
+
+
+def _duration_text(seconds: float) -> str:
+    """Format a duration as ``"10 min"`` or ``"17m 30s"``."""
+    if seconds % 60:
+        return f"{int(seconds) // 60}m {int(seconds) % 60}s"
+    return f"{seconds / 60:g} min"
+
+
+def add_layover_rows(
+    schedule_df: pd.DataFrame,
+    block_df: pd.DataFrame,
+    movements: Sequence[Mapping[str, Any]] = (),
+    include_gaps: bool = True,
+) -> pd.DataFrame:
     """Insert observation rows between adjacent trips in one block/service ID.
 
     Args:
         schedule_df: Formatted stop rows, possibly filtered to timepoints.
         block_df: All prepared stop events for this block and service ID,
             including ``trip_start_seconds`` before the timepoint filter.
+        movements: This block's TODS nonrevenue trips (see
+            :pyfunc:`load_tods_movements`), placed before the first trip,
+            between trips or after the last trip by their scheduled times.
+        include_gaps: Add rows for waiting time (``INCLUDE_LAYOVER_ROWS``).
 
     Returns:
-        Stop rows followed by their positive scheduled gap, where applicable.
-        ``Layover`` means the endpoint stop IDs match. ``Between trips`` means
-        they differ, so the gap may include repositioning as well as waiting.
+        Stop rows with their positive scheduled gaps and TODS movements.
+        ``Layover`` means the vehicle waits at one stop. ``Between trips`` means
+        the endpoint stops differ and no TODS movement covers the gap, so it may
+        include repositioning as well as waiting. A TODS movement row
+        (``Pull-out``, ``Deadhead``, ``Pull-in`` ...) gives its scheduled
+        departure from the first stop and arrival at the last; a gap it covers
+        becomes the movement plus a layover before or after it.
 
     Notes:
         Gap limits are the preceding trip's last arrival and the following
@@ -558,10 +672,11 @@ def add_layover_rows(schedule_df: pd.DataFrame, block_df: pd.DataFrame) -> pd.Da
         only if the preferred time is missing. Actual time fields record the
         observed waiting period; Comments records its location and activity.
         A gap row carries the preceding trip ID, with no stop sequence or
-        timepoint flag. There are no rows before the first or after the last
-        trip, and no rows for zero or negative gaps. Endpoints come from full
-        trips even when only timepoints are printed. Separate service IDs are
-        never connected; selecting an actual date is outside this exporter.
+        timepoint flag. Without TODS there are no rows before the first or
+        after the last trip, and no rows for zero or negative gaps. Endpoints
+        come from full trips even when only timepoints are printed. Separate
+        service IDs are never connected; selecting an actual date is outside
+        this exporter.
     """
     if len(block_df["service_id"].unique()) != 1:
         raise ValueError("Layover rows require one service ID per block schedule.")
@@ -583,17 +698,83 @@ def add_layover_rows(schedule_df: pd.DataFrame, block_df: pd.DataFrame) -> pd.Da
         trip_id: group.to_dict("records")
         for trip_id, group in schedule_df.groupby("Trip ID", sort=False)
     }
+    block_id = trips[0][1]["block_id"]
+
+    def observation_row(fields: Mapping[str, Any], note: str) -> dict[str, Any]:
+        row = dict.fromkeys(schedule_df.columns, "")
+        row.update(
+            {
+                "Block ID": block_id,
+                "Actual Arrival Time": MISSING_TIME,
+                "Actual Departure Time": MISSING_TIME,
+                "Boardings": BLOCKED_COUNT_MARKER,
+                "Alightings": BLOCKED_COUNT_MARKER,
+                "Comments": (
+                    f"{note}\nActual location: __________________________"
+                    "\nActivity / reason: _________________________"
+                ),
+                **fields,
+            }
+        )
+        return row
+
+    def movement_row(move: Mapping[str, Any]) -> dict[str, Any]:
+        label = str(move["label"])
+        return observation_row(
+            {
+                "Event Type": label,
+                "Trip ID": move["trip_id"],
+                "Trip Start Time": format_hhmm(move["start"]),
+                "Stop Name": f"From: {move['from_name']}\nTo: {move['to_name']}",
+                "Scheduled Departure Time": format_hhmm(move["start"]),
+                "Scheduled Arrival Time": format_hhmm(move["end"]),
+            },
+            f"Scheduled {label.lower()} (TODS): {_duration_text(move['end'] - move['start'])}",
+        )
+
+    def wait_row(trip: tuple, begin: float, finish: float, stop: Any) -> dict[str, Any]:
+        trip_id, first, last = trip
+        return observation_row(
+            {
+                "Event Type": "Layover",
+                "Route": last["route_short_name"],
+                "Direction": last["direction_id"],
+                "Trip ID": trip_id,
+                "Trip Start Time": format_hhmm(first["trip_start_seconds"]),
+                "Stop ID": stop["stop_label"],
+                "Stop Name": stop["stop_name"],
+                "Scheduled Arrival Time": format_hhmm(begin),
+                "Scheduled Departure Time": format_hhmm(finish),
+            },
+            f"Scheduled gap: {_duration_text(finish - begin)}",
+        )
+
+    def trip_end(last: Any) -> float:
+        end = last["arrival_seconds"]
+        return last["departure_seconds"] if pd.isna(end) else end
+
+    placed: set[str] = set()
     rows: list[dict[str, Any]] = []
+    first_start = trips[0][1]["trip_start_seconds"]
+    for move in movements:
+        if move["end"] <= first_start:
+            rows.append(movement_row(move))
+            placed.add(move["trip_id"])
+
     latest_end = -math.inf
     for pos, (trip_id, first, last) in enumerate(trips):
         rows.extend(stop_rows.get(trip_id, []))
         if pos + 1 == len(trips):
+            end_seconds = trip_end(last)
+            for move in movements:
+                if move["trip_id"] not in placed and pd.notna(end_seconds):
+                    if move["start"] >= end_seconds:
+                        rows.append(movement_row(move))
+                        placed.add(move["trip_id"])
             continue
 
         next_trip_id, next_first, _ = trips[pos + 1]
-        end_seconds = last["arrival_seconds"]
-        if pd.isna(end_seconds):
-            end_seconds = last["departure_seconds"]
+        end_seconds = trip_end(last)
         start_seconds = next_first["trip_start_seconds"]
         if pd.isna(end_seconds):
             logging.warning("No terminal time for trip %s; its following gap is skipped.", trip_id)
@@ -612,7 +793,27 @@ def add_layover_rows(schedule_df: pd.DataFrame, block_df: pd.DataFrame) -> pd.Da
                 first["service_id"],
             )
             continue
-        if gap_seconds == 0:
+
+        inside = [
+            m
+            for m in movements
+            if m["trip_id"] not in placed
+            and m["start"] >= end_seconds
+            and m["end"] <= start_seconds
+        ]
+        if inside:
+            # TODS explains the gap: wait at the origin, move, wait at the destination.
+            cursor = end_seconds
+            for move in inside:
+                if include_gaps and move["start"] > cursor:
+                    rows.append(wait_row(trips[pos], cursor, move["start"], last))
+                rows.append(movement_row(move))
+                placed.add(move["trip_id"])
+                cursor = move["end"]
+            if include_gaps and start_seconds > cursor:
+                rows.append(wait_row(trips[pos], cursor, start_seconds, next_first))
+            continue
+        if gap_seconds == 0 or not include_gaps:
             continue
 
         same_stop = (
@@ -621,47 +822,39 @@ def add_layover_rows(schedule_df: pd.DataFrame, block_df: pd.DataFrame) -> pd.Da
             and str(last["stop_id"]).strip() != ""
             and last["stop_id"] == next_first["stop_id"]
         )
-        duration = f"{gap_seconds / 60:g} min"
-        if gap_seconds % 60:
-            duration = f"{int(gap_seconds) // 60}m {int(gap_seconds) % 60}s"
-        gap_note = f"Scheduled gap: {duration}"
-        if not same_stop:
-            gap_note += " (may include travel)"
-
-        row = dict.fromkeys(schedule_df.columns, "")
-        row.update(
-            {
-                "Block ID": first["block_id"],
-                "Event Type": "Layover" if same_stop else "Between trips",
-                "Route": last["route_short_name"],
-                "Direction": last["direction_id"],
-                "Trip ID": trip_id,
-                "Trip Start Time": format_hhmm(first["trip_start_seconds"]),
-                "Stop ID": last["stop_label"] if same_stop else "",
-                "Stop Name": (
-                    last["stop_name"]
-                    if same_stop
-                    else f"From: {last['stop_name']}\nTo: {next_first['stop_name']}"
-                ),
-                "Scheduled Arrival Time": format_hhmm(end_seconds),
-                "Scheduled Departure Time": format_hhmm(start_seconds),
-                "Actual Arrival Time": MISSING_TIME,
-                "Actual Departure Time": MISSING_TIME,
-                "Boardings": BLOCKED_COUNT_MARKER,
-                "Alightings": BLOCKED_COUNT_MARKER,
-                "Comments": (
-                    f"{gap_note}\nActual location: __________________________"
-                    "\nActivity / reason: _________________________"
-                ),
-            }
+        if same_stop:
+            rows.append(wait_row(trips[pos], end_seconds, start_seconds, last))
+            continue
+        rows.append(
+            observation_row(
+                {
+                    "Event Type": "Between trips",
+                    "Route": last["route_short_name"],
+                    "Direction": last["direction_id"],
+                    "Trip ID": trip_id,
+                    "Trip Start Time": format_hhmm(first["trip_start_seconds"]),
+                    "Stop Name": f"From: {last['stop_name']}\nTo: {next_first['stop_name']}",
+                    "Scheduled Arrival Time": format_hhmm(end_seconds),
+                    "Scheduled Departure Time": format_hhmm(start_seconds),
+                },
+                f"Scheduled gap: {_duration_text(gap_seconds)} (may include travel)",
+            )
         )
-        rows.append(row)
 
+    unplaced = [m["trip_id"] for m in movements if m["trip_id"] not in placed]
+    if unplaced:
+        logging.warning(
+            "Block %s: TODS trip(s) %s overlap revenue trips; not listed.",
+            block_id,
+            ", ".join(unplaced),
+        )
     return pd.DataFrame(rows, columns=schedule_df.columns)
 
 
 def export_blocks(
-    stop_times_df: pd.DataFrame, service_labels: Optional[Mapping[str, str]] = None
+    stop_times_df: pd.DataFrame,
+    service_labels: Optional[Mapping[str, str]] = None,
+    tods_movements: Optional[Mapping[tuple[str, str], Sequence[Mapping[str, Any]]]] = None,
 ) -> None:
     """Generate one Excel schedule per vehicle block and service ID.
 
@@ -672,6 +865,8 @@ def export_blocks(
             ``scheduled_departure_hhmm``, etc.).
         service_labels: ``service_id`` → calendar label for file names (see
             :pyfunc:`build_service_labels`). ``None`` shows raw service_ids.
+        tods_movements: TODS nonrevenue trips by ``(block_id, service_id)``
+            (see :pyfunc:`load_tods_movements`); ``None`` lists GTFS trips only.
 
     Side Effects:
         Writes one file per block/service, named by :pyfunc:`build_block_filename`, to
@@ -800,8 +995,11 @@ def export_blocks(
         final_df["_trip_start_seconds"] = block_subset["trip_start_seconds"]
         final_df = final_df.sort_values(by=["_trip_start_seconds", "Trip ID", "Stop Sequence"])
         final_df = final_df.drop(columns="_trip_start_seconds")
-        if INCLUDE_LAYOVER_ROWS:
-            final_df = add_layover_rows(final_df, full_block)
+        movements = (tods_movements or {}).get((str(block_id), str(service_id)), [])
+        if INCLUDE_LAYOVER_ROWS or movements:
+            final_df = add_layover_rows(
+                final_df, full_block, movements, include_gaps=INCLUDE_LAYOVER_ROWS
+            )
 
         output_path = os.path.join(BASE_OUTPUT_PATH, filename)
         export_to_excel(final_df, output_path)
@@ -1076,7 +1274,11 @@ def main() -> int:
             )
             return 1
 
-        export_blocks(prepared, service_labels)
+        tods_movements = None
+        if TODS_PATH.strip():
+            logging.info("TODS supplement files: %s", TODS_PATH)
+            tods_movements = load_tods_movements(TODS_PATH, stops_df)
+        export_blocks(prepared, service_labels, tods_movements)
         logging.info("Script finished successfully.")
         logging.info("Script completed successfully.")
         return 0
