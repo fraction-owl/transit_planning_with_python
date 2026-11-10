@@ -627,7 +627,7 @@ def _drop_unfriendly_cols(df: pd.DataFrame) -> pd.DataFrame:
 # -----------------------------------------------------------------------------
 # BLOCK-LEVEL BUILD
 # -----------------------------------------------------------------------------
-@dataclass(slots=True)
+@dataclass
 class _BlockInputs:
     pop_files: list[str]
     hh_files: list[str]
@@ -815,7 +815,7 @@ def _derive_commute(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-@dataclass(slots=True)
+@dataclass
 class _TractInputs:
     income_files: list[str]
     ethnicity_files: list[str]

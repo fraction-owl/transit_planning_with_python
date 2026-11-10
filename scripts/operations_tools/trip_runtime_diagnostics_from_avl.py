@@ -43,9 +43,8 @@ import re
 import warnings
 from collections import defaultdict
 from pathlib import Path
-from typing import Callable, Final, Iterable, List, Sequence, TypeAlias
+from typing import Callable, Final, Iterable, List, Sequence
 
-# May need to comment out TypeAlias import for old ArcPro Python versions
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -126,7 +125,9 @@ LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
 # TYPE ALIASES
 # ---------------------------------------------------------------------
 
-PlotFunc: TypeAlias = Callable[[pd.DataFrame], None]
+# Plain assignment rather than a ``TypeAlias`` annotation: ``typing.TypeAlias``
+# needs Python 3.10, and this script must import on ArcGIS Pro's Python 3.9.
+PlotFunc = Callable[[pd.DataFrame], None]
 
 # =============================================================================
 # FUNCTIONS
