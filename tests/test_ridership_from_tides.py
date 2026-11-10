@@ -39,7 +39,7 @@ def test_join_brings_route_attributes() -> None:
     for col in ("route_id", "direction_id", "route_type_agency"):
         assert col in joined.columns
     assert joined["route_id"].notna().all()
-    assert set(joined["route_id"].unique()) <= {"101", "202", "303"}
+    assert set(joined["route_id"].unique()) <= {"DC_R10", "DC_R20", "DC_R30"}
 
 
 def test_boardings_sum_both_doors() -> None:

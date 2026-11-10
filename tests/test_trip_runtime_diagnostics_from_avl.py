@@ -28,24 +28,24 @@ def test_load_trip_files_tides_support() -> None:
     assert "trip_start_time" in df.columns, "trip_start_time column should be derived"
 
     # 3. Assert filtering
-    # Fixture has 288 rows: 282 Scheduled + 6 Canceled (all trip_type = "In service").
-    # Canceled trips are dropped; no Deadhead/Pullout/Pullin rows in this fixture.
-    # Expected kept: 282 rows.
+    # Fixture has 147 rows: 84 "In service" (80 Scheduled + 4 Canceled) and 63
+    # nonrevenue Pullout/Pullin/Deadhead rows. Canceled and nonrevenue trips are
+    # dropped. Expected kept: 80 rows.
 
-    assert len(df) == 282, f"Expected 282 rows, got {len(df)}"
+    assert len(df) == 80, f"Expected 80 rows, got {len(df)}"
 
     # Check Canceled is gone
-    assert "TP20250101_202_0_03" not in df["TripID"].to_numpy(), (
+    assert "TP20260202_DC_R30_weekday_0025" not in df["TripID"].to_numpy(), (
         "Canceled trip should be filtered out"
     )
 
     # 4. Assert Time Extraction
-    # TP20250102_101_0_00: schedule_trip_start 2025-01-02T05:58:00 -> 05:58
-    row1 = df[df["TripID"] == "TP20250102_101_0_00"].iloc[0]
-    assert row1["trip_start_time"] == "05:58", f"Expected 05:58, got {row1['trip_start_time']}"
+    # TP20260105_DC_R10_weekday_0032: schedule_trip_start 2026-01-05T21:00:00 -> 21:00
+    row1 = df[df["TripID"] == "TP20260105_DC_R10_weekday_0032"].iloc[0]
+    assert row1["trip_start_time"] == "21:00", f"Expected 21:00, got {row1['trip_start_time']}"
 
     # 5. Assert Direction is string "0"/"1"
-    # TP20250102_101_0_00 direction_id is 0
+    # TP20260105_DC_R10_weekday_0032 direction_id is 0
     assert str(row1["Direction"]) == "0", f"Expected direction '0', got {row1['Direction']}"
 
     # 6. Assert Is Tides flag

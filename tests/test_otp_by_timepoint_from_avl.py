@@ -16,7 +16,9 @@ def tides_input_csv(tmp_path: Path) -> Path:
 
     # Add simulated joined columns
     # Pattern is PAT_30_WB or PAT_30_EB.
-    df["pattern_id"] = df["pattern_id"].map({"shp-101-01": "PAT_30_WB", "shp-101-51": "PAT_30_EB"})
+    df["pattern_id"] = df["pattern_id"].map(
+        {"DC_R10_shp_0": "PAT_30_WB", "DC_R10_shp_1": "PAT_30_EB"}
+    )
     df = df.dropna(subset=["pattern_id"])
     df["route_id"] = "30"
     df["direction_id"] = df["pattern_id"].apply(lambda x: "0" if "WB" in x else "1")
@@ -41,9 +43,9 @@ def test_tides_data_processing(tides_input_csv: Path, tmp_path: Path) -> None:
         "--outdir",
         str(output_dir),
         "--start-month",
-        "2025-03",
+        "2026-03",
         "--end-month",
-        "2025-03",
+        "2026-03",
     ]
 
     assert otp_by_timepoint_from_avl.main(argv) == 0
@@ -74,7 +76,7 @@ def test_tides_data_processing(tides_input_csv: Path, tmp_path: Path) -> None:
     # Read output and verify some content
     df_pct = pd.read_csv(expected_pct_file)
     assert "Year-Month" in df_pct.columns
-    assert "2025-03" in df_pct["Year-Month"].to_numpy()
+    assert "2026-03" in df_pct["Year-Month"].to_numpy()
 
 
 # ---------------------------------------------------------------------------

@@ -127,9 +127,18 @@ def test_dow_anomalies_flags_columns(joined: pd.DataFrame) -> None:
     dow = target.compute_dow_anomalies(retained)
     for col in ("n_obs", "dow_mean_min", "trip_mean_min", "low_count", "runtime_anomaly"):
         assert col in dow.columns
-    # The fixture is Monday-heavy, so some DOW buckets carry far fewer trips;
-    # the low_count detector should surface at least one of them.
-    assert dow["low_count"].any()
+    # Pile extra observations onto every day of week but one for a trip seen on
+    # several days; the remaining day then falls far below the trip's median
+    # per-DOW count, and the low_count detector should flag it.
+    days_per_trip = retained.groupby("trip_key")["dow"].nunique()
+    key = days_per_trip.idxmax()
+    assert days_per_trip[key] >= 2
+    trip = retained.loc[retained["trip_key"] == key]
+    quiet = trip["dow"].iloc[0]
+    busy = trip.loc[trip["dow"] != quiet]
+    skewed = target.compute_dow_anomalies(pd.concat([retained] + [busy] * 5, ignore_index=True))
+    flagged = skewed.loc[(skewed["trip_key"] == key) & skewed["low_count"], "dow"]
+    assert flagged.astype(str).tolist() == [str(quiet)]
 
 
 def test_run_writes_all_outputs(tmp_path: Path) -> None:
