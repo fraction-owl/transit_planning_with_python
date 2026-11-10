@@ -33,6 +33,9 @@ Outputs
 - ``service_hours_by_service.csv``: hours per service day of each service_id.
 - ``service_hours_by_day_type.csv``: hours on a typical day of each day type.
 - ``service_hours_by_period.csv``: total hours and day counts per period.
+- ``service_hours.xlsx``: the same period totals as Excel formulas, traceable
+  through Calendar, Services and Blocks sheets to each trip's start and end time,
+  with a layover-as-revenue switch, so totals can be checked and adjusted by hand.
 - A run-log sidecar capturing the verbatim CONFIGURATION block.
 
 Typical usage
@@ -61,6 +64,10 @@ from pathlib import Path
 from typing import Any, List, Optional
 
 import pandas as pd
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font
+from openpyxl.utils import get_column_letter
+from openpyxl.workbook.properties import CalcProperties
 
 # =============================================================================
 # CONFIGURATION
@@ -77,6 +84,8 @@ BLOCK_FILENAME: str = "service_hours_by_block.csv"
 SERVICE_FILENAME: str = "service_hours_by_service.csv"
 DAY_TYPE_FILENAME: str = "service_hours_by_day_type.csv"
 PERIOD_FILENAME: str = "service_hours_by_period.csv"
+# Formula workbook: period totals as Excel formulas back to each trip's times.
+WORKBOOK_FILENAME: str = "service_hours.xlsx"
 
 # Reporting periods as (name, first date, last date), dates as YYYYMMDD.
 PERIODS: List[tuple[str, str, str]] = [("November 2026", "20261101", "20261130")]
@@ -958,21 +967,25 @@ def _parse_date(value: str) -> dt.date:
     return datetime.strptime(str(value).strip(), "%Y%m%d").date()
 
 
-def period_hours(
+def build_calendar(
     services: pd.DataFrame,
     active: Mapping[str, set[dt.date]],
     types: Mapping[str, set[str]],
     cfg: Config,
 ) -> pd.DataFrame:
-    """Total the service hours over each configured period, date by date.
+    """Return one row per (period, date) with its day type and the services running.
 
     Raises:
-        ValueError: If a period's dates are invalid or PERIOD_CALENDAR is unknown.
+        ValueError: If a period's dates are invalid, period names repeat, or
+            PERIOD_CALENDAR is unknown.
     """
     if cfg.period_calendar not in {"gtfs", "config"}:
         raise ValueError(
             f"PERIOD_CALENDAR must be 'gtfs' or 'config', not {cfg.period_calendar!r}."
         )
+    names = [name for name, _first, _last in cfg.periods]
+    if len(names) != len(set(names)):
+        raise ValueError(f"Period names must be unique: {names}")
     known = set(services.index)
     rows = []
     for name, first, last in cfg.periods:
@@ -983,9 +996,6 @@ def period_hours(
         if cfg.use_federal_holidays:
             for year in range(start.year, end.year + 2):
                 holidays |= federal_holidays_observed(year)
-        days: Counter = Counter()
-        totals = pd.Series(0.0, index=list(COMPONENTS))
-        no_service = 0
         day = start
         while day <= end:
             if cfg.period_calendar == "gtfs":
@@ -995,17 +1005,36 @@ def period_hours(
                 holiday = day in holidays
                 lookup = cfg.holiday_service_day_type if holiday else WEEKDAY_LABELS[day.weekday()]
                 running = {s for s in known if lookup in types.get(s, set())}
-            days["Holiday" if holiday else WEEKDAY_LABELS[day.weekday()]] += 1
-            no_service += not running
-            for sid in running:
-                totals += services.loc[sid, list(COMPONENTS)].astype(float)
+            rows.append(
+                {
+                    "period": name,
+                    "date": day,
+                    "weekday": day.strftime("%A"),
+                    "day_type": "Holiday" if holiday else WEEKDAY_LABELS[day.weekday()],
+                    "running": tuple(sorted(running)),
+                }
+            )
             day += dt.timedelta(days=1)
+    return pd.DataFrame(rows, columns=["period", "date", "weekday", "day_type", "running"])
+
+
+def period_hours(services: pd.DataFrame, calendar: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    """Total each period as service days x hours per service day, summed over services."""
+    rows = []
+    for name, first, last in cfg.periods:
+        sub = calendar.loc[calendar["period"] == name]
+        days = Counter(sub["day_type"])
+        service_days = Counter(sid for running in sub["running"] for sid in running)
+        totals = pd.Series(0.0, index=list(COMPONENTS))
+        for sid, n_days in service_days.items():
+            totals += n_days * services.loc[sid, list(COMPONENTS)].astype(float)
+        no_service = int(sum(1 for running in sub["running"] if not running))
         row: dict[str, Any] = {
             "period": name,
-            "start_date": start.isoformat(),
-            "end_date": end.isoformat(),
+            "start_date": _parse_date(first).isoformat(),
+            "end_date": _parse_date(last).isoformat(),
             "calendar": cfg.period_calendar,
-            "days": (end - start).days + 1,
+            "days": len(sub),
             "weekdays": days["Weekday"],
             "saturdays": days["Saturday"],
             "sundays": days["Sunday"],
@@ -1017,6 +1046,436 @@ def period_hours(
         if no_service:
             logging.warning("Period %s: %d day(s) with no service counted.", name, no_service)
     return pd.DataFrame(rows)
+
+
+# =============================================================================
+# FORMULA WORKBOOK
+# =============================================================================
+
+TRIP_TYPE_LABELS = {
+    "revenue": "revenue",
+    "pull_out": "pull-out",
+    "pull_in": "pull-in",
+    "deadhead": "deadhead",
+    "other_nonrevenue": "other nonrevenue",
+}
+COMPONENT_LABELS = {
+    "revenue_trip_hours": "Revenue trip h",
+    "layover_hours": "Layover h",
+    "pull_out_hours": "Pull-out h",
+    "pull_in_hours": "Pull-in h",
+    "deadhead_hours": "Deadhead h",
+    "other_nonrevenue_hours": "Other nonrevenue h",
+    "unresolved_gap_hours": "Unresolved gap h",
+}
+DERIVED_LABELS = {
+    "vehicle_revenue_hours": "Vehicle revenue h",
+    "nonrevenue_hours": "Nonrevenue h",
+    "vehicle_hours": "Vehicle h",
+}
+LAYOVER_CELL = "Settings!$B$2"
+HOURS_FORMAT = "0.00"
+CLOCK_FORMAT = "[h]:mm:ss"
+
+
+def movement_table(movements: pd.DataFrame, places: Mapping[str, tuple[str, str]]) -> pd.DataFrame:
+    """Return every trip in block order, flagging when the vehicle stayed put since the last.
+
+    Trips with a blank block_id each form their own block, labelled
+    ``(none: <trip_id>)``. ``stays_put`` is True when the trip starts where the
+    previous trip of the same block ended (same stop ID or same coordinates).
+    """
+    df = movements.copy()
+    df["block_key"] = df["block_id"].where(df["block_id"] != "", "(none: " + df["trip_id"] + ")")
+    df = df.sort_values(["service_id", "block_key", "start", "end"], kind="stable")
+    df = df.reset_index(drop=True)
+    same_block = df["service_id"].eq(df["service_id"].shift()) & df["block_key"].eq(
+        df["block_key"].shift()
+    )
+    previous_end = df["last_stop"].shift()
+    df["same_block_as_previous"] = same_block
+    df["stays_put"] = [
+        bool(sb) and same_place(str(prev), str(first), places)
+        for sb, prev, first in zip(same_block, previous_end, df["first_stop"])
+    ]
+    df["trip_type"] = df["category"].map(TRIP_TYPE_LABELS)
+    return df
+
+
+def _derived_formulas(cols: Mapping[str, str], r: int, tods: bool) -> dict[str, Any]:
+    """Formulas for vehicle revenue, nonrevenue and vehicle hours on row *r*."""
+    c = {k: f"{v}{r}" for k, v in cols.items()}
+    revenue = f"={c['revenue_trip_hours']}+IF({LAYOVER_CELL},{c['layover_hours']},0)"
+    if not tods:
+        return {"vehicle_revenue_hours": revenue, "nonrevenue_hours": "n/a", "vehicle_hours": "n/a"}
+    moves = "+".join(c[k] for k in TODS_COMPONENTS)
+    first, last = cols["revenue_trip_hours"], cols["unresolved_gap_hours"]
+    return {
+        "vehicle_revenue_hours": revenue,
+        "nonrevenue_hours": f"={moves}+IF({LAYOVER_CELL},0,{c['layover_hours']})",
+        "vehicle_hours": f"=SUM({first}{r}:{last}{r})",
+    }
+
+
+def _sheet(wb: Any, title: str, headers: Sequence[str], widths: Mapping[int, int]) -> Any:
+    """Add a sheet with a bold, frozen header row and the given column widths."""
+    ws = wb.create_sheet(title)
+    ws.append(list(headers))
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(wrap_text=True, vertical="top")
+    ws.freeze_panes = "A2"
+    for idx in range(1, len(headers) + 1):
+        ws.column_dimensions[get_column_letter(idx)].width = widths.get(idx, 14)
+    return ws
+
+
+def write_workbook(
+    path: Path,
+    trips: pd.DataFrame,
+    calendar: pd.DataFrame,
+    types: Mapping[str, set[str]],
+    cfg: Config,
+    tods_supplied: bool,
+) -> Path:
+    """Write a workbook whose period totals are Excel formulas back to trip times.
+
+    Sheets: Periods (service days x hours per service day), Settings (the
+    layover toggle and inputs), Period days and Calendar (which services run on
+    each date; editable), Services and Blocks (sums of the rows below them) and
+    Trips (start/end times; durations, gaps and layover as formulas).
+
+    Args:
+        path: Output ``.xlsx`` path.
+        trips: Output of :func:`movement_table`.
+        calendar: Output of :func:`build_calendar`.
+        types: service_id -> day types.
+        cfg: Resolved configuration.
+        tods_supplied: False leaves the TODS columns as "n/a".
+
+    Returns:
+        *path*.
+    """
+    wb = Workbook()
+    wb.remove(wb.active)
+    services = sorted(set(trips["service_id"]))
+    component_cols = list(COMPONENTS)
+
+    def n_a(column: str) -> bool:
+        return not tods_supplied and column in TODS_COMPONENTS
+
+    # --- Trips -----------------------------------------------------------------
+    ws_t = _sheet(
+        wb,
+        "Trips",
+        [
+            "Service",
+            "Block",
+            "Trip ID",
+            "Type",
+            "TODS_trip_type",
+            "Route",
+            "From stop",
+            "To stop",
+            "Start",
+            "End",
+            "Duration h",
+            "Same block as previous row",
+            "Gap before h",
+            "Stays at the same place",
+            "Layover h",
+            "Unresolved gap h",
+        ],
+        {2: 26, 3: 30, 5: 16, 7: 18, 8: 18},
+    )
+    block_rows: dict[tuple[str, str], list[int]] = {}
+    for i, t in enumerate(trips.to_dict("records")):
+        r = i + 2
+        ws_t.append(
+            [
+                t["service_id"],
+                t["block_key"],
+                t["trip_id"],
+                t["trip_type"],
+                t["tods_trip_type"],
+                t["route_id"],
+                t["first_stop"],
+                t["last_stop"],
+                t["start"] / 86400,
+                t["end"] / 86400,
+                f"=(J{r}-I{r})*24",
+                bool(t["same_block_as_previous"]),
+                f"=IF(L{r},(I{r}-J{r - 1})*24,0)" if r > 2 else 0,
+                bool(t["stays_put"]),
+                f"=IF(AND(M{r}>0,N{r}),M{r},0)",
+                f"=IF(AND(M{r}>0,NOT(N{r})),M{r},0)",
+            ]
+        )
+        for col in ("I", "J"):
+            ws_t[f"{col}{r}"].number_format = CLOCK_FORMAT
+        for col in ("K", "M", "O", "P"):
+            ws_t[f"{col}{r}"].number_format = HOURS_FORMAT
+        block_rows.setdefault((t["service_id"], t["block_key"]), []).append(r)
+
+    # --- Blocks ----------------------------------------------------------------
+    block_headers = [
+        "Service",
+        "Block",
+        "Routes",
+        "Trips rows",
+        "Revenue trips",
+        "Nonrevenue trips",
+        *COMPONENT_LABELS.values(),
+        *DERIVED_LABELS.values(),
+    ]
+    ws_b = _sheet(wb, "Blocks", block_headers, {2: 26, 3: 18})
+    b_cols = {c: get_column_letter(7 + i) for i, c in enumerate(component_cols)}
+    sums = {
+        "revenue_trip_hours": ("K", "revenue"),
+        "pull_out_hours": ("K", "pull-out"),
+        "pull_in_hours": ("K", "pull-in"),
+        "deadhead_hours": ("K", "deadhead"),
+        "other_nonrevenue_hours": ("K", "other nonrevenue"),
+    }
+    service_block_rows: dict[str, list[int]] = {}
+    for i, ((sid, block), rows) in enumerate(block_rows.items()):
+        r = i + 2
+        a, b = rows[0], rows[-1]
+        routes = trips.loc[(trips["service_id"] == sid) & (trips["block_key"] == block)]
+        routes = routes.loc[routes["category"] == "revenue", "route_id"]
+        values: dict[str, Any] = {}
+        for column in component_cols:
+            if n_a(column):
+                values[column] = "n/a"
+            elif column in sums:
+                src, kind = sums[column]
+                values[column] = (
+                    f'=SUMIFS(Trips!${src}${a}:${src}${b},Trips!$D${a}:$D${b},"{kind}")'
+                )
+            else:
+                src = "O" if column == "layover_hours" else "P"
+                values[column] = f"=SUM(Trips!${src}${a}:${src}${b})"
+        values.update(_derived_formulas(b_cols, r, tods_supplied))
+        ws_b.append(
+            [
+                sid,
+                block,
+                "|".join(sorted(set(routes))),
+                f"{a}-{b}",
+                f'=COUNTIFS(Trips!$D${a}:$D${b},"revenue")',
+                f"=ROWS(Trips!$D${a}:$D${b})-E{r}",
+                *(values[c] for c in (*component_cols, *DERIVED)),
+            ]
+        )
+        for idx in range(7, 7 + len(component_cols) + len(DERIVED)):
+            ws_b.cell(r, idx).number_format = HOURS_FORMAT
+        service_block_rows.setdefault(sid, []).append(r)
+
+    # --- Services --------------------------------------------------------------
+    ws_s = _sheet(
+        wb,
+        "Services",
+        [
+            "Service",
+            "Day types",
+            "Blocks rows",
+            "Blocks",
+            "Revenue trips",
+            *COMPONENT_LABELS.values(),
+            *DERIVED_LABELS.values(),
+        ],
+        {2: 20},
+    )
+    s_cols = {c: get_column_letter(6 + i) for i, c in enumerate(component_cols)}
+    service_row: dict[str, int] = {}
+    for i, sid in enumerate(services):
+        r = i + 2
+        a, b = service_block_rows[sid][0], service_block_rows[sid][-1]
+        values = {
+            c: "n/a" if n_a(c) else f"=SUM(Blocks!{b_cols[c]}{a}:{b_cols[c]}{b})"
+            for c in component_cols
+        }
+        values.update(_derived_formulas(s_cols, r, tods_supplied))
+        ws_s.append(
+            [
+                sid,
+                ", ".join(d for d in DAY_TYPES if d in types.get(sid, set())),
+                f"{a}-{b}",
+                f"=ROWS(Blocks!A{a}:A{b})",
+                f"=SUM(Blocks!E{a}:E{b})",
+                *(values[c] for c in (*component_cols, *DERIVED)),
+            ]
+        )
+        for idx in range(6, 6 + len(component_cols) + len(DERIVED)):
+            ws_s.cell(r, idx).number_format = HOURS_FORMAT
+        service_row[sid] = r
+
+    # --- Calendar --------------------------------------------------------------
+    ws_c = _sheet(
+        wb,
+        "Calendar",
+        ["Period", "Date", "Weekday", "Day type", *services, "Services running"],
+        {1: 18, 2: 12},
+    )
+    c_cols = {sid: get_column_letter(5 + i) for i, sid in enumerate(services)}
+    running_col = get_column_letter(5 + len(services))
+    last_service_col = get_column_letter(4 + len(services))
+    for i, day in enumerate(calendar.to_dict("records")):
+        r = i + 2
+        ws_c.append(
+            [
+                day["period"],
+                day["date"],
+                day["weekday"],
+                day["day_type"],
+                *(1 if sid in day["running"] else 0 for sid in services),
+                f"=SUM(E{r}:{last_service_col}{r})",
+            ]
+        )
+        ws_c[f"B{r}"].number_format = "yyyy-mm-dd"
+
+    # --- Period days -----------------------------------------------------------
+    ws_d = _sheet(
+        wb,
+        "Period days",
+        [
+            "Period",
+            "Start",
+            "End",
+            "Days",
+            "Weekdays",
+            "Saturdays",
+            "Sundays",
+            "Holidays",
+            "Days without service",
+        ],
+        {1: 18, 2: 12, 3: 12},
+    )
+    for i, (name, first, last) in enumerate(cfg.periods):
+        r = i + 2
+        key = f"Calendar!$A:$A,$A{r}"
+        ws_d.append(
+            [
+                name,
+                _parse_date(first),
+                _parse_date(last),
+                f"=COUNTIFS({key})",
+                *(f'=COUNTIFS({key},Calendar!$D:$D,"{label}")' for label in DAY_TYPES),
+                f"=COUNTIFS({key},Calendar!${running_col}:${running_col},0)",
+            ]
+        )
+        for col in ("B", "C"):
+            ws_d[f"{col}{r}"].number_format = "yyyy-mm-dd"
+
+    # --- Periods ---------------------------------------------------------------
+    ws_p = _sheet(
+        wb,
+        "Periods",
+        [
+            "Period",
+            "Start",
+            "End",
+            "Service",
+            "Service days",
+            *COMPONENT_LABELS.values(),
+            *DERIVED_LABELS.values(),
+        ],
+        {1: 18, 2: 12, 3: 12, 4: 16},
+    )
+    p_cols = {c: get_column_letter(6 + i) for i, c in enumerate(component_cols)}
+    r = 1
+    for name, first, last in cfg.periods:
+        first_row = r + 1
+        for sid in services:
+            r += 1
+            srow = service_row[sid]
+            values = {
+                c: "n/a" if n_a(c) else f"=$E{r}*Services!{s_cols[c]}{srow}" for c in component_cols
+            }
+            values.update(_derived_formulas(p_cols, r, tods_supplied))
+            ws_p.append(
+                [
+                    name,
+                    _parse_date(first),
+                    _parse_date(last),
+                    sid,
+                    f"=SUMIFS(Calendar!{c_cols[sid]}:{c_cols[sid]},Calendar!$A:$A,$A{r})",
+                    *(values[c] for c in (*component_cols, *DERIVED)),
+                ]
+            )
+        r += 1
+        totals: list[Any] = []
+        for idx in range(6, 6 + len(component_cols) + len(DERIVED)):
+            col = get_column_letter(idx)
+            header = ws_p.cell(1, idx).value
+            unknown = not tods_supplied and header in (
+                *(COMPONENT_LABELS[c] for c in TODS_COMPONENTS),
+                DERIVED_LABELS["nonrevenue_hours"],
+                DERIVED_LABELS["vehicle_hours"],
+            )
+            totals.append("n/a" if unknown else f"=SUM({col}{first_row}:{col}{r - 1})")
+        ws_p.append([name, _parse_date(first), _parse_date(last), "All services", "", *totals])
+        for cell in ws_p[r]:
+            cell.font = Font(bold=True)
+        for row in range(first_row, r + 1):
+            for col in ("B", "C"):
+                ws_p[f"{col}{row}"].number_format = "yyyy-mm-dd"
+            for idx in range(6, 6 + len(component_cols) + len(DERIVED)):
+                ws_p.cell(row, idx).number_format = HOURS_FORMAT
+
+    # --- Settings --------------------------------------------------------------
+    ws_set = _sheet(wb, "Settings", ["Setting", "Value", "Notes"], {1: 34, 2: 40, 3: 90})
+    notes = [
+        (
+            "Layover counts as revenue time",
+            cfg.layover_in_revenue_hours,
+            "TRUE or FALSE. Every vehicle revenue / nonrevenue total recalculates.",
+        ),
+        ("GTFS", str(cfg.gtfs_path), ""),
+        ("TODS", str(cfg.tods_path) if cfg.tods_path else "(none: revenue only)", ""),
+        ("Period calendar", cfg.period_calendar, "gtfs: GTFS calendar; config: day types"),
+        ("Generated", datetime.now().isoformat(timespec="seconds"), ""),
+        ("", "", ""),
+        ("How the numbers are built", "", ""),
+        (
+            "Trips",
+            "",
+            "One row per revenue (GTFS) or nonrevenue (TODS) trip, in block order. "
+            "Duration h = (End - Start) x 24. A positive gap where the vehicle stays at "
+            "the same place is layover; a positive gap where it changes place with no "
+            "trip in between is an unresolved gap.",
+        ),
+        ("Blocks", "", "Sums of each block's Trips rows (row range shown)."),
+        ("Services", "", "Sums of the service's Blocks rows: hours for one day of service."),
+        (
+            "Calendar",
+            "",
+            "1 where a service runs on a date. Edit a cell (e.g. a holiday) and the "
+            "period totals follow.",
+        ),
+        ("Period days", "", "Day counts per period, from the Calendar."),
+        (
+            "Periods",
+            "",
+            "Service days in the period x hours per day of that service, then totalled.",
+        ),
+    ]
+    if not tods_supplied:
+        notes.append(("No TODS", "", "Pull-out, pull-in, deadhead and vehicle hours are n/a."))
+    for row in notes:
+        ws_set.append(list(row))
+    for row in ws_set.iter_rows(min_row=2):
+        for cell in row:
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+
+    order = ("Periods", "Settings", "Period days", "Calendar", "Services", "Blocks", "Trips")
+    for idx, name in enumerate(order):
+        wb.move_sheet(name, offset=idx - wb.sheetnames.index(name))
+    # openpyxl stores formulas without results; have Excel compute them on open.
+    wb.calculation = CalcProperties(fullCalcOnLoad=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(path)
+    return path
 
 
 # =============================================================================
@@ -1099,11 +1558,12 @@ def run(cfg: Config) -> dict[str, pd.DataFrame]:
     blocks = block_hours(schedule.movements, schedule.stop_places)
     services = service_hours(blocks)
     types = service_day_types(schedule.active_dates, cfg.service_day_types)
+    calendar = build_calendar(services, schedule.active_dates, types, cfg)
     tables = {
         "block": blocks,
         "service": services.reset_index(),
         "day_type": day_type_hours(services, types),
-        "period": period_hours(services, schedule.active_dates, types, cfg),
+        "period": period_hours(services, calendar, cfg),
     }
     for key, table in tables.items():
         if not table.empty:
@@ -1121,6 +1581,15 @@ def run(cfg: Config) -> dict[str, pd.DataFrame]:
     ):
         tables[key].to_csv(cfg.output_dir / filename, index=False)
         logging.info("Wrote %s", cfg.output_dir / filename)
+    workbook = write_workbook(
+        cfg.output_dir / WORKBOOK_FILENAME,
+        movement_table(schedule.movements, schedule.stop_places),
+        calendar,
+        types,
+        cfg,
+        schedule.tods_supplied,
+    )
+    logging.info("Wrote %s (formulas; open in Excel to check the totals)", workbook)
 
     summary = [
         f"GTFS input:        {cfg.gtfs_path}",

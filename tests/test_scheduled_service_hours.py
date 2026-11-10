@@ -5,12 +5,17 @@ from __future__ import annotations
 import csv
 import io
 import math
+import os
+import shutil
+import subprocess
 import zipfile
 from collections import defaultdict
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 import pytest
+from openpyxl import load_workbook
 
 import scripts.gtfs_exports.scheduled_service_hours as target
 
@@ -334,3 +339,151 @@ def test_main_without_tods_leaves_nonrevenue_blank(tmp_path: Path) -> None:
     period = pd.read_csv(tmp_path / target.PERIOD_FILENAME).iloc[0]
     assert period["revenue_trip_hours"] > 0
     assert pd.isna(period["deadhead_hours"]) and pd.isna(period["vehicle_hours"])
+
+
+# =============================================================================
+# FORMULA WORKBOOK
+# =============================================================================
+
+SOFFICE = shutil.which("soffice")
+needs_libreoffice = pytest.mark.skipif(SOFFICE is None, reason="LibreOffice not installed")
+
+
+@pytest.fixture(scope="module")
+def mock_run(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, dict[str, pd.DataFrame]]:
+    out = tmp_path_factory.mktemp("workbook")
+    cfg = target.Config(
+        gtfs_path=GTFS_ZIP,
+        tods_path=TODS_ZIP,
+        output_dir=out,
+        periods=[("November 2026", "20261101", "20261130"), ("Jan 2026", "20260101", "20260131")],
+    )
+    return out, target.run(cfg)
+
+
+def recalculate(path: Path, work: Path) -> Any:
+    """Recalculate *path* in LibreOffice and return it with formula results."""
+    out = work / "recalculated"
+    out.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [
+            str(SOFFICE),
+            "--headless",
+            "--calc",
+            "--convert-to",
+            "xlsx",
+            "--outdir",
+            str(out),
+            str(path),
+        ],
+        check=True,
+        capture_output=True,
+        timeout=180,
+        env={**os.environ, "HOME": str(work / "lo-profile")},
+    )
+    return load_workbook(out / path.name, data_only=True)
+
+
+def sheet_rows(ws: Any) -> list[dict[str, Any]]:
+    header = [c.value for c in ws[1]]
+    return [dict(zip(header, [c.value for c in row])) for row in ws.iter_rows(min_row=2)]
+
+
+def period_totals(wb: Any) -> dict[str, dict[str, Any]]:
+    return {r["Period"]: r for r in sheet_rows(wb["Periods"]) if r["Service"] == "All services"}
+
+
+def test_workbook_formulas_trace_back_to_trip_times(mock_run: tuple) -> None:
+    out, _ = mock_run
+    wb = load_workbook(out / target.WORKBOOK_FILENAME)
+    assert wb.sheetnames == [
+        "Periods",
+        "Settings",
+        "Period days",
+        "Calendar",
+        "Services",
+        "Blocks",
+        "Trips",
+    ]
+    assert wb.calculation.fullCalcOnLoad
+    assert wb["Settings"]["B2"].value is True  # LAYOVER_IN_REVENUE_HOURS default.
+    periods = sheet_rows(wb["Periods"])
+    service_row = next(r for r in periods if r["Service"] == "weekday")
+    assert service_row["Service days"].startswith("=SUMIFS(Calendar!")
+    assert (
+        service_row["Revenue trip h"].startswith("=$E")
+        and "Services!" in service_row["Revenue trip h"]
+    )
+    assert period_totals(wb)["November 2026"]["Vehicle h"].startswith("=SUM(")
+    block = sheet_rows(wb["Blocks"])[0]
+    assert block["Revenue trip h"].startswith("=SUMIFS(Trips!$K$")
+    trip = sheet_rows(wb["Trips"])[1]
+    assert trip["Duration h"] == "=(J3-I3)*24"
+    assert wb["Trips"]["I2"].number_format == "[h]:mm:ss"  # GTFS times past 24:00.
+
+
+@needs_libreoffice
+def test_workbook_totals_match_the_csv(mock_run: tuple, tmp_path: Path) -> None:
+    out, tables = mock_run
+    wb = recalculate(out / target.WORKBOOK_FILENAME, tmp_path)
+    labels = {**target.COMPONENT_LABELS, **target.DERIVED_LABELS}
+    csv_periods = tables["period"].set_index("period")
+    for name, row in period_totals(wb).items():
+        for column, label in labels.items():
+            assert row[label] == pytest.approx(csv_periods.loc[name, column], abs=0.01), label
+    days = {r["Period"]: r for r in sheet_rows(wb["Period days"])}
+    assert (days["Jan 2026"]["Weekdays"], days["Jan 2026"]["Holidays"]) == (21, 1)
+    errors = [
+        (ws.title, c.coordinate)
+        for ws in wb
+        for row in ws.iter_rows()
+        for c in row
+        if isinstance(c.value, str) and c.value.startswith("#")
+    ]
+    assert not errors
+
+
+@needs_libreoffice
+def test_workbook_layover_switch_and_calendar_edits_recalculate(
+    mock_run: tuple, tmp_path: Path
+) -> None:
+    out, tables = mock_run
+    edited = tmp_path / "edited.xlsx"
+    wb = load_workbook(out / target.WORKBOOK_FILENAME)
+    wb["Settings"]["B2"] = False
+    # Drop weekday service on the first November weekday (2026-11-02).
+    cal = wb["Calendar"]
+    header = [c.value for c in cal[1]]
+    weekday_col = header.index("weekday") + 1
+    row = next(
+        r
+        for r in range(2, cal.max_row + 1)
+        if cal.cell(r, 1).value == "November 2026" and cal.cell(r, 2).value.day == 2
+    )
+    cal.cell(row, weekday_col).value = 0
+    wb.save(edited)
+
+    totals = period_totals(recalculate(edited, tmp_path))["November 2026"]
+    weekday = tables["service"].set_index("service_id").loc["weekday"]
+    nov = tables["period"].set_index("period").loc["November 2026"]
+    assert totals["Revenue trip h"] == pytest.approx(
+        nov["revenue_trip_hours"] - weekday["revenue_trip_hours"], abs=0.01
+    )
+    # Layover now counts as nonrevenue time.
+    assert totals["Vehicle revenue h"] == pytest.approx(totals["Revenue trip h"], abs=1e-6)
+    moves = sum(totals[target.COMPONENT_LABELS[c]] for c in target.TODS_COMPONENTS)
+    assert totals["Nonrevenue h"] == pytest.approx(moves + totals["Layover h"], abs=1e-6)
+
+
+def test_workbook_without_tods_marks_unknowns(tmp_path: Path) -> None:
+    cfg = target.Config(
+        gtfs_path=GTFS_ZIP,
+        tods_path=None,
+        output_dir=tmp_path,
+        periods=[("Nov", "20261101", "20261130")],
+    )
+    target.run(cfg)
+    wb = load_workbook(tmp_path / target.WORKBOOK_FILENAME)
+    total = period_totals(wb)["Nov"]
+    assert total["Deadhead h"] == total["Vehicle h"] == "n/a"
+    assert total["Revenue trip h"].startswith("=SUM(")
