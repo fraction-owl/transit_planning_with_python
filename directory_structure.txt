@@ -279,6 +279,7 @@ transit_planning_with_python/
 │   ├── test_load_factor_monitor.py
 │   ├── test_load_gtfs_data.py
 │   ├── test_max_load_from_tides.py
+│   ├── test_mock_tides_dc.py
 │   ├── test_mock_tods_dc.py
 │   ├── test_monthly_ridership_model.py
 │   ├── test_network_helpers.py
