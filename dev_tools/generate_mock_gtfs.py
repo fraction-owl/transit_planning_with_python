@@ -75,6 +75,7 @@ Outputs:
 from __future__ import annotations
 
 import csv
+import datetime
 import logging
 import math
 from dataclasses import dataclass, field, replace
@@ -129,7 +130,13 @@ FEED_LANG = "en"
 # (b) remove those dates from the regular "weekday" service via calendar_dates.txt.
 HOLIDAYS = (
     "20260101",  # New Year's Day
+    "20261111",  # Veterans Day
     "20261225",  # Christmas Day
+)
+# Holidays on the nth weekday of a month, as (month, weekday with Monday = 0, n).
+# Each edition gets the date the rule gives in its own year; used as HOLIDAYS is.
+FLOATING_HOLIDAYS = (
+    (11, 3, 4),  # Thanksgiving Day: fourth Thursday in November
 )
 
 # Fares (GTFS-Fares v1), written to fare_attributes.txt. Each RouteSpec names one
@@ -392,7 +399,7 @@ class FeedEdition:
         year: Calendar year the feed covers. FEED_START_DATE, FEED_END_DATE,
             FEED_VERSION and HOLIDAYS are moved by the number of years between
             FEED_START_DATE's year and this one, so HOLIDAYS should hold
-            fixed-date holidays only.
+            fixed-date holidays only (FLOATING_HOLIDAYS holds the rest).
         fares: The fare_attributes.txt rows.
         route_fares: Route short_name -> fare_id, overriding ``RouteSpec.fare_id``.
         sunday_service: When False, the feed has no "sunday" service and every
@@ -697,7 +704,12 @@ def _build_calendar_rows(edition: FeedEdition) -> List[Dict[str, str]]:
 def _build_calendar_dates_rows(edition: FeedEdition) -> List[Dict[str, str]]:
     """Return calendar_dates.txt rows turning weekday service off and holiday on."""
     rows: List[Dict[str, str]] = []
-    for date in (_shift_years(holiday, edition) for holiday in HOLIDAYS):
+    dates = [_shift_years(holiday, edition) for holiday in HOLIDAYS]
+    for month, weekday, n in FLOATING_HOLIDAYS:
+        first = datetime.date(edition.year, month, 1)
+        day = 1 + (weekday - first.weekday()) % 7 + 7 * (n - 1)
+        dates.append(f"{edition.year:04d}{month:02d}{day:02d}")
+    for date in sorted(dates):
         rows.append({"service_id": "weekday", "date": date, "exception_type": "2"})
         rows.append({"service_id": "holiday", "date": date, "exception_type": "1"})
     return rows

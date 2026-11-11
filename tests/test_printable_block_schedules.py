@@ -925,3 +925,144 @@ def test_export_to_excel_formats_gap_rows(tmp_path: Path) -> None:
     assert ws["B3"].font.b
     assert ws["C3"].alignment.wrap_text
     assert ws["A2"].border.top.style is None
+
+
+# =============================================================================
+# TODS NONREVENUE MOVEMENTS
+# =============================================================================
+
+MOCK_GTFS = FIXTURES / "mock_gtfs_dc.zip"
+MOCK_TODS = FIXTURES / "mock_tods_dc.zip"
+
+
+def _move(trip_id: str, label: str, start: str, end: str, origin: str, dest: str) -> dict:
+    return {
+        "trip_id": trip_id,
+        "label": label,
+        "start": time_to_seconds(start),
+        "end": time_to_seconds(end),
+        "from_stop": origin,
+        "to_stop": dest,
+        "from_name": origin,
+        "to_name": dest,
+    }
+
+
+def _rows_with_movements(movements: list, include_gaps: bool = True) -> pd.DataFrame:
+    # T1 S1->S2 07:00-07:20; T2 starts back at S1 at 08:00, so the bus must deadhead.
+    trips = [*_LAYOVER_TRIPS[:2], ("T2", "S1", 1, "08:00:00", "08:00:00")]
+    block = _make_prepared_block(trips)
+    block["trip_start_seconds"] = block.groupby("trip_id")["departure_seconds"].transform("min")
+    schedule = pd.DataFrame(
+        {
+            "Block ID": "B1",
+            "Event Type": "Stop",
+            "Trip ID": block["trip_id"],
+            "Stop ID": block["stop_label"],
+            "Stop Name": block["stop_name"],
+        },
+    ).reindex(
+        columns=[
+            "Block ID",
+            "Event Type",
+            "Route",
+            "Direction",
+            "Trip ID",
+            "Trip Start Time",
+            "Stop ID",
+            "Stop Name",
+            "Scheduled Arrival Time",
+            "Scheduled Departure Time",
+            "Actual Arrival Time",
+            "Actual Departure Time",
+            "Boardings",
+            "Alightings",
+            "Comments",
+        ],
+        fill_value="",
+    )
+    return add_layover_rows(schedule, block, movements, include_gaps=include_gaps)
+
+
+def test_tods_movements_fill_the_block_day() -> None:
+    movements = [
+        _move("PO", "Pull-out", "06:30:00", "07:00:00", "G", "S1"),
+        _move("DH", "Deadhead", "07:25:00", "07:45:00", "S2", "S1"),
+        _move("PB", "Pull-in", "08:00:00", "08:40:00", "S1", "G"),
+    ]
+    result = _rows_with_movements(movements)
+    assert result["Event Type"].tolist() == [
+        "Pull-out",
+        "Stop",
+        "Stop",
+        "Layover",
+        "Deadhead",
+        "Layover",
+        "Stop",
+        "Pull-in",
+    ]
+    deadhead = result.iloc[4]
+    assert (deadhead["Scheduled Departure Time"], deadhead["Scheduled Arrival Time"]) == (
+        "07:25",
+        "07:45",
+    )
+    assert deadhead["Stop Name"] == "From: S2\nTo: S1"
+    assert deadhead["Comments"].startswith("Scheduled deadhead (TODS): 20 min\n")
+    # Waiting at S2 before the deadhead, then at S1 until T2 leaves.
+    assert result.iloc[3][
+        ["Stop ID", "Scheduled Arrival Time", "Scheduled Departure Time"]
+    ].tolist() == [
+        "S2",
+        "07:20",
+        "07:25",
+    ]
+    assert result.iloc[5][
+        ["Stop ID", "Scheduled Arrival Time", "Scheduled Departure Time"]
+    ].tolist() == [
+        "S1",
+        "07:45",
+        "08:00",
+    ]
+    assert "Between trips" not in result["Event Type"].tolist()
+
+
+def test_tods_movements_without_gap_rows() -> None:
+    movements = [_move("DH", "Deadhead", "07:25:00", "07:45:00", "S2", "S1")]
+    result = _rows_with_movements(movements, include_gaps=False)
+    assert result["Event Type"].tolist() == ["Stop", "Stop", "Deadhead", "Stop"]
+
+
+def test_tods_movement_overlapping_a_trip_is_not_listed(caplog: pytest.LogCaptureFixture) -> None:
+    movements = [_move("DH", "Deadhead", "07:10:00", "07:40:00", "S2", "S1")]
+    result = _rows_with_movements(movements)
+    assert result["Event Type"].tolist() == ["Stop", "Stop", "Between trips", "Stop"]
+    assert "overlap revenue trips" in caplog.text
+
+
+def test_load_tods_movements_reads_the_mock_supplements() -> None:
+    from scripts.field_tools.printable_block_schedules import load_gtfs_data, load_tods_movements
+
+    stops = load_gtfs_data(str(MOCK_GTFS), files=["stops.txt"], dtype=str)["stops"]
+    movements = load_tods_movements(str(MOCK_TODS), stops)
+    legs = movements["DC_R20_weekday_BLK001", "weekday"]
+    assert [m["label"] for m in legs] == ["Pull-out", "Deadhead", "Pull-in"]
+    assert legs[0]["from_name"] == "Mock DC North Garage"  # Named from stops_supplement.
+    assert legs[0]["end"] <= legs[1]["start"] <= legs[1]["end"] <= legs[2]["start"]
+
+
+def test_main_lists_tods_movements_for_mock_express_block(tmp_path: Path) -> None:
+    from scripts.field_tools.printable_block_schedules import main
+
+    with (
+        patch(f"{_MODULE}.GTFS_FOLDER_PATH", str(MOCK_GTFS)),
+        patch(f"{_MODULE}.BASE_OUTPUT_PATH", str(tmp_path)),
+        patch(f"{_MODULE}.TODS_PATH", str(MOCK_TODS)),
+        patch(f"{_MODULE}.FILTER_ROUTE_SHORT_NAMES", ["20"]),
+        patch(f"{_MODULE}.FILTER_SERVICE_IDS", ["weekday"]),
+        patch(f"{_MODULE}.TIMEPOINTS_ONLY", True),
+    ):
+        assert main() == 0
+    (path,) = tmp_path.glob("block_DC_R20_weekday_BLK001_*.xlsx")
+    events = pd.read_excel(path, dtype=str, keep_default_na=False)["Event Type"].tolist()
+    assert events[0] == "Pull-out" and events[-1] == "Pull-in"
+    assert "Deadhead" in events and "Between trips" not in events
