@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import zipfile
 from pathlib import Path
 
 import numpy as np
@@ -285,3 +286,27 @@ def test_main_end_to_end_on_gtfs_basic(tmp_path: Path) -> None:
     assert row["qualifying_stop_pairs"] == 3  # S3, S4, S5
     assert row["nearest_walk_distance_m"] == 0.0
     assert row["min_transfer_wait_min"] == 25.0
+
+
+def test_read_feed_zipped_feed_matches_folder(tmp_path: Path) -> None:
+    fixture = Path(__file__).parent / "fixtures" / "mock_gtfs_dc.zip"
+    with zipfile.ZipFile(fixture) as zf:
+        zf.extractall(tmp_path / "extracted")
+    folder = tmp_path / "extracted" / "dc"
+
+    tables_folder, calendar_folder = rtc._read_feed(str(folder))
+    tables_zip, calendar_zip = rtc._read_feed(str(fixture))
+
+    assert tables_zip.keys() == tables_folder.keys()
+    for key, frame in tables_folder.items():
+        pd.testing.assert_frame_equal(tables_zip[key], frame)
+    assert calendar_folder is not None and calendar_zip is not None
+    pd.testing.assert_frame_equal(calendar_zip, calendar_folder)
+
+
+def test_read_feed_missing_required_file_raises(tmp_path: Path) -> None:
+    zipped = tmp_path / "feed.zip"
+    with zipfile.ZipFile(zipped, "w") as zf:
+        zf.writestr("stops.txt", "stop_id\n1\n")
+    with pytest.raises(FileNotFoundError, match="routes.txt"):
+        rtc._read_feed(str(zipped))

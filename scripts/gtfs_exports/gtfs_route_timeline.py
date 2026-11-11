@@ -5,7 +5,7 @@ changed between these *two* feeds?" in depth; this one takes a whole *sequence*
 of GTFS feeds in chronological order and answers "which routes existed when?"
 across the entire span:
 
-- Point ``GTFS_FEEDS`` at your feed folders, oldest first. Optionally provide
+- Point ``GTFS_FEEDS`` at your feeds (folders or ``.zip`` files), oldest first. Optionally provide
   ``CHANGE_DATES`` (the service-change date each feed took effect); otherwise
   each feed's start date is inferred from ``feed_info.txt`` / the calendar.
 - Route identity is chained across consecutive feeds: a route continues through
@@ -40,9 +40,12 @@ import datetime as dt
 import logging
 import os
 import re
+import zipfile
+from collections.abc import Generator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import IO, Optional
 
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
@@ -56,7 +59,7 @@ from matplotlib.patches import Patch
 
 # === BEGIN CONFIG ===
 
-# GTFS feed folders in chronological order, OLDEST FIRST. Each must contain
+# GTFS feeds (folders or .zip files) in chronological order, OLDEST FIRST. Each must contain
 # routes.txt; trips.txt + stop_times.txt are used (when present) to chain route
 # identity across renumberings. Two feeds minimum.
 GTFS_FEEDS: list[str] = [
@@ -66,7 +69,8 @@ GTFS_FEEDS: list[str] = [
 ]
 
 # Optional labels for each feed, parallel to GTFS_FEEDS (e.g. "Aug 2023 pick").
-# None = label each feed by its folder name (duplicates are suffixed _2, _3, ...).
+# None = label each feed by its folder name, or a .zip's name without the extension
+# (duplicates are suffixed _2, _3, ...).
 FEED_LABELS: Optional[list[str]] = None
 
 # Optional service-change dates, parallel to GTFS_FEEDS: the date each feed took
@@ -184,11 +188,68 @@ def setup_logging(output_dir: Path) -> None:
 # =============================================================================
 
 
-def _read_csv(path: Path, usecols: Optional[object] = None) -> pd.DataFrame:
+@contextmanager
+def open_gtfs_file(
+    gtfs_path: str | os.PathLike[str], file_name: str
+) -> Generator[IO[bytes], None, None]:
+    """Open one GTFS text file from a feed folder or a ``.zip`` of the feed.
+
+    The counterpart of :func:`load_gtfs_data` for scripts that read a file with
+    their own options (``pandas.read_csv`` with ``usecols`` or
+    ``keep_default_na=False``, or the :mod:`csv` module), so they accept a
+    zipped feed without extracting it. Zip members are found the way
+    :func:`load_gtfs_data` finds them: at the archive root or inside a single
+    wrapper folder.
+
+    Args:
+        gtfs_path: Folder containing the GTFS feed, or a ``.zip`` archive of it.
+        file_name: GTFS file to open, e.g. ``"stops.txt"``.
+
+    Yields:
+        A binary file handle. ``pandas.read_csv`` reads it directly; wrap it in
+        :class:`io.TextIOWrapper` for the :mod:`csv` module.
+
+    Raises:
+        FileNotFoundError: *gtfs_path* does not exist, or the feed has no
+            *file_name*.
+        ValueError: *gtfs_path* is neither a directory nor a valid ``.zip``
+            file, or *file_name* is found in more than one place in the zip.
+    """
+    path = os.fspath(gtfs_path)
+    if os.path.isdir(path):
+        file_path = os.path.join(path, file_name)
+        if not os.path.isfile(file_path):
+            raise FileNotFoundError(f"Missing GTFS file in '{path}': {file_name}")
+        with open(file_path, "rb") as handle:
+            yield handle
+        return
+
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"The path '{path}' does not exist.")
+    if not (os.path.isfile(path) and path.lower().endswith(".zip")):
+        raise ValueError(f"'{path}' is neither a directory nor a .zip file.")
+    try:
+        archive = zipfile.ZipFile(path)
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"'{path}' is not a valid zip archive.") from exc
+    with archive:
+        matches = [name for name in archive.namelist() if os.path.basename(name) == file_name]
+        if not matches:
+            raise FileNotFoundError(f"Missing GTFS file in '{path}': {file_name}")
+        if len(matches) > 1:
+            raise ValueError(
+                f"Ambiguous GTFS file in '{path}' (found in multiple locations): {file_name}"
+            )
+        with archive.open(matches[0]) as handle:
+            yield handle
+
+
+def _read_csv(path: Path | IO[bytes], usecols: Optional[object] = None) -> pd.DataFrame:
     """Read a GTFS table as all-string columns with missing values as empty strings.
 
     Args:
-        path: Path to the ``.txt`` file.
+        path: Path to the ``.txt`` file, or an open binary handle to it (as
+            yielded by ``open_gtfs_file``).
         usecols: Optional value forwarded to ``pandas.read_csv(usecols=...)``; a
             callable is convenient for keeping only columns that exist.
 
@@ -214,7 +275,7 @@ def load_feed_summary(gtfs_dir: Path, label: str) -> FeedSummary:
     and the calendar files are reduced to declared date bounds.
 
     Args:
-        gtfs_dir: Folder containing the GTFS feed.
+        gtfs_dir: GTFS feed folder, or a ``.zip`` of the feed.
         label: Human-readable feed label used in log messages.
 
     Returns:
@@ -222,22 +283,32 @@ def load_feed_summary(gtfs_dir: Path, label: str) -> FeedSummary:
 
     Raises:
         OSError: ``gtfs_dir`` or its ``routes.txt`` is missing.
+        ValueError: ``gtfs_dir`` is neither a folder nor a valid ``.zip``.
     """
     if not os.path.exists(gtfs_dir):
-        raise OSError(f"{label}: directory '{gtfs_dir}' does not exist.")
-    routes_path = Path(gtfs_dir) / "routes.txt"
-    if not routes_path.exists():
-        raise OSError(f"{label}: missing required GTFS file routes.txt in '{gtfs_dir}'.")
+        raise OSError(f"{label}: GTFS feed '{gtfs_dir}' does not exist.")
 
-    routes = _read_csv(routes_path)
+    def _read(name: str, usecols: Optional[object] = None) -> Optional[pd.DataFrame]:
+        """Read *name* from the feed, or return None when the feed has no such file."""
+        try:
+            with open_gtfs_file(gtfs_dir, name) as handle:
+                return _read_csv(handle, usecols=usecols)
+        except FileNotFoundError:
+            return None
+
+    routes = _read("routes.txt")
+    if routes is None:
+        raise OSError(f"{label}: missing required GTFS file routes.txt in '{gtfs_dir}'.")
     logging.info("%s: loaded routes.txt (%d records).", label, len(routes))
 
     stop_sets: dict[str, frozenset[str]] = {}
-    trips_path = Path(gtfs_dir) / "trips.txt"
-    st_path = Path(gtfs_dir) / "stop_times.txt"
-    if trips_path.exists() and st_path.exists():
-        trips = _read_csv(trips_path, usecols=lambda c: c in {"route_id", "trip_id"})
-        stop_times = _read_csv(st_path, usecols=lambda c: c in {"trip_id", "stop_id"})
+    trips = _read("trips.txt", usecols=lambda c: c in {"route_id", "trip_id"})
+    stop_times = (
+        _read("stop_times.txt", usecols=lambda c: c in {"trip_id", "stop_id"})
+        if trips is not None
+        else None
+    )
+    if trips is not None and stop_times is not None:
         stop_sets = route_stop_sets(trips, stop_times)
         logging.info(
             "%s: loaded trips.txt/stop_times.txt (%d trips, %d stop_time rows).",
@@ -252,15 +323,9 @@ def load_feed_summary(gtfs_dir: Path, label: str) -> FeedSummary:
             label,
         )
 
-    feed_info = None
-    calendar = None
-    calendar_dates = None
-    if (Path(gtfs_dir) / "feed_info.txt").exists():
-        feed_info = _read_csv(Path(gtfs_dir) / "feed_info.txt")
-    if (Path(gtfs_dir) / "calendar.txt").exists():
-        calendar = _read_csv(Path(gtfs_dir) / "calendar.txt")
-    if (Path(gtfs_dir) / "calendar_dates.txt").exists():
-        calendar_dates = _read_csv(Path(gtfs_dir) / "calendar_dates.txt")
+    feed_info = _read("feed_info.txt")
+    calendar = _read("calendar.txt")
+    calendar_dates = _read("calendar_dates.txt")
 
     return FeedSummary(
         routes=routes,
@@ -378,7 +443,7 @@ def resolve_periods(
     declared end, else ``final_fallback_days`` after its start (with a warning).
 
     Args:
-        feed_dirs: GTFS folders, oldest first.
+        feed_dirs: GTFS feed folders or .zip files, oldest first.
         labels: Unique label per feed, parallel to ``feed_dirs``.
         summaries: Loaded feed summaries (see :func:`load_feed_summary`).
         change_dates: Optional per-feed effective dates (entries may be None).
@@ -960,7 +1025,8 @@ def run_timeline(
     """Run the timeline end-to-end and write all outputs (notebook-friendly).
 
     Args:
-        feed_dirs: GTFS folders, oldest first (defaults to ``GTFS_FEEDS``).
+        feed_dirs: GTFS feed folders or ``.zip`` files, oldest first (defaults to
+            ``GTFS_FEEDS``).
         labels: Optional per-feed labels (defaults to ``FEED_LABELS`` / folder names).
         change_dates: Optional per-feed effective dates (defaults to ``CHANGE_DATES``).
         out_dir: Output folder (defaults to ``OUTPUT_DIR``).
@@ -982,7 +1048,9 @@ def run_timeline(
             f"{len(feed_dirs)}; provide one label per feed or None."
         )
     if not raw_labels:
-        raw_labels = [Path(d).name for d in feed_dirs]
+        raw_labels = [
+            Path(d).stem if str(d).lower().endswith(".zip") else Path(d).name for d in feed_dirs
+        ]
     feed_labels = dedupe_labels(raw_labels)
 
     setup_logging(Path(out_dir))
