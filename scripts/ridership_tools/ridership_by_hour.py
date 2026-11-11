@@ -128,11 +128,12 @@ XLSX_COLUMN_MAP: Mapping[str, str] = {
 TIDES_STOP_VISITS_PATH: str = r"Path\To\stop_visits.csv"
 TIDES_TRIPS_PERFORMED_PATH: str = r"Path\To\trips_performed.csv"
 # First column found (and non-blank per row) provides each stop visit's time.
+# Defaults are the TIDES stop_visits field names.
 TIDES_TIME_COLUMNS: Sequence[str] = (
-    "departure_time",
-    "arrival_time",
-    "scheduled_departure_time",
-    "scheduled_arrival_time",
+    "actual_departure_time",
+    "actual_arrival_time",
+    "schedule_departure_time",
+    "schedule_arrival_time",
 )
 # Per-door APC count columns summed into total boardings / alightings.
 TIDES_BOARDING_COLS: Sequence[str] = ("boarding_1", "boarding_2")
@@ -808,6 +809,12 @@ def build_hourly_from_tides(
                 raise ValueError(f"{label} is missing required column {col!r}.")
     if "route_id" not in performed.columns:
         raise ValueError("trips_performed is missing required column 'route_id'.")
+    # The two exports may format service_date differently (M/D/YYYY vs.
+    # YYYY-MM-DD), so normalise both before they are joined on it.
+    for frame in (visits, performed):
+        frame["service_date"] = pd.to_datetime(frame["service_date"], errors="coerce").dt.strftime(
+            "%Y-%m-%d"
+        )
 
     board_cols = [c for c in TIDES_BOARDING_COLS if c in visits.columns]
     if not board_cols:
