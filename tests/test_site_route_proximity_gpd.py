@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -42,6 +43,29 @@ def test_load_gtfs_returns_string_dataframes(tmp_path: Path) -> None:
     assert set(gtfs) == {"stops", "stop_times", "trips", "routes"}
     assert gtfs["stops"]["stop_id"].iloc[0] == "S1"
     assert gtfs["stops"]["stop_lat"].dtype == object  # loaded as str
+
+
+def test_check_and_load_gtfs_read_zipped_feed(tmp_path: Path) -> None:
+    folder = tmp_path / "feed"
+    folder.mkdir()
+    _write_minimal_gtfs(folder)
+    zipped = tmp_path / "feed.zip"
+    with zipfile.ZipFile(zipped, "w") as zf:
+        for path in folder.iterdir():
+            zf.write(path, f"wrapper/{path.name}")
+    target._check_gtfs(str(zipped))  # should not raise
+    from_zip = target._load_gtfs(str(zipped))
+    from_folder = target._load_gtfs(str(folder))
+    for key, frame in from_folder.items():
+        pd.testing.assert_frame_equal(from_zip[key], frame)
+
+
+def test_check_gtfs_zip_missing_file_raises(tmp_path: Path) -> None:
+    zipped = tmp_path / "feed.zip"
+    with zipfile.ZipFile(zipped, "w") as zf:
+        zf.writestr("stops.txt", "stop_id\nS1\n")
+    with pytest.raises(FileNotFoundError, match="stop_times.txt"):
+        target._check_gtfs(str(zipped))
 
 
 # ---------------------------------------------------------------------------

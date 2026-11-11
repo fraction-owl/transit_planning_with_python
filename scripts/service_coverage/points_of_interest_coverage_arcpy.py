@@ -21,8 +21,12 @@ from __future__ import annotations
 
 import logging
 import math
+import os
+import zipfile
+from collections.abc import Generator
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import IO, Dict, Iterable, List, Mapping, Optional, Tuple
 
 import arcpy
 import pandas as pd
@@ -33,7 +37,7 @@ import pandas as pd
 # === BEGIN CONFIG ===
 
 # Top-level directories
-GTFS_DIR = Path(r"Path\To\Your\GTFS_Data")  # folder containing GTFS .txt files
+GTFS_DIR = Path(r"Path\To\Your\GTFS_Data")  # GTFS feed folder or .zip
 # SHP_INPUT_DIR = Path(r"data/shapefiles")  # folder with .shp layers to test
 SHP_INPUT_DIR = Path(r"Path\To\Your\Shapefile_Data_Directory")  # folder with .shp layers to test
 OUTPUT_DIR = Path(r"Path\To\Your\Output_Folder")  # where CSVs and GDB output are written
@@ -150,11 +154,67 @@ def _log_available_shapefiles(shp_dir: Path, max_examples: int = 50) -> None:
 # =============================================================================
 
 
+@contextmanager
+def open_gtfs_file(
+    gtfs_path: str | os.PathLike[str], file_name: str
+) -> Generator[IO[bytes], None, None]:
+    """Open one GTFS text file from a feed folder or a ``.zip`` of the feed.
+
+    The counterpart of :func:`load_gtfs_data` for scripts that read a file with
+    their own options (``pandas.read_csv`` with ``usecols`` or
+    ``keep_default_na=False``, or the :mod:`csv` module), so they accept a
+    zipped feed without extracting it. Zip members are found the way
+    :func:`load_gtfs_data` finds them: at the archive root or inside a single
+    wrapper folder.
+
+    Args:
+        gtfs_path: Folder containing the GTFS feed, or a ``.zip`` archive of it.
+        file_name: GTFS file to open, e.g. ``"stops.txt"``.
+
+    Yields:
+        A binary file handle. ``pandas.read_csv`` reads it directly; wrap it in
+        :class:`io.TextIOWrapper` for the :mod:`csv` module.
+
+    Raises:
+        FileNotFoundError: *gtfs_path* does not exist, or the feed has no
+            *file_name*.
+        ValueError: *gtfs_path* is neither a directory nor a valid ``.zip``
+            file, or *file_name* is found in more than one place in the zip.
+    """
+    path = os.fspath(gtfs_path)
+    if os.path.isdir(path):
+        file_path = os.path.join(path, file_name)
+        if not os.path.isfile(file_path):
+            raise FileNotFoundError(f"Missing GTFS file in '{path}': {file_name}")
+        with open(file_path, "rb") as handle:
+            yield handle
+        return
+
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"The path '{path}' does not exist.")
+    if not (os.path.isfile(path) and path.lower().endswith(".zip")):
+        raise ValueError(f"'{path}' is neither a directory nor a .zip file.")
+    try:
+        archive = zipfile.ZipFile(path)
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"'{path}' is not a valid zip archive.") from exc
+    with archive:
+        matches = [name for name in archive.namelist() if os.path.basename(name) == file_name]
+        if not matches:
+            raise FileNotFoundError(f"Missing GTFS file in '{path}': {file_name}")
+        if len(matches) > 1:
+            raise ValueError(
+                f"Ambiguous GTFS file in '{path}' (found in multiple locations): {file_name}"
+            )
+        with archive.open(matches[0]) as handle:
+            yield handle
+
+
 def _load_gtfs_tables(gtfs_dir: Path) -> Mapping[str, pd.DataFrame]:
     """Load GTFS text files into pandas DataFrames.
 
     Args:
-        gtfs_dir: Directory containing GTFS .txt files.
+        gtfs_dir: GTFS feed folder, or a ``.zip`` of the feed.
 
     Returns:
         Mapping keyed by table name (without .txt) to DataFrame.
@@ -174,12 +234,10 @@ def _load_gtfs_tables(gtfs_dir: Path) -> Mapping[str, pd.DataFrame]:
     }
 
     for fn in required:
-        path = gtfs_dir / f"{fn}.txt"
-        if not path.exists():
-            raise FileNotFoundError(path)
-        df = pd.read_csv(path, dtype=id_dtypes)
+        with open_gtfs_file(gtfs_dir, f"{fn}.txt") as handle:
+            df = pd.read_csv(handle, dtype=id_dtypes)
         tables[fn] = df
-        _add_message(f"Loaded {path} ({len(df)} rows)", "INFO")
+        _add_message(f"Loaded {fn}.txt from {gtfs_dir} ({len(df)} rows)", "INFO")
 
     return tables
 
