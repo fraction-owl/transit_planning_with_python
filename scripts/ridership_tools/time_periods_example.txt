@@ -1,0 +1,19 @@
+# Example time periods for ridership_by_time_period.py.
+#
+# Copy this file, edit the copy, and point TIME_PERIODS_FILE (or
+# --time-periods-file) at it. One period per line:
+#
+#     NAME = HH:MM - HH:MM
+#
+# Times use the 24-hour clock; the start is inclusive and the end exclusive. An
+# end earlier than the start wraps past midnight, and 24:00 may be used as an
+# end. Together the periods must cover every minute of the day exactly once, or
+# the script stops and names each gap or overlap. Output rows follow the order
+# of the lines below. Blank lines and anything after "#" are ignored.
+
+Early AM = 04:00 - 06:00
+AM Peak  = 06:00 - 09:00
+Midday   = 09:00 - 15:00
+PM Peak  = 15:00 - 18:00
+Late PM  = 18:00 - 22:00
+Night    = 22:00 - 04:00
