@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import zipfile
 from pathlib import Path
 
 import geopandas as gpd
@@ -98,6 +99,24 @@ def test_load_gtfs_tables_accepts_feed_without_direction_id(tmp_path: Path) -> N
     _write_text_feed(tmp_path, "route_id,service_id,trip_id,shape_id\nR1,WK,T1,10\n")
     tables = target.load_gtfs_tables(tmp_path)
     assert list(tables["trips"]["direction_id"]) == ["<NA>"]
+
+
+def test_load_gtfs_tables_reads_zipped_feed_like_folder(tmp_path: Path) -> None:
+    feed = tmp_path / "feed"
+    feed.mkdir()
+    _write_text_feed(
+        feed, "route_id,service_id,trip_id,direction_id,shape_id\nR1,WK,T1,0,10\nR1,WK,T2,1,\n"
+    )
+    zip_path = tmp_path / "feed.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        for path in feed.iterdir():
+            zf.write(path, f"wrapper/{path.name}")
+
+    from_folder = target.load_gtfs_tables(feed)
+    from_zip = target.load_gtfs_tables(zip_path)
+    assert from_zip.keys() == from_folder.keys()
+    for key, frame in from_folder.items():
+        pd.testing.assert_frame_equal(from_zip[key], frame)
 
 
 def test_sanitize_token_makes_labels_filename_safe() -> None:

@@ -5,7 +5,8 @@ single GTFS feed using stop sequences only (no geometry).
 
 At a high level, the script:
 
-  - Loads stops.txt, trips.txt, and stop_times.txt from a GTFS directory.
+  - Loads stops.txt, trips.txt, and stop_times.txt from a GTFS folder or
+    ``.zip``.
   - For each (route_id, direction_id), selects the trip with the most distinct
     stops as the representative pattern (its stop sequence and its shape).
   - Builds ordered logical stop sequences using a configurable stop key
@@ -42,11 +43,15 @@ from __future__ import annotations
 
 import itertools
 import logging
+import os
 import re
+import zipfile
 from collections import Counter
+from collections.abc import Generator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, cast
+from typing import IO, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, cast
 
 import geopandas as gpd
 import matplotlib.pyplot as plt
@@ -62,7 +67,8 @@ from shapely.ops import substring
 # =============================================================================
 # === BEGIN CONFIG ===
 
-# Directory containing a single GTFS feed:
+# A single GTFS feed, as a folder or a .zip (files at the zip root or in one
+# wrapper folder), containing:
 #   - stops.txt
 #   - trips.txt
 #   - stop_times.txt
@@ -208,6 +214,62 @@ INTRA_ROUTE_COLUMNS: List[str] = [
 # =============================================================================
 
 
+@contextmanager
+def open_gtfs_file(
+    gtfs_path: str | os.PathLike[str], file_name: str
+) -> Generator[IO[bytes], None, None]:
+    """Open one GTFS text file from a feed folder or a ``.zip`` of the feed.
+
+    The counterpart of :func:`load_gtfs_data` for scripts that read a file with
+    their own options (``pandas.read_csv`` with ``usecols`` or
+    ``keep_default_na=False``, or the :mod:`csv` module), so they accept a
+    zipped feed without extracting it. Zip members are found the way
+    :func:`load_gtfs_data` finds them: at the archive root or inside a single
+    wrapper folder.
+
+    Args:
+        gtfs_path: Folder containing the GTFS feed, or a ``.zip`` archive of it.
+        file_name: GTFS file to open, e.g. ``"stops.txt"``.
+
+    Yields:
+        A binary file handle. ``pandas.read_csv`` reads it directly; wrap it in
+        :class:`io.TextIOWrapper` for the :mod:`csv` module.
+
+    Raises:
+        FileNotFoundError: *gtfs_path* does not exist, or the feed has no
+            *file_name*.
+        ValueError: *gtfs_path* is neither a directory nor a valid ``.zip``
+            file, or *file_name* is found in more than one place in the zip.
+    """
+    path = os.fspath(gtfs_path)
+    if os.path.isdir(path):
+        file_path = os.path.join(path, file_name)
+        if not os.path.isfile(file_path):
+            raise FileNotFoundError(f"Missing GTFS file in '{path}': {file_name}")
+        with open(file_path, "rb") as handle:
+            yield handle
+        return
+
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"The path '{path}' does not exist.")
+    if not (os.path.isfile(path) and path.lower().endswith(".zip")):
+        raise ValueError(f"'{path}' is neither a directory nor a .zip file.")
+    try:
+        archive = zipfile.ZipFile(path)
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"'{path}' is not a valid zip archive.") from exc
+    with archive:
+        matches = [name for name in archive.namelist() if os.path.basename(name) == file_name]
+        if not matches:
+            raise FileNotFoundError(f"Missing GTFS file in '{path}': {file_name}")
+        if len(matches) > 1:
+            raise ValueError(
+                f"Ambiguous GTFS file in '{path}' (found in multiple locations): {file_name}"
+            )
+        with archive.open(matches[0]) as handle:
+            yield handle
+
+
 def choose_representative_trip_ids_max_stops(
     trips_df: pd.DataFrame,
     stop_times_df: pd.DataFrame,
@@ -287,7 +349,7 @@ def normalize_direction_id(series: pd.Series) -> pd.Series:
 
 
 def load_gtfs_tables(gtfs_dir: Path) -> Dict[str, pd.DataFrame]:
-    """Load required GTFS tables from the specified directory.
+    """Load required GTFS tables from a feed folder or ``.zip``.
 
     Every column is read as text, so identifiers keep their exact spelling in
     every table ("001" stays "001", "10" never becomes "10.0", and "NA" is not
@@ -296,14 +358,15 @@ def load_gtfs_tables(gtfs_dir: Path) -> Dict[str, pd.DataFrame]:
     each route's trips are treated as a single direction.
 
     Args:
-        gtfs_dir: Directory containing GTFS CSV files.
+        gtfs_dir: GTFS feed folder, or a ``.zip`` of the feed.
 
     Returns:
         Dictionary mapping table name to DataFrame.
 
     Raises:
         FileNotFoundError: If required GTFS files are missing.
-        ValueError: If a file cannot be parsed as CSV.
+        ValueError: If a file cannot be parsed as CSV, or *gtfs_dir* is
+            neither a folder nor a valid ``.zip``.
     """
     required_files = {
         "stops": "stops.txt",
@@ -320,11 +383,12 @@ def load_gtfs_tables(gtfs_dir: Path) -> Dict[str, pd.DataFrame]:
 
     tables: Dict[str, pd.DataFrame] = {}
     for key, filename in required_files.items():
-        path = gtfs_dir / filename
-        if not path.exists():
-            msg = f"Required GTFS file not found: {path}"
-            raise FileNotFoundError(msg)
-        table = pd.read_csv(path, dtype=str, keep_default_na=False)
+        try:
+            with open_gtfs_file(gtfs_dir, filename) as handle:
+                table = pd.read_csv(handle, dtype=str, keep_default_na=False)
+        except FileNotFoundError as exc:
+            msg = f"Required GTFS file not found: {exc}"
+            raise FileNotFoundError(msg) from exc
         for column in numeric_fields.get(key, ()):
             if column in table.columns:
                 table[column] = pd.to_numeric(table[column], errors="coerce")
