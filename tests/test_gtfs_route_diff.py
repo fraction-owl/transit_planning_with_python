@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import zipfile
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -725,3 +726,29 @@ def test_correspondence_is_dataclass() -> None:
     # Guard the public type stays a frozen dataclass other tools can rely on.
     corr = Correspondence(matched=[], rekeyed={}, eliminated=[], added=[])
     assert corr.matched == []
+
+
+# ---------------------------------------------------------------------------
+# load_feed: zipped feeds
+# ---------------------------------------------------------------------------
+
+
+def test_load_feed_zipped_feed_matches_folder(tmp_path: Path) -> None:
+    folder = _REPLACEMENT_DAY / "before"
+    zipped = tmp_path / "before.zip"
+    with zipfile.ZipFile(zipped, "w") as zf:
+        for path in folder.iterdir():
+            zf.write(path, f"feed/{path.name}")
+    from_folder = load_feed(folder, label="before")
+    from_zip = load_feed(zipped, label="before")
+    assert from_zip.keys() == from_folder.keys()
+    for key, frame in from_folder.items():
+        pd.testing.assert_frame_equal(from_zip[key], frame)
+
+
+def test_load_feed_zip_missing_required_file_raises(tmp_path: Path) -> None:
+    zipped = tmp_path / "feed.zip"
+    with zipfile.ZipFile(zipped, "w") as zf:
+        zf.writestr("routes.txt", "route_id\nR1\n")
+    with pytest.raises(OSError, match="missing required GTFS files: trips.txt, stop_times.txt"):
+        load_feed(zipped, label="before")
