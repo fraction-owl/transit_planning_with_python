@@ -28,6 +28,9 @@ transit_planning_with_python/
 │   ├── lint_commit.py
 │   └── lint_pr.py
 ├── scripts/
+│   ├── conversion_tools/
+│   │   ├── convert_to_tides_stop_visits.py
+│   │   └── convert_to_tides_trips_performed.py
 │   ├── facilities_tools/
 │   │   ├── bay_change_sweep.py
 │   │   ├── bay_usage_analyzer.py
@@ -86,8 +89,6 @@ transit_planning_with_python/
 │   │   ├── uscensus_tiger_join_arcpy.py
 │   │   └── uscensus_tiger_join_gpd.py
 │   ├── operations_tools/
-│   │   ├── convert_to_tides_stop_visits.py
-│   │   ├── convert_to_tides_trips_performed.py
 │   │   ├── otp_by_route.py
 │   │   ├── otp_by_stop.py
 │   │   ├── otp_by_timepoint_from_avl.py
