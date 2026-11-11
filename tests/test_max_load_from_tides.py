@@ -70,7 +70,7 @@ def test_join_attributes_match_fixture_routes() -> None:
     sv = target.load_stop_visits(STOP_VISITS)
     tp = target.load_trips_performed(TRIPS_PERFORMED)
     joined = target.join_trip_attributes(target.compute_trip_max_load(sv), tp)
-    assert set(joined["route_id"].unique()) <= {"101", "202", "303"}
+    assert set(joined["route_id"].unique()) <= {"DC_R10", "DC_R20", "DC_R30"}
     assert joined["max_load"].notna().all()
 
 
