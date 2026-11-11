@@ -38,7 +38,7 @@ def test_join_brings_route_attributes() -> None:
         assert col in joined.columns
     # Every joined row should carry a route id (inner join on performed trips).
     assert joined["route_id"].notna().all()
-    assert set(joined["route_id"].unique()) <= {"101", "202", "303"}
+    assert set(joined["route_id"].unique()) <= {"DC_R10", "DC_R20", "DC_R30"}
 
 
 def test_compute_stop_deviations_sign() -> None:
@@ -189,7 +189,7 @@ def test_build_all_levels_and_long_table(scored: pd.DataFrame) -> None:
 
 def test_corridor_level_added_when_configured(scored: pd.DataFrame) -> None:
     """A corridor mapping introduces a corridor level pooling its routes."""
-    levels = target.build_all_levels(scored, corridors={"Downtown": ["101", "202"]})
+    levels = target.build_all_levels(scored, corridors={"Downtown": ["DC_R10", "DC_R20"]})
     assert "corridor" in levels
     long_table = target.make_long_table(levels)
     corr = long_table.loc[long_table["level"] == "corridor"]

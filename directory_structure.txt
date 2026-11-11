@@ -67,6 +67,7 @@ transit_planning_with_python/
 │   │   ├── pattern_map_exporter_gpd.py
 │   │   ├── route_stops_exporter.py
 │   │   ├── route_transfer_calculator.py
+│   │   ├── scheduled_service_hours.py
 │   │   ├── segment_speed_exporter.py
 │   │   ├── stop_pattern_exporter.py
 │   │   ├── time_band_exporter.py
@@ -98,7 +99,8 @@ transit_planning_with_python/
 │   │   ├── runtime_by_segment.py
 │   │   ├── runtime_by_trip.py
 │   │   ├── runtime_workflow.py
-│   │   └── trip_runtime_diagnostics_from_avl.py
+│   │   ├── trip_runtime_diagnostics_from_avl.py
+│   │   └── tsde_to_tods.py
 │   ├── ridership_tools/
 │   │   ├── data_request_by_stop_processor.py
 │   │   ├── district_ridership_share_arcpy.py
@@ -221,6 +223,7 @@ transit_planning_with_python/
 │   │   ├── md_wac_S000_JT00_2023.csv.gz
 │   │   ├── mock_cbd_dc.zip
 │   │   ├── mock_gtfs_dc.zip
+│   │   ├── mock_tods_dc.zip
 │   │   ├── ntd_monthly_multi_month.csv
 │   │   ├── output_road_shps_dc.zip
 │   │   ├── private_shuttles_sample.csv
@@ -277,6 +280,8 @@ transit_planning_with_python/
 │   ├── test_load_factor_monitor.py
 │   ├── test_load_gtfs_data.py
 │   ├── test_max_load_from_tides.py
+│   ├── test_mock_tides_dc.py
+│   ├── test_mock_tods_dc.py
 │   ├── test_monthly_ridership_model.py
 │   ├── test_network_helpers.py
 │   ├── test_ntd_anchor_builder.py
@@ -303,6 +308,7 @@ transit_planning_with_python/
 │   ├── test_runtime_by_route.py
 │   ├── test_runtime_by_segment.py
 │   ├── test_runtime_by_trip.py
+│   ├── test_scheduled_service_hours.py
 │   ├── test_school_coverage_by_route_gpd.py
 │   ├── test_schools_prep_join_gpd.py
 │   ├── test_segment_speed_exporter.py
@@ -321,6 +327,7 @@ transit_planning_with_python/
 │   ├── test_time_helpers.py
 │   ├── test_gtfs_timetable_exporter.py
 │   ├── test_trip_runtime_diagnostics_from_avl.py
+│   ├── test_tsde_to_tods.py
 │   ├── test_uscensus_table_build.py
 │   ├── test_uscensus_tiger_join_arcpy.py
 │   ├── test_uscensus_tiger_join_gpd.py

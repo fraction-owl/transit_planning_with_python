@@ -214,7 +214,8 @@ def test_build_trip_table_counts_reconcile(scored: pd.DataFrame) -> None:
     assert (table["early"] + table["on_time"] + table["late"] == table["evaluated"]).all()
     # Fixture trips repeat across dates via trip_id_scheduled.
     assert table["n_dates"].max() > 1
-    assert table["trip_id"].str.startswith("TRIP_").all()
+    # trip_id is the GTFS trip_id from tests/fixtures/mock_gtfs_dc.zip.
+    assert table["trip_id"].str.match(r"^DC_R\d+_(weekday|saturday|sunday)_\d{4}$").all()
     # Scheduled starts render as (possibly 24+) service-day clock strings.
     assert table["scheduled_start"].str.match(r"^\d{2}:\d{2}$").all()
     # Sorted by scheduled start within each day type.
@@ -236,12 +237,12 @@ def test_build_hourly_table_percentages_sum_to_100(scored: pd.DataFrame) -> None
 def test_build_day_type_table_summarizes(scored: pd.DataFrame) -> None:
     """The day-type summary carries dates/trips observed and OTP splits."""
     table = target.build_day_type_table(scored, list(target.DAY_TYPES))
-    # The fixtures contain weekday service only.
-    assert table["day_type"].tolist() == ["Weekday"]
-    row = table.iloc[0]
-    assert row["n_dates"] > 1
-    assert row["n_trips"] > 1
-    assert row["early"] + row["on_time"] + row["late"] == row["evaluated"]
+    # The fixtures sample weekday, Saturday and Sunday service.
+    assert table["day_type"].tolist() == ["Weekday", "Saturday", "Sunday"]
+    for _, row in table.iterrows():
+        assert row["n_dates"] > 1
+        assert row["n_trips"] > 1
+        assert row["early"] + row["on_time"] + row["late"] == row["evaluated"]
 
 
 def test_build_trip_table_blanks_start_outside_the_service_day() -> None:
@@ -275,11 +276,11 @@ def test_run_respects_route_filter(tmp_path: Path) -> None:
         output_dir=tmp_path,
         trips_performed_path=TRIPS_PERFORMED,
         day_types=target.normalize_day_types(target.DAY_TYPES),
-        routes_to_include=("101",),
+        routes_to_include=("DC_R10",),
         make_plots=False,
     )
     tables = target.run(cfg)
-    assert set(tables["trip"]["route_id"].unique()) == {"101"}
+    assert set(tables["trip"]["route_id"].unique()) == {"DC_R10"}
 
 
 def test_run_writes_tables_charts_and_runlog(tmp_path: Path) -> None:

@@ -30,7 +30,7 @@ def test_join_adds_route_and_trip_key(joined: pd.DataFrame) -> None:
     for col in ("route_id", "trip_key", "actual_runtime_min"):
         assert col in joined.columns
     assert (joined["actual_runtime_min"] > 0).all()
-    assert set(joined["route_id"].unique()) <= {"101", "202", "303"}
+    assert set(joined["route_id"].unique()) <= {"DC_R10", "DC_R20", "DC_R30"}
 
 
 def test_runtimes_are_per_service_date_for_a_reused_trip_id() -> None:

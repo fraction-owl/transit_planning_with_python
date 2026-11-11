@@ -23,6 +23,19 @@ Route archetypes per region (five routes each):
 Fares (FARE_ATTRIBUTES): routes 10, 30 and 40 take the LOCAL fare, route 20
 the EXPRESS fare and route 50H the FREE fare, one fare_rules row per route.
 
+Blocks chain trips on one route and service. A trip joins a block only if the
+bus can deadhead from where it is to the trip's first stop
+(DEADHEAD_SPEED_MPH, DEADHEAD_DETOUR_FACTOR) and still take its layover.
+
+TODS
+----
+With WRITE_TODS, the base feed also gets TODS 2.1 supplement files describing
+the same blocks' nonrevenue movements (routes_, stops_, trips_ and
+stop_times_supplement.txt): a pull-out from the garage nearest each block's
+first stop, a pull-back to that garage, and an interlining deadhead wherever a
+bus ends a trip somewhere other than where its next trip starts. Every row is
+new, so applying the supplements to the base feed only adds data.
+
 Feed archive
 ------------
 Each region also gets dated copies of its feed (ARCHIVE_EDITIONS), one per
@@ -55,11 +68,14 @@ Outputs:
       .txt files listed above.
     - One archive folder per region under OUTPUT_DIR (dc_archive/), holding
       one dated feed sub-folder per ARCHIVE_EDITIONS entry (dc_2024/, ...).
+    - With WRITE_TODS, one TODS folder per region under OUTPUT_DIR (dc_tods/)
+      holding the four supplement files for the base feed.
 """
 
 from __future__ import annotations
 
 import csv
+import datetime
 import logging
 import math
 from dataclasses import dataclass, field, replace
@@ -90,6 +106,19 @@ MAX_BLOCK_HOURS = 8.0
 # Layover (recovery) time inserted between trips chained into the same block.
 BLOCK_LAYOVER_MINUTES = 5
 
+# Nonrevenue (deadhead) travel: average speed, and a detour factor applied to the
+# straight-line distance to approximate the street path. A trip joins a block
+# only if the bus can deadhead from the block's last stop to the trip's first
+# stop and still take its layover; the same timing drives the mock TODS
+# pull-outs, pull-backs and interlining deadheads. Durations round up to minutes.
+DEADHEAD_SPEED_MPH = 20.0
+DEADHEAD_DETOUR_FACTOR = 1.3
+
+# Also write TODS supplement files (garages, pull-outs, pull-backs, interlining
+# deadheads) for the base feed to OUTPUT_DIR/<region>_tods/
+# (tests/fixtures/mock_tods_dc.zip). The archive editions get no TODS copy.
+WRITE_TODS = True
+
 # Feed-wide service window (calendar.txt start/end dates) and feed publisher info.
 FEED_START_DATE = "20260101"
 FEED_END_DATE = "20261231"
@@ -101,7 +130,13 @@ FEED_LANG = "en"
 # (b) remove those dates from the regular "weekday" service via calendar_dates.txt.
 HOLIDAYS = (
     "20260101",  # New Year's Day
+    "20261111",  # Veterans Day
     "20261225",  # Christmas Day
+)
+# Holidays on the nth weekday of a month, as (month, weekday with Monday = 0, n).
+# Each edition gets the date the rule gives in its own year; used as HOLIDAYS is.
+FLOATING_HOLIDAYS = (
+    (11, 3, 4),  # Thanksgiving Day: fourth Thursday in November
 )
 
 # Fares (GTFS-Fares v1), written to fare_attributes.txt. Each RouteSpec names one
@@ -203,6 +238,9 @@ class Region:
             used to derive the bounding box. ``None`` falls back to
             ``default_bbox``.
         default_bbox: Fallback bbox as ``(min_lon, min_lat, max_lon, max_lat)``.
+        garages: Bus garages for the mock TODS files, as
+            ``(key, name, lat, lon)``. Each block pulls out from, and back to,
+            the garage nearest its first stop.
     """
 
     key: str
@@ -212,6 +250,7 @@ class Region:
     agency_timezone: str
     fixture_path: Optional[Path]
     default_bbox: Tuple[float, float, float, float]
+    garages: Tuple[Tuple[str, str, float, float], ...] = ()
 
 
 REGIONS: Tuple[Region, ...] = (
@@ -223,6 +262,10 @@ REGIONS: Tuple[Region, ...] = (
         agency_timezone="America/New_York",
         fixture_path=DC_FIXTURE_PATH,
         default_bbox=DEFAULT_BBOX_DC,
+        garages=(
+            ("N", "Mock DC North Garage", 38.960, -77.030),
+            ("S", "Mock DC South Garage", 38.830, -76.990),
+        ),
     ),
 )
 
@@ -356,7 +399,7 @@ class FeedEdition:
         year: Calendar year the feed covers. FEED_START_DATE, FEED_END_DATE,
             FEED_VERSION and HOLIDAYS are moved by the number of years between
             FEED_START_DATE's year and this one, so HOLIDAYS should hold
-            fixed-date holidays only.
+            fixed-date holidays only (FLOATING_HOLIDAYS holds the rest).
         fares: The fare_attributes.txt rows.
         route_fares: Route short_name -> fare_id, overriding ``RouteSpec.fare_id``.
         sunday_service: When False, the feed has no "sunday" service and every
@@ -661,7 +704,12 @@ def _build_calendar_rows(edition: FeedEdition) -> List[Dict[str, str]]:
 def _build_calendar_dates_rows(edition: FeedEdition) -> List[Dict[str, str]]:
     """Return calendar_dates.txt rows turning weekday service off and holiday on."""
     rows: List[Dict[str, str]] = []
-    for date in (_shift_years(holiday, edition) for holiday in HOLIDAYS):
+    dates = [_shift_years(holiday, edition) for holiday in HOLIDAYS]
+    for month, weekday, n in FLOATING_HOLIDAYS:
+        first = datetime.date(edition.year, month, 1)
+        day = 1 + (weekday - first.weekday()) % 7 + 7 * (n - 1)
+        dates.append(f"{edition.year:04d}{month:02d}{day:02d}")
+    for date in sorted(dates):
         rows.append({"service_id": "weekday", "date": date, "exception_type": "2"})
         rows.append({"service_id": "holiday", "date": date, "exception_type": "1"})
     return rows
@@ -825,22 +873,38 @@ def _headsign_for(spec: RouteSpec, direction_id: int) -> str:
 # ==================================================================================================
 
 
-def _assign_blocks(trips: List[TripPlan]) -> None:
+def _deadhead_seconds(origin: Tuple[float, float], destination: Tuple[float, float]) -> int:
+    """Return the scheduled deadhead time between two (lat, lon) points.
+
+    The straight-line distance is stretched by DEADHEAD_DETOUR_FACTOR, driven at
+    DEADHEAD_SPEED_MPH and rounded up to a whole minute; coincident points take 0.
+    """
+    meters = _haversine_m(origin[0], origin[1], destination[0], destination[1])
+    hours = meters * DEADHEAD_DETOUR_FACTOR / METERS_PER_MILE / DEADHEAD_SPEED_MPH
+    return math.ceil(hours * 60) * 60
+
+
+def _assign_blocks(trips: List[TripPlan], stop_coords: Dict[str, Tuple[float, float]]) -> None:
     """Assign block_ids in place, chaining trips on the same route+service.
 
     Algorithm (interval scheduling):
         - Group by (route_id, service_id) — a vehicle stays on its route.
         - Within each group, walk trips in start-time order.
         - Maintain a pool of currently-open blocks (each with its first
-          trip's start time and its most recent trip's end time).
+          trip's start time, its most recent trip's end time and last stop).
         - For each new trip, pick the open block whose most recent trip
           ended earliest, provided that block can still accept this trip
-          while honoring the layover and the MAX_BLOCK_HOURS cap.
+          while honoring the deadhead to the trip's first stop, the layover
+          and the MAX_BLOCK_HOURS cap.
         - Otherwise, open a new block for the trip.
 
-    This produces realistic block chaining: a single bus runs trip → layover →
-    next available trip in the same service, accumulating revenue hours up
-    to the policy cap.
+    This produces realistic block chaining: a single bus runs trip → (deadhead)
+    → layover → next reachable trip in the same service, accumulating revenue
+    hours up to the policy cap.
+
+    Args:
+        trips: Trips to chain; ``block_id`` is set on each.
+        stop_coords: ``stop_id`` -> ``(lat, lon)`` for every stop the trips visit.
     """
     max_block_seconds = int(MAX_BLOCK_HOURS * 3600)
     layover_seconds = BLOCK_LAYOVER_MINUTES * 60
@@ -852,17 +916,19 @@ def _assign_blocks(trips: List[TripPlan]) -> None:
     for (route_id, service_id), group in groups.items():
         group.sort(key=lambda t: t.start_seconds)
 
-        # Open blocks for this group: each entry is [block_id, start_s, end_s].
+        # Open blocks for this group: each entry is [block_id, start_s, end_s, last_stop].
         open_blocks: List[List] = []
         next_block_idx = 1
 
         for trip in group:
+            first_stop = trip.stop_visits[0][0]
             # Find the open block with the earliest end time that can still
-            # accept this trip without violating layover or duration limits.
+            # accept this trip without violating deadhead, layover or duration limits.
             best_idx: Optional[int] = None
             best_end = math.inf
-            for i, (_bid, bstart, bend) in enumerate(open_blocks):
-                if trip.start_seconds < bend + layover_seconds:
+            for i, (_bid, bstart, bend, last_stop) in enumerate(open_blocks):
+                deadhead = _deadhead_seconds(stop_coords[last_stop], stop_coords[first_stop])
+                if trip.start_seconds < bend + deadhead + layover_seconds:
                     continue
                 if trip.end_seconds - bstart > max_block_seconds:
                     continue
@@ -870,14 +936,15 @@ def _assign_blocks(trips: List[TripPlan]) -> None:
                     best_end = bend
                     best_idx = i
 
+            last_stop = trip.stop_visits[-1][0]
             if best_idx is not None:
-                bid, bstart, _bend = open_blocks[best_idx]
                 open_blocks[best_idx][2] = trip.end_seconds
-                trip.block_id = bid
+                open_blocks[best_idx][3] = last_stop
+                trip.block_id = open_blocks[best_idx][0]
             else:
                 bid = f"{route_id}_{service_id}_BLK{next_block_idx:03d}"
                 next_block_idx += 1
-                open_blocks.append([bid, trip.start_seconds, trip.end_seconds])
+                open_blocks.append([bid, trip.start_seconds, trip.end_seconds, last_stop])
                 trip.block_id = bid
 
 
@@ -1156,14 +1223,185 @@ def _write_trips_and_stop_times(trips: Sequence[TripPlan], out_dir: Path) -> Non
 
 
 # ==================================================================================================
+# TODS (SCHEDULED NONREVENUE OPERATIONS)
+# ==================================================================================================
+
+# Column order for each TODS supplement file; matches tsde_to_tods.py's output.
+TODS_FIELDS: Dict[str, Tuple[str, ...]] = {
+    "routes_supplement.txt": ("route_id", "agency_id", "route_long_name", "route_type"),
+    "stops_supplement.txt": (
+        "stop_id",
+        "stop_name",
+        "stop_lat",
+        "stop_lon",
+        "location_type",
+        "TODS_location_type",
+    ),
+    "trips_supplement.txt": ("route_id", "service_id", "trip_id", "block_id", "TODS_trip_type"),
+    "stop_times_supplement.txt": (
+        "trip_id",
+        "arrival_time",
+        "departure_time",
+        "stop_id",
+        "stop_sequence",
+        "pickup_type",
+        "drop_off_type",
+        "timepoint",
+    ),
+}
+
+
+def build_tods_rows(
+    region: Region,
+    trips: Sequence[TripPlan],
+    stop_coords: Dict[str, Tuple[float, float]],
+) -> Dict[str, List[Dict[str, str]]]:
+    """Return TODS supplement rows for every block in *trips*.
+
+    Each block gets a pull-out from the garage nearest its first stop, a
+    pull-back to the same garage, and a deadhead wherever one trip ends at a
+    different place from where the next begins. Deadheads leave as soon as the
+    previous trip arrives; the layover is taken at the destination. Every row
+    is new (no GTFS primary key is reused), so the supplements only add data.
+
+    Args:
+        region: The region, which supplies the agency and garages.
+        trips: Trips with ``block_id`` assigned by ``_assign_blocks``.
+        stop_coords: ``stop_id`` -> ``(lat, lon)``, the same coordinates the
+            block assignment used.
+
+    Returns:
+        Rows per TODS file name, with the columns in ``TODS_FIELDS``.
+
+    Raises:
+        ValueError: If the region has no garages.
+    """
+    if not region.garages:
+        raise ValueError(f"Region {region.key} has no garages for the TODS files.")
+    prefix = region.key.upper()
+    route_id = f"{prefix}_NONREVENUE"
+    garages = {f"{prefix}_GARAGE_{key}": (lat, lon) for key, _name, lat, lon in region.garages}
+    coords = {**stop_coords, **garages}
+
+    blocks: Dict[Tuple[str, str], List[TripPlan]] = {}
+    for trip in trips:
+        blocks.setdefault((trip.service_id, trip.block_id), []).append(trip)
+
+    trip_rows: List[Dict[str, str]] = []
+    time_rows: List[Dict[str, str]] = []
+
+    def add(
+        trip_id: str, kind: str, block: Tuple[str, str], legs: Tuple[Tuple[str, int], ...]
+    ) -> None:
+        trip_rows.append(
+            {
+                "route_id": route_id,
+                "service_id": block[0],
+                "trip_id": trip_id,
+                "block_id": block[1],
+                "TODS_trip_type": kind,
+            }
+        )
+        for seq, (stop_id, seconds) in enumerate(legs, start=1):
+            clock = _seconds_to_hhmmss(seconds)
+            time_rows.append(
+                {
+                    "trip_id": trip_id,
+                    "arrival_time": clock,
+                    "departure_time": clock,
+                    "stop_id": stop_id,
+                    "stop_sequence": str(seq),
+                    "pickup_type": "1",
+                    "drop_off_type": "1",
+                    "timepoint": "1",
+                }
+            )
+
+    for block in sorted(blocks):
+        chain = sorted(blocks[block], key=lambda t: t.start_seconds)
+        first_stop, last_stop = chain[0].stop_visits[0][0], chain[-1].stop_visits[-1][0]
+        garage = min(
+            garages, key=lambda g: _haversine_m(*coords[g], *coords[first_stop])
+        )  # Ties go to the first garage listed.
+        pull_out = _deadhead_seconds(coords[garage], coords[first_stop])
+        add(
+            f"{block[1]}_PO",
+            "pull-out",
+            block,
+            ((garage, chain[0].start_seconds - pull_out), (first_stop, chain[0].start_seconds)),
+        )
+        n_deadheads = 0
+        for before, after in zip(chain, chain[1:]):
+            origin, destination = before.stop_visits[-1][0], after.stop_visits[0][0]
+            seconds = _deadhead_seconds(coords[origin], coords[destination])
+            if origin == destination or seconds == 0:
+                continue  # Same place: the gap is layover, not a movement.
+            n_deadheads += 1
+            add(
+                f"{block[1]}_DH{n_deadheads:02d}",
+                "deadhead",
+                block,
+                ((origin, before.end_seconds), (destination, before.end_seconds + seconds)),
+            )
+        pull_back = _deadhead_seconds(coords[last_stop], coords[garage])
+        end = chain[-1].end_seconds
+        add(f"{block[1]}_PB", "pull-back", block, ((last_stop, end), (garage, end + pull_back)))
+
+    used = {row["stop_id"] for row in time_rows}
+    return {
+        "routes_supplement.txt": [
+            {
+                "route_id": route_id,
+                "agency_id": region.agency_id,
+                "route_long_name": "Nonrevenue movements",
+                "route_type": "3",
+            }
+        ],
+        "stops_supplement.txt": [
+            {
+                "stop_id": f"{prefix}_GARAGE_{key}",
+                "stop_name": name,
+                "stop_lat": f"{lat:.6f}",
+                "stop_lon": f"{lon:.6f}",
+                "location_type": "0",
+                "TODS_location_type": "garage",
+            }
+            for key, name, lat, lon in region.garages
+            if f"{prefix}_GARAGE_{key}" in used
+        ],
+        "trips_supplement.txt": trip_rows,
+        "stop_times_supplement.txt": time_rows,
+    }
+
+
+def _write_tods(
+    region: Region,
+    trips: Sequence[TripPlan],
+    stop_coords: Dict[str, Tuple[float, float]],
+    tods_dir: Path,
+) -> Dict[str, int]:
+    """Write the TODS supplement files into *tods_dir* and return row counts."""
+    tables = build_tods_rows(region, trips, stop_coords)
+    for name, rows in tables.items():
+        _write_csv(tods_dir / name, TODS_FIELDS[name], rows)
+    return {name: len(rows) for name, rows in tables.items()}
+
+
+# ==================================================================================================
 # REGION ASSEMBLY
 # ==================================================================================================
 
 
 def _build_region_feed(
-    region: Region, region_dir: Path, edition: FeedEdition = BASE_EDITION
+    region: Region,
+    region_dir: Path,
+    edition: FeedEdition = BASE_EDITION,
+    tods_dir: Optional[Path] = None,
 ) -> None:
-    """Build and write one edition of a region's GTFS feed into ``region_dir``."""
+    """Build and write one edition of a region's GTFS feed into ``region_dir``.
+
+    When ``tods_dir`` is given, the matching TODS supplement files go there.
+    """
     import json  # noqa: PLC0415
 
     import generate_mock_roads as roads  # noqa: PLC0415 — couples geometry to the road network
@@ -1217,14 +1455,21 @@ def _build_region_feed(
         trips = _materialize_trips(region.key, spec, stops, shape_length_m)
         all_trips.extend(trips)
 
-    _assign_blocks(all_trips)
-
     # Decorate stops against the road network: road-derived names, a lateral nudge
     # off the roadbed, and deterministic typo/conflict positives. The manifest
     # documents the expected positives for the downstream data-quality checkers.
     stop_meta, manifest = roads.decorate_stops(
         region.key, stops_by_route, roads.route_corridor_keys_for_region(region.key)
     )
+
+    # Chain blocks on the published (nudged) coordinates, so deadhead times
+    # can be checked against stops.txt.
+    stop_coords: Dict[str, Tuple[float, float]] = {}
+    for stops in stops_by_route.values():
+        for stop_id, lat, lon, _dist in stops:
+            meta = stop_meta.get(stop_id)
+            stop_coords[stop_id] = (meta[0], meta[1]) if meta is not None else (lat, lon)
+    _assign_blocks(all_trips, stop_coords)
 
     # Write all GTFS tables.
     _write_agency(region, region_dir)
@@ -1253,6 +1498,15 @@ def _build_region_feed(
         len(manifest["conflicts"]),
         region_dir,
     )
+
+    if tods_dir is not None:
+        counts = _write_tods(region, all_trips, stop_coords, tods_dir)
+        logging.info(
+            "  wrote TODS for %d blocks (%d nonrevenue trips) to %s",
+            len({(t.service_id, t.block_id) for t in all_trips}),
+            counts["trips_supplement.txt"],
+            tods_dir,
+        )
 
 
 def _build_loop_stops_with_shared_east_leg(
@@ -1344,7 +1598,8 @@ def main() -> None:
     try:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         for region in REGIONS:
-            _build_region_feed(region, OUTPUT_DIR / region.key)
+            tods_dir = OUTPUT_DIR / f"{region.key}_tods" if WRITE_TODS else None
+            _build_region_feed(region, OUTPUT_DIR / region.key, tods_dir=tods_dir)
             archive_dir = OUTPUT_DIR / f"{region.key}_archive"
             for edition in ARCHIVE_EDITIONS:
                 _build_region_feed(region, archive_dir / f"{region.key}_{edition.year}", edition)
