@@ -1,8 +1,9 @@
 """Join ridership data to bus stop features, optionally with a spatial join to polygon areas.
 
 Designed for ArcGIS Pro workflows, this script merges stop-level ridership data from
-an Excel file with stop locations (from a shapefile or GTFS stops.txt), and optionally
-joins to a polygon layer (e.g., Census Blocks) for geographic aggregation.
+an Excel file with stop locations (from a shapefile or GTFS stops.txt, in a feed folder
+or .zip), and optionally joins to a polygon layer (e.g., Census Blocks) for geographic
+aggregation.
 
 Outputs:
     Shapefiles land in OUTPUT_FOLDER/shapefiles/; CSVs and the run log stay at the
@@ -23,21 +24,29 @@ Outputs:
       from GTFS shapes (when DRAW_PLOTS is True).
     - stops_ridership_joiner_arcpy_runlog.txt: run-log sidecar capturing the
       verbatim CONFIGURATION block.
+    - stops_from_zip_tmp.txt: a working copy of stops.txt for ArcPy to read
+      (when BUS_STOPS_INPUT is a GTFS .zip).
 
 Typical usage:
     Configure paths and options at the top of the script, then run inside ArcGIS Pro
     or as a standalone Python script with access to the ArcPy environment.
 """
 
+from __future__ import annotations
+
 import csv
 import datetime as _dt  # aliased: notebooks often rebind 'datetime' to the module
 import logging
 import math
 import os
+import shutil
 import sys
 import time
+import zipfile
+from collections.abc import Generator
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple
+from typing import IO, Callable, List, Optional, Tuple
 
 import arcpy
 import pandas as pd
@@ -62,10 +71,11 @@ CONFIG_END_MARKER: str = "# === END CONFIG ==="
 # === BEGIN CONFIG ===
 
 # INPUTS --------------------------------------------------------------------
-# Bus stops can be a GTFS feed FOLDER, a GTFS stops.txt, or a .shp.
-# For plotting (DRAW_PLOTS), point this at a GTFS feed FOLDER so that
-# shapes.txt, trips.txt, routes.txt and stops.txt can all be read from it.
-BUS_STOPS_INPUT = r"Your\File\Path\To\GTFS_folder"  # folder, stops.txt, or .shp
+# Bus stops can be a GTFS feed FOLDER or .zip, a GTFS stops.txt, or a .shp
+# (unzipped; a .zip is always read as a GTFS feed). For plotting (DRAW_PLOTS),
+# point this at a GTFS feed FOLDER or .zip so that shapes.txt, trips.txt,
+# routes.txt and stops.txt can all be read from it.
+BUS_STOPS_INPUT = r"Your\File\Path\To\GTFS_folder"  # folder, .zip, stops.txt, or .shp
 
 # Path to Excel with ridership data.
 EXCEL_FILE = r"Your\File\Path\To\STOP_USAGE_(BY_STOP_ID).XLSX"
@@ -116,7 +126,7 @@ POLYGON_FIELDS_TO_KEEP = ["NAME", "GEOID", "GEOIDFQ"]  # Must include the join f
 
 # PLOTTING ------------------------------------------------------------------
 # Master switch for per-route boardings/alightings maps. Requires BUS_STOPS_INPUT
-# to resolve to a GTFS feed folder (for shapes.txt / trips.txt / routes.txt).
+# to resolve to a GTFS feed folder or .zip (for shapes.txt / trips.txt / routes.txt).
 DRAW_PLOTS: bool = False
 
 # Ridership color bins: (lower_inclusive, upper_exclusive, color, legend_label).
@@ -164,8 +174,8 @@ ROUTE_DEFAULT_COLOR: str = "0.4"
 ROUTE_LINEWIDTH: float = 1.2
 
 # ENVIRONMENT & FLAGS ------------------------------------------------------
-# A folder or a .txt is treated as GTFS input; anything else (e.g. .shp) is not.
-IS_GTFS_INPUT = os.path.isdir(BUS_STOPS_INPUT) or BUS_STOPS_INPUT.lower().endswith(".txt")
+# A folder, .zip or .txt is treated as GTFS input; anything else (e.g. .shp) is not.
+IS_GTFS_INPUT = os.path.isdir(BUS_STOPS_INPUT) or BUS_STOPS_INPUT.lower().endswith((".txt", ".zip"))
 arcpy.env.overwriteOutput = True
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
@@ -196,13 +206,69 @@ _PLACEHOLDER_PATHS: dict[str, str] = {
 # =============================================================================
 
 
-def resolve_gtfs_dir(bus_stops_input: str) -> Optional[str]:
-    """Return the GTFS feed folder implied by *bus_stops_input*, or None.
+@contextmanager
+def open_gtfs_file(
+    gtfs_path: str | os.PathLike[str], file_name: str
+) -> Generator[IO[bytes], None, None]:
+    """Open one GTFS text file from a feed folder or a ``.zip`` of the feed.
 
-    A directory is returned as-is; a stops.txt path returns its parent folder;
-    a shapefile (or anything else) returns None.
+    The counterpart of :func:`load_gtfs_data` for scripts that read a file with
+    their own options (``pandas.read_csv`` with ``usecols`` or
+    ``keep_default_na=False``, or the :mod:`csv` module), so they accept a
+    zipped feed without extracting it. Zip members are found the way
+    :func:`load_gtfs_data` finds them: at the archive root or inside a single
+    wrapper folder.
+
+    Args:
+        gtfs_path: Folder containing the GTFS feed, or a ``.zip`` archive of it.
+        file_name: GTFS file to open, e.g. ``"stops.txt"``.
+
+    Yields:
+        A binary file handle. ``pandas.read_csv`` reads it directly; wrap it in
+        :class:`io.TextIOWrapper` for the :mod:`csv` module.
+
+    Raises:
+        FileNotFoundError: *gtfs_path* does not exist, or the feed has no
+            *file_name*.
+        ValueError: *gtfs_path* is neither a directory nor a valid ``.zip``
+            file, or *file_name* is found in more than one place in the zip.
     """
-    if os.path.isdir(bus_stops_input):
+    path = os.fspath(gtfs_path)
+    if os.path.isdir(path):
+        file_path = os.path.join(path, file_name)
+        if not os.path.isfile(file_path):
+            raise FileNotFoundError(f"Missing GTFS file in '{path}': {file_name}")
+        with open(file_path, "rb") as handle:
+            yield handle
+        return
+
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"The path '{path}' does not exist.")
+    if not (os.path.isfile(path) and path.lower().endswith(".zip")):
+        raise ValueError(f"'{path}' is neither a directory nor a .zip file.")
+    try:
+        archive = zipfile.ZipFile(path)
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"'{path}' is not a valid zip archive.") from exc
+    with archive:
+        matches = [name for name in archive.namelist() if os.path.basename(name) == file_name]
+        if not matches:
+            raise FileNotFoundError(f"Missing GTFS file in '{path}': {file_name}")
+        if len(matches) > 1:
+            raise ValueError(
+                f"Ambiguous GTFS file in '{path}' (found in multiple locations): {file_name}"
+            )
+        with archive.open(matches[0]) as handle:
+            yield handle
+
+
+def resolve_gtfs_dir(bus_stops_input: str) -> Optional[str]:
+    """Return the GTFS feed (folder or .zip) implied by *bus_stops_input*, or None.
+
+    A directory or a .zip is returned as-is; a stops.txt path returns its
+    parent folder; a shapefile (or anything else) returns None.
+    """
+    if os.path.isdir(bus_stops_input) or bus_stops_input.lower().endswith(".zip"):
         return bus_stops_input
     if bus_stops_input.lower().endswith(".txt"):
         return os.path.dirname(bus_stops_input)
@@ -212,11 +278,19 @@ def resolve_gtfs_dir(bus_stops_input: str) -> Optional[str]:
 def resolve_stops_table(bus_stops_input: str) -> str:
     """Return the GTFS stops table path used by XYTableToPoint.
 
-    If *bus_stops_input* is a folder, its stops.txt is used; otherwise the
-    input is returned unchanged.
+    If *bus_stops_input* is a folder, its stops.txt is used. XYTableToPoint
+    cannot read inside a zip, so a .zip's stops.txt is copied to
+    ``stops_from_zip_tmp.txt`` in OUTPUT_FOLDER and that copy is used.
+    Otherwise the input is returned unchanged.
     """
     if os.path.isdir(bus_stops_input):
         return os.path.join(bus_stops_input, "stops.txt")
+    if bus_stops_input.lower().endswith(".zip"):
+        os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+        tmp_txt = os.path.join(OUTPUT_FOLDER, "stops_from_zip_tmp.txt")
+        with open_gtfs_file(bus_stops_input, "stops.txt") as handle, open(tmp_txt, "wb") as out:
+            shutil.copyfileobj(handle, out)
+        return tmp_txt
     return bus_stops_input
 
 
@@ -794,12 +868,17 @@ def normalize_route_name(name: object) -> str:
 
 
 def _read_gtfs_table(gtfs_dir: str, filename: str, required_cols: List[str]) -> pd.DataFrame:
-    """Read a GTFS table as strings; fail loud if the file or a column is missing."""
+    """Read a GTFS table as strings; fail loud if the file or a column is missing.
+
+    *gtfs_dir* is a GTFS feed folder or ``.zip``.
+    """
     path = os.path.join(gtfs_dir, filename)
-    if not os.path.isfile(path):
+    try:
+        with open_gtfs_file(gtfs_dir, filename) as handle:
+            df = pd.read_csv(handle, dtype=str)
+    except FileNotFoundError:
         logging.error("Required GTFS file not found: %s", path)
         sys.exit(1)
-    df = pd.read_csv(path, dtype=str)
     missing = [c for c in required_cols if c not in df.columns]
     if missing:
         logging.error("GTFS file '%s' is missing columns: %s", path, missing)
@@ -1107,15 +1186,15 @@ def plot_route_ridership(
 def generate_route_plots() -> None:
     """Render per-route boardings and alightings maps from GTFS shapes.
 
-    Fails loud (sys.exit(1)) if BUS_STOPS_INPUT is not a GTFS folder/stops.txt or
+    Fails loud (sys.exit(1)) if BUS_STOPS_INPUT is not a GTFS folder/.zip/stops.txt or
     if a required GTFS file is missing. Routes with no matching shape or no matching
     stop coordinates are skipped and reported, not silently dropped.
     """
     gtfs_dir = resolve_gtfs_dir(BUS_STOPS_INPUT)
     if gtfs_dir is None:
         logging.error(
-            "DRAW_PLOTS is True but BUS_STOPS_INPUT is not a GTFS folder or stops.txt. "
-            "Point BUS_STOPS_INPUT at a GTFS feed folder to enable plotting."
+            "DRAW_PLOTS is True but BUS_STOPS_INPUT is not a GTFS folder, .zip or stops.txt. "
+            "Point BUS_STOPS_INPUT at a GTFS feed folder or .zip to enable plotting."
         )
         sys.exit(1)
 
