@@ -276,11 +276,14 @@ def test_gtfs_calendar_periods_follow_the_feed(mock_tables: dict[str, pd.DataFra
     services = mock_tables["service"].set_index("service_id")
     periods = mock_tables["period"].set_index("period")
     nov = periods.loc["Nov"]
-    assert (nov["weekdays"], nov["saturdays"], nov["sundays"], nov["holidays"]) == (21, 4, 5, 0)
+    # calendar_dates swaps Veterans Day (Wed 11/11) and Thanksgiving (Thu 11/26)
+    # from weekday to holiday service.
+    assert (nov["weekdays"], nov["saturdays"], nov["sundays"], nov["holidays"]) == (19, 4, 5, 2)
     expected = (
-        21 * services.loc["weekday", "vehicle_hours"]
+        19 * services.loc["weekday", "vehicle_hours"]
         + 4 * services.loc["saturday", "vehicle_hours"]
         + 5 * services.loc["sunday", "vehicle_hours"]
+        + 2 * services.loc["holiday", "vehicle_hours"]
     )
     assert nov["vehicle_hours"] == pytest.approx(expected, abs=0.1)
     # 2026-01-01 runs holiday service only (calendar_dates removes weekday service).
