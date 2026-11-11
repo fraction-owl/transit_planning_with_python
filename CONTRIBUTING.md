@@ -202,7 +202,7 @@ Guidelines:
 ## 📁 File Organization
 
 - Add new scripts to the appropriate subfolder within `scripts/`, based on function (e.g., `ridership_tools/`, `gtfs_exports/`).
-  - Scripts that convert a vendor export into an open standard (GTFS, TIDES, TODS) go in `conversion_tools/`. A converter maps the vendor's columns onto the standard's schema and keeps the source's row grain. A script that rolls standard data up to a coarser grain (by month, time period, route, and so on) is analysis, so it goes in the folder for its task, e.g. `ridership_from_tides.py` in `ridership_tools/`.
+  - Scripts that convert a vendor export into an open standard (GTFS, GBFS, TIDES, TODS) go in `conversion_tools/`. A converter maps the vendor's columns onto the standard's schema and keeps the source's row grain. A script that rolls standard data up to a coarser grain (by month, time period, route, and so on) is analysis, so it goes in the folder for its task, e.g. `ridership_from_tides.py` in `ridership_tools/`.
 - If you create a helper that’s reused across multiple scripts:
   - Add the canonical version to the appropriate file under `utils/`.
   - Then copy that helper into any script that uses it.
