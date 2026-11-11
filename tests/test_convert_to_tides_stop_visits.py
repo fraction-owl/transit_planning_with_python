@@ -3,8 +3,8 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-import scripts.operations_tools.convert_to_tides_stop_visits as target
-import scripts.operations_tools.convert_to_tides_trips_performed as trips_target
+import scripts.conversion_tools.convert_to_tides_stop_visits as target
+import scripts.conversion_tools.convert_to_tides_trips_performed as trips_target
 
 # ---------------------------------------------------------------------------
 # Shared helpers

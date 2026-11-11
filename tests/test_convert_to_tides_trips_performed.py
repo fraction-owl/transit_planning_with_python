@@ -3,7 +3,7 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-import scripts.operations_tools.convert_to_tides_trips_performed as target
+import scripts.conversion_tools.convert_to_tides_trips_performed as target
 
 # ---------------------------------------------------------------------------
 # Shared helpers
