@@ -1,114 +1,47 @@
 """Audit a pedestrian line network near GTFS stops with ArcGIS Pro / Python 3.9+.
 
-Edit CONFIGURATION, then run this file in the ArcGIS Pro Python environment.
-Requires ArcPy, but no Network Analyst, Data Reviewer, pandas, or NetworkX.
-Use file geodatabases/shapefiles with Basic; enterprise geometry checks may require
-a higher ArcGIS license, according to the input storage type.
-Inputs are never edited. Each run writes a NEW timestamped output directory.
+Edit CONFIGURATION, then run this file in the ArcGIS Pro Python environment. Requires
+ArcPy, but no Network Analyst, Data Reviewer, pandas, or NetworkX. Enterprise geometry
+checks may require a higher ArcGIS license than Basic. Inputs are never edited. Each run
+writes a NEW timestamped output directory; failed runs keep their working folder.
 
 Outputs:
     review.gdb: gtfs_stops; stop_buffers; study_area; context_area; road_context;
-      network_original; network_working; network_components;
-      issues_points; issues_lines; network_clip_<radius>; geometry_check_<source>.
-    Network outputs with Z/M dimensions have _z, _m, or _zm suffixes. Dimension
-      groups are kept separate so missing elevation values are not invented.
+      network_original; network_working; network_components; issues_points;
+      issues_lines; network_clip_<radius>; geometry_check_<source>. Network outputs
+      with Z/M dimensions have _z, _m, or _zm suffixes.
     issues.csv: location, type, confidence, source/part IDs, reason, road context.
-    stop_summary.csv: radius, nearby line length/density, component count,
-      nearest-line distance, and review-issue counts. Overlapping buffers are
-      intentionally summarized separately; never add their lengths together.
+    stop_summary.csv: radius, nearby line length/density, component count, nearest-line
+      distance, review-issue counts. Buffers overlap; never add their lengths together.
     components.csv; source_attributes.csv; repair_candidates.csv; repair_log.csv;
-      summary.json; timings.csv; run_status.json; run.log. The manifest records
-      assumptions and parameters. study_area_<radius> polygons cache smaller
-      dissolved scopes when map clips are enabled.
+      summary.json (assumptions and parameters); timings.csv; run_status.json; run.log.
 
 Typical usage:
     1. Set NETWORK_SOURCES, GTFS_PATH, OUTPUT_FOLDER, and optional ROAD_POLYGONS.
     2. Use a suitable local projected CRS. ANALYSIS_WKID=0 uses the first input's CRS.
-    3. Start with all repair options disabled. Inspect issues_points, issues_lines,
-       network_components, stop_summary.csv, and summary.json in the run folder.
-    4. Correct ambiguous crossings/grade separation in your source GIS and rerun.
-       Optional: copy repair_candidates.csv elsewhere, mark selected APPROVE cells
-       YES, and set APPROVED_SNAPS_CSV to that file. Stale candidates are rejected.
-
-PERFORMANCE AND PROGRESS
-    - Buffers and whole-feature selection precede the detailed network checks.
-      By default, Check Geometry also runs only on the selected context features.
-      Null shapes cannot be located by a spatial selection. Set
-      FULL_SOURCE_GEOMETRY_CHECK=True to restore the whole-source preflight.
-    - USE_LOCAL_WORKSPACE=True builds in Windows TEMP, then copies completed
-      results to OUTPUT_FOLDER. Set LOCAL_WORK_ROOT to another local folder if
-      desired. The final folder contains run.log and run_status.json immediately;
-      review.gdb and CSVs arrive when publication completes. Failed runs retain
-      their working folder, whose full path appears in the log and status file.
-    - Smaller indexed pieces of the study/context polygons accelerate repeated
-      spatial tests. They do not cut sidewalk lines or introduce network nodes.
-      Set USE_TILED_SCOPE=False to use the undivided polygons for comparison.
-    - Buffers, graph results, and review geometries are reused; the graph is
-      rebuilt only after actual repairs. Original and working outputs remain.
-    - Stop coordinates are inserted in WGS84 and projected in one batch. Setup
-      logs distinguish schema creation, coordinate insertion, projection, buffer
-      creation, and dissolve. Geoprocessing runs after write cursors are closed.
-    - Temporary source/road layers have unique names for each use and are removed
-      on normal exit or Python exceptions. A hard interruption may leave a layer
-      behind; its name will not be reused on the next run.
-    - Network sources are staged locally with their original OIDs, projected by
-      one native Project operation per source, and spatially selected in the
-      analysis CRS. Original attributes are read separately without geometry.
-      ID sets and Z/M dimensions are checked; geometry problems from both source
-      and projected copies remain excluded. Project does not add vertices for
-      shape preservation. Curves remain excluded even if projection densifies them.
-      BATCH_PROJECT_SOURCES=False restores the slower per-feature loading path.
-    - KEEP_SOURCE_STAGING=True retains the intermediate source_stage_* feature
-      classes for investigation. Failed runs retain them regardless. Projected
-      geometry-check tables include SOURCE_OID for the original source ID.
-    - Stage starts/completions and elapsed-time heartbeats appear in the console
-      and run.log. Heartbeats are not percentages. timings.csv and summary.json
-      record the measured stage durations; runtime depends on the selected data.
-    - If a diagnostic line becomes empty during ArcPy geometry construction, its
-      map marker falls back to its first point. MAP_GEOM and GEOM_NOTE document
-      this; issues.csv preserves the original coordinates in POINTS_JSON and the
-      measured VALUE_FT. Unmappable issues remain in the CSV and run summary.
-      Display fallbacks never change source coordinates or graph connectivity.
+    3. With repairs disabled, inspect the issue/component layers and summary files.
+    4. Correct ambiguous crossings/grade separation in your source GIS and rerun. To
+       snap, mark APPROVE=YES in a copy of repair_candidates.csv; set APPROVED_SNAPS_CSV.
 
 IMPORTANT INTERPRETATION
     - STOP_BUFFER_MILES defines straight-line REVIEW radii, not walk service areas.
-      Features outside the largest radius cannot contribute to a walking route
-      shorter than that radius measured from a stop. This does not apply to an
-      unrestricted route search. The network itself is NOT clipped for the audit.
-    - Whole features intersecting the largest buffer plus CONTEXT_MARGIN_FT are
-      retained. Components touching the context boundary have incomplete context.
-      network_clip_* layers contain only audited parts and are convenient map
-      extracts, NOT audit/routing inputs. Excluded geometry remains in working copies.
+      Whole features within the largest radius plus CONTEXT_MARGIN_FT are retained;
+      the network is NOT clipped. network_clip_* layers are map extracts, NOT
+      audit/routing inputs. Components touching the context boundary are incomplete.
     - This is a diagnostic undirected XY graph, not an ArcGIS network dataset.
       ENDPOINT / ANY_VERTEX must match your intended routing configuration.
-      Coincidence uses coordinate resolution, never the gap review threshold.
       Crossings without eligible coincident vertices are reported, never joined.
-    - LEVEL_FIELD is optional and must describe a CONSTANT level for the entire
-      feature. Do not map from/to elevation fields or a ramp to this field.
-      Equal known levels connect; different levels do not; two unknown levels
-      assume XY connectivity; known-versus-unknown remains unresolved. Z values
-      alone are NOT used to determine connectivity. Grade/access review remains
-      necessary even for a visually clean graph. No slope/ADA certification.
-    - Road polygons are evidence of a potential street crossing, not evidence
-      that crossing is permitted, safe, at grade, or missing from the source.
-    - GTFS platform stops (location_type blank or 0) are used. Optional route
-      filters select stops from trips in the feed, WITHOUT calendar/date filtering.
-      Missing/malformed stop coordinates fail the run instead of shrinking scope.
-    - True curves and geometry flagged by Check Geometry are retained in the
-      network outputs but excluded from the diagnostic graph (except a duplicate-
-      vertex-only problem repaired by the optional exact-duplicate cleanup).
-      Their exclusion is explicit; affected results are marked incomplete.
-    - Sparse coverage and long vertex spacing are review indicators, not errors.
-      Component counts are context-dependent and cannot certify completeness.
-    - Repairs are limited to consecutive identical XY vertices on 2D lines and
-      explicitly approved, unique, tiny endpoint-to-endpoint snaps. No automatic
-      street crossing, unnoded intersection, smoothing, or feature deletion.
-      Source attributes are retained in source_attributes.csv as JSON, linked by
-      SOURCE_KEY. Output network feature classes have a normalized review schema;
-      they do NOT carry a configured routing impedance/restriction model.
-
-Use stable ID_FIELD values where available. Otherwise SOURCE_KEY uses source label
-and original OID and is only stable while the source OIDs remain unchanged.
+    - LEVEL_FIELD must describe a CONSTANT level for the entire feature. Equal known
+      levels connect; different levels do not; two unknown levels assume XY
+      connectivity; known-versus-unknown remains unresolved. Z values are NOT used.
+    - Road polygons are evidence of a potential street crossing, not that the
+      crossing is permitted, safe, at grade, or missing. No slope/ADA certification.
+    - True curves and Check Geometry failures stay in the network outputs but out of
+      the graph; affected results are marked incomplete. Only the selected context
+      features are checked (never null shapes) unless FULL_SOURCE_GEOMETRY_CHECK=True.
+    - Optional GTFS route filters select stops from trips WITHOUT date filtering.
+    - Repairs are limited to identical consecutive vertices and approved tiny
+      endpoint snaps. SOURCE_KEY is stable only with ID_FIELD or unchanged OIDs.
 
 References (ArcGIS Pro documentation):
     https://pro.arcgis.com/en/pro-app/latest/help/analysis/networks/understanding-connectivity.htm

@@ -1,65 +1,48 @@
 """Compare public-service and concept GTFS stops without conflating feed scope.
 
-Python 3.9+; requires pandas, numpy, openpyxl. No ArcPy or SciPy required.
-Edit the CONFIGURATION block and run in an IDE/notebook, or use CLI options.
-Paths may be GTFS ZIP archives or extracted folders. Relative paths are resolved
-against this script's folder (the working directory when pasted in a notebook).
+Python 3.9+; requires pandas, numpy, openpyxl. No ArcPy or SciPy required. Edit the
+CONFIGURATION block and run in an IDE/notebook, or use CLI options. Paths may be GTFS ZIP
+archives or extracted folders; relative paths resolve against this script's folder.
 
 DEFAULT: SCOPE_MODE='after_routes' for a partial Remix/concept export.
-PRIMARY_STOP_KEY='stop_code' compares public stop codes across feeds. Choose
-'stop_id' explicitly for native-ID comparisons. The selected field must be
-populated and unique in both full inventories; missing/duplicate keys stop the
-run. GTFS joins still use native stop_id. Codes and IDs remain strings, preserving
-leading zeros. Same-code stops with changed stop_id values remain matched; those
-secondary ID changes are flagged separately and do not count as attribute changes.
+PRIMARY_STOP_KEY='stop_code' compares public stop codes across feeds ('stop_id' for
+native IDs); the key must be populated and unique in both full inventories. GTFS joins
+still use native stop_id, and codes and IDs stay strings. Same-code stops with changed
+stop_id values remain matched; those ID changes are flagged separately.
 - Match concept routes to current routes by route label, not generated route ID.
 - Compare stops referenced by stop_times on those routes, across ALL feed trips.
 - Stops outside these routes are excluded, not reported as deletions.
-- Use BEFORE_ROUTE_NAMES to include an affected route absent from the concept.
-- Use AFTER_TO_BEFORE_ROUTE_NAMES when a concept route has been renamed.
-- Unmatched concept routes prompt for current counterparts or an explicit 'none'.
-- Use --route-pair AFTER BEFORE (repeatable), or --no-route-match AFTER.
-- A concept route can map to several current routes; a current route can map to
-  several concept routes. Scope counts use distinct stops, not summed pair counts.
-- 'none' means no current counterpart; the concept route remains in after scope.
-- --unmatched-routes error disables prompts; warn explicitly allows provisional
-  scope counts. Headless prompt mode stops and requests explicit choices.
+- BEFORE_ROUTE_NAMES adds an affected route absent from the concept;
+  AFTER_TO_BEFORE_ROUTE_NAMES maps a renamed concept route.
+- Unmatched concept routes prompt for current counterparts or an explicit 'none' (the
+  route stays in after scope). Or use --route-pair AFTER BEFORE (repeatable) or
+  --no-route-match AFTER; --unmatched-routes error disables prompts, warn allows
+  provisional scope counts. Pairings may be many-to-many; scope counts distinct stops.
 - route_pairings.json saves resolved pairs and no-match decisions for reuse with
   --route-pairs-file. CLI choices override file/config for each named route.
 - Use 'all_stops' for an intentional inventory comparison of two complete feeds.
 
 Outputs (in a new timestamped run folder):
-  stops_comparison.xlsx, summary.json, run_settings.json, gtfs_stop_diff.log,
-  plus a CSV for each workbook sheet. Primary sheets: summary, route_scope,
-  modified, removed_from_scope, new_stop_codes, existing_stops_new_to_scope,
-  needs_review, attribute_summary. ADDITIONS_OUTPUT_MODE controls addition tables:
-  separate (default), combined, new_only, or existing_only. Summary totals always
-  retain both categories. "New" means the selected primary key is absent from
-  the full current inventory; candidate ID matches still require review before claiming new poles.
-  Existing stops new to route scope are separate from route gains/losses at stops
-  already shared by both scopes (see route_changes). With PRIMARY_STOP_KEY='stop_id',
-  the new-key output is named new_stop_ids instead. stop_id_code_changes exposes
-  native IDs associated with different public codes across the feeds.
-  'removed_from_scope' means no stop_times reference in the selected after scope;
-  it does NOT establish a physical stop closure or loss of all transit service.
-  Unchanged means no compared attribute or above-threshold coordinate change.
-  Route-context changes are reported separately and do not drive classification.
-  reused_stop_comparison checks existing stops newly used by the concept routes.
-  Coordinates changed is not proof that a bus pole physically moved.
+  stops_comparison.xlsx, summary.json, run_settings.json, gtfs_stop_diff.log, plus a
+  CSV for each workbook sheet. Primary sheets: summary, route_scope, modified,
+  removed_from_scope, new_stop_codes (new_stop_ids with PRIMARY_STOP_KEY='stop_id'),
+  existing_stops_new_to_scope, needs_review, attribute_summary; also route_changes,
+  stop_id_code_changes and reused_stop_comparison. ADDITIONS_OUTPUT_MODE controls the
+  addition tables: separate (default), combined, new_only, or existing_only.
+  "New" means the primary key is absent from the full current inventory; candidate ID
+  matches still require review before claiming new poles. 'removed_from_scope' means
+  no stop_times reference in the after scope; it does NOT establish a physical closure
+  or loss of all service. Unchanged means no compared attribute or above-threshold
+  coordinate change. Coordinates changed is not proof that a bus pole physically moved.
 
 Primary-key matches are exact. Candidate ID changes use stop_code and nearby coordinates;
-these are review suggestions only and never silently revise the counts. Blank
-GTFS defaults are normalized for location_type and wheelchair_boarding. Other
-attribute losses in a concept export are retained and explained, not suppressed.
-No service-date or pickup/drop-off filtering is performed. In route scope,
-parent stations and other unreferenced locations remain in the full inventory.
+these are review suggestions only and never revise the counts. Blank location_type and
+wheelchair_boarding defaults are normalized; other attribute losses are retained and
+explained. No service-date or pickup/drop-off filtering is performed.
 
 Typical usage:
     python gtfs_stop_diff.py --before current.zip --after concept.zip --out output
     python gtfs_stop_diff.py --scope all_stops --before a.zip --after b.zip
-    python gtfs_stop_diff.py --before-routes 301 305 310
-    python gtfs_stop_diff.py --additions new_only
-    python gtfs_stop_diff.py --primary-stop-key stop_id
     python gtfs_stop_diff.py --route-pair "353New" "353" --no-route-match "400X"
     python gtfs_stop_diff.py --route-pairs-file "previous_run/route_pairings.json"
 Notebook:

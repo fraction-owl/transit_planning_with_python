@@ -1,19 +1,15 @@
 """Roll trip-level ridership up to average boardings by hour of the service day.
 
 Two input modes cover the common data situations. ``"route_trip_xlsx"`` reads the
-pre-aggregated "Route and Trip" workbooks a vendor ridership database exports (one
-row per scheduled trip carrying period-average passengers on/off and a trip start
-time; one workbook per day type), and assigns each trip's average boardings to the
-hour of its start time. ``"tides"`` derives the same table from raw TIDES
-``stop_visits`` + ``trips_performed`` events, counting boardings at the hour each
-stop visit actually occurred and averaging across the service dates observed for
-each day type.
+pre-aggregated "Route and Trip" workbooks a vendor ridership database exports (one per
+day type; one row per scheduled trip with period-average passengers on/off and a start
+time) and assigns each trip's average boardings to the hour of its start time.
+``"tides"`` derives the same table from raw TIDES ``stop_visits`` + ``trips_performed``,
+counting boardings at the hour each stop visit occurred and averaging across the
+service dates observed for each day type.
 
-Hours are expressed on the GTFS-style service-day clock, the industry convention
-for owl service: trips or events in the small hours (before
-``LATE_NIGHT_CUTOVER_HOUR``) are treated as hours 24-27 of the prior service
-day, so late-night service does not masquerade as early-morning ridership and
-the default service day runs 04:00-27:59.
+Hours use the GTFS-style service-day clock: times before ``LATE_NIGHT_CUTOVER_HOUR`` are
+hours 24-27 of the prior service day, so the default service day runs 04:00-27:59.
 
 Inputs:
     - ``route_trip_xlsx`` mode: one workbook per day type (weekday/saturday/
@@ -25,39 +21,27 @@ Outputs:
     - ``ridership_by_hour_route.csv``: day type × route × hour average boardings
       (and alightings when available), with observation counts.
     - ``ridership_by_hour_system.csv``: day type × hour system totals.
-    - ``ridership_by_trip_<day>.csv`` per day type (``EXPORT_TRIP_TABLE``):
-      average daily boardings by ``trip_id`` (and ``stop_id`` in tides mode) —
-      the exact ``RIDERSHIP_CSV`` input ``service_cut_impact_gpd.py`` expects;
-      pass the file matching that script's ``SERVICE_DAY``.
-    - ``low_ridership_trips.csv``: trips whose ``LOW_RIDERSHIP_MEASURE``
-      (passengers per revenue hour by default; per revenue mile and raw
-      boardings also available) falls below ``LOW_RIDERSHIP_THRESHOLD``, with
-      route, direction, start time, service-day hour, and all three measures;
-      each
-      flagged day type is also logged as a warning. Written only when trips
-      are flagged; set the threshold to 0 to disable.
-    - ``charts/``: one bar chart PNG per route per day type, plus a system chart
-      per day type (``EXPORT_CHARTS``).
-    - ``charts/trips/``: one per-trip bar chart PNG per route — split by
-      direction where the data carries one — per day type on the
-      ``LOW_RIDERSHIP_MEASURE`` scale, y-axis shared within each day type,
-      with the threshold as a dashed line and below-threshold trips
-      highlighted (``EXPORT_TRIP_CHARTS``).
+    - ``ridership_by_trip_<day>.csv`` per day type (``EXPORT_TRIP_TABLE``): average
+      daily boardings by ``trip_id`` (and ``stop_id`` in tides mode), the
+      ``RIDERSHIP_CSV`` input ``service_cut_impact_gpd.py`` expects for its ``SERVICE_DAY``.
+    - ``low_ridership_trips.csv``: trips whose ``LOW_RIDERSHIP_MEASURE`` (passengers per
+      revenue hour by default; per revenue mile and raw boardings also available) falls
+      below ``LOW_RIDERSHIP_THRESHOLD``. Written only when trips are flagged; set the
+      threshold to 0 to disable.
+    - ``charts/``: one bar chart PNG per route per day type, plus a system chart per
+      day type (``EXPORT_CHARTS``).
+    - ``charts/trips/``: per-trip bar charts per route (and direction) and day type on
+      the ``LOW_RIDERSHIP_MEASURE`` scale, with the threshold dashed and below-threshold
+      trips highlighted (``EXPORT_TRIP_CHARTS``).
     - A run-log sidecar capturing the verbatim CONFIGURATION block.
 
 Notes:
-    The two modes time-locate boardings differently — trip start hour versus
-    actual event hour — so expect small shifts between them for long trips.
-    Holiday service is not separated: dates are classed weekday/saturday/sunday
-    by calendar day alone in ``tides`` mode, and the xlsx export's own day-type
-    split is trusted as-is. The trip tables are only as good as their ids: the
-    xlsx export's trip-number column must hold GTFS ``trip_id`` values, and
-    TIDES trips should carry ``trip_id_scheduled``; otherwise blank the
-    ``trip_id`` mapping / expect unmatched ids downstream.
-    Routes are identified by name, not code: an export may number a route 3695
-    and name it "RIBS5", and the name is what the route filters match and what
-    leads chart titles and filenames (the code appears in parentheses when the
-    two differ). Routes the export leaves unnamed fall back to the code.
+    The two modes time-locate boardings differently (trip start hour versus actual
+    event hour), so expect small shifts between them for long trips. Holiday service is
+    not separated. Trip tables need GTFS ``trip_id`` values (the xlsx trip-number
+    column, or TIDES ``trip_id_scheduled``); otherwise expect unmatched ids downstream.
+    Routes are identified by name, not code (the code appears in parentheses when the
+    two differ); routes the export leaves unnamed fall back to the code.
 
 Typical usage:
     Update the paths in the CONFIGURATION section (or pass the matching CLI

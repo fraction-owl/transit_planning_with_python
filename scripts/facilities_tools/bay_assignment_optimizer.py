@@ -1,68 +1,52 @@
 """Choose bus-bay assignments that reduce conflicts at a transit center, straight from GTFS.
 
-Runs the whole bay-analysis pipeline in one pass. Every vehicle block that
-visits the facility is rendered minute by minute, as
-``block_status_timeline_exporter.py`` renders it, under two occupancy
-standards ("direct" and "likely" conflict). Passenger-bay, layover-space and
-facility-wide conflict minutes are counted as ``bay_usage_analyzer.py`` counts
-them. Every movement that could change bay (``<route> arrive``, ``<route>
-depart``, ``<route> through <direction>``) is listed. PuLP's CBC solver then
-chooses bay reassignments that minimize a weighted count of conflict minutes.
-The time-shift search stays in ``bay_change_sweep.py``.
+Runs the whole bay-analysis pipeline in one pass. Every vehicle block that visits the
+facility is rendered minute by minute, as ``block_status_timeline_exporter.py`` renders
+it, under two occupancy standards ("direct" and "likely" conflict), and conflict minutes
+are counted as ``bay_usage_analyzer.py`` counts them. PuLP's CBC solver then chooses bay
+reassignments that minimize a weighted count of conflict minutes. The time-shift search
+stays in ``bay_change_sweep.py``.
 
 Method
 ------
-Schedules are fixed: only the bay a movement uses may change. A changed
-movement uses one permitted bay for every visit, while KEEP preserves its
-scheduled stops. A bay-minute is a conflict when it holds more buses than the
-bay's capacity. Each conflict minute is weighted by standard (direct, or likely
-only) and by peak/off-peak period; a direct conflict is never charged as likely
-as well. ``OPTIMIZER_OBJECTIVE`` ranks plans by that score, then by changed
-routes, then by changed movements, or minimizes changes under a hard score
-ceiling, subject to route budgets, bays per route, consistent boarding bays
-per passenger direction, same-bay groups, a direct-conflict policy and, when
-``BAY_TRANSFERS`` is set, the bay-to-bay moves a bus may make between
-consecutive trips of its block (bus circulation). The same renderer rebuilds
-every returned plan, and its rows must match the solver's model before the
-plan is reported. ``NAMED_PROPOSALS`` (e.g. a consultant's
-layout) are scored the same way, with rule breaks flagged. Layover-space and
-facility-wide totals are reported but not optimized; a bay-only change cannot
-alter them.
+Schedules are fixed: only the bay a movement uses may change, and a changed movement
+uses one permitted bay for every visit. A bay-minute is a conflict when it holds more
+buses than the bay's capacity; each is weighted by standard (a direct conflict is never
+charged as likely as well) and by peak/off-peak period. ``OPTIMIZER_OBJECTIVE`` ranks
+plans by that score, then changed routes, then changed movements, or minimizes changes
+under a hard score ceiling, subject to route budgets, bays per route, consistent
+boarding bays, same-bay groups, a direct-conflict policy and, with ``BAY_TRANSFERS``,
+bus circulation. The same renderer rebuilds every returned plan, which must match the
+solver's model. ``NAMED_PROPOSALS`` are scored the same way, with rule breaks flagged.
+Layover-space and facility-wide totals are reported but not optimized.
 
 Inputs
 ------
-- A GTFS folder or ``.zip`` with trips, stop_times, stops and routes, plus
-  calendar.txt / calendar_dates.txt when ``SERVICE_DATE`` selects the day.
-  Fields are read as written, so IDs such as ``NA`` stay text.
+- A GTFS folder or ``.zip`` with trips, stop_times, stops, routes and (when ``SERVICE_DATE``
+  selects the day) calendar files. Fields are read as written, so IDs like ``NA`` stay text.
 
 Outputs
 -------
 Each run writes a new ``<SCENARIO_LABEL>_<timestamp>`` folder in ``OUTPUT_DIR``:
-- ``<SCENARIO_LABEL>_bay_plans.xlsx``: Read me, Conflict summary, Plan
-  comparison, Assignments, Route bay usage, Boarding bays, Bay transfers,
-  Conflict minutes, Route-ends, Interlines, Block chains, Bay options and
-  Configuration. It is rewritten after each route budget, so a long solve
-  leaves results that can be used.
-- ``<SCENARIO_LABEL>_bay_plans_runlog.txt``, the run-log sidecar capturing the
-  verbatim CONFIGURATION block and the effective settings.
-- ``solver/``: CBC's log and working files (model, warm start, solution) per
-  route budget.
+- ``<SCENARIO_LABEL>_bay_plans.xlsx``: Read me, Conflict summary, Plan comparison,
+  Assignments, Route bay usage, Boarding bays, Bay transfers, Conflict minutes,
+  Route-ends, Interlines, Block chains, Bay options and Configuration. It is rewritten
+  after each route budget, so a long solve leaves results that can be used.
+- ``<SCENARIO_LABEL>_bay_plans_runlog.txt``: verbatim CONFIGURATION and settings used.
+- ``solver/``: CBC's log and working files (model, warm start, solution) per budget.
 
 Typical usage
 -------------
-Set the GTFS path, output folder, service day and facility in CONFIGURATION
-(or pass the matching CLI flags; ``--config`` takes a JSON file of further
-overrides) and run from a shell, ArcGIS Pro's Python window, or a Jupyter
-notebook. Run once with ``OPTIMIZE_MODE = "never"`` to review the Route-ends
-and Bay options sheets, restrict ``BAY_OPTIONS`` or add locks if needed, then
-run with ``"if_conflicts"``.
+Set the GTFS path, output folder, service day and facility in CONFIGURATION (or pass
+the CLI flags; ``--config`` takes a JSON file of overrides) and run from a shell, ArcGIS
+Pro's Python window, or a Jupyter notebook. Run once with ``OPTIMIZE_MODE = "never"`` to
+review the Route-ends and Bay options sheets, then with ``"if_conflicts"``.
 
 Requires
 --------
-pandas, numpy and openpyxl. Optimizing also needs PuLP 3.x
-(``pip install PuLP==3.2.2``), whose bundled CBC solver is used.
-Results are proposals only: review bay access, bus suitability and walking
-paths before adopting a plan.
+pandas, numpy and openpyxl; optimizing also needs PuLP 3.x (``pip install PuLP==3.2.2``),
+whose bundled CBC solver is used. Results are proposals only: review bay access, bus
+suitability and walking paths before adopting a plan.
 """
 
 from __future__ import annotations

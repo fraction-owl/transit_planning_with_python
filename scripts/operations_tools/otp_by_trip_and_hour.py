@@ -1,78 +1,52 @@
 """Compute trip-level and hour-of-day on-time performance (OTP) from TIDES ``stop_visits``.
 
-This script slices on-time performance two ways that the monthly panel
-(``otp_monthly_panel.py``) does not: by *scheduled trip* (which trips of the
-day chronically run hot or late) and by *hour of the service day* (when in the
-day OTP sags), each computed separately per configurable day-type bucket
-(default: Weekday, Saturday, Sunday).
-
-It reads a TIDES-style ``stop_visits`` table (stop-level arrival/departure
-events), optionally joined to a ``trips_performed`` table (trip-level
-attributes such as ``route_id``, ``direction_id``, and the schedule-stable
-``trip_id_scheduled``). The scoring rules deliberately mirror
-``otp_monthly_panel.py`` -- timepoint-only (``TIMEPOINTS_ONLY``),
-``Scheduled``-relationship-only, departure with arrival fallback, inclusive
-``[EARLY_MIN, LATE_MIN]`` window -- so "on-time" means the same thing across
-this repo's OTP outputs.
+This script slices on-time performance two ways that ``otp_monthly_panel.py`` does not:
+by *scheduled trip* (which trips chronically run hot or late) and by *hour of the service
+day*, each per day-type bucket (default: Weekday, Saturday, Sunday). It reads TIDES
+``stop_visits``, optionally joined to ``trips_performed`` (``route_id``, ``direction_id``,
+``trip_id_scheduled``). Scoring mirrors the panel -- ``TIMEPOINTS_ONLY``, ``Scheduled``
+visits only, departure with arrival fallback, inclusive ``[EARLY_MIN, LATE_MIN]`` -- so
+"on-time" means the same thing across this repo's OTP outputs.
 
 Day-type buckets
 ----------------
-``DAY_TYPES`` maps a bucket name to the weekdays it pools; each bucket is
-scored separately. Buckets may overlap -- e.g. add ``"Weekend": ("Saturday",
-"Sunday")`` alongside the individual days to get a pooled series too (a visit
-is then counted once per bucket it belongs to, which is why per-bucket rows
-are never summed across buckets). Weekdays in no bucket are dropped, so a
-weekend-only analysis is just a two-bucket mapping. The same mapping can be
-passed on the CLI as ``--day-types "Weekday=Mon,Tue,Wed,Thu,Fri;Saturday=Sat;
-Sunday=Sun"``.
+``DAY_TYPES`` maps a bucket name to the weekdays it pools (on the CLI: ``--day-types
+"Weekday=Mon,Tue,Wed,Thu,Fri;Saturday=Sat;Sunday=Sun"``). Buckets may overlap, so a
+visit counts once per bucket it belongs to and rows are never summed across buckets.
+Weekdays in no bucket are dropped.
 
 Hour of the service day
 -----------------------
-Visits are bucketed by their *scheduled* time (a late trip is charged to the
-hour it was supposed to serve), measured as hours since midnight of
-``service_date`` rather than the timestamp's own clock hour. TIDES timestamps
-are full datetimes, so an owl trip scheduled past midnight lands on the next
-calendar date while ``service_date`` stays on the operational day; measuring
-from the service date keeps that trip at hour 24+ (GTFS-style) instead of
-folding it into the next morning's 0-1 AM.
+Visits are bucketed by *scheduled* time, in hours since midnight of ``service_date``:
+a late trip is charged to the hour it was supposed to serve, and an owl trip past
+midnight stays at hour 24+ (GTFS-style) instead of folding into the next morning.
 
 Trip identity
 -------------
-Pooling a trip across many service dates needs a schedule-stable ID. When
-``trips_performed`` is provided, ``trip_id_scheduled`` is used (falling back
-to ``trip_id_performed`` where blank); without it the script falls back to
-``trip_id_performed`` and warns when those IDs turn out to be unique per day
-(each "trip" then spans a single date and the table is per-performed-trip,
-not per-scheduled-trip).
+Trips are pooled across dates by ``trip_id_scheduled`` from ``trips_performed``,
+falling back to ``trip_id_performed``; the script warns when those IDs are unique per
+day, since each "trip" then spans a single date.
 
 Data sanity warnings
 --------------------
-Checks are limited to what changes the validity of *these* OTP numbers:
-duplicated visit rows (double counting), unscorable visits split by cause
-(missing schedule vs. missing actual timestamp), deviations beyond
-``DEV_ABS_WARN_MIN`` (schedule-join or clock defects hiding inside the
-early/late buckets), scheduled times implausibly far from ``service_date``,
-and day-type buckets backed by very few service dates. Deeper TIDES schema
-validation belongs upstream (in the AVL-to-TIDES converters or a standalone
-validator), not duplicated in every consumer script.
+Duplicated visit rows, unscorable visits by cause, deviations beyond
+``DEV_ABS_WARN_MIN``, scheduled times implausibly far from ``service_date``, and day
+types backed by very few service dates. Deeper TIDES schema validation belongs upstream.
 
 Outputs (all in ``OUTPUT_DIR``):
   1) ``otp_by_trip.csv``     - one row per (day type, trip): scheduled start,
      dates observed, early/on-time/late counts and percentages.
   2) ``otp_by_hour.csv``     - one row per (day type, service-day hour).
   3) ``otp_by_day_type.csv`` - one summary row per day type.
-  4) ``plots/otp_by_hour_<day_type>.png`` - % on-time by hour, as bars (bars
-     rather than a line so hours with no service read as gaps instead of
-     being bridged), each annotated with its evaluated visit count.
+  4) ``plots/otp_by_hour_<day_type>.png`` - % on-time bars with visit counts.
   5) ``plots/otp_by_trip_<day_type>[_<route>].png`` - % on-time per trip in
      scheduled-start order (skipped above ``MAX_TRIPS_PER_CHART`` bars).
   6) A run-log sidecar capturing the verbatim CONFIGURATION block.
 
 Typical usage
 -------------
-Update the paths in the CONFIGURATION section (or pass ``--stop-visits`` /
-``--trips-performed`` / ``--output-dir``) and run from a shell, ArcGIS Pro's
-Python window, or a Jupyter notebook.
+Update the paths in CONFIGURATION (or pass ``--stop-visits`` / ``--trips-performed`` /
+``--output-dir``) and run from a shell, ArcGIS Pro's Python window, or a Jupyter notebook.
 """
 
 from __future__ import annotations

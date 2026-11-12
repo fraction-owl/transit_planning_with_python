@@ -1,45 +1,34 @@
 """Perform spatial analysis on GTFS transit data and demographic shapefiles.
 
 Generates a transit *service area* and estimates the population, household, and
-employment characteristics that fall within it. The script offers two
-independent choices:
+employment characteristics that fall within it. The script offers two independent choices:
 
-* **Analysis mode** — how results are grouped: ``"network"`` (one combined
-  surface), ``"route"`` (one surface per route), or ``"stop"`` (one surface per
-  stop).
+* **Analysis mode** — how results are grouped: ``"network"`` (one combined surface),
+  ``"route"`` (one surface per route), or ``"stop"`` (one surface per stop).
 * **Service-area method** — how each catchment polygon is built:
     - ``"stop_buffer"``: a fixed-radius buffer around each transit stop, with an
       optional wider drive-access buffer for express origin (park-and-ride) stops.
-    - ``"route_buffer"``: a fixed-radius buffer around the route-line geometry
-      taken from GTFS ``shapes.txt``.
-    - ``"isochrone"``: a walk-time isochrone (walkshed) around each stop: the
-      pedestrian-network segments reachable within the walk-time budget,
-      buffered by ``ISOCHRONE_EDGE_BUFFER_FT``.
+    - ``"route_buffer"``: a fixed-radius buffer around the GTFS ``shapes.txt`` lines.
+    - ``"isochrone"``: a walkshed around each stop: the pedestrian-network segments
+      reachable within the walk-time budget, buffered by ``ISOCHRONE_EDGE_BUFFER_FT``.
 
-In ``"route"`` mode each route is labeled by ``service_type``
-(``"express"``/``"local"``) and ``express_direction``
-(``"unidirectional"``/``"bidirectional"``/``""``). Express routes get *access-mode
-accounting* under the ``"stop_buffer"`` method: population is drive-scaled at the
-park-and-ride origin stops (wide buffer) and walk-scaled elsewhere, while
-employment is always walk-scaled (riders walk from the alighting stop to the
-job). Unidirectional (commuter) routes additionally drop the two cross-terms —
-origin employment and destination population — which can be zeroed
-independently; bidirectional routes keep both ends. See the express settings in
-the CONFIGURATION block.
+In ``"route"`` mode each route is labeled by ``service_type`` (``"express"``/``"local"``)
+and ``express_direction`` (``"unidirectional"``/``"bidirectional"``/``""``). Under the
+``"stop_buffer"`` method, express routes get *access-mode accounting*: population is
+drive-scaled at the park-and-ride origin stops and walk-scaled elsewhere, while
+employment is always walk-scaled. Unidirectional (commuter) routes also drop origin
+employment and destination population, each of which can be zeroed independently; see
+the express settings in the CONFIGURATION block.
 
 Trips are limited to the service day(s) in ``SERVICE_IDS_TO_INCLUDE`` (GTFS
-``service_id``; default ``"4"``). Each run logs ``calendar.txt`` in full so the
-right id can be checked or picked, warns while the default is unchanged, and
-stops with exit code 2 if a listed service_id has no trips in the feed.
+``service_id``; default ``"4"``). Each run logs ``calendar.txt`` in full, warns while the
+default is unchanged, and stops with exit code 2 if a listed service_id has no trips.
 
-Intended for use in Jupyter notebooks with appropriate EPSG settings. The
-projected CRS (``CRS_EPSG_CODE``, default NAD83 / Maryland in US survey feet)
-may use any linear unit: buffer distances (miles), walk speed, isochrone
-settings (feet), and acreage are converted with the CRS's own unit. A CRS that
-is not projected is rejected at startup, and one that distorts distances by
-more than 2% at the feed's location (e.g. World Mercator away from the equator)
-triggers a warning. Stops, route shapes, and demographics are all built in that
-one CRS.
+Stops, route shapes, and demographics are all built in one projected CRS
+(``CRS_EPSG_CODE``, default NAD83 / Maryland in US survey feet) of any linear unit;
+distances and acreage are converted with the CRS's own unit. A CRS that is not projected
+is rejected, and one that distorts distances by more than 2% at the feed's location
+(e.g. World Mercator away from the equator) triggers a warning.
 
 Inputs:
     - GTFS folder containing: trips.txt, stop_times.txt, routes.txt,

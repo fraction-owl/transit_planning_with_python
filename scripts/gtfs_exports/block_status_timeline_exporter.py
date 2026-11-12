@@ -1,72 +1,52 @@
 """Generate minute-by-minute transit block status timelines from GTFS data.
 
-Processes GTFS files to determine each vehicle block's operational status (e.g.
-DWELL, LAYOVER, LOADING, TRAVELING BETWEEN STOPS, LONG BREAK, INACTIVE) at
-one-minute intervals across the service day, producing one spreadsheet per
-block for further analysis (bay conflict checks, layover planning, cluster
-staffing). Named stop clusters (``CLUSTER_DEFINITIONS``) group related stops --
-for example the bays of a transit center -- so statuses reflect time spent
-anywhere in the cluster.
+Processes GTFS files to determine each vehicle block's operational status (e.g. DWELL,
+LAYOVER, LOADING, TRAVELING BETWEEN STOPS, LONG BREAK, INACTIVE) at one-minute intervals
+across the service day, producing one spreadsheet per block for further analysis (bay
+conflict checks, layover planning, cluster staffing). Named stop clusters
+(``CLUSTER_DEFINITIONS``) group related stops -- for example the bays of a transit
+center -- so statuses reflect time spent anywhere in the cluster.
 
 Inputs
 ------
-- A GTFS folder (or ``.zip``) containing trips.txt, stop_times.txt,
-  routes.txt and stops.txt, plus calendar.txt / calendar_dates.txt when the
-  service day is selected by ``SERVICE_DATE``. The service day to analyze is
-  selected via ``CALENDAR_SERVICE_IDS`` or ``SERVICE_DATE``; optional route and
-  stop filters narrow the run. Frequency-based trips (frequencies.txt) are not
-  modeled: the export stops if any are in the selected service, routes and
-  stops, and ignores the rest.
-- Optional GTFS fields: a route without a route_short_name is named by its
-  route_long_name, then its route_id; a stop without a stop_name by its
-  stop_id (with a warning). Untimed intermediate stops and trips without a
-  block_id stop the export unless ``INTERPOLATE_UNTIMED_STOPS`` /
-  ``TRIP_ONLY_WITHOUT_BLOCK_ID`` allow them, and the assumptions file then
-  records what was estimated or is unknown.
+- A GTFS folder (or ``.zip``) containing trips.txt, stop_times.txt, routes.txt and
+  stops.txt, plus calendar.txt / calendar_dates.txt when ``SERVICE_DATE`` selects the
+  day (otherwise ``CALENDAR_SERVICE_IDS``); optional route and stop filters narrow the
+  run. Frequency-based trips (frequencies.txt) in the selection stop the export.
+- A route without a route_short_name is named by its route_long_name, then route_id; a
+  stop without a stop_name by its stop_id. Untimed intermediate stops and trips without
+  a block_id stop the export unless ``INTERPOLATE_UNTIMED_STOPS`` /
+  ``TRIP_ONLY_WITHOUT_BLOCK_ID`` allow them; the assumptions file then records them.
 
 Occupancy assumptions
 ---------------------
-GTFS gives a single minute for most stop visits. The ``*_MINUTES`` settings in
-CONFIGURATION stretch that into the time a bus actually occupies a stop
-(through-stop dwell, sitting at the departure bay before a trip, staying at
-the arrival bay after one) and decide whether a between-trip gap is spent in
-the arrival bay (``DWELL``) or in the cluster's overflow/layover space
-(``LAYOVER`` / ``LONG BREAK``). ``BAY_OVERRIDES`` re-assigns a route's visits
-to a different stop so alternative bay assignments can be tested without
-editing the feed. The assumptions used are written to ``ASSUMPTIONS_FILE``
-alongside the output so downstream reports can echo them.
+GTFS gives a single minute for most stop visits. The ``*_MINUTES`` settings stretch that
+into the time a bus actually occupies a stop (through-stop dwell, sitting at the
+departure bay before a trip, staying at the arrival bay after one) and decide whether a
+between-trip gap is spent in the arrival bay (``DWELL``) or in the cluster's
+overflow/layover space (``LAYOVER`` / ``LONG BREAK``). ``BAY_OVERRIDES`` re-assigns a
+route's visits to a different stop to test alternative bay assignments.
 
-A trip holds its vehicle from its first scheduled time (the first stop's
-arrival) to its last (the last stop's departure), so a scheduled hold at the
-first stop -- arriving 10:02, departing 10:10 -- keeps the bus in the bay
-from 10:02. Between-trip rows and reports quote the scheduled times: the
-previous trip's last-stop arrival and the next trip's first-stop departure
-(10:10).
+A trip holds its vehicle from its first stop's arrival to its last stop's departure, so
+a first-stop hold (arriving 10:02, departing 10:10) keeps the bus in the bay from 10:02.
+Between-trip rows quote scheduled times: last-stop arrival and first-stop departure.
 
 Outputs
 -------
-- One Excel workbook per vehicle block (``block_<block_id>_<route(s)>.xlsx``)
-  in ``BLOCK_OUTPUT_FOLDER``: one row per minute with timestamp, route,
-  direction, trip, stop, arrival/departure times, and status. ``Estimated
-  Time`` marks visits whose time was interpolated.
-- Optionally a single ``COMBINED_TIMELINE_FILE`` (CSV) holding every block's
-  rows, which Step 2 can read directly instead of re-opening each workbook.
-- ``ASSUMPTIONS_FILE`` recording the parameters used for the run.
-- ``RUN_LOG_FILENAME``, a run-log sidecar in the same folder capturing the
-  source CONFIGURATION block and the effective runtime settings.
-- ``SCHEDULE_SNAPSHOT_FILE`` with scheduled visits and occupancy settings for
-  exact bay-change rescoring, plus ``timeline_manifest.json`` identifying the
-  completed run. A failed rerun invalidates the run for downstream readers;
-  old files are retained but cannot be mistaken for current output.
+- One Excel workbook per vehicle block (``block_<block_id>_<route(s)>.xlsx``) in
+  ``BLOCK_OUTPUT_FOLDER``: one row per minute with timestamp, route, direction, trip,
+  stop, arrival/departure times, and status; ``Estimated Time`` marks interpolated visits.
+- Optionally a single ``COMBINED_TIMELINE_FILE`` (CSV) of every block's rows for Step 2.
+- ``ASSUMPTIONS_FILE`` recording the parameters used, and ``RUN_LOG_FILENAME``, a
+  run-log sidecar with the CONFIGURATION block and the effective runtime settings.
+- ``SCHEDULE_SNAPSHOT_FILE`` (for exact bay-change rescoring) and
+  ``timeline_manifest.json``. A failed rerun invalidates the run for downstream readers.
 
 Typical usage
 -------------
-Update the paths in the CONFIGURATION section and run from a shell, ArcGIS
-Pro's Python window, or a Jupyter notebook.
-
-Run this revised exporter once per scenario before using the revised sweep.
-The pipeline requires one-minute sampling. The timeline automatically extends
-past DEFAULT_HOURS when a scheduled trip or its post-arrival buffer ends later.
+Update the paths in the CONFIGURATION section and run from a shell, ArcGIS Pro's Python
+window, or a Jupyter notebook, once per scenario before the sweep. The pipeline requires
+one-minute sampling; the timeline extends past DEFAULT_HOURS when a trip ends later.
 """
 
 from __future__ import annotations

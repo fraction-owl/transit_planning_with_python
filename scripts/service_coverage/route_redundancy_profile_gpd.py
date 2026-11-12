@@ -3,48 +3,32 @@
 "How redundant is this route?" has no single number, so this script captures
 five angles of it at once and emits one row per (schedule, route):
 
-1. **Shared vs. solo stops** — a route's stop is *shared* when any other route
-   serves a stop within walking distance of it (the same stop counts, and so
-   does an across-the-street stop with a different stop_id); it is *solo* when
-   no other route comes that close. Solo stops are the places only this route
-   serves.
-2. **Routes within walking distance** — every other route a rider standing at
-   one of this route's stops could walk to, plus (when the time check is on)
-   the subset that is a *timed alternative*: for at least one of this route's
-   scheduled stop visits, the other route has a departure nearby that the rider
-   could catch within walking time plus a maximum wait (default 30 minutes).
-3. **Shared timepoints** — the walking-distance test again, restricted to
-   timepoints (stop_times rows with ``timepoint == 1``; feeds that mark none
-   fall back to every timed stop). Agencies put timepoints at the major
-   destinations along a route, so two routes whose timepoints coincide serve
-   the same major destinations — a stronger redundancy signal than sharing
-   ordinary local stops.
-4. **Solo vs. shared service area** — a route's service area is the union of
-   walk-distance buffers around its stops. The *solo* portion is covered by no
-   other route; the *shared* portion overlaps at least one other route's
-   service area.
-5. **Paired routes** — a one-way couplet, or a loop published as two
-   direction-named routes, reads as near-total redundancy on every other angle
-   but is really one service split by direction. Pairs declared in
-   ``ROUTE_PAIRS`` are excluded from each other's metrics, so a couplet's
-   redundancy is measured against the rest of the network. Undeclared pairs
-   whose service areas mutually overlap by at least
-   ``PAIRED_ROUTE_MIN_OVERLAP_PCT`` (default 90%) are *suggested* — in a
-   ``suggested_pairs`` column and a warning log — for review and declaration
-   on a rerun; suggestions alone never change any number.
+1. **Shared vs. solo stops** — a route's stop is *shared* when any other route serves a
+   stop within walking distance of it (the same stop, or one across the street with a
+   different stop_id); it is *solo* when no other route comes that close.
+2. **Routes within walking distance** — every other route a rider at one of this route's
+   stops could walk to, plus (when the time check is on) the *timed alternatives*: for at
+   least one of this route's scheduled stop visits, the other route has a nearby
+   departure catchable within walking time plus a maximum wait (default 30 minutes).
+3. **Shared timepoints** — the walking-distance test restricted to timepoints
+   (``timepoint == 1``; feeds that mark none fall back to every timed stop). Coinciding
+   timepoints mean the same major destinations, a stronger signal than local stops.
+4. **Solo vs. shared service area** — the union of walk-distance buffers around a
+   route's stops, split into the part no other route covers and the part that overlaps
+   at least one other route's service area.
+5. **Paired routes** — a one-way couplet, or a loop published as two direction-named
+   routes, is really one service split by direction. Pairs declared in ``ROUTE_PAIRS``
+   are excluded from each other's metrics. Undeclared pairs whose service areas mutually
+   overlap by at least ``PAIRED_ROUTE_MIN_OVERLAP_PCT`` (default 90%) are *suggested* (a
+   ``suggested_pairs`` column and a warning) for review; suggestions change no number.
 
-Every angle is computed independently per schedule calendar. Each service_id is
-classified from its real active-date pattern (calendar.txt × calendar_dates.txt
-exceptions) into Weekday / Saturday / Sunday / Holiday, so a route that is
-redundant on weekdays but the only service running on Sundays shows both facts.
-Feeds with no usable calendar files are profiled once under an "All Service"
-label.
+Every angle is computed per schedule calendar: each service_id is classified from its
+real active dates (calendar.txt × calendar_dates.txt) as Weekday / Saturday / Sunday /
+Holiday, or "All Service" when the feed has no usable calendar files.
 
-Caveats: distances are straight-line in a projected CRS (no pedestrian
-network), service areas are stop buffers (not parcels reachable on foot), and
-the timed-alternative check compares this route's scheduled arrivals against
-the other route's scheduled departures — it asks "was another bus coming
-soon nearby", not "does the other route continue to my destination".
+Caveats: distances are straight-line in a projected CRS (no pedestrian network),
+service areas are stop buffers, and the timed-alternative check asks "was another bus
+coming soon nearby", not "does the other route continue to my destination".
 
 Inputs:
     - A GTFS feed (folder or .zip) with stops.txt, routes.txt, trips.txt, and
@@ -52,14 +36,12 @@ Inputs:
       the per-schedule classification.
 
 Outputs:
-    - ``route_redundancy_profile.csv``: one row per (schedule, route) with
-      shared/solo stop counts, routes within walking distance, timed
-      alternatives, shared timepoint counts, total/solo/shared service area
-      in square miles, declared paired routes, and suggested pairs.
-    - ``route_redundancy_partners.csv`` (optional): one row per
-      (schedule, route, partner route) pair with shared stop and timepoint
-      counts, the nearest walk distance, the shortest feasible wait, the
-      service-area overlap percentage, and the paired/suggested flags.
+    - ``route_redundancy_profile.csv``: one row per (schedule, route) with shared/solo
+      stop counts, routes within walking distance, timed alternatives, shared timepoint
+      counts, total/solo/shared service area in square miles, and paired/suggested pairs.
+    - ``route_redundancy_partners.csv`` (optional): one row per (schedule, route,
+      partner route) with shared stop and timepoint counts, nearest walk distance,
+      shortest feasible wait, service-area overlap percentage, and paired/suggested flags.
     - A run-log sidecar capturing the verbatim CONFIGURATION block.
 
 Typical usage:

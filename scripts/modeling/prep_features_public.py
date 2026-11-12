@@ -1,63 +1,40 @@
 """Orchestrate drop-folder feature prep (the PUBLIC half of the split).
 
-This is the unsecured-box half of a split pipeline that keeps proprietary NTD
-data on one machine while feature prep happens elsewhere. Its secured-box
-counterpart is ``prep_features_private.py``, which assembles the NTD / OTP /
-runtime features that may never cross to this side:
+This is the unsecured-box half of a split pipeline that keeps proprietary NTD data on
+one machine while feature prep happens elsewhere; ``prep_features_private.py`` is its
+secured-box counterpart. It runs the non-NTD feature scripts as subprocesses, describes
+each output table's join keys and shippable columns, and writes one CSV bundle per
+join-key signature plus a manifest. ``monthly_ridership_model.py``, which runs only where
+the NTD anchor lives, verifies and joins the bundles onto the anchor and fits the model.
 
-    PUBLIC (this script, runs anywhere, NO NTD)
-        Runs the non-NTD feature-generation scripts as subprocesses, collects
-        the tabular outputs they write, describes each output's join keys and
-        shippable columns (registry-or-inference), then groups everything by
-        join-key signature and writes one CSV bundle per signature plus a
-        manifest (row counts + per-bundle SHA-256 + provenance).
-
-    MODEL (``monthly_ridership_model.py``, runs only where the NTD anchor lives)
-        Loads the NTD anchor, verifies and joins each prepped bundle onto it,
-        then fits the regression and exports results.
-
-Workflow (front half is new; the "combine" back half is unchanged):
+Workflow:
 
     scan -> extract -> run -> collect -> describe -> combine
 
     scan      Discover feature scripts (``SCRIPTS_DIR`` and an optional inbox)
               and an optional ``jobs.json`` registry.
-    extract   Optionally unzip ``*.zip`` archives found under the input root
-              (zip-slip guarded), so a human can drop either loose files or
-              zips.
-    run       Invoke each script as a subprocess using a per-script command
-              template (from the registry, else ``DEFAULT_CMD_TEMPLATE``),
-              each into its own output subdir, capturing logs, applying a
-              per-script timeout, and recording the exit code.
-    collect   Gather the ``*.csv`` / ``*.xlsx`` tables each successful script
-              produced.
-    describe  Resolve each table's join keys + kept columns from the registry
-              when present, else by inference, building a ``list[FeatureTable]``
-              dynamically instead of hardcoding it.
-    combine   Run the existing back half: ``validate_config`` (fail-closed
-              governance), then ``write_bundles`` -> ``write_manifest`` ->
-              ``write_run_log``.
+    extract   Optionally unzip dropped ``*.zip`` archives (zip-slip guarded).
+    run       Invoke each script as a subprocess from its command template (registry,
+              else ``DEFAULT_CMD_TEMPLATE``) into its own output subdir, capturing logs,
+              applying a per-script timeout, and recording the exit code.
+    collect   Gather the ``*.csv`` / ``*.xlsx`` tables each successful script produced.
+    describe  Resolve each table's join keys + kept columns (registry, else inference).
+    combine   ``validate_config`` (fail-closed governance), then ``write_bundles`` ->
+              ``write_manifest`` -> ``write_run_log``.
 
 Notes:
-    - One bundle per join-key signature. Tables that share a join key (e.g. all
-      the ``route_id`` coverage tables) are outer-merged into a single bundle; a
-      differently keyed table (e.g. ``period``-keyed exogenous series) goes to
-      its own bundle. The model then joins each bundle only if the anchor carries
-      its keys, which is what makes ``period`` optional downstream.
-    - Run-what-you-can, fail-closed only on leakage. A script that exits
-      non-zero or times out is logged and skipped; the run continues. The only
-      hard failures are (a) a shipped column matching ``FORBIDDEN_COLUMN_PATTERNS``
-      (caught by ``validate_config`` *before* any bundle is written) and (b) zero
-      usable bundles.
-    - CSV only. Bundles cross to a stock ``arcgispro-py3`` env that has no
-      ``pyarrow``, so Parquet is deliberately avoided.
-    - This script must never read, require, or reference the NTD anchor; that is
-      ``monthly_ridership_model.py``'s job on the secured box.
+    - Tables that share a join key (e.g. the ``route_id`` coverage tables) are
+      outer-merged into one bundle; a differently keyed table (e.g. a ``period``-keyed
+      series) gets its own. The model joins a bundle only if the anchor has its keys.
+    - Run-what-you-can: a failed or timed-out script is logged and skipped. The only hard
+      failures are a shipped column matching ``FORBIDDEN_COLUMN_PATTERNS`` (caught before
+      any bundle is written) and zero usable bundles.
+    - CSV only: bundles cross to a stock ``arcgispro-py3`` env that has no ``pyarrow``.
+    - This script must never read, require, or reference the NTD anchor.
 
 Inputs:
-    - Feature-generation scripts (``*.py``) plus their input data, and an
-      optional ``jobs.json`` registry describing each script's command and the
-      join keys / kept columns of its outputs.
+    - Feature-generation scripts (``*.py``) and their input data, plus an optional
+      ``jobs.json`` registry of each script's command and its outputs' keys / columns.
 
 Outputs:
     - One CSV bundle per join-key signature in ``OUTPUT_DIR``.
@@ -67,10 +44,9 @@ Outputs:
       exit code, duration, and collected output files.
 
 Typical usage:
-    Update the paths in the CONFIGURATION section (or pass the matching CLI flags,
-    e.g. ``--scripts-dir`` / ``--input-dir`` / ``--output-dir``), run from a shell
-    or a Jupyter notebook on the unsecured box, then transfer the resulting bundle
-    folder + manifest to the secured box for the model scripts.
+    Update the paths in the CONFIGURATION section (or pass ``--scripts-dir`` /
+    ``--input-dir`` / ``--output-dir``), run on the unsecured box from a shell or a
+    Jupyter notebook, then move the bundle folder + manifest to the secured box.
 """
 
 from __future__ import annotations
