@@ -74,7 +74,7 @@ Caveats worth knowing before you read the coefficients:
       number, the number is 1 if any of them stops in the CBD.
 
 Inputs:
-    A GTFS feed folder containing routes/trips/calendar/stop_times/shapes (.txt).
+    A GTFS feed folder or .zip containing routes/trips/calendar/stop_times/shapes (.txt).
     Optionally, CBD_PATH: a polygon layer (.shp, or a .zip holding one) of the central
     business district. It may hold several polygons; a stop in any of them counts.
     stops.txt is also read when it is set.
@@ -99,8 +99,10 @@ import logging
 import os
 import sys
 import zipfile
+from collections.abc import Generator
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Final, List, Optional, Sequence
+from typing import IO, Final, List, Optional, Sequence
 
 import geopandas as gpd
 import numpy as np
@@ -123,7 +125,7 @@ CONFIG_END_MARKER: Final[str] = "# === END CONFIG ==="
 # shapefile, service-type file) live here as siblings of the GTFS feed.
 INPUT_DIR: Final[Path] = Path(r"Path\To\Your\Input_Folder")  # <<< EDIT ME
 
-# GTFS feed folder. Resolved under INPUT_DIR by default; repoint to an absolute
+# GTFS feed folder or .zip. Resolved under INPUT_DIR by default; repoint to an absolute
 # path (e.g. the shared G:\ data drive) if the feed isn't copied per request.
 GTFS_DIR: Final[Path] = INPUT_DIR / "your_gtfs_name"  # <<< EDIT ME
 
@@ -176,25 +178,86 @@ def _canonical_key(series: pd.Series) -> pd.Series:
     return out.fillna("")
 
 
-def _gtfs_path(gtfs_dir: Path, name: str) -> Path:
-    """Return the path to a required GTFS file, raising if it is missing."""
-    path = gtfs_dir / name
-    if not path.exists():
-        raise FileNotFoundError(f"Missing GTFS file: {path}")
-    return path
+@contextmanager
+def open_gtfs_file(
+    gtfs_path: str | os.PathLike[str], file_name: str
+) -> Generator[IO[bytes], None, None]:
+    """Open one GTFS text file from a feed folder or a ``.zip`` of the feed.
+
+    The counterpart of :func:`load_gtfs_data` for scripts that read a file with
+    their own options (``pandas.read_csv`` with ``usecols`` or
+    ``keep_default_na=False``, or the :mod:`csv` module), so they accept a
+    zipped feed without extracting it. Zip members are found the way
+    :func:`load_gtfs_data` finds them: at the archive root or inside a single
+    wrapper folder.
+
+    Args:
+        gtfs_path: Folder containing the GTFS feed, or a ``.zip`` archive of it.
+        file_name: GTFS file to open, e.g. ``"stops.txt"``.
+
+    Yields:
+        A binary file handle. ``pandas.read_csv`` reads it directly; wrap it in
+        :class:`io.TextIOWrapper` for the :mod:`csv` module.
+
+    Raises:
+        FileNotFoundError: *gtfs_path* does not exist, or the feed has no
+            *file_name*.
+        ValueError: *gtfs_path* is neither a directory nor a valid ``.zip``
+            file, or *file_name* is found in more than one place in the zip.
+    """
+    path = os.fspath(gtfs_path)
+    if os.path.isdir(path):
+        file_path = os.path.join(path, file_name)
+        if not os.path.isfile(file_path):
+            raise FileNotFoundError(f"Missing GTFS file in '{path}': {file_name}")
+        with open(file_path, "rb") as handle:
+            yield handle
+        return
+
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"The path '{path}' does not exist.")
+    if not (os.path.isfile(path) and path.lower().endswith(".zip")):
+        raise ValueError(f"'{path}' is neither a directory nor a .zip file.")
+    try:
+        archive = zipfile.ZipFile(path)
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"'{path}' is not a valid zip archive.") from exc
+    with archive:
+        matches = [name for name in archive.namelist() if os.path.basename(name) == file_name]
+        if not matches:
+            raise FileNotFoundError(f"Missing GTFS file in '{path}': {file_name}")
+        if len(matches) > 1:
+            raise ValueError(
+                f"Ambiguous GTFS file in '{path}' (found in multiple locations): {file_name}"
+            )
+        with archive.open(matches[0]) as handle:
+            yield handle
 
 
-def _read_gtfs_csv(path: Path, usecols: Optional[Sequence[str]] = None) -> pd.DataFrame:
+def _read_gtfs_csv(path: Path | IO[bytes], usecols: Optional[Sequence[str]] = None) -> pd.DataFrame:
     """Read a GTFS table as all-string columns (IDs are categorical, never numeric)."""
     return pd.read_csv(path, dtype=str, usecols=usecols, encoding="utf-8-sig", low_memory=False)
 
 
+def _read_feed_csv(
+    gtfs_dir: Path, name: str, usecols: Optional[Sequence[str]] = None
+) -> pd.DataFrame:
+    """Read *name* from a GTFS feed folder or .zip; FileNotFoundError if it is missing."""
+    with open_gtfs_file(gtfs_dir, name) as handle:
+        return _read_gtfs_csv(handle, usecols=usecols)
+
+
 def _sha256_file(path: Path) -> str:
     """Return the hex SHA-256 of a file, read in chunks."""
-    digest = hashlib.sha256()
     with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1 << 20), b""):
-            digest.update(chunk)
+        return _sha256_stream(handle)
+
+
+def _sha256_stream(handle: IO[bytes]) -> str:
+    """Return the hex SHA-256 of an open binary stream, read in chunks."""
+    digest = hashlib.sha256()
+    for chunk in iter(lambda: handle.read(1 << 20), b""):
+        digest.update(chunk)
     return digest.hexdigest()
 
 
@@ -350,9 +413,9 @@ def _time_to_seconds(series: pd.Series) -> pd.Series:
 
 
 def load_stop_times_filtered(
-    stop_times_path: Path, trip_ids: set[str], chunksize: int
+    stop_times_path: Path | IO[bytes], trip_ids: set[str], chunksize: int
 ) -> pd.DataFrame:
-    """Stream stop_times.txt, keeping only rows for the in-scope trips."""
+    """Stream stop_times.txt (a path or an open binary handle), keeping in-scope trips only."""
     usecols = ["trip_id", "arrival_time", "departure_time", "stop_sequence", "stop_id"]
     kept: list[pd.DataFrame] = []
     for chunk in pd.read_csv(
@@ -371,7 +434,7 @@ def load_stop_times_filtered(
     return pd.concat(kept, ignore_index=True)
 
 
-def compute_shape_lengths(shapes_path: Path, shape_ids: set[str]) -> pd.DataFrame:
+def compute_shape_lengths(shapes_path: Path | IO[bytes], shape_ids: set[str]) -> pd.DataFrame:
     """Haversine length (meters) of each in-scope shape -> [shape_id, shape_len_m]."""
     usecols = ["shape_id", "shape_pt_lat", "shape_pt_lon", "shape_pt_sequence"]
     df = _read_gtfs_csv(shapes_path, usecols=usecols)
@@ -829,7 +892,7 @@ def find_cbd_stop_ids(stops: pd.DataFrame, cbd_area: gpd.GeoSeries) -> set[str]:
 
 
 def compute_serves_cbd(
-    stop_times_path: Path,
+    stop_times_path: Path | IO[bytes],
     all_trips: pd.DataFrame,
     routes: pd.DataFrame,
     cbd_stop_ids: set[str],
@@ -841,7 +904,7 @@ def compute_serves_cbd(
     so a route whose only CBD stops are on, say, Saturday trips is still flagged.
 
     Args:
-        stop_times_path: Path to stop_times.txt.
+        stop_times_path: Path to stop_times.txt, or an open binary handle to it.
         all_trips: Every trip in the feed, with string ``route_id`` and ``trip_id``.
         routes: routes.txt with string ``route_id`` and ``route_short_name``.
         cbd_stop_ids: stop_ids inside or on the edge of the CBD.
@@ -1073,11 +1136,13 @@ def run(
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    routes = _read_gtfs_csv(_gtfs_path(gtfs_dir, "routes.txt"))
-    trips = _read_gtfs_csv(_gtfs_path(gtfs_dir, "trips.txt"))
-    calendar = _read_gtfs_csv(_gtfs_path(gtfs_dir, "calendar.txt"))
-    cd_path = gtfs_dir / "calendar_dates.txt"
-    calendar_dates = _read_gtfs_csv(cd_path) if cd_path.exists() else None
+    routes = _read_feed_csv(gtfs_dir, "routes.txt")
+    trips = _read_feed_csv(gtfs_dir, "trips.txt")
+    calendar = _read_feed_csv(gtfs_dir, "calendar.txt")
+    try:
+        calendar_dates: Optional[pd.DataFrame] = _read_feed_csv(gtfs_dir, "calendar_dates.txt")
+    except FileNotFoundError:
+        calendar_dates = None
 
     analysis_date, active_sids = choose_analysis_date_and_services(
         calendar, calendar_dates, analysis_weekday
@@ -1099,11 +1164,11 @@ def run(
     trip_ids = set(trips["trip_id"])
     shape_ids = set(trips["shape_id"]) - {""}
 
-    stop_times = load_stop_times_filtered(
-        _gtfs_path(gtfs_dir, "stop_times.txt"), trip_ids, STOP_TIMES_CHUNKSIZE
-    )
+    with open_gtfs_file(gtfs_dir, "stop_times.txt") as handle:
+        stop_times = load_stop_times_filtered(handle, trip_ids, STOP_TIMES_CHUNKSIZE)
     logging.info("stop_times rows in scope: %d", len(stop_times))
-    shape_len = compute_shape_lengths(_gtfs_path(gtfs_dir, "shapes.txt"), shape_ids)
+    with open_gtfs_file(gtfs_dir, "shapes.txt") as handle:
+        shape_len = compute_shape_lengths(handle, shape_ids)
     logging.info("Shapes measured: %d", len(shape_len))
 
     supply = compute_route_supply_metrics(trips, stop_times, shape_len)
@@ -1127,9 +1192,7 @@ def run(
     features["route_id"] = _canonical_key(features["route_id"])
 
     if cbd_area is not None:
-        stops = _read_gtfs_csv(
-            _gtfs_path(gtfs_dir, "stops.txt"), usecols=["stop_id", "stop_lat", "stop_lon"]
-        )
+        stops = _read_feed_csv(gtfs_dir, "stops.txt", usecols=["stop_id", "stop_lat", "stop_lon"])
         cbd_stop_ids = find_cbd_stop_ids(stops, cbd_area)
         if not cbd_stop_ids:
             logging.warning(
@@ -1137,13 +1200,10 @@ def run(
                 "Check that the layer covers this feed's area and has the right "
                 "coordinate system."
             )
-        serves_cbd = compute_serves_cbd(
-            _gtfs_path(gtfs_dir, "stop_times.txt"),
-            all_trips,
-            routes,
-            cbd_stop_ids,
-            STOP_TIMES_CHUNKSIZE,
-        )
+        with open_gtfs_file(gtfs_dir, "stop_times.txt") as handle:
+            serves_cbd = compute_serves_cbd(
+                handle, all_trips, routes, cbd_stop_ids, STOP_TIMES_CHUNKSIZE
+            )
         features = features.merge(serves_cbd, on="route_id", how="left")
         features["serves_cbd"] = features["serves_cbd"].fillna(0).astype(int)
         logging.info(
@@ -1189,9 +1249,13 @@ def run(
         feed_names = ["routes.txt", "trips.txt", "calendar.txt", "stop_times.txt", "shapes.txt"]
         if cbd_path is not None:
             feed_names.append("stops.txt")
-        feed_files = {
-            name: _sha256_file(gtfs_dir / name) for name in feed_names if (gtfs_dir / name).exists()
-        }
+        feed_files: dict[str, str] = {}
+        for name in feed_names:
+            try:
+                with open_gtfs_file(gtfs_dir, name) as handle:
+                    feed_files[name] = _sha256_stream(handle)
+            except FileNotFoundError:
+                continue
         write_run_log(
             output_dir,
             feed_files,
@@ -1247,7 +1311,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
-        "--gtfs-dir", type=Path, default=GTFS_DIR, help="Path to the GTFS feed folder."
+        "--gtfs-dir", type=Path, default=GTFS_DIR, help="Path to the GTFS feed folder or .zip."
     )
     parser.add_argument(
         "--output-dir",
