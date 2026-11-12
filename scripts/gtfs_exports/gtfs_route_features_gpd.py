@@ -1,16 +1,8 @@
 """Compute route-level GTFS supply & competition features (PART A feature generator).
 
 This is a feature-generation script for the cross-sectional route boardings model
-(engine 1). It reads a GTFS feed directly — no arcpy; distances are haversine, and
-GeoPandas is used only to read the optional CBD polygon layer — and emits one row per
-route, keyed so the result joins straight onto the NTD boardings anchor consumed by
-``route_performance_model.py`` (PART B).
-
-Where this sits in the pipeline:
-
-    PART A (this script + others)   ->  route-keyed CSV of non-NTD features
-    prep_features_public.py (orchestrator) ->  bundles the CSV(s) + writes manifest.json
-    route_performance_model.py (PART B) ->  joins the bundle onto the NTD anchor, fits OLS
+(engine 1). It reads a GTFS feed directly (haversine distances; GeoPandas only for the
+CBD layer) and emits one row per route for ``route_performance_model.py`` (PART B).
 
 Features produced (one row per route, keyed on ``route_id`` = GTFS route_short_name):
 
@@ -24,9 +16,7 @@ Features produced (one row per route, keyed on ``route_id`` = GTFS route_short_n
         route_length_mi       representative one-way length (longest shape the route uses)
         route_length_modal_mi one-way length of the modal shape variant (shape most trips run)
         avg_speed_mph         revenue_miles / revenue_hours
-        n_directions          distinct trips.txt direction_id values among the day's trips
-                              (2 = bidirectional, 1 = one-way or loop; NaN when the feed
-                              provides no usable direction_id)
+        n_directions          distinct direction_id values (2 = bidirectional; NaN if none)
 
     Network structure / redundancy:
         n_stops                          distinct stops served by the route
@@ -37,57 +27,26 @@ Features produced (one row per route, keyed on ``route_id`` = GTFS route_short_n
         competition_intensity            competitor trips at shared stops / this route's trips
 
     Location (only when CBD_PATH is set):
-        serves_cbd            1 if the route stops inside or on the edge of any polygon in
-                              the CBD layer, on any schedule in the feed; otherwise 0
-
-PHASE 2 (deferred to a separate spatial feature script): WMATA cross-agency competition
-and Metrorail proximity both need an external feed and spatial stop matching, so they
-belong with the geospatial features rather than here. serves_cbd is the exception: it
-only tests this feed's own stops against a polygon layer.
+        serves_cbd            1 if the route stops inside or on the edge of a CBD polygon
 
 Caveats worth knowing before you read the coefficients:
-    - median_headway_min is a coarse all-day, all-direction route-level median; it mixes
-      directions and counts layover gaps below 4 h. Peak/by-direction headway is a later
-      refinement, not this number.
-    - pct_day_with_service is the more robust service-span measure: the share of the day's
-      24 one-hour bins in which at least one trip *departs*, x100. Counting departures (not
-      whole operating intervals) mirrors what a rider waiting at a stop experiences -- how
-      often a boardable vehicle shows up, not that some bus is mid-route elsewhere -- so a
-      long through-running trip credits only its start bin. Bins are one hour wide on
-      purpose: a route running at least hourly counts as serving the whole hour, so this
-      stays a span/availability measure and leaves finer frequency (30- vs 60-minute
-      service) to median_headway_min rather than docking the route for the empty half of
-      each hour. Unlike that headway it is direction-agnostic and counts every
-      midday/overnight gap rather than ignoring it. Late trips keep the GTFS extended clock
-      (25:xx, 26:xx are not wrapped to the next day), matching span_hours / runtimes; the
-      denominator is a nominal 24 h (24 bins).
-    - revenue_miles is a daily total (a supply *quantity*); route_length_mi is the
-      one-way extent used for stops_per_mile. They are deliberately different units.
-    - route_length_mi is the route's longest shape (its full extent); route_length_modal_mi
-      is the length of the shape variant the most trips run (the *typical* one-way trip).
-      They diverge when a route has short-turns or occasional extensions. stops_per_mile
-      still pairs with route_length_mi (the all-shapes distinct-stop count needs the extent).
-    - serves_cbd ignores the analysis weekday: a route is 1 if any of its trips, on any
-      service in the feed, stops in the CBD. It tests stops, not the route line, so a
-      route that passes through the CBD without stopping there is 0. A stop exactly on a
-      polygon's edge counts as inside. When several GTFS route_ids share a public route
-      number, the number is 1 if any of them stops in the CBD.
+    - median_headway_min mixes directions and counts layover gaps below 4 h, while
+      pct_day_with_service counts only hours with a departure: a span, not frequency.
+    - route_length_mi (longest shape) and route_length_modal_mi (typical trip) diverge
+      with short-turns; revenue_miles is a daily total, a deliberately different unit.
+    - serves_cbd ignores the analysis weekday and tests stops, not the route line.
 
 Inputs:
-    A GTFS feed folder containing routes/trips/calendar/stop_times/shapes (.txt).
-    Optionally, CBD_PATH: a polygon layer (.shp, or a .zip holding one) of the central
-    business district. It may hold several polygons; a stop in any of them counts.
-    stops.txt is also read when it is set.
+    A GTFS feed folder containing routes/trips/calendar/stop_times/shapes (.txt) and,
+    optionally, CBD_PATH: a CBD polygon layer (.shp, or a .zip holding one).
 
 Outputs:
-    OUTPUT_DIR / OUTPUT_CSV_NAME : the route-keyed feature table.
-    A run-log sidecar capturing the verbatim config block, feed SHA-256, and the
-    analysis date that was actually selected.
+    OUTPUT_DIR / OUTPUT_CSV_NAME : the route-keyed feature table, plus a run-log sidecar
+    with the verbatim config block, feed SHA-256, and the analysis date actually selected.
 
 Typical usage:
-    Update the paths in the CONFIGURATION block (or pass ``--gtfs-dir`` /
-    ``--output-dir`` / ``--analysis-weekday`` / ``--cbd-path``) and run from a
-    shell or a Jupyter notebook.
+    Update the paths in CONFIGURATION (or pass ``--gtfs-dir`` / ``--output-dir`` /
+    ``--analysis-weekday`` / ``--cbd-path``) and run from a shell or a Jupyter notebook.
 """
 
 from __future__ import annotations

@@ -1,17 +1,9 @@
 """Generate mock GTFS feeds (composed of .txt files) for development and testing.
 
-Produces one self-contained GTFS feed per region (DC by default).
-Each feed exercises a range of route archetypes, service profiles, headways,
-stop spacings, and block lengths to serve as fixture data for downstream
-scripts in this repository (e.g., schedule exporters, stop-spacing flaggers,
-skipped-stop flaggers, GTFS-to-shapefile converters).
-
-Outputs
--------
-For each region, a complete GTFS package containing:
-    agency.txt, stops.txt, routes.txt, trips.txt, stop_times.txt,
-    calendar.txt, calendar_dates.txt, shapes.txt, feed_info.txt,
-    fare_attributes.txt, fare_rules.txt (GTFS-Fares v1)
+Produces one self-contained GTFS feed per region (DC by default). Each feed exercises a
+range of route archetypes, service profiles, headways, stop spacings, and block lengths
+to serve as fixture data for downstream scripts in this repository (e.g., schedule
+exporters, stop-spacing and skipped-stop flaggers, GTFS-to-shapefile converters).
 
 Route archetypes per region (five routes each):
     10  N-S Local         — all-day weekday/Sat/Sun, weekday late-night tail
@@ -20,28 +12,20 @@ Route archetypes per region (five routes each):
     40  NE-SW Diagonal    — all-day weekday/Sat/Sun, close stop spacing
     50H Holiday Loop      — holiday only, clockwise; shares east leg with R10
 
-Fares (FARE_ATTRIBUTES): routes 10, 30 and 40 take the LOCAL fare, route 20
-the EXPRESS fare and route 50H the FREE fare, one fare_rules row per route.
+Fares (FARE_ATTRIBUTES): routes 10, 30 and 40 take the LOCAL fare, route 20 the EXPRESS
+fare and route 50H the FREE fare, one fare_rules row per route. Blocks chain trips on
+one route and service; a trip joins a block only if the bus can deadhead to its first
+stop (DEADHEAD_SPEED_MPH, DEADHEAD_DETOUR_FACTOR) and still take its layover.
 
-Blocks chain trips on one route and service. A trip joins a block only if the
-bus can deadhead from where it is to the trip's first stop
-(DEADHEAD_SPEED_MPH, DEADHEAD_DETOUR_FACTOR) and still take its layover.
+With WRITE_TODS, the base feed also gets TODS 2.1 supplement files (routes_, stops_,
+trips_ and stop_times_supplement.txt) for the same blocks' nonrevenue movements: a
+pull-out from and pull-back to the garage nearest each block's first stop, and an
+interlining deadhead wherever a bus's next trip starts elsewhere. Every row is new, so
+applying the supplements to the base feed only adds data.
 
-TODS
-----
-With WRITE_TODS, the base feed also gets TODS 2.1 supplement files describing
-the same blocks' nonrevenue movements (routes_, stops_, trips_ and
-stop_times_supplement.txt): a pull-out from the garage nearest each block's
-first stop, a pull-back to that garage, and an interlining deadhead wherever a
-bus ends a trip somewhere other than where its next trip starts. Every row is
-new, so applying the supplements to the base feed only adds data.
-
-Feed archive
-------------
-Each region also gets dated copies of its feed (ARCHIVE_EDITIONS), one per
-calendar year, for scripts that compare a sequence of feeds
-(gtfs_route_diff.py, gtfs_route_timeline.py, gtfs_service_change_dates.py).
-The DC copies are:
+Each region also gets dated copies of its feed (ARCHIVE_EDITIONS), one per calendar
+year, for scripts that compare a sequence of feeds (gtfs_route_diff.py,
+gtfs_route_timeline.py, gtfs_service_change_dates.py). The DC copies are:
     dc_2024  no Sunday service; route 30 every 20 min on weekdays; $1.75
              local fare and no free fare (route 50H charges the local fare)
     dc_2025  service change only: Sunday service starts and route 30 runs
@@ -49,27 +33,20 @@ The DC copies are:
     dc_2026  fare change only: local fare $2.00, FREE fare added and route
              50H moved to it; identical to the single dc/ feed
 
-Geographic basis
-----------------
-Each region's bounding box is taken from a Census shapefile fixture if one is
-configured and reachable; otherwise the script falls back to a hardcoded
-approximate bbox. Shapes are drawn so they (nearly) hit the edges of the
-bounding box, with a small inset so they sit inside the study area.
+Each region's bounding box comes from a Census shapefile fixture if one is configured
+and reachable, else a hardcoded approximation; shapes nearly reach its edges.
 
 Inputs:
     - OUTPUT_DIR: Folder where the feeds will be written.
-    - DC_FIXTURE_PATH (optional): Path to any geopandas-readable file
-      (.shp, .geojson, .gpkg, ...) used to derive the region bounding box.
-      Geopandas is imported lazily — the script runs fine without it when
-      no fixture path is configured.
+    - DC_FIXTURE_PATH (optional): any geopandas-readable file (.shp, .geojson, .gpkg, ...)
+      that sets the region bounding box; geopandas is imported only when it is configured.
 
 Outputs:
-    - One GTFS sub-folder per region under OUTPUT_DIR (dc/), holding the
-      .txt files listed above.
-    - One archive folder per region under OUTPUT_DIR (dc_archive/), holding
-      one dated feed sub-folder per ARCHIVE_EDITIONS entry (dc_2024/, ...).
-    - With WRITE_TODS, one TODS folder per region under OUTPUT_DIR (dc_tods/)
-      holding the four supplement files for the base feed.
+    - One GTFS sub-folder per region under OUTPUT_DIR (dc/): agency, stops, routes,
+      trips, stop_times, calendar, calendar_dates, shapes, feed_info, fare_attributes
+      and fare_rules (.txt; GTFS-Fares v1).
+    - One archive folder per region (dc_archive/) with one dated feed per edition.
+    - With WRITE_TODS, one TODS folder per region (dc_tods/) with the four supplements.
 """
 
 from __future__ import annotations
