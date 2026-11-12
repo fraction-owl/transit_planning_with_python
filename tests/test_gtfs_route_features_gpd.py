@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import shutil
 import zipfile
 from pathlib import Path
@@ -331,6 +332,29 @@ def test_serves_cbd_on_the_mock_dc_feed_and_cbd_fixture(tmp_path: Path) -> None:
     }
     runlog = (out_dir / "gtfs_route_features_runlog.txt").read_text(encoding="utf-8")
     assert f"CBD layer:       {MOCK_CBD_ZIP}  sha256=" in runlog
+
+
+def test_main_reads_zipped_feed_like_extracted_folder(tmp_path: Path) -> None:
+    # The fixture keeps its files in a dc/ wrapper folder inside the zip.
+    with zipfile.ZipFile(MOCK_GTFS_DC_ZIP) as zf:
+        zf.extractall(tmp_path / "feed")
+        routes_bytes = zf.read("dc/routes.txt")
+    cbd = ["--cbd-path", str(MOCK_CBD_ZIP)]
+    folder_out, zip_out = tmp_path / "out_folder", tmp_path / "out_zip"
+
+    assert (
+        main(["--gtfs-dir", str(tmp_path / "feed" / "dc"), "--output-dir", str(folder_out), *cbd])
+        == 0
+    )
+    assert main(["--gtfs-dir", str(MOCK_GTFS_DC_ZIP), "--output-dir", str(zip_out), *cbd]) == 0
+
+    pd.testing.assert_frame_equal(
+        pd.read_csv(zip_out / "gtfs_route_features.csv", dtype={"route_id": str}),
+        pd.read_csv(folder_out / "gtfs_route_features.csv", dtype={"route_id": str}),
+    )
+    # The run log hashes each feed file read from inside the zip.
+    runlog = (zip_out / "gtfs_route_features_runlog.txt").read_text(encoding="utf-8")
+    assert f"routes.txt  sha256={hashlib.sha256(routes_bytes).hexdigest()}" in runlog
 
 
 def test_serves_cbd_counts_a_stop_served_only_on_another_schedule(tmp_path: Path) -> None:

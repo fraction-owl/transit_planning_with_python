@@ -40,8 +40,12 @@ from __future__ import annotations
 
 import logging
 import math
+import os
+import zipfile
+from collections.abc import Generator
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple, cast
+from typing import IO, Any, Dict, List, Optional, Sequence, Tuple, cast
 
 import geopandas as gpd
 import matplotlib.pyplot as plt
@@ -58,11 +62,13 @@ from shapely.strtree import STRtree
 # =============================================================================
 # === BEGIN CONFIG ===
 
+# A .zip holding the shapefile also works.
 SIDEWALK_SHP = Path(r"Path\To\Your\Sidewalks_Centerline.shp")  # Must be a functional network
-GTFS_DIR = Path(r"Path\To\Your\GTFS_Folder")  # folder path must contain stops.txt
+GTFS_DIR = Path(r"Path\To\Your\GTFS_Folder")  # GTFS feed folder or .zip with stops.txt
 OUTPUT_DIR = Path(r"Path\To\Your\Output_Folder")
 
 # Plotting-only backdrop (not used for analysis)
+# A .zip holding the shapefile also works.
 PLOT_SIDEWALKS_SHP: Optional[Path] = Path(r"Path\To\Your\Sidewalks_Centerline.shp")
 SIDEWALK_BACKDROP_PAD_FT: float = 300.0  # how far to expand the map view when clipping
 
@@ -109,6 +115,76 @@ DEFAULT_NODE_GRID_FT: float = NODE_GRID_FT
 # =============================================================================
 
 
+def load_shapefile(path: str, member: Optional[str] = None) -> gpd.GeoDataFrame:
+    """Load a shapefile given a direct ``.shp`` path or a ``.zip`` archive.
+
+    Args:
+        path: Path to a ``.shp`` file, or to a ``.zip`` archive containing
+            one. A zipped shapefile is opened directly via GDAL's ``zip://``
+            virtual filesystem, so the archive is never extracted to disk.
+        member: For a ``.zip`` containing more than one ``.shp``, the name
+            of the one to load (matched case-insensitively against its
+            base filename, e.g. ``"Hospitals.shp"``). Ignored when *path*
+            is a direct ``.shp`` file. Required when the archive contains
+            more than one shapefile. macOS metadata entries (anything under
+            ``__MACOSX/`` and ``._*`` files) are not counted as shapefiles.
+
+    Returns:
+        The loaded :class:`geopandas.GeoDataFrame`.
+
+    Raises:
+        OSError: *path* does not exist.
+        ValueError: *path* is neither a ``.shp`` nor a ``.zip`` file; the
+            zip is unreadable/corrupt; the zip contains no shapefile; the
+            zip contains more than one shapefile and *member* was not
+            supplied; or *member* does not match any shapefile in the zip.
+    """
+    if not os.path.exists(path):
+        raise OSError(f"The path '{path}' does not exist.")
+
+    lower_path = path.lower()
+    if lower_path.endswith(".shp"):
+        logging.info("Reading %s", path)
+        return gpd.read_file(path)
+
+    if not lower_path.endswith(".zip"):
+        raise ValueError(f"'{path}' is neither a .shp nor a .zip file.")
+
+    try:
+        with zipfile.ZipFile(path) as archive:
+            # Zips made with macOS Finder add __MACOSX/._<name>.shp metadata
+            # files next to the real ones; they are not shapefiles.
+            shp_members = [
+                name
+                for name in archive.namelist()
+                if name.lower().endswith(".shp")
+                and not name.startswith("__MACOSX/")
+                and not os.path.basename(name).startswith("._")
+            ]
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"'{path}' is not a valid zip archive.") from exc
+
+    if not shp_members:
+        raise ValueError(f"No .shp file found inside '{path}'.")
+
+    if member is not None:
+        matches = [name for name in shp_members if os.path.basename(name).lower() == member.lower()]
+        if not matches:
+            raise ValueError(f"'{member}' not found inside '{path}'. Available: {shp_members}")
+        chosen = matches[0]
+    elif len(shp_members) == 1:
+        chosen = shp_members[0]
+    else:
+        raise ValueError(
+            f"'{path}' contains {len(shp_members)} shapefiles; pass `member=` to "
+            f"choose one of: {shp_members}"
+        )
+
+    source = f"zip://{path}!{chosen}"
+    logging.info("Reading %s", source)
+    return gpd.read_file(source)
+
+
 def _load_backdrop_layer_for_plots(
     path: Optional[Path], target_crs: int | str
 ) -> Optional[gpd.GeoDataFrame]:
@@ -116,7 +192,9 @@ def _load_backdrop_layer_for_plots(
     if path is None:
         return None
     try:
-        gdf = gpd.read_file(path)
+        gdf = (
+            load_shapefile(str(path)) if str(path).lower().endswith(".zip") else gpd.read_file(path)
+        )
     except Exception as exc:  # noqa: BLE001
         logging.warning("Backdrop load failed (%s); continuing without it.", exc)
         return None
@@ -284,7 +362,7 @@ def linestring_substring(line: LineString, start_m: float, end_m: float) -> Line
 
 def load_centerlines(path: Path, target_crs: int | str) -> gpd.GeoDataFrame:
     """Load centerlines and reproject to target CRS."""
-    gdf = gpd.read_file(path)
+    gdf = load_shapefile(str(path)) if str(path).lower().endswith(".zip") else gpd.read_file(path)
     if gdf.crs is None:
         raise ValueError("Sidewalk/centerline file has no CRS.")
     return gdf.to_crs(target_crs)
@@ -333,10 +411,66 @@ def build_segment_index(
     return index, seg_geoms, wkb_to_eid
 
 
+@contextmanager
+def open_gtfs_file(
+    gtfs_path: str | os.PathLike[str], file_name: str
+) -> Generator[IO[bytes], None, None]:
+    """Open one GTFS text file from a feed folder or a ``.zip`` of the feed.
+
+    The counterpart of :func:`load_gtfs_data` for scripts that read a file with
+    their own options (``pandas.read_csv`` with ``usecols`` or
+    ``keep_default_na=False``, or the :mod:`csv` module), so they accept a
+    zipped feed without extracting it. Zip members are found the way
+    :func:`load_gtfs_data` finds them: at the archive root or inside a single
+    wrapper folder.
+
+    Args:
+        gtfs_path: Folder containing the GTFS feed, or a ``.zip`` archive of it.
+        file_name: GTFS file to open, e.g. ``"stops.txt"``.
+
+    Yields:
+        A binary file handle. ``pandas.read_csv`` reads it directly; wrap it in
+        :class:`io.TextIOWrapper` for the :mod:`csv` module.
+
+    Raises:
+        FileNotFoundError: *gtfs_path* does not exist, or the feed has no
+            *file_name*.
+        ValueError: *gtfs_path* is neither a directory nor a valid ``.zip``
+            file, or *file_name* is found in more than one place in the zip.
+    """
+    path = os.fspath(gtfs_path)
+    if os.path.isdir(path):
+        file_path = os.path.join(path, file_name)
+        if not os.path.isfile(file_path):
+            raise FileNotFoundError(f"Missing GTFS file in '{path}': {file_name}")
+        with open(file_path, "rb") as handle:
+            yield handle
+        return
+
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"The path '{path}' does not exist.")
+    if not (os.path.isfile(path) and path.lower().endswith(".zip")):
+        raise ValueError(f"'{path}' is neither a directory nor a .zip file.")
+    try:
+        archive = zipfile.ZipFile(path)
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"'{path}' is not a valid zip archive.") from exc
+    with archive:
+        matches = [name for name in archive.namelist() if os.path.basename(name) == file_name]
+        if not matches:
+            raise FileNotFoundError(f"Missing GTFS file in '{path}': {file_name}")
+        if len(matches) > 1:
+            raise ValueError(
+                f"Ambiguous GTFS file in '{path}' (found in multiple locations): {file_name}"
+            )
+        with archive.open(matches[0]) as handle:
+            yield handle
+
+
 def load_gtfs_stops(gtfs_dir: Path, target_crs: int | str) -> gpd.GeoDataFrame:
-    """Load GTFS stops.txt as a projected GeoDataFrame."""
-    stops_csv = gtfs_dir / "stops.txt"
-    df = pd.read_csv(stops_csv, dtype=str)
+    """Load GTFS stops.txt, from a feed folder or ``.zip``, as a projected GeoDataFrame."""
+    with open_gtfs_file(gtfs_dir, "stops.txt") as handle:
+        df = pd.read_csv(handle, dtype=str)
     df = df.drop_duplicates("stop_id")
     gdf = gpd.GeoDataFrame(
         df,

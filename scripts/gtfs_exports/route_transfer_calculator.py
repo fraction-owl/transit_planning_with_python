@@ -29,7 +29,7 @@ never enters the pool either. Set a single day name to filter to that day, or
 pair trips that never run on the same day — inflating counts).
 
 Inputs:
-    - A GTFS feed folder with stops.txt, routes.txt, trips.txt, and
+    - A GTFS feed folder or ``.zip`` with stops.txt, routes.txt, trips.txt, and
       stop_times.txt (a single agency's feed, or a merged multi-agency feed
       from gtfs_feed_merger.py). calendar.txt is used when a day filter is set.
 
@@ -55,8 +55,11 @@ import argparse
 import logging
 import os
 import sys
+import zipfile
+from collections.abc import Generator
+from contextlib import contextmanager
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import IO, List, Optional, Sequence
 
 import geopandas as gpd
 import numpy as np
@@ -69,7 +72,7 @@ from shapely.geometry import Point
 # =============================================================================
 # === BEGIN CONFIG ===
 
-# GTFS feed folder containing stops.txt, routes.txt, trips.txt, and
+# GTFS feed folder or .zip containing stops.txt, routes.txt, trips.txt, and
 # stop_times.txt. For transfers between agencies, merge their feeds first with
 # gtfs_feed_merger.py and point this at the merged feed. Use raw strings (r"")
 # for Windows paths.
@@ -268,11 +271,67 @@ def has_timed_connection(
     return best_wait is not None, best_wait
 
 
-def _read_feed(folder: str) -> tuple[dict[str, pd.DataFrame], Optional[pd.DataFrame]]:
-    """Load the GTFS tables this script needs from one feed folder.
+@contextmanager
+def open_gtfs_file(
+    gtfs_path: str | os.PathLike[str], file_name: str
+) -> Generator[IO[bytes], None, None]:
+    """Open one GTFS text file from a feed folder or a ``.zip`` of the feed.
+
+    The counterpart of :func:`load_gtfs_data` for scripts that read a file with
+    their own options (``pandas.read_csv`` with ``usecols`` or
+    ``keep_default_na=False``, or the :mod:`csv` module), so they accept a
+    zipped feed without extracting it. Zip members are found the way
+    :func:`load_gtfs_data` finds them: at the archive root or inside a single
+    wrapper folder.
 
     Args:
-        folder: Path to the GTFS feed folder.
+        gtfs_path: Folder containing the GTFS feed, or a ``.zip`` archive of it.
+        file_name: GTFS file to open, e.g. ``"stops.txt"``.
+
+    Yields:
+        A binary file handle. ``pandas.read_csv`` reads it directly; wrap it in
+        :class:`io.TextIOWrapper` for the :mod:`csv` module.
+
+    Raises:
+        FileNotFoundError: *gtfs_path* does not exist, or the feed has no
+            *file_name*.
+        ValueError: *gtfs_path* is neither a directory nor a valid ``.zip``
+            file, or *file_name* is found in more than one place in the zip.
+    """
+    path = os.fspath(gtfs_path)
+    if os.path.isdir(path):
+        file_path = os.path.join(path, file_name)
+        if not os.path.isfile(file_path):
+            raise FileNotFoundError(f"Missing GTFS file in '{path}': {file_name}")
+        with open(file_path, "rb") as handle:
+            yield handle
+        return
+
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"The path '{path}' does not exist.")
+    if not (os.path.isfile(path) and path.lower().endswith(".zip")):
+        raise ValueError(f"'{path}' is neither a directory nor a .zip file.")
+    try:
+        archive = zipfile.ZipFile(path)
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"'{path}' is not a valid zip archive.") from exc
+    with archive:
+        matches = [name for name in archive.namelist() if os.path.basename(name) == file_name]
+        if not matches:
+            raise FileNotFoundError(f"Missing GTFS file in '{path}': {file_name}")
+        if len(matches) > 1:
+            raise ValueError(
+                f"Ambiguous GTFS file in '{path}' (found in multiple locations): {file_name}"
+            )
+        with archive.open(matches[0]) as handle:
+            yield handle
+
+
+def _read_feed(folder: str) -> tuple[dict[str, pd.DataFrame], Optional[pd.DataFrame]]:
+    """Load the GTFS tables this script needs from one feed folder or ``.zip``.
+
+    Args:
+        folder: Path to the GTFS feed folder, or to a ``.zip`` of the feed.
 
     Returns:
         A tuple ``(tables, calendar)``: ``stops``, ``routes``, ``trips`` and
@@ -282,24 +341,26 @@ def _read_feed(folder: str) -> tuple[dict[str, pd.DataFrame], Optional[pd.DataFr
         FileNotFoundError: If a required GTFS file is missing.
     """
     for filename in _REQUIRED_FILES:
-        if not os.path.exists(os.path.join(folder, filename)):
-            raise FileNotFoundError(f"Missing {filename} in {folder}")
+        with open_gtfs_file(folder, filename):
+            pass  # raises FileNotFoundError naming the file when it is missing
 
     def _read(name: str) -> pd.DataFrame:
-        return pd.read_csv(os.path.join(folder, name), dtype=str, low_memory=False)
+        with open_gtfs_file(folder, name) as handle:
+            return pd.read_csv(handle, dtype=str, low_memory=False)
 
     stops = _read("stops.txt")
     routes = _read("routes.txt")
     trips = _read("trips.txt")
     stop_times = _read("stop_times.txt")
 
-    calendar_path = os.path.join(folder, "calendar.txt")
     calendar: Optional[pd.DataFrame] = None
-    if os.path.exists(calendar_path):
-        try:
-            calendar = pd.read_csv(calendar_path, dtype=str)
-        except (OSError, ValueError, pd.errors.ParserError) as exc:
-            logging.warning("Could not read calendar.txt (%s).", exc)
+    try:
+        with open_gtfs_file(folder, "calendar.txt") as handle:
+            calendar = pd.read_csv(handle, dtype=str)
+    except FileNotFoundError:
+        pass  # optional; a day filter then has nothing to filter on
+    except (OSError, ValueError, pd.errors.ParserError) as exc:
+        logging.warning("Could not read calendar.txt (%s).", exc)
 
     logging.info(
         "Feed: %d stops, %d routes, %d trips, %d stop_times.",
@@ -651,7 +712,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--gtfs-dir",
         default=GTFS_FOLDER,
-        help="GTFS feed folder (merge several agencies first with gtfs_feed_merger.py).",
+        help="GTFS feed folder or .zip (merge several agencies first with gtfs_feed_merger.py).",
     )
     parser.add_argument(
         "--output-dir",

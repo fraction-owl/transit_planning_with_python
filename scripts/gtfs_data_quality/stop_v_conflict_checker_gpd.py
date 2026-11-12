@@ -35,8 +35,11 @@ from __future__ import annotations
 import logging
 import math
 import os
+import zipfile
+from collections.abc import Generator
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import IO, Optional, Sequence
 
 import geopandas as gpd
 import pandas as pd
@@ -55,12 +58,13 @@ OVERWRITE_OUTPUT: bool = True  # False: abort if any enabled output already exis
 
 # --- Input: specify exactly ONE of the following for stops ---
 STOPS_TXT_PATH: str = r""  # e.g., r"C:\data\gtfs\stops.txt"
-GTFS_DIR: str = r"data\gtfs_feed_2025_10_30"  # must hold stops.txt
+GTFS_DIR: str = r"data\gtfs_feed_2025_10_30"  # GTFS feed folder or .zip holding stops.txt
 
 # --- Context layers. Any vector format readable by GeoPandas. Each layer must
 # contain POLYGON geometries (road surface, driveway, building footprint);
 # line layers such as road centerlines are rejected. A layer whose FLAG_* toggle
 # is True must be set and must exist; set the toggle to False to skip a layer.
+# Each layer may also be a .zip holding the shapefile.
 ROADWAYS_PATH: str = r"data\gis_layers\roads\road_surface_polygons.shp"
 DRIVEWAYS_PATH: str = r"data\gis_layers\parcels\driveways.shp"
 BUILDINGS_PATH: str = r"data\gis_layers\buildings\building_footprints.shp"
@@ -101,6 +105,62 @@ LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
 # =============================================================================
 
 
+@contextmanager
+def open_gtfs_file(
+    gtfs_path: str | os.PathLike[str], file_name: str
+) -> Generator[IO[bytes], None, None]:
+    """Open one GTFS text file from a feed folder or a ``.zip`` of the feed.
+
+    The counterpart of :func:`load_gtfs_data` for scripts that read a file with
+    their own options (``pandas.read_csv`` with ``usecols`` or
+    ``keep_default_na=False``, or the :mod:`csv` module), so they accept a
+    zipped feed without extracting it. Zip members are found the way
+    :func:`load_gtfs_data` finds them: at the archive root or inside a single
+    wrapper folder.
+
+    Args:
+        gtfs_path: Folder containing the GTFS feed, or a ``.zip`` archive of it.
+        file_name: GTFS file to open, e.g. ``"stops.txt"``.
+
+    Yields:
+        A binary file handle. ``pandas.read_csv`` reads it directly; wrap it in
+        :class:`io.TextIOWrapper` for the :mod:`csv` module.
+
+    Raises:
+        FileNotFoundError: *gtfs_path* does not exist, or the feed has no
+            *file_name*.
+        ValueError: *gtfs_path* is neither a directory nor a valid ``.zip``
+            file, or *file_name* is found in more than one place in the zip.
+    """
+    path = os.fspath(gtfs_path)
+    if os.path.isdir(path):
+        file_path = os.path.join(path, file_name)
+        if not os.path.isfile(file_path):
+            raise FileNotFoundError(f"Missing GTFS file in '{path}': {file_name}")
+        with open(file_path, "rb") as handle:
+            yield handle
+        return
+
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"The path '{path}' does not exist.")
+    if not (os.path.isfile(path) and path.lower().endswith(".zip")):
+        raise ValueError(f"'{path}' is neither a directory nor a .zip file.")
+    try:
+        archive = zipfile.ZipFile(path)
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"'{path}' is not a valid zip archive.") from exc
+    with archive:
+        matches = [name for name in archive.namelist() if os.path.basename(name) == file_name]
+        if not matches:
+            raise FileNotFoundError(f"Missing GTFS file in '{path}': {file_name}")
+        if len(matches) > 1:
+            raise ValueError(
+                f"Ambiguous GTFS file in '{path}' (found in multiple locations): {file_name}"
+            )
+        with archive.open(matches[0]) as handle:
+            yield handle
+
+
 def _validate_config() -> None:
     """Validate configuration choices (paths, outputs, exclusivity)."""
     has_stops_txt = bool(STOPS_TXT_PATH.strip())
@@ -124,16 +184,16 @@ def _validate_config() -> None:
 
 
 def _resolve_stops_path() -> str:
-    """Return a filesystem path to stops.txt based on configuration."""
+    """Return the stops source: a stops.txt path, or the GTFS feed folder or .zip."""
     if STOPS_TXT_PATH.strip():
         p = Path(STOPS_TXT_PATH)
         if not p.exists():
             raise FileNotFoundError(f"stops.txt not found at: {p}")
         return str(p)
-    p = Path(GTFS_DIR) / "stops.txt"
-    if not p.exists():
-        raise FileNotFoundError(f"stops.txt not found in GTFS_DIR: {GTFS_DIR}")
-    return str(p)
+    # Fails now, before any output is written, if the feed has no stops.txt.
+    with open_gtfs_file(GTFS_DIR, "stops.txt"):
+        pass
+    return GTFS_DIR
 
 
 def _deg_tolerance_for_meters(lat_deg: float, tol_m: float) -> tuple[float, float]:
@@ -165,12 +225,17 @@ def _read_stops(src_stops: str) -> pd.DataFrame:
     for some location types).
 
     Args:
-        src_stops: Path to GTFS stops.txt.
+        src_stops: Path to GTFS stops.txt, or to a GTFS feed folder or
+            ``.zip`` that holds it.
 
     Returns:
         Stops DataFrame with numeric stop_lat / stop_lon columns.
     """
-    df = pd.read_csv(src_stops, dtype=str, keep_default_na=False)
+    if os.path.isdir(src_stops) or src_stops.lower().endswith(".zip"):
+        with open_gtfs_file(src_stops, "stops.txt") as handle:
+            df = pd.read_csv(handle, dtype=str, keep_default_na=False)
+    else:
+        df = pd.read_csv(src_stops, dtype=str, keep_default_na=False)
 
     if "stop_lat" not in df.columns or "stop_lon" not in df.columns:
         raise ValueError("stops.txt must include 'stop_lat' and 'stop_lon' columns.")
@@ -188,7 +253,8 @@ def _pandas_dedupe_stops(src_stops: str, keys: Sequence[str], xy_tol_m: float) -
     """Read stops.txt with pandas and return a deduplicated DataFrame.
 
     Args:
-        src_stops: Path to GTFS stops.txt.
+        src_stops: Path to GTFS stops.txt, or to a GTFS feed folder or
+            ``.zip`` that holds it.
         keys: Candidate keys to dedupe by (only existing are used).
         xy_tol_m: Optional XY tolerance in meters; 0 to disable.
 
@@ -231,6 +297,76 @@ def _stops_to_gdf(stops_df: pd.DataFrame, analysis_crs: str) -> gpd.GeoDataFrame
     return gdf.to_crs(analysis_crs)
 
 
+def load_shapefile(path: str, member: Optional[str] = None) -> gpd.GeoDataFrame:
+    """Load a shapefile given a direct ``.shp`` path or a ``.zip`` archive.
+
+    Args:
+        path: Path to a ``.shp`` file, or to a ``.zip`` archive containing
+            one. A zipped shapefile is opened directly via GDAL's ``zip://``
+            virtual filesystem, so the archive is never extracted to disk.
+        member: For a ``.zip`` containing more than one ``.shp``, the name
+            of the one to load (matched case-insensitively against its
+            base filename, e.g. ``"Hospitals.shp"``). Ignored when *path*
+            is a direct ``.shp`` file. Required when the archive contains
+            more than one shapefile. macOS metadata entries (anything under
+            ``__MACOSX/`` and ``._*`` files) are not counted as shapefiles.
+
+    Returns:
+        The loaded :class:`geopandas.GeoDataFrame`.
+
+    Raises:
+        OSError: *path* does not exist.
+        ValueError: *path* is neither a ``.shp`` nor a ``.zip`` file; the
+            zip is unreadable/corrupt; the zip contains no shapefile; the
+            zip contains more than one shapefile and *member* was not
+            supplied; or *member* does not match any shapefile in the zip.
+    """
+    if not os.path.exists(path):
+        raise OSError(f"The path '{path}' does not exist.")
+
+    lower_path = path.lower()
+    if lower_path.endswith(".shp"):
+        logging.info("Reading %s", path)
+        return gpd.read_file(path)
+
+    if not lower_path.endswith(".zip"):
+        raise ValueError(f"'{path}' is neither a .shp nor a .zip file.")
+
+    try:
+        with zipfile.ZipFile(path) as archive:
+            # Zips made with macOS Finder add __MACOSX/._<name>.shp metadata
+            # files next to the real ones; they are not shapefiles.
+            shp_members = [
+                name
+                for name in archive.namelist()
+                if name.lower().endswith(".shp")
+                and not name.startswith("__MACOSX/")
+                and not os.path.basename(name).startswith("._")
+            ]
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"'{path}' is not a valid zip archive.") from exc
+
+    if not shp_members:
+        raise ValueError(f"No .shp file found inside '{path}'.")
+
+    if member is not None:
+        matches = [name for name in shp_members if os.path.basename(name).lower() == member.lower()]
+        if not matches:
+            raise ValueError(f"'{member}' not found inside '{path}'. Available: {shp_members}")
+        chosen = matches[0]
+    elif len(shp_members) == 1:
+        chosen = shp_members[0]
+    else:
+        raise ValueError(
+            f"'{path}' contains {len(shp_members)} shapefiles; pass `member=` to "
+            f"choose one of: {shp_members}"
+        )
+
+    source = f"zip://{path}!{chosen}"
+    logging.info("Reading %s", source)
+    return gpd.read_file(source)
+
+
 def _load_context(path: str, analysis_crs: str, source_crs: str = "") -> Optional[gpd.GeoDataFrame]:
     """Load a polygon context layer, projected to the analysis CRS.
 
@@ -252,7 +388,7 @@ def _load_context(path: str, analysis_crs: str, source_crs: str = "") -> Optiona
         return None
     if not Path(path).exists():
         raise FileNotFoundError(f"Context layer not found: {path}")
-    gdf = gpd.read_file(path)
+    gdf = load_shapefile(str(path)) if str(path).lower().endswith(".zip") else gpd.read_file(path)
     if gdf.crs is None:
         if not source_crs.strip():
             raise ValueError(

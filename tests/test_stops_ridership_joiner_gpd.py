@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import sys
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -471,6 +472,41 @@ def test_resolve_stops_table_appends_stops_txt_for_dir(tmp_path: Path) -> None:
 def test_resolve_stops_table_returns_file_unchanged() -> None:
     p = Path("/feed/stops.txt")
     assert target.resolve_stops_table(p) == p
+
+
+def _zip_dir(folder: Path, zip_path: Path, wrapper: str = "feed") -> Path:
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        for path in folder.iterdir():
+            zf.write(path, f"{wrapper}/{path.name}")
+    return zip_path
+
+
+def test_gtfs_zip_is_gtfs_input_and_its_own_feed(tmp_path: Path) -> None:
+    _write_min_gtfs(tmp_path / "gtfs")
+    zipped = _zip_dir(tmp_path / "gtfs", tmp_path / "gtfs.zip")
+    assert target.is_gtfs_zip(zipped) is True
+    assert target.is_gtfs_input(zipped) is True
+    assert target.resolve_gtfs_dir(zipped) == zipped
+
+
+def test_zip_without_stops_txt_is_not_gtfs(tmp_path: Path) -> None:
+    zipped = tmp_path / "stops_layer.zip"
+    with zipfile.ZipFile(zipped, "w") as zf:
+        zf.writestr("stops_layer.shp", b"")
+    assert target.is_gtfs_zip(zipped) is False
+    assert target.is_gtfs_input(zipped) is False
+    assert target.resolve_gtfs_dir(zipped) is None
+
+
+def test_gtfs_lookups_read_zipped_feed_like_folder(tmp_path: Path) -> None:
+    folder = tmp_path / "gtfs"
+    _write_min_gtfs(folder)
+    zipped = _zip_dir(folder, tmp_path / "gtfs.zip")
+    pd.testing.assert_frame_equal(target.load_stop_coords(zipped), target.load_stop_coords(folder))
+    shapes_zip, colors_zip = target.build_route_shape_lookup(zipped)
+    shapes_dir, colors_dir = target.build_route_shape_lookup(folder)
+    assert colors_zip == colors_dir
+    assert shapes_zip.keys() == shapes_dir.keys()
 
 
 # ---------------------------------------------------------------------------
@@ -990,6 +1026,22 @@ def _patch_main(gtfs_dir: Path, excel: Path, out: Path, split: bool) -> list:
         patch("stops_ridership_joiner_gpd.SPLIT_BY_ROUTE", split),
         patch("stops_ridership_joiner_gpd.DRAW_PLOTS", False),
     ]
+
+
+def test_main_reads_stops_from_zipped_gtfs(tmp_path: Path) -> None:
+    gtfs_dir, excel, out = _main_inputs(tmp_path)
+    zipped = _zip_dir(gtfs_dir, tmp_path / "gtfs.zip")
+    patches = _patch_main(zipped, excel, out, False)
+    for p in patches:
+        p.start()
+    try:
+        assert target.main() == 0
+    finally:
+        for p in patches:
+            p.stop()
+    (run_dir,) = out.glob("stops_ridership_*")
+    recon = pd.read_csv(run_dir / "ridership_reconciliation.csv").set_index("category")
+    assert recon.loc["matched_to_stops", "XBOARDINGS"] == pytest.approx(40.0)
 
 
 @pytest.mark.parametrize("split", [False, True])

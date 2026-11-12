@@ -60,9 +60,12 @@ import logging
 import math
 import os
 import sys
+import zipfile
+from collections.abc import Generator
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import IO, Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import arcpy
 import matplotlib.pyplot as plt
@@ -89,7 +92,7 @@ except NameError:
 # NODE_GRID_FT of one another, or the graph will be split into islands.
 SIDEWALK_FC: str = r"Path\To\Your\Sidewalks_Centerline.shp"
 
-# Folder containing stops.txt.
+# GTFS feed folder or .zip containing stops.txt.
 GTFS_DIR: str = r"Path\To\Your\GTFS_Folder"
 
 # Plotting-only backdrop (never used for analysis). Set to "" to skip it.
@@ -473,13 +476,69 @@ def build_graph(
     return graph, edge_endpoints
 
 
+@contextmanager
+def open_gtfs_file(
+    gtfs_path: str | os.PathLike[str], file_name: str
+) -> Generator[IO[bytes], None, None]:
+    """Open one GTFS text file from a feed folder or a ``.zip`` of the feed.
+
+    The counterpart of :func:`load_gtfs_data` for scripts that read a file with
+    their own options (``pandas.read_csv`` with ``usecols`` or
+    ``keep_default_na=False``, or the :mod:`csv` module), so they accept a
+    zipped feed without extracting it. Zip members are found the way
+    :func:`load_gtfs_data` finds them: at the archive root or inside a single
+    wrapper folder.
+
+    Args:
+        gtfs_path: Folder containing the GTFS feed, or a ``.zip`` archive of it.
+        file_name: GTFS file to open, e.g. ``"stops.txt"``.
+
+    Yields:
+        A binary file handle. ``pandas.read_csv`` reads it directly; wrap it in
+        :class:`io.TextIOWrapper` for the :mod:`csv` module.
+
+    Raises:
+        FileNotFoundError: *gtfs_path* does not exist, or the feed has no
+            *file_name*.
+        ValueError: *gtfs_path* is neither a directory nor a valid ``.zip``
+            file, or *file_name* is found in more than one place in the zip.
+    """
+    path = os.fspath(gtfs_path)
+    if os.path.isdir(path):
+        file_path = os.path.join(path, file_name)
+        if not os.path.isfile(file_path):
+            raise FileNotFoundError(f"Missing GTFS file in '{path}': {file_name}")
+        with open(file_path, "rb") as handle:
+            yield handle
+        return
+
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"The path '{path}' does not exist.")
+    if not (os.path.isfile(path) and path.lower().endswith(".zip")):
+        raise ValueError(f"'{path}' is neither a directory nor a .zip file.")
+    try:
+        archive = zipfile.ZipFile(path)
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"'{path}' is not a valid zip archive.") from exc
+    with archive:
+        matches = [name for name in archive.namelist() if os.path.basename(name) == file_name]
+        if not matches:
+            raise FileNotFoundError(f"Missing GTFS file in '{path}': {file_name}")
+        if len(matches) > 1:
+            raise ValueError(
+                f"Ambiguous GTFS file in '{path}' (found in multiple locations): {file_name}"
+            )
+        with archive.open(matches[0]) as handle:
+            yield handle
+
+
 def load_gtfs_stops(
     gtfs_dir: str, sr: arcpy.SpatialReference, transformation: str = ""
 ) -> pd.DataFrame:
     """Load GTFS stops.txt as a DataFrame of projected point geometries.
 
     Args:
-        gtfs_dir: Folder containing stops.txt.
+        gtfs_dir: GTFS feed folder or ``.zip`` containing stops.txt.
         sr: Target projected spatial reference.
         transformation: Optional geographic (datum) transformation name.
 
@@ -489,14 +548,15 @@ def load_gtfs_stops(
 
     Raises:
         OSError: stops.txt is missing or unreadable.
-        ValueError: stops.txt lacks required columns or has no usable rows.
+        ValueError: stops.txt lacks required columns or has no usable rows, or
+            *gtfs_dir* is neither a folder nor a valid ``.zip``.
     """
     stops_csv = Path(gtfs_dir) / "stops.txt"
-    if not stops_csv.is_file():
-        raise OSError(f"stops.txt not found in GTFS folder: {gtfs_dir}")
-
     try:
-        raw = pd.read_csv(stops_csv, dtype=str)
+        with open_gtfs_file(gtfs_dir, "stops.txt") as handle:
+            raw = pd.read_csv(handle, dtype=str)
+    except FileNotFoundError as exc:
+        raise OSError(f"stops.txt not found in GTFS feed: {gtfs_dir}") from exc
     except (OSError, UnicodeDecodeError, pd.errors.ParserError) as exc:
         raise OSError(f"Could not read '{stops_csv}': {exc}") from exc
 
@@ -1917,7 +1977,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--gtfs-dir",
         default=GTFS_DIR,
-        help="GTFS folder containing stops.txt.",
+        help="GTFS feed folder or .zip containing stops.txt.",
     )
     parser.add_argument(
         "--plot-sidewalks-fc",

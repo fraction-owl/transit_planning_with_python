@@ -18,6 +18,9 @@ stops flagged for one or more conflicts:
   ``OUTPUT_DIR``): flagged stops with conflict attributes.
 - ``stops_conflicts`` feature class (``OUTPUT_FC_NAME``) in ``OUTPUT_GDB``.
 - ``stop_conflicts.shp``: optional shapefile copy of the flagged stops.
+- Working copies of the stops in ``OUTPUT_DIR`` for ArcPy to read:
+  ``stops_dedup_tmp.csv`` when deduplicating, and ``stops_from_zip_tmp.txt``
+  when ``GTFS_DIR`` is a ``.zip``.
 
 Typical usage
 -------------
@@ -31,8 +34,12 @@ import csv
 import logging
 import math
 import os
+import shutil
+import zipfile
+from collections.abc import Generator
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import IO, Optional, Sequence
 
 import arcpy
 import pandas as pd
@@ -51,7 +58,7 @@ OVERWRITE_OUTPUT: bool = True
 
 # --- Input: specify exactly ONE of the following for stops ---
 STOPS_TXT_PATH: str = r""  # e.g., r"C:\data\gtfs\stops.txt"
-GTFS_DIR: str = r"data\gtfs_feed_2025_10_30"  # must hold stops.txt
+GTFS_DIR: str = r"data\gtfs_feed_2025_10_30"  # GTFS feed folder or .zip holding stops.txt
 
 # --- Optional context layers (any may be empty). Can be shapefile or FC (any geometry type).
 ROADWAYS_PATH: str = r"data\gis_layers\context_data.gdb\transportation\road_centerlines"
@@ -92,6 +99,62 @@ TMP_WS = arcpy.env.scratchGDB
 # =============================================================================
 
 
+@contextmanager
+def open_gtfs_file(
+    gtfs_path: str | os.PathLike[str], file_name: str
+) -> Generator[IO[bytes], None, None]:
+    """Open one GTFS text file from a feed folder or a ``.zip`` of the feed.
+
+    The counterpart of :func:`load_gtfs_data` for scripts that read a file with
+    their own options (``pandas.read_csv`` with ``usecols`` or
+    ``keep_default_na=False``, or the :mod:`csv` module), so they accept a
+    zipped feed without extracting it. Zip members are found the way
+    :func:`load_gtfs_data` finds them: at the archive root or inside a single
+    wrapper folder.
+
+    Args:
+        gtfs_path: Folder containing the GTFS feed, or a ``.zip`` archive of it.
+        file_name: GTFS file to open, e.g. ``"stops.txt"``.
+
+    Yields:
+        A binary file handle. ``pandas.read_csv`` reads it directly; wrap it in
+        :class:`io.TextIOWrapper` for the :mod:`csv` module.
+
+    Raises:
+        FileNotFoundError: *gtfs_path* does not exist, or the feed has no
+            *file_name*.
+        ValueError: *gtfs_path* is neither a directory nor a valid ``.zip``
+            file, or *file_name* is found in more than one place in the zip.
+    """
+    path = os.fspath(gtfs_path)
+    if os.path.isdir(path):
+        file_path = os.path.join(path, file_name)
+        if not os.path.isfile(file_path):
+            raise FileNotFoundError(f"Missing GTFS file in '{path}': {file_name}")
+        with open(file_path, "rb") as handle:
+            yield handle
+        return
+
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"The path '{path}' does not exist.")
+    if not (os.path.isfile(path) and path.lower().endswith(".zip")):
+        raise ValueError(f"'{path}' is neither a directory nor a .zip file.")
+    try:
+        archive = zipfile.ZipFile(path)
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"'{path}' is not a valid zip archive.") from exc
+    with archive:
+        matches = [name for name in archive.namelist() if os.path.basename(name) == file_name]
+        if not matches:
+            raise FileNotFoundError(f"Missing GTFS file in '{path}': {file_name}")
+        if len(matches) > 1:
+            raise ValueError(
+                f"Ambiguous GTFS file in '{path}' (found in multiple locations): {file_name}"
+            )
+        with archive.open(matches[0]) as handle:
+            yield handle
+
+
 def _validate_config() -> None:
     """Validate configuration choices (paths, outputs, exclusivity)."""
     has_stops_txt = bool(STOPS_TXT_PATH.strip())
@@ -103,17 +166,28 @@ def _validate_config() -> None:
         raise ValueError("Enable at least one export format.")
 
 
-def _resolve_stops_path() -> str:
-    """Return a filesystem path to stops.txt based on configuration."""
+def _resolve_stops_path(out_dir: Path) -> str:
+    """Return a filesystem path to stops.txt based on configuration.
+
+    ArcPy tools cannot read a file inside a zip, so when GTFS_DIR is a ``.zip``
+    its stops.txt is copied to ``stops_from_zip_tmp.txt`` in *out_dir* and that
+    copy's path is returned.
+    """
     if STOPS_TXT_PATH.strip():
         p = Path(STOPS_TXT_PATH)
         if not p.exists():
             raise FileNotFoundError(f"stops.txt not found at: {p}")
         return str(p)
-    p = Path(GTFS_DIR) / "stops.txt"
-    if not p.exists():
-        raise FileNotFoundError(f"stops.txt not found in GTFS_DIR: {GTFS_DIR}")
-    return str(p)
+    if os.path.isdir(GTFS_DIR):
+        p = Path(GTFS_DIR) / "stops.txt"
+        if not p.exists():
+            raise FileNotFoundError(f"stops.txt not found in GTFS_DIR: {GTFS_DIR}")
+        return str(p)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tmp_txt = out_dir / "stops_from_zip_tmp.txt"
+    with open_gtfs_file(GTFS_DIR, "stops.txt") as handle, tmp_txt.open("wb") as out:
+        shutil.copyfileobj(handle, out)
+    return str(tmp_txt)
 
 
 def _deg_tolerance_for_meters(lat_deg: float, tol_m: float) -> tuple[float, float]:
@@ -368,8 +442,8 @@ def main() -> int:
     _validate_config()
 
     # Resolve stops.txt and dedupe with pandas
-    src_stops = _resolve_stops_path()
     out_dir = Path(OUTPUT_DIR)
+    src_stops = _resolve_stops_path(out_dir)
     if DEDUPE_STOPS:
         dedup_csv = _pandas_dedupe_stops(
             src_stops=src_stops,

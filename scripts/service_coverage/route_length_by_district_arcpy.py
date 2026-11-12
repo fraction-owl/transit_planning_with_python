@@ -5,7 +5,7 @@ ArcPy and the Python standard library; pandas and additional GIS extensions are
 not required.
 
 Inputs:
-    GTFS_FOLDER: an unzipped GTFS feed with routes.txt, trips.txt, and shapes.txt.
+    GTFS_FOLDER: a GTFS feed folder or .zip with routes.txt, trips.txt, and shapes.txt.
     DISTRICTS_FC: district polygons (shapefile or feature class) with a name field.
 
 Method:
@@ -53,14 +53,19 @@ from __future__ import annotations
 
 import csv
 import datetime as datetime_module
+import io
 import json
 import logging
 import math
+import os
 import re
 import time
+import zipfile
 from collections import Counter, defaultdict
+from collections.abc import Generator
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Collection, Dict, Iterator, List, Optional, Sequence, Set, Tuple
+from typing import IO, Any, Collection, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
 import arcpy
 
@@ -69,7 +74,7 @@ import arcpy
 # =============================================================================
 # === BEGIN CONFIG ===
 
-GTFS_FOLDER = Path(r"Path\To\Your\GTFS_Folder")
+GTFS_FOLDER = Path(r"Path\To\Your\GTFS_Folder")  # GTFS feed folder or .zip
 DISTRICTS_FC = Path(r"Path\To\Your\Districts.shp")
 OUTPUT_DIR = Path(r"Path\To\Your\Output_Folder")
 
@@ -121,18 +126,74 @@ RouteInfo = Dict[str, str]
 Piece = Tuple[Tuple[str, ...], Any]
 
 
+@contextmanager
+def open_gtfs_file(
+    gtfs_path: str | os.PathLike[str], file_name: str
+) -> Generator[IO[bytes], None, None]:
+    """Open one GTFS text file from a feed folder or a ``.zip`` of the feed.
+
+    The counterpart of :func:`load_gtfs_data` for scripts that read a file with
+    their own options (``pandas.read_csv`` with ``usecols`` or
+    ``keep_default_na=False``, or the :mod:`csv` module), so they accept a
+    zipped feed without extracting it. Zip members are found the way
+    :func:`load_gtfs_data` finds them: at the archive root or inside a single
+    wrapper folder.
+
+    Args:
+        gtfs_path: Folder containing the GTFS feed, or a ``.zip`` archive of it.
+        file_name: GTFS file to open, e.g. ``"stops.txt"``.
+
+    Yields:
+        A binary file handle. ``pandas.read_csv`` reads it directly; wrap it in
+        :class:`io.TextIOWrapper` for the :mod:`csv` module.
+
+    Raises:
+        FileNotFoundError: *gtfs_path* does not exist, or the feed has no
+            *file_name*.
+        ValueError: *gtfs_path* is neither a directory nor a valid ``.zip``
+            file, or *file_name* is found in more than one place in the zip.
+    """
+    path = os.fspath(gtfs_path)
+    if os.path.isdir(path):
+        file_path = os.path.join(path, file_name)
+        if not os.path.isfile(file_path):
+            raise FileNotFoundError(f"Missing GTFS file in '{path}': {file_name}")
+        with open(file_path, "rb") as handle:
+            yield handle
+        return
+
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"The path '{path}' does not exist.")
+    if not (os.path.isfile(path) and path.lower().endswith(".zip")):
+        raise ValueError(f"'{path}' is neither a directory nor a .zip file.")
+    try:
+        archive = zipfile.ZipFile(path)
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"'{path}' is not a valid zip archive.") from exc
+    with archive:
+        matches = [name for name in archive.namelist() if os.path.basename(name) == file_name]
+        if not matches:
+            raise FileNotFoundError(f"Missing GTFS file in '{path}': {file_name}")
+        if len(matches) > 1:
+            raise ValueError(
+                f"Ambiguous GTFS file in '{path}' (found in multiple locations): {file_name}"
+            )
+        with archive.open(matches[0]) as handle:
+            yield handle
+
+
 def read_gtfs(filename: str, required: Set[str]) -> Iterator[Dict[str, str]]:
     """Read a GTFS table without coercing identifiers or literal 'NA' values."""
-    path = GTFS_FOLDER / filename
-    with path.open("r", encoding="utf-8-sig", newline="") as handle:
-        reader = csv.DictReader(handle)
-        missing = required - set(reader.fieldnames or [])
-        if missing:
-            raise ValueError(f"{filename} is missing fields: {sorted(missing)}")
-        for line_number, row in enumerate(reader, start=2):
-            if None in row:
-                raise ValueError(f"{filename}, row {line_number}: too many CSV columns.")
-            yield {key: (value or "").strip() for key, value in row.items()}
+    with open_gtfs_file(GTFS_FOLDER, filename) as raw:
+        with io.TextIOWrapper(raw, encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            missing = required - set(reader.fieldnames or [])
+            if missing:
+                raise ValueError(f"{filename} is missing fields: {sorted(missing)}")
+            for line_number, row in enumerate(reader, start=2):
+                if None in row:
+                    raise ValueError(f"{filename}, row {line_number}: too many CSV columns.")
+                yield {key: (value or "").strip() for key, value in row.items()}
 
 
 def route_label(route: RouteInfo) -> str:
@@ -801,8 +862,13 @@ def main() -> int:
     run_dir: Optional[Path] = None
     try:
         # Check inputs before creating an output folder, so placeholder paths do nothing.
-        paths = [GTFS_FOLDER / name for name in ("routes.txt", "trips.txt", "shapes.txt")]
-        missing = [str(path) for path in paths if not path.is_file()]
+        missing = []
+        for name in ("routes.txt", "trips.txt", "shapes.txt"):
+            try:
+                with open_gtfs_file(GTFS_FOLDER, name):
+                    pass
+            except (FileNotFoundError, ValueError):
+                missing.append(str(GTFS_FOLDER / name))
         if not arcpy.Exists(str(DISTRICTS_FC)):
             missing.append(str(DISTRICTS_FC))
         if missing:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import zipfile
 from pathlib import Path
 
 import pandas as pd
@@ -250,6 +251,32 @@ def test_build_stop_route_direction_index_returns_correct_structure(tmp_path: Pa
     index = target.build_stop_route_direction_index(gtfs)
     assert "S1" in index.directions
     assert index.directions["S1"]["R1"] == {0}
+
+
+def _zip_feed(gtfs: Path, zip_path: Path) -> Path:
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        for path in gtfs.iterdir():
+            zf.write(path, f"feed/{path.name}")
+    return zip_path
+
+
+def test_build_stop_route_direction_index_reads_zipped_feed(tmp_path: Path) -> None:
+    gtfs = _make_gtfs_dir_with_direction(tmp_path)
+    index = target.build_stop_route_direction_index(_zip_feed(gtfs, tmp_path / "gtfs.zip"))
+    assert index == target.build_stop_route_direction_index(gtfs)
+    assert index.directions["S1"]["R1"] == {0}
+
+
+def test_main_runs_on_zipped_feed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    gtfs = _make_gtfs_dir_with_direction(tmp_path)
+    out_dir = tmp_path / "out"
+    monkeypatch.setattr(target, "GTFS_DIR", _zip_feed(gtfs, tmp_path / "gtfs.zip"))
+    monkeypatch.setattr(target, "OUT_DIR", out_dir)
+    monkeypatch.setattr(target, "THRESHOLD_FEET", 5000.0)
+    monkeypatch.setattr(target, "EXCLUDE_OPPOSITE_DIRECTION_SAME_ROUTE_PAIRS", False)
+    assert target.main() == 0
+    pairs = pd.read_csv(out_dir / "close_stop_pairs.csv", dtype=str)
+    assert len(pairs) == 1
 
 
 def test_build_stop_route_direction_index_missing_files_returns_empty(tmp_path: Path) -> None:

@@ -56,10 +56,12 @@ import json
 import logging
 import os
 import sys
-from collections.abc import Mapping, Sequence
+import zipfile
+from collections.abc import Generator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import IO, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -69,6 +71,7 @@ import pandas as pd
 # =============================================================================
 # === BEGIN CONFIG ===
 
+# GTFS feeds to compare, each a folder or a .zip.
 BEFORE_GTFS_DIR = Path(r"Path\To\Old\GTFS\Dir")
 AFTER_GTFS_DIR = Path(r"Path\To\New\GTFS\Dir")
 OUTPUT_DIR = Path(r"Path\To\Output\Dir")
@@ -224,11 +227,68 @@ _OPTIONAL_FILES: tuple[str, ...] = (
 )
 
 
-def _read_csv(path: Path, usecols: Optional[object] = None) -> pd.DataFrame:
+@contextmanager
+def open_gtfs_file(
+    gtfs_path: str | os.PathLike[str], file_name: str
+) -> Generator[IO[bytes], None, None]:
+    """Open one GTFS text file from a feed folder or a ``.zip`` of the feed.
+
+    The counterpart of :func:`load_gtfs_data` for scripts that read a file with
+    their own options (``pandas.read_csv`` with ``usecols`` or
+    ``keep_default_na=False``, or the :mod:`csv` module), so they accept a
+    zipped feed without extracting it. Zip members are found the way
+    :func:`load_gtfs_data` finds them: at the archive root or inside a single
+    wrapper folder.
+
+    Args:
+        gtfs_path: Folder containing the GTFS feed, or a ``.zip`` archive of it.
+        file_name: GTFS file to open, e.g. ``"stops.txt"``.
+
+    Yields:
+        A binary file handle. ``pandas.read_csv`` reads it directly; wrap it in
+        :class:`io.TextIOWrapper` for the :mod:`csv` module.
+
+    Raises:
+        FileNotFoundError: *gtfs_path* does not exist, or the feed has no
+            *file_name*.
+        ValueError: *gtfs_path* is neither a directory nor a valid ``.zip``
+            file, or *file_name* is found in more than one place in the zip.
+    """
+    path = os.fspath(gtfs_path)
+    if os.path.isdir(path):
+        file_path = os.path.join(path, file_name)
+        if not os.path.isfile(file_path):
+            raise FileNotFoundError(f"Missing GTFS file in '{path}': {file_name}")
+        with open(file_path, "rb") as handle:
+            yield handle
+        return
+
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"The path '{path}' does not exist.")
+    if not (os.path.isfile(path) and path.lower().endswith(".zip")):
+        raise ValueError(f"'{path}' is neither a directory nor a .zip file.")
+    try:
+        archive = zipfile.ZipFile(path)
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"'{path}' is not a valid zip archive.") from exc
+    with archive:
+        matches = [name for name in archive.namelist() if os.path.basename(name) == file_name]
+        if not matches:
+            raise FileNotFoundError(f"Missing GTFS file in '{path}': {file_name}")
+        if len(matches) > 1:
+            raise ValueError(
+                f"Ambiguous GTFS file in '{path}' (found in multiple locations): {file_name}"
+            )
+        with archive.open(matches[0]) as handle:
+            yield handle
+
+
+def _read_csv(path: Path | IO[bytes], usecols: Optional[object] = None) -> pd.DataFrame:
     """Read a GTFS table as all-string columns with missing values as empty strings.
 
     Args:
-        path: Path to the ``.txt`` file.
+        path: Path to the ``.txt`` file, or an open binary handle to it (as
+            yielded by ``open_gtfs_file``).
         usecols: Optional value forwarded to ``pandas.read_csv(usecols=...)``; a
             callable is convenient for keeping only columns that exist.
 
@@ -250,7 +310,7 @@ def load_feed(gtfs_dir: Path, label: str) -> dict[str, pd.DataFrame]:
     """Load the GTFS files needed for a route diff, tolerating absent optional files.
 
     Args:
-        gtfs_dir: Folder containing the GTFS feed.
+        gtfs_dir: GTFS feed folder, or a ``.zip`` of the feed.
         label: Human-readable feed label used in log messages (e.g. ``"before"``).
 
     Returns:
@@ -261,11 +321,16 @@ def load_feed(gtfs_dir: Path, label: str) -> dict[str, pd.DataFrame]:
             ``calendar.txt`` nor ``calendar_dates.txt`` is present.
     """
     if not os.path.exists(gtfs_dir):
-        raise OSError(f"{label}: directory '{gtfs_dir}' does not exist.")
+        raise OSError(f"{label}: GTFS feed '{gtfs_dir}' does not exist.")
 
-    missing_required = [
-        name for name in _REQUIRED_FILES if not os.path.exists(os.path.join(gtfs_dir, name))
-    ]
+    def _has(name: str) -> bool:
+        try:
+            with open_gtfs_file(gtfs_dir, name):
+                return True
+        except FileNotFoundError:
+            return False
+
+    missing_required = [name for name in _REQUIRED_FILES if not _has(name)]
     if missing_required:
         raise OSError(f"{label}: missing required GTFS files: {', '.join(missing_required)}")
 
@@ -274,16 +339,16 @@ def load_feed(gtfs_dir: Path, label: str) -> dict[str, pd.DataFrame]:
     st_cols = {"trip_id", "stop_id", "stop_sequence", "arrival_time", "departure_time"}
 
     for name in _REQUIRED_FILES + _OPTIONAL_FILES:
-        path = Path(gtfs_dir) / name
-        if not path.exists():
+        if not _has(name):
             continue
         key = name.replace(".txt", "")
-        if name == "trips.txt":
-            frame = _read_csv(path, usecols=lambda c: c in trip_cols)
-        elif name == "stop_times.txt":
-            frame = _read_csv(path, usecols=lambda c: c in st_cols)
-        else:
-            frame = _read_csv(path)
+        with open_gtfs_file(gtfs_dir, name) as handle:
+            if name == "trips.txt":
+                frame = _read_csv(handle, usecols=lambda c: c in trip_cols)
+            elif name == "stop_times.txt":
+                frame = _read_csv(handle, usecols=lambda c: c in st_cols)
+            else:
+                frame = _read_csv(handle)
         feed[key] = frame
         logging.info("%s: loaded %s (%d records).", label, name, len(frame))
 
@@ -1970,9 +2035,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
-        "--before", type=Path, default=BEFORE_GTFS_DIR, help="Old/before GTFS folder"
+        "--before", type=Path, default=BEFORE_GTFS_DIR, help="Old/before GTFS folder or .zip"
     )
-    parser.add_argument("--after", type=Path, default=AFTER_GTFS_DIR, help="New/after GTFS folder")
+    parser.add_argument(
+        "--after", type=Path, default=AFTER_GTFS_DIR, help="New/after GTFS folder or .zip"
+    )
     parser.add_argument("--out", type=Path, default=OUTPUT_DIR, help="Output directory")
     parser.add_argument(
         "--weekday", default=ANALYSIS_WEEKDAY, help="Representative weekday (monday..friday)"

@@ -14,14 +14,20 @@ Typical usage:
     after configuring input paths and parameters at the top of the script.
 """
 
+from __future__ import annotations
+
 import difflib
 import logging
 import os
 import re
 import sys
+import zipfile
 from collections import defaultdict
+from collections.abc import Generator
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
+from typing import IO
 
 import arcpy  # type: ignore
 import pandas as pd
@@ -31,7 +37,7 @@ import pandas as pd
 # =============================================================================
 # === BEGIN CONFIG ===
 
-GTFS_FOLDER = r"path\to\your\GTFS"
+GTFS_FOLDER = r"path\to\your\GTFS"  # GTFS feed folder or .zip
 ROADWAYS_PATH = r"path\to\your\roadways.shp"
 OUTPUT_DIR = r"path\to\output"  # any writable folder
 OUTPUT_CSV = "potential_typos.csv"
@@ -100,11 +106,68 @@ def fgdb_path(gdb: str, fc_name: str) -> str:
 # -----------------------------------------------------------------------------
 
 
+@contextmanager
+def open_gtfs_file(
+    gtfs_path: str | os.PathLike[str], file_name: str
+) -> Generator[IO[bytes], None, None]:
+    """Open one GTFS text file from a feed folder or a ``.zip`` of the feed.
+
+    The counterpart of :func:`load_gtfs_data` for scripts that read a file with
+    their own options (``pandas.read_csv`` with ``usecols`` or
+    ``keep_default_na=False``, or the :mod:`csv` module), so they accept a
+    zipped feed without extracting it. Zip members are found the way
+    :func:`load_gtfs_data` finds them: at the archive root or inside a single
+    wrapper folder.
+
+    Args:
+        gtfs_path: Folder containing the GTFS feed, or a ``.zip`` archive of it.
+        file_name: GTFS file to open, e.g. ``"stops.txt"``.
+
+    Yields:
+        A binary file handle. ``pandas.read_csv`` reads it directly; wrap it in
+        :class:`io.TextIOWrapper` for the :mod:`csv` module.
+
+    Raises:
+        FileNotFoundError: *gtfs_path* does not exist, or the feed has no
+            *file_name*.
+        ValueError: *gtfs_path* is neither a directory nor a valid ``.zip``
+            file, or *file_name* is found in more than one place in the zip.
+    """
+    path = os.fspath(gtfs_path)
+    if os.path.isdir(path):
+        file_path = os.path.join(path, file_name)
+        if not os.path.isfile(file_path):
+            raise FileNotFoundError(f"Missing GTFS file in '{path}': {file_name}")
+        with open(file_path, "rb") as handle:
+            yield handle
+        return
+
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"The path '{path}' does not exist.")
+    if not (os.path.isfile(path) and path.lower().endswith(".zip")):
+        raise ValueError(f"'{path}' is neither a directory nor a .zip file.")
+    try:
+        archive = zipfile.ZipFile(path)
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"'{path}' is not a valid zip archive.") from exc
+    with archive:
+        matches = [name for name in archive.namelist() if os.path.basename(name) == file_name]
+        if not matches:
+            raise FileNotFoundError(f"Missing GTFS file in '{path}': {file_name}")
+        if len(matches) > 1:
+            raise ValueError(
+                f"Ambiguous GTFS file in '{path}' (found in multiple locations): {file_name}"
+            )
+        with archive.open(matches[0]) as handle:
+            yield handle
+
+
 def load_gtfs_stops(folder: str) -> pd.DataFrame:
     """Loads GTFS stops from stops.txt into a pandas DataFrame.
 
     Args:
-        folder: The path to the folder containing the GTFS `stops.txt` file.
+        folder: The GTFS feed folder containing `stops.txt`, or a ``.zip`` of
+            the feed.
 
     Returns:
         A pandas DataFrame with stop data. Pandas' default NA parsing is
@@ -113,14 +176,13 @@ def load_gtfs_stops(folder: str) -> pd.DataFrame:
         dropped with a warning.
 
     Raises:
-        FileNotFoundError: If `stops.txt` is not found in the specified folder.
-        ValueError: If the `stops.txt` file is missing required columns, or a
-            non-blank lat/lon cannot be cast to float.
+        FileNotFoundError: If `stops.txt` is not found in the feed.
+        ValueError: If the `stops.txt` file is missing required columns, a
+            non-blank lat/lon cannot be cast to float, or *folder* is neither
+            a folder nor a valid ``.zip``.
     """
-    path = os.path.join(folder, "stops.txt")
-    if not os.path.isfile(path):
-        raise FileNotFoundError(f"stops.txt not found in {folder}")
-    df = pd.read_csv(path, dtype=str, keep_default_na=False, low_memory=False)
+    with open_gtfs_file(folder, "stops.txt") as handle:
+        df = pd.read_csv(handle, dtype=str, keep_default_na=False, low_memory=False)
     need = {"stop_id", "stop_name", "stop_lat", "stop_lon"}
     if not need.issubset(df.columns):
         raise ValueError(f"stops.txt missing columns: {', '.join(need - set(df.columns))}")

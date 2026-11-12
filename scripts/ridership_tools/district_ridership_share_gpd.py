@@ -135,6 +135,7 @@ PCT_BASE: str = "allocated"
 
 # District polygons and the field carrying the district identifier/name.
 # Any format geopandas can read works (shapefile, GeoPackage, GeoJSON, ...).
+# A .zip holding the shapefile also works.
 DISTRICTS_FC = r"Path\To\Your\Districts.shp"
 DISTRICT_FIELD = "DISTRICT"
 
@@ -355,6 +356,76 @@ def filter_stops(stops: pd.DataFrame, join_key: str = GTFS_JOIN_KEY) -> pd.DataF
 # =============================================================================
 
 
+def load_shapefile(path: str, member: Optional[str] = None) -> gpd.GeoDataFrame:
+    """Load a shapefile given a direct ``.shp`` path or a ``.zip`` archive.
+
+    Args:
+        path: Path to a ``.shp`` file, or to a ``.zip`` archive containing
+            one. A zipped shapefile is opened directly via GDAL's ``zip://``
+            virtual filesystem, so the archive is never extracted to disk.
+        member: For a ``.zip`` containing more than one ``.shp``, the name
+            of the one to load (matched case-insensitively against its
+            base filename, e.g. ``"Hospitals.shp"``). Ignored when *path*
+            is a direct ``.shp`` file. Required when the archive contains
+            more than one shapefile. macOS metadata entries (anything under
+            ``__MACOSX/`` and ``._*`` files) are not counted as shapefiles.
+
+    Returns:
+        The loaded :class:`geopandas.GeoDataFrame`.
+
+    Raises:
+        OSError: *path* does not exist.
+        ValueError: *path* is neither a ``.shp`` nor a ``.zip`` file; the
+            zip is unreadable/corrupt; the zip contains no shapefile; the
+            zip contains more than one shapefile and *member* was not
+            supplied; or *member* does not match any shapefile in the zip.
+    """
+    if not os.path.exists(path):
+        raise OSError(f"The path '{path}' does not exist.")
+
+    lower_path = path.lower()
+    if lower_path.endswith(".shp"):
+        logging.info("Reading %s", path)
+        return gpd.read_file(path)
+
+    if not lower_path.endswith(".zip"):
+        raise ValueError(f"'{path}' is neither a .shp nor a .zip file.")
+
+    try:
+        with zipfile.ZipFile(path) as archive:
+            # Zips made with macOS Finder add __MACOSX/._<name>.shp metadata
+            # files next to the real ones; they are not shapefiles.
+            shp_members = [
+                name
+                for name in archive.namelist()
+                if name.lower().endswith(".shp")
+                and not name.startswith("__MACOSX/")
+                and not os.path.basename(name).startswith("._")
+            ]
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"'{path}' is not a valid zip archive.") from exc
+
+    if not shp_members:
+        raise ValueError(f"No .shp file found inside '{path}'.")
+
+    if member is not None:
+        matches = [name for name in shp_members if os.path.basename(name).lower() == member.lower()]
+        if not matches:
+            raise ValueError(f"'{member}' not found inside '{path}'. Available: {shp_members}")
+        chosen = matches[0]
+    elif len(shp_members) == 1:
+        chosen = shp_members[0]
+    else:
+        raise ValueError(
+            f"'{path}' contains {len(shp_members)} shapefiles; pass `member=` to "
+            f"choose one of: {shp_members}"
+        )
+
+    source = f"zip://{path}!{chosen}"
+    logging.info("Reading %s", source)
+    return gpd.read_file(source)
+
+
 def load_districts(districts_fc: str, district_field: str) -> gpd.GeoDataFrame:
     """Load the district polygon layer and validate its CRS and field.
 
@@ -375,7 +446,11 @@ def load_districts(districts_fc: str, district_field: str) -> gpd.GeoDataFrame:
     if not os.path.exists(districts_fc):
         raise OSError(f"District layer not found: {districts_fc}")
     try:
-        districts = gpd.read_file(districts_fc)
+        districts = (
+            load_shapefile(str(districts_fc))
+            if str(districts_fc).lower().endswith(".zip")
+            else gpd.read_file(districts_fc)
+        )
     except Exception as exc:  # pyogrio/fiona raise driver-specific errors
         raise ValueError(f"Could not read district layer '{districts_fc}': {exc}") from exc
 

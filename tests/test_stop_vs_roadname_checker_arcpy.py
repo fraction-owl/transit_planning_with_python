@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib
 import sys
 import types
+import zipfile
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -51,6 +52,20 @@ def test_load_gtfs_stops_keeps_literal_na_and_drops_blank_coords(
     assert df["stop_id"].tolist() == ["NA"]
     assert df["stop_name"].tolist() == ["NA"]
     assert df["stop_lat"].tolist() == [38.9]
+
+
+def test_load_gtfs_stops_reads_zipped_feed(mod: types.ModuleType, tmp_path: Path) -> None:
+    zipped = tmp_path / "feed.zip"
+    with zipfile.ZipFile(zipped, "w") as zf:
+        zf.writestr("feed/stops.txt", "stop_id,stop_name,stop_lat,stop_lon\nNA,NA,38.9,-77.0\n")
+    df = mod.load_gtfs_stops(str(zipped))
+    assert df["stop_id"].tolist() == ["NA"]
+    assert df["stop_lon"].tolist() == [-77.0]
+
+
+def test_load_gtfs_stops_missing_stops_raises(mod: types.ModuleType, tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError, match="stops.txt"):
+        mod.load_gtfs_stops(str(tmp_path))
 
 
 # ---------------------------------------------------------------------------

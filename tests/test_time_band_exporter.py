@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import zipfile
 from pathlib import Path
 
 import openpyxl
@@ -150,6 +151,19 @@ def test_load_gtfs_loads_basic_fixture() -> None:
 def test_load_gtfs_stop_sequence_is_numeric() -> None:
     data = load_gtfs(FIXTURES / "gtfs_basic")
     assert pd.api.types.is_numeric_dtype(data["stop_times"]["stop_sequence"])
+
+
+def test_load_gtfs_zipped_feed_matches_folder(tmp_path: Path) -> None:
+    folder = FIXTURES / "gtfs_basic"
+    zipped = tmp_path / "feed.zip"
+    with zipfile.ZipFile(zipped, "w") as zf:
+        for path in folder.iterdir():
+            zf.write(path, f"feed/{path.name}")
+    from_folder = load_gtfs(folder)
+    from_zip = load_gtfs(zipped)
+    assert from_zip.keys() == from_folder.keys()
+    for key, frame in from_folder.items():
+        pd.testing.assert_frame_equal(from_zip[key], frame)
 
 
 # ---------------------------------------------------------------------------

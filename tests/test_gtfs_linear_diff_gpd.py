@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import zipfile
 from pathlib import Path
 
 import pandas as pd
@@ -452,6 +453,30 @@ def test_load_feed_missing_required_file_raises(tmp_path: Path) -> None:
 def test_load_feed_missing_directory_raises(tmp_path: Path) -> None:
     with pytest.raises(OSError, match="does not exist"):
         load_feed(tmp_path / "nope", "test")
+
+
+def test_load_feed_zipped_feed_matches_folder(tmp_path: Path) -> None:
+    feed_dir = tmp_path / "feed"
+    _write_feed(
+        feed_dir,
+        routes=[{"route_id": "R1", "route_short_name": "1"}],
+        trips=[{"route_id": "R1", "trip_id": "T1", "shape_id": "S1"}],
+        stop_times=_stop_times_rows("T1", ["A", "B"]),
+        stops=[
+            {"stop_id": "A", "stop_lat": 38.90, "stop_lon": -77.03},
+            {"stop_id": "B", "stop_lat": 38.91, "stop_lon": -77.03},
+        ],
+        shapes=_shape_rows("S1", [(-77.03, 38.90), (-77.03, 38.91)]),
+    )
+    zipped = tmp_path / "feed.zip"
+    with zipfile.ZipFile(zipped, "w") as zf:
+        for path in feed_dir.iterdir():
+            zf.write(path, f"wrapper/{path.name}")
+    from_folder = load_feed(feed_dir, "test")
+    from_zip = load_feed(zipped, "test")
+    assert from_zip.keys() == from_folder.keys()
+    for key, frame in from_folder.items():
+        pd.testing.assert_frame_equal(from_zip[key], frame)
 
 
 def test_build_route_geometries_chord_fallback_flagged(tmp_path: Path) -> None:

@@ -22,8 +22,12 @@ Typical usage:
 from __future__ import annotations
 
 import logging
+import os
+import zipfile
+from collections.abc import Generator
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import IO, Iterable, Optional
 
 import numpy as np
 import pandas as pd
@@ -33,7 +37,7 @@ import pandas as pd
 # =============================================================================
 # === BEGIN CONFIG ===
 
-GTFS_DIR = Path(r"Path\To\GIS\Folder")
+GTFS_DIR = Path(r"Path\To\GIS\Folder")  # GTFS feed folder or .zip
 OUTPUT_DIR = Path(r"Path\To\Output_Folder")
 
 # Match against route_short_name OR route_id.
@@ -61,15 +65,66 @@ LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
 # =============================================================================
 
 
-def _require_file(path: Path) -> None:
-    if not path.exists():
-        raise FileNotFoundError(f"Missing GTFS file: {path}")
+@contextmanager
+def open_gtfs_file(
+    gtfs_path: str | os.PathLike[str], file_name: str
+) -> Generator[IO[bytes], None, None]:
+    """Open one GTFS text file from a feed folder or a ``.zip`` of the feed.
+
+    The counterpart of :func:`load_gtfs_data` for scripts that read a file with
+    their own options (``pandas.read_csv`` with ``usecols`` or
+    ``keep_default_na=False``, or the :mod:`csv` module), so they accept a
+    zipped feed without extracting it. Zip members are found the way
+    :func:`load_gtfs_data` finds them: at the archive root or inside a single
+    wrapper folder.
+
+    Args:
+        gtfs_path: Folder containing the GTFS feed, or a ``.zip`` archive of it.
+        file_name: GTFS file to open, e.g. ``"stops.txt"``.
+
+    Yields:
+        A binary file handle. ``pandas.read_csv`` reads it directly; wrap it in
+        :class:`io.TextIOWrapper` for the :mod:`csv` module.
+
+    Raises:
+        FileNotFoundError: *gtfs_path* does not exist, or the feed has no
+            *file_name*.
+        ValueError: *gtfs_path* is neither a directory nor a valid ``.zip``
+            file, or *file_name* is found in more than one place in the zip.
+    """
+    path = os.fspath(gtfs_path)
+    if os.path.isdir(path):
+        file_path = os.path.join(path, file_name)
+        if not os.path.isfile(file_path):
+            raise FileNotFoundError(f"Missing GTFS file in '{path}': {file_name}")
+        with open(file_path, "rb") as handle:
+            yield handle
+        return
+
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"The path '{path}' does not exist.")
+    if not (os.path.isfile(path) and path.lower().endswith(".zip")):
+        raise ValueError(f"'{path}' is neither a directory nor a .zip file.")
+    try:
+        archive = zipfile.ZipFile(path)
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"'{path}' is not a valid zip archive.") from exc
+    with archive:
+        matches = [name for name in archive.namelist() if os.path.basename(name) == file_name]
+        if not matches:
+            raise FileNotFoundError(f"Missing GTFS file in '{path}': {file_name}")
+        if len(matches) > 1:
+            raise ValueError(
+                f"Ambiguous GTFS file in '{path}' (found in multiple locations): {file_name}"
+            )
+        with archive.open(matches[0]) as handle:
+            yield handle
 
 
 def _read_gtfs_csv(gtfs_dir: Path, filename: str, usecols: list[str]) -> pd.DataFrame:
-    path = gtfs_dir / filename
-    _require_file(path)
-    return pd.read_csv(path, dtype=str, usecols=usecols, low_memory=False)
+    """Read *filename* from a GTFS feed folder or .zip; FileNotFoundError if it is missing."""
+    with open_gtfs_file(gtfs_dir, filename) as handle:
+        return pd.read_csv(handle, dtype=str, usecols=usecols, low_memory=False)
 
 
 def _as_sorted_csv(values: Iterable[str]) -> str:
@@ -138,10 +193,10 @@ def _clean_for_export(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def load_gtfs_tables(gtfs_dir: Path) -> dict[str, Optional[pd.DataFrame]]:
-    """Load required GTFS files (stops, routes, trips, stop_times, calendar) from directory.
+    """Load required GTFS files (stops, routes, trips, stop_times, calendar) from a feed.
 
     Args:
-        gtfs_dir: Path to the directory containing GTFS text files.
+        gtfs_dir: GTFS feed folder, or a ``.zip`` of the feed.
 
     Returns:
         A dictionary containing loaded DataFrames for each file key.
@@ -178,8 +233,7 @@ def load_gtfs_tables(gtfs_dir: Path) -> dict[str, Optional[pd.DataFrame]]:
     )
 
     calendar = None
-    cal_path = gtfs_dir / "calendar.txt"
-    if cal_path.exists():
+    try:
         calendar = _read_gtfs_csv(
             gtfs_dir,
             "calendar.txt",
@@ -194,6 +248,8 @@ def load_gtfs_tables(gtfs_dir: Path) -> dict[str, Optional[pd.DataFrame]]:
                 "sunday",
             ],
         ).drop_duplicates(subset=["service_id"])
+    except FileNotFoundError:
+        pass  # optional; calendar-derived day codes are then left blank
 
     return {
         "stops": stops,

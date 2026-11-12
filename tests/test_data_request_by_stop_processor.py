@@ -1,5 +1,6 @@
 import hashlib
 import sys
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -767,3 +768,28 @@ def test_main_omits_route_analysis_when_disabled() -> None:
         _, kwargs = mock_write.call_args
 
     assert kwargs["route_analysis"] is None
+
+
+# ---------------------------------------------------------------------------
+# load_gtfs_stops: folder, stops.txt, or .zip (root or wrapper folder)
+# ---------------------------------------------------------------------------
+
+_STOPS_TXT = "stop_id,stop_code,stop_name,stop_lat,stop_lon\n1,001,Main,38.9,-77.0\n"
+
+
+@pytest.mark.parametrize("arcname", ["stops.txt", "feed/stops.txt"])
+def test_load_gtfs_stops_reads_zip_root_or_wrapper_folder(tmp_path: Path, arcname: str) -> None:
+    zipped = tmp_path / "gtfs.zip"
+    with zipfile.ZipFile(zipped, "w") as zf:
+        zf.writestr(arcname, _STOPS_TXT)
+    stops = target.load_gtfs_stops(zipped)
+    assert stops["stop_code"].tolist() == ["001"]
+    assert stops["stop_lat"].tolist() == [38.9]
+
+
+def test_load_gtfs_stops_zip_without_stops_exits(tmp_path: Path) -> None:
+    zipped = tmp_path / "gtfs.zip"
+    with zipfile.ZipFile(zipped, "w") as zf:
+        zf.writestr("routes.txt", "route_id\nR1\n")
+    with pytest.raises(SystemExit):
+        target.load_gtfs_stops(zipped)

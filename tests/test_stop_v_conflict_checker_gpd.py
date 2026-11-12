@@ -137,6 +137,29 @@ def test_pandas_dedupe_stops_xy_tolerance_merges_close(tmp_path: Path) -> None:
     assert len(df) == 1
 
 
+def test_read_stops_from_zipped_feed_matches_stops_txt(tmp_path: Path) -> None:
+    """The mock DC fixture keeps its files in a dc/ wrapper folder inside the zip."""
+    from_zip = target._read_stops(str(FIXTURES / "mock_gtfs_dc.zip"))
+    from_txt = target._read_stops(str(_dc_stops_txt(tmp_path)))
+    pd.testing.assert_frame_equal(from_zip, from_txt)
+
+
+def test_resolve_stops_path_accepts_zipped_gtfs_dir(monkeypatch: pytest.MonkeyPatch) -> None:
+    zipped = str(FIXTURES / "mock_gtfs_dc.zip")
+    monkeypatch.setattr(target, "STOPS_TXT_PATH", "")
+    monkeypatch.setattr(target, "GTFS_DIR", zipped)
+    assert target._resolve_stops_path() == zipped
+
+
+def test_resolve_stops_path_rejects_feed_without_stops(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(target, "STOPS_TXT_PATH", "")
+    monkeypatch.setattr(target, "GTFS_DIR", str(tmp_path))
+    with pytest.raises(FileNotFoundError, match="stops.txt"):
+        target._resolve_stops_path()
+
+
 # ---------------------------------------------------------------------------
 # _stops_to_gdf
 # ---------------------------------------------------------------------------

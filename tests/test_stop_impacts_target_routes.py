@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import zipfile
+from pathlib import Path
+
 import pandas as pd
 import pytest
 
@@ -11,6 +14,7 @@ from scripts.stop_analysis.stop_impacts_target_routes import (
     build_stop_service_routes,
     classify_impacts,
     identify_target_route_ids,
+    load_gtfs_tables,
 )
 
 # ---------------------------------------------------------------------------
@@ -278,3 +282,49 @@ def test_add_stop_level_summary_columns_eliminated_category(
     only_s2 = classified[classified["stop_id"] == "S2"].copy()
     result = add_stop_level_summary_columns(only_s2, svc_to_dow={})
     assert (result["impact_category"] == "eliminated").all()
+
+
+# ---------------------------------------------------------------------------
+# load_gtfs_tables (folder or .zip)
+# ---------------------------------------------------------------------------
+
+
+_FEED = {
+    "stops.txt": (
+        "stop_id,stop_name,stop_code,stop_lat,stop_lon,location_type\nS1,A,1,38.9,-77.0,\n"
+    ),
+    "routes.txt": "route_id,route_short_name,route_long_name\nR1,101,Main\n",
+    "trips.txt": "trip_id,route_id,service_id\nT1,R1,WK\n",
+    "stop_times.txt": "trip_id,stop_id\nT1,S1\n",
+    "calendar.txt": (
+        "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday\nWK,1,1,1,1,1,0,0\n"
+    ),
+}
+
+
+def test_load_gtfs_tables_zipped_feed_matches_folder(tmp_path: Path) -> None:
+    folder = tmp_path / "feed"
+    folder.mkdir()
+    zipped = tmp_path / "feed.zip"
+    with zipfile.ZipFile(zipped, "w") as zf:
+        for name, text in _FEED.items():
+            (folder / name).write_text(text, encoding="utf-8")
+            zf.writestr(f"wrapper/{name}", text)
+    from_folder = load_gtfs_tables(folder)
+    from_zip = load_gtfs_tables(zipped)
+    assert from_zip.keys() == from_folder.keys()
+    for key, frame in from_folder.items():
+        other = from_zip[key]
+        assert frame is not None and other is not None, key
+        pd.testing.assert_frame_equal(other, frame)
+
+
+def test_load_gtfs_tables_zip_without_calendar(tmp_path: Path) -> None:
+    zipped = tmp_path / "feed.zip"
+    with zipfile.ZipFile(zipped, "w") as zf:
+        for name, text in _FEED.items():
+            if name != "calendar.txt":
+                zf.writestr(name, text)
+    tables = load_gtfs_tables(zipped)
+    assert tables["calendar"] is None
+    assert tables["stops"] is not None and list(tables["stops"]["stop_id"]) == ["S1"]

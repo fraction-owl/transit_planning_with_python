@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import zipfile
 from pathlib import Path
 
 import matplotlib
@@ -436,3 +437,52 @@ def test_run_timeline_end_to_end(tmp_path: Path) -> None:
 def test_run_timeline_rejects_label_length_mismatch(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="FEED_LABELS"):
         run_timeline(feed_dirs=["a", "b"], labels=["only-one"], out_dir=tmp_path)
+
+
+def test_run_timeline_accepts_zipped_feeds_and_labels_them_by_stem(tmp_path: Path) -> None:
+    f1 = _write_feed(
+        tmp_path,
+        "gtfs_2024_winter",
+        routes=[("R1", "1")],
+        trips=[("R1", "t1")],
+        stop_times=[("t1", "a", "1"), ("t1", "b", "2")],
+        start="20240101",
+        end="20240630",
+    )
+    f2 = _write_feed(
+        tmp_path,
+        "gtfs_2024_summer",
+        routes=[("R1", "1"), ("R3", "3")],
+        trips=[("R1", "t1"), ("R3", "t3")],
+        stop_times=[("t1", "a", "1"), ("t1", "b", "2"), ("t3", "g", "1")],
+        start="20240701",
+        end="20241231",
+    )
+    zipped = tmp_path / "gtfs_2024_summer.zip"
+    with zipfile.ZipFile(zipped, "w") as zf:
+        for path in f2.iterdir():
+            zf.write(path, f"wrapper/{path.name}")
+
+    timeline = run_timeline(feed_dirs=[str(f1), str(zipped)], out_dir=tmp_path / "out")
+
+    r3 = timeline[timeline["route"] == "3"].iloc[0]
+    assert (r3["gtfs_2024_winter"], r3["gtfs_2024_summer"]) == ("", "R3")
+    periods = pd.read_csv(tmp_path / "out" / "feed_periods.csv")
+    assert periods["start"].tolist() == ["2024-01-01", "2024-07-01"]
+
+
+def test_run_timeline_zip_without_routes_raises(tmp_path: Path) -> None:
+    f1 = _write_feed(
+        tmp_path,
+        "a",
+        routes=[("R1", "1")],
+        trips=[],
+        stop_times=[],
+        start="20240101",
+        end="20240630",
+    )
+    zipped = tmp_path / "b.zip"
+    with zipfile.ZipFile(zipped, "w") as zf:
+        zf.writestr("trips.txt", "route_id,trip_id,service_id\n")
+    with pytest.raises(OSError, match="routes.txt"):
+        run_timeline(feed_dirs=[str(f1), str(zipped)], out_dir=tmp_path / "out")

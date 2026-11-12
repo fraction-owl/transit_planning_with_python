@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import zipfile
 from pathlib import Path
 
 import pandas as pd
@@ -281,6 +282,22 @@ def test_run_holiday_negation_keeps_holiday_service_out_of_weekday(tmp_path: Pat
     # HOL claims Mon/Wed/Fri columns but only runs on holidays; a normal
     # weekday must count WKD's 6 trips alone.
     assert result.iloc[0]["trip_count"] == 6
+
+
+def test_run_zipped_feed_matches_folder(tmp_path: Path) -> None:
+    """A .zip (files in a wrapper folder) gives the same result, calendar_dates included."""
+    folder = FIXTURES / "gtfs_holiday_negation"
+    zipped = tmp_path / "feed.zip"
+    with zipfile.ZipFile(zipped, "w") as zf:
+        for path in folder.iterdir():
+            zf.write(path, f"feed/{path.name}")
+
+    from_folder = target.run(
+        gtfs_folder=folder, output_path=tmp_path / "a.csv", service_day="weekday"
+    )
+    from_zip = target.run(gtfs_folder=zipped, output_path=tmp_path / "b.csv", service_day="weekday")
+    pd.testing.assert_frame_equal(from_zip, from_folder)
+    assert from_zip.iloc[0]["trip_count"] == 6
 
 
 def test_run_service_date_override_selects_holiday_schedule(tmp_path: Path) -> None:

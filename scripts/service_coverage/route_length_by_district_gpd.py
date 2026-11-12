@@ -5,7 +5,7 @@ CSV tables, and QA checks, with a GeoPackage in place of the file geodatabase.
 Edit only the configuration section unless changing the analysis method.
 
 Inputs:
-    GTFS_FOLDER: an unzipped GTFS feed with routes.txt, trips.txt, and shapes.txt.
+    GTFS_FOLDER: a GTFS feed folder or .zip with routes.txt, trips.txt, and shapes.txt.
     DISTRICTS_PATH: district polygons (shapefile, GeoPackage, or file geodatabase
         layer) with a name field and a defined coordinate system.
 
@@ -55,13 +55,16 @@ import datetime as datetime_module
 import json
 import logging
 import math
+import os
 import re
 import time
 import warnings
+import zipfile
 from collections import Counter, defaultdict
-from collections.abc import Collection, Sequence
+from collections.abc import Collection, Generator, Sequence
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import IO, Any, Optional
 
 import geopandas as gpd
 import numpy as np
@@ -78,7 +81,8 @@ from shapely.geometry.base import BaseGeometry
 # =============================================================================
 # === BEGIN CONFIG ===
 
-GTFS_FOLDER = Path(r"Path\To\Your\GTFS_Folder")
+GTFS_FOLDER = Path(r"Path\To\Your\GTFS_Folder")  # GTFS feed folder or .zip
+# A shapefile may also be given as a .zip holding it (leave DISTRICTS_LAYER None).
 DISTRICTS_PATH = Path(r"Path\To\Your\Districts.shp")
 # Layer name inside a GeoPackage or file geodatabase; None for a shapefile.
 DISTRICTS_LAYER: str | None = None
@@ -137,15 +141,70 @@ RouteInfo = dict[str, str]
 Piece = tuple[tuple[str, ...], BaseGeometry]
 
 
+@contextmanager
+def open_gtfs_file(
+    gtfs_path: str | os.PathLike[str], file_name: str
+) -> Generator[IO[bytes], None, None]:
+    """Open one GTFS text file from a feed folder or a ``.zip`` of the feed.
+
+    The counterpart of :func:`load_gtfs_data` for scripts that read a file with
+    their own options (``pandas.read_csv`` with ``usecols`` or
+    ``keep_default_na=False``, or the :mod:`csv` module), so they accept a
+    zipped feed without extracting it. Zip members are found the way
+    :func:`load_gtfs_data` finds them: at the archive root or inside a single
+    wrapper folder.
+
+    Args:
+        gtfs_path: Folder containing the GTFS feed, or a ``.zip`` archive of it.
+        file_name: GTFS file to open, e.g. ``"stops.txt"``.
+
+    Yields:
+        A binary file handle. ``pandas.read_csv`` reads it directly; wrap it in
+        :class:`io.TextIOWrapper` for the :mod:`csv` module.
+
+    Raises:
+        FileNotFoundError: *gtfs_path* does not exist, or the feed has no
+            *file_name*.
+        ValueError: *gtfs_path* is neither a directory nor a valid ``.zip``
+            file, or *file_name* is found in more than one place in the zip.
+    """
+    path = os.fspath(gtfs_path)
+    if os.path.isdir(path):
+        file_path = os.path.join(path, file_name)
+        if not os.path.isfile(file_path):
+            raise FileNotFoundError(f"Missing GTFS file in '{path}': {file_name}")
+        with open(file_path, "rb") as handle:
+            yield handle
+        return
+
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"The path '{path}' does not exist.")
+    if not (os.path.isfile(path) and path.lower().endswith(".zip")):
+        raise ValueError(f"'{path}' is neither a directory nor a .zip file.")
+    try:
+        archive = zipfile.ZipFile(path)
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"'{path}' is not a valid zip archive.") from exc
+    with archive:
+        matches = [name for name in archive.namelist() if os.path.basename(name) == file_name]
+        if not matches:
+            raise FileNotFoundError(f"Missing GTFS file in '{path}': {file_name}")
+        if len(matches) > 1:
+            raise ValueError(
+                f"Ambiguous GTFS file in '{path}' (found in multiple locations): {file_name}"
+            )
+        with archive.open(matches[0]) as handle:
+            yield handle
+
+
 def read_gtfs(filename: str, required: set[str]) -> pd.DataFrame:
     """Read a GTFS table as text, without coercing identifiers or literal 'NA' values."""
-    path = GTFS_FOLDER / filename
     try:
-        with warnings.catch_warnings():
+        with warnings.catch_warnings(), open_gtfs_file(GTFS_FOLDER, filename) as handle:
             # pandas only warns when the first data row has extra fields; treat it as an error.
             warnings.simplefilter("error", pd.errors.ParserWarning)
             table = pd.read_csv(
-                path, dtype=str, keep_default_na=False, index_col=False, encoding="utf-8-sig"
+                handle, dtype=str, keep_default_na=False, index_col=False, encoding="utf-8-sig"
             )
     except (pd.errors.ParserError, pd.errors.ParserWarning, pd.errors.EmptyDataError) as exc:
         raise ValueError(f"Could not read {filename}: {exc}") from exc
@@ -410,12 +469,85 @@ def find_district_field(districts: gpd.GeoDataFrame) -> str:
     )
 
 
+def load_shapefile(path: str, member: Optional[str] = None) -> gpd.GeoDataFrame:
+    """Load a shapefile given a direct ``.shp`` path or a ``.zip`` archive.
+
+    Args:
+        path: Path to a ``.shp`` file, or to a ``.zip`` archive containing
+            one. A zipped shapefile is opened directly via GDAL's ``zip://``
+            virtual filesystem, so the archive is never extracted to disk.
+        member: For a ``.zip`` containing more than one ``.shp``, the name
+            of the one to load (matched case-insensitively against its
+            base filename, e.g. ``"Hospitals.shp"``). Ignored when *path*
+            is a direct ``.shp`` file. Required when the archive contains
+            more than one shapefile. macOS metadata entries (anything under
+            ``__MACOSX/`` and ``._*`` files) are not counted as shapefiles.
+
+    Returns:
+        The loaded :class:`geopandas.GeoDataFrame`.
+
+    Raises:
+        OSError: *path* does not exist.
+        ValueError: *path* is neither a ``.shp`` nor a ``.zip`` file; the
+            zip is unreadable/corrupt; the zip contains no shapefile; the
+            zip contains more than one shapefile and *member* was not
+            supplied; or *member* does not match any shapefile in the zip.
+    """
+    if not os.path.exists(path):
+        raise OSError(f"The path '{path}' does not exist.")
+
+    lower_path = path.lower()
+    if lower_path.endswith(".shp"):
+        logging.info("Reading %s", path)
+        return gpd.read_file(path)
+
+    if not lower_path.endswith(".zip"):
+        raise ValueError(f"'{path}' is neither a .shp nor a .zip file.")
+
+    try:
+        with zipfile.ZipFile(path) as archive:
+            # Zips made with macOS Finder add __MACOSX/._<name>.shp metadata
+            # files next to the real ones; they are not shapefiles.
+            shp_members = [
+                name
+                for name in archive.namelist()
+                if name.lower().endswith(".shp")
+                and not name.startswith("__MACOSX/")
+                and not os.path.basename(name).startswith("._")
+            ]
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"'{path}' is not a valid zip archive.") from exc
+
+    if not shp_members:
+        raise ValueError(f"No .shp file found inside '{path}'.")
+
+    if member is not None:
+        matches = [name for name in shp_members if os.path.basename(name).lower() == member.lower()]
+        if not matches:
+            raise ValueError(f"'{member}' not found inside '{path}'. Available: {shp_members}")
+        chosen = matches[0]
+    elif len(shp_members) == 1:
+        chosen = shp_members[0]
+    else:
+        raise ValueError(
+            f"'{path}' contains {len(shp_members)} shapefiles; pass `member=` to "
+            f"choose one of: {shp_members}"
+        )
+
+    source = f"zip://{path}!{chosen}"
+    logging.info("Reading %s", source)
+    return gpd.read_file(source)
+
+
 def load_districts(
     target: CRS, grid: float
 ) -> tuple[dict[str, BaseGeometry], str, str | None, list[str]]:
     """Project district polygons and union multiple records with the same label."""
     LOGGER.info("Reading districts from %s", DISTRICTS_PATH)
-    districts = gpd.read_file(DISTRICTS_PATH, layer=DISTRICTS_LAYER)
+    if DISTRICTS_LAYER is None and str(DISTRICTS_PATH).lower().endswith(".zip"):
+        districts = load_shapefile(str(DISTRICTS_PATH))
+    else:
+        districts = gpd.read_file(DISTRICTS_PATH, layer=DISTRICTS_LAYER)
     if districts.empty:
         raise ValueError("No district polygons found.")
     if districts.crs is None:
@@ -879,8 +1011,13 @@ def main() -> int:
     run_dir: Path | None = None
     try:
         # Check inputs before creating an output folder, so placeholder paths do nothing.
-        paths = [GTFS_FOLDER / name for name in ("routes.txt", "trips.txt", "shapes.txt")]
-        missing = [str(path) for path in paths if not path.is_file()]
+        missing = []
+        for name in ("routes.txt", "trips.txt", "shapes.txt"):
+            try:
+                with open_gtfs_file(GTFS_FOLDER, name):
+                    pass
+            except (FileNotFoundError, ValueError):
+                missing.append(str(GTFS_FOLDER / name))
         if not DISTRICTS_PATH.exists():
             missing.append(str(DISTRICTS_PATH))
         if missing:

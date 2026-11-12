@@ -1,10 +1,10 @@
 """Flag GTFS stops closer together than a configured distance threshold.
 
 Reads GTFS stops.txt (and optionally stop_times.txt and trips.txt when the
-direction-based filter is enabled) and flags stops closer than a configured
-distance threshold (default 50 feet). Only stops/platforms (location_type blank
-or 0) are checked; stations, entrances, generic nodes and boarding areas are
-skipped.
+direction-based filter is enabled) from a feed folder or ``.zip`` and flags
+stops closer than a configured distance threshold (default 50 feet). Only
+stops/platforms (location_type blank or 0) are checked; stations, entrances,
+generic nodes and boarding areas are skipped.
 
 Optionally excludes ("passes") stops whose stop_name contains any configured safe
 words (e.g., "bay", "metro"). When enabled, any close pair where either stop is
@@ -33,11 +33,13 @@ import logging
 import math
 import os
 import re
-from collections.abc import Mapping, Sequence
+import zipfile
+from collections.abc import Generator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Iterable, NamedTuple, Optional
+from typing import IO, Iterable, NamedTuple, Optional
 
 import pandas as pd
 
@@ -46,7 +48,7 @@ import pandas as pd
 # =============================================================================
 # === BEGIN CONFIG ===
 
-GTFS_DIR = Path(r"path\to\gtfs")  # folder containing GTFS .txt files
+GTFS_DIR = Path(r"path\to\gtfs")  # GTFS feed folder or .zip
 OUT_DIR = Path(r"path\to\output")  # output folder for CSVs
 
 THRESHOLD_FEET = 50.0
@@ -161,43 +163,135 @@ def add_safe_flag(df: pd.DataFrame, safe_words: list[str], whole_word: bool) -> 
 
 
 def validate_gtfs_files_exist(
-    gtfs_folder_path: str,
+    gtfs_path: str,
     files: Optional[Sequence[str]] = None,
 ) -> None:
     """Check that specific GTFS text files exist and log a warning if missing.
 
     Args:
-        gtfs_folder_path: Absolute or relative path to the folder
-            containing the GTFS feed.
+        gtfs_path: Absolute or relative path to the folder containing the
+            GTFS feed, or to a ``.zip`` archive of it. Zip members may sit
+            at the archive root or nested one level inside a single
+            wrapper folder — both layouts are common among GTFS producers
+            and open-data portals.
         files: Explicit sequence of file names to check. If ``None``,
             a standard set of GTFS files is checked.
     """
-    if not os.path.exists(gtfs_folder_path):
-        logging.warning("The directory '%s' does not exist.", gtfs_folder_path)
+    if not os.path.exists(gtfs_path):
+        logging.warning("The path '%s' does not exist.", gtfs_path)
         return
 
     if files is None:
-        # Only check files this script actually reads. stop_times.txt and
-        # trips.txt are consumed only when the direction filter is enabled,
-        # but a missing stops.txt is always fatal.
         files = (
+            "agency.txt",
             "stops.txt",
-            "stop_times.txt",
+            "routes.txt",
             "trips.txt",
+            "stop_times.txt",
+            "calendar.txt",
+            "calendar_dates.txt",
+            "fare_attributes.txt",
+            "fare_rules.txt",
+            "feed_info.txt",
+            "frequencies.txt",
+            "shapes.txt",
+            "transfers.txt",
         )
 
+    is_zip = os.path.isfile(gtfs_path) and gtfs_path.lower().endswith(".zip")
+    if not is_zip:
+        if not os.path.isdir(gtfs_path):
+            logging.warning("'%s' is neither a directory nor a .zip file.", gtfs_path)
+            return
+        for file_name in files:
+            if not os.path.exists(os.path.join(gtfs_path, file_name)):
+                logging.warning("Missing GTFS file: %s", file_name)
+        return
+
+    try:
+        with zipfile.ZipFile(gtfs_path) as archive:
+            names_by_basename: dict[str, list[str]] = {}
+            for name in archive.namelist():
+                names_by_basename.setdefault(os.path.basename(name), []).append(name)
+    except zipfile.BadZipFile:
+        logging.warning("'%s' is not a valid zip archive.", gtfs_path)
+        return
+
     for file_name in files:
-        if not os.path.exists(os.path.join(gtfs_folder_path, file_name)):
+        matches = names_by_basename.get(file_name, [])
+        if not matches:
             logging.warning("Missing GTFS file: %s", file_name)
+        elif len(matches) > 1:
+            logging.warning("Ambiguous GTFS file (found in multiple locations): %s", file_name)
 
 
-def load_stops(stops_txt: Path) -> pd.DataFrame:
+@contextmanager
+def open_gtfs_file(
+    gtfs_path: str | os.PathLike[str], file_name: str
+) -> Generator[IO[bytes], None, None]:
+    """Open one GTFS text file from a feed folder or a ``.zip`` of the feed.
+
+    The counterpart of :func:`load_gtfs_data` for scripts that read a file with
+    their own options (``pandas.read_csv`` with ``usecols`` or
+    ``keep_default_na=False``, or the :mod:`csv` module), so they accept a
+    zipped feed without extracting it. Zip members are found the way
+    :func:`load_gtfs_data` finds them: at the archive root or inside a single
+    wrapper folder.
+
+    Args:
+        gtfs_path: Folder containing the GTFS feed, or a ``.zip`` archive of it.
+        file_name: GTFS file to open, e.g. ``"stops.txt"``.
+
+    Yields:
+        A binary file handle. ``pandas.read_csv`` reads it directly; wrap it in
+        :class:`io.TextIOWrapper` for the :mod:`csv` module.
+
+    Raises:
+        FileNotFoundError: *gtfs_path* does not exist, or the feed has no
+            *file_name*.
+        ValueError: *gtfs_path* is neither a directory nor a valid ``.zip``
+            file, or *file_name* is found in more than one place in the zip.
+    """
+    path = os.fspath(gtfs_path)
+    if os.path.isdir(path):
+        file_path = os.path.join(path, file_name)
+        if not os.path.isfile(file_path):
+            raise FileNotFoundError(f"Missing GTFS file in '{path}': {file_name}")
+        with open(file_path, "rb") as handle:
+            yield handle
+        return
+
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"The path '{path}' does not exist.")
+    if not (os.path.isfile(path) and path.lower().endswith(".zip")):
+        raise ValueError(f"'{path}' is neither a directory nor a .zip file.")
+    try:
+        archive = zipfile.ZipFile(path)
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"'{path}' is not a valid zip archive.") from exc
+    with archive:
+        matches = [name for name in archive.namelist() if os.path.basename(name) == file_name]
+        if not matches:
+            raise FileNotFoundError(f"Missing GTFS file in '{path}': {file_name}")
+        if len(matches) > 1:
+            raise ValueError(
+                f"Ambiguous GTFS file in '{path}' (found in multiple locations): {file_name}"
+            )
+        with archive.open(matches[0]) as handle:
+            yield handle
+
+
+def load_stops(stops_txt: Path | IO[bytes]) -> pd.DataFrame:
     """Load the stops/platforms in GTFS stops.txt with minimal validation.
 
     Keeps location_type 0 or blank (an absent column counts as blank), the only
     kind stop_times.txt can reference. Other rows are dropped before coordinates
     are checked, because generic nodes and boarding areas may omit them. Only
     empty fields count as missing, so literal IDs such as "NA" are kept.
+
+    Args:
+        stops_txt: Path to stops.txt, or an open binary handle to it (as
+            yielded by ``open_gtfs_file``).
     """
     df = pd.read_csv(
         stops_txt,
@@ -281,27 +375,25 @@ def build_stop_route_direction_index(gtfs_dir: Path) -> DirectionIndex:
           blank route_id, marks the stops it serves as unresolved.
         - Only empty fields count as missing, so literal IDs such as "NA" are kept.
     """
-    stop_times_path = gtfs_dir / "stop_times.txt"
-    trips_path = gtfs_dir / "trips.txt"
-
-    if not stop_times_path.exists() or not trips_path.exists():
+    try:
+        with open_gtfs_file(gtfs_dir, "trips.txt") as handle:
+            trips = pd.read_csv(
+                handle,
+                dtype={"trip_id": "string", "route_id": "string"},
+                keep_default_na=False,
+                na_values=[""],
+            )
+        with open_gtfs_file(gtfs_dir, "stop_times.txt") as handle:
+            stop_times = pd.read_csv(
+                handle,
+                usecols=["trip_id", "stop_id"],
+                dtype={"trip_id": "string", "stop_id": "string"},
+                keep_default_na=False,
+                na_values=[""],
+            )
+    except FileNotFoundError:
         logging.warning("Missing stop_times.txt or trips.txt; direction-based filtering disabled.")
         return DirectionIndex()
-
-    stop_times = pd.read_csv(
-        stop_times_path,
-        usecols=["trip_id", "stop_id"],
-        dtype={"trip_id": "string", "stop_id": "string"},
-        keep_default_na=False,
-        na_values=[""],
-    )
-
-    trips = pd.read_csv(
-        trips_path,
-        dtype={"trip_id": "string", "route_id": "string"},
-        keep_default_na=False,
-        na_values=[""],
-    )
 
     if "direction_id" not in trips.columns:
         logging.warning("trips.txt has no direction_id; direction-based filtering disabled.")
@@ -583,15 +675,16 @@ def main() -> int:
         )
         return 2
 
-    validate_gtfs_files_exist(str(GTFS_DIR))
+    # Only check files this script reads. stop_times.txt and trips.txt are
+    # consumed only when the direction filter is enabled, but a missing
+    # stops.txt is always fatal.
+    validate_gtfs_files_exist(str(GTFS_DIR), files=("stops.txt", "stop_times.txt", "trips.txt"))
 
-    stops_txt = GTFS_DIR / "stops.txt"
-    if not stops_txt.exists():
-        raise FileNotFoundError(f"Could not find stops.txt at: {stops_txt}")
+    with open_gtfs_file(GTFS_DIR, "stops.txt") as handle:
+        stops = load_stops(handle)
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    stops = load_stops(stops_txt)
     stops = add_safe_flag(stops, safe_words=SAFE_WORDS, whole_word=SAFE_WORD_MATCH_WHOLE_WORD)
 
     stop_route_dir_index = DirectionIndex()

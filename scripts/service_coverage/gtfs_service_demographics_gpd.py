@@ -90,12 +90,14 @@ SERVICE_AREA_METHOD = "stop_buffer"  # Options: "stop_buffer", "route_buffer", "
 
 # Paths
 GTFS_DATA_PATH = r"Path\To\GTFS_data_folder"
+# A .zip holding the shapefile also works.
 DEMOGRAPHICS_SHP_PATH = r"Path\To\census_blocks.shp"
 OUTPUT_DIRECTORY = r"Path\To\Output"
 
 # Pedestrian centerline (sidewalk/road) shapefile — only used when
 # SERVICE_AREA_METHOD == "isochrone". Lines should be routable (split at
 # intersections) for best results.
+# A .zip holding the shapefile also works.
 PEDESTRIAN_NETWORK_PATH = r"Path\To\centerlines.shp"
 
 # Service day(s) to analyze, by GTFS service_id. The default "4" is the typical weekday
@@ -2211,6 +2213,76 @@ def load_express_route_ids(
 # =============================================================================
 
 
+def load_shapefile(path: str, member: Optional[str] = None) -> gpd.GeoDataFrame:
+    """Load a shapefile given a direct ``.shp`` path or a ``.zip`` archive.
+
+    Args:
+        path: Path to a ``.shp`` file, or to a ``.zip`` archive containing
+            one. A zipped shapefile is opened directly via GDAL's ``zip://``
+            virtual filesystem, so the archive is never extracted to disk.
+        member: For a ``.zip`` containing more than one ``.shp``, the name
+            of the one to load (matched case-insensitively against its
+            base filename, e.g. ``"Hospitals.shp"``). Ignored when *path*
+            is a direct ``.shp`` file. Required when the archive contains
+            more than one shapefile. macOS metadata entries (anything under
+            ``__MACOSX/`` and ``._*`` files) are not counted as shapefiles.
+
+    Returns:
+        The loaded :class:`geopandas.GeoDataFrame`.
+
+    Raises:
+        OSError: *path* does not exist.
+        ValueError: *path* is neither a ``.shp`` nor a ``.zip`` file; the
+            zip is unreadable/corrupt; the zip contains no shapefile; the
+            zip contains more than one shapefile and *member* was not
+            supplied; or *member* does not match any shapefile in the zip.
+    """
+    if not os.path.exists(path):
+        raise OSError(f"The path '{path}' does not exist.")
+
+    lower_path = path.lower()
+    if lower_path.endswith(".shp"):
+        logging.info("Reading %s", path)
+        return gpd.read_file(path)
+
+    if not lower_path.endswith(".zip"):
+        raise ValueError(f"'{path}' is neither a .shp nor a .zip file.")
+
+    try:
+        with zipfile.ZipFile(path) as archive:
+            # Zips made with macOS Finder add __MACOSX/._<name>.shp metadata
+            # files next to the real ones; they are not shapefiles.
+            shp_members = [
+                name
+                for name in archive.namelist()
+                if name.lower().endswith(".shp")
+                and not name.startswith("__MACOSX/")
+                and not os.path.basename(name).startswith("._")
+            ]
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"'{path}' is not a valid zip archive.") from exc
+
+    if not shp_members:
+        raise ValueError(f"No .shp file found inside '{path}'.")
+
+    if member is not None:
+        matches = [name for name in shp_members if os.path.basename(name).lower() == member.lower()]
+        if not matches:
+            raise ValueError(f"'{member}' not found inside '{path}'. Available: {shp_members}")
+        chosen = matches[0]
+    elif len(shp_members) == 1:
+        chosen = shp_members[0]
+    else:
+        raise ValueError(
+            f"'{path}' contains {len(shp_members)} shapefiles; pass `member=` to "
+            f"choose one of: {shp_members}"
+        )
+
+    source = f"zip://{path}!{chosen}"
+    logging.info("Reading %s", source)
+    return gpd.read_file(source)
+
+
 def run(
     analysis_mode: str | None = None,
     service_area_method: str | None = None,
@@ -2454,7 +2526,11 @@ def run(
                     f"Pedestrian network shapefile not found: {ped_path}. "
                     "It is required for the 'isochrone' method."
                 )
-            centerlines = gpd.read_file(ped_path).to_crs(epsg=crs_epsg_code)
+            centerlines = (
+                load_shapefile(str(ped_path))
+                if str(ped_path).lower().endswith(".zip")
+                else gpd.read_file(ped_path)
+            ).to_crs(epsg=crs_epsg_code)
             ped_graph, _ = build_pedestrian_time_network(
                 centerlines, walk_speed=walk_speed_units_per_s
             )
@@ -2476,7 +2552,11 @@ def run(
         if not demographics_path.is_file():
             raise FileNotFoundError(f"Demographics shapefile not found: {demographics_path}")
 
-        demographics_gdf = gpd.read_file(demographics_path)
+        demographics_gdf = (
+            load_shapefile(str(demographics_path))
+            if str(demographics_path).lower().endswith(".zip")
+            else gpd.read_file(demographics_path)
+        )
         demographics_gdf = apply_fips_filter(demographics_gdf, fips_filter)
         demographics_gdf = demographics_gdf.to_crs(epsg=crs_epsg_code)
 
