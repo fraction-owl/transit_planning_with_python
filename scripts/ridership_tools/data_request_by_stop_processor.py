@@ -58,11 +58,14 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import sys
 import zipfile
+from collections.abc import Generator
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import IO, Any, Dict, List, Sequence, Tuple
 
 import pandas as pd
 from openpyxl import load_workbook
@@ -408,11 +411,68 @@ def read_excel_file(input_file: Path) -> pd.DataFrame:
         sys.exit(1)
 
 
+@contextmanager
+def open_gtfs_file(
+    gtfs_path: str | os.PathLike[str], file_name: str
+) -> Generator[IO[bytes], None, None]:
+    """Open one GTFS text file from a feed folder or a ``.zip`` of the feed.
+
+    The counterpart of :func:`load_gtfs_data` for scripts that read a file with
+    their own options (``pandas.read_csv`` with ``usecols`` or
+    ``keep_default_na=False``, or the :mod:`csv` module), so they accept a
+    zipped feed without extracting it. Zip members are found the way
+    :func:`load_gtfs_data` finds them: at the archive root or inside a single
+    wrapper folder.
+
+    Args:
+        gtfs_path: Folder containing the GTFS feed, or a ``.zip`` archive of it.
+        file_name: GTFS file to open, e.g. ``"stops.txt"``.
+
+    Yields:
+        A binary file handle. ``pandas.read_csv`` reads it directly; wrap it in
+        :class:`io.TextIOWrapper` for the :mod:`csv` module.
+
+    Raises:
+        FileNotFoundError: *gtfs_path* does not exist, or the feed has no
+            *file_name*.
+        ValueError: *gtfs_path* is neither a directory nor a valid ``.zip``
+            file, or *file_name* is found in more than one place in the zip.
+    """
+    path = os.fspath(gtfs_path)
+    if os.path.isdir(path):
+        file_path = os.path.join(path, file_name)
+        if not os.path.isfile(file_path):
+            raise FileNotFoundError(f"Missing GTFS file in '{path}': {file_name}")
+        with open(file_path, "rb") as handle:
+            yield handle
+        return
+
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"The path '{path}' does not exist.")
+    if not (os.path.isfile(path) and path.lower().endswith(".zip")):
+        raise ValueError(f"'{path}' is neither a directory nor a .zip file.")
+    try:
+        archive = zipfile.ZipFile(path)
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"'{path}' is not a valid zip archive.") from exc
+    with archive:
+        matches = [name for name in archive.namelist() if os.path.basename(name) == file_name]
+        if not matches:
+            raise FileNotFoundError(f"Missing GTFS file in '{path}': {file_name}")
+        if len(matches) > 1:
+            raise ValueError(
+                f"Ambiguous GTFS file in '{path}' (found in multiple locations): {file_name}"
+            )
+        with archive.open(matches[0]) as handle:
+            yield handle
+
+
 def load_gtfs_stops(gtfs_path: Path) -> pd.DataFrame:
     """Load and normalize the GTFS stops table.
 
     Accepts a path to a ``stops.txt`` file, a GTFS ``.zip`` archive
-    containing one, or an unzipped GTFS directory.
+    containing one (at its root or inside one wrapper folder), or an unzipped
+    GTFS directory.
 
     Args:
         gtfs_path: Path to stops.txt, a GTFS .zip, or a GTFS directory.
@@ -427,18 +487,15 @@ def load_gtfs_stops(gtfs_path: Path) -> pd.DataFrame:
             required GTFS columns.
     """
     try:
-        if gtfs_path.is_file() and gtfs_path.suffix.lower() == ".zip":
-            with zipfile.ZipFile(gtfs_path) as zf:
-                with zf.open("stops.txt") as f:
-                    stops: pd.DataFrame = pd.read_csv(f, dtype=str)
+        if gtfs_path.is_dir() or (gtfs_path.is_file() and gtfs_path.suffix.lower() == ".zip"):
+            with open_gtfs_file(gtfs_path, "stops.txt") as f:
+                stops: pd.DataFrame = pd.read_csv(f, dtype=str)
         elif gtfs_path.is_file():
             stops = pd.read_csv(gtfs_path, dtype=str)
-        elif gtfs_path.is_dir():
-            stops = pd.read_csv(gtfs_path / "stops.txt", dtype=str)
         else:
             logging.error("GTFS path '%s' does not exist.", gtfs_path)
             sys.exit(1)
-    except (FileNotFoundError, KeyError, OSError, zipfile.BadZipFile) as exc:
+    except (FileNotFoundError, KeyError, OSError, ValueError, zipfile.BadZipFile) as exc:
         logging.error("Error reading GTFS stops: %s", exc)
         sys.exit(1)
 

@@ -22,8 +22,10 @@ import logging
 import os
 import zipfile
 from collections import defaultdict
+from collections.abc import Generator
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Mapping, Optional, Sequence, Tuple
+from typing import IO, Any, Dict, List, Literal, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -35,7 +37,7 @@ from openpyxl.utils import get_column_letter
 # =============================================================================
 # === BEGIN CONFIG ===
 
-# Folder containing the raw GTFS feed (must include at least stops.txt, trips.txt,
+# The raw GTFS feed, as a folder or a .zip (must include at least stops.txt, trips.txt,
 # stop_times.txt, and routes.txt). Use a raw string (r"") for Windows UNC paths.
 INPUT_DIR: Path = Path(r"Path\To\Your\GTFS_Folder")
 
@@ -998,6 +1000,62 @@ def load_gtfs_data(
 # =============================================================================
 
 
+@contextmanager
+def open_gtfs_file(
+    gtfs_path: str | os.PathLike[str], file_name: str
+) -> Generator[IO[bytes], None, None]:
+    """Open one GTFS text file from a feed folder or a ``.zip`` of the feed.
+
+    The counterpart of :func:`load_gtfs_data` for scripts that read a file with
+    their own options (``pandas.read_csv`` with ``usecols`` or
+    ``keep_default_na=False``, or the :mod:`csv` module), so they accept a
+    zipped feed without extracting it. Zip members are found the way
+    :func:`load_gtfs_data` finds them: at the archive root or inside a single
+    wrapper folder.
+
+    Args:
+        gtfs_path: Folder containing the GTFS feed, or a ``.zip`` archive of it.
+        file_name: GTFS file to open, e.g. ``"stops.txt"``.
+
+    Yields:
+        A binary file handle. ``pandas.read_csv`` reads it directly; wrap it in
+        :class:`io.TextIOWrapper` for the :mod:`csv` module.
+
+    Raises:
+        FileNotFoundError: *gtfs_path* does not exist, or the feed has no
+            *file_name*.
+        ValueError: *gtfs_path* is neither a directory nor a valid ``.zip``
+            file, or *file_name* is found in more than one place in the zip.
+    """
+    path = os.fspath(gtfs_path)
+    if os.path.isdir(path):
+        file_path = os.path.join(path, file_name)
+        if not os.path.isfile(file_path):
+            raise FileNotFoundError(f"Missing GTFS file in '{path}': {file_name}")
+        with open(file_path, "rb") as handle:
+            yield handle
+        return
+
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"The path '{path}' does not exist.")
+    if not (os.path.isfile(path) and path.lower().endswith(".zip")):
+        raise ValueError(f"'{path}' is neither a directory nor a .zip file.")
+    try:
+        archive = zipfile.ZipFile(path)
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"'{path}' is not a valid zip archive.") from exc
+    with archive:
+        matches = [name for name in archive.namelist() if os.path.basename(name) == file_name]
+        if not matches:
+            raise FileNotFoundError(f"Missing GTFS file in '{path}': {file_name}")
+        if len(matches) > 1:
+            raise ValueError(
+                f"Ambiguous GTFS file in '{path}' (found in multiple locations): {file_name}"
+            )
+        with archive.open(matches[0]) as handle:
+            yield handle
+
+
 def main() -> int:
     """Main script function for generating GTFS pattern exports.
 
@@ -1029,39 +1087,34 @@ def main() -> int:
 
     # Load calendar.txt (optional)
     calendar_df = None
-    calendar_file_path = str(INPUT_DIR / "calendar.txt")
-    if os.path.exists(calendar_file_path):
-        try:
-            calendar_df = pd.read_csv(calendar_file_path, dtype=str)
+    try:
+        with open_gtfs_file(INPUT_DIR, "calendar.txt") as handle:
+            calendar_df = pd.read_csv(handle, dtype=str)
 
-            if calendar_df.empty and os.path.getsize(calendar_file_path) > 0:
-                logging.warning(
-                    "Loaded calendar.txt but it appears to have headers only or is malformed "
-                    "(%d records).",
-                    len(calendar_df),
-                )
-            elif not calendar_df.empty:
-                logging.info("Loaded calendar.txt successfully (%d records).", len(calendar_df))
-            else:
-                logging.info("calendar.txt (%s) exists but is empty.", calendar_file_path)
-                calendar_df = None
-
-        except pd.errors.EmptyDataError:
+        if calendar_df.empty:
             logging.warning(
-                "calendar.txt (%s) is empty. Proceeding without calendar day names.",
-                calendar_file_path,
+                "Loaded calendar.txt but it appears to have headers only or is malformed "
+                "(%d records).",
+                len(calendar_df),
             )
-            calendar_df = None
+        else:
+            logging.info("Loaded calendar.txt successfully (%d records).", len(calendar_df))
 
-        except (OSError, ValueError, pd.errors.ParserError) as exc:
-            logging.warning("Could not load calendar.txt from %s: %s", calendar_file_path, exc)
-            calendar_df = None
-
-    else:
+    except FileNotFoundError:
         logging.info(
-            "No calendar.txt found at %s; subfolders will be 'calendar_<service_id>' only.",
-            calendar_file_path,
+            "No calendar.txt found in %s; subfolders will be 'calendar_<service_id>' only.",
+            INPUT_DIR,
         )
+
+    except pd.errors.EmptyDataError:
+        logging.warning(
+            "calendar.txt in %s is empty. Proceeding without calendar day names.", INPUT_DIR
+        )
+        calendar_df = None
+
+    except (OSError, ValueError, pd.errors.ParserError) as exc:
+        logging.warning("Could not load calendar.txt from %s: %s", INPUT_DIR, exc)
+        calendar_df = None
 
     # Load essential GTFS files
     essential_files = [

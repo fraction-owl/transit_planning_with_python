@@ -5,7 +5,7 @@ standard WGS 84 coordinates. Designed for notebook workflows.
 Supports configurable default input/output paths and selective export.
 
 Inputs:
-    - GTFS directory with `stops.txt` (required) and `shapes.txt` (optional)
+    - GTFS feed (folder or .zip) with `stops.txt` (required) and `shapes.txt` (optional)
     - Optional export type: "stops", "lines", or "both"
     - Optional per-route split (uses `trips.txt`/`routes.txt` when present)
 
@@ -25,9 +25,10 @@ import logging
 import os
 import re
 import zipfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Generator, Mapping, Sequence
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import IO, Any, Literal, Optional
 
 import geopandas as gpd
 import pandas as pd
@@ -42,7 +43,7 @@ GTFS_CRS = "EPSG:4326"  # Standard CRS for GTFS (WGS 84)
 # Type alias for export choices for clarity
 ExportKind = Literal["stops", "lines", "both"]
 
-# REQUIRED: Default path to the directory containing GTFS .txt files
+# REQUIRED: Default path to the GTFS feed, as a folder of .txt files or a .zip
 DEFAULT_GTFS_DIR: Optional[Path] = Path(r"/path/to/your/default_gtfs_folder")  # <-- EDIT ME
 
 # REQUIRED: Default path to the directory where Shapefiles will be saved
@@ -193,11 +194,76 @@ def load_gtfs_data(
             archive.close()
 
 
+@contextmanager
+def open_gtfs_file(
+    gtfs_path: str | os.PathLike[str], file_name: str
+) -> Generator[IO[bytes], None, None]:
+    """Open one GTFS text file from a feed folder or a ``.zip`` of the feed.
+
+    The counterpart of :func:`load_gtfs_data` for scripts that read a file with
+    their own options (``pandas.read_csv`` with ``usecols`` or
+    ``keep_default_na=False``, or the :mod:`csv` module), so they accept a
+    zipped feed without extracting it. Zip members are found the way
+    :func:`load_gtfs_data` finds them: at the archive root or inside a single
+    wrapper folder.
+
+    Args:
+        gtfs_path: Folder containing the GTFS feed, or a ``.zip`` archive of it.
+        file_name: GTFS file to open, e.g. ``"stops.txt"``.
+
+    Yields:
+        A binary file handle. ``pandas.read_csv`` reads it directly; wrap it in
+        :class:`io.TextIOWrapper` for the :mod:`csv` module.
+
+    Raises:
+        FileNotFoundError: *gtfs_path* does not exist, or the feed has no
+            *file_name*.
+        ValueError: *gtfs_path* is neither a directory nor a valid ``.zip``
+            file, or *file_name* is found in more than one place in the zip.
+    """
+    path = os.fspath(gtfs_path)
+    if os.path.isdir(path):
+        file_path = os.path.join(path, file_name)
+        if not os.path.isfile(file_path):
+            raise FileNotFoundError(f"Missing GTFS file in '{path}': {file_name}")
+        with open(file_path, "rb") as handle:
+            yield handle
+        return
+
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"The path '{path}' does not exist.")
+    if not (os.path.isfile(path) and path.lower().endswith(".zip")):
+        raise ValueError(f"'{path}' is neither a directory nor a .zip file.")
+    try:
+        archive = zipfile.ZipFile(path)
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"'{path}' is not a valid zip archive.") from exc
+    with archive:
+        matches = [name for name in archive.namelist() if os.path.basename(name) == file_name]
+        if not matches:
+            raise FileNotFoundError(f"Missing GTFS file in '{path}': {file_name}")
+        if len(matches) > 1:
+            raise ValueError(
+                f"Ambiguous GTFS file in '{path}' (found in multiple locations): {file_name}"
+            )
+        with archive.open(matches[0]) as handle:
+            yield handle
+
+
+def _has_gtfs_file(gtfs_dir: Path, name: str) -> bool:
+    """Return True if the GTFS feed (folder or .zip) at *gtfs_dir* contains *name*."""
+    try:
+        with open_gtfs_file(gtfs_dir, name):
+            return True
+    except FileNotFoundError:
+        return False
+
+
 def read_stops(gtfs_dir: Path) -> gpd.GeoDataFrame:
     """Reads GTFS 'stops.txt' file into a Point GeoDataFrame.
 
     Args:
-        gtfs_dir: Path to the directory containing the GTFS files.
+        gtfs_dir: Path to the GTFS feed folder or ``.zip``.
 
     Returns:
         A GeoDataFrame containing stop locations as Points.
@@ -260,7 +326,7 @@ def read_shapes(gtfs_dir: Path) -> gpd.GeoDataFrame:
     If 'shapes.txt' is missing, an empty GeoDataFrame is returned.
 
     Args:
-        gtfs_dir: Path to the directory containing the GTFS files.
+        gtfs_dir: Path to the GTFS feed folder or ``.zip``.
 
     Returns:
         A GeoDataFrame containing shape geometries as LineStrings. Returns an
@@ -270,7 +336,7 @@ def read_shapes(gtfs_dir: Path) -> gpd.GeoDataFrame:
         ValueError: If 'shapes.txt' exists but is missing required columns
                     or contains invalid coordinate/sequence data.
     """
-    if not (gtfs_dir / "shapes.txt").exists():
+    if not _has_gtfs_file(gtfs_dir, "shapes.txt"):
         logging.info("Info: Optional file 'shapes.txt' not found. Skipping shapes.")
         return gpd.GeoDataFrame(columns=["shape_id", "geometry"], geometry=[], crs=GTFS_CRS)
 
@@ -416,14 +482,14 @@ def map_shapes_to_routes(gtfs_dir: Path) -> Optional[pd.DataFrame]:
     """Build a shape_id → route mapping from `trips.txt` (and `routes.txt`).
 
     Args:
-        gtfs_dir: Path to the directory containing the GTFS files.
+        gtfs_dir: Path to the GTFS feed folder or ``.zip``.
 
     Returns:
         DataFrame with columns ``shape_id``, ``route_id``, and
         ``route_short`` (one row per distinct shape/route pair), or ``None``
         when `trips.txt` is missing, unreadable, or lacks the needed columns.
     """
-    if not (gtfs_dir / "trips.txt").exists():
+    if not _has_gtfs_file(gtfs_dir, "trips.txt"):
         logging.warning("Warning: trips.txt not found; cannot map shapes to routes.")
         return None
 
@@ -444,7 +510,7 @@ def map_shapes_to_routes(gtfs_dir: Path) -> Optional[pd.DataFrame]:
         return None
 
     short_lookup: dict[str, str] = {}
-    if (gtfs_dir / "routes.txt").exists():
+    if _has_gtfs_file(gtfs_dir, "routes.txt"):
         try:
             routes = load_gtfs_data(str(gtfs_dir), files=["routes.txt"])["routes"]
             if {"route_id", "route_short_name"}.issubset(routes.columns):
@@ -477,7 +543,7 @@ def export_lines_per_route(
 
     Args:
         lines_gdf: LineString GeoDataFrame as returned by :func:`read_shapes`.
-        gtfs_dir: Path to the directory containing the GTFS files.
+        gtfs_dir: Path to the GTFS feed folder or ``.zip``.
         output_dir: Base output directory (the subfolder is created inside).
 
     Raises:
@@ -557,7 +623,7 @@ def gtfs_to_shapefiles(
     are not provided.
 
     Args:
-        gtfs_dir: Path to the GTFS directory. If None, uses
+        gtfs_dir: Path to the GTFS feed folder or ``.zip``. If None, uses
                   DEFAULT_GTFS_DIR from module configuration.
         output_dir: Path to the output directory. If None, uses
                     DEFAULT_OUTPUT_DIR from module configuration.
@@ -570,7 +636,8 @@ def gtfs_to_shapefiles(
 
     Raises:
         ValueError: If required path arguments are None and defaults are also None.
-        NotADirectoryError: If resolved gtfs_dir does not exist or is not a directory.
+        NotADirectoryError: If resolved gtfs_dir does not exist or is neither a
+            directory nor a ``.zip`` file.
         FileNotFoundError: If 'stops.txt' is required but not found.
         ValueError: If GTFS files have missing columns or invalid data.
         IOError: If shapefiles cannot be written to the output directory.
@@ -594,9 +661,10 @@ def gtfs_to_shapefiles(
     logging.info("Split lines by route: %s", resolved_split)
     logging.info("-" * 50)
 
-    if not resolved_gtfs_dir.is_dir():
+    is_zip = resolved_gtfs_dir.is_file() and resolved_gtfs_dir.suffix.lower() == ".zip"
+    if not (resolved_gtfs_dir.is_dir() or is_zip):
         raise NotADirectoryError(
-            f"Input GTFS directory not found or is not a directory: {resolved_gtfs_dir}"
+            f"Input GTFS feed not found or is neither a folder nor a .zip: {resolved_gtfs_dir}"
         )
 
     # Ensure output directory exists before processing files

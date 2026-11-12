@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shutil
+import zipfile
 from pathlib import Path
 
 import openpyxl
@@ -384,3 +385,24 @@ def test_main_writes_real_pattern_workbooks(
     # One pattern of three trips. Segment distances are 960 / 690 / 690 / 900 m
     # of shape_dist_traveled, converted to miles.
     assert rows == [("R2", "0", "WKDY", 1, 3, "07:30", "-", "0.60", "0.43", "0.43", "0.56")]
+
+
+def test_main_reads_calendar_from_zipped_feed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import scripts.gtfs_exports.stop_pattern_exporter as mod
+
+    feed = _gtfs_basic_with_shape_dist(tmp_path)
+    zipped = tmp_path / "gtfs_basic.zip"
+    with zipfile.ZipFile(zipped, "w") as zf:
+        for path in feed.iterdir():
+            zf.write(path, f"wrapper/{path.name}")
+    out_dir = tmp_path / "out"
+    monkeypatch.setattr(mod, "INPUT_DIR", zipped)
+    monkeypatch.setattr(mod, "OUTPUT_DIR", out_dir)
+
+    assert mod.main() == 0
+
+    # calendar.txt came from inside the zip, so the folder names WKDY's days.
+    folder = out_dir / "calendar_WKDY_mon_tue_wed_thu_fri"
+    assert len(list(folder.glob("*.xlsx"))) == 3

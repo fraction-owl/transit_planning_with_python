@@ -405,6 +405,23 @@ def test_gtfs_to_shapefiles_split_off_by_default(dc_gtfs_dir: Path, tmp_path: Pa
 # ---------------------------------------------------------------------------
 
 
+def test_gtfs_to_shapefiles_reads_zipped_feed(tmp_path: Path) -> None:
+    """The .zip as published (files in a dc/ wrapper folder) converts like the folder."""
+    out = tmp_path / "out"
+    gtfs_to_shapefiles(FIXTURES / "mock_gtfs_dc.zip", out, kind="both", split_by_route=True)
+    stops = gpd.read_file(out / "gtfs_stops.shp")
+    lines = gpd.read_file(out / "gtfs_lines.shp")
+    assert len(stops) > 0 and len(lines) > 0
+    # trips.txt and routes.txt were found in the zip, so shapes map to routes.
+    assert (out / PER_ROUTE_SUBDIR / "route_10.shp").exists()
+
+
+def test_read_shapes_zip_matches_folder(dc_gtfs_dir: Path) -> None:
+    from_zip = read_shapes(FIXTURES / "mock_gtfs_dc.zip")
+    from_folder = read_shapes(dc_gtfs_dir)
+    pd.testing.assert_frame_equal(pd.DataFrame(from_zip), pd.DataFrame(from_folder))
+
+
 def test_gtfs_to_shapefiles_nonexistent_gtfs_dir_raises(tmp_path: Path) -> None:
     """NotADirectoryError when the GTFS directory does not exist."""
     with pytest.raises(NotADirectoryError):
