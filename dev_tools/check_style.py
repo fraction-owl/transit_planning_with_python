@@ -25,6 +25,8 @@ Checks performed (per-file):
     13. docstring_script_refs – Every `name.py` the module docstring mentions
         is a file that exists somewhere in the repository (catches names left
         behind by a rename).
+    14. docstring_length – Module docstring runs at most DOCSTRING_MAX_LINES
+        lines (CONTRIBUTING.md asks for ~50).
 
 Exit status:
     0 – all enabled checks passed for all files
@@ -84,7 +86,13 @@ CHECKS_ENABLED: dict[str, bool] = {
     "no_dataclasses": True,
     "docstring_sections": True,
     "docstring_script_refs": True,
+    "docstring_length": True,
 }
+
+# Module docstrings longer than this many lines, counted from the opening quotes
+# to the closing quotes, are flagged. CONTRIBUTING.md asks for ~50 lines; the
+# margin above that keeps the warning to clear outliers.
+DOCSTRING_MAX_LINES: int = 59
 
 # === END CONFIG ===
 
@@ -773,6 +781,40 @@ def check_docstring_script_refs(
     return found
 
 
+def check_docstring_length(
+    src: str, path: Path, max_lines: int = DOCSTRING_MAX_LINES
+) -> list[Violation]:
+    """Flag a module docstring longer than *max_lines* source lines.
+
+    Lines are counted from the opening quotes to the closing quotes, inclusive,
+    so the count is what a reader scrolls past at the top of the file. A missing
+    docstring is left to the docstring_sections check.
+    """
+    try:
+        tree = ast.parse(src, filename=str(path))
+    except SyntaxError:
+        return []
+
+    if ast.get_docstring(tree) is None:
+        return []
+
+    doc_node = tree.body[0]
+    n_lines = (doc_node.end_lineno or doc_node.lineno) - doc_node.lineno + 1
+    if n_lines <= max_lines:
+        return []
+    return [
+        Violation(
+            check="docstring_length",
+            line=doc_node.lineno,
+            message=(
+                f"Module docstring is {n_lines} lines (limit {max_lines}) — keep what "
+                "an analyst needs to run and trust the tool and trim the rest, per "
+                "CONTRIBUTING.md"
+            ),
+        )
+    ]
+
+
 # =============================================================================
 # ORCHESTRATION
 # =============================================================================
@@ -816,6 +858,8 @@ def audit_file(path: Path) -> FileResult:
         violations.extend(check_docstring_sections(src, path))
     if enabled.get("docstring_script_refs", True):
         violations.extend(check_docstring_script_refs(src, path))
+    if enabled.get("docstring_length", True):
+        violations.extend(check_docstring_length(src, path))
 
     return FileResult(path=path, violations=violations)
 
