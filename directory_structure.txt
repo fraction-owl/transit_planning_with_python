@@ -348,6 +348,7 @@ transit_planning_with_python/
 ├── .gitignore
 ├── .pre-commit-config.yaml
 ├── CONTRIBUTING.md
+├── GETTING_STARTED.md
 ├── LICENSE
 ├── README.md
 ├── directory_structure.txt
