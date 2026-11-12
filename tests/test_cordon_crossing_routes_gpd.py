@@ -24,7 +24,7 @@ FIXTURES = Path(__file__).parent / "fixtures"
 THRESHOLD = 500.0
 KW = {"step": 25.0, "delta": 0.5, "tol": 0.01}
 
-# A straight north-south screenline 10,000 ft long, centered on the origin.
+# A straight north-south line 10,000 ft long, centered on the origin.
 SCREENLINE = LineString([(0, -5000), (0, 5000)])
 SQUARE = Polygon([(0, 0), (4000, 0), (4000, 4000), (0, 4000)])
 
@@ -34,7 +34,7 @@ def _assess(path: list[tuple[float, float]], cordon=SCREENLINE) -> target.PathRe
 
 
 # ---------------------------------------------------------------------------
-# assess_path — screenlines
+# assess_path — cordon lines
 # ---------------------------------------------------------------------------
 
 
@@ -57,7 +57,7 @@ def test_shallow_dip_past_the_line_is_marginal() -> None:
     assert result.margin_reason == "depth"
 
 
-def test_crossing_near_the_end_of_a_screenline_is_marginal() -> None:
+def test_crossing_near_the_end_of_a_cordon_line_is_marginal() -> None:
     result = _assess([(-3000, 4900), (3000, 4900)])
     assert result.status == target.STATUS_MARGINAL
     assert result.margin == pytest.approx(100, abs=1)
@@ -117,6 +117,23 @@ def test_zero_threshold_turns_flags_off() -> None:
     assert target.assess_path(dip, SCREENLINE, 0.0, **KW).status == target.STATUS_CROSSES
     parallel = LineString([(300, -3000), (300, 3000)])
     assert target.assess_path(parallel, SCREENLINE, 0.0, **KW).status == target.STATUS_NONE
+
+
+def test_default_threshold_suits_a_roadway_width_cordon() -> None:
+    """A 200 ft cordon across a road: the route on the road crosses cleanly by default."""
+    cordon = LineString([(0, -100), (0, 100)])
+    on_road = LineString([(-3000, 0), (3000, 0)])
+    in_extra_length = LineString([(-3000, 80), (3000, 80)])
+    just_past_end = LineString([(-3000, 130), (3000, 130)])
+    kw = {"step": 5.0, "delta": 0.5, "tol": 0.01}
+    assess = target.assess_path
+    assert assess(on_road, cordon, target.NEAR_MISS_FT, **kw).status == target.STATUS_CROSSES
+    assert (
+        assess(in_extra_length, cordon, target.NEAR_MISS_FT, **kw).status == target.STATUS_MARGINAL
+    )
+    assert (
+        assess(just_past_end, cordon, target.NEAR_MISS_FT, **kw).status == target.STATUS_NEAR_MISS
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -237,9 +254,10 @@ def _offsets_to_lonlat(points: list[tuple[float, float]]) -> list[tuple[float, f
 
 
 def _write_feed(gtfs_dir: Path) -> None:
-    """Write a feed where route 1 crosses the test screenline.
+    """Write a feed where route 1 crosses the test cordon.
 
-    Route 2 runs 300 ft east of the line, and route 3 (no shape) crosses it stop to stop.
+    Route 2 runs parallel to route 1, 30 ft past the cordon's north end, and route 3
+    (no shape) crosses the cordon stop to stop.
     """
     gtfs_dir.mkdir()
     (gtfs_dir / "routes.txt").write_text(
@@ -253,12 +271,12 @@ def _write_feed(gtfs_dir: Path) -> None:
     shape_rows = ["shape_id,shape_pt_lat,shape_pt_lon,shape_pt_sequence"]
     for shape_id, pts in (
         ("SH1", [(-3000, 0), (3000, 0)]),
-        ("SH2", [(300, -3000), (300, 3000)]),
+        ("SH2", [(-3000, 130), (3000, 130)]),
     ):
         for seq, (lon, lat) in enumerate(_offsets_to_lonlat(pts), start=1):
             shape_rows.append(f"{shape_id},{lat:.7f},{lon:.7f},{seq}")
     (gtfs_dir / "shapes.txt").write_text("\n".join(shape_rows) + "\n")
-    (s1, s2) = _offsets_to_lonlat([(-2000, 2000), (2000, 2000)])
+    (s1, s2) = _offsets_to_lonlat([(-2000, -20), (2000, -20)])
     (gtfs_dir / "stops.txt").write_text(
         f"stop_id,stop_name,stop_lat,stop_lon\nS1,West,{s1[1]:.7f},{s1[0]:.7f}\n"
         f"S2,East,{s2[1]:.7f},{s2[0]:.7f}\n"
@@ -269,15 +287,15 @@ def _write_feed(gtfs_dir: Path) -> None:
     )
 
 
-def _write_zipped_screenline(tmp_path: Path) -> Path:
-    """Write the 10,000 ft north-south screenline through HUB as a zipped shapefile."""
+def _write_zipped_cordon(tmp_path: Path) -> Path:
+    """Write a 200 ft north-south cordon centered on HUB, as across a roadway, zipped."""
     shp_dir = tmp_path / "shp"
     shp_dir.mkdir()
-    line = LineString(_offsets_to_lonlat([(0, -5000), (0, 5000)]))
+    line = LineString(_offsets_to_lonlat([(0, -100), (0, 100)]))
     gpd.GeoDataFrame({"NAME": ["Test line"]}, geometry=[line], crs="EPSG:4326").to_file(
-        shp_dir / "screenline.shp"
+        shp_dir / "cordon.shp"
     )
-    zip_path = tmp_path / "screenline.zip"
+    zip_path = tmp_path / "cordon.zip"
     with zipfile.ZipFile(zip_path, "w") as archive:
         for part in shp_dir.iterdir():
             archive.write(part, part.name)
@@ -287,7 +305,7 @@ def _write_zipped_screenline(tmp_path: Path) -> Path:
 def test_run_writes_tables_maps_and_run_log(tmp_path: Path) -> None:
     gtfs_dir = tmp_path / "gtfs"
     _write_feed(gtfs_dir)
-    cordons = _write_zipped_screenline(tmp_path)
+    cordons = _write_zipped_cordon(tmp_path)
     out = tmp_path / "out"
 
     routes = target.run(
@@ -299,8 +317,8 @@ def test_run_writes_tables_maps_and_run_log(tmp_path: Path) -> None:
     assert by_route.loc["1", "trips_crossing"] == 2
     assert by_route.loc["1", "directions_crossing"] == "0; 1"
     assert by_route.loc["2", "status"] == target.STATUS_NEAR_MISS
-    assert by_route.loc["2", "closest_approach_ft"] == pytest.approx(300, abs=2)
-    assert re.search(r"within 30[01] ft", by_route.loc["2", "note"])
+    assert by_route.loc["2", "closest_approach_ft"] == pytest.approx(30, abs=2)
+    assert re.search(r"within 3[01] ft", by_route.loc["2", "note"])
     assert by_route.loc["3", "status"] == target.STATUS_CROSSES
 
     summary = pd.read_csv(out / target.SUMMARY_FILENAME, dtype=str, keep_default_na=False)
@@ -323,7 +341,7 @@ def test_run_writes_tables_maps_and_run_log(tmp_path: Path) -> None:
 def test_run_with_service_filter_uses_only_those_trips(tmp_path: Path) -> None:
     gtfs_dir = tmp_path / "gtfs"
     _write_feed(gtfs_dir)
-    cordons = _write_zipped_screenline(tmp_path)
+    cordons = _write_zipped_cordon(tmp_path)
     routes = target.run(
         gtfs_path=gtfs_dir,
         cordons_path=cordons,
@@ -344,6 +362,7 @@ def test_mock_dc_cbd_fixture_matches_its_documented_layout(tmp_path: Path) -> No
         gtfs_path=FIXTURES / "mock_gtfs_dc.zip",
         cordons_path=FIXTURES / "mock_cbd_dc.zip",
         output_dir=tmp_path / "out",
+        near_miss_ft=500,  # the CBD polygons are miles across, not roadway-sized
         write_maps=False,
     )
     downtown = routes[routes["cordon"] == "Mock Central Business District"]
@@ -381,7 +400,7 @@ def test_main_blocks_unedited_placeholder_config(monkeypatch: pytest.MonkeyPatch
 def test_main_unknown_service_id_exits_2(tmp_path: Path) -> None:
     gtfs_dir = tmp_path / "gtfs"
     _write_feed(gtfs_dir)
-    cordons = _write_zipped_screenline(tmp_path)
+    cordons = _write_zipped_cordon(tmp_path)
     argv = [
         "--gtfs-path",
         str(gtfs_dir),
@@ -400,7 +419,7 @@ def test_run_without_any_usable_geometry_raises(tmp_path: Path) -> None:
     gtfs_dir = tmp_path / "gtfs"
     _write_feed(gtfs_dir)
     (gtfs_dir / "trips.txt").write_text("route_id,service_id,trip_id,shape_id\nR1,wk,T9,NOPE\n")
-    cordons = _write_zipped_screenline(tmp_path)
+    cordons = _write_zipped_cordon(tmp_path)
     with pytest.raises(ValueError, match="usable geometry"):
         target.run(gtfs_path=gtfs_dir, cordons_path=cordons, output_dir=tmp_path / "out")
 

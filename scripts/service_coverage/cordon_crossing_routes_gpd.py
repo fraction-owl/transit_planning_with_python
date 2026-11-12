@@ -1,25 +1,29 @@
-"""List the GTFS routes that cross each cordon or screenline, and flag near misses.
+"""List the GTFS routes that cross each cordon line, and flag near misses.
 
-Corridor studies often start by drawing cordons around an area (a polygon
-around downtown) or screenlines across parallel streets (a line along a river),
-then asking which routes cross each one so that ridership and service can be
-summed by corridor. This script overlays every GTFS shape on every cordon,
-counts how many times each shape crosses it, and rolls the result up to routes,
-with the share of each route's trips whose shape crosses.
+Corridor studies often start by drawing short cordon lines across the roadways
+of a corridor, then asking which routes cross each one so that ridership and
+service can be summed by corridor. This script overlays every GTFS shape on
+every cordon, counts how many times each shape crosses it, and rolls the result
+up to routes, with the share of each route's trips whose shape crosses.
+
+Draw each cordon across one roadway, from just past one curb to just past the
+other: wide enough to catch every route on that roadway, plus a little extra
+(at least ``NEAR_MISS_FT``) past each curb as insurance against GTFS shapes
+drawn off the centerline. It need not be longer; routes on nearby parallel and
+cross streets should miss it.
 
 Lines drawn by hand rarely meet routes cleanly, so the script also flags the
 cases to check before trusting the list: near misses (routes that come within
 ``NEAR_MISS_FT`` of a cordon without crossing it) and marginal crossings
-(routes that cross it by less than that distance, e.g. a route that turns back
-or ends just past the line, or crosses near the end of a screenline). In both
-cases, moving either line by less than ``NEAR_MISS_FT`` would change the answer.
+(routes that cross within ``NEAR_MISS_FT`` of the cordon's end, i.e. in the
+extra length past the curb, or that end or turn back just past the line).
 
 Inputs
 ------
 - A GTFS feed folder or ``.zip`` with routes.txt, trips.txt and shapes.txt.
   Trips without a usable shape are traced stop to stop (stop_times, stops).
-- A cordon layer (``.shp``, zipped shapefile, ``.gpkg`` or ``.geojson``). Each
-  line feature is a screenline; each polygon is a cordon whose outline is the
+- A cordon layer (``.shp``, zipped shapefile, ``.gpkg`` or ``.geojson``) with
+  one line feature per cordon. Polygons are also accepted; their outline is the
   line crossed. Names come from ``CORDON_NAME_FIELD``.
 
 Outputs
@@ -93,15 +97,17 @@ CONFIG_END_MARKER: str = "# === END CONFIG ==="
 # GTFS feed: a folder of .txt files or the published .zip.
 GTFS_PATH: Path = Path(r"Path\To\Your\GTFS_Folder")  # ←–– change me
 
-# Cordon / screenline layer: a .shp, a zipped shapefile, a .gpkg or a .geojson.
-# Each line feature is a screenline; each polygon is a closed cordon whose
-# outline is the line crossed. Multi-part features count as one cordon.
+# Cordon layer: a .shp, a zipped shapefile, a .gpkg or a .geojson, one line per
+# cordon. Draw each line across one roadway, from just past one curb to just
+# past the other, extending at least NEAR_MISS_FT beyond each curb: it should
+# catch every route on that roadway and miss routes on nearby streets. Polygons
+# also work (their outline is the cordon). Multi-part features count as one.
 CORDONS_PATH: Path = Path(r"Path\To\Your\Cordons.shp")  # ←–– change me
 
 OUTPUT_DIR: Path = Path(r"Path\To\Your\Output_Folder")  # ←–– change me
 
 # When CORDONS_PATH is a .zip holding several shapefiles, the one to use,
-# e.g. "screenlines.shp". None when the zip holds a single shapefile.
+# e.g. "cordons.shp". None when the zip holds a single shapefile.
 CORDONS_ZIP_MEMBER: Optional[str] = None
 
 # Attribute holding each cordon's name. None = the first of name / cordon_name /
@@ -109,10 +115,13 @@ CORDONS_ZIP_MEMBER: Optional[str] = None
 # name are called cordon_1, cordon_2, … in file order.
 CORDON_NAME_FIELD: Optional[str] = None
 
-# Review threshold, in feet. A route that comes within this distance of a
-# cordon without crossing it is a near miss; a route that crosses it by less
-# than this distance is a marginal crossing. 0 turns both flags off.
-NEAR_MISS_FT: float = 500.0
+# Review threshold, in feet: about the extra length drawn past each curb. A
+# route is flagged when it passes within this distance of a cordon without
+# crossing it (near miss), or crosses within this distance of the cordon's end
+# or ends/turns back within this distance past it (marginal crossing). Keep it
+# smaller than the gap to the nearest parallel street, or routes there are
+# flagged too. 0 turns the flags off.
+NEAR_MISS_FT: float = 50.0
 
 # Optional service_id filter (values from trips.txt). Leave empty to use every
 # trip in the feed; trip counts then combine all service days.
@@ -1450,7 +1459,7 @@ def plot_cordon_map(
     """
     polygonal = cordon_geom.geom_type in ("Polygon", "MultiPolygon")
     threshold = threshold_ft / unit_to_ft
-    extent = map_extent(cordon_geom, max(3.0 * threshold, 1500.0 / unit_to_ft))
+    extent = map_extent(cordon_geom, max(3.0 * threshold, 300.0 / unit_to_ft))
     xmin, ymin, xmax, ymax = extent
     aspect = (ymax - ymin) / (xmax - xmin)
     halo = [withStroke(linewidth=3, foreground=SURFACE_COLOR)]
@@ -2058,7 +2067,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     """Build the CLI parser; every flag defaults to its CONFIGURATION constant."""
     parser = argparse.ArgumentParser(
         description=(
-            "List the GTFS routes that cross each cordon or screenline and flag near misses. "
+            "List the GTFS routes that cross each cordon line and flag near misses. "
             "Defaults come from the configuration block at the top of this file."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
