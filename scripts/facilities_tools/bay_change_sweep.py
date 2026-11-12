@@ -1,100 +1,52 @@
 """Rank candidate bay reassignments and time shifts at a transit center (Step 3).
 
-Reads Step 1 timelines (one scenario folder per occupancy standard, for
-example a "direct conflict" and a "likely conflict" run), inventories what
-could move, and scores candidate changes with the same conflict rule Step 2
-uses: buses occupying the same bay in the same minute. Nothing moves unless
-the CONFIGURATION lists it.
+Reads Step 1 timelines (one scenario folder per occupancy standard, for example a
+"direct conflict" and a "likely conflict" run), inventories what could move, and
+scores candidate changes with the conflict rule Step 2 uses: buses occupying the
+same bay in the same minute. Nothing moves unless the CONFIGURATION lists it.
 
 Discover pass (``DISCOVER_ONLY = True``)
 ----------------------------------------
-Run this first. It writes ``<label>_discover.xlsx`` with every route-end found
-at the cluster (``<route> arrive``, ``<route> depart``, ``<route> through
-<direction>``) and the bay(s) it uses, every block's chain of trips with the
-gaps between them and where they are spent, and the interline hand-offs whose
-gaps a time shift has to respect. It also logs a ``BAY_CANDIDATES`` /
-``SHIFT_CANDIDATES`` stub to paste into this CONFIGURATION.
+Run this first. It writes every route-end at the cluster (``<route> arrive``,
+``<route> depart``, ``<route> through <direction>``) and its bay(s), every block's
+chain of trips with the gaps between them, and the interline hand-offs a time shift
+has to respect, and logs a ``BAY_CANDIDATES`` / ``SHIFT_CANDIDATES`` stub for CONFIGURATION.
 
-Two gaps are reported between consecutive trips of a block. The schedule gap
-runs from the previous trip's scheduled arrival (last stop) to the next trip's
-scheduled departure (first stop): the layover a timetable shows. The occupancy
-gap runs from the previous trip's last scheduled time (last-stop departure) to
-the next trip's first (first-stop arrival); a scheduled hold at the first stop
-belongs to the next trip, so this gap is shorter than the schedule gap when
-there is one.
-
-Routes are identified by route_id. Reports and CONFIGURATION name a route by
-its short name, else its long name, else its route_id; where two routes would
-share a name the route_id is added in brackets (``Express [R12]``). Names may
-contain spaces. A route_id is accepted wherever a route name is.
+Two gaps are reported between consecutive trips of a block. The schedule gap (the
+timetable layover) runs from scheduled last-stop arrival to first-stop departure.
+The occupancy gap runs from last-stop departure to first-stop arrival, so a
+scheduled hold at the first stop belongs to the next trip. Routes are named by short
+name, else long name, else route_id; a route_id is accepted wherever a name is.
 
 Sweep (``DISCOVER_ONLY = False``)
 ---------------------------------
-Every listed single change is applied to the scheduled trips. Occupancy is
-rebuilt for affected blocks, including loading, arrival buffers and layover
-thresholds. A route-end shift moves the entire trips serving that end. Each
-change is also checked against the block chains and rejected, with the
-reason, if it shrinks a schedule gap below its minimum or makes a trip begin
-before the previous trip on its vehicle ends (a negative occupancy gap).
-Counts are shown per standard and never summed across them; conflicts are
-broken out by kind (boarding/boarding, boarding/waiting, waiting/waiting)
-rather than weighted.
+Every listed single change is applied to the scheduled trips and occupancy rebuilt for
+affected blocks; a route-end shift moves whole trips. A change that shrinks a schedule
+gap below its minimum or makes an occupancy gap negative is rejected, with the reason.
+Counts are per standard, never summed; conflicts are broken out by kind. Packages come
+from a beam search (``BEAM_WIDTH``): candidates, not a guaranteed optimum.
 
 Inputs
 ------
-- One Step 1 output folder per standard (``TIMELINES``): the combined CSV
-  ``block_status_timeline_exporter.py`` writes, or its ``block_*.xlsx``
-  workbooks. Sweeps require the revised exporter's ``schedule_snapshot.json``
-  and ``timeline_manifest.json`` sidecars. Rerun Step 1 for every standard.
-  Discover can inspect legacy timelines, but exact sweeps cannot use them.
-  Both refuse runs that Step 1 exported in trip-only mode (trips without a
-  block_id), because block chains need every trip's vehicle.
+- One Step 1 output folder per standard (``TIMELINES``) from
+  ``block_status_timeline_exporter.py``, all for the same trips and bay assignments.
+  Sweeps need its ``schedule_snapshot.json`` and ``timeline_manifest.json``
+  sidecars; trip-only exports (trips without a block_id) are refused.
 
 Outputs
 -------
-- ``<SCENARIO_LABEL>_discover.xlsx`` (discover pass): "Route-ends", "Block
-  chains" and "Interlines" sheets per standard, plus the "Config stub".
-- ``<SCENARIO_LABEL>_sweep.xlsx`` (sweep): "Baseline" conflict minutes per
-  bay and by kind; "Easy wins" (feasible single changes that do not raise the
-  count on the standards named in ``REQUIRE_NO_WORSE_ON``, with before/after,
-  the conflicts removed and created, the tightest gap after the change and
-  an off-clockface note); "Pairs" (the best pairs, including pairs whose
-  members are not wins on their own, such as a bay swap between two routes);
-  "Packages" and "Package finalists" (a beam search over singles and the
-  best pairs, up to ``MAX_CHANGES_PER_PACKAGE`` steps); "Rejected"
-  (infeasible or non-improving changes and why); and "Config used".
-- With REPORTS_ONLY (or WRITE_BAY_REPORTS after a sweep), selected bay-only
-  reports in ``<SCENARIO_LABEL>_bay_reports``: one ``<cluster>_Conflicts``
-  workbook per configuration and standard, and a comparison workbook.
-  Each report includes Summary, Assignments, Conflict Events, Overflow Events,
-  Conflict Minutes, Changes vs Baseline, AllStops and individual space sheets.
-  Complete rebuilt timelines are saved as CSVs. Reports include all cluster
-  presence, not only conflicting buses. Baseline is rebuilt and compared with
-  the input timeline before any reports are published. Times and blocks must
-  remain unchanged; each detailed count must equal the sweep scorer.
-- A ``_runlog.txt`` sidecar next to each workbook capturing the verbatim
-  CONFIGURATION block.
+- ``<SCENARIO_LABEL>_discover.xlsx``: Route-ends, Block chains, Interlines, Config stub.
+- ``<SCENARIO_LABEL>_sweep.xlsx``: Baseline; Easy wins (feasible changes no worse on
+  ``REQUIRE_NO_WORSE_ON``); Pairs; Packages; Package finalists; Rejected; Config used.
+- With REPORTS_ONLY or WRITE_BAY_REPORTS, ``<SCENARIO_LABEL>_bay_reports``: per-standard
+  ``<cluster>_Conflicts`` workbooks, a comparison workbook, and rebuilt timeline CSVs.
+- A ``_runlog.txt`` sidecar next to each workbook capturing the CONFIGURATION block.
 
 Typical usage
 -------------
-Update the paths in the CONFIGURATION section, run once with
-``DISCOVER_ONLY = True``, paste the candidates you are willing to consider
-into ``BAY_CANDIDATES`` / ``SHIFT_CANDIDATES``, set ``DISCOVER_ONLY = False``
-and run again, from a shell, ArcGIS Pro's Python window, or a Jupyter
-notebook.
-
-For detailed reports on bay assignments you have already chosen, list them in
-``BAY_REPORT_CONFIGURATIONS``, set ``DISCOVER_ONLY = False`` and
-``REPORTS_ONLY = True``, and run: no candidate search runs, and each
-configuration is compared with the baseline. Keep only the standards for which
-you have current Step 1 outputs.
-
-The three scripts remain standalone: the sweep contains an identical copy of
-the exporter's occupancy renderer (canonical in utils/block_timeline_helpers.py).
-Search is bounded by BEAM_WIDTH and the step limit; the returned packages are
-candidates, not a guaranteed optimum.
-Overlapping shift selectors apply the same shift once or reject contradictory
-values. All standards must describe the same source trips and bay assignments.
+Update the paths in CONFIGURATION and run with ``DISCOVER_ONLY = True``; paste the
+candidates you will consider into the stub, set ``DISCOVER_ONLY = False``, and rerun.
+Set ``REPORTS_ONLY = True`` to report on the assignments in ``BAY_REPORT_CONFIGURATIONS``.
 """
 
 from __future__ import annotations
