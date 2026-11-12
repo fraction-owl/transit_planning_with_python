@@ -63,6 +63,12 @@ The repository is organized for ease of use, with:
 
 New to Python or Jupyter? [GETTING_STARTED.md](GETTING_STARTED.md) walks through setting up Python on a work computer with ArcGIS Pro or on a home computer, getting the scripts, and running one in a notebook, with troubleshooting steps for common installation problems.
 
+Depending on the script, you can give it its settings in up to three ways:
+
+- **Edit the CONFIGURATION section** at the top of the script. Every script has one.
+- **Pass command-line flags.** About half the scripts (those that import `argparse`) also accept their settings as flags, so you can change inputs for one run without editing the file; see **Running from the Shell** below.
+- **Point to a settings file.** `ntd_monthly_summary.py` keeps its settings in a separate `.txt` file, named in its CONFIGURATION section or passed with `--config`, and can repeat an earlier run from its `_runlog.txt`. `bay_assignment_optimizer.py` accepts a JSON file of setting overrides with `--config`, and `ridership_by_time_period.py` can read its time periods from a `.txt` file. Other scripts don't read settings from a file yet.
+
 ### 🐚 Running from the Shell (Command Line)
 
 Every script is also a normal command-line program — nothing about the notebook workflow is required. This suits users who prefer a terminal, or who want to automate a script in a batch file, Makefile, or scheduled task.
