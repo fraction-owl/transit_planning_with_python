@@ -85,6 +85,7 @@ VECTOR_SUBDIR: str = "vector"
 PLOT_SUBDIR: str = "plots"
 
 # Optional polygons (set to None to disable)
+# A .zip holding the shapefile also works.
 POLYGON_LAYER: Optional[Path] = Path(r"Your\File\Path\To\census_blocks.shp")
 
 # OUTPUT FORMAT
@@ -177,6 +178,7 @@ PLOT_LEGEND_LOC: str = "outside"
 # It is read once and bbox-filtered to each route's extent for speed.
 # Roads are kept light and thin so they recede; the darker/thicker route reads on
 # top. (Darkening roads makes them blend with the route — push them lighter.)
+# A .zip holding the shapefile also works.
 ROADS_SHAPEFILE: Optional[Path] = None
 ROADS_COLOR: str = "0.75"  # matplotlib grayscale: larger = lighter (route line is 0.4)
 ROADS_LINEWIDTH: float = 0.5  # thinner than the route line (1.2)
@@ -440,6 +442,76 @@ def _write_csv(df: pd.DataFrame, path: Path) -> None:
 # =============================================================================
 
 
+def load_shapefile(path: str, member: Optional[str] = None) -> gpd.GeoDataFrame:
+    """Load a shapefile given a direct ``.shp`` path or a ``.zip`` archive.
+
+    Args:
+        path: Path to a ``.shp`` file, or to a ``.zip`` archive containing
+            one. A zipped shapefile is opened directly via GDAL's ``zip://``
+            virtual filesystem, so the archive is never extracted to disk.
+        member: For a ``.zip`` containing more than one ``.shp``, the name
+            of the one to load (matched case-insensitively against its
+            base filename, e.g. ``"Hospitals.shp"``). Ignored when *path*
+            is a direct ``.shp`` file. Required when the archive contains
+            more than one shapefile. macOS metadata entries (anything under
+            ``__MACOSX/`` and ``._*`` files) are not counted as shapefiles.
+
+    Returns:
+        The loaded :class:`geopandas.GeoDataFrame`.
+
+    Raises:
+        OSError: *path* does not exist.
+        ValueError: *path* is neither a ``.shp`` nor a ``.zip`` file; the
+            zip is unreadable/corrupt; the zip contains no shapefile; the
+            zip contains more than one shapefile and *member* was not
+            supplied; or *member* does not match any shapefile in the zip.
+    """
+    if not os.path.exists(path):
+        raise OSError(f"The path '{path}' does not exist.")
+
+    lower_path = path.lower()
+    if lower_path.endswith(".shp"):
+        logging.info("Reading %s", path)
+        return gpd.read_file(path)
+
+    if not lower_path.endswith(".zip"):
+        raise ValueError(f"'{path}' is neither a .shp nor a .zip file.")
+
+    try:
+        with zipfile.ZipFile(path) as archive:
+            # Zips made with macOS Finder add __MACOSX/._<name>.shp metadata
+            # files next to the real ones; they are not shapefiles.
+            shp_members = [
+                name
+                for name in archive.namelist()
+                if name.lower().endswith(".shp")
+                and not name.startswith("__MACOSX/")
+                and not os.path.basename(name).startswith("._")
+            ]
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"'{path}' is not a valid zip archive.") from exc
+
+    if not shp_members:
+        raise ValueError(f"No .shp file found inside '{path}'.")
+
+    if member is not None:
+        matches = [name for name in shp_members if os.path.basename(name).lower() == member.lower()]
+        if not matches:
+            raise ValueError(f"'{member}' not found inside '{path}'. Available: {shp_members}")
+        chosen = matches[0]
+    elif len(shp_members) == 1:
+        chosen = shp_members[0]
+    else:
+        raise ValueError(
+            f"'{path}' contains {len(shp_members)} shapefiles; pass `member=` to "
+            f"choose one of: {shp_members}"
+        )
+
+    source = f"zip://{path}!{chosen}"
+    logging.info("Reading %s", source)
+    return gpd.read_file(source)
+
+
 def load_bus_stops() -> tuple[gpd.GeoDataFrame, str]:
     """Load bus stop points as a GeoDataFrame and return (gdf, key_field).
 
@@ -476,7 +548,11 @@ def load_bus_stops() -> tuple[gpd.GeoDataFrame, str]:
         logging.info("Loaded GTFS stops.txt with %d records.", len(gdf))
         return gdf, GTFS_KEY_FIELD
 
-    gdf = gpd.read_file(BUS_STOPS_INPUT)
+    gdf = (
+        load_shapefile(str(BUS_STOPS_INPUT))
+        if str(BUS_STOPS_INPUT).lower().endswith(".zip")
+        else gpd.read_file(BUS_STOPS_INPUT)
+    )
     _require_columns(
         gdf,
         [SHAPE_KEY_FIELD, SHAPE_SECONDARY_ID_FIELD],
@@ -498,7 +574,11 @@ def spatial_join_to_polygons(
         logging.info("POLYGON_LAYER is None; skipping spatial join.")
         return stops, None
 
-    polygons = gpd.read_file(POLYGON_LAYER)
+    polygons = (
+        load_shapefile(str(POLYGON_LAYER))
+        if str(POLYGON_LAYER).lower().endswith(".zip")
+        else gpd.read_file(POLYGON_LAYER)
+    )
     _require_columns(polygons, [POLYGON_JOIN_FIELD], context=f"polygon layer {POLYGON_LAYER}")
     _require_unique_polygon_ids(polygons)
 
@@ -1104,7 +1184,11 @@ def load_road_polylines(roads_fc: Path) -> list:
         logging.error("ROADS_SHAPEFILE set but not found: %s", roads_fc)
         sys.exit(1)
 
-    roads = gpd.read_file(roads_fc)
+    roads = (
+        load_shapefile(str(roads_fc))
+        if str(roads_fc).lower().endswith(".zip")
+        else gpd.read_file(roads_fc)
+    )
     if roads.crs is not None and roads.crs.to_epsg() != 4326:
         roads = roads.to_crs("EPSG:4326")
 
