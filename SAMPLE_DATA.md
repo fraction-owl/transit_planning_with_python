@@ -25,7 +25,6 @@ Start here. GTFS, TODS and TIDES are published data standards, and many scripts 
 Each of these is read by only the scripts named. These samples are hand-made, and their route and stop IDs don't match the mock agency's.
 
 - [ ] **Ridership by route and stop.** Sample: `tests/fixtures/ridership_by_route_and_stop.csv`. Yours: your ridership system's route-and-stop export, with the same column names. Read by `data_request_by_stop_processor.py` and `ntd_monthly_summary.py`.
-- [ ] **Stop ID list.** Sample: `tests/fixtures/stop_ids.txt`. Yours: the stops one data request covers, one ID per line, in the same `STOP_ID` values as your ridership export (these usually match GTFS `stop_id` or `stop_code`). Read by `data_request_by_stop_processor.py` (`STOP_IDS_FILE`); you can list the IDs inline in `STOP_IDS` instead.
 - [ ] **Max load by trip.** Sample: `tests/fixtures/statistics_by_route_and_trip.csv`. Yours: your ridership system's statistics-by-route-and-trip export. Read by `load_factor_monitor.py`.
 - [ ] **Stop usage by stop ID.** Sample: `tests/fixtures/stop_usage_by_stop_id_sample.csv`. Yours: your ridership system's stop-usage export. Read by `flag_stop_upgrades.py`.
 - [ ] **Monthly NTD ridership.** Sample: `tests/fixtures/ntd_monthly_multi_month.csv`. Yours: monthly NTD ridership workbooks with `ROUTE_NAME`, `SERVICE_PERIOD`, `MTH_BOARD` and `DAYS` columns. Read by `ntd_monthly_trends_export.py`.
@@ -66,10 +65,11 @@ These are small, hand-built cases for specific behavior. They aren't meant as sa
 | `tests/fixtures/gtfs_holiday_negation/` | A `calendar.txt` service whose every date is removed in `calendar_dates.txt`. |
 | `tests/fixtures/gtfs_split_weekday/` | Weekday service split across several `service_id`s (Monday, Tuesday–Thursday, Friday). |
 | `tests/fixtures/gtfs_route_diff_replacement_day/` | Before and after feeds where a one-day replacement service swaps in for the weekday service. |
+| `tests/fixtures/stop_ids.txt` | Parsing of `data_request_by_stop_processor.py`'s optional `STOP_IDS_FILE` (comments, blank lines, mixed commas and spaces). That setting is a per-request filter, an alternative to listing IDs inline in `STOP_IDS`, not a standing input. |
 
 ## Not read by any test
 
-No test reads these by name or glob. Some tests use the same filenames, but only for synthetic files they write to a temporary folder. Issue #326 asks what to do with them.
+No test reads these by name or glob. Some tests use the same filenames, but only for synthetic files they write to a temporary folder. Issue #331 proposes a test for the Census and LODES files; issue #326 asks what to do with the rest.
 
 - `tests/fixtures/ACSDT5Y2024.B01001_*.zip`, `ACSDT5Y2024.B08201_*.zip`, `ACSDT5Y2024.B19001_*.zip`
 - `tests/fixtures/DECENNIALDHC2020.H1_*.zip`, `DECENNIALDHC2020.P9_*.zip`, `DECENNIALPL2020.P1_*.zip`
