@@ -14,8 +14,8 @@ Outputs (CSV, UTF-8 with BOM, suitable for Excel):
     Audit tables: service_selection, service_inventory, feed_metadata, stop_catalog,
     stop_candidates, resolved_locations, endpoint_connections, network_transit_segments,
     network_walk_links, station_pathways, stop_time_adjustments, benchmark_comparison,
-    benchmark_method_totals and benchmark_method_legs (.csv); methods.txt,
-    settings.json, run.log and the gtfs_od_travel_times_runlog.txt sidecar.
+    benchmark_method_totals and benchmark_method_legs (.csv); settings.json,
+    run.log and the gtfs_od_travel_times_runlog.txt sidecar.
     station_pathway_minutes is INCLUDED in walk_minutes, not an extra cost.
     Means and percentiles cover successful samples only; always check coverage.
 
@@ -1904,7 +1904,6 @@ def run(output: Path) -> int:
     validate_config()
     batches = configured_queries()
     references = export_benchmark_reference(output)
-    (output / "methods.txt").write_text(__doc__ or "", encoding="utf-8")
     feed = CombinedFeed(GTFS_FEEDS) if USE_MULTIPLE_FEEDS else Feed(GTFS_PATH)
     try:
         trip_rows = unique_rows(
