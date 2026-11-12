@@ -1,31 +1,22 @@
 """Subset and summarize NTD monthly ridership for selected routes (config-driven).
 
-Workbooks are discovered by scanning DATA_ROOT (matching ntd_anchor_builder.py):
-each file is assumed to hold a single worksheet, and its month/year are parsed
-from the filename (full or 3-letter month, 4-digit year, in any order or
-separator). No hand-maintained catalogue is required. The script filters to
-configured routes and exports per-route monthly summaries and trend plots:
-    - Weekday/Saturday/Sunday monthly totals
-    - Weekday/Saturday/Sunday per-day averages by month
+Workbooks are discovered by scanning DATA_ROOT (matching ntd_anchor_builder.py): each
+file is assumed to hold a single worksheet, and its month/year are parsed from the
+filename (full or 3-letter month, 4-digit year, in any order or separator). The script
+filters to configured routes and exports per-route monthly Weekday/Saturday/Sunday
+totals and per-day averages, with trend plots.
 
-It logs warnings when:
-    - A month in the requested range has no discovered workbook
-    - A workbook file is missing
-    - A route-month-service period is missing, or partly blank (some of its
-      rows lack MTH_BOARD or DAYS, so its totals understate the month)
-    - Ridership is 0 while DAYS > 0 (possible localized data outage)
-    - MTH_BOARD or DAYS is negative
-
-Optionally prompts users for manual fixes (enter corrected MTH_BOARD and/or DAYS).
+It logs warnings for a requested month with no workbook, a missing workbook file, a
+missing or partly blank route-month-service period (its totals understate the month),
+ridership of 0 while DAYS > 0 (possible localized outage), and negative MTH_BOARD or
+DAYS. It can optionally prompt for manual fixes to MTH_BOARD and/or DAYS.
 
 Inputs:
     - DATA_ROOT: monthly NTD ridership workbooks with ROUTE_NAME,
       SERVICE_PERIOD, MTH_BOARD, and DAYS columns.
     - SERVICE_CHANGES_CSV (optional): the service_changes.csv written by
-      scripts/field_tools/gtfs_service_change_dates.py. This script does not
-      read GTFS itself: run that script on your GTFS feed archive first, then
-      point SERVICE_CHANGES_CSV at its output to mark each change date on the
-      plots.
+      scripts/field_tools/gtfs_service_change_dates.py; run that script on your GTFS
+      feed archive first to mark each change date on the plots.
 
 Outputs:
     Per route (folder: OUTPUT_ROOT/route_<ROUTE>/):
@@ -33,17 +24,14 @@ Outputs:
     - monthly_wide.csv (one row per month; totals + averages columns)
     - outage_flags.csv
     - yoy_percent_change.csv (per-day-average YoY metrics; when enabled)
-    - plots/monthly_totals.png
-    - plots/daily_averages.png
-    - plots/yoy_percent_change.png (small multiples, one panel per service
-      period: raw YoY points, a rolling-mean YoY line, and an optional
-      systemwide rolling line + comparison band; when enabled). The weekday
-      series can optionally drop holidays from its day count (see HOLIDAYS).
+    - plots/monthly_totals.png and plots/daily_averages.png
+    - plots/yoy_percent_change.png (when enabled): one panel per service period with
+      raw YoY points, a rolling-mean line, and an optional systemwide comparison. The
+      weekday series can drop holidays from its day count (see HOLIDAYS).
 
-    Combined (folder: OUTPUT_ROOT/_combined/):
-    - all_routes_monthly_long.csv / all_routes_monthly_wide.csv /
-      all_routes_outage_flags.csv / all_routes_yoy_percent_change.csv:
-      the per-route tables stacked across all configured routes.
+    Combined (folder: OUTPUT_ROOT/_combined/): all_routes_monthly_long.csv,
+    all_routes_monthly_wide.csv, all_routes_outage_flags.csv and
+    all_routes_yoy_percent_change.csv, the per-route tables stacked across routes.
 
     Plus ntd_route_trends_runlog.txt in OUTPUT_ROOT: a run-log sidecar
     capturing the verbatim CONFIGURATION block.
@@ -53,14 +41,11 @@ Typical usage:
     Pro's Python window, or a Jupyter notebook.
 
 Notes:
-    The service change markers are the dates gtfs_service_change_dates.py
-    found in the GTFS calendars: days when the weekly service pattern changes
-    across the system. They are not confirmed changes to the plotted route,
-    and that script misses a pick that changes only trip times under the same
-    service_ids. A mid-month change affects only part of that month's
-    figures. A lasting change shows in the YoY points for about 12 months,
-    until both years compared fall after it, and the rolling line rises and
-    falls more gradually.
+    Service change markers are the dates gtfs_service_change_dates.py found in the GTFS
+    calendars, when the weekly service pattern changes across the system. They are not
+    confirmed changes to the plotted route, and a pick that changes only trip times
+    under the same service_ids is missed. A lasting change shows in the YoY points for
+    about 12 months, until both years compared fall after it.
 """
 
 from __future__ import annotations
