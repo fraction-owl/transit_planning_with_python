@@ -1,18 +1,15 @@
 """Assess stop-level service impacts of cutting bus routes, trips, or stops, by scenario.
 
-Every service cut — eliminating whole routes, dropping individual trips (by id or by
-route/direction/departure window), or removing stops from a route (truncation) — reduces
-to removing rows from ``stop_times``. This script exploits that: each configured scenario
-is resolved to a removal mask over the baseline feed's stop events, and every impact
-metric is a before/after comparison of products derived from the surviving rows. Scenarios
-are evaluated independently against the same baseline, so alternatives (drop route 101
-*or* drop 202 and 303) can be compared in one run.
+Every service cut — eliminating whole routes, dropping trips (by id or by route/direction/
+departure window), or removing stops from a route (truncation) — reduces to removing rows
+from ``stop_times``. Each configured scenario is resolved to a removal mask over the
+baseline feed's stop events, and every impact metric is a before/after comparison of the
+surviving rows. Scenarios are evaluated independently against the same baseline, so
+alternatives (drop route 101 *or* drop 202 and 303) can be compared in one run.
 
-Metrics are computed for a single representative service day (default: weekday), chosen
-from the feed's real calendar the same way ``headway_span_exporter.py`` does, so holiday
-and weekend services cannot leak into weekday counts. Coverage uses straight-line stop
-buffers — no pedestrian network — and optional demographic and trip-level ridership
-inputs upgrade the impact accounting from areas to people.
+Metrics cover one representative service day (default: weekday), chosen from the feed's
+real calendar as ``headway_span_exporter.py`` does. Coverage uses straight-line stop
+buffers; optional demographic and ridership inputs upgrade it from areas to people.
 
 Inputs:
     - A GTFS feed (folder or .zip): stops, routes, trips, stop_times, plus calendar /
@@ -20,42 +17,31 @@ Inputs:
     - Optional demographics polygon layer (any geopandas-readable format) with numeric
       fields to apportion over lost coverage.
     - Optional trip-level ridership CSV of average daily boardings by ``trip_id`` (and
-      optionally ``stop_id``), from APC/ridecheck processing. Exports carrying no
-      GTFS trip_id match on route + start time (``RIDERSHIP_TRIP_MATCH_MODE``), and
-      one holding a row per trip per surveyed day is averaged over those days
-      rather than summed (``RIDERSHIP_DATE_COL``).
-    - Optional stop-level ridership CSV at route × stop grain (a vendor "stop usage"
-      export) for boardings-lost estimates when trip-level data is unavailable.
-      Both ridership inputs may be .csv or .xlsx/.xls, and their stop ids may be
-      GTFS stop_ids or stop_codes (``RIDERSHIP_STOP_MATCH_FIELD``).
+      optionally ``stop_id``); without GTFS trip_ids it matches on route + start time
+      (``RIDERSHIP_TRIP_MATCH_MODE``) and averages per-day rows (``RIDERSHIP_DATE_COL``).
+    - Optional stop-level ridership CSV at route × stop grain, for boardings lost when
+      trip-level data is unavailable. Both ridership inputs may be .csv or .xlsx/.xls,
+      keyed by GTFS stop_ids or stop_codes (``RIDERSHIP_STOP_MATCH_FIELD``).
 
 Outputs:
     - ``scenario_summary.csv``: one row per scenario — trips cut/truncated, stops
       eliminated/reduced, stop×time-bin service lost, revenue hours/miles cut, coverage
-      area lost, demographics lost, and riders affected. In screening mode
-      (``SCENARIOS = "each_route"`` or ``--each-route``) this is the only table:
-      every route's elimination is evaluated and ranked by what is at stake.
+      area and demographics lost, and riders affected. In screening mode (``SCENARIOS =
+      "each_route"`` or ``--each-route``) it is the only table, ranking every route.
     - ``<scenario>_stop_impacts.csv``: per impacted stop — baseline vs scenario trips,
       span, largest gap, time bins lost, nearest remaining stop, boardings lost.
-    - ``<scenario>_stop_time_bins.csv``: long-format stop × time-bin trip counts,
-      baseline vs scenario.
+    - ``<scenario>_stop_time_bins.csv``: stop × time-bin trip counts, baseline vs scenario.
     - ``<scenario>_lost_coverage.shp``: polygon of walk-buffer coverage lost.
-    - Map layers per scenario (``EXPORT_MAP_LAYERS``): ``_remaining_lines.shp``
-      and ``_removed_lines.shp`` (route alignments still run / no longer run by
-      any trip, from shapes.txt) and ``_remaining_coverage.shp`` (walk buffer of
-      the surviving network).
-    - ``<scenario>_gtfs/`` per scenario (``EXPORT_SCENARIO_GTFS``): the surviving
-      network as a standalone GTFS feed (cuts applied across all service days),
-      so any other tool can run baseline-vs-scenario comparisons.
+    - Map layers (``EXPORT_MAP_LAYERS``): ``_remaining_lines.shp``, ``_removed_lines.shp``
+      (from shapes.txt) and ``_remaining_coverage.shp``.
+    - ``<scenario>_gtfs/`` (``EXPORT_SCENARIO_GTFS``): the surviving network as a GTFS
+      feed (cuts applied across all service days) for baseline-vs-scenario comparisons.
     - A run-log sidecar capturing the verbatim CONFIGURATION block.
 
 Limitations:
-    Coverage is straight-line buffer, not a walkshed. Revenue hours/miles are GTFS
-    revenue-service approximations — deadhead, pull-ins/outs, and layover need scheduled
-    operations data (TODS) to be accurate, and truncation mileage changes are not
-    estimated. ``frequencies.txt``-based feeds are not expanded. Access-quality metrics
-    (replacement direction match, added wait) and a Title VI equity screen are future
-    work.
+    Coverage is straight-line buffer, not a walkshed. Revenue hours/miles approximate
+    revenue service only (deadhead, pull-ins/outs, and layover need TODS), and truncation
+    mileage changes are not estimated. ``frequencies.txt``-based feeds are not expanded.
 
 Typical usage:
     Update the paths and SCENARIOS in the CONFIGURATION section (or pass the matching
