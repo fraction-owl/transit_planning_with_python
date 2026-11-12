@@ -1,64 +1,50 @@
 """Clean a private-shuttle operator registry and roll shuttle presence up to GTFS routes.
 
-Private employer, university, hospital, and residential shuttles overlap public
-transit markets, but agencies rarely hold them in analysis-ready form — the
-typical source is a hand-maintained spreadsheet of operators with partial
-addresses, partial coordinates, blank rows, and free-text notes. This script
-turns that registry into three products so planners can see where private
-shuttles run and the modeling pipeline can test whether they move ridership.
+Private employer, university, hospital, and residential shuttles overlap public transit
+markets, but agencies rarely hold them in analysis-ready form — the typical source is a
+hand-maintained spreadsheet with partial addresses and coordinates, blank rows, and
+free-text notes. This script turns that registry into three products so planners can
+see where private shuttles run and the modeling pipeline can test whether they move
+ridership.
 
 Outputs
 -------
-1. **Clean registry** (``private_shuttles_clean.csv``) — deduplicated,
-   whitespace-trimmed rows with usable WGS84 coordinates, plus a ``category``
-   column derived from the notes: ``transit_feeder`` (the shuttle connects to
-   rail/metro/transit, i.e. likely *complements* fixed-route service),
-   ``shuttle`` (a shuttle with no stated transit connection, i.e. a potential
-   *competitor*), or ``unspecified``. Service ``start_date`` / ``end_date``
-   columns are carried through and normalized to ISO dates (blank = unknown /
-   still operating), so dated openings and closures survive cleaning — the
-   raw material for panel (route × month) modeling later.
-2. **Geocoding worklist** (``private_shuttles_needs_geocoding.csv``) — rows
-   whose coordinates are missing or invalid (out of range, or the 0,0
-   "null island" geocoder artifact). No geocoding is attempted here — the
-   script is offline by design; fill these in and re-run.
-3. **POI layer** (``Private_Shuttle_Stops.zip``) — the clean rows as a zipped
-   point shapefile whose name and id column (``NAME``) match the
-   ``("Private_Shuttle_Stops.shp", "NAME")`` entry already listed in
-   ``points_of_interest_coverage_gpd.py``'s ``LAYER_SPECS``, so dropping this
-   zip anywhere under that script's ``SHP_INPUT_DIR`` wires private shuttles
-   into the strategic-site coverage counts with no further configuration.
+1. **Clean registry** (``private_shuttles_clean.csv``) — deduplicated, trimmed rows with
+   usable WGS84 coordinates and a ``category`` derived from the notes:
+   ``transit_feeder`` (connects to transit, likely *complements* fixed-route service),
+   ``shuttle`` (no stated transit connection, a potential *competitor*), or
+   ``unspecified``. ``start_date`` / ``end_date`` are normalized to ISO dates (blank =
+   unknown / still operating), so dated openings and closures survive cleaning.
+2. **Geocoding worklist** (``private_shuttles_needs_geocoding.csv``) — rows whose
+   coordinates are missing or invalid (out of range, or 0,0 "null island"). The script
+   is offline by design; fill these in and re-run.
+3. **POI layer** (``Private_Shuttle_Stops.zip``) — a zipped point shapefile matching the
+   ``("Private_Shuttle_Stops.shp", "NAME")`` entry in
+   ``points_of_interest_coverage_gpd.py``'s ``LAYER_SPECS``; dropping it under that
+   script's ``SHP_INPUT_DIR`` adds shuttles to the strategic-site coverage counts.
 
-Optionally (when a GTFS folder is supplied), it also writes
-``private_shuttle_coverage_by_route.csv`` — one row per ``route_id`` counting
-the shuttle sites inside each route's catchment (``shuttle_sites_served``) and
-the transit-feeder subset (``shuttle_feeder_sites_served``). That table is the
-modeling hook: registered in ``scripts/modeling/orchestrator_jobs_public.json``,
-it joins the ridership anchor by ``route_id`` so the OLS / ML models
-(``monthly_ridership_model.py``, ``ridership_ml_model.py``) can estimate
-whether private-shuttle presence helps explain route-level ridership. Set
-``ACTIVE_AS_OF`` (or ``--as-of``) to count only the shuttles active on a given
-date — match it to the ridership anchor's period so a shuttle that shut down
-years ago doesn't inflate today's counts. A site with an unknown start or end
-date is treated as active.
+With a GTFS folder, it also writes ``private_shuttle_coverage_by_route.csv``: per
+``route_id``, the shuttle sites inside the route's catchment (``shuttle_sites_served``)
+and the transit-feeder subset (``shuttle_feeder_sites_served``). Registered in
+``scripts/modeling/orchestrator_jobs_public.json``, it joins the ridership anchor so
+``monthly_ridership_model.py`` and ``ridership_ml_model.py`` can test whether shuttle
+presence helps explain route-level ridership. Set ``ACTIVE_AS_OF`` (or ``--as-of``) to
+the anchor's period to count only shuttles active then; unknown dates count as active.
 
 Typical usage
 -------------
-Update the paths in the CONFIGURATION section (or pass the matching CLI flags,
-e.g. ``--shuttles-csv``, ``--gtfs-dir``, ``--output-dir``) and run from a shell
-or a Jupyter notebook. Without ``--gtfs-dir`` the script runs in prep-only mode
-(clean registry + worklist + POI layer, no route rollup). Running the script
-completely unedited also works: in an interactive session (terminal or
-notebook) it prompts for the registry CSV and the optional GTFS folder
-instead of exiting, so a new user can copy, paste, and hit run.
+Update the paths in the CONFIGURATION section (or pass the matching CLI flags, e.g.
+``--shuttles-csv``, ``--gtfs-dir``, ``--output-dir``) and run from a shell or a Jupyter
+notebook. Without ``--gtfs-dir`` the script runs in prep-only mode (no route rollup).
+Run unedited in an interactive session, it prompts for the registry CSV and the
+optional GTFS folder instead of exiting.
 
 Assumptions
 -----------
-- The registry carries the operator name, street address fields, WGS84
-  coordinates (X = longitude, Y = latitude), and a free-text notes column;
-  column names are configurable and matched case-insensitively. The file may
-  be a CSV (UTF-8, falling back to Windows cp1252) or an Excel workbook
-  (.xls/.xlsx; ``REGISTRY_SHEET`` / ``--sheet`` picks the sheet).
+- The registry carries the operator name, street address fields, WGS84 coordinates
+  (X = longitude, Y = latitude), and a free-text notes column; column names are
+  configurable and matched case-insensitively. It may be a CSV (UTF-8, falling back to
+  cp1252) or an Excel workbook (``REGISTRY_SHEET`` / ``--sheet`` picks the sheet).
 - The buffer distance is given in feet and converted to meters when the
   projected CRS is metric.
 """
