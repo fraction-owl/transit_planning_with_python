@@ -26,16 +26,7 @@ Where possible, we will provide both `arcpy` and `geopandas` versions of geospat
      jupyter notebook
      ```
 
-2. **Get the Script(s) You Need**
-   - Navigate to scripts that are useful to you and your agency. Then copy and paste their contents into an active notebook file or download them as .py files. You do not need a GitHub account to do this.
-   - Alternately, you can clone or download the whole repository from GitHub.
- 
-3. **Run the Script**
-   - Confirm that desired code is present in notebook file and locate "CONFIGURATION" section.
-   - "Update file paths:" At a minimum, you will need to update the folder and file paths to point to your data and specify where to save any
-     output. There may also be additional configuration choices (e.g. choice of CRS, list of routes or stops to analyze)
-   - You do not need to modify any code outside of the configuration section, which contains the core script logic.
-   - Run the script, follow any printed instructions or error messages, and check the output for reasonableness and/or accuracy.
+Then continue to **Getting and Running a Script** below.
 
 ---
 
@@ -66,11 +57,19 @@ Jupyter Notebook is a powerful tool for running Python scripts in an interactive
      ```
    - Once you have JupyterLab open in your web browser, you can browse your local files and create new notebook files.
 
-4. **Get the Script(s) You Need**
+Then continue to **Getting and Running a Script** below.
+
+---
+
+## 📥 Getting and Running a Script
+
+After finishing Option A or Option B:
+
+1. **Get the Script(s) You Need**
    - Navigate to scripts that are useful to you and your agency. Then copy and paste their contents into an active notebook file or download them as .py files. You do not need a GitHub account to do this.
    - Alternately, you can clone or download the whole repository from GitHub.
  
-5. **Run the Script**
+2. **Run the Script**
    - Confirm that desired code is present in notebook file and locate "CONFIGURATION" section.
    - "Update file paths:" At a minimum, you will need to update the folder and file paths to point to your data and specify where to save any
      output. There may also be additional configuration choices (e.g. choice of CRS, list of routes or stops to analyze)
@@ -116,8 +115,9 @@ If you encounter any issues while installing Python or libraries, or if JupyterL
 
    - Locate the directory where Python installed its scripts. For most users, this will be:
         ```makefile
-     C:\Users\<YourUsername>\AppData\Roaming\Python\Python311\Scripts
+     C:\Users\<YourUsername>\AppData\Roaming\Python\Python312\Scripts
      ```
+     The number matches your Python version (e.g. `Python313` for Python 3.13). If pip warned during installation that scripts are not on PATH, that warning names the exact folder.
 
    - Add this directory to your PATH:
       - Press <kbd>Win + S</kbd>, search for **Environment Variables**, and open **Edit the system environment variables**.
