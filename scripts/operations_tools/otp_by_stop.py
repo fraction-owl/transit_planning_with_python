@@ -1,87 +1,52 @@
 """Compute stop-level OTP and AVL data coverage from TIDES, with cross-route flags.
 
-This script computes on-time performance and AVL data coverage per stop (and
-per stop/route) from TIDES ``stop_visits`` (stop-level arrival/departure
-events) joined to ``trips_performed`` (trip-level attributes). By default only
-timepoint visits are scored (``TIMEPOINTS_ONLY``), so "per stop" means per
-timepoint stop -- the same scoring rule as ``otp_monthly_panel.py``.
+This script computes on-time performance and AVL data coverage per stop (and per
+stop/route) from TIDES ``stop_visits`` joined to ``trips_performed``. Only timepoint visits
+are scored by default (``TIMEPOINTS_ONLY``), as in ``otp_monthly_panel.py``. No GTFS needed.
 
-The flagging layered on top exists because route-level rollups (see
-``otp_monthly_panel.py``) average over every stop a route serves, so a single
-problem stop hides inside the route mean and a stop-specific defect is easy to
-misread as a route problem. This script inverts the view: it asks whether a
-stop looks bad on *several* of the routes serving it at once. A stop that
-underperforms its routes' own baselines on multiple independent routes is
-unlikely to be the routes' fault -- it points at the stop itself: a mis-placed
-AVL geofence, a stop moved in the field but not in the AVL configuration, a
-construction detour, or chronic congestion at that location. Whether the cause
-is operational or a data defect, the stop deserves a look, and the per-stop
-diagnostics here separate the two failure modes as far as the data allows.
-
-Everything is derived from the TIDES tables alone -- no GTFS feed is required
-(see "Limitations" for what that costs).
+Route-level rollups hide a problem stop inside the route mean. This script asks whether
+a stop looks bad on *several* of its routes at once, which points at the stop itself: a
+misplaced AVL geofence, a stop moved but not in AVL, a detour, or chronic congestion.
 
 Method
 ------
-For each (stop, route) pair, over the whole analysis window:
+For each (stop, route) pair over the whole window, *data coverage* is the share of
+expected trip-visits that produced a scored timepoint record. Every pattern
+(``pattern_id``, falling back to route + direction) that ever emitted a visit at the
+stop is assumed to serve it on every in-service performed trip of that pattern,
+including trips whose AVL never reported. *OTP* is the percent of scored visits whose
+deviation (actual minus scheduled departure) is within ``[EARLY_MIN, LATE_MIN]``.
 
-* **Data coverage** -- the share of expected trip-visits that produced a scored
-  timepoint record. Expected service is inferred from the export itself: every
-  pattern (``pattern_id``, falling back to route + direction) that ever emitted
-  a visit at the stop is assumed to serve that stop on every scheduled
-  in-service performed trip of that pattern (``trips_performed`` lists those,
-  including trips whose AVL never reported). Observed = distinct trips that
-  produced at least one scorable visit at the stop.
-* **OTP** -- percent of scored visits classified on-time, where a visit is
-  on-time when its deviation (actual minus scheduled departure) falls within
-  ``[EARLY_MIN, LATE_MIN]``, inclusive.
-
-Each (stop, route) value is then compared to the route's own systemwide
-baseline. A route that is uniformly late, or uniformly under-covered because a
-garage's AVL units are failing, does not flag every stop it serves -- the gap
-against the route baseline isolates the stop-specific component. A (stop,
-route) cell is judged *low-coverage* when it is both far below the route
-baseline (``COVERAGE_GAP_FLAG_PCT`` points) and below an absolute floor
-(``COVERAGE_ABS_FLAG_PCT``); *poor-OTP* is analogous. Cells with too little
-data (``MIN_EXPECTED_TRIPS`` / ``MIN_SCORED_VISITS``) are never judged. A stop
-is flagged only when at least ``MIN_ROUTES_FLAGGED`` routes independently
-agree; set that to 1 to also flag stops served by a single route (at the cost
-of no longer being able to distinguish a stop problem from a route problem).
+Each value is compared with the route's own systemwide baseline, so a uniformly late or
+under-covered route does not flag every stop it serves. A cell is *low-coverage* when
+it is both ``COVERAGE_GAP_FLAG_PCT`` points below the baseline and below
+``COVERAGE_ABS_FLAG_PCT``; *poor-OTP* is analogous. Cells under ``MIN_EXPECTED_TRIPS``
+/ ``MIN_SCORED_VISITS`` are never judged. A stop is flagged only when ``MIN_ROUTES_FLAGGED``
+routes agree; 1 also flags single-route stops but loses the stop-vs-route distinction.
 
 Outputs
 -------
-  1) ``otp_by_stop.csv`` - one row per stop: pooled coverage/OTP, flags and
-     flag reasons, worst gaps versus route baselines, per-cause visit
-     diagnostics (skipped, missing-actual, missing-schedule), sorted with
-     flagged stops first.
-  2) ``otp_by_stop_route_detail.csv`` - the per-(stop, route) table behind
-     each flag: expected/observed trips, coverage and OTP with route baselines
-     and gaps, and the per-route verdicts.
+  1) ``otp_by_stop.csv`` - one row per stop, flagged first: pooled coverage/OTP, flags
+     and reasons, worst gaps versus route baselines, and per-cause visit diagnostics.
+  2) ``otp_by_stop_route_detail.csv`` - the per-(stop, route) table behind each flag.
   3) A run-log sidecar capturing the verbatim CONFIGURATION block.
 
 Reading the diagnostics
 -----------------------
-``visits_skipped`` (stop marked Skipped) and ``visits_missing_actual``
-(schedule present, no AVL timestamp) point at operations or AVL hardware;
-``visits_missing_schedule`` (no schedule timestamp on an emitted row) points at
-a data defect in the export's schedule join. Low *trip* coverage with clean
-visit diagnostics means whole trips leave no trace at the stop -- typical of a
-geofence/stop-matching problem when the stop's routes are otherwise healthy.
+``visits_skipped``/``visits_missing_actual`` point at operations or AVL hardware, and
+``visits_missing_schedule`` at the schedule join. Low *trip* coverage with clean visit
+diagnostics suggests a geofence/stop-matching problem.
 
 Limitations (the GTFS-shaped hole)
 ----------------------------------
-Observed-only exports cannot reveal a stop that never appears in them: a stop
-whose AVL matching is completely dead for the whole window is invisible here.
-Catching that case requires comparing against GTFS ``stop_times``, which is
-deliberately out of scope for now. Likewise, expected service is inferred from
-the window as a whole, so a stop added to (or dropped from) a pattern mid-window
-will look under-covered; run separate windows around known service changes.
+A stop whose AVL matching is dead for the whole window never appears in the export, so
+it is invisible here; catching it needs GTFS ``stop_times``. Expected service is
+inferred from the whole window, so run separate windows around service changes.
 
 Typical usage
 -------------
-Update the paths in the CONFIGURATION section (or pass ``--stop-visits`` /
-``--trips-performed`` / ``--output-dir``) and run from a shell, ArcGIS Pro's
-Python window, or a Jupyter notebook.
+Update the paths in CONFIGURATION (or pass ``--stop-visits`` / ``--trips-performed`` /
+``--output-dir``) and run from a shell, ArcGIS Pro's Python window, or a Jupyter notebook.
 """
 
 from __future__ import annotations

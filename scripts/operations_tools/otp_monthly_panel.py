@@ -1,67 +1,46 @@
 """Compute on-time performance (OTP) over time from TIDES ``stop_visits``.
 
-This script computes monthly on-time performance from a TIDES-style
-``stop_visits`` table (stop-level arrival/departure events) joined to a
-``trips_performed`` table (trip-level attributes such as ``route_id`` and
-``direction_id``).  OTP is evaluated at each *timepoint* stop visit by
-comparing the actual departure time to the scheduled departure time and
-classifying the visit as Early, On-time, or Late using a configurable window.
+This script computes monthly on-time performance from a TIDES-style ``stop_visits``
+table (stop-level arrival/departure events) joined to a ``trips_performed`` table
+(trip-level attributes such as ``route_id`` and ``direction_id``). OTP is evaluated at
+each *timepoint* stop visit by comparing the actual departure time to the scheduled
+departure time and classifying the visit as Early, On-time, or Late using a
+configurable window.
 
 It produces, for several aggregation levels:
 
   * **route/direction** - one series per ``(route_id, direction_id)``
   * **route**           - one series per ``route_id`` (both directions pooled)
-  * **service type**    - one series per ``route_type_agency`` (e.g. LOCAL,
-    EXPRESS) -- a stand-in for "service type" lists
-  * **corridor**        - optional, one series per user-defined corridor (a
-    named group of routes; see ``CORRIDORS``)
+  * **service type**    - one series per ``route_type_agency`` (e.g. LOCAL, EXPRESS)
+  * **corridor**        - optional, one series per named group of routes (``CORRIDORS``)
   * **overall**         - a single system-wide series
 
 Outputs:
-  1) ``otp_monthly_processed.csv`` - tidy long table with one row per
-     (level, group, month) carrying the on-time / early / late counts and the
-     derived percentages.
-  2) ``otp_monthly_<level>.csv`` - one wide pivot per level (rows = group,
-     columns = month, values = % on-time) for quick human scanning.
-  3) PNG line charts of % on-time over time, one per group within each level,
-     with a dashed reference line at the configured OTP standard.
-  4) ``otp_coverage_monthly.csv`` - trip-level AVL coverage per route and month
-     (see "AVL coverage" below), so differential coverage can be spotted before
-     the OTP numbers are trusted.
+  1) ``otp_monthly_processed.csv`` - tidy long table with one row per (level, group,
+     month) carrying the on-time / early / late counts and the derived percentages.
+  2) ``otp_monthly_<level>.csv`` - one wide pivot per level (group x month, % on-time).
+  3) PNG line charts of % on-time per group, with a dashed line at the OTP standard.
+  4) ``otp_coverage_monthly.csv`` - trip-level AVL coverage per route and month (see
+     "AVL coverage" below).
 
 Normalization
 -------------
-OTP is reported as a **percentage of evaluated timepoint visits** within each
-(group, month) cell: ``pct_on_time = on_time / evaluated * 100``.  This makes
-groups with very different service volumes directly comparable.  Only visits
-that can actually be scored are counted in the denominator: ``timepoint`` is
-TRUE (when ``TIMEPOINTS_ONLY`` is set), ``schedule_relationship`` is
-``Scheduled`` (Skipped/Added visits have no comparable actual/used time), and a
-finite scheduled-vs-actual deviation could be computed.  Raw counts are kept
-alongside the percentages so cells backed by very little data can be spotted
-and, if desired, re-weighted downstream.
+OTP is a **percentage of evaluated timepoint visits** within each (group, month) cell,
+``pct_on_time = on_time / evaluated * 100``, so groups with very different service
+volumes are comparable. Only scorable visits count: ``timepoint`` is TRUE (when
+``TIMEPOINTS_ONLY`` is set), ``schedule_relationship`` is ``Scheduled``, and a finite
+deviation could be computed. Raw counts are kept so thin cells can be spotted.
 
 AVL coverage (observed-only exports)
 ------------------------------------
-Most AVL-derived ``stop_visits`` exports are *observed-only*: a row exists only
-when the vehicle actually reported at the stop, so the file itself cannot show
-what is missing.  A trip whose AVL unit was dead (or whose block never matched)
-simply contributes no rows, and if such gaps correlate with route or time of
-day, the naive visit-pooled OTP above is silently biased.  ``trips_performed``
-closes that gap from the schedule side -- it lists every scheduled trip on the
-service day (that is what makes ``schedule_relationship = Canceled`` possible),
-so scheduled in-service trips with zero scorable timepoint visits are
-recoverable even though ``stop_visits`` never mentions them.
-
-This script therefore also writes ``otp_coverage_monthly.csv``: per route and
-month (plus an overall series), the number of scheduled in-service trips, how
-many of them produced at least one scored timepoint visit, the resulting
-percent-of-trips-observed, and the mean scored visits per observed trip.  Cells
-whose coverage falls below ``COVERAGE_WARN_PCT`` are logged as warnings.  The
-OTP estimator itself stays naive (visit-pooled within each month); the coverage
-table is the evidence for deciding whether that is safe -- flat, high coverage
-means yes, while coverage that varies by route or month means the affected
-cells deserve caution or reweighting downstream.
+Most AVL-derived ``stop_visits`` exports are *observed-only*: a trip whose AVL unit was
+dead contributes no rows, and if such gaps correlate with route or time of day the
+visit-pooled OTP is silently biased. ``trips_performed`` lists every scheduled trip, so
+``otp_coverage_monthly.csv`` reports, per route and month (plus overall), scheduled
+in-service trips, how many produced a scored timepoint visit, percent of trips observed,
+and mean scored visits per observed trip; cells below ``COVERAGE_WARN_PCT`` are logged.
+The OTP estimator stays visit-pooled: flat, high coverage means that is safe, while
+coverage that varies by route or month calls for caution or reweighting downstream.
 
 Typical usage
 -------------
