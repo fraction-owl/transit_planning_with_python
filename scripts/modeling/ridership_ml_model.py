@@ -1,46 +1,35 @@
 """Fit machine-learning ridership models from the same agency planning data.
 
-This is the machine-learning counterpart to the hand-rolled OLS ridership
-models in this folder. It ingests the *exact same* modeling table — the
-dependent NTD ridership variable plus the service-supplied, exogenous,
-demographic, and points-of-interest predictors — but replaces the single
-hand-rolled OLS fit
-with tree-ensemble learners that capture the nonlinearities and feature
-interactions a linear model cannot.
+This is the machine-learning counterpart to the hand-rolled OLS ridership models in
+this folder. It ingests the *exact same* modeling table — the dependent NTD ridership
+variable plus the service-supplied, exogenous, demographic, and points-of-interest
+predictors — but replaces the single hand-rolled OLS fit with tree-ensemble learners
+that capture the nonlinearities and feature interactions a linear model cannot.
 
 Why this can "do a better job" than the regression:
-    - Ridership responds to service and context in ways that are rarely linear
-      or additive: doubling frequency on an already-frequent route buys less
-      than the first doubling, and the payoff from population coverage depends
-      on whether the route also reaches jobs. Trees model those thresholds and
-      interactions directly, without the analyst pre-specifying them.
-    - Two complementary ensembles are fit and compared head-to-head:
-        * Random forest — bagged trees, robust and low-maintenance.
-        * Gradient boosting (histogram-based) — sequentially corrected trees,
-          usually the strongest performer on tabular data.
+    - Ridership responds to service and context in ways that are rarely linear or
+      additive: doubling frequency on an already-frequent route buys less than the first
+      doubling, and population coverage pays off more where the route also reaches jobs.
+      Trees model those thresholds and interactions without the analyst pre-specifying them.
+    - Two complementary ensembles are compared head-to-head: a random forest (bagged
+      trees, robust and low-maintenance) and histogram-based gradient boosting
+      (sequentially corrected trees, usually the strongest on tabular data).
     - The original OLS is kept as a baseline in the same comparison so the
       accuracy gain (or lack of one) is explicit and honest.
 
 Honesty about accuracy:
-    - Every headline metric is *out-of-sample*: predictions are pooled from
-      K-fold cross-validation, so each row is scored by a model that never saw
-      it during training. R^2 here is genuine generalization, not the in-sample
-      R^2 the regression reports.
+    - Every headline metric is *out-of-sample*: predictions are pooled from K-fold
+      cross-validation, so each row is scored by a model that never saw it. R^2 here is
+      genuine generalization, not the in-sample R^2 the regression reports.
     - Metrics are reported in both the modeling space (log ridership, if
       ``LOG_DEPENDENT``) and back-transformed level space (boardings), because
       a great log-space fit can still mis-rank routes by absolute ridership.
 
 Interpretability (the thing OLS coefficients give you for free):
-    - Permutation importance ranks predictors by how much out-of-sample
-      accuracy degrades when each is shuffled — a model-agnostic analog to
-      standardized coefficients.
-    - Partial-dependence plots show the marginal shape the model learned for
-      the most important predictors, recovering the "effect of X" reading that
-      a regression coefficient provides.
-
-Unlike the regression, this script depends on scikit-learn. It targets the
-"Demand Modeling (advanced)" audience that is comfortable installing it; it is
-*not* meant to run inside a bare ArcGIS Pro environment.
+    - Permutation importance ranks predictors by how much out-of-sample accuracy degrades
+      when each is shuffled — a model-agnostic analog to standardized coefficients.
+    - Partial-dependence plots show the marginal shape the model learned for the most
+      important predictors, recovering the "effect of X" reading of a coefficient.
 
 Inputs:
     - One anchor table (CSV or XLSX) holding the dependent variable.

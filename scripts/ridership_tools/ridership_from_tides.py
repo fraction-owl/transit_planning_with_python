@@ -1,72 +1,52 @@
 """Compute ridership (boardings/alightings) from TIDES ``stop_visits``.
 
-This is the ridership counterpart to ``otp_monthly_panel.py``: it derives
-ridership directly from raw TIDES automated-passenger-counter (APC) events
-rather than consuming a vendor's pre-aggregated ridecheck export. It is meant
-for agencies that have TIDES ``stop_visits`` data but no database or vendor
-software that already rolls boardings and alightings up by stop, route, and
-time period.
+This is the ridership counterpart to ``otp_monthly_panel.py``: it derives ridership from
+raw TIDES automated-passenger-counter (APC) events, for agencies without software that
+already rolls boardings and alightings up by stop, route, and time period.
 
-It reads a TIDES-style ``stop_visits`` table (stop-level events carrying the
-per-door ``boarding_*`` / ``alighting_*`` counts and the post-stop
-``departure_load``) joined to a ``trips_performed`` table (trip-level
-attributes such as ``route_id`` and ``direction_id``), then sums boardings and
-alightings for several aggregation levels:
+It reads TIDES ``stop_visits`` (per-door ``boarding_*`` / ``alighting_*`` counts and the
+post-stop ``departure_load``) joined to ``trips_performed`` (``route_id``,
+``direction_id``), then sums boardings and alightings for several aggregation levels:
 
   * **route_stop**       - one row per ``(route_id, direction_id, stop_id)``
     (the stop-level ridership grain that feeds ``stops_ridership_joiner``)
   * **stop**             - one row per ``stop_id`` (all routes pooled)
   * **route_direction**  - one series per ``(route_id, direction_id)``
   * **route**            - one series per ``route_id`` (both directions pooled)
-  * **service_type**     - one series per ``route_type_agency`` (e.g. LOCAL,
-    EXPRESS)
+  * **service_type**     - one series per ``route_type_agency`` (e.g. LOCAL, EXPRESS)
   * **overall**          - a single system-wide total
 
 Temporal grain
 --------------
-The CONFIGURATION block produces every temporal grain at once by default, so an
-analyst who is not yet sure which cut they need gets all of them. Each grain is
-written to its own file -- grains are never mixed as rows in one table, which
-would invite double-counting when a column is naively summed:
-
-  * ``TIME_PERIODS`` - named clock windows (e.g. AM PEAK / MIDDAY / PM PEAK).
-    Each event is assigned to the window containing its departure time. Leave
-    the mapping empty to disable time-of-day splitting entirely.
-  * ``EXPORT_GRAINS`` - which grains to write: ``month_and_period`` (finest),
-    ``month`` (a monthly trend), ``period`` (a time-of-day profile), and
-    ``total`` (one number per group). Period grains are skipped automatically
-    when ``TIME_PERIODS`` is empty.
+``EXPORT_GRAINS`` picks the grains, each written to its own file (never mixed as rows,
+which would invite double-counting) and all on by default: ``month_and_period``
+(finest), ``month``, ``period``, and ``total``. Each event falls in the ``TIME_PERIODS``
+window containing its departure time; an empty mapping disables time-of-day splitting.
 
 Outputs
 -------
-  1) One tidy long table per exported grain -- ``ridership_by_month_and_period``
-     / ``ridership_by_month`` / ``ridership_by_period`` / ``ridership_total``
-     ``.csv`` -- each with one row per (level, group, *temporal keys*) carrying
-     boardings, alightings, net boardings, observed stop visits, observed
-     trips, and average boardings per observed trip.
-  2) ``ridership_by_route_and_stop.csv`` - the ``route_stop`` level (at the
-     finest exported grain) reshaped into a vendor-style export (``TIME_PERIOD``
-     / ``ROUTE_ID`` / ``STOP_ID`` / ``BOARD_ALL`` / ``ALIGHT_ALL``) so it can
-     stand in as the input that ``stops_ridership_joiner`` expects.
-  3) PNG bar charts of boardings per group within each level, drawn from the
-     monthly grain when present, otherwise the time-period grain.
+  1) One tidy long table per exported grain (``ridership_by_month_and_period`` /
+     ``ridership_by_month`` / ``ridership_by_period`` / ``ridership_total`` ``.csv``)
+     with boardings, alightings, net boardings, observed stop visits, observed trips,
+     and average boardings per observed trip for each (level, group, temporal keys).
+  2) ``ridership_by_route_and_stop.csv`` - the ``route_stop`` level at the finest grain as a
+     vendor-style export (``TIME_PERIOD`` / ``ROUTE_ID`` / ``STOP_ID`` / ``BOARD_ALL`` /
+     ``ALIGHT_ALL``), the input ``stops_ridership_joiner`` expects.
+  3) PNG bar charts of boardings per group within each level, drawn from the monthly
+     grain when present, otherwise the time-period grain.
   4) A run-log sidecar capturing the verbatim CONFIGURATION block.
 
 A note on APC data
 ------------------
-Raw TIDES counts are the observed boardings/alightings from whatever vehicles
-carried working APC units on each performed trip; they are *not* expansion-
-factored systemwide estimates the way many vendor ridecheck products are. The
-observed stop-visit and trip counts are reported alongside the sums so a cell
-backed by very little data can be spotted and, if desired, expanded downstream.
-Both doors are summed (``boarding_1 + boarding_2``); single-door counters simply
-leave the door-2 column at zero.
+Raw TIDES counts are the observed boardings/alightings from vehicles with working APC
+units, *not* expansion-factored systemwide estimates like many vendor ridecheck products.
+Observed stop-visit and trip counts are reported beside the sums so thin cells can be
+spotted. Both doors are summed; single-door counters leave the door-2 column at zero.
 
 Typical usage
 -------------
-Update the paths in the CONFIGURATION section (or pass ``--stop-visits`` /
-``--trips-performed`` / ``--output-dir``) and run from a shell, ArcGIS Pro's
-Python window, or a Jupyter notebook.
+Update the paths in CONFIGURATION (or pass ``--stop-visits`` / ``--trips-performed`` /
+``--output-dir``) and run from a shell, ArcGIS Pro's Python window, or a Jupyter notebook.
 """
 
 from __future__ import annotations

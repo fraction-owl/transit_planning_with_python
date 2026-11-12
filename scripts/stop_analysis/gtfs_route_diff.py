@@ -9,56 +9,43 @@ the service-change buckets planners actually track:
 - major / minor alignment changes (how much the set of stops a route serves moved);
 - major / minor schedule changes (trips/day, span, headway, revenue-hours on a
   representative weekday). "none" means the weekday trips are *identical* (an exact
-  fingerprint check, not a tolerance), so a feed that keeps trips/day, span and headway
-  but shifts individual trips reads as a minor change rather than unchanged;
+  fingerprint check), so shifted individual trips read as a minor change;
 - candidate route splits (1 -> 2+) and merges (2+ -> 1), inferred from stop-set
   containment and flagged for planner review;
 - reblocking (the set of routes a route interlines with via shared ``block_id`` changed);
-- route name changes (``route_short_name`` / ``route_long_name``) and other route
-  attribute changes (``route_type``/mode, colors, ``agency_id``, ...);
-- calendar-approach changes (a ``service_id`` redefined from, say, weekday to a new
-  day pattern or date range) and per-route day-type coverage changes (gained/lost
-  Saturday or Sunday service);
-- fare changes (GTFS-Fares v1: ``fare_attributes`` prices/attributes and the
-  ``fare_rules`` route -> fare mapping);
+- route name changes and other route attribute changes (``route_type``/mode, colors, ...);
+- calendar-approach changes (a ``service_id`` redefined to a new day pattern or date
+  range) and per-route day-type coverage changes (gained/lost Saturday or Sunday service);
+- fare changes (GTFS-Fares v1 only: ``fare_attributes`` and the ``fare_rules`` mapping);
 - each feed's effective date range and how the two windows relate (gap / overlap).
 
 Design decisions (all threshold knobs live in the CONFIG block and are CLI flags):
-- Alignment is classified from **stop patterns**, not shape geometry: ``stop_times``
-  exists in every feed, and a stop-set comparison is what catches "Route 10 now
-  skips the Elm St loop". Shape length is reported as context when ``shapes.txt``
-  exists but does not drive the major/minor call.
-- Schedule magnitude is measured on a single **representative weekday** picked per
-  feed (the median date of the most common set of active service_ids among the feed's
-  dates of that weekday, so a holiday or one-off date with its own service is not
-  picked). Routes with no trips on that date are not measured. Weekend gains/losses
-  are still surfaced through the route-level day-type rollup.
-- Fares cover GTFS-Fares **v1** only (the files the loader already reads).
+- Alignment is classified from **stop patterns**, not shape geometry, since a stop-set
+  comparison is what catches "Route 10 now skips the Elm St loop". Shape length is
+  reported as context when ``shapes.txt`` exists but does not drive the call.
+- Schedule magnitude is measured on one **representative weekday** per feed (the median
+  date of the most common set of active service_ids, so a holiday is not picked).
+  Routes with no trips on that date are not measured; weekend gains/losses still show
+  in the day-type rollup.
 
 Outputs:
     - routes_overview.csv         : one row per route with flags + a plain-English summary
-    - routes_eliminated.csv       : routes only in the before feed (true eliminations)
-    - routes_added.csv            : routes only in the after feed (true additions)
-    - routes_alignment_changes.csv
-    - routes_schedule_changes.csv
-    - routes_reblocked.csv
-    - routes_name_attr_changes.csv
+    - routes_eliminated.csv / routes_added.csv : routes only in the before / after feed
+    - routes_alignment_changes.csv, routes_schedule_changes.csv, routes_reblocked.csv,
+      routes_name_attr_changes.csv
     - routes_daytype_changes.csv  : routes that gained/lost weekday/Saturday/Sunday service
     - routes_split_merge_candidates.csv : heuristic split (1->2+) / merge (2+->1) candidates
-    - calendar_changes.csv        : service_ids added/removed/redefined (the "calendar approach")
-    - fare_attribute_changes.csv  : fare_id prices/attributes added/removed/changed
-    - route_fare_changes.csv      : routes whose fare_rules mapping changed
-    - summary.json
-    - routes_comparison.xlsx (one sheet per table above + summary)
-    - gtfs_route_diff.log
+    - calendar_changes.csv        : service_ids added/removed/redefined
+    - fare_attribute_changes.csv / route_fare_changes.csv : fare and fare_rules changes
+    - summary.json, gtfs_route_diff.log, and routes_comparison.xlsx (one sheet per table
+      above + summary)
 
 No arcpy / geopandas. pandas + numpy only.
 
 Typical usage:
     Update the paths in the CONFIG block (or pass ``--before``, ``--after`` and ``--out``,
     plus the threshold flags) and run from a shell or a Jupyter notebook — arguments are
-    parsed strictly, with ``notebook_safe_argv`` shielding notebook kernels from their
-    injected argv so ``main()`` also runs cleanly inside a notebook.
+    parsed strictly, with ``notebook_safe_argv`` shielding notebook kernels' injected argv.
 """
 
 from __future__ import annotations

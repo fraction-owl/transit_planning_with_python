@@ -10,55 +10,37 @@ Inputs:
         layer) with a name field and a defined coordinate system.
 
 Method:
-    * Group by route_id, retaining route_short_name and route_long_name.
-    * Use every shape referenced by trips.txt, across all directions and services.
-      No service-date filter or trip-frequency weighting is applied.
-    * Union each route's shapes. Coincident linework counts once; branches and
-      spatially separate inbound/outbound alignments remain separate. This is
-      unique mapped route linework, not revenue miles or average trip length.
-      Nearby but noncoincident shapes are not merged. Overlays use a precision
-      grid (XY_GRID_FEET, 1 mm by default, matching ArcGIS's default XY
-      tolerance), so coincident means within about that distance, and opposite
-      directions on one street count once only if their shapes trace the same path.
-    * Project with pyproj, using the most accurate datum transformation installed
-      for each input's extent (never a ballpark one). The log names it, and any
-      more accurate transformation that needs PROJ grid files.
-    * Measure planar miles in ANALYSIS_EPSG (default NAD83 / Maryland, ftUS).
-    * Report either or both length/percentage bases, set by OUTSIDE_LENGTH: full
-      route (including outside areas), and district-only (outside length set to
-      zero and excluded from the total; the default).
-    * Split linework shared by multiple district polygons equally among them.
-      This includes exact shared boundaries and polygon overlaps. Shared length
-      is separately flagged, and the GIS output retains every membership. A route
-      on a road that forms a district boundary usually lies slightly to one side
-      of the boundary line, so it is assigned to that side, not split or flagged.
-    * District polygons that are invalid under shapely's rules are repaired with
-      shapely.make_valid and named in a log warning.
+    * Group by route_id, using every shape referenced by trips.txt across all
+      directions and services; no service-date filter or trip weighting is applied.
+    * Union each route's shapes. Coincident linework (within XY_GRID_FEET, 1 mm by
+      default) counts once, so opposite directions on one street count once only if
+      their shapes trace the same path; branches stay separate. This is unique mapped
+      route linework, not revenue miles or average trip length.
+    * Project with pyproj, using the most accurate datum transformation installed for
+      each input's extent (named in the log), and measure planar miles in
+      ANALYSIS_EPSG (default NAD83 / Maryland, ftUS).
+    * OUTSIDE_LENGTH picks the length/percentage bases: full route, district-only
+      (outside length excluded from the total; the default), or both.
+    * Split linework shared by several district polygons (shared boundaries or
+      overlaps) equally among them, flagged separately. A route on a boundary road
+      usually lies slightly to one side, so it is assigned to that side, not split.
+    * Invalid district polygons are repaired with shapely.make_valid and logged.
 
 Outputs (in a new timestamped subfolder beneath OUTPUT_DIR):
     route_district_percentages.csv: one row per route; length totals and
         percentage columns for every district (0-100, not 0-1) on the selected bases.
     route_district_detail.csv: one row per route/district; length and percentage
-        columns on the selected bases, and raw intersected miles. The outside row
-        is left out when OUTSIDE_LENGTH is "exclude".
-    route_length_qa.csv: coverage, shared length, and length-conservation checks,
-        always on both bases.
+        columns, and raw intersected miles (no outside row if OUTSIDE_LENGTH is "exclude").
+    route_length_qa.csv: coverage, shared length and length-conservation checks, both bases.
     route_district.gpkg: unique_routes, district_segments, districts_projected.
     run_settings.json and run.log: settings, field selection, transformations.
 
-For district_segments, alloc_mi is the additive length field. A shared piece has
-one row per district; its physical geometry is repeated, but alloc_mi is divided
-by share_n. Outside pieces have share_n=0 and retain their full length. Do not
-sum geom_mi across shared rows.
-in_dist_mi is alloc_mi with outside pieces set to zero. If a route has no length
-inside any district, district-only percentages are undefined and left blank.
-Routes with no trips have blank percentages and status NO_TRIPS. Missing or
-invalid shapes for routes with trips cause an error rather than partial results.
-total_route_miles is the unique linework length described above.
-CSV miles and percentages are rounded to CSV_DECIMALS places (one by default),
-so a row's displayed percentages may sum to 99.9 or 100.1; the percent-sum
-columns are summed before rounding. The QA shared-length and length-check
-difference columns use QA_CSV_DECIMALS (six by default).
+In district_segments, alloc_mi is the additive length field: a shared piece's rows
+divide it by share_n, and outside pieces (share_n=0) keep their full length. Do not sum
+geom_mi across shared rows. Routes with no trips get status NO_TRIPS; a route with no
+length in any district gets blank district-only percentages; missing or invalid shapes
+on routes with trips raise an error. CSV values round to CSV_DECIMALS (one by default),
+so displayed percentages may sum to 99.9 or 100.1; QA differences use QA_CSV_DECIMALS.
 
 Typical usage:
     Set the paths in the CONFIGURATION section and run with Python 3.12 or newer

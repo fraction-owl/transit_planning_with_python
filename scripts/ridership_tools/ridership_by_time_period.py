@@ -1,23 +1,17 @@
 """Summarize TIDES ridership by time period, optionally by route or by route and direction.
 
-Reads TIDES ``stop_visits`` (stop-level APC events) joined to
-``trips_performed`` (trip-level route and direction), places each stop visit in
-a named time period by the clock time it happened, and reports average daily
-boardings and alightings per time period for each day type (weekday, saturday,
-sunday). ``GROUP_BY`` picks the grain: ``"system"``, ``"route"``, or
-``"route_direction"``.
+Reads TIDES ``stop_visits`` (stop-level APC events) joined to ``trips_performed`` (route
+and direction), places each stop visit in a named time period by its clock time, and
+reports average daily boardings and alightings per period and day type (weekday, saturday,
+sunday). ``GROUP_BY`` picks the grain: ``"system"``, ``"route"``, or ``"route_direction"``.
 
-Time periods are named clock windows, set in one of three ways: the
-``TIME_PERIODS`` mapping in the CONFIGURATION block, a plain-text file named by
-``TIME_PERIODS_FILE`` (see ``time_periods_example.txt``), or ``--time-period``
-flags. Flags replace a file, and a file replaces the mapping. Before any data
-is read, the periods are checked to cover every minute of the 24-hour clock
-exactly once. A gap, an overlap, a malformed time, or a repeated name stops the
-run with exit code 2 and a message naming each problem.
+Time periods are named clock windows from ``TIME_PERIODS`` in CONFIGURATION, a text
+file named by ``TIME_PERIODS_FILE`` (see ``time_periods_example.txt``), or
+``--time-period`` flags; flags replace a file, which replaces the mapping. A gap,
+overlap, malformed time, or repeated name stops the run (exit 2) before data is read.
 
-``ridership_from_tides.py`` also has a time-period grain, but it sums all days
-together and does not check that the windows cover the day.
-``ridership_by_hour.py`` gives the hour-by-hour profile.
+``ridership_from_tides.py`` also has a time-period grain, but it sums all days and does
+not check that the windows cover the day; ``ridership_by_hour.py`` profiles each hour.
 
 Inputs
 ------
@@ -27,24 +21,20 @@ Inputs
 
 Outputs
 -------
-- ``ridership_by_time_period_<GROUP_BY>.csv``: one row per day type, group, and
-  time period, with the window and its length, average daily boardings and
-  alightings, average daily boardings per hour of the window, the totals behind
-  the averages, and the stop visits, trips, and service dates observed.
+- ``ridership_by_time_period_<GROUP_BY>.csv``: one row per day type, group, and time
+  period, with the window and its length, average daily boardings, alightings, and
+  boardings per hour, the totals behind them, and the visits, trips, and dates observed.
 - A run-log sidecar with the verbatim CONFIGURATION block, the settings actually
   used, and the time periods in the same format as a time-periods file.
 
 Method
 ------
-- Canceled and non-revenue trips are dropped, as are Skipped stop visits. Both
-  doors' counts are summed.
-- A visit's time of day is the first readable value among ``TIME_COLUMNS``.
-  ISO 8601 timestamps are read as written, so a UTC offset or a daylight-saving
-  change part way through the data does not shift them.
-- Day type comes from ``service_date``, so a trip after midnight stays with its
-  service day while its time period follows the clock.
-- Averages divide by the number of service dates of that day type with any
-  observed stop visit in the input, counted before the route filters.
+- Canceled/non-revenue trips and Skipped visits are dropped; both doors' counts are summed.
+- Time of day is the first readable ``TIME_COLUMNS`` value; ISO 8601 timestamps are read
+  as written, so UTC offsets and daylight-saving changes do not shift them.
+- Day type follows ``service_date``; the time period follows the clock, even after midnight.
+- Averages divide by the service dates of that day type with any observed stop
+  visit, counted before the route filters.
 
 Limitations
 -----------
@@ -55,9 +45,8 @@ Limitations
 
 Typical usage
 -------------
-Update the paths in the CONFIGURATION section (or pass ``--stop-visits`` /
-``--trips-performed`` / ``--output-dir``) and run from a shell, ArcGIS Pro's
-Python window, or a Jupyter notebook.
+Update the paths in CONFIGURATION (or pass ``--stop-visits`` / ``--trips-performed`` /
+``--output-dir``) and run from a shell, ArcGIS Pro's Python window, or a Jupyter notebook.
 """
 
 from __future__ import annotations

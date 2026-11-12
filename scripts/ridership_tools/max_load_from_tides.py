@@ -1,78 +1,52 @@
 """Compute maximum load (peak passenger load) from TIDES ``stop_visits``.
 
-This is the maximum-load counterpart to ``otp_monthly_panel.py``: it derives
-each performed trip's peak passenger load directly from raw TIDES
-automated-passenger-counter (APC) events rather than consuming a vendor's
-pre-aggregated ridecheck export. It is meant for agencies that have TIDES
-``stop_visits`` data but no database or vendor software that already computes a
-trip's maximum load and peak load point.
+This is the maximum-load counterpart to ``otp_monthly_panel.py``: it derives each
+performed trip's peak passenger load from raw TIDES automated-passenger-counter (APC)
+events, for agencies without software that already computes it and its peak load point.
 
-The TIDES ``stop_visits`` table carries ``departure_load`` -- the number of
-passengers on board as the vehicle leaves each stop. A trip's **maximum load**
-is the largest ``departure_load`` over its stop sequence, and the **peak load
-point** is the stop where that maximum occurs. This script reduces the
-stop-level events to one max-load record per performed trip, joins trip-level
-attributes from ``trips_performed``, and rolls the per-trip maxima up across
-several aggregation levels:
-
-  * **route_direction**  - one series per ``(route_id, direction_id)``
-  * **route**            - one series per ``route_id`` (both directions pooled)
-  * **service_type**     - one series per ``route_type_agency`` (e.g. LOCAL,
-    EXPRESS)
-  * **overall**          - a single system-wide series
+A trip's **maximum load** is the largest ``departure_load`` (passengers on board as the
+vehicle leaves a stop) over its stop sequence, and the **peak load point** is the stop
+where that maximum occurs. The per-trip maxima, joined to ``trips_performed``, roll up
+by **route_direction**, **route**, **service_type** (``route_type_agency``, e.g. LOCAL,
+EXPRESS), and **overall**.
 
 Temporal grain
 --------------
-The CONFIGURATION block produces every temporal grain at once by default, so an
-analyst who is not yet sure which cut they need gets all of them. Each grain is
-written to its own file. This matters more than for simple ridership counts:
-max-load statistics (mean / median / p85 / peak) do not compose across grains,
-so every grain is recomputed from the per-trip table rather than rolled up from
-a finer one. A trip is assigned to a single time period by its **start time**
-(the conventional "this is an AM-peak trip" rule):
-
-  * ``TIME_PERIODS`` - named clock windows (e.g. AM PEAK / MIDDAY / PM PEAK).
-    Leave the mapping empty to disable time-of-day splitting entirely.
-  * ``EXPORT_GRAINS`` - which grains to write: ``month_and_period`` (finest),
-    ``month`` (a monthly trend), ``period`` (a time-of-day profile), and
-    ``total`` (one number per group). Period grains are skipped automatically
-    when ``TIME_PERIODS`` is empty.
+``EXPORT_GRAINS`` picks the grains, each written to its own file and all on by default:
+``month_and_period`` (finest), ``month``, ``period``, and ``total``. Max-load statistics
+(mean / median / p85 / peak) do not compose across grains, so each grain is recomputed
+from the per-trip table. A trip falls in one ``TIME_PERIODS`` window by its **start
+time**; an empty mapping disables time-of-day splitting.
 
 Load factor
 -----------
-Each trip's load factor is ``max_load / VEHICLE_CAPACITY``; the rolled-up
-series report the mean load factor and the share of trips whose maximum load
-exceeded capacity. ``VEHICLE_CAPACITY`` is a single agency-wide default here;
-for mixed fleets, filter by route or run per service type.
+Each trip's load factor is ``max_load / VEHICLE_CAPACITY``; the rolled-up series report
+the mean load factor and the share of trips whose maximum load exceeded capacity.
+``VEHICLE_CAPACITY`` is a single agency-wide default; for mixed fleets, filter by route
+or run per service type.
 
 Outputs
 -------
-  1) ``max_load_by_trip.csv`` - one row per performed trip with its maximum
-     load, load factor, peak load point (``stop_id`` and sequence), start time,
-     month, and time period. Its column shape echoes the vendor
-     ``statistics_by_route_and_trip`` export that ``load_factor_monitor``
-     consumes, so it can serve as that tool's input.
-  2) One tidy long table per exported grain -- ``max_load_by_month_and_period``
-     / ``max_load_by_month`` / ``max_load_by_period`` / ``max_load_total``
-     ``.csv`` -- each with one row per (level, group, *temporal keys*) carrying
-     the trip count and the mean / median / 85th-percentile / peak maximum load,
-     mean load factor, and the share of trips over capacity.
-  3) PNG bar charts of mean and peak maximum load per group within each level,
-     drawn from the monthly grain when present, otherwise the time-period grain.
+  1) ``max_load_by_trip.csv`` - one row per performed trip with its maximum load, load
+     factor, peak load point (``stop_id`` and sequence), start time, month, and time
+     period. Its columns echo the vendor ``statistics_by_route_and_trip`` export, so it
+     can serve as ``load_factor_monitor``'s input.
+  2) One tidy long table per exported grain (``max_load_by_month_and_period`` /
+     ``max_load_by_month`` / ``max_load_by_period`` / ``max_load_total`` ``.csv``): trip
+     count, mean / median / p85 / peak maximum load, mean load factor, share over capacity.
+  3) PNG bar charts of mean and peak maximum load per group, from the monthly grain
+     when present, otherwise the time-period grain.
   4) A run-log sidecar capturing the verbatim CONFIGURATION block.
 
 A note on APC data
 ------------------
-``departure_load`` is the observed on-board count from whatever vehicles
-carried working APC units on each performed trip; it is not an expansion-
-factored estimate. The observed trip count is reported alongside every
-statistic so thinly observed cells can be spotted.
+``departure_load`` is the observed count from vehicles with working APCs, not an expanded
+estimate; the observed trip count beside every statistic shows thinly observed cells.
 
 Typical usage
 -------------
-Update the paths in the CONFIGURATION section (or pass ``--stop-visits`` /
-``--trips-performed`` / ``--output-dir``) and run from a shell, ArcGIS Pro's
-Python window, or a Jupyter notebook.
+Update the paths in CONFIGURATION (or pass ``--stop-visits`` / ``--trips-performed`` /
+``--output-dir``) and run from a shell, ArcGIS Pro's Python window, or a Jupyter notebook.
 """
 
 from __future__ import annotations

@@ -3,116 +3,50 @@
 Python 3.9+; standard library only. No ArcPy, pandas, or API key needed.
 
 Inputs:
-    One or more GTFS feeds, each an unzipped folder or a .zip (GTFS_FEEDS, or
-    GTFS_PATH for a single feed). pathways.txt, transfers.txt and
-    frequencies.txt are used when present. Endpoints and OD pairs are set in
-    LOCATIONS and OD_PAIRS; BENCHMARK_ESTIMATES optionally holds reference
-    travel times from another method for comparison.
+    One or more GTFS feeds, each an unzipped folder or a .zip (GTFS_FEEDS, or GTFS_PATH
+    for a single feed). pathways.txt, transfers.txt and frequencies.txt are used when
+    present. Endpoints and OD pairs are set in LOCATIONS and OD_PAIRS; BENCHMARK_ESTIMATES
+    optionally holds reference travel times from another method for comparison.
 
 Outputs (CSV, UTF-8 with BOM, suitable for Excel):
-    service_selection.csv / service_inventory.csv: active IDs, modes, trip counts.
-    feed_metadata.csv: publisher, feed version and advertised validity dates.
-    stop_catalog.csv / stop_candidates.csv: IDs, codes, coordinates and matches.
-    resolved_locations.csv / endpoint_connections.csv: endpoint and access audit.
     od_results.csv / od_summary.csv: sampled results, coverage and statistics.
     itinerary_legs.csv: ordered WALK / WAIT / RIDE legs and original source IDs.
-    network_transit_segments.csv / network_walk_links.csv: network tables.
-    station_pathways.csv / stop_time_adjustments.csv: pathway/time input audits.
-    benchmark_comparison.csv: GTFS means against reported benchmark totals.
-    benchmark_method_totals.csv / benchmark_method_legs.csv: formula audit.
-    methods.txt, settings.json and run.log: assumptions and diagnostics.
-    gtfs_od_travel_times_runlog.txt: the verbatim CONFIGURATION block, any
-    command-line overrides, the run timestamp and the source script path.
+    Audit tables: service_selection, service_inventory, feed_metadata, stop_catalog,
+    stop_candidates, resolved_locations, endpoint_connections, network_transit_segments,
+    network_walk_links, station_pathways, stop_time_adjustments, benchmark_comparison,
+    benchmark_method_totals and benchmark_method_legs (.csv); settings.json,
+    run.log and the gtfs_od_travel_times_runlog.txt sidecar.
     station_pathway_minutes is INCLUDED in walk_minutes, not an extra cost.
     Means and percentiles cover successful samples only; always check coverage.
 
 Typical usage:
-    Save this single file and run: python gtfs_od_travel_times.py
     Edit paths, SERVICE_DATE, LOCATIONS and OD_PAIRS in the configuration below,
-    or override scalar settings with flags, for example:
-        python gtfs_od_travel_times.py --feed agency_a=agency_a.zip --output-dir od_runs
-    Run with --help for every flag and its default. LOCATIONS, OD_PAIRS,
-    PERIODS and the benchmark tables are set in the configuration only.
-    Use GTFS_FEEDS to add/remove agencies or substitute planned-service feeds.
-    A new timestamped output folder is created for every run.
+    then run: python gtfs_od_travel_times.py (--help lists the scalar overrides).
     Set DISCOVERY_ONLY=True to inspect calendars and stop candidates first.
 
 Service selection:
-    SERVICE_DATE selects one local service day, applying calendar.txt weekday/date
-    ranges, then calendar_dates.txt additions/removals. Several service IDs may
-    run concurrently. Do not select a service_id by its name alone: a calendar
-    row can be active on the date yet have zero trips. Check service_selection.csv
-    for the IDs and modes actually used on the date.
-    IDs are prefixed with feed names to prevent collisions across agencies.
-    Stop codes remain unchanged; ambiguous codes require a prefixed stop_id.
-    For a single-calendar scenario, set USE_MULTIPLE_FEEDS=False,
-    SERVICE_DATE=None, and GTFS_PATH / SERVICE_ID. That mode ignores exceptions.
-    Times above 24:00 remain on the selected service day; no adjacent day's trips
-    are added. This limits late-night/early-morning analyses across day boundaries.
-
-Endpoints and sampling:
-    Each location is a fixed WGS84 point or one exact stop. Arrival means alight
-    at a scheduled stop and walk to the point. A building or place pin is not a
-    verified pedestrian entrance. When a site has several entrances or gates,
-    configure each as its own location and OD pair rather than a centroid.
-    The router chooses the fastest available itinerary; it is not restricted to
-    any particular route or transfer point. Routes absent from the input feeds
-    cannot be evaluated.
-    Peak/off-peak clock windows are analysis assumptions; set PERIODS to your
-    agency's definitions. Every-minute origin departure samples include
-    scheduled waits.
+    SERVICE_DATE selects one local service day from calendar.txt and
+    calendar_dates.txt. Do not select a service_id by its name alone: check
+    service_selection.csv for the IDs and modes actually used on the date.
+    Times above 24:00 stay on the selected day; no adjacent day's trips are added.
 
 Method:
-    Each boarding round scans all trips with a feasible boarding. Fixed labels
-    from the prior round handle overtaking without depending on trip order.
-    Earliest arrival is the objective; fewer boardings break final arrival ties.
-    Waiting is unrestricted within MAX_JOURNEY_MINUTES. One surface walking link
-    is allowed for access, for each transfer, and for egress. Links cannot be
-    chained to bypass walking limits or transfer bans. No total walking budget
-    is imposed. Local ties prefer less walking; globally least walking is not
-    guaranteed among equal arrival times.
-    Outdoor distances are straight-line great-circle distances at WALK_SPEED_MPH.
-    Where pathways.txt is present, station access/egress and platform transfers
-    use its directed station pathways and their traversal times. Mileage limits
-    apply to the outdoor link only; station pathway distance/time is additional.
-    Platforms cannot be reached directly from the street without an entrance
-    path. With REQUIRE_RAIL_PATHWAYS=True, active subway/metro (route_type 1)
-    platforms without entrance/exit paths fail explicitly; set it to False for
-    feeds that publish no pathways, so those platforms are reached on foot.
-    If DERIVE_ZERO_TIME_WALKWAYS=True, zero-time mode-1 pathways use length divided
-    by WALK_SPEED_MPH, rounded up with a one-second minimum. Any adjustment is
-    recorded in station_pathways.csv. Exit gates are restricted to their forward
-    direction, including where the feed incorrectly marks them bidirectional.
-    A transfer buffer is added AFTER physical walking. Any GTFS minimum can
-    require more elapsed time. A timed transfer never holds a vehicle.
+    Round-based earliest-arrival search; fewer boardings break final arrival ties.
+    Waiting is unrestricted within MAX_JOURNEY_MINUTES. One surface walking link is
+    allowed for access, each transfer, and egress; links cannot be chained. Outdoor
+    distances are straight-line at WALK_SPEED_MPH; station access and platform
+    transfers use pathways.txt where present. The router may use any route in the
+    feeds. A location's fixed point is not a verified pedestrian entrance.
 
 Benchmark comparison (optional):
-    BENCHMARK_ESTIMATES holds totals from a sketch method: distance / assumed
-    speed + half headway for each transit leg, plus walking, 1 minute per
-    intermediate metro station and 5 minutes per metro use. This router uses
-    scheduled running/dwell times, actual sampled waits and station pathways.
-    Do not add half a headway, metro dwell or fixed entry/exit time again. The
-    reference audit retains the benchmark's distinct assumptions. Rounded source
-    values and different endpoints can prevent exact agreement. Endpoint
-    variants mapped to one benchmark through PAIR_BENCHMARK_IDS are not
-    independent OD pairs; this script does not calculate a network average.
+    BENCHMARK_ESTIMATES totals add half headways and fixed metro times; this router
+    uses scheduled times and sampled waits instead, so do not add those again.
 
 Limitations:
     Surface walks ignore highways, fences, water, grade separations and security
-    restrictions. Check access at secured sites such as military bases. Station
-    routing permits stairs/escalators; it is not wheelchair-accessible routing.
-    No elevator outage, fare or gate-opening-hours model is included.
-    p90 describes departure-time variation, not operational reliability.
-    Only regular pickup/drop-off (types 0/blank) is allowed. No inferred through
-    service from block IDs. Route/trip-qualified and linked-trip transfer rules
-    fail explicitly; ordinary stop/station transfer types 0-3 are supported.
-    Exact frequency schedules (exact_times=1) are expanded. Headway-only service
-    (exact_times=0) fails rather than inventing scheduled departures.
-    Missing interior times are optionally interpolated at timepoint=0 stops.
-    Feed validity dates alone do not guarantee all modes operate on a given day:
-    inspect service_selection.csv and warnings about absent feed/route types.
-
-Reference: https://gtfs.org/documentation/schedule/reference/
+    restrictions. Station routing is not wheelchair-accessible routing. p90
+    describes departure-time variation, not operational reliability. Headway-only
+    frequencies (exact_times=0) and route/trip-qualified transfer rules fail.
 """
 
 from __future__ import annotations
@@ -1970,7 +1904,6 @@ def run(output: Path) -> int:
     validate_config()
     batches = configured_queries()
     references = export_benchmark_reference(output)
-    (output / "methods.txt").write_text(__doc__ or "", encoding="utf-8")
     feed = CombinedFeed(GTFS_FEEDS) if USE_MULTIPLE_FEEDS else Feed(GTFS_PATH)
     try:
         trip_rows = unique_rows(

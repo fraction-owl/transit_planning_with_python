@@ -197,7 +197,8 @@ Guidelines:
 - **Length:** most script docstrings land between 15 and 45 lines. Helper modules in `utils/`
   need only a couple of lines — their function docstrings carry the detail. If a module docstring
   grows past ~50 lines, keep what an analyst needs to *run and trust* the tool (inputs, outputs,
-  method, limitations) and move extended design rationale elsewhere.
+  method, limitations) and move extended design rationale elsewhere. `dev_tools/check_style.py`
+  (`docstring_length` check) warns when a module docstring runs past 59 lines.
 
 ## 📁 File Organization
 

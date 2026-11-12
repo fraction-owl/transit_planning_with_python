@@ -1,63 +1,40 @@
 """Orchestrate secured-box feature prep (the PRIVATE half of the split).
 
-This is the secured-box counterpart to ``prep_features_public.py``. The two are
-symmetric at the *interface* -- each runs a set of feature scripts, collects
-their tabular outputs, groups them by join-key signature, and writes one CSV
-bundle per signature plus a manifest -- but they have opposite trust postures:
-
-    prep_features_public.py (runs anywhere, NO NTD)
-        A guarded *exporter*. Its whole reason to exist is a fail-closed
-        boundary: it must never let an NTD-derived quantity cross to the
-        unsecured box, so it runs a forbidden-column denylist before writing.
-
-    prep_features_private.py (this script, runs only on the secured box)
-        An internal *assembler*. The proprietary data (NTD ridership, plus the
-        TIDES-derived OTP and runtime operational measures) all live here, so
-        there is no boundary to police. The dependent variable (NTD boardings)
-        and the service-supply predictors are *expected* in these bundles, not
-        forbidden. Nothing produced here is meant to leave the secured box.
+This is the secured-box counterpart to ``prep_features_public.py``. Both run feature
+scripts, group their tables by join-key signature, and write one CSV bundle per
+signature plus a manifest, but with opposite trust postures. The public half is a
+guarded *exporter* whose fail-closed denylist keeps NTD-derived data off the unsecured
+box. This script is an internal *assembler*: NTD ridership and the TIDES-derived OTP and
+runtime measures all live here, so the dependent variable and service-supply predictors
+are *expected* in its bundles. Nothing produced here is meant to leave the secured box.
 
 Workflow (identical shape to the public half):
 
     scan -> extract -> run -> collect -> describe -> combine
 
-    scan      Discover the private feature scripts under ``SCRIPTS_DIR``
-              (searched recursively, since the private set spans
-              ``ridership_tools`` and ``operations_tools``) using the
+    scan      Discover the private scripts under ``SCRIPTS_DIR`` (recursively) using the
               ``jobs.private.json`` registry as an ordered allowlist.
-    extract   Optionally unzip ``*.zip`` archives found under the input root
-              (zip-slip guarded), so NTD workbooks / TIDES exports can be dropped
-              either loose or zipped.
-    run       Invoke each script as a subprocess using its registry command
-              template, each into its own output subdir, capturing logs and
-              applying a per-script timeout. Downstream scripts read an upstream
-              script's output via ``{work}/out/<script_stem>/`` (e.g.
-              ``otp_by_route`` consumes ``otp_monthly_panel``'s output).
-    collect   Gather the ``*.csv`` / ``*.xlsx`` tables each successful script
-              produced.
-    describe  Resolve each table's join keys + kept columns from the registry
-              when present, else by inference, building a ``list[FeatureTable]``.
+    extract   Optionally unzip dropped ``*.zip`` archives (zip-slip guarded).
+    run       Invoke each script as a subprocess from its registry template into its
+              own output subdir, with logs and a per-script timeout. Downstream scripts
+              read upstream output via ``{work}/out/<script_stem>/``.
+    collect   Gather the ``*.csv`` / ``*.xlsx`` tables each successful script produced.
+    describe  Resolve each table's join keys + kept columns (registry, else inference).
     combine   Validate (hygiene only -- no denylist), then ``write_bundles`` ->
               ``write_manifest`` -> ``write_run_log``.
 
 Notes:
-    - One bundle per join-key signature, exactly like the public half. The
-      route-level rollups (NTD cross-section anchor + OTP + runtime) merge into a
-      single ``route_id`` bundle -- the "one route-level table" the OLS and ML
-      models consume -- while any route x month panel collected (e.g. the runtime
-      monthly panel) becomes its own bundle for the future monthly-change model.
-    - Governance is inverted relative to the public half: there is NO forbidden
-      column denylist and NO anchor guard. The only checks are hygiene (every
-      shipped table must enumerate its keep_cols; a join key may not also be a
-      shipped value; two tables in one key group may not ship the same column),
-      plus an advisory check that the configured dependent variable is present.
-    - CSV only, for parity with the public bundles and the stock
-      ``arcgispro-py3`` env (no ``pyarrow``).
+    - The route-level rollups (NTD anchor + OTP + runtime) merge into one ``route_id``
+      bundle, the route-level table the OLS and ML models consume; a route x month
+      panel (e.g. runtime) becomes its own bundle.
+    - There is NO forbidden-column denylist and NO anchor guard, only hygiene checks (each
+      table lists its keep_cols; no join key is also a shipped value; no two tables in a key
+      group ship the same column) and an advisory check that the dependent variable exists.
+    - CSV only, matching the public bundles and the stock ``arcgispro-py3`` env.
 
 Inputs:
-    - The private feature scripts (NTD anchor builder; OTP and runtime rollups)
-      plus their input data, and a ``jobs.private.json`` registry describing each
-      script's command and its outputs' join keys / kept columns.
+    - The private feature scripts (NTD anchor builder; OTP and runtime rollups) and
+      their data, plus a ``jobs.private.json`` registry of commands and output keys.
 
 Outputs:
     - One CSV bundle per join-key signature in ``OUTPUT_DIR``.
@@ -67,9 +44,9 @@ Outputs:
       exit code, duration, and collected output files.
 
 Typical usage:
-    Update the paths in the CONFIGURATION section (or pass the matching CLI flags,
-    e.g. ``--scripts-dir`` / ``--input-dir`` / ``--output-dir``) and run on the
-    secured box from a shell or a Jupyter notebook.
+    Update the paths in the CONFIGURATION section (or pass ``--scripts-dir`` /
+    ``--input-dir`` / ``--output-dir``) and run on the secured box from a shell or a
+    Jupyter notebook.
 """
 
 from __future__ import annotations
