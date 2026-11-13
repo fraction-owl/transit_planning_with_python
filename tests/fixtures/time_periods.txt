@@ -1,0 +1,16 @@
+# System time periods for the mock DC agency behind the TIDES fixtures
+# (stop_visits.csv, trips_performed.csv).
+#
+# Read by the grains that split by time of day, e.g. ridership_from_tides.py's
+# time_period and month_time_period cuts (TIME_PERIODS_FILE / --time-periods-file).
+# Format: one "NAME = HH:MM - HH:MM" per line on the 24-hour clock, start inclusive,
+# end exclusive; an end earlier than the start wraps past midnight. Together the
+# periods cover every minute of the day exactly once. Blank lines and anything after
+# "#" are ignored. Output rows follow the order of the lines below.
+
+Early AM = 04:00 - 06:00
+AM Peak  = 06:00 - 09:00
+Midday   = 09:00 - 15:00
+PM Peak  = 15:00 - 18:00
+Late PM  = 18:00 - 22:00
+Night    = 22:00 - 04:00

@@ -15,6 +15,12 @@ sampled block's pull-out, deadheads and pull-in appear as ``Pullout`` /
 ``Deadhead`` / ``Pullin`` rows whose ``trip_id_scheduled`` is the TODS trip.
 The sampling unit is a whole vehicle block on one date, run by one vehicle.
 
+A second pass (``HOLIDAY_PASS``) appends every block of the holiday-only service
+on each date it runs inside the month range -- with the base feed, the 50H loop
+on 2026-01-01, a Thursday -- so day-type and holiday detection have a real
+holiday to find. It draws from its own random stream, so the main sample's rows
+do not change when the pass is edited.
+
 Sizing is configurable at the top of the module; defaults keep the files
 small enough to commit while leaving enough rows for meaningful aggregation.
 A fixed random seed makes the output stable run-to-run.
@@ -36,7 +42,7 @@ import math
 import os
 import random
 import zipfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -69,6 +75,14 @@ END_MONTH: Final[tuple[int, int]] = (2026, 3)
 # Service dates sampled per month for each GTFS service_id, evenly spread over
 # the dates that service runs (holidays drop out where calendar_dates says so).
 DAYS_PER_MONTH: Final[dict[str, int]] = {"weekday": 2, "saturday": 1, "sunday": 1}
+
+# Holiday pass, run after the main sample: {service_id: route_ids}. On every date
+# the service runs inside the month range, each listed route runs all of its
+# blocks for that service. The base feed's holiday service is the 50H loop on
+# Jan 1, Nov 11, Nov 26 and Dec 25, so the default Jan-Mar range adds one date.
+# Rows come from their own random stream (RANDOM_SEED + 1) and are appended, so
+# the main sample above is unchanged. Set to {} to skip the pass.
+HOLIDAY_PASS: Final[dict[str, list[str]]] = {"holiday": ["DC_R50H"]}
 
 # Each (service_id, route) gets a fixed rotation of blocks, chosen once; the
 # sampled dates of a month take them in turn, one block per route per date.
@@ -864,6 +878,67 @@ def _block_rotation(by_block: dict[str, list[ScheduledTrip]], rng: random.Random
     return rotation
 
 
+def _run_block(
+    day: date,
+    trips: Sequence[ScheduledTrip],
+    schedule: Schedule,
+    rng: random.Random,
+    vehicle_id: str,
+    forced: Iterator[str],
+    trip_rows: list[dict[str, object]],
+    stop_rows: list[dict[str, object]],
+) -> None:
+    """Emit one vehicle block on one date: a trip row per trip, stop rows per revenue trip.
+
+    One vehicle runs the whole block, trip after trip; a canceled trip gets a
+    trip row but no stop visits. Rows are appended to *trip_rows* / *stop_rows*.
+    """
+    not_before: datetime | None = None
+    for trip in trips:
+        row, canceled = _generate_trip_row(day, trip, rng, vehicle_id, not_before)
+        trip_rows.append(row)
+        if canceled:
+            continue
+        not_before = datetime.strptime(str(row["actual_trip_end"]), "%Y-%m-%dT%H:%M:%S")
+        if not trip.tods_type:
+            visits = _generate_stop_rows(
+                day, trip, row, schedule.stop_coords, rng, force=next(forced, "")
+            )
+            stop_rows.extend(visits)
+
+
+def _holiday_pass(
+    schedule: Schedule,
+    trip_rows: list[dict[str, object]],
+    stop_rows: list[dict[str, object]],
+) -> None:
+    """Append every block of each ``HOLIDAY_PASS`` service on each date it runs in range.
+
+    Uses its own random stream so editing the pass never changes the main sample.
+    """
+    rng = random.Random(RANDOM_SEED + 1)
+    months = set(_iter_months(START_MONTH, END_MONTH))
+    for service_id, routes in HOLIDAY_PASS.items():
+        dates = sorted(
+            d for d in schedule.active_dates.get(service_id, set()) if (d.year, d.month) in months
+        )
+        for day in dates:
+            fleet = iter(rng.sample(FLEET, len(FLEET)))
+            for route_id in routes:
+                by_block = schedule.blocks.get((service_id, route_id), {})
+                for block_id in sorted(by_block):
+                    _run_block(
+                        day,
+                        by_block[block_id],
+                        schedule,
+                        rng,
+                        next(fleet),
+                        iter(()),
+                        trip_rows,
+                        stop_rows,
+                    )
+
+
 def generate(schedule: Schedule, rng: random.Random) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Build both fixtures and return them as DataFrames."""
     trip_rows: list[dict[str, object]] = []
@@ -893,23 +968,19 @@ def generate(schedule: Schedule, rng: random.Random) -> tuple[pd.DataFrame, pd.D
                     by_block = schedule.blocks[service_id, route_id]
                     rotation = rotations[service_id, route_id]
                     block_id = rotation[day_idx % len(rotation)]
-                    # One vehicle runs the whole block, trip after trip.
                     vehicle_id = next(fleet)
-                    not_before: datetime | None = None
-                    for trip in by_block[block_id]:
-                        row, canceled = _generate_trip_row(day, trip, rng, vehicle_id, not_before)
-                        trip_rows.append(row)
-                        if canceled:
-                            continue
-                        not_before = datetime.strptime(
-                            str(row["actual_trip_end"]), "%Y-%m-%dT%H:%M:%S"
-                        )
-                        if not trip.tods_type:
-                            visits = _generate_stop_rows(
-                                day, trip, row, schedule.stop_coords, rng, force=next(forced, "")
-                            )
-                            stop_rows.extend(visits)
+                    _run_block(
+                        day,
+                        by_block[block_id],
+                        schedule,
+                        rng,
+                        vehicle_id,
+                        forced,
+                        trip_rows,
+                        stop_rows,
+                    )
 
+    _holiday_pass(schedule, trip_rows, stop_rows)
     trips_df = pd.DataFrame(trip_rows, columns=TRIPS_COLS)
     stops_df = pd.DataFrame(stop_rows, columns=STOPS_COLS)
     return trips_df, stops_df

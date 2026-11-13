@@ -151,9 +151,10 @@ DEMOGRAPHIC_FIELDS: Sequence[str] = ("population",)
 # optional stop_id (blank/absent = whole-trip total) and a numeric boardings
 # column, and are tied to GTFS trips by the match mode below. Leave the path ""
 # to skip ridership accounting. The column names default to a ridecheck export;
-# for the trip_id/stop_id/avg_daily_boardings frame that this repo's
-# ridership_by_hour.py writes, set RIDERSHIP_BOARDINGS_COL to
-# "avg_daily_boardings" and RIDERSHIP_TRIP_MATCH_MODE to "trip_id".
+# for the trip_id/stop_id/avg_daily_boardings frames this repo writes
+# (ridership_from_tides.py's service_cut_inputs/ files, or ridership_by_hour.py's
+# trip tables), set RIDERSHIP_BOARDINGS_COL to "avg_daily_boardings" and
+# RIDERSHIP_TRIP_MATCH_MODE to "trip_id".
 RIDERSHIP_CSV: str = r""
 RIDERSHIP_TRIP_ID_COL: str = "trip_id"
 RIDERSHIP_STOP_ID_COL: str = "stop_id"

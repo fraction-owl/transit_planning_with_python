@@ -134,11 +134,29 @@ def test_fixture_keeps_its_edge_cases(trips: list, visits: list) -> None:
     assert any(t["schedule_trip_end"][:10] > t["service_date"] for t in revenue)
     assert any(t["schedule_relationship"] == "Canceled" for t in revenue)
     assert {"Skipped", "Added"} <= {v["schedule_relationship"] for v in visits}
-    # Every month covers every route and direction.
-    cells = {(t["service_date"][:7], t["route_id"], t["direction_id"]) for t in revenue}
+    # Every month covers every sampled route and direction.
+    cells = {
+        (t["service_date"][:7], t["route_id"], t["direction_id"])
+        for t in revenue
+        if t["route_id"] in gen.ROUTES
+    }
     assert len(cells) == 3 * len(gen.ROUTES) * 2
     # stop_visits keeps the M/D/YYYY service_date format of the real exports.
     assert visits[0]["service_date"].count("/") == 2
+
+
+def test_holiday_pass_adds_the_holiday_service_date(trips: list) -> None:
+    """2026-01-01 runs only the holiday service, every block of it, and nothing else."""
+    holiday = [t for t in trips if t["service_date"] == "2026-01-01"]
+    revenue = [t for t in holiday if t["trip_type"] == "In service"]
+    assert {t["route_id"] for t in revenue} == {"DC_R50H"}
+    assert all("_holiday_" in t["trip_id_scheduled"] for t in holiday)
+    schedule = gen.load_schedule(gen.GTFS_PATH, gen.TODS_PATH)
+    blocks = schedule.blocks["holiday", "DC_R50H"]
+    assert {t["block_id"] for t in holiday} == set(blocks)
+    # The holiday pass sits after the main sample, so its rows are appended.
+    assert trips[-1]["service_date"] == "2026-01-01"
+    assert all(t["route_id"] != "DC_R50H" for t in trips if t["service_date"] != "2026-01-01")
 
 
 def test_fixtures_match_the_generator_output() -> None:

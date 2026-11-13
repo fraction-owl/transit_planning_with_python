@@ -106,13 +106,11 @@ transit_planning_with_python/
 │   │   ├── district_ridership_share_arcpy.py
 │   │   ├── district_ridership_share_gpd.py
 │   │   ├── load_factor_monitor.py
-│   │   ├── max_load_from_tides.py
 │   │   ├── ntd_anchor_builder.py
 │   │   ├── ntd_monthly_config_example.txt
 │   │   ├── ntd_monthly_summary.py
 │   │   ├── ntd_monthly_trends_export.py
 │   │   ├── ridership_by_hour.py
-│   │   ├── ridership_by_time_period.py
 │   │   ├── ridership_from_tides.py
 │   │   ├── stop_ridership_change.py
 │   │   ├── stops_ridership_joiner_arcpy.py
@@ -237,6 +235,7 @@ transit_planning_with_python/
 │   │   ├── stop_usage_by_stop_id_sample.csv
 │   │   ├── stop_visits.csv
 │   │   ├── supplemental_jobs.csv
+│   │   ├── time_periods.txt
 │   │   ├── tl_2025_11_tabblock20_sample.zip
 │   │   ├── tl_2025_24_tabblock20_sample.zip
 │   │   ├── tl_2025_51_tabblock20_sample.zip
@@ -282,7 +281,6 @@ transit_planning_with_python/
 │   ├── test_headway_span_exporter.py
 │   ├── test_load_factor_monitor.py
 │   ├── test_load_gtfs_data.py
-│   ├── test_max_load_from_tides.py
 │   ├── test_mock_tides_dc.py
 │   ├── test_mock_tods_dc.py
 │   ├── test_monthly_ridership_model.py
@@ -301,7 +299,6 @@ transit_planning_with_python/
 │   ├── test_prep_features_public_orchestrator.py
 │   ├── test_printable_block_schedules.py
 │   ├── test_private_shuttle_coverage_by_route_gpd.py
-│   ├── test_ridership_by_time_period.py
 │   ├── test_ridership_from_tides.py
 │   ├── test_ridership_ml_model.py
 │   ├── test_route_direction_classifier_arcpy.py

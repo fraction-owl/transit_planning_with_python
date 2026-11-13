@@ -215,7 +215,7 @@ def test_build_trip_table_counts_reconcile(scored: pd.DataFrame) -> None:
     # Fixture trips repeat across dates via trip_id_scheduled.
     assert table["n_dates"].max() > 1
     # trip_id is the GTFS trip_id from tests/fixtures/mock_gtfs_dc.zip.
-    assert table["trip_id"].str.match(r"^DC_R\d+_(weekday|saturday|sunday)_\d{4}$").all()
+    assert table["trip_id"].str.match(r"^DC_R\w+_(weekday|saturday|sunday|holiday)_\d{4}$").all()
     # Scheduled starts render as (possibly 24+) service-day clock strings.
     assert table["scheduled_start"].str.match(r"^\d{2}:\d{2}$").all()
     # Sorted by scheduled start within each day type.

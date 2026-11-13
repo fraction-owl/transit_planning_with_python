@@ -38,7 +38,7 @@ def test_join_brings_route_attributes() -> None:
         assert col in joined.columns
     # Every joined row should carry a route id (inner join on performed trips).
     assert joined["route_id"].notna().all()
-    assert set(joined["route_id"].unique()) <= {"DC_R10", "DC_R20", "DC_R30"}
+    assert set(joined["route_id"].unique()) <= {"DC_R10", "DC_R20", "DC_R30", "DC_R50H"}
 
 
 def test_compute_stop_deviations_sign() -> None:

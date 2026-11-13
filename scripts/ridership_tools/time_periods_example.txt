@@ -1,4 +1,4 @@
-# Example time periods for ridership_by_time_period.py.
+# Example time periods for ridership_from_tides.py.
 #
 # Copy this file, edit the copy, and point TIME_PERIODS_FILE (or
 # --time-periods-file) at it. One period per line:

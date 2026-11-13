@@ -10,7 +10,6 @@ import datetime
 from pathlib import Path
 
 import openpyxl
-import pandas as pd
 import pytest
 
 from scripts.ridership_tools import ridership_by_hour
@@ -140,32 +139,3 @@ def test_trip_chart_filename_uses_the_route_name(tmp_path) -> None:
     out_dir = tmp_path / "charts"
     assert ridership_by_hour.export_trip_charts(rows, "pass_per_hour", 5.0, out_dir) == 1
     assert (out_dir / "route_RIBS5_LOOP_weekday.png").exists()
-
-
-_STOP_VISITS = Path("tests/fixtures/stop_visits.csv")
-_TRIPS_PERFORMED = Path("tests/fixtures/trips_performed.csv")
-
-
-def test_tides_mode_runs_on_the_repo_fixtures(caplog) -> None:
-    """Tides mode runs end to end on the repo's TIDES fixtures.
-
-    The default TIDES_TIME_COLUMNS match the fixture's TIDES field names, and
-    its M/D/YYYY stop_visits dates join to the YYYY-MM-DD trips_performed ones.
-    """
-    with caplog.at_level("WARNING"):
-        hourly, trip_tables, _ = ridership_by_hour.build_hourly_from_tides(
-            _STOP_VISITS, _TRIPS_PERFORMED
-        )
-    assert "no matching trips_performed row" not in caplog.text
-    assert "unparseable event times" not in caplog.text
-
-    days = hourly.groupby("day_type")["days_observed"].first().to_dict()
-    assert days == {"weekday": 6, "saturday": 3, "sunday": 3}
-    assert hourly["hour"].min() >= ridership_by_hour.LATE_NIGHT_CUTOVER_HOUR
-    assert hourly["hour"].max() >= 24  # owl visits after midnight land on hour 24+
-
-    visits = pd.read_csv(_STOP_VISITS)
-    fixture_boardings = visits[["boarding_1", "boarding_2"]].sum().sum()
-    daily_total = (hourly["boardings"] * hourly["days_observed"]).sum()
-    assert daily_total == pytest.approx(fixture_boardings)
-    assert set(trip_tables) == {"weekday", "saturday", "sunday"}

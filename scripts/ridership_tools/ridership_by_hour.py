@@ -1,29 +1,25 @@
-"""Roll trip-level ridership up to average boardings by hour of the service day.
+"""Roll vendor Route-and-Trip ridership up to average boardings by hour of the service day.
 
-Two input modes cover the common data situations. ``"route_trip_xlsx"`` reads the
-pre-aggregated "Route and Trip" workbooks a vendor ridership database exports (one per
-day type; one row per scheduled trip with period-average passengers on/off and a start
-time) and assigns each trip's average boardings to the hour of its start time.
-``"tides"`` derives the same table from raw TIDES ``stop_visits`` + ``trips_performed``,
-counting boardings at the hour each stop visit occurred and averaging across the
-service dates observed for each day type.
+Reads the pre-aggregated "Route and Trip" workbooks a vendor ridership database exports
+(one per day type; one row per scheduled trip with period-average passengers on/off and
+a start time) and assigns each trip's average boardings to the hour of its start time.
+For raw TIDES ``stop_visits`` + ``trips_performed`` events, use ``ridership_from_tides.py``
+instead: its ``hour`` time cut gives the same profile, located by each stop visit's time.
 
 Hours use the GTFS-style service-day clock: times before ``LATE_NIGHT_CUTOVER_HOUR`` are
 hours 24-27 of the prior service day, so the default service day runs 04:00-27:59.
 
 Inputs:
-    - ``route_trip_xlsx`` mode: one workbook per day type (weekday/saturday/
-      sunday), column names configurable via ``XLSX_COLUMN_MAP``.
-    - ``tides`` mode: ``stop_visits.csv`` and ``trips_performed.csv`` (e.g. from
-      ``convert_to_tides_stop_visits.py`` / ``convert_to_tides_trips_performed.py``).
+    - One workbook per day type (weekday/saturday/sunday), column names configurable
+      via ``XLSX_COLUMN_MAP``.
 
 Outputs:
     - ``ridership_by_hour_route.csv``: day type × route × hour average boardings
       (and alightings when available), with observation counts.
     - ``ridership_by_hour_system.csv``: day type × hour system totals.
     - ``ridership_by_trip_<day>.csv`` per day type (``EXPORT_TRIP_TABLE``): average
-      daily boardings by ``trip_id`` (and ``stop_id`` in tides mode), the
-      ``RIDERSHIP_CSV`` input ``service_cut_impact_gpd.py`` expects for its ``SERVICE_DAY``.
+      daily boardings by ``trip_id``, the ``RIDERSHIP_CSV`` input
+      ``service_cut_impact_gpd.py`` expects for its ``SERVICE_DAY``.
     - ``low_ridership_trips.csv``: trips whose ``LOW_RIDERSHIP_MEASURE`` (passengers per
       revenue hour by default; per revenue mile and raw boardings also available) falls
       below ``LOW_RIDERSHIP_THRESHOLD``. Written only when trips are flagged; set the
@@ -36,10 +32,9 @@ Outputs:
     - A run-log sidecar capturing the verbatim CONFIGURATION block.
 
 Notes:
-    The two modes time-locate boardings differently (trip start hour versus actual
-    event hour), so expect small shifts between them for long trips. Holiday service is
-    not separated. Trip tables need GTFS ``trip_id`` values (the xlsx trip-number
-    column, or TIDES ``trip_id_scheduled``); otherwise expect unmatched ids downstream.
+    Each trip's boardings land in the hour it starts, so long trips are not split
+    across hours. Holiday service is not separated. Trip tables need GTFS ``trip_id``
+    values in the trip-number column; otherwise expect unmatched ids downstream.
     Routes are identified by name, not code (the code appears in parentheses when the
     two differ); routes the export leaves unnamed fall back to the code.
 
@@ -76,14 +71,9 @@ CONFIG_END_MARKER: str = "# === END CONFIG ==="
 # =============================================================================
 # === BEGIN CONFIG ===
 
-# "route_trip_xlsx" (vendor Route-and-Trip average workbooks, one per day type)
-# or "tides" (raw TIDES stop_visits + trips_performed event files).
-INPUT_MODE: str = "route_trip_xlsx"
-
 OUTPUT_DIR: str = r"Path\To\Your\Output_Folder"
 
-# --- route_trip_xlsx mode -----------------------------------------------------
-# One workbook per day type. Remove entries you don't have.
+# One Route-and-Trip workbook per day type. Remove entries you don't have.
 XLSX_INPUTS: Mapping[str, str] = {
     "weekday": r"Path\To\RIDERSHIP_BY_ROUTE_AND_TRIP_weekday.xlsx",
     "saturday": r"Path\To\RIDERSHIP_BY_ROUTE_AND_TRIP_saturday.xlsx",
@@ -108,23 +98,7 @@ XLSX_COLUMN_MAP: Mapping[str, str] = {
     "revenue_miles": "REVENUE_MILES",
 }
 
-# --- tides mode ---------------------------------------------------------------
-TIDES_STOP_VISITS_PATH: str = r"Path\To\stop_visits.csv"
-TIDES_TRIPS_PERFORMED_PATH: str = r"Path\To\trips_performed.csv"
-# First column found (and non-blank per row) provides each stop visit's time.
-# Defaults are the TIDES stop_visits field names.
-TIDES_TIME_COLUMNS: Sequence[str] = (
-    "actual_departure_time",
-    "actual_arrival_time",
-    "schedule_departure_time",
-    "schedule_arrival_time",
-)
-# Per-door APC count columns summed into total boardings / alightings.
-TIDES_BOARDING_COLS: Sequence[str] = ("boarding_1", "boarding_2")
-TIDES_ALIGHTING_COLS: Sequence[str] = ("alighting_1", "alighting_2")
-
-# --- shared -------------------------------------------------------------------
-# Events/trips starting before this clock hour belong to the prior service day
+# Trips starting before this clock hour belong to the prior service day
 # and are shifted to hour 24+ (e.g. a 00:30 owl trip becomes hour 24, a 2:15
 # trip hour 26). The default 4 gives the industry-standard 04:00-27:59 service
 # day; set 3 if your agency's service day starts at 3am (hours run to 26).
@@ -149,16 +123,14 @@ SYSTEM_OUTPUT_FILENAME: str = r"ridership_by_hour_system.csv"
 # Measures: "pass_per_hour" (average boardings per revenue hour, the
 # productivity measure most agency service standards use), "pass_per_mile"
 # (per revenue mile), or "boardings" (raw average boardings per trip, which
-# favors longer trips). xlsx mode computes the ratios from the revenue_hours /
-# revenue_miles column mappings; tides mode derives hours from the
-# trips_performed start/end times and has no mileage, so "pass_per_mile"
-# works only in xlsx mode. Trips missing the measure are logged and skipped.
+# favors longer trips). The ratios come from the revenue_hours / revenue_miles
+# column mappings. Trips missing the measure are logged and skipped.
 LOW_RIDERSHIP_MEASURE: str = "pass_per_hour"
 LOW_RIDERSHIP_THRESHOLD: float = 5.0
 LOW_RIDERSHIP_FILENAME: str = r"low_ridership_trips.csv"
 
 # Also write ridership_by_trip_<day>.csv per day type — average daily boardings
-# by trip_id (and stop_id in tides mode), in exactly the schema
+# by trip_id, in exactly the schema
 # service_cut_impact_gpd.py's RIDERSHIP_CSV input expects. Pass the file whose
 # day type matches that script's SERVICE_DAY.
 EXPORT_TRIP_TABLE: bool = True
@@ -170,8 +142,7 @@ CHARTS_SUBDIR: str = r"charts"
 CHART_MEASURE: str = "boardings"  # "boardings" or "alightings"
 
 # Per-trip charts (written to CHARTS_SUBDIR/trips, gated by EXPORT_CHARTS):
-# one PNG per route — split by direction when the direction column is mapped
-# (xlsx mode) or trips_performed carries direction_id (tides mode) — per day
+# one PNG per route — split by direction when the direction column is mapped — per day
 # type, with one bar per trip in start-time order on the LOW_RIDERSHIP_MEASURE
 # scale. The y-axis is shared across routes within a day type so routes (and a
 # route's two directions) compare directly. When the low-ridership threshold
@@ -190,7 +161,7 @@ REQUIRE_RUN_LOG: bool = True
 # Day types recognised, in output order.
 _DAY_ORDER: List[str] = ["weekday", "saturday", "sunday"]
 
-# Per-trip row schema shared by both input modes; feeds flag_low_ridership.
+# Per-trip row schema; feeds flag_low_ridership.
 _TRIP_ROW_COLS: List[str] = [
     "day_type",
     "route",
@@ -674,244 +645,6 @@ def build_hourly_from_xlsx(
 
 
 # =============================================================================
-# TIDES MODE
-# =============================================================================
-
-
-def _coalesce_time_columns(visits: pd.DataFrame, candidates: Sequence[str]) -> pd.Series:
-    """Return the first non-blank time value per row across *candidates*."""
-    present = [c for c in candidates if c in visits.columns]
-    if not present:
-        raise ValueError(
-            f"stop_visits has none of the configured TIDES_TIME_COLUMNS: {list(candidates)}"
-        )
-    coalesced = visits[present[0]]
-    for col in present[1:]:
-        coalesced = coalesced.where(coalesced.notna() & (coalesced.astype(str) != ""), visits[col])
-    return coalesced
-
-
-def _event_service_hour(time_value: object, service_date: object, cutover_hour: int) -> float:
-    """Locate one stop-visit event on the service-day hour clock.
-
-    Full timestamps are compared against the service date, so an event logged
-    at 00:30 on the calendar day after its service date lands at hour 24. An
-    event timestamped in the small hours *of the service date itself* (a vendor
-    that stamps owl events with the operating day's date) gets the same
-    cutover shift, so hours below the cutover never appear either way.
-    Time-only values fall back to the cutover rule.
-
-    Args:
-        time_value: Raw time cell (timestamp or ``HH:MM[:SS]`` string).
-        service_date: Raw service_date cell for the same row.
-        cutover_hour: Clock hours below this are shifted to 24+.
-
-    Returns:
-        Service-day hour as a float, or NaN when unparseable.
-    """
-    stamp = pd.to_datetime(time_value, errors="coerce")
-    if not pd.isna(stamp):
-        day = pd.to_datetime(service_date, errors="coerce")
-        if not pd.isna(day):
-            offset_days = (stamp.date() - day.date()).days
-            if offset_days == 1:
-                return float(stamp.hour + 24)
-        return float(_service_hour(stamp.hour, cutover_hour))
-    minutes = parse_time_to_minutes(str(time_value))
-    if minutes is None:
-        return float("nan")
-    hour = minutes // 60
-    if hour < 24:
-        hour = _service_hour(hour, cutover_hour)
-    return float(hour)
-
-
-def _trip_duration_hours(performed: pd.DataFrame) -> pd.Series:
-    """Per-row trip duration in hours from trips_performed start/end times.
-
-    Prefers ``actual_trip_start``/``actual_trip_end`` and falls back to
-    ``schedule_trip_start``/``schedule_trip_end`` per row. Rows where neither
-    pair parses to a positive duration come back NaN.
-    """
-    duration = pd.Series(float("nan"), index=performed.index)
-    for start_col, end_col in (
-        ("actual_trip_start", "actual_trip_end"),
-        ("schedule_trip_start", "schedule_trip_end"),
-    ):
-        if start_col not in performed.columns or end_col not in performed.columns:
-            continue
-        start = pd.to_datetime(performed[start_col], errors="coerce")
-        end = pd.to_datetime(performed[end_col], errors="coerce")
-        hours = (end - start).dt.total_seconds() / 3600.0
-        duration = duration.fillna(hours.where(hours > 0))
-    return duration
-
-
-def build_hourly_from_tides(
-    stop_visits_path: Path, trips_performed_path: Path
-) -> "tuple[pd.DataFrame, dict[str, pd.DataFrame], pd.DataFrame]":
-    """Build the route × day × hour table from TIDES event files.
-
-    Boardings are counted at the hour each stop visit occurred and averaged
-    over the distinct service dates observed for each day type, so the result
-    is an average *daily* profile comparable to the xlsx mode's.
-
-    Args:
-        stop_visits_path: TIDES ``stop_visits`` CSV.
-        trips_performed_path: TIDES ``trips_performed`` CSV.
-
-    Returns:
-        Tuple of (hourly table, engine trip tables, per-trip rows). The hourly
-        table has one row per (day_type, route, hour): average daily
-        ``boardings``/``alightings``, average daily distinct ``trips``, and the
-        number of service dates observed (``days_observed``). The trip tables
-        map day type to a ``trip_id``/``stop_id``/``avg_daily_boardings`` frame
-        ready for ``service_cut_impact_gpd.py``, keyed on ``trip_id_scheduled``
-        (the GTFS trip_id) when trips_performed carries it, with per-stop
-        grain when stop_visits carries ``stop_id``. The per-trip rows are one
-        row per trip for the low-ridership flagging pass: average daily
-        boardings across the dates each trip was observed, with ``hour`` set
-        to the trip's earliest observed stop-visit hour, ``pass_per_hour``
-        derived from the trips_performed actual (or scheduled) start/end
-        times, ``direction`` from trips_performed ``direction_id`` when
-        present, ``pass_per_mile`` NaN (no mileage in TIDES event data), and
-        ``start_time`` blank (no scheduled start time in the event data).
-
-    Raises:
-        FileNotFoundError: If either file does not exist.
-        ValueError: If required columns are missing or nothing is parseable.
-    """
-    for path in (stop_visits_path, trips_performed_path):
-        if not path.exists():
-            raise FileNotFoundError(f"TIDES file not found: {path}")
-    visits = pd.read_csv(stop_visits_path, dtype=str, low_memory=False)
-    performed = pd.read_csv(trips_performed_path, dtype=str, low_memory=False)
-
-    for frame, label in ((visits, "stop_visits"), (performed, "trips_performed")):
-        for col in ("trip_id_performed", "service_date"):
-            if col not in frame.columns:
-                raise ValueError(f"{label} is missing required column {col!r}.")
-    if "route_id" not in performed.columns:
-        raise ValueError("trips_performed is missing required column 'route_id'.")
-    # The two exports may format service_date differently (M/D/YYYY vs.
-    # YYYY-MM-DD), so normalise both before they are joined on it.
-    for frame in (visits, performed):
-        frame["service_date"] = pd.to_datetime(frame["service_date"], errors="coerce").dt.strftime(
-            "%Y-%m-%d"
-        )
-
-    board_cols = [c for c in TIDES_BOARDING_COLS if c in visits.columns]
-    if not board_cols:
-        raise ValueError(
-            f"stop_visits has none of the configured TIDES_BOARDING_COLS: "
-            f"{list(TIDES_BOARDING_COLS)}"
-        )
-    alight_cols = [c for c in TIDES_ALIGHTING_COLS if c in visits.columns]
-    for col in board_cols + alight_cols:
-        visits[col] = pd.to_numeric(visits[col], errors="coerce")
-    visits["boardings"] = visits[board_cols].sum(axis=1)
-    visits["alightings"] = visits[alight_cols].sum(axis=1) if alight_cols else float("nan")
-
-    time_raw = _coalesce_time_columns(visits, TIDES_TIME_COLUMNS)
-    visits["hour"] = [
-        _event_service_hour(t, d, LATE_NIGHT_CUTOVER_HOUR)
-        for t, d in zip(time_raw, visits["service_date"])
-    ]
-    bad = int(visits["hour"].isna().sum())
-    if bad:
-        logging.warning("stop_visits: dropped %d row(s) with unparseable event times.", bad)
-    visits = visits[visits["hour"].notna()].copy()
-    visits["hour"] = visits["hour"].astype(int)
-
-    routes = performed.drop_duplicates(subset=["service_date", "trip_id_performed"]).copy()
-    routes["duration_hours"] = _trip_duration_hours(routes)
-    route_cols = ["service_date", "trip_id_performed", "route_id", "duration_hours"]
-    for optional in ("trip_id_scheduled", "direction_id"):
-        if optional in routes.columns:
-            route_cols.append(optional)
-    events = visits.merge(routes[route_cols], on=["service_date", "trip_id_performed"], how="left")
-    unmatched = int(events["route_id"].isna().sum())
-    if unmatched:
-        logging.warning(
-            "stop_visits: %d visit(s) had no matching trips_performed row; they are excluded.",
-            unmatched,
-        )
-        events = events[events["route_id"].notna()]
-    if events.empty:
-        raise ValueError("No stop visits joined to trips_performed — check the two files.")
-
-    day = pd.to_datetime(events["service_date"], errors="coerce")
-    events = events[day.notna()].copy()
-    dow = day[day.notna()].dt.dayofweek
-    events["day_type"] = "weekday"
-    events.loc[dow == 5, "day_type"] = "saturday"
-    events.loc[dow == 6, "day_type"] = "sunday"
-    events["route"] = events["route_id"].astype(str).str.strip()
-    events = _apply_route_filters(events)
-
-    n_dates = events.groupby("day_type")["service_date"].nunique()
-    totals = events.groupby(["day_type", "route", "hour"], as_index=False).agg(
-        boardings=("boardings", "sum"),
-        alightings=("alightings", "sum"),
-        trip_visits=("trip_id_performed", "nunique"),
-    )
-    totals["days_observed"] = totals["day_type"].map(n_dates)
-    totals["boardings"] = totals["boardings"] / totals["days_observed"]
-    totals["alightings"] = totals["alightings"] / totals["days_observed"]
-    totals["trips"] = totals["trip_visits"] / totals["days_observed"]
-    totals["route_name"] = ""
-    for day_type, count in n_dates.items():
-        logging.info("TIDES: %s averaged over %d service date(s).", day_type, count)
-
-    if "trip_id_scheduled" in events.columns:
-        sched = events["trip_id_scheduled"].fillna("").astype(str).str.strip()
-        events["trip_key"] = sched.where(sched != "", events["trip_id_performed"])
-    else:
-        events["trip_key"] = events["trip_id_performed"]
-    if "stop_id" in events.columns:
-        events["_stop"] = events["stop_id"].fillna("").astype(str).str.strip()
-    else:
-        events["_stop"] = ""
-    if "direction_id" in events.columns:
-        events["direction"] = events["direction_id"].fillna("").astype(str).str.strip()
-    else:
-        events["direction"] = ""
-    trip_tables: dict[str, pd.DataFrame] = {}
-    trip_row_frames: list[pd.DataFrame] = []
-    for day_type, sub in events.groupby("day_type"):
-        trip_dates = sub.groupby("trip_key")["service_date"].nunique()
-        table = sub.groupby(["trip_key", "_stop"], as_index=False)["boardings"].sum()
-        table["avg_daily_boardings"] = table["boardings"] / table["trip_key"].map(trip_dates)
-        table = table.rename(columns={"trip_key": "trip_id", "_stop": "stop_id"})
-        trip_tables[str(day_type)] = table[["trip_id", "stop_id", "avg_daily_boardings"]]
-
-        detail = sub.groupby("trip_key", as_index=False).agg(
-            route=("route", "first"),
-            direction=("direction", "first"),
-            hour=("hour", "min"),
-            boardings=("boardings", "sum"),
-            days_observed=("service_date", "nunique"),
-        )
-        detail["boardings"] = detail["boardings"] / detail["days_observed"]
-        per_date = sub.drop_duplicates(subset=["trip_key", "service_date"])
-        mean_duration = per_date.groupby("trip_key")["duration_hours"].mean()
-        duration = detail["trip_key"].map(mean_duration)
-        detail["pass_per_hour"] = detail["boardings"] / duration.where(duration > 0)
-        detail["pass_per_mile"] = float("nan")  # no mileage in TIDES event data
-        detail["day_type"] = str(day_type)
-        detail["route_name"] = ""
-        detail["start_time"] = ""
-        detail = detail.rename(columns={"trip_key": "trip_id"})
-        trip_row_frames.append(detail)
-    trip_rows = (
-        pd.concat(trip_row_frames, ignore_index=True)[_TRIP_ROW_COLS]
-        if trip_row_frames
-        else pd.DataFrame(columns=_TRIP_ROW_COLS)
-    )
-    return totals.drop(columns=["trip_visits"]), trip_tables, trip_rows
-
-
-# =============================================================================
 # OUTPUT TABLES & CHARTS
 # =============================================================================
 
@@ -920,7 +653,7 @@ def finalize_tables(hourly: pd.DataFrame) -> "tuple[pd.DataFrame, pd.DataFrame]"
     """Sort, label, and round the route table; derive the system rollup.
 
     Args:
-        hourly: Route × day × hour table from either input mode.
+        hourly: Route × day × hour table from the workbooks.
 
     Returns:
         Tuple of (route table, system table), both ready to write.
@@ -966,7 +699,7 @@ def flag_low_ridership(
     surface in the console and run log even when nobody opens the CSV.
 
     Args:
-        trip_rows: Per-trip rows from either input mode (``_TRIP_ROW_COLS``).
+        trip_rows: Per-trip rows from the workbooks (``_TRIP_ROW_COLS``).
         measure: Column to test — ``"boardings"``, ``"pass_per_hour"``, or
             ``"pass_per_mile"``. Trips where the measure is NaN (unmapped
             revenue columns, missing trip times) are skipped with a warning.
@@ -1182,7 +915,7 @@ def export_trip_charts(
     be placed on the scale and are left off, same as the flagging pass.
 
     Args:
-        trip_rows: Per-trip rows from either input mode (``_TRIP_ROW_COLS``).
+        trip_rows: Per-trip rows from the workbooks (``_TRIP_ROW_COLS``).
         measure: Per-trip column to plot.
         threshold: Low-ridership threshold; <= 0 draws plain charts.
         out_dir: Charts folder (created if needed).
@@ -1296,38 +1029,21 @@ def write_run_log(output_dir: Path, summary_lines: List[str]) -> bool:
 
 
 def run(
-    input_mode: str,
     output_dir: Path,
     xlsx_inputs: Mapping[str, str],
-    stop_visits_path: Path,
-    trips_performed_path: Path,
     export_charts_flag: bool,
 ) -> pd.DataFrame:
     """Build the hourly tables, write CSVs and charts, and log a summary.
 
     Args:
-        input_mode: ``"route_trip_xlsx"`` or ``"tides"``.
         output_dir: Destination folder.
-        xlsx_inputs: Day-type → workbook mapping (xlsx mode).
-        stop_visits_path: TIDES stop_visits CSV (tides mode).
-        trips_performed_path: TIDES trips_performed CSV (tides mode).
+        xlsx_inputs: Day-type → workbook mapping.
         export_charts_flag: Write chart PNGs when True.
 
     Returns:
         The route × day × hour table (also written to disk).
-
-    Raises:
-        ValueError: On an unrecognised *input_mode*.
     """
-    mode = input_mode.strip().lower()
-    if mode == "route_trip_xlsx":
-        hourly, trip_tables, trip_rows = build_hourly_from_xlsx(xlsx_inputs)
-    elif mode == "tides":
-        hourly, trip_tables, trip_rows = build_hourly_from_tides(
-            stop_visits_path, trips_performed_path
-        )
-    else:
-        raise ValueError(f"INPUT_MODE must be 'route_trip_xlsx' or 'tides'; got {input_mode!r}.")
+    hourly, trip_tables, trip_rows = build_hourly_from_xlsx(xlsx_inputs)
 
     route_table, system = finalize_tables(hourly)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1359,7 +1075,7 @@ def run(
         else:
             logging.warning(
                 "EXPORT_TRIP_TABLE is on but no trip ids are available — map "
-                "XLSX_COLUMN_MAP['trip_id'] (xlsx mode) to write engine-ready trip tables."
+                "XLSX_COLUMN_MAP['trip_id'] to write engine-ready trip tables."
             )
 
     low_measure = LOW_RIDERSHIP_MEASURE.strip().lower()
@@ -1386,7 +1102,6 @@ def run(
         else "disabled (LOW_RIDERSHIP_THRESHOLD <= 0)"
     )
     summary_lines = [
-        f"Input mode:        {mode}",
         f"Day types:         {day_types}",
         f"Routes:            {route_table['route'].nunique()}",
         f"Route rows:        {len(route_table)}",
@@ -1406,37 +1121,13 @@ def run(
 def build_arg_parser() -> argparse.ArgumentParser:
     """Create the command-line argument parser."""
     p = argparse.ArgumentParser(
-        description="Average ridership by hour of day from Route-and-Trip xlsx or TIDES events.",
+        description="Average ridership by hour of day from Route-and-Trip workbooks.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument(
-        "--mode",
-        default=INPUT_MODE,
-        choices=("route_trip_xlsx", "tides"),
-        help="Input mode.",
-    )
     p.add_argument("--output-dir", default=OUTPUT_DIR, help="Directory for outputs.")
-    p.add_argument(
-        "--weekday", default=XLSX_INPUTS.get("weekday", ""), help="Weekday workbook (xlsx mode)."
-    )
-    p.add_argument(
-        "--saturday",
-        default=XLSX_INPUTS.get("saturday", ""),
-        help="Saturday workbook (xlsx mode).",
-    )
-    p.add_argument(
-        "--sunday", default=XLSX_INPUTS.get("sunday", ""), help="Sunday workbook (xlsx mode)."
-    )
-    p.add_argument(
-        "--stop-visits",
-        default=TIDES_STOP_VISITS_PATH,
-        help="TIDES stop_visits CSV (tides mode).",
-    )
-    p.add_argument(
-        "--trips-performed",
-        default=TIDES_TRIPS_PERFORMED_PATH,
-        help="TIDES trips_performed CSV (tides mode).",
-    )
+    p.add_argument("--weekday", default=XLSX_INPUTS.get("weekday", ""), help="Weekday workbook.")
+    p.add_argument("--saturday", default=XLSX_INPUTS.get("saturday", ""), help="Saturday workbook.")
+    p.add_argument("--sunday", default=XLSX_INPUTS.get("sunday", ""), help="Sunday workbook.")
     p.add_argument(
         "--charts",
         action=argparse.BooleanOptionalAction,
@@ -1476,26 +1167,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         if str(path).strip() and not str(path).startswith("Path")
     }
-    if args.mode == "route_trip_xlsx" and not xlsx_inputs:
+    if not xlsx_inputs:
         logging.warning(
             "XLSX_INPUTS paths are still placeholders. Update the CONFIGURATION section or "
             "pass --weekday/--saturday/--sunday before running."
         )
         return 2
-    if args.mode == "tides" and str(args.stop_visits).startswith("Path"):
-        logging.warning(
-            "TIDES paths are still placeholders. Update the CONFIGURATION section or pass "
-            "--stop-visits/--trips-performed before running."
-        )
-        return 2
 
     try:
         run(
-            input_mode=args.mode,
             output_dir=Path(args.output_dir).expanduser(),
             xlsx_inputs=xlsx_inputs,
-            stop_visits_path=Path(str(args.stop_visits)).expanduser(),
-            trips_performed_path=Path(str(args.trips_performed)).expanduser(),
             export_charts_flag=bool(args.charts),
         )
     except (OSError, ValueError, RuntimeError) as exc:
