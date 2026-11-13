@@ -179,6 +179,7 @@ MISSING_COUNTS: str = "drop_trip"
 # Exact duplicate stop visits are always removed. Stop visits that share a
 # service_date, trip_id_performed and trip_stop_sequence but differ elsewhere
 # conflict: the first is kept, and the date is flagged in date_classification.csv.
+# Visits with a blank trip_stop_sequence are only checked for exact duplicates.
 
 # DATE CHECKS -----------------------------------------------------------------
 # date_classification.csv flags a service date when more than
@@ -378,6 +379,37 @@ PLACEHOLDER_PATHS: frozenset[str] = frozenset(
         r"Path\To\Your\trips_performed.csv",
         r"Path\To\Your\Output_Folder",
     }
+)
+
+# date_classification.csv columns, plus the two internal ones dropped before writing.
+CLASSIFICATION_COLUMNS: Tuple[str, ...] = (
+    "service_date",
+    "weekday",
+    "day_type",
+    "day_type_source",
+    "gtfs_feed",
+    "gtfs_services",
+    "gtfs_service_labels",
+    "revenue_trips",
+    "canceled_trips",
+    "trips_run",
+    "trips_checked_against_gtfs",
+    "trips_not_scheduled",
+    "trips_not_in_gtfs",
+    "visits_missing_counts",
+    "trips_missing_counts",
+    "duplicate_visits_dropped",
+    "conflicting_visits_dropped",
+    "flagged",
+    "flag_reason",
+    "_stamp",
+    "_day_types",
+)
+
+# Raised when no stop visit joins an in-service trip.
+NO_MATCH_MESSAGE: str = (
+    "No stop visits matched an in-service trip in trips_performed; check that the two "
+    "files cover the same service dates and trip_id_performed values."
 )
 
 # MISSING_COUNTS choices.
@@ -1386,7 +1418,9 @@ def _casefolded(values: pd.Series, blank: str) -> pd.Series:
     return text.where(text != "", blank).str.casefold()
 
 
-def join_trips(stop_visits: pd.DataFrame, trips_performed: pd.DataFrame) -> pd.DataFrame:
+def join_trips(
+    stop_visits: pd.DataFrame, trips_performed: pd.DataFrame, require_rows: bool = True
+) -> pd.DataFrame:
     """Attach trip attributes to each stop visit and keep revenue service only.
 
     The join keys are ``service_date`` and ``trip_id_performed`` (TIDES makes
@@ -1399,13 +1433,16 @@ def join_trips(stop_visits: pd.DataFrame, trips_performed: pd.DataFrame) -> pd.D
     Args:
         stop_visits: The TIDES ``stop_visits`` table.
         trips_performed: The TIDES ``trips_performed`` table.
+        require_rows: Raise when no visit survives (False returns an empty table,
+            so a caller can still report on the trips).
 
     Returns:
         Stop visits with the :data:`TRIP_ATTRIBUTE_COLUMNS` present in
         ``trips_performed`` joined on, and ``service_date`` parsed.
 
     Raises:
-        InputDataError: If a join key is missing or no visit survives.
+        InputDataError: If a join key is missing, or no visit survives and
+            *require_rows* is True.
     """
     keys = ["service_date", "trip_id_performed"]
     _require_columns(stop_visits, keys, "stop_visits", "the join to trips_performed needs")
@@ -1456,11 +1493,8 @@ def join_trips(stop_visits: pd.DataFrame, trips_performed: pd.DataFrame) -> pd.D
     joined = visits.drop(columns=attr_cols, errors="ignore").merge(
         trips.loc[revenue, [*keys, *attr_cols]], on=keys, how="inner"
     )
-    if joined.empty:
-        raise InputDataError(
-            "No stop visits matched an in-service trip in trips_performed; check that the "
-            "two files cover the same service dates and trip_id_performed values."
-        )
+    if joined.empty and require_rows:
+        raise InputDataError(NO_MATCH_MESSAGE)
     return joined.reset_index(drop=True)
 
 
@@ -1598,8 +1632,10 @@ def dedupe_stop_visits(stop_visits: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Data
 
     Visits conflict when they share ``service_date`` (compared parsed),
     ``trip_id_performed`` and ``trip_stop_sequence`` but differ elsewhere; the
-    first is kept. Without a ``trip_stop_sequence`` column only exact duplicates
-    are removed.
+    first is kept. Only visits whose three key values are all filled are
+    compared: a blank ``trip_stop_sequence`` says nothing about which stop a
+    visit is, so such visits (and every visit, when the column is absent) are
+    only checked for exact duplicates.
 
     Args:
         stop_visits: The TIDES ``stop_visits`` table as read.
@@ -1613,7 +1649,17 @@ def dedupe_stop_visits(stop_visits: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Data
     conflict = pd.Series(False, index=out.index)
     if all(col in out.columns for col in VISIT_KEY):
         keyed = out[list(VISIT_KEY)].assign(service_date=_parse_dates(out["service_date"]))
-        conflict = keyed.duplicated(keep="first")
+        text = keyed.drop(columns="service_date").astype("string")
+        filled = keyed["service_date"].notna()
+        for col in text.columns:
+            filled &= (text[col].str.strip() != "").fillna(False).astype(bool)
+        conflict.loc[filled] = keyed.loc[filled].duplicated(keep="first")
+        if (~filled).any():
+            logging.info(
+                "%d stop visit(s) have a blank %s and are only checked for exact duplicates.",
+                int((~filled).sum()),
+                " / ".join(VISIT_KEY),
+            )
     if exact.any():
         logging.warning("Removed %d exact duplicate stop visit(s).", int(exact.sum()))
     if conflict.any():
@@ -1654,7 +1700,10 @@ def add_trip_key(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def filter_dates(
-    df: pd.DataFrame, start: Optional[dt.date], end: Optional[dt.date]
+    df: pd.DataFrame,
+    start: Optional[dt.date],
+    end: Optional[dt.date],
+    require_rows: bool = True,
 ) -> pd.DataFrame:
     """Keep service dates from *start* to *end* (inclusive; ``None`` = no limit).
 
@@ -1662,12 +1711,13 @@ def filter_dates(
         df: Rows with a parsed ``service_date``.
         start: First date kept, or ``None``.
         end: Last date kept, or ``None``.
+        require_rows: Raise when no row is in range (False returns an empty table).
 
     Returns:
         The rows in range.
 
     Raises:
-        InputDataError: If no rows are in range.
+        InputDataError: If no rows are in range and *require_rows* is True.
     """
     if start is None and end is None:
         return df
@@ -1679,12 +1729,17 @@ def filter_dates(
     if (~keep).any():
         logging.info("Left out %d stop visit(s) outside the date range.", int((~keep).sum()))
     out = df.loc[keep]
-    if out.empty:
-        raise InputDataError(
-            f"No stop visits fall between {start or 'the first date'} and "
-            f"{end or 'the last date'}; check START_DATE / END_DATE."
-        )
+    if out.empty and require_rows:
+        raise InputDataError(out_of_range_message(start, end))
     return out
+
+
+def out_of_range_message(start: Optional[dt.date], end: Optional[dt.date]) -> str:
+    """Explain that no stop visit falls in the requested date range."""
+    return (
+        f"No stop visits fall between {start or 'the first date'} and "
+        f"{end or 'the last date'}; check START_DATE / END_DATE."
+    )
 
 
 # =============================================================================
@@ -1986,7 +2041,7 @@ def classify_service_dates(
                 "_day_types": types,
             }
         )
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows, columns=CLASSIFICATION_COLUMNS)
 
 
 def date_table_from_classification(
@@ -3479,8 +3534,10 @@ def run(settings: RunSettings) -> RunResult:
 
     stop_visits, duplicate_stats = dedupe_stop_visits(stop_visits)
 
-    joined = join_trips(stop_visits, trips)
-    joined = filter_dates(joined, settings.start_date, settings.end_date)
+    # Neither step may stop the run yet: the date audit below is written first,
+    # so it exists even when no stop visit survives (e.g. a range of canceled dates).
+    matched = join_trips(stop_visits, trips, require_rows=False)
+    joined = filter_dates(matched, settings.start_date, settings.end_date, require_rows=False)
     joined = add_trip_key(joined)
     # Counts are checked before MISSING_COUNTS drops anything, so the date table
     # reports every visit and trip with missing counts.
@@ -3513,12 +3570,21 @@ def run(settings: RunSettings) -> RunResult:
         classification["flagged"] & settings.exclude_flagged_dates
     )
     log_date_classification(classification, holiday)
+    published = classification.drop(columns=["_stamp", "_day_types"])
+    files: List[Path] = []
+    out_dir = settings.output_dir
+    _write_csv(published, out_dir / DATE_CLASSIFICATION_FILENAME, files)
+    written = f" {DATE_CLASSIFICATION_FILENAME} was still written."
+    if matched.empty:
+        raise InputDataError(NO_MATCH_MESSAGE + written)
+    if joined.empty:
+        raise InputDataError(out_of_range_message(settings.start_date, settings.end_date) + written)
     date_table = date_table_from_classification(classification, settings.exclude_flagged_dates)
     if date_table.empty:
         raise InputDataError(
-            "No service date is left in any day type; check DAY_TYPES and EXCLUDE_FLAGGED_DATES."
+            "No service date is left in any day type; check DAY_TYPES and "
+            "EXCLUDE_FLAGGED_DATES." + written
         )
-    published = classification.drop(columns=["_stamp", "_day_types"])
 
     # --- ridership -------------------------------------------------------------
     needs_time = any(set(TIME_CUTS[cut]) - {"month"} for cut in cuts)
@@ -3544,9 +3610,6 @@ def run(settings: RunSettings) -> RunResult:
     visits = filter_routes(visits, settings.routes_to_include, settings.routes_to_exclude)
     visits = label_blank_groups(visits, GROUP_KEY_COLUMNS).pipe(add_performed_trip_key)
 
-    files: List[Path] = []
-    out_dir = settings.output_dir
-    _write_csv(published, out_dir / DATE_CLASSIFICATION_FILENAME, files)
     ridership: Dict[Tuple[str, str], pd.DataFrame] = {}
     for level in levels:
         missing = missing_level_columns(level, visits.columns)

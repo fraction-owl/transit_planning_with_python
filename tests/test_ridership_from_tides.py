@@ -1103,6 +1103,52 @@ def test_fully_canceled_date_is_audited_and_flagged(tmp_path: Path) -> None:
     assert outside.date_classification["service_date"].tolist() == ["2026-03-02"]
 
 
+def test_canceled_only_date_range_still_writes_the_audit(tmp_path: Path) -> None:
+    """With only a fully canceled date in range, the run stops but the date table exists."""
+    trips = [_trip("2026-03-02", "A", "A"), _trip("2026-03-09", "B", "A", rel="Canceled")]
+    with pytest.raises(target.InputDataError, match="date_classification.csv was still written"):
+        _synthetic_run(
+            tmp_path,
+            trips,
+            [_visit("2026-03-02", "A", 1, 10)],
+            start_date=dt.date(2026, 3, 9),
+            end_date=dt.date(2026, 3, 9),
+        )
+    audit = pd.read_csv(tmp_path / "out" / "date_classification.csv")
+    assert audit["service_date"].tolist() == ["2026-03-09"]
+    assert audit["flag_reason"].tolist() == ["100% of revenue trips canceled"]
+
+
+def test_empty_date_range_writes_a_header_only_audit(tmp_path: Path) -> None:
+    """A range with no trips at all still leaves a date table with its columns."""
+    with pytest.raises(target.InputDataError, match="START_DATE"):
+        _synthetic_run(
+            tmp_path,
+            [_trip("2026-03-02", "A", "A")],
+            [_visit("2026-03-02", "A", 1, 10)],
+            start_date=dt.date(2027, 1, 1),
+        )
+    audit = pd.read_csv(tmp_path / "out" / "date_classification.csv")
+    assert audit.empty and "flag_reason" in audit.columns
+
+
+def test_blank_stop_sequences_are_not_treated_as_conflicts(tmp_path: Path) -> None:
+    """Visits with a blank trip_stop_sequence are kept unless they are exact duplicates."""
+    first = _visit("2026-03-02", "A", 1, 10, trip_stop_sequence="")
+    visits = [
+        first,
+        dict(first),
+        _visit("2026-03-02", "A", 2, 5, trip_stop_sequence="", stop_id="S2"),
+    ]
+    result, _ = _synthetic_run(tmp_path, [_trip("2026-03-02", "A", "A")], visits)
+    row = result.ridership[("system", "all_day")].iloc[0]
+    assert (row["total_boardings"], row["stop_visits"]) == (15.0, 2)
+    audit = result.date_classification.iloc[0]
+    assert audit["duplicate_visits_dropped"] == 1
+    assert audit["conflicting_visits_dropped"] == 0
+    assert not audit["flagged"]
+
+
 # --- maximum load -----------------------------------------------------------------
 
 
