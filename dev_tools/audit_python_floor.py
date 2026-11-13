@@ -90,7 +90,7 @@ def is_arcpro_tier(tree: ast.AST) -> bool:
     """Return True when a file must run in ArcGIS Pro's bundled Python.
 
     ``arcpy`` importers obviously run there; everything else defaults to the
-    ArcPro tier too (README Option A pastes any script into a Pro notebook)
+    ArcPro tier too (GETTING_STARTED.md Option A pastes any script into a Pro notebook)
     unless it imports a package that only exists in the open-source stack.
     """
     modules = imported_top_level_modules(tree)

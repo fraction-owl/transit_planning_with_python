@@ -7,24 +7,24 @@
 # -----------------------------------------------------------------------------
 
 # Testing
-faker==25.8.0                # Fake data generation for tests
+faker==40.54.0               # Fake data generation for tests
 pytest==9.2.0                # Unit testing framework
 pytest-cov                   # Test coverage reporting
 
 # Linting & formatting
 # Keep this version in sync with `rev` in .pre-commit-config.yaml.
-ruff==0.17.3                 # Linting & formatting
+ruff==0.17.5                 # Linting & formatting
 pre-commit                   # Local git hooks (ruff)
 
 # Type checking
 # Pinned while [tool.ty.rules] entries are promoted to "error": ty is pre-1.0
 # and new releases add or reclassify diagnostics, which would break CI on an
 # unplanned upgrade. Bump deliberately and re-run `ty check scripts`.
-ty==0.0.93                   # Type checks; error-level rules block CI
+ty==0.0.101                  # Type checks; error-level rules block CI
 
 # ------------- Typing stubs (temporary) -------------------------------------
-pandas-stubs==2.2.*
+pandas-stubs==2.3.*
 types-openpyxl>=3.1,<5
-types-networkx>=3.4,<4
+types-networkx==3.2.*
 #types-faker>=25,<26
 #types-rapidfuzz>=3.11,<4
