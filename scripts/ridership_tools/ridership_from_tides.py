@@ -9,41 +9,38 @@ is an aggregation level crossed with a time cut; ``EXPORT_LEVELS`` and
   route_direction_stop, trip, trip_stop.
 - Time cuts: all_day, time_period, hour, month, month_time_period.
 
-Every table is split by day type. ``DAY_TYPES`` maps day-type names to weekdays,
-``START_DATE`` / ``END_DATE`` limit the dates, and dates listed in ``HOLIDAYS`` form a
-day type of their own. Averages divide by the service dates that have observed data:
-per day type (and month) across the system, or per trip for the trip levels. Each row's
-``days_observed`` column shows the divisor.
+Every table is split by day type: ``DAY_TYPES`` maps names to weekdays, and holidays
+form a day type of their own. A holiday is a date whose GTFS services (``GTFS_PATHS``)
+include none of its weekday's regular service, or a date in ``HOLIDAYS``. Averages
+divide by the dates with observed data (system-wide per day type and month, or per trip
+for the trip levels); each row's ``days_observed`` shows the divisor.
 
 Time periods come from ``TIME_PERIODS``, a ``TIME_PERIODS_FILE`` (see
 ``time_periods_example.txt``) or ``--time-period`` flags, and must cover the day exactly
-once. A visit falls in a period by its clock time, and in an hour of the service day
-(04:00-27:59 by default; see ``LATE_NIGHT_CUTOVER_HOUR``).
+once. A visit falls in a period by its clock time and in an hour of the service day.
 
 Inputs
 ------
 - TIDES ``stop_visits.csv`` and ``trips_performed.csv`` (for example from
   ``convert_to_tides_stop_visits.py`` and ``convert_to_tides_trips_performed.py``).
-- Optional: a time-periods ``.txt`` file, one ``NAME = HH:MM - HH:MM`` per line.
+- Optional: GTFS feeds covering the TIDES dates, and a time-periods ``.txt`` file.
 
 Outputs
 -------
 - ``ridership/ridership_by_<level>[_and_<cut>].csv``: average daily and total boardings
   and alightings, with the dates, stop visits and trips observed behind them.
-- ``max_load/max_load_by_performed_trip.csv``: each performed trip's maximum
-  ``departure_load``, peak load point and load factor, plus
-  ``max_load_by_<level>[_and_<cut>].csv`` rollups for the system, service_type, route,
-  route_direction and trip levels.
+- ``max_load/``: each performed trip's maximum ``departure_load``, peak load point and
+  load factor, plus rollups for the system, service_type, route, route_direction and
+  trip levels.
+- ``date_classification.csv``: each service date's day type and why, and a flag when
+  its trips do not match the GTFS schedule or many were canceled.
 - ``service_cut_inputs/ridership_by_trip_<day type>.csv``: the ``RIDERSHIP_CSV`` input of
   ``service_cut_impact_gpd.py``.
-- ``low_ridership_trips.csv``: trips below ``LOW_RIDERSHIP_THRESHOLD``.
-- ``charts/``: bar charts by time period, hour and month, and per-trip charts.
-- ``ridership_from_tides_runlog.txt``: settings, time periods and the CONFIGURATION block.
+- ``low_ridership_trips.csv``, ``charts/`` and a run log with the CONFIGURATION block.
 
 Limitations
 -----------
-- Counts are raw APC observations, not expanded to systemwide estimates; the stop-visit
-  and trip counts show how much data backs each row.
+- Counts are raw APC observations, not expanded to systemwide estimates.
 - Canceled and non-revenue trips are dropped. Skipped visits are left out of ridership
   but kept for maximum load.
 - A trip that crosses a period or hour boundary counts in both; maximum load places
@@ -61,11 +58,13 @@ import argparse
 import datetime as dt
 import itertools
 import logging
+import os
 import re
 import sys
 import warnings
+import zipfile
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 import matplotlib
 
@@ -140,15 +139,39 @@ DAY_TYPES: Mapping[str, Sequence[str]] = {
     "Sunday": ("Sunday",),
 }
 
-# Holiday service dates as "YYYY-MM-DD". They leave the day type of their
-# weekday and form a day type of their own, named HOLIDAY_DAY_TYPE. Leave the
-# list empty and holidays count as the weekday they fall on.
+# GTFS feeds (folders or .zip files) whose calendars cover the TIDES dates, the
+# recommended source of holidays. List a series oldest first; where two feeds
+# schedule service on the same date, the later feed is used. A date becomes a
+# holiday when none of the services scheduled that day is a regular service for
+# its weekday: holiday-only service on Labor Day, or Sunday service on a
+# Wednesday Veterans Day. A date that runs its weekday's regular service stays
+# in its DAY_TYPES day type even if it is a public holiday. Leave empty to rely
+# on HOLIDAYS alone.
+GTFS_PATHS: Sequence[str] = ()
+
+# Extra holiday dates as "YYYY-MM-DD", added to any GTFS finds. Use it without
+# GTFS, or for days the feed does not mark.
 HOLIDAYS: Sequence[str] = ()
+# Name of the day type holidays form; they leave the day type of their weekday.
 HOLIDAY_DAY_TYPE: str = "Holiday"
 
 # Optional service-date range as "YYYY-MM-DD", both ends inclusive. None = no limit.
 START_DATE: Optional[str] = None
 END_DATE: Optional[str] = None
+
+# DATE CHECKS -----------------------------------------------------------------
+# date_classification.csv flags a service date when more than
+# MAX_UNSCHEDULED_SHARE of the revenue trips that ran are not scheduled that day
+# in GTFS (another schedule ran, or trip IDs do not match the feed), when GTFS
+# schedules no service that day, or when more than MAX_CANCELED_SHARE of the
+# day's revenue trips in trips_performed are Canceled (heavy cuts, e.g. weather).
+# The thresholds are judgment calls; set one to 1.0 to switch its check off.
+MAX_UNSCHEDULED_SHARE: float = 0.10
+MAX_CANCELED_SHARE: float = 0.20
+# False keeps flagged dates in every table (they are only listed). True leaves
+# them out of every table and every days_observed divisor, as NTD does with
+# "atypical" days when it computes average-day figures.
+EXCLUDE_FLAGGED_DATES: bool = False
 
 # TIME OF DAY -----------------------------------------------------------------
 # Time periods as {name: ("HH:MM", "HH:MM")} on the 24-hour clock, start
@@ -286,6 +309,17 @@ WEEKDAY_NAMES: Tuple[str, ...] = (
     "Sunday",
 )
 
+# GTFS service label that a regular service on each weekday (Monday = 0) carries.
+REGULAR_SERVICE_LABEL: Tuple[str, ...] = (
+    "Weekday",
+    "Weekday",
+    "Weekday",
+    "Weekday",
+    "Weekday",
+    "Saturday",
+    "Sunday",
+)
+
 MINUTES_PER_DAY: int = 24 * 60
 BLANK_LABEL: str = "(blank)"
 UNCLASSIFIED: str = "UNCLASSIFIED"
@@ -321,6 +355,7 @@ SERVICE_CUT_SUBDIR: str = "service_cut_inputs"
 CHARTS_SUBDIR: str = "charts"
 MAX_LOAD_BY_TRIP_FILENAME: str = "max_load_by_performed_trip.csv"
 LOW_RIDERSHIP_FILENAME: str = "low_ridership_trips.csv"
+DATE_CLASSIFICATION_FILENAME: str = "date_classification.csv"
 RUN_LOG_FILENAME: str = "ridership_from_tides_runlog.txt"
 RUN_LOG_TITLE: str = "RIDERSHIP FROM TIDES RUN LOG"
 
@@ -399,6 +434,7 @@ class RunSettings(NamedTuple):
     export_max_load: bool = EXPORT_MAX_LOAD
     vehicle_capacity: int = VEHICLE_CAPACITY
     day_types: Optional[Mapping[str, Sequence[str]]] = None
+    gtfs_paths: Sequence[str] = GTFS_PATHS
     holidays: Sequence[dt.date] = ()
     holiday_day_type: str = HOLIDAY_DAY_TYPE
     start_date: Optional[dt.date] = None
@@ -407,6 +443,9 @@ class RunSettings(NamedTuple):
     cutover_hour: int = LATE_NIGHT_CUTOVER_HOUR
     routes_to_include: Sequence[str] = ROUTES_TO_INCLUDE
     routes_to_exclude: Sequence[str] = ROUTES_TO_EXCLUDE
+    max_unscheduled_share: float = MAX_UNSCHEDULED_SHARE
+    max_canceled_share: float = MAX_CANCELED_SHARE
+    exclude_flagged_dates: bool = EXCLUDE_FLAGGED_DATES
     low_ridership_measure: str = LOW_RIDERSHIP_MEASURE
     low_ridership_threshold: float = LOW_RIDERSHIP_THRESHOLD
     export_service_cut_tables: bool = EXPORT_SERVICE_CUT_TRIP_TABLES
@@ -423,6 +462,7 @@ class RunResult(NamedTuple):
     max_load_by_trip: pd.DataFrame
     trip_rows: pd.DataFrame
     service_cut_tables: Dict[str, pd.DataFrame]
+    date_classification: pd.DataFrame
     files: List[Path]
 
 
@@ -522,6 +562,312 @@ def extract_config_block(source_file: Path) -> str:
         )
 
     return "\n".join(lines[begin_idx + 1 : end_idx])
+
+
+def load_gtfs_data(
+    gtfs_path: str,
+    files: Optional[Sequence[str]] = None,
+    dtype: str | type[str] | Mapping[str, Any] = str,
+    logger: Optional[logging.Logger] = None,
+) -> dict[str, pd.DataFrame]:
+    """Load one or more GTFS text files into memory.
+
+    Args:
+        gtfs_path: Absolute or relative path to the folder containing the
+            GTFS feed, or to a ``.zip`` archive of it — the form GTFS
+            producers and most open-data portals distribute feeds in. Zip
+            members may sit at the archive root or nested one level inside
+            a single wrapper folder; both layouts are handled.
+        files: Explicit sequence of file names to load. If ``None``,
+            the standard 13 GTFS text files are attempted.
+        dtype: Value forwarded to :pyfunc:`pandas.read_csv(dtype=…)` to
+            control column dtypes. Supply a mapping for per-column dtypes.
+        logger: Logger for progress messages. Defaults to this module's
+            logger (``logging.getLogger(__name__)``) rather than the root
+            logger, so callers keep control of handler configuration.
+
+    Returns:
+        Mapping of file stem → :class:`pandas.DataFrame`; for example,
+        ``data["trips"]`` holds the parsed *trips.txt* table.
+
+    Raises:
+        OSError: Path missing, one of *files* not present in the feed, or
+            an OS-level failure while reading a file.
+        ValueError: *gtfs_path* is neither a directory nor a valid ``.zip``
+            file, a requested file matches more than one location inside
+            the zip, a file is empty, or the CSV parser fails.
+
+    Notes:
+        All columns default to ``str`` to avoid pandas’ type-inference
+        pitfalls (e.g. leading zeros in IDs).
+    """
+    log = logger if logger is not None else logging.getLogger(__name__)
+
+    if not os.path.exists(gtfs_path):
+        raise OSError(f"The path '{gtfs_path}' does not exist.")
+
+    if files is None:
+        files = (
+            "agency.txt",
+            "stops.txt",
+            "routes.txt",
+            "trips.txt",
+            "stop_times.txt",
+            "calendar.txt",
+            "calendar_dates.txt",
+            "fare_attributes.txt",
+            "fare_rules.txt",
+            "feed_info.txt",
+            "frequencies.txt",
+            "shapes.txt",
+            "transfers.txt",
+        )
+
+    is_zip = os.path.isfile(gtfs_path) and gtfs_path.lower().endswith(".zip")
+    if not is_zip and not os.path.isdir(gtfs_path):
+        raise ValueError(f"'{gtfs_path}' is neither a directory nor a .zip file.")
+
+    archive: zipfile.ZipFile | None = None
+    members_by_name: dict[str, list[str]] = {}
+    if is_zip:
+        try:
+            archive = zipfile.ZipFile(gtfs_path)
+        except zipfile.BadZipFile as exc:
+            raise ValueError(f"'{gtfs_path}' is not a valid zip archive.") from exc
+        for name in archive.namelist():
+            members_by_name.setdefault(os.path.basename(name), []).append(name)
+
+    try:
+        missing: list[str] = []
+        ambiguous: list[str] = []
+        resolved: dict[str, str] = {}
+        for file_name in files:
+            if archive is None:
+                if not os.path.exists(os.path.join(gtfs_path, file_name)):
+                    missing.append(file_name)
+                continue
+            candidates = members_by_name.get(file_name, [])
+            if not candidates:
+                missing.append(file_name)
+            elif len(candidates) > 1:
+                ambiguous.append(file_name)
+            else:
+                resolved[file_name] = candidates[0]
+
+        if ambiguous:
+            raise ValueError(
+                f"Ambiguous GTFS files in '{gtfs_path}' (found in multiple "
+                f"locations): {', '.join(ambiguous)}"
+            )
+        if missing:
+            raise OSError(f"Missing GTFS files in '{gtfs_path}': {', '.join(missing)}")
+
+        data: dict[str, pd.DataFrame] = {}
+        for file_name in files:
+            key = file_name.replace(".txt", "")
+            try:
+                if archive is None:
+                    df = pd.read_csv(
+                        os.path.join(gtfs_path, file_name), dtype=dtype, low_memory=False
+                    )
+                else:
+                    with archive.open(resolved[file_name]) as handle:
+                        df = pd.read_csv(handle, dtype=dtype, low_memory=False)
+                data[key] = df
+                log.info("Loaded %s (%d records).", file_name, len(df))
+
+            except pd.errors.EmptyDataError as exc:
+                raise ValueError(f"File '{file_name}' in '{gtfs_path}' is empty.") from exc
+
+            except pd.errors.ParserError as exc:
+                raise ValueError(f"Parser error in '{file_name}' in '{gtfs_path}': {exc}") from exc
+
+        return data
+    finally:
+        if archive is not None:
+            archive.close()
+
+
+def expand_service_active_dates(
+    calendar_df: Optional[pd.DataFrame],
+    calendar_dates_df: Optional[pd.DataFrame] = None,
+    max_days_per_service: int = 1830,
+    today: Optional[dt.date] = None,
+) -> dict[str, set[dt.date]]:
+    """Expand each service_id into its real set of active calendar dates.
+
+    Builds the base date set from each ``calendar.txt`` row (day-of-week
+    pattern × ``start_date``–``end_date`` range), then applies
+    ``calendar_dates.txt`` exceptions (``exception_type`` 1 adds a date,
+    2 removes it). Handles calendar_dates-only feeds (*calendar_df* empty or
+    ``None``), redundant additions, and fully negated base patterns — the
+    returned sets reflect only the dates a service truly operates.
+
+    Rows with unparseable or reversed dates are skipped with a warning.
+    A date range longer than *max_days_per_service* (a common placeholder
+    pattern, e.g. 2000–2099) is clamped to a window of that length centred
+    on *today* and logged, so expansion stays fast and downstream per-year
+    statistics stay meaningful.
+
+    Args:
+        calendar_df: Parsed ``calendar.txt``, or ``None`` if the feed has
+            none. Expected columns: ``service_id``, the seven day-of-week
+            flags, ``start_date``, ``end_date``.
+        calendar_dates_df: Parsed ``calendar_dates.txt`` or ``None``.
+            Expected columns: ``service_id``, ``date``, ``exception_type``.
+        max_days_per_service: Longest date range expanded per service before
+            clamping kicks in. The default (1830 ≈ 5 years) is far beyond
+            any real service span but well short of placeholder ranges.
+        today: Anchor date for clamping oversized ranges. Defaults to the
+            current date; pass a fixed date for deterministic tests.
+
+    Returns:
+        Mapping of ``service_id`` (as ``str``) to the set of dates the
+        service operates. Services whose dates never parse map to an empty
+        set rather than being dropped, so callers can report them.
+
+    Raises:
+        ValueError: If *calendar_df* is provided but lacks ``service_id``,
+            ``start_date``, or ``end_date`` columns.
+    """
+    day_cols = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+    anchor = dt.date.today() if today is None else today
+    active: dict[str, set[dt.date]] = {}
+
+    if calendar_df is not None and not calendar_df.empty:
+        required = {"service_id", "start_date", "end_date"}
+        missing = required - set(calendar_df.columns)
+        if missing:
+            raise ValueError(f"calendar.txt is missing required column(s): {sorted(missing)}")
+        for _, row in calendar_df.iterrows():
+            sid = str(row["service_id"]).strip()
+            try:
+                start = dt.datetime.strptime(str(row["start_date"]).strip(), "%Y%m%d").date()
+                end = dt.datetime.strptime(str(row["end_date"]).strip(), "%Y%m%d").date()
+            except ValueError:
+                logging.warning("Service %s: unparseable start/end date — skipping row.", sid)
+                active.setdefault(sid, set())
+                continue
+            if end < start:
+                logging.warning(
+                    "Service %s: end_date %s precedes start_date %s — skipping row.",
+                    sid,
+                    end,
+                    start,
+                )
+                active.setdefault(sid, set())
+                continue
+            if (end - start).days + 1 > max_days_per_service:
+                half = max_days_per_service // 2
+                clamped_start = max(start, anchor - dt.timedelta(days=half))
+                clamped_end = min(end, anchor + dt.timedelta(days=half))
+                logging.warning(
+                    "Service %s: date range %s–%s looks like a placeholder; "
+                    "clamping expansion to %s–%s.",
+                    sid,
+                    start,
+                    end,
+                    clamped_start,
+                    clamped_end,
+                )
+                start, end = clamped_start, clamped_end
+            pattern = [str(row.get(c, "0")).strip() == "1" for c in day_cols]
+            dates = active.setdefault(sid, set())
+            d = start
+            while d <= end:
+                if pattern[d.weekday()]:
+                    dates.add(d)
+                d += dt.timedelta(days=1)
+
+    if calendar_dates_df is not None and not calendar_dates_df.empty:
+        bad_rows = 0
+        for _, row in calendar_dates_df.iterrows():
+            sid = str(row["service_id"]).strip()
+            try:
+                d = dt.datetime.strptime(str(row["date"]).strip(), "%Y%m%d").date()
+            except ValueError:
+                bad_rows += 1
+                continue
+            etype = str(row.get("exception_type", "")).strip()
+            dates = active.setdefault(sid, set())
+            if etype == "1":
+                dates.add(d)
+            elif etype == "2":
+                dates.discard(d)
+            else:
+                bad_rows += 1
+        if bad_rows:
+            logging.warning(
+                "calendar_dates.txt: skipped %d row(s) with unparseable date/exception_type.",
+                bad_rows,
+            )
+
+    return active
+
+
+def classify_service_ids(
+    active_dates: Mapping[str, set[dt.date]],
+    holiday_max_days_per_year: float = 25.0,
+    dow_share: float = 0.80,
+) -> dict[str, set[str]]:
+    """Classify each service_id by its real active-date pattern.
+
+    A service operating at or below *holiday_max_days_per_year* is labelled
+    ``Holiday`` — this catches holiday-only services regardless of what
+    their day-of-week columns claim (scheduling-software exports often stamp
+    a weekday pattern on a service that really runs five days a year).
+    Otherwise, day-of-week shares of the active dates determine the labels.
+
+    Args:
+        active_dates: Output of :func:`expand_service_active_dates`.
+        holiday_max_days_per_year: Services active at or below this annual
+            rate are labelled ``Holiday``.
+        dow_share: Minimum fraction of active dates on a day-of-week bucket
+            (Mon–Fri, Saturday, Sunday) to earn that bucket's label.
+
+    Returns:
+        Mapping of ``service_id`` to a set of labels drawn from
+        ``{"Weekday", "Saturday", "Sunday", "Holiday"}``. A service with no
+        active dates maps to an empty set.
+    """
+    result: dict[str, set[str]] = {}
+    for sid, dates in active_dates.items():
+        if not dates:
+            result[sid] = set()
+            logging.info("Service %s: empty (0 active dates).", sid)
+            continue
+        span_days = (max(dates) - min(dates)).days + 1
+        per_year = len(dates) / max(span_days / 365.25, 0.1)
+        labels: set[str] = set()
+        if per_year <= holiday_max_days_per_year:
+            labels.add("Holiday")
+        else:
+            n = len(dates)
+            wd = sum(1 for d in dates if d.weekday() < 5)
+            sat = sum(1 for d in dates if d.weekday() == 5)
+            sun = sum(1 for d in dates if d.weekday() == 6)
+            if wd / n >= dow_share:
+                labels.add("Weekday")
+            if sat / n >= dow_share:
+                labels.add("Saturday")
+            if sun / n >= dow_share:
+                labels.add("Sunday")
+            if not labels:
+                if wd > 0:
+                    labels.add("Weekday")
+                if sat > 0:
+                    labels.add("Saturday")
+                if sun > 0:
+                    labels.add("Sunday")
+        result[sid] = labels
+        logging.info(
+            "Service %s -> %s (%d dates, %.1f/yr).",
+            sid,
+            sorted(labels),
+            len(dates),
+            per_year,
+        )
+    return result
 
 
 # =============================================================================
@@ -1186,55 +1532,285 @@ def filter_dates(
 # =============================================================================
 
 
-def build_date_table(
+class GtfsFeed(NamedTuple):
+    """The parts of one GTFS feed the day-type logic needs."""
+
+    name: str
+    services_by_date: Dict[dt.date, frozenset[str]]  # date -> service_ids scheduled
+    service_labels: Dict[str, frozenset[str]]  # service_id -> Weekday/Saturday/Sunday/Holiday
+    trip_services: Dict[str, str]  # trip_id -> service_id
+
+
+def load_gtfs_feed(path: str) -> GtfsFeed:
+    """Read one feed's calendar and trips, and label each service by its active dates.
+
+    Services are labeled Weekday, Saturday, Sunday or Holiday from the dates they
+    actually run (``classify_service_ids``), not from their names.
+
+    Args:
+        path: A GTFS folder or ``.zip``.
+
+    Returns:
+        The feed's scheduled services per date, service labels and trip services.
+
+    Raises:
+        InputDataError: If the feed cannot be read, or has neither
+            ``calendar.txt`` nor ``calendar_dates.txt``.
+    """
+    try:
+        trips = load_gtfs_data(path, files=["trips.txt"])["trips"]
+    except (OSError, ValueError) as exc:
+        raise InputDataError(f"Could not read trips.txt from GTFS feed '{path}': {exc}") from exc
+    tables: Dict[str, Optional[pd.DataFrame]] = {}
+    for name in ("calendar", "calendar_dates"):
+        try:
+            tables[name] = load_gtfs_data(path, files=[f"{name}.txt"])[name]
+        except OSError:
+            tables[name] = None  # either calendar file may be absent
+        except ValueError as exc:
+            if "is empty" not in str(exc):
+                raise InputDataError(f"GTFS feed '{path}': {exc}") from exc
+            tables[name] = None
+    if tables["calendar"] is None and tables["calendar_dates"] is None:
+        raise InputDataError(
+            f"GTFS feed '{path}' has neither calendar.txt nor calendar_dates.txt, so its "
+            "service dates are unknown."
+        )
+    logging.disable(logging.INFO)  # the calendar helpers log one line per service
+    try:
+        active = expand_service_active_dates(tables["calendar"], tables["calendar_dates"])
+        labels = classify_service_ids(active)
+    except ValueError as exc:
+        raise InputDataError(f"GTFS feed '{path}': {exc}") from exc
+    finally:
+        logging.disable(logging.NOTSET)
+    by_date: Dict[dt.date, set[str]] = {}
+    for service_id, dates in active.items():
+        for day in dates:
+            by_date.setdefault(day, set()).add(service_id)
+    trip_services = dict(
+        zip(
+            trips["trip_id"].fillna("").astype(str).str.strip(),
+            trips["service_id"].fillna("").astype(str).str.strip(),
+        )
+    )
+    logging.info(
+        "GTFS feed %s: %d service(s), %d trip(s), service on %d date(s).",
+        Path(path).name,
+        len(active),
+        len(trip_services),
+        len(by_date),
+    )
+    return GtfsFeed(
+        Path(path).name,
+        {day: frozenset(sids) for day, sids in by_date.items()},
+        {sid: frozenset(labs) for sid, labs in labels.items()},
+        trip_services,
+    )
+
+
+def trip_date_stats(trips_performed: pd.DataFrame) -> pd.DataFrame:
+    """Count each date's revenue trips and canceled trips, and list the scheduled trips run.
+
+    Args:
+        trips_performed: The TIDES ``trips_performed`` table (all rows).
+
+    Returns:
+        One row per service date (midnight timestamp index) with
+        ``revenue_trips``, ``canceled_trips``, ``trips_run`` and ``ran_trip_ids``
+        (the non-blank ``trip_id_scheduled`` of the revenue trips that ran).
+    """
+    trips = trips_performed.assign(service_date=_parse_dates(trips_performed["service_date"]))
+    trips = trips.loc[trips["service_date"].notna()].drop_duplicates(
+        ["service_date", "trip_id_performed"]
+    )
+    revenue = pd.Series(True, index=trips.index)
+    if "trip_type" in trips.columns:
+        revenue = _casefolded(trips["trip_type"], "in service") == "in service"
+    canceled = pd.Series(False, index=trips.index)
+    if "schedule_relationship" in trips.columns:
+        status = _casefolded(trips["schedule_relationship"], "scheduled")
+        canceled = status.isin(["canceled", "cancelled"])
+    if "trip_id_scheduled" in trips.columns:
+        scheduled = trips["trip_id_scheduled"].fillna("").astype(str).str.strip()
+    else:
+        scheduled = pd.Series("", index=trips.index)
+    work = pd.DataFrame(
+        {
+            "service_date": trips["service_date"],
+            "canceled": canceled,
+            "scheduled": scheduled,
+        }
+    ).loc[revenue]
+    ran = work.loc[~work["canceled"] & (work["scheduled"] != "")]
+    stats = work.groupby("service_date").agg(
+        revenue_trips=("canceled", "size"), canceled_trips=("canceled", "sum")
+    )
+    stats["canceled_trips"] = stats["canceled_trips"].astype(int)
+    stats["trips_run"] = stats["revenue_trips"] - stats["canceled_trips"]
+    ids = ran.groupby("service_date")["scheduled"].agg(list)
+    stats["ran_trip_ids"] = [ids.get(stamp, []) for stamp in stats.index]
+    return stats
+
+
+def classify_service_dates(
     dates: Iterable[pd.Timestamp],
     day_types: Mapping[str, Sequence[int]],
     holidays: Iterable[dt.date] = (),
     holiday_day_type: str = HOLIDAY_DAY_TYPE,
+    feeds: Sequence[GtfsFeed] = (),
+    trip_stats: Optional[pd.DataFrame] = None,
+    max_unscheduled_share: float = MAX_UNSCHEDULED_SHARE,
+    max_canceled_share: float = MAX_CANCELED_SHARE,
 ) -> pd.DataFrame:
-    """Assign each service date its day type(s).
+    """Give each service date its day type(s), the reason, and any data-quality flag.
 
-    A holiday gets only the holiday day type. Any other date gets every day type
-    listing its weekday, so a date can belong to several (or to none, in which
-    case it is left out of every table).
+    A date is a holiday when it is in *holidays*, or when GTFS schedules service
+    that day but none of it carries the regular label of the date's weekday (a
+    Wednesday with only Sunday or holiday-only service). Any other date gets
+    every ``DAY_TYPES`` entry listing its weekday. With several feeds, the last
+    one scheduling service on a date governs it.
+
+    A date is flagged when GTFS schedules no service that day, when more than
+    *max_unscheduled_share* of the scheduled trip IDs that ran are not scheduled
+    that day in the governing feed, or when more than *max_canceled_share* of its
+    revenue trips were canceled.
 
     Args:
         dates: Service dates (midnight timestamps).
         day_types: Output of :func:`build_day_types`.
-        holidays: Holiday dates.
+        holidays: Holiday dates given by hand.
         holiday_day_type: Name of the holiday day type.
+        feeds: Loaded GTFS feeds, oldest first.
+        trip_stats: Output of :func:`trip_date_stats`, or ``None``.
+        max_unscheduled_share: Flag threshold for trips run but not scheduled.
+        max_canceled_share: Flag threshold for canceled revenue trips.
 
     Returns:
-        One row per date and day type: ``service_date``, ``day_type``.
+        One row per date, in date order, with the published columns (see
+        ``date_classification.csv``) plus ``_stamp`` and ``_day_types`` for
+        building the date table.
     """
-    holiday_set = set(holidays)
-    rows: List[Tuple[pd.Timestamp, str]] = []
-    no_type: List[str] = []
-    seen_holidays: List[str] = []
+    manual = set(holidays)
+    stats: Dict[Any, Dict[str, Any]] = {} if trip_stats is None else trip_stats.to_dict("index")
+    rows: List[Dict[str, Any]] = []
     for stamp in sorted({pd.Timestamp(d) for d in dates}):
         day = stamp.date()
-        if day in holiday_set:
-            rows.append((stamp, holiday_day_type))
-            seen_holidays.append(day.isoformat())
-            continue
-        names = [name for name, numbers in day_types.items() if day.weekday() in numbers]
-        if not names:
-            no_type.append(day.isoformat())
-        rows.extend((stamp, name) for name in names)
-    if seen_holidays:
-        logging.info(
-            "%d holiday date(s) in the data form the %s day type: %s",
-            len(seen_holidays),
-            holiday_day_type,
-            ", ".join(seen_holidays),
+        regular = REGULAR_SERVICE_LABEL[day.weekday()]
+        governing: Optional[GtfsFeed] = None
+        for feed in feeds:
+            if feed.services_by_date.get(day):
+                governing = feed  # later feeds win
+        services = sorted(governing.services_by_date[day]) if governing else []
+        labels = sorted(
+            set().union(*(governing.service_labels.get(s, frozenset()) for s in services))
+            if governing
+            else set()
         )
-    if no_type:
+        if day in manual:
+            types, source = [holiday_day_type], "HOLIDAYS"
+        elif services and regular not in labels:
+            types, source = [holiday_day_type], f"GTFS: no regular {regular} service"
+        else:
+            types = [name for name, numbers in day_types.items() if day.weekday() in numbers]
+            source = "DAY_TYPES" if types else "DAY_TYPES (weekday in no day type)"
+
+        reasons: List[str] = []
+        if feeds and not services:
+            reasons.append("GTFS schedules no service on this date")
+        revenue = canceled = run = checked = not_scheduled = not_in_gtfs = 0
+        stat = stats.get(stamp)
+        if stat is not None:
+            revenue, canceled = int(stat["revenue_trips"]), int(stat["canceled_trips"])
+            run = int(stat["trips_run"])
+            if revenue and canceled / revenue > max_canceled_share:
+                reasons.append(f"{canceled / revenue:.0%} of revenue trips canceled")
+            ids = list(stat["ran_trip_ids"])
+            if governing is not None and ids:
+                checked = len(ids)
+                active = governing.services_by_date[day]
+                not_in_gtfs = sum(1 for t in ids if t not in governing.trip_services)
+                not_scheduled = sum(
+                    1
+                    for t in ids
+                    if t in governing.trip_services and governing.trip_services[t] not in active
+                )
+                share = (not_in_gtfs + not_scheduled) / checked
+                if share > max_unscheduled_share:
+                    reasons.append(
+                        f"{share:.0%} of trips run are not scheduled on this date in GTFS "
+                        f"({not_in_gtfs} not in trips.txt)"
+                    )
+        rows.append(
+            {
+                "service_date": day.isoformat(),
+                "weekday": WEEKDAY_NAMES[day.weekday()],
+                "day_type": " / ".join(types),
+                "day_type_source": source,
+                "gtfs_feed": governing.name if governing else "",
+                "gtfs_services": ";".join(services),
+                "gtfs_service_labels": ";".join(labels),
+                "revenue_trips": revenue,
+                "canceled_trips": canceled,
+                "trips_run": run,
+                "trips_checked_against_gtfs": checked,
+                "trips_not_scheduled": not_scheduled,
+                "trips_not_in_gtfs": not_in_gtfs,
+                "flagged": bool(reasons),
+                "flag_reason": "; ".join(reasons),
+                "_stamp": stamp,
+                "_day_types": types,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def date_table_from_classification(
+    classification: pd.DataFrame, exclude_flagged: bool = False
+) -> pd.DataFrame:
+    """Expand the classification into one row per date and day type.
+
+    Dates in no day type drop out; flagged dates drop out too when
+    *exclude_flagged* is True.
+
+    Args:
+        classification: Output of :func:`classify_service_dates`.
+        exclude_flagged: Whether to leave flagged dates out.
+
+    Returns:
+        ``service_date`` (midnight timestamp) and ``day_type`` columns.
+    """
+    rows = [
+        (stamp, day_type)
+        for stamp, types, flagged in zip(
+            classification["_stamp"], classification["_day_types"], classification["flagged"]
+        )
+        if not (exclude_flagged and flagged)
+        for day_type in types
+    ]
+    return pd.DataFrame(rows, columns=["service_date", "day_type"])
+
+
+def log_date_classification(classification: pd.DataFrame, holiday_day_type: str) -> None:
+    """Log the holidays found, the flagged dates, and dates in no day type."""
+    holidays = classification.loc[classification["_day_types"].map(lambda t: holiday_day_type in t)]
+    for _, row in holidays.iterrows():
+        logging.info(
+            "%s (%s) is in the %s day type: %s.",
+            row["service_date"],
+            row["weekday"],
+            holiday_day_type,
+            row["day_type_source"],
+        )
+    for _, row in classification.loc[classification["flagged"]].iterrows():
+        logging.warning("%s is flagged: %s.", row["service_date"], row["flag_reason"])
+    untyped = classification.loc[classification["day_type"] == "", "service_date"].tolist()
+    if untyped:
         logging.info(
             "%d service date(s) fall on a weekday in no day type and are left out: %s",
-            len(no_type),
-            ", ".join(no_type[:10]) + (" ..." if len(no_type) > 10 else ""),
+            len(untyped),
+            ", ".join(untyped[:10]) + (" ..." if len(untyped) > 10 else ""),
         )
-    return pd.DataFrame(rows, columns=["service_date", "day_type"])
 
 
 def day_type_order(
@@ -2602,6 +3178,12 @@ def _resolve_run_settings(
             f"LOW_RIDERSHIP_MEASURE must be one of {', '.join(LOW_RIDERSHIP_MEASURES)}, "
             f"not {settings.low_ridership_measure!r}."
         )
+    for name, value in (
+        ("MAX_UNSCHEDULED_SHARE", settings.max_unscheduled_share),
+        ("MAX_CANCELED_SHARE", settings.max_canceled_share),
+    ):
+        if not 0.0 <= value <= 1.0:
+            raise SettingsError(f"{name} must be between 0 and 1, not {value!r}.")
     if settings.start_date and settings.end_date and settings.start_date > settings.end_date:
         raise SettingsError(
             f"START_DATE {settings.start_date} is after END_DATE {settings.end_date}."
@@ -2638,11 +3220,27 @@ def run(settings: RunSettings) -> RunResult:
     joined = join_trips(stop_visits, trips)
     joined = filter_dates(joined, settings.start_date, settings.end_date)
     joined = add_trip_key(joined)
-    date_table = build_date_table(
-        joined["service_date"].unique(), day_types, settings.holidays, holiday
+    feeds = [load_gtfs_feed(str(path)) for path in settings.gtfs_paths]
+    classification = classify_service_dates(
+        joined["service_date"].unique(),
+        day_types,
+        settings.holidays,
+        holiday,
+        feeds,
+        trip_date_stats(trips),
+        settings.max_unscheduled_share,
+        settings.max_canceled_share,
     )
+    classification["excluded"] = (classification["day_type"] == "") | (
+        classification["flagged"] & settings.exclude_flagged_dates
+    )
+    log_date_classification(classification, holiday)
+    date_table = date_table_from_classification(classification, settings.exclude_flagged_dates)
     if date_table.empty:
-        raise InputDataError("No service date falls in any of the DAY_TYPES; check DAY_TYPES.")
+        raise InputDataError(
+            "No service date is left in any day type; check DAY_TYPES and EXCLUDE_FLAGGED_DATES."
+        )
+    published = classification.drop(columns=["_stamp", "_day_types"])
 
     # --- ridership -------------------------------------------------------------
     visits = (
@@ -2667,6 +3265,7 @@ def run(settings: RunSettings) -> RunResult:
 
     files: List[Path] = []
     out_dir = settings.output_dir
+    _write_csv(published, out_dir / DATE_CLASSIFICATION_FILENAME, files)
     ridership: Dict[Tuple[str, str], pd.DataFrame] = {}
     for level in levels:
         missing = missing_level_columns(level, visits.columns)
@@ -2781,7 +3380,11 @@ def run(settings: RunSettings) -> RunResult:
             f"{name} = {', '.join(WEEKDAY_NAMES[n][:3] for n in nums)}"
             for name, nums in day_types.items()
         ),
-        f"Holidays ({holiday}): {holidays_text}",
+        f"HOLIDAYS list:      {holidays_text} (day type {holiday})",
+        f"GTFS feeds:         {', '.join(str(p) for p in settings.gtfs_paths) or '(none)'}",
+        f"Date checks:        flag above {settings.max_unscheduled_share:.0%} of trips "
+        f"unscheduled or {settings.max_canceled_share:.0%} canceled; "
+        f"exclude flagged dates: {settings.exclude_flagged_dates}",
         f"Date range:         {settings.start_date or '(start)'} to {settings.end_date or '(end)'}",
         f"Time columns:       {', '.join(settings.time_columns)}",
         f"Service day starts: {settings.cutover_hour:02d}:00",
@@ -2801,6 +3404,28 @@ def run(settings: RunSettings) -> RunResult:
         f"Trips observed:     {n_trips}",
         "Service dates:      "
         + ", ".join(f"{d} {day_counts[d]}" for d in order if d in day_counts),
+        "Holiday dates:      "
+        + (
+            ", ".join(
+                f"{d} ({src})"
+                for d, src, types in zip(
+                    published["service_date"],
+                    published["day_type_source"],
+                    classification["_day_types"],
+                )
+                if holiday in types
+            )
+            or "(none)"
+        ),
+        "Flagged dates:      "
+        + (
+            "; ".join(
+                f"{d}: {why}"
+                for d, why in zip(published["service_date"], published["flag_reason"])
+                if why
+            )
+            or "(none)"
+        ),
         f"Low-ridership trips: {low_count}",
         f"Charts written:     {charts}",
     ]
@@ -2816,7 +3441,7 @@ def run(settings: RunSettings) -> RunResult:
             "Run log could not be written. Set REQUIRE_RUN_LOG = False to suppress this "
             "error when a sidecar file is genuinely impossible."
         )
-    return RunResult(ridership, max_load, by_trip, trip_rows, service_cut_tables, files)
+    return RunResult(ridership, max_load, by_trip, trip_rows, service_cut_tables, published, files)
 
 
 def _visit_keys(visits: pd.DataFrame) -> List[str]:
@@ -2886,10 +3511,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--start-date", default=START_DATE, help="First service date (YYYY-MM-DD).")
     p.add_argument("--end-date", default=END_DATE, help="Last service date (YYYY-MM-DD).")
     p.add_argument(
+        "--gtfs",
+        nargs="+",
+        default=None,
+        metavar="FEED",
+        help="GTFS feeds (folders or .zip), oldest first; replaces GTFS_PATHS.",
+    )
+    p.add_argument(
         "--holiday",
         action="append",
         metavar="YYYY-MM-DD",
         help="One holiday date; repeat the flag for each. Replaces HOLIDAYS.",
+    )
+    p.add_argument(
+        "--exclude-flagged-dates",
+        action=argparse.BooleanOptionalAction,
+        default=EXCLUDE_FLAGGED_DATES,
+        help="Leave flagged dates out of every table.",
     )
     p.add_argument(
         "--routes-include",
@@ -2958,9 +3596,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             time_cuts=args.time_cuts,
             export_max_load=args.max_load,
             vehicle_capacity=args.vehicle_capacity,
+            gtfs_paths=tuple(args.gtfs) if args.gtfs else tuple(GTFS_PATHS),
             holidays=holidays,
             start_date=start,
             end_date=end,
+            exclude_flagged_dates=args.exclude_flagged_dates,
             routes_to_include=tuple(args.routes_include),
             routes_to_exclude=tuple(args.routes_exclude),
             export_charts=args.charts,
@@ -2979,6 +3619,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     for path in (settings.stop_visits_path, settings.trips_performed_path):
         if not path.is_file():
             logging.error("Input file not found: %s", path)
+            return 1
+    for feed in settings.gtfs_paths:
+        if not Path(feed).expanduser().exists():
+            logging.error("GTFS feed not found: %s", feed)
             return 1
 
     try:

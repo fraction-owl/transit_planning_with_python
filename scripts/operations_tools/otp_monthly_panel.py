@@ -387,6 +387,10 @@ def aggregate_otp(df: pd.DataFrame, group_cols: Sequence[str]) -> pd.DataFrame:
             counts[cls] = 0
     counts = counts[["early", "on_time", "late"]]
     counts["evaluated"] = counts.sum(axis=1)
+    # pivot_table(dropna=False) expands multi-key indexes to the cartesian
+    # product of key values; combinations that never occurred (0 visits) are
+    # artifacts, not groups, so they are dropped rather than reported as NaN%.
+    counts = counts.loc[counts["evaluated"] > 0]
 
     with np.errstate(divide="ignore", invalid="ignore"):
         counts["pct_on_time"] = counts["on_time"] / counts["evaluated"] * 100.0

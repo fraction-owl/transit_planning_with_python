@@ -1,13 +1,16 @@
 """Tests for ridership_from_tides (the TIDES ridership and max-load exporter).
 
 Most end-to-end checks share one run on the repo TIDES fixtures (every level and
-time cut, charts off, 2026-02-16 as a holiday) and compare it with an independent
-join of the same files.
+time cut, charts off, day types from the mock GTFS feed) and compare it with an
+independent join of the same files. The fixtures' one holiday-service date is
+2026-01-01 (a Thursday running the 50H holiday loop); 2026-02-16, Washington's
+Birthday, runs regular weekday service in the mock feed.
 """
 
 import datetime as dt
 import logging
 import sys
+import zipfile
 from pathlib import Path
 
 import pandas as pd
@@ -22,7 +25,9 @@ STOP_VISITS = Path("tests/fixtures/stop_visits.csv")
 TRIPS_PERFORMED = Path("tests/fixtures/trips_performed.csv")
 PERIODS_FIXTURE = Path("tests/fixtures/time_periods.txt")
 EXAMPLE_PERIODS = script_dir / "time_periods_example.txt"
-HOLIDAY = dt.date(2026, 2, 16)  # Washington's Birthday, a Monday in the fixture
+MOCK_GTFS = Path("tests/fixtures/mock_gtfs_dc.zip")
+HOLIDAY = dt.date(2026, 1, 1)  # the fixtures' holiday-service date, a Thursday
+PRESIDENTS_DAY = dt.date(2026, 2, 16)  # a public holiday running weekday service
 
 DEFAULT_PERIODS = target.build_time_periods(
     target.specs_from_mapping(target.TIME_PERIODS), "test defaults"
@@ -66,7 +71,7 @@ def _expected_visits() -> pd.DataFrame:
 
 @pytest.fixture(scope="module")
 def full_run(tmp_path_factory: pytest.TempPathFactory) -> "target.RunResult":
-    """Every level and time cut on the fixtures, with one holiday and charts off."""
+    """Every level and time cut on the fixtures, day types from the mock GTFS feed."""
     out_dir = tmp_path_factory.mktemp("full_run")
     settings = target.RunSettings(
         stop_visits_path=STOP_VISITS,
@@ -75,10 +80,48 @@ def full_run(tmp_path_factory: pytest.TempPathFactory) -> "target.RunResult":
         periods=DEFAULT_PERIODS,
         levels=list(target.LEVELS),
         time_cuts=list(target.TIME_CUTS),
-        holidays=[HOLIDAY],
+        gtfs_paths=[str(MOCK_GTFS)],
         export_charts=False,
     )
     return target.run(settings)
+
+
+def _gtfs_copy(
+    dest: Path,
+    calendar_start: str = "",
+    calendar_end: str = "",
+    extra_dates: tuple = (),
+    trip_prefix: str = "",
+) -> Path:
+    """Write an edited copy of the mock feed's calendar and trips into *dest*.
+
+    Args:
+        dest: New folder for the feed.
+        calendar_start: New calendar.txt start_date; calendar_dates rows before
+            it are dropped, as a feed published that day would not carry them.
+        calendar_end: New calendar.txt end_date.
+        extra_dates: Extra calendar_dates rows as (service_id, date, exception_type).
+        trip_prefix: Text prepended to every trip_id, so no TIDES trip matches.
+    """
+    dest.mkdir(parents=True)
+    with zipfile.ZipFile(MOCK_GTFS) as archive:
+        for name in ("calendar.txt", "calendar_dates.txt", "trips.txt"):
+            (dest / name).write_bytes(archive.read(f"dc/{name}"))
+    calendar = pd.read_csv(dest / "calendar.txt", dtype=str)
+    dates = pd.read_csv(dest / "calendar_dates.txt", dtype=str)
+    if calendar_start:
+        calendar["start_date"] = calendar_start
+        dates = dates[dates["date"] >= calendar_start]
+    if calendar_end:
+        calendar["end_date"] = calendar_end
+    extra = pd.DataFrame(list(extra_dates), columns=["service_id", "date", "exception_type"])
+    calendar.to_csv(dest / "calendar.txt", index=False)
+    pd.concat([dates, extra]).to_csv(dest / "calendar_dates.txt", index=False)
+    if trip_prefix:
+        trips = pd.read_csv(dest / "trips.txt", dtype=str)
+        trips["trip_id"] = trip_prefix + trips["trip_id"]
+        trips.to_csv(dest / "trips.txt", index=False)
+    return dest
 
 
 # --- time periods ---------------------------------------------------------------
@@ -358,7 +401,14 @@ def test_date_table_holidays_overlaps_and_unassigned_days() -> None:
     """Holidays get only their own type; overlapping types both apply; others drop out."""
     day_types = target.build_day_types({"Weekday": ("Mon", "Tue"), "Monday": ("Mon",)})
     dates = pd.to_datetime(["2026-02-16", "2026-02-23", "2026-02-24", "2026-02-21"])
-    table = target.build_date_table(dates, day_types, [HOLIDAY], "Holiday")
+    classification = target.classify_service_dates(dates, day_types, [PRESIDENTS_DAY], "Holiday")
+    assert classification["day_type_source"].tolist() == [
+        "HOLIDAYS",
+        "DAY_TYPES (weekday in no day type)",
+        "DAY_TYPES",
+        "DAY_TYPES",
+    ]
+    table = target.date_table_from_classification(classification)
     pairs = sorted((d.strftime("%m-%d"), t) for d, t in table.to_numpy().tolist())
     assert pairs == [
         ("02-16", "Holiday"),
@@ -446,7 +496,7 @@ def test_boardings_sum_both_doors() -> None:
 def test_every_grain_is_written(full_run: "target.RunResult") -> None:
     """One ridership CSV per level and cut, max-load rollups, trip tables and a run log."""
     assert set(full_run.ridership) == set(ALL_GRAINS)
-    out_dir = full_run.files[0].parents[1]
+    out_dir = next(p.parent for p in full_run.files if p.name == "date_classification.csv")
     for level, cut in ALL_GRAINS:
         assert (out_dir / "ridership" / target.grain_filename("ridership", level, cut)).exists()
     expected_max = {(lv, c) for lv in target.MAX_LOAD_LEVELS for c in target.TIME_CUTS}
@@ -456,6 +506,7 @@ def test_every_grain_is_written(full_run: "target.RunResult") -> None:
     for day in ("weekday", "saturday", "sunday", "holiday"):
         assert (out_dir / "service_cut_inputs" / f"ridership_by_trip_{day}.csv").exists()
     assert (out_dir / "ridership_from_tides_runlog.txt").exists()
+    assert (out_dir / "date_classification.csv").exists()
     assert not (out_dir / "charts").exists()
 
 
@@ -485,7 +536,7 @@ def test_averages_divide_by_observed_dates(full_run: "target.RunResult") -> None
     """System averages use the dates with data in each day type; the holiday is its own."""
     table = full_run.ridership[("system", "all_day")]
     days = table.set_index("day_type")["days_observed"].to_dict()
-    assert days == {"Weekday": 5, "Saturday": 3, "Sunday": 3, "Holiday": 1}
+    assert days == {"Weekday": 6, "Saturday": 3, "Sunday": 3, "Holiday": 1}
     assert table["day_type"].tolist() == ["Weekday", "Saturday", "Sunday", "Holiday"]
     expected = (table["total_boardings"] / table["days_observed"]).round(2)
     assert table["avg_daily_boardings"].tolist() == expected.tolist()
@@ -522,7 +573,7 @@ def test_trip_averages_divide_by_the_trips_own_dates(full_run: "target.RunResult
     dates = weekday.groupby("trip_id_scheduled")["service_date"].nunique()
     rows = trip[trip["day_type"] == "Weekday"].set_index("trip_id")["days_observed"]
     assert rows.sort_index().to_dict() == dates.sort_index().to_dict()
-    assert (rows <= 5).all() and (rows < 5).any()
+    assert (rows <= 6).all() and (rows < 6).any()
 
 
 def test_time_period_rows_are_zero_filled_for_routes_not_stops(
@@ -545,7 +596,7 @@ def test_period_rates_and_windows(full_run: "target.RunResult") -> None:
     am = table[(table["day_type"] == "Weekday") & (table["time_period"] == "AM Peak")].iloc[0]
     assert (am["period_start"], am["period_end"], am["period_hours"]) == ("06:00", "09:00", 3.0)
     assert am["avg_daily_boardings_per_period_hour"] == pytest.approx(
-        am["total_boardings"] / 5 / 3, abs=0.01
+        am["total_boardings"] / am["days_observed"] / 3, abs=0.01
     )
 
 
@@ -571,14 +622,21 @@ def test_month_divisors_add_up_to_the_day_type(full_run: "target.RunResult") -> 
     monthly = full_run.ridership[("system", "month")]
     assert set(monthly["month"]) == {"2026-01", "2026-02", "2026-03"}
     totals = monthly.groupby("day_type")["days_observed"].sum().to_dict()
-    assert totals == {"Weekday": 5, "Saturday": 3, "Sunday": 3, "Holiday": 1}
+    assert totals == {"Weekday": 6, "Saturday": 3, "Sunday": 3, "Holiday": 1}
 
 
-def test_without_holidays_the_date_counts_as_its_weekday(tmp_path: Path) -> None:
-    """With HOLIDAYS empty, the holiday's Monday is one more weekday."""
+def test_without_gtfs_or_holidays_the_date_counts_as_its_weekday(tmp_path: Path) -> None:
+    """With no GTFS and HOLIDAYS empty, the holiday-service Thursday is one more weekday."""
     result = target.run(_settings(tmp_path, levels=["system"], time_cuts=["all_day"]))
     days = result.ridership[("system", "all_day")].set_index("day_type")["days_observed"]
-    assert days.to_dict() == {"Weekday": 6, "Saturday": 3, "Sunday": 3}
+    assert days.to_dict() == {"Weekday": 7, "Saturday": 3, "Sunday": 3}
+    sources = set(result.date_classification["day_type_source"])
+    assert sources == {"DAY_TYPES"}
+    result = target.run(
+        _settings(tmp_path, levels=["system"], time_cuts=["all_day"], holidays=[HOLIDAY])
+    )
+    days = result.ridership[("system", "all_day")].set_index("day_type")["days_observed"]
+    assert days.to_dict() == {"Weekday": 6, "Saturday": 3, "Sunday": 3, "Holiday": 1}
 
 
 def test_day_types_and_date_range(tmp_path: Path) -> None:
@@ -684,6 +742,155 @@ def test_service_cut_tables(full_run: "target.RunResult") -> None:
     merged = weekday.merge(trip_stop, on=["trip_id", "stop_id"], suffixes=("", "_level"))
     assert len(merged) == len(weekday)
     assert (merged["avg_daily_boardings"] == merged["avg_daily_boardings_level"]).all()
+
+
+# --- GTFS day types and date checks ---------------------------------------------
+
+
+def _date_row(classification: pd.DataFrame, day: dt.date) -> pd.Series:
+    """Return the date_classification row for *day*."""
+    return classification.set_index("service_date").loc[day.isoformat()]
+
+
+def test_gtfs_finds_holiday_service_not_public_holidays(full_run: "target.RunResult") -> None:
+    """Jan 1 runs holiday-only service, so it is a holiday; Presidents' Day runs weekday."""
+    classification = full_run.date_classification
+    new_year = _date_row(classification, HOLIDAY)
+    assert new_year["day_type"] == "Holiday"
+    assert new_year["day_type_source"] == "GTFS: no regular Weekday service"
+    assert new_year["gtfs_services"] == "holiday"
+    presidents = _date_row(classification, PRESIDENTS_DAY)
+    assert (presidents["day_type"], presidents["day_type_source"]) == ("Weekday", "DAY_TYPES")
+    assert not classification["flagged"].any()
+    assert (classification["trips_checked_against_gtfs"] == classification["trips_run"]).all()
+    assert (classification["trips_not_scheduled"] + classification["trips_not_in_gtfs"] == 0).all()
+    assert list(classification.columns[:4]) == [
+        "service_date",
+        "weekday",
+        "day_type",
+        "day_type_source",
+    ]
+
+
+def test_sunday_service_on_a_weekday_is_a_holiday_and_mismatched_trips_are_flagged(
+    tmp_path: Path,
+) -> None:
+    """Sunday service on a Thursday makes it a holiday; the weekday trips that ran get flagged."""
+    feed = _gtfs_copy(
+        tmp_path / "feed",
+        extra_dates=(("weekday", "20260115", "2"), ("sunday", "20260115", "1")),
+    )
+    result = target.run(
+        _settings(tmp_path / "out", levels=["system"], time_cuts=["all_day"], gtfs_paths=[feed])
+    )
+    row = _date_row(result.date_classification, dt.date(2026, 1, 15))
+    assert row["day_type"] == "Holiday"
+    assert row["gtfs_service_labels"] == "Sunday"
+    assert row["flagged"]
+    assert (
+        row["flag_reason"]
+        == "100% of trips run are not scheduled on this date in GTFS (0 not in trips.txt)"
+    )
+    assert row["trips_not_scheduled"] == row["trips_run"]
+
+
+def test_gtfs_series_later_feed_governs_and_gaps_are_flagged(tmp_path: Path) -> None:
+    """Each date uses the last feed scheduling it; dates no feed covers are flagged."""
+    winter = _gtfs_copy(tmp_path / "winter", calendar_end="20260131")
+    spring = _gtfs_copy(
+        tmp_path / "spring",
+        calendar_start="20260201",
+        calendar_end="20260228",
+        extra_dates=(("weekday", "20260216", "2"), ("holiday", "20260216", "1")),
+    )
+    result = target.run(
+        _settings(
+            tmp_path / "out",
+            levels=["system"],
+            time_cuts=["all_day"],
+            gtfs_paths=[winter, spring],
+        )
+    )
+    classification = result.date_classification.set_index("service_date")
+    assert classification.loc["2026-01-01", "gtfs_feed"] == "winter"
+    assert classification.loc["2026-01-01", "day_type"] == "Holiday"
+    assert classification.loc["2026-02-02", "gtfs_feed"] == "spring"
+    assert classification.loc["2026-02-16", "day_type"] == "Holiday"
+    assert "not scheduled on this date" in classification.loc["2026-02-16", "flag_reason"]
+    march = classification[classification.index.str.startswith("2026-03")]
+    assert (march["gtfs_feed"] == "").all()
+    assert (march["flag_reason"] == "GTFS schedules no service on this date").all()
+    assert (march["day_type_source"] == "DAY_TYPES").all()
+
+
+def test_trip_ids_missing_from_gtfs_are_counted_and_flagged(tmp_path: Path) -> None:
+    """When no TIDES trip_id_scheduled is in trips.txt, every date is flagged."""
+    feed = _gtfs_copy(tmp_path / "feed", trip_prefix="X")
+    result = target.run(
+        _settings(tmp_path / "out", levels=["system"], time_cuts=["all_day"], gtfs_paths=[feed])
+    )
+    classification = result.date_classification
+    assert classification["flagged"].all()
+    assert (classification["trips_not_in_gtfs"] == classification["trips_run"]).all()
+    assert classification["flag_reason"].str.endswith("not in trips.txt)").all()
+
+
+def test_canceled_trips_flag_and_flagged_dates_can_be_excluded(tmp_path: Path) -> None:
+    """Dates with too many canceled trips are flagged, and optionally left out everywhere."""
+    base = {"levels": ["system"], "time_cuts": ["all_day"], "gtfs_paths": [str(MOCK_GTFS)]}
+    kept = target.run(_settings(tmp_path / "kept", max_canceled_share=0.10, **base))
+    classification = kept.date_classification
+    flagged = classification.loc[classification["flagged"], "service_date"].tolist()
+    shares = classification["canceled_trips"] / classification["revenue_trips"]
+    assert flagged == classification.loc[shares > 0.10, "service_date"].tolist()
+    assert flagged and not classification["excluded"].any()
+    assert (
+        classification.loc[classification["flagged"], "flag_reason"]
+        .str.endswith("of revenue trips canceled")
+        .all()
+    )
+
+    dropped = target.run(
+        _settings(tmp_path / "dropped", max_canceled_share=0.10, exclude_flagged_dates=True, **base)
+    )
+    assert dropped.date_classification["excluded"].tolist() == classification["flagged"].tolist()
+    days_kept = kept.ridership[("system", "all_day")].set_index("day_type")["days_observed"]
+    days_dropped = dropped.ridership[("system", "all_day")].set_index("day_type")["days_observed"]
+    assert days_kept.sum() - days_dropped.sum() == len(flagged)
+    excluded = pd.to_datetime(flagged)
+    assert not dropped.max_load_by_trip["service_date"].isin(excluded.strftime("%Y-%m-%d")).any()
+
+
+def test_date_check_thresholds_must_be_shares(tmp_path: Path) -> None:
+    """A threshold outside 0-1 is a settings error."""
+    with pytest.raises(target.SettingsError, match="MAX_CANCELED_SHARE"):
+        target.run(_settings(tmp_path, max_canceled_share=20))
+
+
+def test_main_with_gtfs(tmp_path: Path) -> None:
+    """--gtfs feeds the day types; a missing feed path exits 1."""
+    out_dir = tmp_path / "out"
+    common = [
+        "--stop-visits",
+        str(STOP_VISITS),
+        "--trips-performed",
+        str(TRIPS_PERFORMED),
+        "--output-dir",
+        str(out_dir),
+        "--levels",
+        "system",
+        "--time-cuts",
+        "all_day",
+        "--no-charts",
+    ]
+    assert target.main([*common, "--gtfs", str(tmp_path / "missing.zip")]) == 1
+    assert target.main([*common, "--gtfs", str(MOCK_GTFS)]) == 0
+    classification = pd.read_csv(out_dir / "date_classification.csv", dtype=str)
+    holiday = classification[classification["day_type"] == "Holiday"]
+    assert holiday["service_date"].tolist() == ["2026-01-01"]
+    log = (out_dir / "ridership_from_tides_runlog.txt").read_text("utf-8")
+    assert "mock_gtfs_dc.zip" in log
+    assert "2026-01-01 (GTFS: no regular Weekday service)" in log
 
 
 # --- maximum load -----------------------------------------------------------------
@@ -880,7 +1087,7 @@ def test_main_end_to_end(tmp_path: Path) -> None:
     log = (out_dir / "ridership_from_tides_runlog.txt").read_text("utf-8")
     assert "time_periods.txt" in log
     assert "AM Peak = 06:00 - 09:00" in log
-    assert "Holidays (Holiday): 2026-02-16" in log
+    assert "HOLIDAYS list:      2026-01-01 (day type Holiday)" in log
     assert "Levels:             route, route_direction_stop" in log
     assert "# === BEGIN CONFIG ===" not in log
     assert "EXPORT_LEVELS: Mapping" in log

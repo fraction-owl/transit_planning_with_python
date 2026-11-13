@@ -28,11 +28,12 @@ def test_load_trip_files_tides_support() -> None:
     assert "trip_start_time" in df.columns, "trip_start_time column should be derived"
 
     # 3. Assert filtering
-    # Fixture has 147 rows: 84 "In service" (80 Scheduled + 4 Canceled) and 63
-    # nonrevenue Pullout/Pullin/Deadhead rows. Canceled and nonrevenue trips are
-    # dropped. Expected kept: 80 rows.
+    # Fixture has 171 rows: 96 "In service" (92 Scheduled + 4 Canceled, 12 of the
+    # Scheduled from the 2026-01-01 holiday pass) and 75 nonrevenue
+    # Pullout/Pullin/Deadhead rows. Canceled and nonrevenue trips are dropped.
+    # Expected kept: 92 rows.
 
-    assert len(df) == 80, f"Expected 80 rows, got {len(df)}"
+    assert len(df) == 92, f"Expected 92 rows, got {len(df)}"
 
     # Check Canceled is gone
     assert "TP20260202_DC_R30_weekday_0025" not in df["TripID"].to_numpy(), (
