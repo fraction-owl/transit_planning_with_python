@@ -34,7 +34,8 @@ Outputs
   trip levels.
 - ``date_classification.csv``: each service date's day type and why, its missing and
   duplicate visits, and a flag when its trips do not match the GTFS schedule, many
-  were canceled, or its stop visits conflict.
+  were canceled or have no record at all, or its stop visits conflict.
+- ``trip_coverage.csv`` (with GTFS): how often each scheduled trip has a TIDES record.
 - ``service_cut_inputs/ridership_by_trip_<day type>.csv``: the ``RIDERSHIP_CSV`` input of
   ``service_cut_impact_gpd.py``.
 - ``low_ridership_trips.csv``, ``charts/`` and a run log with the CONFIGURATION block.
@@ -65,8 +66,21 @@ import re
 import sys
 import warnings
 import zipfile
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Tuple
+from typing import (
+    IO,
+    Any,
+    Dict,
+    Generator,
+    Iterable,
+    List,
+    Mapping,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 import matplotlib
 
@@ -191,6 +205,24 @@ MISSING_COUNTS: str = "drop_trip"
 # The thresholds are judgment calls; set one to 1.0 to switch its check off.
 MAX_UNSCHEDULED_SHARE: float = 0.10
 MAX_CANCELED_SHARE: float = 0.20
+
+# SCHEDULE COVERAGE (needs GTFS_PATHS) ------------------------------------------
+# GTFS gives the trips that should have run; a scheduled trip with no
+# trips_performed row at all (of any status) points to an AVL gap rather than a
+# cancellation. Only routes that appear in the TIDES data are checked, so a route
+# missing from the export entirely is warned about once instead of flagging
+# every date. Every date GTFS schedules from START_DATE to END_DATE (when unset,
+# the first and last dates in the TIDES data) is audited, including dates with no
+# TIDES records at all; set both to catch outages at either end of the export.
+# Missing trips are common in AVL exports, so the defaults only catch large gaps;
+# set a share to 1.0 to switch its check off (e.g. for a sampled export that
+# covers only some vehicles).
+# A date is flagged when more than this share of its scheduled trips has no record.
+MAX_UNRECORDED_SHARE: float = 0.50
+# trip_coverage.csv flags (and the log warns about) a scheduled trip with no
+# record on more than this share of its scheduled dates, catching recurring gaps
+# such as the same evening trips missing night after night.
+MAX_TRIP_UNRECORDED_SHARE: float = 0.50
 # False keeps flagged dates in every table (they are only listed). True leaves
 # them out of every table and every days_observed divisor, as NTD does with
 # "atypical" days when it computes average-day figures.
@@ -368,6 +400,7 @@ CHARTS_SUBDIR: str = "charts"
 MAX_LOAD_BY_TRIP_FILENAME: str = "max_load_by_performed_trip.csv"
 LOW_RIDERSHIP_FILENAME: str = "low_ridership_trips.csv"
 DATE_CLASSIFICATION_FILENAME: str = "date_classification.csv"
+TRIP_COVERAGE_FILENAME: str = "trip_coverage.csv"
 RUN_LOG_FILENAME: str = "ridership_from_tides_runlog.txt"
 RUN_LOG_TITLE: str = "RIDERSHIP FROM TIDES RUN LOG"
 
@@ -396,6 +429,9 @@ CLASSIFICATION_COLUMNS: Tuple[str, ...] = (
     "trips_checked_against_gtfs",
     "trips_not_scheduled",
     "trips_not_in_gtfs",
+    "trips_scheduled",
+    "trips_without_record",
+    "share_without_record",
     "visits_missing_counts",
     "trips_missing_counts",
     "duplicate_visits_dropped",
@@ -509,6 +545,8 @@ class RunSettings(NamedTuple):
     routes_to_exclude: Sequence[str] = ROUTES_TO_EXCLUDE
     max_unscheduled_share: float = MAX_UNSCHEDULED_SHARE
     max_canceled_share: float = MAX_CANCELED_SHARE
+    max_unrecorded_share: float = MAX_UNRECORDED_SHARE
+    max_trip_unrecorded_share: float = MAX_TRIP_UNRECORDED_SHARE
     exclude_flagged_dates: bool = EXCLUDE_FLAGGED_DATES
     missing_counts: str = MISSING_COUNTS
     low_ridership_measure: str = LOW_RIDERSHIP_MEASURE
@@ -528,6 +566,7 @@ class RunResult(NamedTuple):
     trip_rows: pd.DataFrame
     service_cut_tables: Dict[str, pd.DataFrame]
     date_classification: pd.DataFrame
+    trip_coverage: pd.DataFrame
     files: List[Path]
 
 
@@ -751,6 +790,62 @@ def load_gtfs_data(
     finally:
         if archive is not None:
             archive.close()
+
+
+@contextmanager
+def open_gtfs_file(
+    gtfs_path: str | os.PathLike[str], file_name: str
+) -> Generator[IO[bytes], None, None]:
+    """Open one GTFS text file from a feed folder or a ``.zip`` of the feed.
+
+    The counterpart of :func:`load_gtfs_data` for scripts that read a file with
+    their own options (``pandas.read_csv`` with ``usecols`` or
+    ``keep_default_na=False``, or the :mod:`csv` module), so they accept a
+    zipped feed without extracting it. Zip members are found the way
+    :func:`load_gtfs_data` finds them: at the archive root or inside a single
+    wrapper folder.
+
+    Args:
+        gtfs_path: Folder containing the GTFS feed, or a ``.zip`` archive of it.
+        file_name: GTFS file to open, e.g. ``"stops.txt"``.
+
+    Yields:
+        A binary file handle. ``pandas.read_csv`` reads it directly; wrap it in
+        :class:`io.TextIOWrapper` for the :mod:`csv` module.
+
+    Raises:
+        FileNotFoundError: *gtfs_path* does not exist, or the feed has no
+            *file_name*.
+        ValueError: *gtfs_path* is neither a directory nor a valid ``.zip``
+            file, or *file_name* is found in more than one place in the zip.
+    """
+    path = os.fspath(gtfs_path)
+    if os.path.isdir(path):
+        file_path = os.path.join(path, file_name)
+        if not os.path.isfile(file_path):
+            raise FileNotFoundError(f"Missing GTFS file in '{path}': {file_name}")
+        with open(file_path, "rb") as handle:
+            yield handle
+        return
+
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"The path '{path}' does not exist.")
+    if not (os.path.isfile(path) and path.lower().endswith(".zip")):
+        raise ValueError(f"'{path}' is neither a directory nor a .zip file.")
+    try:
+        archive = zipfile.ZipFile(path)
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"'{path}' is not a valid zip archive.") from exc
+    with archive:
+        matches = [name for name in archive.namelist() if os.path.basename(name) == file_name]
+        if not matches:
+            raise FileNotFoundError(f"Missing GTFS file in '{path}': {file_name}")
+        if len(matches) > 1:
+            raise ValueError(
+                f"Ambiguous GTFS file in '{path}' (found in multiple locations): {file_name}"
+            )
+        with archive.open(matches[0]) as handle:
+            yield handle
 
 
 def expand_service_active_dates(
@@ -1755,6 +1850,50 @@ class GtfsFeed(NamedTuple):
     service_labels: Dict[str, frozenset[str]]  # service_id -> Weekday/Saturday/Sunday/Holiday
     trip_services: Dict[str, str]  # trip_id -> service_id
     regular_weekdays: Dict[str, frozenset[int]]  # service_id -> weekdays it regularly runs
+    trip_routes: Dict[str, str]  # trip_id -> route_id
+    trip_directions: Dict[str, str]  # trip_id -> direction_id ("" when absent)
+    trip_starts: Dict[str, float]  # trip_id -> first scheduled departure, minutes (GTFS clock)
+
+
+_GTFS_TIME_RE = r"^\s*(\d{1,3}):([0-5]\d)(?::[0-5]\d)?\s*$"
+
+
+def gtfs_trip_starts(path: str) -> Dict[str, float]:
+    """Return each trip's first scheduled departure from ``stop_times.txt``.
+
+    Only the trip ID and time columns are read. Times keep the GTFS clock, so a
+    trip leaving at 25:10 is 1510 minutes.
+
+    Args:
+        path: A GTFS folder or ``.zip``.
+
+    Returns:
+        ``{trip_id: minutes}``; empty when the feed has no usable ``stop_times.txt``.
+    """
+    try:
+        with open_gtfs_file(path, "stop_times.txt") as handle:
+            header = pd.read_csv(handle, nrows=0).columns
+        wanted = [c for c in ("trip_id", "departure_time", "arrival_time") if c in header]
+        with open_gtfs_file(path, "stop_times.txt") as handle:
+            times = pd.read_csv(handle, usecols=wanted, dtype=str)
+    except (OSError, ValueError, pd.errors.EmptyDataError) as exc:
+        logging.info(
+            "GTFS feed %s: no usable stop_times.txt (%s); trip start times are blank.", path, exc
+        )
+        return {}
+    if "trip_id" not in times.columns:
+        return {}
+    minutes = pd.Series(np.nan, index=times.index, dtype="float64")
+    for col in ("departure_time", "arrival_time"):
+        if col not in times.columns:
+            continue
+        parts = times[col].astype("string").str.extract(_GTFS_TIME_RE)
+        clock = pd.to_numeric(parts[0], errors="coerce") * 60 + pd.to_numeric(
+            parts[1], errors="coerce"
+        )
+        minutes = minutes.fillna(clock.astype("float64"))
+    first = minutes.groupby(times["trip_id"].astype(str).str.strip()).min()
+    return {str(trip): float(value) for trip, value in first.items() if pd.notna(value)}
 
 
 def regular_weekdays(
@@ -1838,12 +1977,15 @@ def load_gtfs_feed(path: str) -> GtfsFeed:
     for service_id, dates in active.items():
         for day in dates:
             by_date.setdefault(day, set()).add(service_id)
-    trip_services = dict(
-        zip(
-            trips["trip_id"].fillna("").astype(str).str.strip(),
-            trips["service_id"].fillna("").astype(str).str.strip(),
-        )
-    )
+    trip_ids = trips["trip_id"].fillna("").astype(str).str.strip()
+
+    def trip_column(column: str) -> Dict[str, str]:
+        """Map trip_id to one trips.txt column ("" when the column is absent)."""
+        if column not in trips.columns:
+            return dict.fromkeys(trip_ids, "")
+        return dict(zip(trip_ids, trips[column].fillna("").astype(str).str.strip()))
+
+    trip_services = trip_column("service_id")
     logging.info(
         "GTFS feed %s: %d service(s), %d trip(s), service on %d date(s).",
         Path(path).name,
@@ -1860,6 +2002,9 @@ def load_gtfs_feed(path: str) -> GtfsFeed:
             sid: regular_weekdays(dates, "Holiday" in labels.get(sid, ()))
             for sid, dates in active.items()
         },
+        trip_column("route_id"),
+        trip_column("direction_id"),
+        gtfs_trip_starts(path),
     )
 
 
@@ -1907,6 +2052,206 @@ def trip_date_stats(trips_performed: pd.DataFrame) -> pd.DataFrame:
     return stats
 
 
+def governing_feed(feeds: Sequence[GtfsFeed], day: dt.date) -> Optional[GtfsFeed]:
+    """Return the last feed that schedules any service on *day* (later feeds win)."""
+    chosen: Optional[GtfsFeed] = None
+    for feed in feeds:
+        if feed.services_by_date.get(day):
+            chosen = feed
+    return chosen
+
+
+def trip_records_by_date(
+    trips_performed: pd.DataFrame,
+) -> Dict[pd.Timestamp, Tuple[frozenset[str], frozenset[str]]]:
+    """Return, per service date, the scheduled trip IDs with any row and those canceled.
+
+    Args:
+        trips_performed: The TIDES ``trips_performed`` table (all rows).
+
+    Returns:
+        ``{date: (recorded trip_id_scheduled values, canceled ones)}``.
+    """
+    if "trip_id_scheduled" not in trips_performed.columns:
+        return {}
+    work = pd.DataFrame(
+        {
+            "service_date": _parse_dates(trips_performed["service_date"]),
+            "trip": trips_performed["trip_id_scheduled"].fillna("").astype(str).str.strip(),
+            "canceled": (
+                _casefolded(trips_performed["schedule_relationship"], "scheduled").isin(
+                    ["canceled", "cancelled"]
+                )
+                if "schedule_relationship" in trips_performed.columns
+                else False
+            ),
+        }
+    )
+    work = work.loc[work["service_date"].notna() & (work["trip"] != "")]
+    records: Dict[pd.Timestamp, Tuple[frozenset[str], frozenset[str]]] = {}
+    for stamp, sub in work.groupby("service_date"):
+        records[pd.Timestamp(str(stamp))] = (
+            frozenset(sub["trip"]),
+            frozenset(sub.loc[sub["canceled"], "trip"]),
+        )
+    return records
+
+
+def schedule_coverage(
+    dates: Iterable[pd.Timestamp],
+    feeds: Sequence[GtfsFeed],
+    records: Mapping[pd.Timestamp, Tuple[frozenset[str], frozenset[str]]],
+) -> pd.DataFrame:
+    """List every GTFS trip scheduled on each date and whether TIDES recorded it.
+
+    Each date uses its governing feed (:func:`governing_feed`). A trip counts as
+    recorded when ``trips_performed`` has a row with that ``trip_id_scheduled``
+    on that date, whatever its status; a Canceled row is recorded (its outcome is
+    known) and also counted as canceled.
+
+    Args:
+        dates: Service dates to check (midnight timestamps).
+        feeds: Loaded GTFS feeds, oldest first.
+        records: Output of :func:`trip_records_by_date`.
+
+    Returns:
+        One row per date and scheduled trip: ``service_date``, ``trip_id``,
+        ``route_id``, ``direction_id``, ``start_minutes`` (GTFS clock, NaN when
+        unknown), ``recorded`` and ``canceled``.
+    """
+    columns = [
+        "service_date",
+        "trip_id",
+        "route_id",
+        "direction_id",
+        "start_minutes",
+        "recorded",
+        "canceled",
+    ]
+    # Keyed by object identity: feeds in a series often share a file name.
+    trips_by_service: Dict[int, Dict[str, List[str]]] = {}
+    for feed in feeds:
+        by_service: Dict[str, List[str]] = {}
+        for trip_id, service_id in feed.trip_services.items():
+            by_service.setdefault(service_id, []).append(trip_id)
+        trips_by_service[id(feed)] = by_service
+    frames: List[pd.DataFrame] = []
+    for stamp in sorted({pd.Timestamp(d) for d in dates}):
+        feed = governing_feed(feeds, stamp.date())
+        if feed is None:
+            continue
+        trip_ids = [
+            trip_id
+            for service_id in sorted(feed.services_by_date[stamp.date()])
+            for trip_id in trips_by_service[id(feed)].get(service_id, [])
+        ]
+        if not trip_ids:
+            continue
+        recorded, canceled = records.get(stamp, (frozenset(), frozenset()))
+        frames.append(
+            pd.DataFrame(
+                {
+                    "service_date": stamp,
+                    "trip_id": trip_ids,
+                    "route_id": [feed.trip_routes.get(t, "") for t in trip_ids],
+                    "direction_id": [feed.trip_directions.get(t, "") for t in trip_ids],
+                    "start_minutes": [feed.trip_starts.get(t, np.nan) for t in trip_ids],
+                    "recorded": [t in recorded for t in trip_ids],
+                    "canceled": [t in canceled for t in trip_ids],
+                }
+            )
+        )
+    if not frames:
+        return pd.DataFrame(columns=columns)
+    return pd.concat(frames, ignore_index=True)[columns]
+
+
+def coverage_by_date(schedule: pd.DataFrame) -> pd.DataFrame:
+    """Count each date's scheduled trips and those with no TIDES record.
+
+    Args:
+        schedule: Output of :func:`schedule_coverage`.
+
+    Returns:
+        ``trips_scheduled`` and ``trips_without_record`` per service date.
+    """
+    if schedule.empty:
+        return pd.DataFrame(columns=["trips_scheduled", "trips_without_record"])
+    grouped = schedule.groupby("service_date")
+    return pd.DataFrame(
+        {
+            "trips_scheduled": grouped.size(),
+            "trips_without_record": grouped["recorded"].agg(lambda r: int((~r).sum())),
+        }
+    )
+
+
+def build_trip_coverage(
+    schedule: pd.DataFrame,
+    classification: pd.DataFrame,
+    periods: Sequence[TimePeriod],
+    day_order: Sequence[str],
+    max_trip_unrecorded_share: float = MAX_TRIP_UNRECORDED_SHARE,
+) -> pd.DataFrame:
+    """Summarize, per scheduled trip and day type, how often TIDES recorded it.
+
+    Args:
+        schedule: Output of :func:`schedule_coverage`.
+        classification: Output of :func:`classify_service_dates` (its
+            ``_stamp`` and ``_day_types`` give each date's day types).
+        periods: The checked time periods (to place each trip by its start).
+        day_order: Output order of the day types.
+        max_trip_unrecorded_share: Trips with no record on more than this share
+            of their scheduled dates are flagged.
+
+    Returns:
+        One row per day type and trip with ``days_scheduled``,
+        ``days_recorded``, ``days_canceled``, ``days_without_record``,
+        ``share_without_record`` and ``flagged``.
+    """
+    columns = [
+        "day_type",
+        "route_id",
+        "direction_id",
+        "trip_id",
+        "start_time",
+        "time_period",
+        "days_scheduled",
+        "days_recorded",
+        "days_canceled",
+        "days_without_record",
+        "share_without_record",
+        "flagged",
+    ]
+    dates = classification[["_stamp", "_day_types"]].explode("_day_types").dropna()
+    dates = dates.rename(columns={"_stamp": "service_date", "_day_types": "day_type"})
+    work = schedule.merge(dates, on="service_date", how="inner")
+    if work.empty:
+        return pd.DataFrame(columns=columns)
+    keys = ["day_type", "route_id", "direction_id", "trip_id"]
+    out = work.groupby(keys, as_index=False).agg(
+        start_minutes=("start_minutes", "min"),
+        days_scheduled=("service_date", "nunique"),
+        days_recorded=("recorded", "sum"),
+        days_canceled=("canceled", "sum"),
+    )
+    out["days_recorded"] = out["days_recorded"].astype(int)
+    out["days_canceled"] = out["days_canceled"].astype(int)
+    out["days_without_record"] = out["days_scheduled"] - out["days_recorded"]
+    out["share_without_record"] = (out["days_without_record"] / out["days_scheduled"]).round(3)
+    out["flagged"] = out["days_without_record"] / out["days_scheduled"] > max_trip_unrecorded_share
+    out["start_time"] = out["start_minutes"].map(minutes_to_hhmm)
+    lookup = period_lookup(periods)
+    known = out["start_minutes"].notna()
+    labels = pd.Series("", index=out.index, dtype="object")
+    labels.loc[known] = lookup[(out.loc[known, "start_minutes"] % MINUTES_PER_DAY).astype(int)]
+    out["time_period"] = labels
+    out = _sort_table(
+        out, ["day_type", "route_id", "direction_id", "start_minutes", "trip_id"], day_order
+    )
+    return out[columns]
+
+
 def classify_service_dates(
     dates: Iterable[pd.Timestamp],
     day_types: Mapping[str, Sequence[int]],
@@ -1917,6 +2262,8 @@ def classify_service_dates(
     max_unscheduled_share: float = MAX_UNSCHEDULED_SHARE,
     max_canceled_share: float = MAX_CANCELED_SHARE,
     visit_stats: Optional[pd.DataFrame] = None,
+    coverage_stats: Optional[pd.DataFrame] = None,
+    max_unrecorded_share: float = MAX_UNRECORDED_SHARE,
 ) -> pd.DataFrame:
     """Give each service date its day type(s), the reason, and any data-quality flag.
 
@@ -1929,7 +2276,9 @@ def classify_service_dates(
     A date is flagged when GTFS schedules no service that day, when more than
     *max_unscheduled_share* of the scheduled trip IDs that ran are not scheduled
     that day in the governing feed, when more than *max_canceled_share* of its
-    revenue trips were canceled, or when it has conflicting duplicate stop visits.
+    revenue trips were canceled, when more than *max_unrecorded_share* of the GTFS
+    trips scheduled that day have no ``trips_performed`` row at all, or when it has
+    conflicting duplicate stop visits.
 
     Args:
         dates: Service dates (midnight timestamps).
@@ -1943,6 +2292,8 @@ def classify_service_dates(
         visit_stats: Per-date stop-visit counts (``duplicate_visits_dropped``,
             ``conflicting_visits_dropped``, ``visits_missing_counts``,
             ``trips_missing_counts``), or ``None``.
+        coverage_stats: Output of :func:`coverage_by_date`, or ``None``.
+        max_unrecorded_share: Flag threshold for scheduled trips with no record.
 
     Returns:
         One row per date, in date order, with the published columns (see
@@ -1954,14 +2305,14 @@ def classify_service_dates(
     visit_counts: Dict[Any, Dict[Any, Any]] = (
         {} if visit_stats is None else visit_stats.to_dict("index")
     )
+    coverage: Dict[Any, Dict[Any, Any]] = (
+        {} if coverage_stats is None else coverage_stats.to_dict("index")
+    )
     rows: List[Dict[str, Any]] = []
     for stamp in sorted({pd.Timestamp(d) for d in dates}):
         day = stamp.date()
         weekday = WEEKDAY_NAMES[day.weekday()]
-        governing: Optional[GtfsFeed] = None
-        for feed in feeds:
-            if feed.services_by_date.get(day):
-                governing = feed  # later feeds win
+        governing = governing_feed(feeds, day)
         services = sorted(governing.services_by_date[day]) if governing else []
         labels = sorted(
             set().union(*(governing.service_labels.get(s, frozenset()) for s in services))
@@ -2005,6 +2356,14 @@ def classify_service_dates(
                         f"{share:.0%} of trips run are not scheduled on this date in GTFS "
                         f"({not_in_gtfs} not in trips.txt)"
                     )
+        scheduled = int(coverage.get(stamp, {}).get("trips_scheduled", 0) or 0)
+        unrecorded = int(coverage.get(stamp, {}).get("trips_without_record", 0) or 0)
+        unrecorded_share = unrecorded / scheduled if scheduled else 0.0
+        if scheduled and unrecorded_share > max_unrecorded_share:
+            reasons.append(
+                f"{unrecorded_share:.0%} of scheduled trips have no TIDES record "
+                f"({unrecorded} of {scheduled})"
+            )
         counts = {
             col: int(visit_counts.get(stamp, {}).get(col, 0) or 0)
             for col in (
@@ -2034,6 +2393,9 @@ def classify_service_dates(
                 "trips_checked_against_gtfs": checked,
                 "trips_not_scheduled": not_scheduled,
                 "trips_not_in_gtfs": not_in_gtfs,
+                "trips_scheduled": scheduled,
+                "trips_without_record": unrecorded,
+                "share_without_record": round(unrecorded_share, 3),
                 **counts,
                 "flagged": bool(reasons),
                 "flag_reason": "; ".join(reasons),
@@ -2081,8 +2443,15 @@ def log_date_classification(classification: pd.DataFrame, holiday_day_type: str)
             holiday_day_type,
             row["day_type_source"],
         )
-    for _, row in classification.loc[classification["flagged"]].iterrows():
-        logging.warning("%s is flagged: %s.", row["service_date"], row["flag_reason"])
+    flagged = classification.loc[classification["flagged"]]
+    if not flagged.empty:
+        listed = [f"{d} ({why})" for d, why in zip(flagged["service_date"], flagged["flag_reason"])]
+        logging.warning(
+            "%d service date(s) are flagged in %s: %s",
+            len(flagged),
+            DATE_CLASSIFICATION_FILENAME,
+            "; ".join(listed[:10]) + ("; ..." if len(listed) > 10 else ""),
+        )
     untyped = classification.loc[classification["day_type"] == "", "service_date"].tolist()
     if untyped:
         logging.info(
@@ -3445,6 +3814,58 @@ def _write_csv(table: pd.DataFrame, path: Path, files: List[Path]) -> None:
     files.append(path)
 
 
+def schedule_for_run(
+    audit_dates: Iterable[pd.Timestamp],
+    feeds: Sequence[GtfsFeed],
+    trips_performed: pd.DataFrame,
+    settings: RunSettings,
+) -> pd.DataFrame:
+    """Build the run's GTFS schedule (see :func:`schedule_coverage`) for the routes in TIDES.
+
+    The window runs from ``START_DATE`` (else the first audited date) to
+    ``END_DATE`` (else the last), so dates with no TIDES records at all are
+    included. Only routes with a ``trips_performed`` row in the window (and kept
+    by the route filters) are checked; GTFS routes the export lacks entirely are
+    named in a warning instead of flagging every date.
+
+    Args:
+        audit_dates: Dates already audited from the TIDES data.
+        feeds: Loaded GTFS feeds (empty skips the check).
+        trips_performed: The TIDES ``trips_performed`` table (all rows).
+        settings: The run settings (date range and route filters).
+
+    Returns:
+        The schedule rows; empty without feeds or dates.
+    """
+    dates = sorted(audit_dates)
+    if not feeds or (not dates and (settings.start_date is None or settings.end_date is None)):
+        return schedule_coverage([], feeds, {})
+    start = pd.Timestamp(settings.start_date) if settings.start_date else dates[0]
+    end = pd.Timestamp(settings.end_date) if settings.end_date else dates[-1]
+    schedule = schedule_coverage(
+        pd.date_range(start, end, freq="D"), feeds, trip_records_by_date(trips_performed)
+    )
+    if schedule.empty or "route_id" not in trips_performed.columns:
+        return schedule
+    trip_dates = _parse_dates(trips_performed["service_date"])
+    in_window = (trip_dates >= start) & (trip_dates <= end)
+    tides_routes = set(trips_performed.loc[in_window, "route_id"].dropna().astype(str).str.strip())
+    tides_routes.discard("")
+    wanted = set(schedule["route_id"])
+    if settings.routes_to_include:
+        wanted &= {str(r).strip() for r in settings.routes_to_include}
+    wanted -= {str(r).strip() for r in settings.routes_to_exclude}
+    absent = sorted(wanted - tides_routes)
+    if absent:
+        logging.warning(
+            "%d GTFS route(s) scheduled in the date range have no TIDES records at all and "
+            "are left out of the schedule checks: %s",
+            len(absent),
+            ", ".join(absent[:10]) + (" ..." if len(absent) > 10 else ""),
+        )
+    return schedule.loc[schedule["route_id"].isin(wanted & tides_routes)].reset_index(drop=True)
+
+
 def _resolve_run_settings(
     settings: RunSettings,
 ) -> Tuple[List[str], List[str], Dict[str, Tuple[int, ...]], List[str]]:
@@ -3496,6 +3917,8 @@ def _resolve_run_settings(
     for name, value in (
         ("MAX_UNSCHEDULED_SHARE", settings.max_unscheduled_share),
         ("MAX_CANCELED_SHARE", settings.max_canceled_share),
+        ("MAX_UNRECORDED_SHARE", settings.max_unrecorded_share),
+        ("MAX_TRIP_UNRECORDED_SHARE", settings.max_trip_unrecorded_share),
     ):
         if not 0.0 <= value <= 1.0:
             raise SettingsError(f"{name} must be between 0 and 1, not {value!r}.")
@@ -3555,6 +3978,11 @@ def run(settings: RunSettings) -> RunResult:
         in_range &= trip_stats.index <= pd.Timestamp(settings.end_date)
     audit_dates = set(joined["service_date"].unique()) | set(trip_stats.index[in_range])
     feeds = [load_gtfs_feed(str(path)) for path in settings.gtfs_paths]
+    schedule = schedule_for_run(audit_dates, feeds, trips, settings)
+    coverage_stats = coverage_by_date(schedule) if feeds else None
+    # Every date GTFS schedules in the range is audited, including dates with no
+    # TIDES records at all (a full AVL outage).
+    audit_dates |= set(schedule["service_date"].unique())
     classification = classify_service_dates(
         sorted(audit_dates),
         day_types,
@@ -3565,6 +3993,8 @@ def run(settings: RunSettings) -> RunResult:
         settings.max_unscheduled_share,
         settings.max_canceled_share,
         visit_stats,
+        coverage_stats,
+        settings.max_unrecorded_share,
     )
     classification["excluded"] = (classification["day_type"] == "") | (
         classification["flagged"] & settings.exclude_flagged_dates
@@ -3574,6 +4004,24 @@ def run(settings: RunSettings) -> RunResult:
     files: List[Path] = []
     out_dir = settings.output_dir
     _write_csv(published, out_dir / DATE_CLASSIFICATION_FILENAME, files)
+    trip_coverage = pd.DataFrame()
+    if feeds:
+        trip_coverage = build_trip_coverage(
+            schedule, classification, periods, order, settings.max_trip_unrecorded_share
+        )
+        _write_csv(trip_coverage, out_dir / TRIP_COVERAGE_FILENAME, files)
+        flagged_trips = int(trip_coverage["flagged"].sum()) if not trip_coverage.empty else 0
+        if flagged_trips:
+            logging.warning(
+                "%d scheduled trip(s) have no TIDES record on more than %.0f%% of their "
+                "scheduled dates; see %s.",
+                flagged_trips,
+                settings.max_trip_unrecorded_share * 100,
+                TRIP_COVERAGE_FILENAME,
+            )
+    elif (out_dir / TRIP_COVERAGE_FILENAME).exists():
+        (out_dir / TRIP_COVERAGE_FILENAME).unlink()
+        logging.info("No GTFS feed given; removed the previous %s.", TRIP_COVERAGE_FILENAME)
     written = f" {DATE_CLASSIFICATION_FILENAME} was still written."
     if matched.empty:
         raise InputDataError(NO_MATCH_MESSAGE + written)
@@ -3727,7 +4175,8 @@ def run(settings: RunSettings) -> RunResult:
         f"HOLIDAYS list:      {holidays_text} (day type {holiday})",
         f"GTFS feeds:         {', '.join(str(p) for p in settings.gtfs_paths) or '(none)'}",
         f"Date checks:        flag above {settings.max_unscheduled_share:.0%} of trips "
-        f"unscheduled or {settings.max_canceled_share:.0%} canceled; "
+        f"unscheduled, {settings.max_canceled_share:.0%} canceled or "
+        f"{settings.max_unrecorded_share:.0%} of scheduled trips without a record; "
         f"exclude flagged dates: {settings.exclude_flagged_dates}",
         f"Date range:         {settings.start_date or '(start)'} to {settings.end_date or '(end)'}",
         f"Time columns:       {', '.join(settings.time_columns)}",
@@ -3772,6 +4221,14 @@ def run(settings: RunSettings) -> RunResult:
             )
             or "(none)"
         ),
+        "Schedule coverage:  "
+        + (
+            f"{int(trip_coverage['flagged'].sum()) if not trip_coverage.empty else 0} trip(s) "
+            f"without a record on more than {settings.max_trip_unrecorded_share:.0%} of "
+            "their scheduled dates"
+            if feeds
+            else "(no GTFS)"
+        ),
         f"Low-ridership trips: {low_count}",
         f"Charts written:     {charts}",
     ]
@@ -3787,7 +4244,9 @@ def run(settings: RunSettings) -> RunResult:
             "Run log could not be written. Set REQUIRE_RUN_LOG = False to suppress this "
             "error when a sidecar file is genuinely impossible."
         )
-    return RunResult(ridership, max_load, by_trip, trip_rows, service_cut_tables, published, files)
+    return RunResult(
+        ridership, max_load, by_trip, trip_rows, service_cut_tables, published, trip_coverage, files
+    )
 
 
 # =============================================================================

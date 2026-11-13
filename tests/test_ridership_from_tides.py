@@ -4,7 +4,9 @@ Most end-to-end checks share one run on the repo TIDES fixtures (every level and
 time cut, charts off, day types from the mock GTFS feed) and compare it with an
 independent join of the same files. The fixtures' one holiday-service date is
 2026-01-01 (a Thursday running the 50H holiday loop); 2026-02-16, Washington's
-Birthday, runs regular weekday service in the mock feed.
+Birthday, runs regular weekday service in the mock feed. The mock TIDES export
+samples one block per route on a few dates, so runs on it switch the GTFS
+schedule coverage checks off; small synthetic feeds test those checks.
 """
 
 import datetime as dt
@@ -12,6 +14,7 @@ import logging
 import sys
 import zipfile
 from pathlib import Path
+from typing import Optional
 
 import pandas as pd
 import pytest
@@ -33,6 +36,8 @@ DEFAULT_PERIODS = target.build_time_periods(
     target.specs_from_mapping(target.TIME_PERIODS), "test defaults"
 )
 ALL_GRAINS = [(level, cut) for level in target.LEVELS for cut in target.TIME_CUTS]
+# The mock TIDES export is sampled, so most GTFS trips have no record on any date.
+SAMPLED_EXPORT = {"max_unrecorded_share": 1.0, "max_trip_unrecorded_share": 1.0}
 
 
 def _periods(*specs: str) -> list:
@@ -48,6 +53,7 @@ def _settings(tmp_path: Path, **overrides: object) -> "target.RunSettings":
         "output_dir": tmp_path,
         "periods": DEFAULT_PERIODS,
         "export_charts": False,
+        **SAMPLED_EXPORT,
     }
     base.update(overrides)
     return target.RunSettings(**base)
@@ -82,6 +88,7 @@ def full_run(tmp_path_factory: pytest.TempPathFactory) -> "target.RunResult":
         time_cuts=list(target.TIME_CUTS),
         gtfs_paths=[str(MOCK_GTFS)],
         export_charts=False,
+        **SAMPLED_EXPORT,
     )
     return target.run(settings)
 
@@ -829,12 +836,13 @@ def test_gtfs_series_later_feed_governs_and_gaps_are_flagged(tmp_path: Path) -> 
 
 
 def test_trip_ids_missing_from_gtfs_are_counted_and_flagged(tmp_path: Path) -> None:
-    """When no TIDES trip_id_scheduled is in trips.txt, every date is flagged."""
+    """When no TIDES trip_id_scheduled is in trips.txt, every date with trips is flagged."""
     feed = _gtfs_copy(tmp_path / "feed", trip_prefix="X")
     result = target.run(
         _settings(tmp_path / "out", levels=["system"], time_cuts=["all_day"], gtfs_paths=[feed])
     )
     classification = result.date_classification
+    classification = classification[classification["trips_run"] > 0]
     assert classification["flagged"].all()
     assert (classification["trips_not_in_gtfs"] == classification["trips_run"]).all()
     assert classification["flag_reason"].str.endswith("not in trips.txt)").all()
@@ -1147,6 +1155,218 @@ def test_blank_stop_sequences_are_not_treated_as_conflicts(tmp_path: Path) -> No
     assert audit["duplicate_visits_dropped"] == 1
     assert audit["conflicting_visits_dropped"] == 0
     assert not audit["flagged"]
+
+
+# --- GTFS schedule coverage: a small synthetic feed --------------------------------
+
+# Weekday service on route R1 (four trips, one past midnight on the GTFS clock) and
+# route R2 (one trip TIDES never records), Monday 2026-03-02 to Friday 2026-03-13.
+COVERAGE_STARTS = {"T1": "08:00:00", "T2": "12:00:00", "T3": "18:00:00", "T4": "24:30:00"}
+COVERAGE_DATES = [d.strftime("%Y-%m-%d") for d in pd.bdate_range("2026-03-02", "2026-03-13")]
+
+
+def _coverage_feed(dest: Path) -> Path:
+    """Write the synthetic weekday feed (calendar, trips and stop_times) into *dest*."""
+    dest.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        [
+            {
+                "service_id": "WK",
+                **{day: 1 for day in ("monday", "tuesday", "wednesday", "thursday", "friday")},
+                "saturday": 0,
+                "sunday": 0,
+                "start_date": "20260302",
+                "end_date": "20260313",
+            }
+        ]
+    ).to_csv(dest / "calendar.txt", index=False)
+    trips = [("R1", trip) for trip in COVERAGE_STARTS] + [("R2", "U1")]
+    pd.DataFrame(
+        [
+            {"route_id": route, "service_id": "WK", "trip_id": trip, "direction_id": "0"}
+            for route, trip in trips
+        ]
+    ).to_csv(dest / "trips.txt", index=False)
+    starts = {**COVERAGE_STARTS, "U1": "09:00:00"}
+    pd.DataFrame(
+        [
+            {
+                "trip_id": trip,
+                "arrival_time": time,
+                "departure_time": time,
+                "stop_id": f"S{seq}",
+                "stop_sequence": seq,
+            }
+            for trip, start in starts.items()
+            for seq, time in ((1, start), (2, f"{int(start[:2]) + 1:02d}:{start[3:]}"))
+        ]
+    ).to_csv(dest / "stop_times.txt", index=False)
+    return dest
+
+
+def _coverage_run(
+    tmp_path: Path, missing: dict, canceled: Optional[dict] = None, **overrides: object
+) -> tuple:
+    """Run the exporter on TIDES rows for the synthetic feed's R1 trips.
+
+    Args:
+        tmp_path: Test folder.
+        missing: ``{date: trip IDs with no trips_performed row}``; ``"all"`` leaves
+            the date out of TIDES entirely.
+        canceled: ``{date: trip IDs recorded as Canceled}``.
+        **overrides: RunSettings overrides (the coverage checks are on at 50%).
+    """
+    canceled = canceled or {}
+    trips, visits = [], []
+    for date in COVERAGE_DATES:
+        gone = missing.get(date, ())
+        if gone == "all":
+            continue
+        for trip in COVERAGE_STARTS:
+            if trip in gone:
+                continue
+            if trip in canceled.get(date, ()):
+                trips.append(_trip(date, trip, trip, rel="Canceled"))
+                continue
+            trips.append(_trip(date, trip, trip))
+            visits.append(_visit(date, trip, 1, 3))
+    settings: dict = {
+        "gtfs_paths": [_coverage_feed(tmp_path / "feed")],
+        "max_unrecorded_share": 0.5,
+        "max_trip_unrecorded_share": 0.5,
+        "max_canceled_share": 1.0,
+    }
+    settings.update(overrides)
+    return _synthetic_run(tmp_path, trips, visits, **settings)
+
+
+def test_dates_missing_most_scheduled_trips_are_flagged(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A partial outage over 50% is flagged, a whole missing day is listed, 25% passes."""
+    missing = {"2026-03-04": {"T2", "T3", "T4"}, "2026-03-05": "all", "2026-03-06": {"T4"}}
+    with caplog.at_level(logging.WARNING):
+        result, _ = _coverage_run(tmp_path, missing)
+    classification = result.date_classification.set_index("service_date")
+    assert classification.index.tolist() == COVERAGE_DATES
+    assert (classification["trips_scheduled"] == 4).all()
+    partial = classification.loc["2026-03-04"]
+    assert partial["flag_reason"] == "75% of scheduled trips have no TIDES record (3 of 4)"
+    whole = classification.loc["2026-03-05"]
+    assert (whole["trips_run"], whole["trips_without_record"]) == (0, 4)
+    assert whole["flag_reason"] == "100% of scheduled trips have no TIDES record (4 of 4)"
+    light = classification.loc["2026-03-06"]
+    assert (light["flagged"], light["share_without_record"]) == (False, 0.25)
+    assert classification.index[classification["flagged"]].tolist() == ["2026-03-04", "2026-03-05"]
+    # The missing day has no stop visits, so it is not in the averages' divisor.
+    assert result.ridership[("system", "all_day")]["days_observed"].tolist() == [9]
+    assert "have no TIDES records at all and are left out of the schedule checks: R2" in (
+        caplog.text
+    )
+    assert "2 service date(s) are flagged" in caplog.text
+
+
+def test_coverage_thresholds_of_one_switch_the_checks_off(tmp_path: Path) -> None:
+    """At 1.0 nothing is flagged for coverage, though the counts are still reported."""
+    missing = {"2026-03-04": {"T2", "T3", "T4"}, "2026-03-05": "all"}
+    result, _ = _coverage_run(
+        tmp_path, missing, max_unrecorded_share=1.0, max_trip_unrecorded_share=1.0
+    )
+    classification = result.date_classification
+    assert not classification["flagged"].any()
+    assert classification["trips_without_record"].sum() == 7
+    assert not result.trip_coverage["flagged"].any()
+
+
+def test_trips_missing_on_most_of_their_dates_are_flagged(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A trip missing on 6 of 10 dates is flagged though no single date passes 50%."""
+    t4_gone = COVERAGE_DATES[:6]
+    t3_gone = COVERAGE_DATES[5:]  # 5 of 10: exactly half is not flagged
+    missing = {
+        date: {t for t, gone in (("T3", t3_gone), ("T4", t4_gone)) if date in gone}
+        for date in COVERAGE_DATES
+    }
+    canceled = {COVERAGE_DATES[0]: {"T2"}, COVERAGE_DATES[1]: {"T2"}}
+    with caplog.at_level(logging.WARNING):
+        result, out = _coverage_run(tmp_path, missing, canceled)
+    assert not result.date_classification["flagged"].any()
+    coverage = result.trip_coverage.set_index("trip_id")
+    assert list(result.trip_coverage.columns) == [
+        "day_type",
+        "route_id",
+        "direction_id",
+        "trip_id",
+        "start_time",
+        "time_period",
+        "days_scheduled",
+        "days_recorded",
+        "days_canceled",
+        "days_without_record",
+        "share_without_record",
+        "flagged",
+    ]
+    assert coverage.index.tolist() == ["T1", "T2", "T3", "T4"]  # R2 is left out
+    assert (coverage["day_type"] == "Weekday").all()
+    assert coverage["start_time"].tolist() == ["08:00", "12:00", "18:00", "24:30"]
+    assert coverage["time_period"].tolist() == ["AM Peak", "Midday", "Late PM", "Night"]
+    assert coverage.loc["T4", ["days_without_record", "share_without_record"]].tolist() == [6, 0.6]
+    assert coverage["flagged"].tolist() == [False, False, False, True]
+    # A Canceled row is a record: the trip's outcome is known.
+    assert coverage.loc["T2", ["days_recorded", "days_canceled"]].tolist() == [10, 2]
+    assert coverage.loc["T2", "days_without_record"] == 0
+    written = pd.read_csv(out / target.TRIP_COVERAGE_FILENAME, dtype=str)
+    assert written["trip_id"].tolist() == ["T1", "T2", "T3", "T4"]
+    assert "1 scheduled trip(s) have no TIDES record on more than 50%" in caplog.text
+
+
+def test_end_date_extends_the_schedule_window(tmp_path: Path) -> None:
+    """Trailing dates with no TIDES records are audited only once END_DATE reaches them."""
+    missing = {date: "all" for date in COVERAGE_DATES[8:]}
+    result, _ = _coverage_run(tmp_path / "default", missing)
+    assert result.date_classification["service_date"].tolist() == COVERAGE_DATES[:8]
+    result, _ = _coverage_run(tmp_path / "end", missing, end_date=dt.date(2026, 3, 13))
+    classification = result.date_classification.set_index("service_date")
+    assert classification.index.tolist() == COVERAGE_DATES
+    assert classification.loc[COVERAGE_DATES[8:], "flagged"].all()
+
+
+def test_feeds_sharing_a_file_name_keep_their_own_trips() -> None:
+    """Each date takes its trips from its governing feed even when feed names repeat."""
+    old_day, new_day = dt.date(2026, 3, 2), dt.date(2026, 3, 9)
+    old = target.GtfsFeed(
+        "google_transit.zip",
+        {old_day: frozenset({"A"}), new_day: frozenset({"A"})},
+        {},
+        {"OLD1": "A"},
+        {},
+        {"OLD1": "R1"},
+        {"OLD1": "0"},
+        {},
+    )
+    new = old._replace(
+        services_by_date={new_day: frozenset({"B"})},
+        trip_services={"NEW1": "B"},
+        trip_routes={"NEW1": "R1"},
+        trip_directions={"NEW1": "0"},
+    )
+    stamps = [pd.Timestamp(old_day), pd.Timestamp(new_day)]
+    schedule = target.schedule_coverage(stamps, [old, new], {})
+    assert list(zip(schedule["service_date"], schedule["trip_id"])) == [
+        (stamps[0], "OLD1"),
+        (stamps[1], "NEW1"),
+    ]
+
+
+def test_trip_coverage_needs_gtfs_and_a_stale_copy_is_removed(tmp_path: Path) -> None:
+    """Without GTFS no coverage is checked, and an earlier trip_coverage.csv is removed."""
+    _, out = _coverage_run(tmp_path, {})
+    assert (out / target.TRIP_COVERAGE_FILENAME).exists()
+    result, out = _coverage_run(tmp_path, {}, gtfs_paths=[])
+    assert not (out / target.TRIP_COVERAGE_FILENAME).exists()
+    assert result.trip_coverage.empty
+    assert (result.date_classification["trips_scheduled"] == 0).all()
 
 
 # --- maximum load -----------------------------------------------------------------
