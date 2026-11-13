@@ -6,41 +6,45 @@
 # For the ArcGIS Pro environment, see requirements_arcpro.txt instead.
 # For dev/test tooling (pytest, ruff, ty, stubs), see requirements-dev.txt.
 # Note: packages shared with the ArcPro stack are listed in both files.
+# Version policy: packages that ArcPro-tier scripts import (the shared stack,
+# plus pulp) are capped at the newest release that still supports ArcGIS Pro's
+# Python 3.9 (see dev_tools/audit_python_floor.py). Open-source-only packages
+# (geopandas stack, rapidfuzz, requests, scikit-learn) are not capped.
 # -----------------------------------------------------------------------------
 
 # Core Data Science Libraries (also listed in requirements_arcpro.txt)
-pandas==2.2.3                # Data manipulation and analysis
-numpy==1.26.4                # Numerical computing
-scipy==1.12.0                # Scientific computing and optimization
+pandas==2.3.3                # Data manipulation and analysis
+numpy==2.0.2                 # Numerical computing
+scipy==1.13.1                # Scientific computing and optimization
 
 # Machine Learning (open-source stack only — NOT bundled with ArcGIS Pro)
 # Required by scripts/modeling/ridership_ml_model.py (random-forest + gradient-
 # boosting ridership models). The linear ridership_regression_model.py needs
 # none of this and still runs on the bare ArcGIS Pro numpy/scipy stack.
-scikit-learn==1.8.0          # Tree-ensemble ridership models + model selection
+scikit-learn==1.9.1          # Tree-ensemble ridership models + model selection
 
 # Network Analysis (also listed in requirements_arcpro.txt)
-networkx==2.8.4              # Graph and network analysis
+networkx==3.2.1              # Graph and network analysis
 
 # Visualization (also listed in requirements_arcpro.txt)
-matplotlib==3.6.0            # Plotting and visualization
-seaborn==0.12.1              # Statistical plotting
+matplotlib==3.9.4            # Plotting and visualization
+seaborn==0.13.2              # Statistical plotting
 
 # Excel File Support (also listed in requirements_arcpro.txt)
 openpyxl==3.1.5              # Read/write Excel .xlsx files
-xlrd==2.0.1                  # Read legacy Excel .xls files (no .xlsx support)
+xlrd==2.0.2                  # Read legacy Excel .xls files (no .xlsx support)
 
 # Geospatial Libraries (GeoPandas stack — open-source only)
-geopandas==1.1.1             # Geospatial data handling (open-source)
+geopandas==1.2.0             # Geospatial data handling (open-source)
 fiona==1.10.1                # Shapefile I/O engine (used for schema-controlled writes)
-shapely==2.1.2               # Geometry operations
-pyproj==3.7.1                # Coordinate reference systems and transformations
+shapely==2.2.0               # Geometry operations
+pyproj==3.8.0                # Coordinate reference systems and transformations
 
 # HTTP / Web Feeds
-requests==2.32.3             # Fetch GBFS and other web-hosted feeds
+requests==2.34.2             # Fetch GBFS and other web-hosted feeds
 
 # String Matching and Text Utilities
 rapidfuzz==3.14.6            # Fast fuzzy string matching
 
 # Optimization
-pulp==3.2.2                  # Linear programming solver interface (bundles CBC)
+pulp==3.3.1                  # Linear programming solver interface (bundles CBC)
