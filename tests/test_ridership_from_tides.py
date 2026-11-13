@@ -342,7 +342,7 @@ def test_period_boundaries_are_start_inclusive() -> None:
 
 
 def test_time_falls_back_through_columns() -> None:
-    """A blank actual time falls back to the next column; no time at all drops the row."""
+    """A blank actual time falls back to the next column; no time at all leaves no period."""
     df = pd.DataFrame(
         {
             "actual_departure_time": ["", None, "2026-01-05T12:00:00"],
@@ -350,9 +350,14 @@ def test_time_falls_back_through_columns() -> None:
         }
     )
     out = target.add_time_period(df, DEFAULT_PERIODS)
-    assert out.index.tolist() == [0, 2]
-    assert out["time_period"].tolist() == ["AM Peak", "Midday"]
-    assert out["_time_text"].tolist() == ["2026-01-05T07:00:00", "2026-01-05T12:00:00"]
+    assert out.index.tolist() == [0, 1, 2]
+    assert out["time_period"].iloc[[0, 2]].tolist() == ["AM Peak", "Midday"]
+    assert pd.isna(out["time_period"].iloc[1])
+    assert out["_time_text"].iloc[[0, 2]].tolist() == [
+        "2026-01-05T07:00:00",
+        "2026-01-05T12:00:00",
+    ]
+    assert pd.isna(out["_minute"].iloc[1])
 
 
 def test_missing_time_columns_raise() -> None:
@@ -757,7 +762,7 @@ def test_gtfs_finds_holiday_service_not_public_holidays(full_run: "target.RunRes
     classification = full_run.date_classification
     new_year = _date_row(classification, HOLIDAY)
     assert new_year["day_type"] == "Holiday"
-    assert new_year["day_type_source"] == "GTFS: no regular Weekday service"
+    assert new_year["day_type_source"] == "GTFS: no service that regularly runs Thursdays"
     assert new_year["gtfs_services"] == "holiday"
     presidents = _date_row(classification, PRESIDENTS_DAY)
     assert (presidents["day_type"], presidents["day_type_source"]) == ("Weekday", "DAY_TYPES")
@@ -890,7 +895,212 @@ def test_main_with_gtfs(tmp_path: Path) -> None:
     assert holiday["service_date"].tolist() == ["2026-01-01"]
     log = (out_dir / "ridership_from_tides_runlog.txt").read_text("utf-8")
     assert "mock_gtfs_dc.zip" in log
-    assert "2026-01-01 (GTFS: no regular Weekday service)" in log
+    assert "2026-01-01 (GTFS: no service that regularly runs Thursdays)" in log
+
+
+# --- review fixes: small synthetic TIDES tables ----------------------------------
+
+
+def _trip(date: str, trip_id: str, scheduled: str, rel: str = "Scheduled") -> dict:
+    """One in-service trips_performed row running 08:00-09:00."""
+    return {
+        "service_date": date,
+        "trip_id_performed": trip_id,
+        "trip_id_scheduled": scheduled,
+        "route_id": "R1",
+        "direction_id": "0",
+        "route_type_agency": "LOCAL",
+        "trip_type": "In service",
+        "schedule_relationship": rel,
+        "schedule_trip_start": f"{date}T08:00:00",
+        "schedule_trip_end": f"{date}T09:00:00",
+        "actual_trip_start": f"{date}T08:00:00",
+        "actual_trip_end": f"{date}T09:00:00",
+    }
+
+
+def _visit(date: str, trip_id: str, seq: int, b1: object, **extra: object) -> dict:
+    """One stop_visits row at 08:30 with *b1* door-1 boardings."""
+    row = {
+        "service_date": date,
+        "trip_id_performed": trip_id,
+        "trip_stop_sequence": seq,
+        "stop_id": f"S{seq}",
+        "boarding_1": b1,
+        "boarding_2": 0,
+        "alighting_1": 0,
+        "alighting_2": 0,
+        "departure_load": 5,
+        "schedule_relationship": "Scheduled",
+        "actual_departure_time": f"{date}T08:30:00",
+    }
+    row.update(extra)
+    return row
+
+
+def _synthetic_run(tmp_path: Path, trips: list, visits: list, **overrides: object) -> tuple:
+    """Write the tables and run the exporter (system level, all-day cut unless overridden)."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    sv, tp = tmp_path / "stop_visits.csv", tmp_path / "trips_performed.csv"
+    pd.DataFrame(visits).to_csv(sv, index=False)
+    pd.DataFrame(trips).to_csv(tp, index=False)
+    settings: dict = {"levels": ["system"], "time_cuts": ["all_day"]}
+    settings.update(overrides)
+    out = tmp_path / "out"
+    return target.run(_settings(out, stop_visits_path=sv, trips_performed_path=tp, **settings)), out
+
+
+def test_main_accepts_configured_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Paths edited in CONFIGURATION run (exit 0); only the shipped placeholders exit 2."""
+    monkeypatch.setattr(target, "STOP_VISITS_PATH", str(STOP_VISITS))
+    monkeypatch.setattr(target, "TRIPS_PERFORMED_PATH", str(TRIPS_PERFORMED))
+    monkeypatch.setattr(target, "OUTPUT_DIR", str(tmp_path / "out"))
+    assert target.main(["--levels", "system", "--time-cuts", "all_day", "--no-charts"]) == 0
+    assert target.main(["--output-dir", r"Path\To\Your\Output_Folder"]) == 2
+
+
+@pytest.mark.parametrize(
+    ("policy", "days", "boardings"),
+    [("drop_trip", 1, 12.0), ("drop_visit", 2, 16.0), ("zero", 2, 16.0)],
+)
+def test_missing_counts_policies(tmp_path: Path, policy: str, days: int, boardings: float) -> None:
+    """Missing counts drop the trip, drop the visit, or count as zero."""
+    trips = [_trip("2026-03-02", "A", "A"), _trip("2026-03-09", "B", "A")]
+    visits = [
+        _visit("2026-03-02", "A", 1, 10),
+        _visit("2026-03-02", "A", 2, 2, boarding_2=""),  # single-door counter: still counted
+        _visit("2026-03-09", "B", 1, 4),
+        _visit("2026-03-09", "B", 2, "", boarding_2=""),  # every boarding blank
+        _visit("2026-03-09", "B", 3, 9, schedule_relationship="Missing"),
+        _visit("2026-03-09", "B", 4, "n/a"),  # text that is not a number
+    ]
+    result, _ = _synthetic_run(tmp_path, trips, visits, missing_counts=policy)
+    row = result.ridership[("system", "all_day")].iloc[0]
+    assert (row["days_observed"], row["total_boardings"]) == (days, boardings)
+    audit = result.date_classification.set_index("service_date")
+    assert audit.loc["2026-03-09", "visits_missing_counts"] == 3
+    assert audit.loc["2026-03-09", "trips_missing_counts"] == 1
+    assert audit.loc["2026-03-02", "visits_missing_counts"] == 0
+    with pytest.raises(target.SettingsError, match="MISSING_COUNTS"):
+        target.run(_settings(tmp_path, missing_counts="ignore"))
+
+
+def test_pass_per_hour_divides_total_boardings_by_total_hours(tmp_path: Path) -> None:
+    """Two one-hour runs of one scheduled trip with 10 boardings each are 10 per hour."""
+    trips = [_trip("2026-03-02", "A1", "A"), _trip("2026-03-02", "A2", "A")]
+    visits = [_visit("2026-03-02", "A1", 1, 10), _visit("2026-03-02", "A2", 1, 10)]
+    result, _ = _synthetic_run(tmp_path, trips, visits)
+    row = result.trip_rows.iloc[0]
+    assert row["avg_daily_boardings"] == 20.0
+    assert row["pass_per_hour"] == pytest.approx(10.0)
+
+
+def test_duplicate_stop_visits_are_removed_or_flagged(tmp_path: Path) -> None:
+    """Exact duplicates are dropped; conflicting ones keep the first and flag the date."""
+    trips = [_trip("2026-03-02", "A", "A"), _trip("2026-03-09", "B", "A")]
+    exact = _visit("2026-03-02", "A", 1, 10)
+    visits = [
+        exact,
+        dict(exact),
+        _visit("2026-03-02", "A", 2, 10),
+        _visit("2026-03-09", "B", 1, 7),
+        _visit("2026-03-09", "B", 1, 99),  # same key, different count
+    ]
+    result, out = _synthetic_run(tmp_path, trips, visits)
+    assert result.ridership[("system", "all_day")]["total_boardings"].sum() == 27.0
+    log = (out / "ridership_from_tides_runlog.txt").read_text("utf-8")
+    assert "Total boardings:    27" in log
+    audit = result.date_classification.set_index("service_date")
+    assert audit.loc["2026-03-02", "duplicate_visits_dropped"] == 1
+    assert not audit.loc["2026-03-02", "flagged"]
+    assert audit.loc["2026-03-09", "conflicting_visits_dropped"] == 1
+    assert "1 conflicting duplicate stop visit(s)" in audit.loc["2026-03-09", "flag_reason"]
+
+
+def test_saturdays_on_a_monday_to_saturday_service_are_not_holidays(tmp_path: Path) -> None:
+    """A Mon-Sat service is regular on Saturdays even though its label is Weekday only."""
+    feed_dir = tmp_path / "feed"
+    feed_dir.mkdir()
+    pd.DataFrame(
+        [
+            {
+                "service_id": "MS",
+                "monday": 1,
+                "tuesday": 1,
+                "wednesday": 1,
+                "thursday": 1,
+                "friday": 1,
+                "saturday": 1,
+                "sunday": 0,
+                "start_date": "20260101",
+                "end_date": "20261231",
+            }
+        ]
+    ).to_csv(feed_dir / "calendar.txt", index=False)
+    pd.DataFrame([{"route_id": "R1", "service_id": "MS", "trip_id": "A"}]).to_csv(
+        feed_dir / "trips.txt", index=False
+    )
+    feed = target.load_gtfs_feed(str(feed_dir))
+    assert feed.service_labels["MS"] == frozenset({"Weekday"})
+    assert feed.regular_weekdays["MS"] == frozenset(range(6))
+    dates = pd.to_datetime(["2026-03-07", "2026-03-08"])  # a Saturday and a Sunday
+    day_types = target.build_day_types(target.DAY_TYPES)
+    classification = target.classify_service_dates(dates, day_types, feeds=[feed])
+    assert classification["day_type"].tolist() == ["Saturday", "Sunday"]
+    assert classification.loc[1, "flag_reason"] == "GTFS schedules no service on this date"
+
+
+def test_regular_weekdays_ignore_one_off_and_holiday_only_dates() -> None:
+    """Sunday service added on one Wednesday is not regular on Wednesdays."""
+    sundays = [dt.date(2026, 1, 4) + dt.timedelta(weeks=w) for w in range(52)]
+    assert target.regular_weekdays([*sundays, dt.date(2026, 11, 11)]) == frozenset({6})
+    assert target.regular_weekdays(sundays, is_holiday_only=True) == frozenset()
+
+
+def test_visits_without_a_time_stay_in_tables_without_a_time_of_day(tmp_path: Path) -> None:
+    """A visit with no readable time counts all day and by month, not by period or hour."""
+    trips = [_trip("2026-03-02", "A", "A")]
+    visits = [
+        _visit("2026-03-02", "A", 1, 10),
+        _visit("2026-03-02", "A", 2, 10, actual_departure_time=""),
+    ]
+    result, _ = _synthetic_run(
+        tmp_path, trips, visits, time_cuts=["all_day", "month", "time_period", "hour"]
+    )
+    totals = {
+        cut: result.ridership[("system", cut)]["total_boardings"].sum()
+        for cut in target.TIME_CUTS
+        if ("system", cut) in result.ridership
+    }
+    assert totals == {"all_day": 20.0, "time_period": 10.0, "hour": 10.0, "month": 20.0}
+    only_all_day, _ = _synthetic_run(tmp_path / "all_day", trips, visits)
+    assert only_all_day.ridership[("system", "all_day")]["total_boardings"].sum() == 20.0
+
+
+def test_low_ridership_file_is_never_stale(tmp_path: Path) -> None:
+    """A run flagging nothing leaves a header-only file; switching the flag off removes it."""
+    trips, visits = [_trip("2026-03-02", "A", "A")], [_visit("2026-03-02", "A", 1, 1)]
+    _, out = _synthetic_run(tmp_path, trips, visits, low_ridership_threshold=100.0)
+    assert len(pd.read_csv(out / "low_ridership_trips.csv")) == 1
+    _, out = _synthetic_run(tmp_path, trips, visits, low_ridership_threshold=0.5)
+    flagged = pd.read_csv(out / "low_ridership_trips.csv")
+    assert flagged.empty and "pass_per_hour" in flagged.columns
+    _, out = _synthetic_run(tmp_path, trips, visits, low_ridership_threshold=0.0)
+    assert not (out / "low_ridership_trips.csv").exists()
+
+
+def test_fully_canceled_date_is_audited_and_flagged(tmp_path: Path) -> None:
+    """A date whose trips were all canceled has no stop visits but is listed and flagged."""
+    trips = [_trip("2026-03-02", "A", "A"), _trip("2026-03-09", "B", "A", rel="Canceled")]
+    result, _ = _synthetic_run(tmp_path, trips, [_visit("2026-03-02", "A", 1, 10)])
+    audit = result.date_classification.set_index("service_date")
+    assert audit.index.tolist() == ["2026-03-02", "2026-03-09"]
+    assert audit.loc["2026-03-09", "flag_reason"] == "100% of revenue trips canceled"
+    assert result.ridership[("system", "all_day")]["days_observed"].tolist() == [1]
+    outside, _ = _synthetic_run(
+        tmp_path / "range", trips, [_visit("2026-03-02", "A", 1, 10)], end_date=dt.date(2026, 3, 5)
+    )
+    assert outside.date_classification["service_date"].tolist() == ["2026-03-02"]
 
 
 # --- maximum load -----------------------------------------------------------------

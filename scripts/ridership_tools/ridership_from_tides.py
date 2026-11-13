@@ -32,8 +32,9 @@ Outputs
 - ``max_load/``: each performed trip's maximum ``departure_load``, peak load point and
   load factor, plus rollups for the system, service_type, route, route_direction and
   trip levels.
-- ``date_classification.csv``: each service date's day type and why, and a flag when
-  its trips do not match the GTFS schedule or many were canceled.
+- ``date_classification.csv``: each service date's day type and why, its missing and
+  duplicate visits, and a flag when its trips do not match the GTFS schedule, many
+  were canceled, or its stop visits conflict.
 - ``service_cut_inputs/ridership_by_trip_<day type>.csv``: the ``RIDERSHIP_CSV`` input of
   ``service_cut_impact_gpd.py``.
 - ``low_ridership_trips.csv``, ``charts/`` and a run log with the CONFIGURATION block.
@@ -42,7 +43,8 @@ Limitations
 -----------
 - Counts are raw APC observations, not expanded to systemwide estimates.
 - Canceled and non-revenue trips are dropped. Skipped visits are left out of ridership
-  but kept for maximum load.
+  but kept for maximum load. Visits without usable counts follow ``MISSING_COUNTS``
+  (by default their whole trip is left out), and exact duplicate visits are dropped.
 - A trip that crosses a period or hour boundary counts in both; maximum load places
   each trip by its start time instead.
 
@@ -159,12 +161,32 @@ HOLIDAY_DAY_TYPE: str = "Holiday"
 START_DATE: Optional[str] = None
 END_DATE: Optional[str] = None
 
+# DATA QUALITY ----------------------------------------------------------------
+# How stop visits without usable APC counts are treated. A visit's counts are
+# missing when its schedule_relationship is "Missing", when every boarding (or
+# every alighting) column is blank, or when a count column holds text that is
+# not a number. A blank door-2 column beside a filled door-1 column counts as 0
+# (single-door counters). Choices:
+#   "drop_trip"  - the whole performed trip counts as unobserved: it is left out
+#                  of ridership, trip averages and the low-ridership flag, so a
+#                  partly counted trip never reads as a low-ridership trip
+#   "drop_visit" - only the visits with missing counts are left out
+#   "zero"       - missing counts count as 0 (understates ridership)
+# Maximum load still uses departure_load wherever it is filled. The date table
+# reports the visits and trips with missing counts on each date.
+MISSING_COUNTS: str = "drop_trip"
+
+# Exact duplicate stop visits are always removed. Stop visits that share a
+# service_date, trip_id_performed and trip_stop_sequence but differ elsewhere
+# conflict: the first is kept, and the date is flagged in date_classification.csv.
+
 # DATE CHECKS -----------------------------------------------------------------
 # date_classification.csv flags a service date when more than
 # MAX_UNSCHEDULED_SHARE of the revenue trips that ran are not scheduled that day
 # in GTFS (another schedule ran, or trip IDs do not match the feed), when GTFS
-# schedules no service that day, or when more than MAX_CANCELED_SHARE of the
-# day's revenue trips in trips_performed are Canceled (heavy cuts, e.g. weather).
+# schedules no service that day, when more than MAX_CANCELED_SHARE of the day's
+# revenue trips in trips_performed are Canceled (heavy cuts, e.g. weather), or
+# when it has conflicting duplicate stop visits.
 # The thresholds are judgment calls; set one to 1.0 to switch its check off.
 MAX_UNSCHEDULED_SHARE: float = 0.10
 MAX_CANCELED_SHARE: float = 0.20
@@ -309,17 +331,6 @@ WEEKDAY_NAMES: Tuple[str, ...] = (
     "Sunday",
 )
 
-# GTFS service label that a regular service on each weekday (Monday = 0) carries.
-REGULAR_SERVICE_LABEL: Tuple[str, ...] = (
-    "Weekday",
-    "Weekday",
-    "Weekday",
-    "Weekday",
-    "Weekday",
-    "Saturday",
-    "Sunday",
-)
-
 MINUTES_PER_DAY: int = 24 * 60
 BLANK_LABEL: str = "(blank)"
 UNCLASSIFIED: str = "UNCLASSIFIED"
@@ -358,6 +369,27 @@ LOW_RIDERSHIP_FILENAME: str = "low_ridership_trips.csv"
 DATE_CLASSIFICATION_FILENAME: str = "date_classification.csv"
 RUN_LOG_FILENAME: str = "ridership_from_tides_runlog.txt"
 RUN_LOG_TITLE: str = "RIDERSHIP FROM TIDES RUN LOG"
+
+# The CONFIGURATION placeholders, kept here so an edited path is never mistaken
+# for one (comparing against the settings themselves rejects every edited path).
+PLACEHOLDER_PATHS: frozenset[str] = frozenset(
+    {
+        r"Path\To\Your\stop_visits.csv",
+        r"Path\To\Your\trips_performed.csv",
+        r"Path\To\Your\Output_Folder",
+    }
+)
+
+# MISSING_COUNTS choices.
+MISSING_COUNTS_CHOICES: Tuple[str, ...] = ("drop_trip", "drop_visit", "zero")
+
+# Columns that identify one stop visit (the trip_stop_sequence is optional in
+# some exports; without it only exact duplicates are removed).
+VISIT_KEY: Tuple[str, ...] = ("service_date", "trip_id_performed", "trip_stop_sequence")
+
+# A GTFS service is a regular service for a weekday when it runs on at least
+# this share of that weekday's dates between its first and last service date.
+REGULAR_WEEKDAY_SHARE: float = 0.5
 
 # Chart styling: series hues and neutral ink from the repo's chart palette.
 _SERIES_COLORS: Tuple[str, ...] = ("#2a78d6", "#e08b2c")
@@ -446,6 +478,7 @@ class RunSettings(NamedTuple):
     max_unscheduled_share: float = MAX_UNSCHEDULED_SHARE
     max_canceled_share: float = MAX_CANCELED_SHARE
     exclude_flagged_dates: bool = EXCLUDE_FLAGGED_DATES
+    missing_counts: str = MISSING_COUNTS
     low_ridership_measure: str = LOW_RIDERSHIP_MEASURE
     low_ridership_threshold: float = LOW_RIDERSHIP_THRESHOLD
     export_service_cut_tables: bool = EXPORT_SERVICE_CUT_TRIP_TABLES
@@ -1307,12 +1340,15 @@ def parse_optional_date(value: Optional[str], setting: str) -> Optional[dt.date]
 # =============================================================================
 
 
-def load_tides_csv(path: Path, table: str) -> pd.DataFrame:
+def load_tides_csv(path: Path, table: str, keep_text: bool = False) -> pd.DataFrame:
     """Read a TIDES CSV with every column as text.
 
     Args:
         path: The CSV file.
         table: The table's name, for error messages.
+        keep_text: Treat only empty fields as blank, keeping placeholder text
+            such as ``n/a`` or ``NULL`` (which pandas would otherwise blank), so
+            a count column holding it reads as a missing count, not a blank door.
 
     Returns:
         The table, all columns as strings.
@@ -1321,6 +1357,10 @@ def load_tides_csv(path: Path, table: str) -> pd.DataFrame:
         InputDataError: If the file is empty or cannot be parsed as CSV.
     """
     try:
+        if keep_text:
+            return pd.read_csv(
+                path, dtype=str, low_memory=False, keep_default_na=False, na_values=[""]
+            )
         return pd.read_csv(path, dtype=str, low_memory=False)
     except (pd.errors.EmptyDataError, pd.errors.ParserError, UnicodeError) as exc:
         raise InputDataError(f"Could not read {table} from '{path}': {exc}") from exc
@@ -1442,13 +1482,20 @@ def drop_skipped(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def add_ridership(df: pd.DataFrame) -> pd.DataFrame:
-    """Add ``boardings`` and ``alightings`` columns (both doors summed; blanks count 0).
+    """Add ``boardings``, ``alightings`` and ``_missing_counts`` columns.
+
+    Both doors are summed, and a blank door counts 0 when another door holds a
+    count. A visit's counts are missing (``_missing_counts`` True) when its
+    ``schedule_relationship`` is Missing, when every boarding (or every
+    alighting) column is blank, or when any count column holds text that is not
+    a number; :func:`apply_missing_counts` decides what happens to those visits.
 
     Args:
         df: Stop visits carrying the per-door APC count columns.
 
     Returns:
-        A copy of *df* with float ``boardings`` and ``alightings`` columns.
+        A copy of *df* with float ``boardings`` and ``alightings`` (missing
+        counts as 0) and a boolean ``_missing_counts``.
 
     Raises:
         InputDataError: If no boarding count column is present.
@@ -1466,12 +1513,125 @@ def add_ridership(df: pd.DataFrame) -> pd.DataFrame:
             ", ".join(ALIGHTING_COLUMNS),
         )
     out = df.copy()
+    missing = pd.Series(False, index=out.index)
+    if "schedule_relationship" in out.columns:
+        missing |= _casefolded(out["schedule_relationship"], "scheduled") == "missing"
     for target, cols in (("boardings", boarding_cols), ("alightings", alighting_cols)):
         total = pd.Series(0.0, index=out.index)
+        all_blank = pd.Series(bool(cols), index=out.index)
         for col in cols:
-            total += pd.to_numeric(out[col], errors="coerce").fillna(0.0)
+            text = out[col].astype("string").str.strip()
+            blank = (text.isna() | (text == "")).fillna(True).astype(bool)
+            numbers = pd.to_numeric(text.where(~blank), errors="coerce").astype("float64")
+            missing |= ~blank & numbers.isna()  # text that is not a number
+            all_blank &= blank
+            total += numbers.fillna(0.0)
+        missing |= all_blank
         out[target] = total
+    out["_missing_counts"] = missing.to_numpy(dtype=bool)
     return out
+
+
+def apply_missing_counts(df: pd.DataFrame, policy: str = MISSING_COUNTS) -> pd.DataFrame:
+    """Treat visits with missing counts as ``MISSING_COUNTS`` says.
+
+    Args:
+        df: Output of :func:`add_ridership`.
+        policy: ``"drop_trip"`` leaves out every visit of a performed trip that
+            has any missing visit; ``"drop_visit"`` leaves out only the missing
+            visits; ``"zero"`` keeps them with 0 counts.
+
+    Returns:
+        The visits kept.
+    """
+    missing = df["_missing_counts"]
+    if not missing.any():
+        return df
+    trips = df.loc[missing, ["service_date", "trip_id_performed"]].drop_duplicates()
+    if policy == "zero":
+        logging.warning(
+            "%d stop visit(s) on %d trip(s) have missing counts; they count as 0 "
+            "(MISSING_COUNTS = 'zero').",
+            int(missing.sum()),
+            len(trips),
+        )
+        out = df.copy()
+        out.loc[missing, ["boardings", "alightings"]] = 0.0
+        return out
+    if policy == "drop_visit":
+        logging.warning(
+            "Left out %d stop visit(s) with missing counts (MISSING_COUNTS = 'drop_visit').",
+            int(missing.sum()),
+        )
+        return df.loc[~missing]
+    keys = pd.MultiIndex.from_frame(df[["service_date", "trip_id_performed"]])
+    drop = keys.isin(pd.MultiIndex.from_frame(trips))
+    logging.warning(
+        "Left out %d trip(s) (%d stop visits) with missing counts as unobserved "
+        "(MISSING_COUNTS = 'drop_trip').",
+        len(trips),
+        int(drop.sum()),
+    )
+    return df.loc[~drop]
+
+
+def missing_count_stats(visits: pd.DataFrame) -> pd.DataFrame:
+    """Count the visits and performed trips with missing counts on each date.
+
+    Args:
+        visits: Output of :func:`add_ridership`.
+
+    Returns:
+        ``visits_missing_counts`` and ``trips_missing_counts`` per service date.
+    """
+    missing = visits.loc[visits["_missing_counts"]]
+    return pd.DataFrame(
+        {
+            "visits_missing_counts": missing.groupby("service_date").size(),
+            "trips_missing_counts": missing.groupby("service_date")["trip_id_performed"].nunique(),
+        }
+    )
+
+
+def dedupe_stop_visits(stop_visits: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Remove exact duplicate stop visits and the later copies of conflicting ones.
+
+    Visits conflict when they share ``service_date`` (compared parsed),
+    ``trip_id_performed`` and ``trip_stop_sequence`` but differ elsewhere; the
+    first is kept. Without a ``trip_stop_sequence`` column only exact duplicates
+    are removed.
+
+    Args:
+        stop_visits: The TIDES ``stop_visits`` table as read.
+
+    Returns:
+        The de-duplicated table, and ``duplicate_visits_dropped`` /
+        ``conflicting_visits_dropped`` per service date (midnight timestamps).
+    """
+    exact = stop_visits.duplicated(keep="first")
+    out = stop_visits.loc[~exact]
+    conflict = pd.Series(False, index=out.index)
+    if all(col in out.columns for col in VISIT_KEY):
+        keyed = out[list(VISIT_KEY)].assign(service_date=_parse_dates(out["service_date"]))
+        conflict = keyed.duplicated(keep="first")
+    if exact.any():
+        logging.warning("Removed %d exact duplicate stop visit(s).", int(exact.sum()))
+    if conflict.any():
+        logging.warning(
+            "%d stop visit(s) repeat a service_date + trip_id_performed + trip_stop_sequence "
+            "with different values; the first of each is kept and the dates are flagged.",
+            int(conflict.sum()),
+        )
+    dates = _parse_dates(stop_visits["service_date"])
+    stats = pd.DataFrame(
+        {
+            "duplicate_visits_dropped": exact.groupby(dates).sum(),
+            "conflicting_visits_dropped": conflict.reindex(stop_visits.index, fill_value=False)
+            .groupby(dates)
+            .sum(),
+        }
+    ).astype(int)
+    return out.loc[~conflict], stats
 
 
 def add_trip_key(df: pd.DataFrame) -> pd.DataFrame:
@@ -1539,6 +1699,41 @@ class GtfsFeed(NamedTuple):
     services_by_date: Dict[dt.date, frozenset[str]]  # date -> service_ids scheduled
     service_labels: Dict[str, frozenset[str]]  # service_id -> Weekday/Saturday/Sunday/Holiday
     trip_services: Dict[str, str]  # trip_id -> service_id
+    regular_weekdays: Dict[str, frozenset[int]]  # service_id -> weekdays it regularly runs
+
+
+def regular_weekdays(
+    dates: Iterable[dt.date],
+    is_holiday_only: bool = False,
+    min_share: float = REGULAR_WEEKDAY_SHARE,
+) -> frozenset[int]:
+    """Return the weekdays (Monday = 0) a service regularly runs on.
+
+    A weekday is regular when the service runs on at least *min_share* of that
+    weekday's dates between its first and last service date, so a Monday-to-
+    Saturday service is regular on Saturdays too, while Sunday service added on
+    one holiday Wednesday is not regular on Wednesdays. A holiday-only service
+    (labeled Holiday by ``classify_service_ids``) is never regular.
+
+    Args:
+        dates: The service's active dates.
+        is_holiday_only: Whether the service is holiday-only.
+        min_share: Share of a weekday's dates the service must run on.
+
+    Returns:
+        The regular weekdays.
+    """
+    days = sorted(set(dates))
+    if is_holiday_only or not days:
+        return frozenset()
+    possible = [0] * 7
+    span = (days[-1] - days[0]).days + 1
+    for offset in range(span):
+        possible[(days[0] + dt.timedelta(days=offset)).weekday()] += 1
+    ran = [0] * 7
+    for day in days:
+        ran[day.weekday()] += 1
+    return frozenset(w for w in range(7) if possible[w] and ran[w] / possible[w] >= min_share)
 
 
 def load_gtfs_feed(path: str) -> GtfsFeed:
@@ -1606,6 +1801,10 @@ def load_gtfs_feed(path: str) -> GtfsFeed:
         {day: frozenset(sids) for day, sids in by_date.items()},
         {sid: frozenset(labs) for sid, labs in labels.items()},
         trip_services,
+        {
+            sid: regular_weekdays(dates, "Holiday" in labels.get(sid, ()))
+            for sid, dates in active.items()
+        },
     )
 
 
@@ -1662,19 +1861,20 @@ def classify_service_dates(
     trip_stats: Optional[pd.DataFrame] = None,
     max_unscheduled_share: float = MAX_UNSCHEDULED_SHARE,
     max_canceled_share: float = MAX_CANCELED_SHARE,
+    visit_stats: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """Give each service date its day type(s), the reason, and any data-quality flag.
 
     A date is a holiday when it is in *holidays*, or when GTFS schedules service
-    that day but none of it carries the regular label of the date's weekday (a
-    Wednesday with only Sunday or holiday-only service). Any other date gets
-    every ``DAY_TYPES`` entry listing its weekday. With several feeds, the last
-    one scheduling service on a date governs it.
+    that day but none of it regularly runs on that weekday (a Wednesday with only
+    Sunday or holiday-only service; see :func:`regular_weekdays`). Any other date
+    gets every ``DAY_TYPES`` entry listing its weekday. With several feeds, the
+    last one scheduling service on a date governs it.
 
     A date is flagged when GTFS schedules no service that day, when more than
     *max_unscheduled_share* of the scheduled trip IDs that ran are not scheduled
-    that day in the governing feed, or when more than *max_canceled_share* of its
-    revenue trips were canceled.
+    that day in the governing feed, when more than *max_canceled_share* of its
+    revenue trips were canceled, or when it has conflicting duplicate stop visits.
 
     Args:
         dates: Service dates (midnight timestamps).
@@ -1685,6 +1885,9 @@ def classify_service_dates(
         trip_stats: Output of :func:`trip_date_stats`, or ``None``.
         max_unscheduled_share: Flag threshold for trips run but not scheduled.
         max_canceled_share: Flag threshold for canceled revenue trips.
+        visit_stats: Per-date stop-visit counts (``duplicate_visits_dropped``,
+            ``conflicting_visits_dropped``, ``visits_missing_counts``,
+            ``trips_missing_counts``), or ``None``.
 
     Returns:
         One row per date, in date order, with the published columns (see
@@ -1692,11 +1895,14 @@ def classify_service_dates(
         building the date table.
     """
     manual = set(holidays)
-    stats: Dict[Any, Dict[str, Any]] = {} if trip_stats is None else trip_stats.to_dict("index")
+    stats: Dict[Any, Dict[Any, Any]] = {} if trip_stats is None else trip_stats.to_dict("index")
+    visit_counts: Dict[Any, Dict[Any, Any]] = (
+        {} if visit_stats is None else visit_stats.to_dict("index")
+    )
     rows: List[Dict[str, Any]] = []
     for stamp in sorted({pd.Timestamp(d) for d in dates}):
         day = stamp.date()
-        regular = REGULAR_SERVICE_LABEL[day.weekday()]
+        weekday = WEEKDAY_NAMES[day.weekday()]
         governing: Optional[GtfsFeed] = None
         for feed in feeds:
             if feed.services_by_date.get(day):
@@ -1707,10 +1913,13 @@ def classify_service_dates(
             if governing
             else set()
         )
+        regular = governing is not None and any(
+            day.weekday() in governing.regular_weekdays.get(s, frozenset()) for s in services
+        )
         if day in manual:
             types, source = [holiday_day_type], "HOLIDAYS"
-        elif services and regular not in labels:
-            types, source = [holiday_day_type], f"GTFS: no regular {regular} service"
+        elif services and not regular:
+            types, source = [holiday_day_type], f"GTFS: no service that regularly runs {weekday}s"
         else:
             types = [name for name, numbers in day_types.items() if day.weekday() in numbers]
             source = "DAY_TYPES" if types else "DAY_TYPES (weekday in no day type)"
@@ -1741,10 +1950,24 @@ def classify_service_dates(
                         f"{share:.0%} of trips run are not scheduled on this date in GTFS "
                         f"({not_in_gtfs} not in trips.txt)"
                     )
+        counts = {
+            col: int(visit_counts.get(stamp, {}).get(col, 0) or 0)
+            for col in (
+                "visits_missing_counts",
+                "trips_missing_counts",
+                "duplicate_visits_dropped",
+                "conflicting_visits_dropped",
+            )
+        }
+        if counts["conflicting_visits_dropped"]:
+            reasons.append(
+                f"{counts['conflicting_visits_dropped']} conflicting duplicate stop visit(s) "
+                "(the first of each kept)"
+            )
         rows.append(
             {
                 "service_date": day.isoformat(),
-                "weekday": WEEKDAY_NAMES[day.weekday()],
+                "weekday": weekday,
                 "day_type": " / ".join(types),
                 "day_type_source": source,
                 "gtfs_feed": governing.name if governing else "",
@@ -1756,6 +1979,7 @@ def classify_service_dates(
                 "trips_checked_against_gtfs": checked,
                 "trips_not_scheduled": not_scheduled,
                 "trips_not_in_gtfs": not_in_gtfs,
+                **counts,
                 "flagged": bool(reasons),
                 "flag_reason": "; ".join(reasons),
                 "_stamp": stamp,
@@ -1980,32 +2204,42 @@ def add_time_period(
     df: pd.DataFrame,
     periods: Sequence[TimePeriod],
     time_columns: Sequence[str] = TIME_COLUMNS,
+    required: bool = True,
 ) -> pd.DataFrame:
     """Add a ``time_period`` column from each visit's clock time.
 
     The first readable value among *time_columns* gives the time of day. Visits
-    with no readable time are counted in a warning and left out. The value used
-    is kept in ``_time_text`` (and its clock minute in ``_minute``) for
-    :func:`add_service_hour`.
+    with no readable time keep a blank ``time_period``: they still count in the
+    tables that need no time of day (all day, month) and are left out of the
+    time-period and hour tables. The value used is kept in ``_time_text`` (and
+    its clock minute in ``_minute``) for :func:`add_service_hour`.
 
     Args:
         df: Stop visits.
         periods: Checked time periods covering the whole day.
         time_columns: Columns to try, in order.
+        required: Whether a time of day is needed (a time-period or hour table
+            is being built). When False, missing *time_columns* are not an error.
 
     Returns:
-        A copy of *df* (minus unreadable rows) with a ``time_period`` column.
+        A copy of *df* with ``time_period`` (None where no time is readable),
+        ``_minute`` (NaN there) and ``_time_text``.
 
     Raises:
-        InputDataError: If none of *time_columns* is present, or no visit has a
-            readable time.
+        InputDataError: If *required* and none of *time_columns* is present.
     """
+    out = df.copy()
     present = [c for c in time_columns if c in df.columns]
     if not present:
-        raise InputDataError(
-            f"stop_visits has none of the TIME_COLUMNS ({', '.join(time_columns)}), so "
-            "visits cannot be placed in a time period."
-        )
+        if required:
+            raise InputDataError(
+                f"stop_visits has none of the TIME_COLUMNS ({', '.join(time_columns)}), so "
+                "visits cannot be placed in a time period."
+            )
+        out["_minute"] = np.nan
+        out["_time_text"] = pd.NA
+        out["time_period"] = None
+        return out
     sample = df[present[0]].dropna().head(1000).astype(str).str.strip()
     if not sample.empty and sample.str.contains(r"(?:Z|[+-]00:?00)$").mean() > 0.5:
         logging.warning(
@@ -2025,26 +2259,24 @@ def add_time_period(
         minutes.loc[hit] = found.loc[hit]
         chosen.loc[hit] = df.loc[hit, col]
     missing = minutes.isna()
-    if missing.all():
-        raise InputDataError(
-            f"No stop visit has a readable time in {', '.join(present)}; check TIME_COLUMNS."
-        )
-    if missing.any():
+    if missing.any() and required:
         logging.warning(
-            "%d stop visit(s) have no readable time in %s; they are left out.",
+            "%d stop visit(s) have no readable time in %s; they count in the all-day and "
+            "month tables but are left out of the time-period and hour tables.",
             int(missing.sum()),
             ", ".join(present),
         )
-    out = df.loc[~missing].copy()
-    out["_minute"] = minutes.loc[~missing].astype(int)
-    out["_time_text"] = chosen.loc[~missing]
+    out["_minute"] = minutes
+    out["_time_text"] = chosen
     lookup = period_lookup(periods)
-    out["time_period"] = lookup[out["_minute"].to_numpy(dtype=int)]
+    labels = pd.Series(None, index=df.index, dtype="object")
+    labels.loc[~missing] = lookup[minutes.loc[~missing].to_numpy(dtype=int)]
+    out["time_period"] = labels
     return out
 
 
 def add_service_hour(df: pd.DataFrame, cutover_hour: int = LATE_NIGHT_CUTOVER_HOUR) -> pd.DataFrame:
-    """Add ``hour``, each visit's hour of the service day.
+    """Add ``hour``, each visit's hour of the service day (NaN where no time is readable).
 
     Args:
         df: Output of :func:`add_time_period` (needs ``_time_text``, ``_minute``
@@ -2052,13 +2284,13 @@ def add_service_hour(df: pd.DataFrame, cutover_hour: int = LATE_NIGHT_CUTOVER_HO
         cutover_hour: First hour of the service day.
 
     Returns:
-        A copy of *df* with an integer ``hour`` column.
+        A copy of *df* with a float ``hour`` column.
     """
     out = df.copy()
     hours = service_day_hour(out["_time_text"], out["service_date"], cutover_hour)
     clock = (out["_minute"] // 60).astype("float64")
     fallback = clock.where(clock >= cutover_hour, clock + 24)
-    out["hour"] = hours.fillna(fallback).astype(int)
+    out["hour"] = hours.fillna(fallback)
     return out
 
 
@@ -2281,7 +2513,13 @@ def summarize_ridership(
     level_cols = level_columns(level, df.columns) or []
     date_keys, time_keys = _cut_keys(cut)
     keys = [*date_keys, *level_cols, *time_keys]
-    work = df if "_trip" in df.columns else add_performed_trip_key(df)
+    base = df if "_trip" in df.columns else add_performed_trip_key(df)
+    work = base
+    if time_keys:
+        # Visits with no readable time count only in the tables without a time of day.
+        work = base.loc[base[time_keys[0]].notna()]
+        if time_keys == ["hour"]:
+            work = work.assign(hour=work["hour"].astype(int))
     agg = (
         work.groupby(keys, sort=False, dropna=False)
         .agg(
@@ -2301,7 +2539,7 @@ def summarize_ridership(
 
     if level in TRIP_LEVELS:
         trip_keys = [*date_keys, *[c for c in level_cols if c != "stop_id"]]
-        agg = agg.merge(observed_dates(work, trip_keys), on=trip_keys, how="left")
+        agg = agg.merge(observed_dates(base, trip_keys), on=trip_keys, how="left")
     else:
         agg = agg.merge(system_days, on=date_keys, how="left")
     agg["stop_visits"] = agg["stop_visits"].astype(int)
@@ -2650,7 +2888,8 @@ def build_trip_rows(
         One row per day type and trip: ``route_id``, ``direction_id``,
         ``trip_id``, ``start_time`` (service-day clock), ``hour``,
         ``avg_daily_boardings`` (averaged over the dates the trip was observed),
-        ``pass_per_hour`` (average boardings per hour of running time),
+        ``pass_per_hour`` (boardings per hour of running time, both summed over
+        the performed trips with a running time),
         ``days_observed`` and ``start_minutes``.
     """
     columns = [
@@ -2687,19 +2926,25 @@ def build_trip_rows(
         duration=("_duration", "first"),
     )
     runs = runs.reset_index()
+    # Boardings per running hour divide boardings by hours over the same performed
+    # trips (TIDES allows several performed trips per scheduled trip and date).
+    timed = runs["duration"] > 0
+    runs["timed_boardings"] = runs["boardings"].where(timed, 0.0)
+    runs["timed_hours"] = runs["duration"].where(timed, 0.0)
     rows = runs.groupby(["day_type", "trip_id"], sort=False, as_index=False).agg(
         route_id=("route_id", "first"),
         direction_id=("direction_id", "first"),
         start_minutes=("start", "min"),
         boardings=("boardings", "sum"),
         days_observed=("service_date", "nunique"),
-        duration=("duration", "mean"),
+        timed_boardings=("timed_boardings", "sum"),
+        timed_hours=("timed_hours", "sum"),
     )
     rows["avg_daily_boardings"] = rows["boardings"] / rows["days_observed"]
-    rows["pass_per_hour"] = rows["avg_daily_boardings"] / rows["duration"].where(
-        rows["duration"] > 0
+    rows["pass_per_hour"] = rows["timed_boardings"] / rows["timed_hours"].where(
+        rows["timed_hours"] > 0
     )
-    rows["hour"] = (rows["start_minutes"] // 60).astype(int)
+    rows["hour"] = (rows["start_minutes"] // 60).astype("Int64")
     rows["start_time"] = rows["start_minutes"].map(minutes_to_hhmm)
     return rows[columns]
 
@@ -2715,7 +2960,9 @@ def flag_low_ridership(
 
     Flagged trips are written to *out_path* sorted by day type, route and start
     time, and a warning is logged per day type so low performers surface in the
-    console and run log even when nobody opens the CSV.
+    console and run log even when nobody opens the CSV. When no trip qualifies
+    the file is still written, with its header only, so a previous run's results
+    never linger; when the flag is off, a previous file is removed.
 
     Args:
         trip_rows: Output of :func:`build_trip_rows`.
@@ -2723,13 +2970,21 @@ def flag_low_ridership(
             (no running time in trips_performed) are skipped with a warning.
         threshold: Trips with *measure* strictly below this are flagged; values
             <= 0 switch the flag off.
-        out_path: Destination CSV (only written when trips are flagged).
+        out_path: Destination CSV (written whenever the flag is on).
         day_order: Output order of the day types.
 
     Returns:
         Number of trips flagged.
     """
-    if threshold <= 0 or trip_rows.empty:
+    if threshold <= 0:
+        if out_path.exists():
+            out_path.unlink()
+            logging.info("Low-ridership flag is off; removed the previous %s.", out_path.name)
+        return 0
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    header = [c for c in trip_rows.columns if c != "start_minutes"]
+    if trip_rows.empty:
+        pd.DataFrame(columns=header).to_csv(out_path, index=False)
         return 0
     column = LOW_RIDERSHIP_MEASURES[measure]
     values = trip_rows[column]
@@ -2749,6 +3004,7 @@ def flag_low_ridership(
             measure,
             len(trip_rows) - missing,
         )
+        pd.DataFrame(columns=header).to_csv(out_path, index=False)
         return 0
     flagged = _sort_table(
         flagged, ["day_type", "route_id", "direction_id", "start_minutes"], day_order
@@ -2756,7 +3012,6 @@ def flag_low_ridership(
     flagged["avg_daily_boardings"] = flagged["avg_daily_boardings"].round(2)
     flagged["pass_per_hour"] = flagged["pass_per_hour"].round(2)
     flagged = flagged.drop(columns="start_minutes")
-    out_path.parent.mkdir(parents=True, exist_ok=True)
     flagged.to_csv(out_path, index=False)
     for day_type in [d for d in day_order if d in set(flagged["day_type"])]:
         sub = flagged.loc[flagged["day_type"] == day_type]
@@ -3178,6 +3433,11 @@ def _resolve_run_settings(
             f"LOW_RIDERSHIP_MEASURE must be one of {', '.join(LOW_RIDERSHIP_MEASURES)}, "
             f"not {settings.low_ridership_measure!r}."
         )
+    if settings.missing_counts not in MISSING_COUNTS_CHOICES:
+        raise SettingsError(
+            f"MISSING_COUNTS must be one of {', '.join(MISSING_COUNTS_CHOICES)}, "
+            f"not {settings.missing_counts!r}."
+        )
     for name, value in (
         ("MAX_UNSCHEDULED_SHARE", settings.max_unscheduled_share),
         ("MAX_CANCELED_SHARE", settings.max_canceled_share),
@@ -3212,24 +3472,42 @@ def run(settings: RunSettings) -> RunResult:
     order = day_type_order(day_types, holiday)
     periods = list(settings.periods)
 
-    stop_visits = load_tides_csv(settings.stop_visits_path, "stop_visits")
+    stop_visits = load_tides_csv(settings.stop_visits_path, "stop_visits", keep_text=True)
     trips = load_tides_csv(settings.trips_performed_path, "trips_performed")
     if settings.routes_to_include or settings.routes_to_exclude:
         _require_columns(trips, ["route_id"], "trips_performed", "the route filters need")
 
+    stop_visits, duplicate_stats = dedupe_stop_visits(stop_visits)
+
     joined = join_trips(stop_visits, trips)
     joined = filter_dates(joined, settings.start_date, settings.end_date)
     joined = add_trip_key(joined)
+    # Counts are checked before MISSING_COUNTS drops anything, so the date table
+    # reports every visit and trip with missing counts.
+    counted = add_ridership(drop_skipped(joined))
+    counted["_visit_id"] = np.arange(len(counted))
+    visit_stats = duplicate_stats.join(missing_count_stats(counted), how="outer").fillna(0)
+
+    # Every date with a trips_performed row in range is audited, so a date whose
+    # trips were all canceled is listed (and flagged) even with no stop visits.
+    trip_stats = trip_date_stats(trips)
+    in_range = pd.Series(True, index=trip_stats.index)
+    if settings.start_date is not None:
+        in_range &= trip_stats.index >= pd.Timestamp(settings.start_date)
+    if settings.end_date is not None:
+        in_range &= trip_stats.index <= pd.Timestamp(settings.end_date)
+    audit_dates = set(joined["service_date"].unique()) | set(trip_stats.index[in_range])
     feeds = [load_gtfs_feed(str(path)) for path in settings.gtfs_paths]
     classification = classify_service_dates(
-        joined["service_date"].unique(),
+        sorted(audit_dates),
         day_types,
         settings.holidays,
         holiday,
         feeds,
-        trip_date_stats(trips),
+        trip_stats,
         settings.max_unscheduled_share,
         settings.max_canceled_share,
+        visit_stats,
     )
     classification["excluded"] = (classification["day_type"] == "") | (
         classification["flagged"] & settings.exclude_flagged_dates
@@ -3243,16 +3521,19 @@ def run(settings: RunSettings) -> RunResult:
     published = classification.drop(columns=["_stamp", "_day_types"])
 
     # --- ridership -------------------------------------------------------------
+    needs_time = any(set(TIME_CUTS[cut]) - {"month"} for cut in cuts)
     visits = (
-        drop_skipped(joined)
-        .pipe(add_ridership)
-        .pipe(add_time_period, periods, settings.time_columns)
+        apply_missing_counts(counted, settings.missing_counts)
+        .pipe(add_time_period, periods, settings.time_columns, needs_time)
         .pipe(add_service_hour, settings.cutover_hour)
         .pipe(add_month)
         .pipe(add_day_type, date_table)
     )
     if visits.empty:
-        raise InputDataError("No stop visits are left on a service date in any day type.")
+        raise InputDataError(
+            "No stop visits are left on a service date in any day type; check DAY_TYPES, "
+            "EXCLUDE_FLAGGED_DATES and MISSING_COUNTS."
+        )
     system_days = {
         False: observed_dates(visits, ["day_type"]),
         True: observed_dates(visits, ["day_type", "month"]),
@@ -3298,7 +3579,7 @@ def run(settings: RunSettings) -> RunResult:
         out_dir / LOW_RIDERSHIP_FILENAME,
         order,
     )
-    if low_count:
+    if (out_dir / LOW_RIDERSHIP_FILENAME).exists():
         files.append(out_dir / LOW_RIDERSHIP_FILENAME)
 
     # --- maximum load ----------------------------------------------------------
@@ -3390,11 +3671,13 @@ def run(settings: RunSettings) -> RunResult:
         f"Service day starts: {settings.cutover_hour:02d}:00",
         f"Routes included:    {', '.join(settings.routes_to_include) or '(all)'}",
         f"Routes excluded:    {', '.join(settings.routes_to_exclude) or '(none)'}",
+        f"Missing counts:     {settings.missing_counts}",
         f"Low ridership:      below {settings.low_ridership_threshold:g} "
         f"{settings.low_ridership_measure}",
     ]
     n_trips = len(visits[["service_date", "trip_id_performed"]].drop_duplicates())
-    pooled = visits.drop_duplicates(["service_date", "trip_id_performed", *_visit_keys(visits)])
+    # One row per visit used (a visit repeats once per day type when day types overlap).
+    pooled = visits.drop_duplicates("_visit_id")
     summary_lines = [
         f"Ridership tables:   {len(ridership)}",
         f"Max-load tables:    {len(max_load) + (0 if by_trip.empty else 1)}",
@@ -3442,14 +3725,6 @@ def run(settings: RunSettings) -> RunResult:
             "error when a sidecar file is genuinely impossible."
         )
     return RunResult(ridership, max_load, by_trip, trip_rows, service_cut_tables, published, files)
-
-
-def _visit_keys(visits: pd.DataFrame) -> List[str]:
-    """Columns that identify one stop visit within a performed trip."""
-    for col in ("trip_stop_sequence", "stop_id"):
-        if col in visits.columns:
-            return [col]
-    return []
 
 
 # =============================================================================
@@ -3522,6 +3797,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="append",
         metavar="YYYY-MM-DD",
         help="One holiday date; repeat the flag for each. Replaces HOLIDAYS.",
+    )
+    p.add_argument(
+        "--missing-counts",
+        choices=list(MISSING_COUNTS_CHOICES),
+        default=MISSING_COUNTS,
+        help="How visits without usable APC counts are treated.",
     )
     p.add_argument(
         "--exclude-flagged-dates",
@@ -3601,6 +3882,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             start_date=start,
             end_date=end,
             exclude_flagged_dates=args.exclude_flagged_dates,
+            missing_counts=args.missing_counts,
             routes_to_include=tuple(args.routes_include),
             routes_to_exclude=tuple(args.routes_exclude),
             export_charts=args.charts,
@@ -3610,10 +3892,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         logging.error("%s", exc)
         return 2
 
-    if args.stop_visits == STOP_VISITS_PATH or args.trips_performed == TRIPS_PERFORMED_PATH:
+    placeholders = [
+        name
+        for name, value in (
+            ("STOP_VISITS_PATH", args.stop_visits),
+            ("TRIPS_PERFORMED_PATH", args.trips_performed),
+            ("OUTPUT_DIR", args.output_dir),
+        )
+        if str(value).strip() in PLACEHOLDER_PATHS
+    ]
+    if placeholders:
         logging.warning(
-            "STOP_VISITS_PATH/TRIPS_PERFORMED_PATH are still placeholders. Update the "
-            "CONFIGURATION section or pass --stop-visits/--trips-performed before running."
+            "%s still hold the placeholder path. Update the CONFIGURATION section or pass "
+            "--stop-visits / --trips-performed / --output-dir before running.",
+            ", ".join(placeholders),
         )
         return 2
     for path in (settings.stop_visits_path, settings.trips_performed_path):
