@@ -1,18 +1,14 @@
 """Export GTFS timetables, distance patterns, runtime bands, and speed bands.
 
-EDIT HERE: change GTFS_PATH and OUTPUT_DIR in CONFIGURATION, confirm the feed's
-shape_dist_traveled unit, then run this file in Python, ArcGIS Pro, or a notebook.
-Requires Python 3.9+ and openpyxl. No pandas, ArcPy, repository, or CLI required.
-
 One workbook per route_id/service_id contains branch-aware timetable sheets,
 separate metric sheets for each direction/stop pattern, a trip index, and issues.
-Every run has a text log and issues.csv; optional detail CSVs retain trip lineage.
 Each run gets a new subfolder by default, so old flagged files are never confused
 with current results. Save failures return a nonzero exit code.
 
 Definitions:
 * Pattern ID describes the ordered DISPLAYED stop IDs, including repeat visits.
-  Full Pattern ID describes ALL stops before filtering. Both are stable hashes.
+  Full Pattern ID describes ALL stops before filtering. Both come from the shared
+  stop_pattern_id helper, so they match the pattern IDs other scripts write.
 * Runtime default: next retained stop's arrival minus previous retained stop's
   departure. This includes travel/dwell at omitted intermediate stops, but not
   holding at the downstream retained stop. Holding is exported separately.
@@ -22,6 +18,7 @@ Definitions:
   segment distances/runtimes are known and all segment runtimes are positive.
 * Consecutive bands split on profile changes within each displayed pattern,
   including changes in full stop sequence, shape_id, distance, runtime or holding.
+  BAND_MODE = "profile_summary" instead gives one row per profile for the day.
   First/Last Departure are observed trip starts, NOT inclusive validity windows.
 * Missing values remain blank; no interpolation, guessed distance units, or
   straight-line fallback is applied. Hours beyond 24 and seconds are preserved.
@@ -31,12 +28,34 @@ Definitions:
   Use service-ID filters. Calendar exceptions are included in labels/metadata;
   this exporter does not combine services into a particular operating date.
 
-Sections intentionally separate feed loading, metrics, timetable layout, and
-export, so they can become modules later without changing the configuration.
+Inputs
+------
+- A GTFS feed folder or .zip (files at the root or in one wrapper folder) with
+  routes.txt, stops.txt, trips.txt and stop_times.txt; calendar.txt,
+  calendar_dates.txt and frequencies.txt are read when present. GTFS does not
+  fix shape_dist_traveled's unit, so set INPUT_DISTANCE_UNIT to match the feed.
+
+Outputs
+-------
+- ``<service>_sid_<id>/route_<name>_rid_<id>_sid_<id>_schedule.xlsx``: one
+  workbook per route and service, ending in WARNING_FILENAME_SUFFIX when it has
+  issues to review.
+- ISSUES_FILENAME, plus TRIPS_FILENAME and SEGMENTS_FILENAME when
+  EXPORT_DETAIL_CSV is True: every finding and the per-trip/per-segment values.
+- RUN_LOG_FILENAME: the verbatim CONFIGURATION block, the effective settings
+  (including command-line overrides), a run summary, and every issue.
+
+Typical usage
+-------------
+Update the paths in the CONFIGURATION section (or pass the matching CLI flags;
+see ``--help``) and run from a shell, ArcGIS Pro's Python window, or a Jupyter
+notebook. Requires Python 3.9+, pandas and openpyxl. Exit codes: 0 = success,
+1 = a trip, workbook or run log failed, 2 = configuration error.
 """
 
 from __future__ import annotations
 
+import argparse
 import csv
 import hashlib
 import heapq
@@ -50,13 +69,14 @@ import sys
 import tempfile
 import zipfile
 from collections import Counter, defaultdict
-from collections.abc import Generator, Iterator, Mapping, Sequence
+from collections.abc import Generator, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import TextIO
+from typing import IO, Any, List, Literal, Optional
 
+import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import Alignment
 from openpyxl.utils import get_column_letter
@@ -67,7 +87,11 @@ from openpyxl.worksheet.worksheet import Worksheet
 # =============================================================================
 # === BEGIN CONFIG ===
 GTFS_PATH = Path(r"Path\To\Your\GTFS_Folder")  # Folder OR ZIP; UNC paths accepted.
-OUTPUT_DIR = Path(r"Path\To\Your\Output_Folder")
+OUTPUT_DIR = Path(r"Path\To\Your\Output_Folder")  # Workbooks go in per-service subfolders.
+ISSUES_FILENAME = "issues.csv"
+TRIPS_FILENAME = "trips.csv"  # Written when EXPORT_DETAIL_CSV is True.
+SEGMENTS_FILENAME = "segments.csv"  # Written when EXPORT_DETAIL_CSV is True.
+RUN_LOG_FILENAME = "gtfs_schedule_exporter_runlog.txt"
 
 INCLUDE_ROUTES: list[str] = []  # route_short_name; empty = all. Values as strings.
 EXCLUDE_ROUTES: list[str] = []
@@ -84,9 +108,9 @@ EXPORT_DETAIL_CSV = True  # trips.csv and segments.csv for traceable calculation
 TIMEPOINTS_ONLY = True
 KEEP_TRIP_ENDPOINTS = True  # Preserve full trip coverage even if endpoints are 0.
 INPUT_DISTANCE_UNIT = "meters"  # "feet", "meters", "km", "miles"; confirm this!
-OUTPUT_DISTANCE_UNIT = "miles"  # Same options; speeds always mph.
+OUTPUT_DISTANCE_UNIT = "miles"  # "miles" or "km"; speeds always mph.
 RUNTIME_BASIS = "departure_to_arrival"  # Or "departure_to_departure".
-BAND_MODE = "consecutive"  # Or "profile_summary" for all-day first/last summaries.
+BAND_MODE = "consecutive"  # Or "profile_summary": one row per profile for the whole day.
 MAX_BAND_GAP_MINUTES: float | None = 120.0  # None disables gap splitting.
 
 TIME_FORMAT = "24"  # "24" preserves 25:15; "12" shows 1:15 AM (+1d).
@@ -96,13 +120,18 @@ FREQUENCY_POLICY = "error"  # "error" or "skip"; no silent template-trip countin
 SPEED_WARNING_MPH = 65.0  # Review flag, not an automatic cap or deletion.
 CREATE_RUN_SUBFOLDER = True
 WARNING_FILENAME_SUFFIX = "_warning"  # Empty string disables suffix, not warnings.
+# Every output must be traceable: if the run log cannot be written, the run fails.
+# Set to False only when writing to a genuinely read-only location.
+REQUIRE_RUN_LOG: bool = True
 LOG_LEVEL = logging.INFO
 # === END CONFIG ===
 
 LOGGER = logging.getLogger("gtfs_schedule_exporter")
 VERSION = "1.0.0"
-METERS_PER_UNIT = {"feet": 0.3048, "meters": 1.0, "km": 1000.0, "miles": 1609.344}
+INPUT_UNITS = ("feet", "meters", "km", "miles")
+OUTPUT_UNITS = ("miles", "km")
 WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+PLACEHOLDER_PREFIX = "Path\\To\\"
 
 
 @dataclass(frozen=True)
@@ -124,7 +153,7 @@ class Config:
     timepoints_only: bool = True
     keep_endpoints: bool = True
     input_unit: str = "meters"
-    output_unit: str = "miles"
+    output_unit: Literal["miles", "km"] = "miles"
     runtime_basis: str = "departure_to_arrival"
     band_mode: str = "consecutive"
     max_band_gap: float | None = 120.0
@@ -135,37 +164,222 @@ class Config:
     speed_warning: float = 65.0
     run_subfolder: bool = True
     warning_suffix: str = "_warning"
+    issues_filename: str = "issues.csv"
+    trips_filename: str = "trips.csv"
+    segments_filename: str = "segments.csv"
+    run_log_filename: str = "gtfs_schedule_exporter_runlog.txt"
+    require_run_log: bool = True
 
 
-def configured_settings() -> Config:
-    """Read live globals, including settings changed in an interactive session."""
+def service_label_pair(value: str) -> tuple[str, str]:
+    """Parse one ``SERVICE_ID=LABEL`` command-line value."""
+    service_id, separator, label = value.partition("=")
+    if not separator or not service_id.strip() or not label.strip():
+        raise argparse.ArgumentTypeError(f"expected SERVICE_ID=LABEL, got {value!r}")
+    return service_id.strip(), label.strip()
+
+
+def optional_minutes(value: str) -> float | None:
+    """Parse a minute count, or ``none`` to disable the limit."""
+    if value.strip().lower() == "none":
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected minutes or 'none', got {value!r}") from None
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    """Mirror the CONFIGURATION constants as flags whose defaults are those constants."""
+    p = argparse.ArgumentParser(
+        description="Export GTFS timetables, distance patterns, runtime bands and speed bands.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    toggle = argparse.BooleanOptionalAction
+    p.add_argument("--gtfs-path", type=Path, default=GTFS_PATH, help="GTFS folder or .zip.")
+    p.add_argument("--output-dir", type=Path, default=OUTPUT_DIR, help="Folder for all outputs.")
+    p.add_argument("--issues-filename", default=ISSUES_FILENAME, help="Issues CSV name.")
+    p.add_argument("--trips-filename", default=TRIPS_FILENAME, help="Trip detail CSV name.")
+    p.add_argument("--segments-filename", default=SEGMENTS_FILENAME, help="Segment CSV name.")
+    p.add_argument("--run-log-filename", default=RUN_LOG_FILENAME, help="Run log name.")
+    p.add_argument(
+        "--include-routes",
+        nargs="*",
+        default=INCLUDE_ROUTES,
+        metavar="NAME",
+        help="route_short_name values to keep; none given = all routes.",
+    )
+    p.add_argument(
+        "--exclude-routes",
+        nargs="*",
+        default=EXCLUDE_ROUTES,
+        metavar="NAME",
+        help="route_short_name values to drop.",
+    )
+    p.add_argument(
+        "--include-service-ids",
+        nargs="*",
+        default=INCLUDE_SERVICE_IDS,
+        metavar="ID",
+        help="service_id values to keep; none given = all services.",
+    )
+    p.add_argument(
+        "--exclude-service-ids",
+        nargs="*",
+        default=EXCLUDE_SERVICE_IDS,
+        metavar="ID",
+        help="service_id values to drop.",
+    )
+    p.add_argument(
+        "--service-label",
+        action="append",
+        type=service_label_pair,
+        default=None,
+        metavar="ID=LABEL",
+        help="Label for a service_id, e.g. 4=Weekday; repeatable. Adds to SERVICE_LABEL_OVERRIDES.",
+    )
+    p.add_argument(
+        "--timetables", action=toggle, default=EXPORT_TIMETABLES, help="Timetable sheets."
+    )
+    p.add_argument(
+        "--distances", action=toggle, default=EXPORT_DISTANCES, help="Distance band sheets."
+    )
+    p.add_argument(
+        "--runtimes", action=toggle, default=EXPORT_RUNTIMES, help="Runtime band sheets."
+    )
+    p.add_argument("--speeds", action=toggle, default=EXPORT_SPEEDS, help="Speed band sheets.")
+    p.add_argument(
+        "--detail-csv", action=toggle, default=EXPORT_DETAIL_CSV, help="Trip/segment CSVs."
+    )
+    p.add_argument(
+        "--timepoints-only",
+        action=toggle,
+        default=TIMEPOINTS_ONLY,
+        help="Show only timepoints (timepoint != 0) instead of every stop.",
+    )
+    p.add_argument(
+        "--keep-trip-endpoints",
+        action=toggle,
+        default=KEEP_TRIP_ENDPOINTS,
+        help="Keep each trip's first and last stop even when they are not timepoints.",
+    )
+    p.add_argument(
+        "--input-distance-unit",
+        choices=INPUT_UNITS,
+        default=INPUT_DISTANCE_UNIT,
+        help="Unit of shape_dist_traveled in the feed.",
+    )
+    p.add_argument(
+        "--output-distance-unit",
+        choices=OUTPUT_UNITS,
+        default=OUTPUT_DISTANCE_UNIT,
+        help="Unit for exported distances; speeds are always mph.",
+    )
+    p.add_argument(
+        "--runtime-basis",
+        choices=("departure_to_arrival", "departure_to_departure"),
+        default=RUNTIME_BASIS,
+        help="Segment runtime definition; departure_to_departure includes holding.",
+    )
+    p.add_argument(
+        "--band-mode",
+        choices=("consecutive", "profile_summary"),
+        default=BAND_MODE,
+        help="consecutive: split bands at every profile change; profile_summary: one row "
+        "per profile for the whole day.",
+    )
+    p.add_argument(
+        "--max-band-gap-minutes",
+        type=optional_minutes,
+        default=MAX_BAND_GAP_MINUTES,
+        help="Split consecutive bands at larger gaps between trip starts; 'none' disables.",
+    )
+    p.add_argument(
+        "--time-format",
+        choices=("24", "12"),
+        default=TIME_FORMAT,
+        help="24 keeps 25:15; 12 shows 1:15 AM (+1d).",
+    )
+    p.add_argument(
+        "--show-seconds",
+        action=toggle,
+        default=SHOW_SECONDS,
+        help="Show seconds; otherwise times are rounded to the minute for display only.",
+    )
+    p.add_argument(
+        "--stop-label-id",
+        choices=("stop_code", "stop_id"),
+        default=STOP_LABEL_ID,
+        help="ID shown in stop column headers.",
+    )
+    p.add_argument(
+        "--frequency-policy",
+        choices=("error", "skip"),
+        default=FREQUENCY_POLICY,
+        help="What to do with selected trips listed in frequencies.txt.",
+    )
+    p.add_argument(
+        "--speed-warning-mph",
+        type=float,
+        default=SPEED_WARNING_MPH,
+        help="Flag scheduled segment speeds above this for review.",
+    )
+    p.add_argument(
+        "--run-subfolder",
+        action=toggle,
+        default=CREATE_RUN_SUBFOLDER,
+        help="Write each run to a new timestamped subfolder of --output-dir.",
+    )
+    p.add_argument(
+        "--warning-filename-suffix",
+        default=WARNING_FILENAME_SUFFIX,
+        help="Suffix for workbooks with issues to review; empty = no suffix.",
+    )
+    p.add_argument(
+        "--require-run-log",
+        action=toggle,
+        default=REQUIRE_RUN_LOG,
+        help="Fail the run if the run log cannot be written.",
+    )
+    return p
+
+
+def configured_settings(args: argparse.Namespace) -> Config:
+    """Build settings from parsed flags, whose defaults are the CONFIGURATION constants."""
+    labels = dict(SERVICE_LABEL_OVERRIDES)
+    labels.update(args.service_label or [])
     return Config(
-        gtfs_path=Path(GTFS_PATH),
-        output_dir=Path(OUTPUT_DIR),
-        include_routes=tuple(str(x) for x in INCLUDE_ROUTES),
-        exclude_routes=tuple(str(x) for x in EXCLUDE_ROUTES),
-        include_services=tuple(str(x) for x in INCLUDE_SERVICE_IDS),
-        exclude_services=tuple(str(x) for x in EXCLUDE_SERVICE_IDS),
-        service_labels=dict(SERVICE_LABEL_OVERRIDES),
-        timetables=EXPORT_TIMETABLES,
-        distances=EXPORT_DISTANCES,
-        runtimes=EXPORT_RUNTIMES,
-        speeds=EXPORT_SPEEDS,
-        detail_csv=EXPORT_DETAIL_CSV,
-        timepoints_only=TIMEPOINTS_ONLY,
-        keep_endpoints=KEEP_TRIP_ENDPOINTS,
-        input_unit=INPUT_DISTANCE_UNIT,
-        output_unit=OUTPUT_DISTANCE_UNIT,
-        runtime_basis=RUNTIME_BASIS,
-        band_mode=BAND_MODE,
-        max_band_gap=MAX_BAND_GAP_MINUTES,
-        time_format=TIME_FORMAT,
-        show_seconds=SHOW_SECONDS,
-        stop_label_id=STOP_LABEL_ID,
-        frequency_policy=FREQUENCY_POLICY,
-        speed_warning=SPEED_WARNING_MPH,
-        run_subfolder=CREATE_RUN_SUBFOLDER,
-        warning_suffix=WARNING_FILENAME_SUFFIX,
+        gtfs_path=Path(args.gtfs_path),
+        output_dir=Path(args.output_dir),
+        include_routes=tuple(str(x) for x in args.include_routes),
+        exclude_routes=tuple(str(x) for x in args.exclude_routes),
+        include_services=tuple(str(x) for x in args.include_service_ids),
+        exclude_services=tuple(str(x) for x in args.exclude_service_ids),
+        service_labels=labels,
+        timetables=args.timetables,
+        distances=args.distances,
+        runtimes=args.runtimes,
+        speeds=args.speeds,
+        detail_csv=args.detail_csv,
+        timepoints_only=args.timepoints_only,
+        keep_endpoints=args.keep_trip_endpoints,
+        input_unit=args.input_distance_unit,
+        output_unit=args.output_distance_unit,
+        runtime_basis=args.runtime_basis,
+        band_mode=args.band_mode,
+        max_band_gap=args.max_band_gap_minutes,
+        time_format=args.time_format,
+        show_seconds=args.show_seconds,
+        stop_label_id=args.stop_label_id,
+        frequency_policy=args.frequency_policy,
+        speed_warning=args.speed_warning_mph,
+        run_subfolder=args.run_subfolder,
+        warning_suffix=args.warning_filename_suffix,
+        issues_filename=args.issues_filename,
+        trips_filename=args.trips_filename,
+        segments_filename=args.segments_filename,
+        run_log_filename=args.run_log_filename,
+        require_run_log=args.require_run_log,
     )
 
 
@@ -301,72 +515,244 @@ class Feed:
 
 
 # =============================================================================
+# PART 0 -- CANONICAL HELPERS (verbatim copies from utils/; do not edit here)
+# =============================================================================
+
+
+@contextmanager
+def open_gtfs_file(
+    gtfs_path: str | os.PathLike[str], file_name: str
+) -> Generator[IO[bytes], None, None]:
+    """Open one GTFS text file from a feed folder or a ``.zip`` of the feed.
+
+    The counterpart of :func:`load_gtfs_data` for scripts that read a file with
+    their own options (``pandas.read_csv`` with ``usecols`` or
+    ``keep_default_na=False``, or the :mod:`csv` module), so they accept a
+    zipped feed without extracting it. Zip members are found the way
+    :func:`load_gtfs_data` finds them: at the archive root or inside a single
+    wrapper folder.
+
+    Args:
+        gtfs_path: Folder containing the GTFS feed, or a ``.zip`` archive of it.
+        file_name: GTFS file to open, e.g. ``"stops.txt"``.
+
+    Yields:
+        A binary file handle. ``pandas.read_csv`` reads it directly; wrap it in
+        :class:`io.TextIOWrapper` for the :mod:`csv` module.
+
+    Raises:
+        FileNotFoundError: *gtfs_path* does not exist, or the feed has no
+            *file_name*.
+        ValueError: *gtfs_path* is neither a directory nor a valid ``.zip``
+            file, or *file_name* is found in more than one place in the zip.
+    """
+    path = os.fspath(gtfs_path)
+    if os.path.isdir(path):
+        file_path = os.path.join(path, file_name)
+        if not os.path.isfile(file_path):
+            raise FileNotFoundError(f"Missing GTFS file in '{path}': {file_name}")
+        with open(file_path, "rb") as handle:
+            yield handle
+        return
+
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"The path '{path}' does not exist.")
+    if not (os.path.isfile(path) and path.lower().endswith(".zip")):
+        raise ValueError(f"'{path}' is neither a directory nor a .zip file.")
+    try:
+        archive = zipfile.ZipFile(path)
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"'{path}' is not a valid zip archive.") from exc
+    with archive:
+        matches = [name for name in archive.namelist() if os.path.basename(name) == file_name]
+        if not matches:
+            raise FileNotFoundError(f"Missing GTFS file in '{path}': {file_name}")
+        if len(matches) > 1:
+            raise ValueError(
+                f"Ambiguous GTFS file in '{path}' (found in multiple locations): {file_name}"
+            )
+        with archive.open(matches[0]) as handle:
+            yield handle
+
+
+def stop_pattern_id(stop_ids: Iterable[object]) -> str:
+    """Return a short text ID for an ordered stop pattern that is stable across runs.
+
+    Python's built-in ``hash()`` is salted per process, so it gives the same
+    pattern a different value on every run. This SHA-1 digest gives the same
+    ID for the same stop sequence on every run, in every feed, and in every
+    script that copies this helper, so outputs from different runs can be
+    matched up by pattern.
+
+    Args:
+        stop_ids: Ordered ``stop_id`` values for one trip pattern. Order
+            matters: the reversed sequence gets a different ID. Values are
+            coerced to ``str``, so ``1`` and ``"1"`` give the same ID.
+
+    Returns:
+        The first 8 lowercase hex characters of the digest, e.g.
+        ``"3f9a1c2e"``. Write it to Excel as text, not as a number.
+    """
+    # JSON-encode the list so a stop_id containing a separator can't collide
+    # with a different split of the same characters (["a,b"] vs ["a", "b"]).
+    payload = json.dumps([str(stop_id) for stop_id in stop_ids])
+    return hashlib.sha1(payload.encode("utf-8"), usedforsecurity=False).hexdigest()[:8]
+
+
+def convert_distance(
+    value: Any,
+    input_unit: str,
+    output_unit: Literal["miles", "km"] = "miles",
+) -> Optional[float]:
+    """Convert a distance value between transit-planning units.
+
+    Args:
+        value: Distance as a number or numeric string. ``None``, NaN, and
+            empty/whitespace strings yield ``None``.
+        input_unit: Unit of *value*: ``"feet"``, ``"meters"``, ``"km"``, or
+            ``"miles"`` (case-insensitive).
+        output_unit: Unit to convert to: ``"miles"`` or ``"km"``.
+
+    Returns:
+        The converted distance as a float, or ``None`` when *value* is
+        missing or cannot be interpreted as a number.
+
+    Raises:
+        ValueError: If *input_unit* or *output_unit* is not a supported unit.
+    """
+    meters_per_input_unit = {"feet": 0.3048, "meters": 1.0, "km": 1000.0, "miles": 1609.344}
+    meters_per_output_unit = {"miles": 1609.344, "km": 1000.0}
+
+    input_factor = meters_per_input_unit.get(str(input_unit).strip().lower())
+    if input_factor is None:
+        raise ValueError(
+            f"Unsupported input_unit {input_unit!r}; "
+            f"expected one of {sorted(meters_per_input_unit)}."
+        )
+    output_factor = meters_per_output_unit.get(str(output_unit).strip().lower())
+    if output_factor is None:
+        raise ValueError(
+            f"Unsupported output_unit {output_unit!r}; "
+            f"expected one of {sorted(meters_per_output_unit)}."
+        )
+
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    if pd.isna(value):
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    return numeric * input_factor / output_factor
+
+
+def extract_config_block(source_file: Path) -> str:
+    r"""Return the text between the CONFIG markers in *source_file*.
+
+    Reads ``source_file`` as UTF-8 text and slices out the lines strictly
+    *between* the first occurrence of ``# === BEGIN CONFIG ===`` and the first
+    subsequent occurrence of ``# === END CONFIG ===``.  The marker lines
+    themselves are excluded; whitespace and inline comments inside the block
+    are preserved verbatim.
+
+    Args:
+        source_file: Path to the Python source file to scan (typically
+            ``Path(__file__)`` from the calling script).
+
+    Returns:
+        The verbatim text of the configuration block, joined with ``\n``.
+
+    Raises:
+        ValueError: If either marker is missing or they appear out of order.
+        OSError: If ``source_file`` cannot be read.
+    """
+    _BEGIN = "# === BEGIN CONFIG ==="
+    _END = "# === END CONFIG ==="
+
+    lines: list[str] = source_file.read_text(encoding="utf-8").splitlines()
+
+    begin_idx: int | None = None
+    end_idx: int | None = None
+    for i, line in enumerate(lines):
+        stripped: str = line.strip()
+        if begin_idx is None and stripped == _BEGIN:
+            begin_idx = i
+        elif begin_idx is not None and stripped == _END:
+            end_idx = i
+            break
+
+    if begin_idx is None or end_idx is None:
+        raise ValueError(
+            f"Config markers not found in '{source_file}'. Expected '{_BEGIN}' and '{_END}'."
+        )
+
+    return "\n".join(lines[begin_idx + 1 : end_idx])
+
+
+def notebook_safe_argv(argv: Optional[Sequence[str]]) -> Optional[List[str]]:
+    """Return the argv to parse, shielding notebook kernels from stray flags.
+
+    When a script's ``main()`` runs with no explicit ``argv`` inside a
+    Jupyter/IPython kernel, ``sys.argv`` holds kernel plumbing (for example
+    ``-f /path/kernel.json``) rather than flags meant for the script, and
+    strict ``argparse.parse_args`` would reject it and abort.  This helper
+    detects the notebook case and substitutes an empty argument list so the
+    CONFIGURATION constants stay in charge, while shell runs keep strict
+    parsing (a typo in a flag fails loudly instead of being silently ignored).
+
+    Canonical implementation: ``utils/cli_helpers.py``.
+
+    Args:
+        argv: Explicit argument list passed to ``main()``, or ``None`` to
+            fall back to ``sys.argv``.
+
+    Returns:
+        ``list(argv)`` when *argv* was provided; ``[]`` when running inside a
+        notebook kernel; otherwise ``None`` so argparse reads ``sys.argv[1:]``.
+    """
+    if argv is not None:
+        return list(argv)
+    if "ipykernel" in sys.modules:
+        return []
+    return None
+
+
+# =============================================================================
 # PART 1 -- FEED LOADING AND VALIDATION
 # =============================================================================
 
 
-class FeedReader:
-    """Read root or nested GTFS CSV members without extracting an archive."""
+def read_rows(
+    gtfs_path: Path, name: str, required: Sequence[str], optional: bool = False
+) -> Iterator[dict[str, str]]:
+    """Read IDs literally, including 'NA', 'NULL', and leading zeros.
 
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self.archive: zipfile.ZipFile | None = None
-        self.members: dict[str, list[str]] = defaultdict(list)
-
-    def __enter__(self) -> FeedReader:
-        if self.path.is_dir():
-            for path in self.path.iterdir():
-                if path.is_file():
-                    self.members[path.name].append(path.name)
-        elif self.path.is_file() and zipfile.is_zipfile(self.path):
-            self.archive = zipfile.ZipFile(self.path)
-            for member in self.archive.namelist():
-                if not member.endswith("/") and "__MACOSX/" not in member:
-                    self.members[member.rsplit("/", 1)[-1]].append(member)
-        else:
-            raise ValueError(f"GTFS_PATH is not a feed directory or valid ZIP: {self.path}")
-        return self
-
-    def __exit__(self, *_args: object) -> None:
-        if self.archive is not None:
-            self.archive.close()
-
-    @contextmanager
-    def open_text(self, name: str) -> Generator[TextIO, None, None]:
-        """Reject ambiguous members instead of silently choosing one feed."""
-        members = self.members.get(name, [])
-        if not members:
-            raise FileNotFoundError(f"Missing required GTFS file: {name}")
-        if len(members) != 1:
-            raise ValueError(f"Ambiguous GTFS file {name}: {members}")
-        if self.archive is None:
-            with (self.path / name).open(encoding="utf-8-sig", newline="") as handle:
-                yield handle
-        else:
-            with self.archive.open(members[0]) as binary:
-                with io.TextIOWrapper(binary, encoding="utf-8-sig", newline="") as handle:
-                    yield handle
-
-    def rows(
-        self, name: str, required: Sequence[str], optional: bool = False
-    ) -> Iterator[dict[str, str]]:
-        """Read IDs literally, including 'NA', 'NULL', and leading zeros."""
-        if optional and name not in self.members:
-            return
-        with self.open_text(name) as handle:
-            reader = csv.DictReader(handle)
-            columns = reader.fieldnames
-            if not columns:
-                raise ValueError(f"{name} is empty or has no header.")
-            if len(columns) != len(set(columns)):
-                raise ValueError(f"{name} has duplicate column names.")
-            missing = set(required) - set(columns)
-            if missing:
-                raise ValueError(f"{name} is missing columns: {sorted(missing)}")
-            for line, row in enumerate(reader, 2):
-                if None in row:
-                    raise ValueError(f"{name}, row {line}: more cells than header columns.")
-                yield {key: (value or "").strip() for key, value in row.items() if key is not None}
+    ``open_gtfs_file`` finds the file in a feed folder or a ``.zip`` (at its root
+    or in one wrapper folder) and rejects a file found in more than one place
+    instead of silently choosing one feed. An absent optional file yields no rows.
+    """
+    try:
+        with open_gtfs_file(gtfs_path, name) as binary:
+            with io.TextIOWrapper(binary, encoding="utf-8-sig", newline="") as handle:
+                reader = csv.DictReader(handle)
+                columns = reader.fieldnames
+                if not columns:
+                    raise ValueError(f"{name} is empty or has no header.")
+                if len(columns) != len(set(columns)):
+                    raise ValueError(f"{name} has duplicate column names.")
+                missing = set(required) - set(columns)
+                if missing:
+                    raise ValueError(f"{name} is missing columns: {sorted(missing)}")
+                for line, row in enumerate(reader, 2):
+                    if None in row:
+                        raise ValueError(f"{name}, row {line}: more cells than header columns.")
+                    yield {
+                        key: (value or "").strip() for key, value in row.items() if key is not None
+                    }
+    except FileNotFoundError:
+        if not optional:
+            raise
 
 
 def keyed_rows(rows: Iterator[dict[str, str]], key: str, name: str) -> dict[str, dict[str, str]]:
@@ -380,15 +766,17 @@ def keyed_rows(rows: Iterator[dict[str, str]], key: str, name: str) -> dict[str,
     return result
 
 
-def calendar_labels(
-    reader: FeedReader, services: set[str], config: Config, audit: Audit
-) -> dict[str, str]:
+def calendar_labels(services: set[str], config: Config, audit: Audit) -> dict[str, str]:
     """Label services without assuming agency-specific ID/day mappings."""
     calendar = keyed_rows(
-        reader.rows("calendar.txt", ["service_id", *WEEKDAYS], True), "service_id", "calendar.txt"
+        read_rows(config.gtfs_path, "calendar.txt", ["service_id", *WEEKDAYS], True),
+        "service_id",
+        "calendar.txt",
     )
     added: dict[str, set[int]] = defaultdict(set)
-    for row in reader.rows("calendar_dates.txt", ["service_id", "date", "exception_type"], True):
+    for row in read_rows(
+        config.gtfs_path, "calendar_dates.txt", ["service_id", "date", "exception_type"], True
+    ):
         try:
             day = datetime.strptime(row["date"], "%Y%m%d").weekday()
             if row["exception_type"] not in {"1", "2"}:
@@ -428,83 +816,84 @@ def calendar_labels(
 
 def load_feed(config: Config, audit: Audit) -> Feed:
     """Load only needed files; scan stop_times once and retain selected trips."""
-    with FeedReader(config.gtfs_path) as reader:
-        routes = keyed_rows(reader.rows("routes.txt", ["route_id"]), "route_id", "routes.txt")
-        stop_rows = keyed_rows(
-            reader.rows("stops.txt", ["stop_id", "stop_name"]), "stop_id", "stops.txt"
-        )
-        stops = {
-            sid: Stop(sid, row["stop_name"] or sid, row.get("stop_code", ""))
-            for sid, row in stop_rows.items()
-        }
-        all_trips = keyed_rows(
-            reader.rows("trips.txt", ["trip_id", "route_id", "service_id"]), "trip_id", "trips.txt"
-        )
-        route_names = {
-            rid: row.get("route_short_name", "") or row.get("route_long_name", "") or rid
-            for rid, row in routes.items()
-        }
-        for name in sorted(set(config.include_routes) - set(route_names.values())):
-            audit.add(
-                "FILTER_NOT_FOUND", f"Included route label {name!r} is absent from routes.txt."
-            )
-        for sid in sorted(
-            set(config.include_services) - {t["service_id"] for t in all_trips.values()}
+    routes = keyed_rows(
+        read_rows(config.gtfs_path, "routes.txt", ["route_id"]), "route_id", "routes.txt"
+    )
+    stop_rows = keyed_rows(
+        read_rows(config.gtfs_path, "stops.txt", ["stop_id", "stop_name"]), "stop_id", "stops.txt"
+    )
+    stops = {
+        sid: Stop(sid, row["stop_name"] or sid, row.get("stop_code", ""))
+        for sid, row in stop_rows.items()
+    }
+    all_trips = keyed_rows(
+        read_rows(config.gtfs_path, "trips.txt", ["trip_id", "route_id", "service_id"]),
+        "trip_id",
+        "trips.txt",
+    )
+    route_names = {
+        rid: row.get("route_short_name", "") or row.get("route_long_name", "") or rid
+        for rid, row in routes.items()
+    }
+    for name in sorted(set(config.include_routes) - set(route_names.values())):
+        audit.add("FILTER_NOT_FOUND", f"Included route label {name!r} is absent from routes.txt.")
+    for sid in sorted(set(config.include_services) - {t["service_id"] for t in all_trips.values()}):
+        audit.add("FILTER_NOT_FOUND", f"Included service_id {sid!r} is absent from trips.txt.")
+    trips = {}
+    for trip_id, trip in all_trips.items():
+        rid, sid = trip["route_id"], trip["service_id"]
+        if rid not in routes or not sid:
+            raise ValueError(f"Trip {trip_id}: unknown route_id or blank service_id.")
+        name = route_names[rid]
+        if (
+            (config.include_routes and name not in config.include_routes)
+            or name in config.exclude_routes
+            or (config.include_services and sid not in config.include_services)
+            or sid in config.exclude_services
         ):
-            audit.add("FILTER_NOT_FOUND", f"Included service_id {sid!r} is absent from trips.txt.")
-        trips = {}
-        for trip_id, trip in all_trips.items():
-            rid, sid = trip["route_id"], trip["service_id"]
-            if rid not in routes or not sid:
-                raise ValueError(f"Trip {trip_id}: unknown route_id or blank service_id.")
-            name = route_names[rid]
-            if (
-                (config.include_routes and name not in config.include_routes)
-                or name in config.exclude_routes
-                or (config.include_services and sid not in config.include_services)
-                or sid in config.exclude_services
-            ):
-                continue
-            trips[trip_id] = {
-                **trip,
-                "route_name": name,
-                "direction_id": trip.get("direction_id", ""),
-            }
-        selected_count = len(trips)
-        frequency_ids = {
-            row["trip_id"] for row in reader.rows("frequencies.txt", ["trip_id"], True)
+            continue
+        trips[trip_id] = {
+            **trip,
+            "route_name": name,
+            "direction_id": trip.get("direction_id", ""),
         }
-        selected_frequency = frequency_ids & trips.keys()
-        if selected_frequency and config.frequency_policy == "error":
-            raise ValueError(
-                f"{len(selected_frequency)} selected trips use frequencies.txt. "
-                "Expansion is unsupported. Use FREQUENCY_POLICY='skip' explicitly "
-                "or provide an expanded fixed-schedule feed."
-            )
-        for trip_id in sorted(selected_frequency):
-            audit.add(
-                "FREQUENCY_SKIPPED",
-                "Frequency template excluded; not counted as a departure.",
-                trips[trip_id],
-            )
-            del trips[trip_id]
-        labels = calendar_labels(reader, {t["service_id"] for t in trips.values()}, config, audit)
-        stop_times: dict[str, list[dict[str, str]]] = defaultdict(list)
-        timepoints_provided = False
-        count = 0
-        for row in reader.rows("stop_times.txt", ["trip_id", "stop_id", "stop_sequence"]):
-            count += 1
-            timepoints_provided = timepoints_provided or bool(row.get("timepoint", ""))
-            if row["trip_id"] in trips:
-                stop_times[row["trip_id"]].append(row)
-            if count % 250000 == 0:
-                LOGGER.info("Read %s stop-time rows...", f"{count:,}")
-        LOGGER.info(
-            "Loaded %s trips; selected %s; retained %s stop-time rows.",
-            f"{len(all_trips):,}",
-            f"{len(trips):,}",
-            f"{sum(map(len, stop_times.values())):,}",
+    selected_count = len(trips)
+    frequency_ids = {
+        row["trip_id"] for row in read_rows(config.gtfs_path, "frequencies.txt", ["trip_id"], True)
+    }
+    selected_frequency = frequency_ids & trips.keys()
+    if selected_frequency and config.frequency_policy == "error":
+        raise ValueError(
+            f"{len(selected_frequency)} selected trips use frequencies.txt. "
+            "Expansion is unsupported. Use FREQUENCY_POLICY='skip' explicitly "
+            "or provide an expanded fixed-schedule feed."
         )
+    for trip_id in sorted(selected_frequency):
+        audit.add(
+            "FREQUENCY_SKIPPED",
+            "Frequency template excluded; not counted as a departure.",
+            trips[trip_id],
+        )
+        del trips[trip_id]
+    labels = calendar_labels({t["service_id"] for t in trips.values()}, config, audit)
+    stop_times: dict[str, list[dict[str, str]]] = defaultdict(list)
+    timepoints_provided = False
+    count = 0
+    for row in read_rows(
+        config.gtfs_path, "stop_times.txt", ["trip_id", "stop_id", "stop_sequence"]
+    ):
+        count += 1
+        timepoints_provided = timepoints_provided or bool(row.get("timepoint", ""))
+        if row["trip_id"] in trips:
+            stop_times[row["trip_id"]].append(row)
+        if count % 250000 == 0:
+            LOGGER.info("Read %s stop-time rows...", f"{count:,}")
+    LOGGER.info(
+        "Loaded %s trips; selected %s; retained %s stop-time rows.",
+        f"{len(all_trips):,}",
+        f"{len(trips):,}",
+        f"{sum(map(len, stop_times.values())):,}",
+    )
     return Feed(
         routes,
         stops,
@@ -527,12 +916,6 @@ def parse_seconds(value: str) -> int | None:
     if minutes >= 60 or seconds >= 60:
         return None
     return hours * 3600 + minutes * 60 + seconds
-
-
-def stable_id(value: object) -> str:
-    """A deterministic display ID; full tuples, not hashes, remain grouping keys."""
-    payload = json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
 def duration(start: int | None, end: int | None) -> int | None:
@@ -592,7 +975,8 @@ def parse_events(
         if (arrival is None) != (departure is None):
             audit.add(
                 "TIME_FALLBACK",
-                f"Sequence {sequence}: using available time for both arrival/departure; holding unknown.",
+                f"Sequence {sequence}: using available time for both arrival/departure; holding "
+                "unknown.",
                 metadata,
             )
         # Keep original missingness: fallback is applied explicitly to intervals,
@@ -630,7 +1014,8 @@ def parse_events(
     if not time_ok:
         audit.add(
             "TIME_REVERSAL",
-            "Time decreases within trip. Times retained for review; runtime/speed metrics left blank.",
+            "Time decreases within trip. Times retained for review; runtime/speed metrics left "
+            "blank.",
             metadata,
         )
     if not distance_ok:
@@ -681,12 +1066,14 @@ def build_trip(
     ]
     if not selected:
         raise ValueError(
-            f"Trip {metadata['trip_id']}: no retained stops. Enable KEEP_TRIP_ENDPOINTS or all-stop export."
+            f"Trip {metadata['trip_id']}: no retained stops. Enable KEEP_TRIP_ENDPOINTS or "
+            "all-stop export."
         )
     if selected[0] != events[0] or selected[-1] != events[-1]:
         audit.add(
             "PARTIAL_TRIP_COVERAGE",
-            "Displayed stops exclude a trip endpoint; displayed metric totals cover only the retained span.",
+            "Displayed stops exclude a trip endpoint; displayed metric totals cover only the "
+            "retained span.",
             metadata,
         )
     distances: list[float | None] = [None]
@@ -719,8 +1106,8 @@ def build_trip(
         tuple(selected),
         events[-1].sequence,
         tuple(e.stop_id for e in events),
-        stable_id([e.stop_id for e in events]),
-        stable_id([e.stop_id for e in selected]),
+        stop_pattern_id(e.stop_id for e in events),
+        stop_pattern_id(e.stop_id for e in selected),
         departure(events[0]),
         arrival(events[-1]),
         tuple(distances),
@@ -739,7 +1126,8 @@ def build_trip(
     if (config.distances or config.speeds) and any(d is None for d in trip.distances[1:]):
         audit.add(
             "INCOMPLETE_DISTANCE",
-            "One or more displayed segment distances unavailable; total displayed distance/speed left blank.",
+            "One or more displayed segment distances unavailable; total displayed distance/speed "
+            "left blank.",
             metadata,
         )
     runtimes = trip.runtimes(config)
@@ -760,7 +1148,8 @@ def build_trip(
         if config.speeds and speed is not None and speed > config.speed_warning:
             audit.add(
                 "HIGH_SPEED",
-                f"Scheduled segment speed {speed:.1f} mph exceeds {config.speed_warning:g}; check distance units/times.",
+                f"Scheduled segment speed {speed:.1f} mph exceeds {config.speed_warning:g}; check "
+                "distance units/times.",
                 metadata,
             )
             break
@@ -784,7 +1173,8 @@ def speed_mph(distance: float | None, seconds: float | int | None, config: Confi
     """Unknown, negative, and zero-duration cases never become numeric speeds."""
     if distance is None or seconds is None or distance < 0 or seconds <= 0:
         return None
-    return distance * METERS_PER_UNIT[config.input_unit] / 1609.344 * 3600 / seconds
+    miles = convert_distance(distance, config.input_unit, "miles")
+    return None if miles is None else miles * 3600 / seconds
 
 
 def mean_speed(trip: Trip, config: Config) -> float | None:
@@ -996,7 +1386,7 @@ def safe_component(value: str, limit: int = 45) -> str:
     """Filename-safe component, with a hash when cleaning/truncation could collide."""
     clean = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", value).strip(" .") or "unknown"
     if clean != value or len(clean) > limit:
-        return clean[:limit] + "_" + stable_id(value)[:8]
+        return clean[:limit] + "_" + stop_pattern_id([value])
     return clean
 
 
@@ -1051,11 +1441,7 @@ def new_sheet(workbook: Workbook, name: str, header: Sequence[str]) -> Worksheet
 
 def display_distance(value: float | None, config: Config) -> float | None:
     """Convert units without rounding the stored number."""
-    return (
-        None
-        if value is None
-        else value * METERS_PER_UNIT[config.input_unit] / METERS_PER_UNIT[config.output_unit]
-    )
+    return convert_distance(value, config.input_unit, config.output_unit)
 
 
 def minutes(value: float | int | None) -> float | None:
@@ -1100,7 +1486,9 @@ def write_timetables(
             if not consistent:
                 audit.add(
                     "OVERTAKING_OR_ORDER_CONFLICT",
-                    f"Direction {direction or 'unspecified'}, layout {layout_index + 1}: no trip order is chronological at every shared stop. Original-departure order retained.",
+                    f"Direction {direction or 'unspecified'}, layout {layout_index + 1}: no trip "
+                    "order is chronological at every shared stop. Original-departure order "
+                    "retained.",
                     {"route_id": group[0].route_id, "service_id": group[0].service_id},
                 )
             sheet = new_sheet(
@@ -1355,32 +1743,39 @@ def export_workbook(
         ["Band times", "First/last actual departures of matching trips; NOT validity windows."],
         [
             "Holding",
-            "Arrival-to-departure at retained stops. Runtime departure_to_arrival excludes downstream holding; intermediate-stop dwell remains included.",
+            "Arrival-to-departure at retained stops. Runtime departure_to_arrival excludes "
+            "downstream holding; intermediate-stop dwell remains included.",
         ],
         [
             "Timetable times",
-            "Departure at each visit; arrival at the ORIGINAL final stop. Missing preferred times use the other field and are flagged.",
+            "Departure at each visit; arrival at the ORIGINAL final stop. Missing preferred times "
+            "use the other field and are flagged.",
         ],
         [
             "Timetable layouts",
-            "Compatible branches share columns; conflicting stop order or ambiguous loop visits use separate sheets.",
+            "Compatible branches share columns; conflicting stop order or ambiguous loop visits "
+            "use separate sheets.",
         ],
         ["Missing data", "Blank cells mean unknown; totals require every contributing segment."],
         [
             "Pattern ID",
-            "Ordered retained stop IDs, including repeats. Full Pattern ID includes all original stops.",
+            "Ordered retained stop IDs, including repeats. Full Pattern ID includes all original "
+            "stops.",
         ],
         [
             "Metric profiles",
-            "All metrics share band boundaries; shape/full-pattern/distance/time/holding changes split bands.",
+            "All metrics share band boundaries; shape/full-pattern/distance/time/holding changes "
+            "split bands.",
         ],
         [
             "Units",
-            "GTFS distances are unitless by specification; INPUT_DISTANCE_UNIT must match your producer.",
+            "GTFS distances are unitless by specification; INPUT_DISTANCE_UNIT must match your "
+            "producer.",
         ],
         [
             "Calendar",
-            "Service IDs are kept separate; labels do not select an operating date or apply holiday exceptions to other service IDs.",
+            "Service IDs are kept separate; labels do not select an operating date or apply "
+            "holiday exceptions to other service IDs.",
         ],
     ]:
         append_row(summary, row)
@@ -1429,7 +1824,7 @@ def export_details(
 ) -> None:
     """Expose per-trip and per-segment calculation lineage without merging IDs."""
     write_csv(
-        output / "trips.csv",
+        output / config.trips_filename,
         trip_header(config),
         (trip_row(trip, bands.get(trip.trip_id, ""), config) for trip in trips),
     )
@@ -1483,7 +1878,7 @@ def export_details(
                     speed_mph(trip.distances[i], trip.runtimes(config)[i], config),
                 ]
 
-    write_csv(output / "segments.csv", header, segment_rows())
+    write_csv(output / config.segments_filename, header, segment_rows())
 
 
 # =============================================================================
@@ -1493,12 +1888,25 @@ def export_details(
 
 def validate_config(config: Config) -> None:
     """Fail early on unsupported settings or accidental placeholder paths."""
-    if str(config.gtfs_path).startswith("Path\\To\\") or str(config.output_dir).startswith(
-        "Path\\To\\"
+    if str(config.gtfs_path).startswith(PLACEHOLDER_PREFIX) or str(config.output_dir).startswith(
+        PLACEHOLDER_PREFIX
     ):
-        raise ValueError("Edit GTFS_PATH and OUTPUT_DIR in CONFIGURATION before running.")
-    if config.input_unit not in METERS_PER_UNIT or config.output_unit not in METERS_PER_UNIT:
-        raise ValueError("Distance unit must be feet, meters, km, or miles.")
+        raise ValueError(
+            "Edit GTFS_PATH and OUTPUT_DIR in CONFIGURATION (or pass --gtfs-path and "
+            "--output-dir) before running."
+        )
+    if config.input_unit not in INPUT_UNITS:
+        raise ValueError(f"INPUT_DISTANCE_UNIT must be one of {list(INPUT_UNITS)}.")
+    if config.output_unit not in OUTPUT_UNITS:
+        raise ValueError(f"OUTPUT_DISTANCE_UNIT must be one of {list(OUTPUT_UNITS)}.")
+    for label, name in [
+        ("ISSUES_FILENAME", config.issues_filename),
+        ("TRIPS_FILENAME", config.trips_filename),
+        ("SEGMENTS_FILENAME", config.segments_filename),
+        ("RUN_LOG_FILENAME", config.run_log_filename),
+    ]:
+        if not name.strip() or re.search(r'[<>:"/\\|?*\x00-\x1f]', name):
+            raise ValueError(f"{label} must be a plain file name, got {name!r}.")
     choices = [
         (config.runtime_basis, {"departure_to_arrival", "departure_to_departure"}, "RUNTIME_BASIS"),
         (config.band_mode, {"consecutive", "profile_summary"}, "BAND_MODE"),
@@ -1521,6 +1929,14 @@ def validate_config(config: Config) -> None:
         raise ValueError("WARNING_FILENAME_SUFFIX contains invalid filename characters.")
 
 
+def resolve_source_file() -> Path | None:
+    """Best-effort path to this script's source (``None`` in notebooks)."""
+    try:
+        return Path(__file__).resolve()
+    except NameError:
+        return None
+
+
 def write_audit(
     output: Path,
     config: Config,
@@ -1529,19 +1945,30 @@ def write_audit(
     written: list[Path],
     failed: list[str],
 ) -> None:
-    """Always capture effective settings, issue counts, failed trips, and exports."""
+    """Always capture effective settings, issue counts, failed trips, and exports.
+
+    The run log holds both the CONFIGURATION block verbatim from the source file
+    and the effective settings, which also reflect command-line overrides.
+    """
     write_csv(
-        output / "issues.csv",
+        output / config.issues_filename,
         ["Severity", "Code", "Route ID", "Service ID", "Trip ID", "Message"],
         (
             [i.severity, i.code, i.route_id, i.service_id, i.trip_id, i.message]
             for i in audit.issues
         ),
     )
+    source_file = resolve_source_file()
+    if source_file is None:
+        config_text = "(config block unavailable: interactive session, no __file__ on disk)"
+    else:
+        config_text = extract_config_block(source_file)
     lines = [
         "GTFS SCHEDULE EXPORTER RUN LOG",
         f"Version: {VERSION}",
         f"Timestamp: {datetime.now().astimezone().isoformat(timespec='seconds')}",
+        f"Source script: {source_file or '<interactive>'}",
+        f"Output folder: {output}",
         "",
         "RUN SUMMARY",
         json.dumps(summary, indent=2, default=str),
@@ -1558,20 +1985,24 @@ def write_audit(
         "FAILED TRIPS / EXPORTS",
         *(failed or ["None"]),
         "",
-        "ALL ISSUES (also available in issues.csv)",
+        "CONFIGURATION (verbatim from source)",
+        config_text,
+        "",
+        f"ALL ISSUES (also available in {config.issues_filename})",
         *[
-            f"{i.severity} | {i.code} | route={i.route_id} | service={i.service_id} | trip={i.trip_id} | {i.message}"
+            f"{i.severity} | {i.code} | route={i.route_id} | service={i.service_id}"
+            f" | trip={i.trip_id} | {i.message}"
             for i in audit.issues
         ],
     ]
-    (output / "gtfs_schedule_exporter_runlog.txt").write_text(
-        "\n".join(lines) + "\n", encoding="utf-8"
-    )
+    (output / config.run_log_filename).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def run(config: Config) -> int:
-    """Export selected trips, continue independent work after failures, reconcile counts."""
-    validate_config(config)
+    """Export selected trips, continue independent work after failures, reconcile counts.
+
+    Expects settings that passed :func:`validate_config`.
+    """
     output = config.output_dir
     if config.run_subfolder:
         output = output / datetime.now().strftime("gtfs_schedule_%Y%m%d_%H%M%S_%f")
@@ -1654,14 +2085,16 @@ def run(config: Config) -> int:
     summary.update(issues=len(audit.issues), failures=len(failed), complete=not failed)
     try:
         write_audit(output, config, audit, summary, written, failed)
-    except OSError:
-        LOGGER.exception("Could not write the mandatory run log / issues.csv.")
-        return 1
+    except (OSError, ValueError) as exc:
+        if config.require_run_log:
+            LOGGER.error("Could not write the required run log or issues file: %s", exc)
+            return 1
+        LOGGER.warning("Run log not written (REQUIRE_RUN_LOG is False): %s", exc)
     if failed:
         LOGGER.error(
             "Finished with %d failure(s). Review %s",
             len(failed),
-            output / "gtfs_schedule_exporter_runlog.txt",
+            output / config.run_log_filename,
         )
         return 1
     LOGGER.info(
@@ -1674,21 +2107,37 @@ def run(config: Config) -> int:
     return 0
 
 
-def main(config: Config | None = None) -> int:
-    """Entry point usable unchanged from a notebook or ordinary Python process."""
+def main(argv: Sequence[str] | None = None, config: Config | None = None) -> int:
+    """Run the export from CONFIGURATION, command-line flags, or a given Config.
+
+    Args:
+        argv: Command-line arguments. ``None`` reads ``sys.argv``, except in a
+            notebook kernel, where the CONFIGURATION constants are used as-is.
+        config: Settings to use instead of CONFIGURATION and flags (e.g. from a
+            test or a notebook cell); *argv* is then ignored.
+
+    Returns:
+        Process exit code: 0 on success, 1 if a trip, a workbook or the required
+        run log failed, 2 for a configuration error such as placeholder paths.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+    if config is None:
+        config = configured_settings(build_arg_parser().parse_args(notebook_safe_argv(argv)))
     try:
-        return run(config if config is not None else configured_settings())
+        validate_config(config)
+    except ValueError as exc:
+        LOGGER.error("Configuration error: %s", exc)
+        return 2
+    try:
+        return run(config)
     except (OSError, ValueError) as exc:
         LOGGER.error("Cannot start export: %s", exc)
         return 1
 
 
 if __name__ == "__main__":
-    status = main()
-    if "ipykernel" not in sys.modules:
-        raise SystemExit(status)
+    raise SystemExit(main())
