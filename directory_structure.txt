@@ -61,17 +61,14 @@ transit_planning_with_python/
 │   │   ├── gtfs_feed_merger.py
 │   │   ├── gtfs_route_features_gpd.py
 │   │   ├── gtfs_route_timeline.py
+│   │   ├── gtfs_schedule_exporter.py
 │   │   ├── gtfs_to_shapefile_arcpy.py
 │   │   ├── gtfs_to_shapefile_gpd.py
 │   │   ├── headway_span_exporter.py
 │   │   ├── pattern_map_exporter_gpd.py
 │   │   ├── route_stops_exporter.py
 │   │   ├── route_transfer_calculator.py
-│   │   ├── scheduled_service_hours.py
-│   │   ├── segment_speed_exporter.py
-│   │   ├── stop_pattern_exporter.py
-│   │   ├── time_band_exporter.py
-│   │   └── gtfs_timetable_exporter.py
+│   │   └── scheduled_service_hours.py
 │   ├── modeling/
 │   │   ├── monthly_ridership_model.py
 │   │   ├── orchestrator_jobs_private.json
@@ -269,6 +266,7 @@ transit_planning_with_python/
 │   ├── test_gtfs_route_features_gpd.py
 │   ├── test_gtfs_route_summary.py
 │   ├── test_gtfs_route_timeline.py
+│   ├── test_gtfs_schedule_exporter.py
 │   ├── test_gtfs_service_by_district_gpd.py
 │   ├── test_gtfs_service_change_dates.py
 │   ├── test_gtfs_service_demographics_arcpy.py
@@ -312,21 +310,17 @@ transit_planning_with_python/
 │   ├── test_scheduled_service_hours.py
 │   ├── test_school_coverage_by_route_gpd.py
 │   ├── test_schools_prep_join_gpd.py
-│   ├── test_segment_speed_exporter.py
 │   ├── test_shapefile_helpers.py
 │   ├── test_site_route_proximity_gpd.py
 │   ├── test_stop_impacts_target_routes.py
 │   ├── test_stop_improvement_coverage_summary.py
-│   ├── test_stop_pattern_exporter.py
 │   ├── test_stop_removal_impact_gpd.py
 │   ├── test_stop_ridership_change.py
 │   ├── test_stop_spacing_flagger_gpd.py
 │   ├── test_stop_v_conflict_checker_gpd.py
 │   ├── test_stop_vs_roadname_checker_gpd.py
 │   ├── test_stops_ridership_joiner_gpd.py
-│   ├── test_time_band_exporter.py
 │   ├── test_time_helpers.py
-│   ├── test_gtfs_timetable_exporter.py
 │   ├── test_trip_runtime_diagnostics_from_avl.py
 │   ├── test_tsde_to_tods.py
 │   ├── test_uscensus_table_build.py

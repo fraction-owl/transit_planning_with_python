@@ -76,7 +76,7 @@ Every script is also a normal command-line program — nothing about the noteboo
 1. **Run a script directly**
    - Edit the CONFIGURATION section at the top of the script, then run it with Python:
      ```bash
-     python scripts/gtfs_exports/stop_pattern_exporter.py
+     python scripts/gtfs_exports/gtfs_schedule_exporter.py
      ```
    - ArcGIS Pro users can run the `*_arcpy` variants with Pro's bundled interpreter instead:
      ```bat

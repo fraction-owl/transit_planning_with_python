@@ -8,13 +8,14 @@ stop across the selected routes, with the selected routes and any *other*
 routes in the feed that also serve it. It answers the everyday data-request
 question "which stops does route X serve?" without running a heavier
 analysis: ``stop_impacts_target_routes.py`` produces a similar stop set only
-as a by-product of a removal-impact analysis, and ``stop_pattern_exporter.py``
-exports full per-pattern stop sequences as Excel workbooks.
+as a by-product of a removal-impact analysis, and ``gtfs_schedule_exporter.py``
+exports per-pattern stop sequences as Excel workbooks (every stop when
+``TIMEPOINTS_ONLY = False``).
 
 Stop order within a route and direction is the *median* ``stop_sequence``
 across that direction's trips, so routes with short-turns or branches get a
 single approximate ordering rather than one row per pattern. Use
-``stop_pattern_exporter.py`` when the exact sequence of each pattern matters.
+``gtfs_schedule_exporter.py`` when the exact sequence of each pattern matters.
 
 Inputs
 ------
