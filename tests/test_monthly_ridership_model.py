@@ -318,3 +318,159 @@ def test_write_run_log_records_anchor_sha(tmp_path: Path) -> None:
     content = (tmp_path / "monthly_ridership_model_runlog.txt").read_text(encoding="utf-8")
     assert f"Anchor SHA-256:   {mrm._sha256_file(anchor)}" in content
     assert "b.csv  sha256=abc123" in content
+
+
+# ---------------------------------------------------------------------------
+# Categoricals, prefixes, and route-group interactions (panel)
+# ---------------------------------------------------------------------------
+
+
+def _panel_table(n_routes: int = 6, n_months: int = 24) -> pd.DataFrame:
+    """A route x month panel where routes A/B respond to a proxy and others don't."""
+    rng = np.random.default_rng(11)
+    periods = pd.period_range("2023-01", periods=n_months, freq="M").strftime("%Y-%m")
+    rows = []
+    for r in range(n_routes):
+        route = "AB"[r] if r < 2 else str(100 + r)
+        for p in periods:
+            rows.append({"route_id": route, "period": p})
+    df = pd.DataFrame(rows)
+    df["month"] = pd.to_datetime(df["period"], format="%Y-%m").dt.strftime("%b")
+    df["hours"] = rng.uniform(50, 500, len(df))
+    df["proxy"] = rng.uniform(1, 10, len(df))
+    df["ev_detour"] = (df["period"] == "2023-06").astype(float) * 0.5
+    in_group = df["route_id"].isin(["A", "B"]).astype(float)
+    log_y = (
+        1.0
+        + 0.6 * np.log(df["hours"])
+        + 0.4 * df["proxy"] * in_group
+        - 0.3 * df["ev_detour"]
+        + rng.normal(0, 0.02, len(df))
+    )
+    df["boardings"] = np.exp(log_y)
+    return df
+
+
+def test_explicit_predictors_keep_present_categoricals() -> None:
+    """Regression: explicit PREDICTORS + a categorical used to KeyError on 'month'."""
+    table = _panel_table()
+    preds = mrm.select_predictors(
+        table, ("hours",), "boardings", ("route_id", "period"), ("month",)
+    )
+    assert preds == ["hours", "month"]
+    _, _, names, _, _ = mrm.build_design_matrix(
+        table, "boardings", preds, ("month",), True, ("hours",), False
+    )
+    assert sum(n.startswith("month_") for n in names) == 11
+
+
+def test_absent_categorical_is_skipped() -> None:
+    """A cross-sectional table has no 'month'; it must be skipped, not raise."""
+    table = _model_table()
+    preds = mrm.select_predictors(
+        table, ("scheduled_hours",), "ntd_boardings", ("route_id",), ("month",)
+    )
+    assert preds == ["scheduled_hours"]
+    auto = mrm.select_predictors(table, (), "ntd_boardings", ("route_id",), ("month",))
+    assert "month" not in auto
+
+
+def test_select_predictors_adds_prefixed_columns() -> None:
+    table = _panel_table()
+    preds = mrm.select_predictors(
+        table, ("hours",), "boardings", ("route_id", "period"), (), prefixes=("ev_",)
+    )
+    assert preds == ["hours", "ev_detour"]
+
+
+def test_numeric_interaction_recovers_group_slope() -> None:
+    table = _panel_table()
+    y, x_matrix, names, frame, _ = mrm.build_design_matrix(
+        table,
+        "boardings",
+        ["hours", "ev_detour"],
+        (),
+        True,
+        ("hours",),
+        False,
+        interactions=[("proxy", "tourism")],
+        route_groups={"tourism": ("a", "B")},  # folded like the bundle join keys
+    )
+    assert "grp_tourism" in names and "proxy_x_tourism" in names
+    assert "proxy" not in names  # main effect only when listed in predictors
+    assert "route_id" in frame.columns
+    result = mrm.fit_ols(y, x_matrix, names, se_type="HC1")
+    coef = dict(zip(names, result.params))
+    assert coef["proxy_x_tourism"] == pytest.approx(0.4, abs=0.02)
+    assert coef["ev_detour"] == pytest.approx(-0.3, abs=0.05)
+
+
+def test_categorical_interaction_and_main_effect_toggle() -> None:
+    table = _panel_table()
+    _, _, names, _, _ = mrm.build_design_matrix(
+        table,
+        "boardings",
+        ["hours"],
+        ("month",),
+        True,
+        (),
+        False,
+        interactions=[("month", "tourism")],
+        route_groups={"tourism": ("A", "B")},
+        include_group_main_effects=False,
+    )
+    assert "grp_tourism" not in names
+    assert sum(n.endswith("_x_tourism") and n.startswith("month_") for n in names) == 11
+
+
+def test_interaction_errors_are_actionable() -> None:
+    table = _panel_table()
+    with pytest.raises(KeyError, match="not in ROUTE_GROUPS"):
+        mrm.build_design_matrix(
+            table,
+            "boardings",
+            ["hours"],
+            (),
+            True,
+            (),
+            False,
+            interactions=[("proxy", "nope")],
+            route_groups={},
+        )
+    with pytest.raises(ValueError, match="matches none"):
+        mrm.build_design_matrix(
+            table,
+            "boardings",
+            ["hours"],
+            (),
+            True,
+            (),
+            False,
+            interactions=[("proxy", "g")],
+            route_groups={"g": ("999",)},
+        )
+
+
+def test_panel_anchor_joins_route_period_exposure_bundle(tmp_path: Path) -> None:
+    """A (route_id, period) exposure bundle joins a panel anchor alongside the others."""
+    anchor_path, bundle_dir, _ = _make_panel_inputs(tmp_path)
+    pd.DataFrame(
+        {
+            "route_id": ["101", "101", "202", "202"],
+            "period": ["2024-01", "2024-02", "2024-01", "2024-02"],
+            "ev_detour": [0.0, 0.5, 0.0, 0.0],
+        }
+    ).to_csv(bundle_dir / "features__route_id__period.csv", index=False)
+    manifest_path = _write_manifest(
+        bundle_dir,
+        [
+            ("features__route_id.csv", ["route_id"]),
+            ("features__period.csv", ["period"]),
+            ("features__route_id__period.csv", ["route_id", "period"]),
+        ],
+    )
+    merged, provenance = mrm.assemble_model_table(
+        anchor_path, 0, bundle_dir, manifest_path, verify_hashes=True
+    )
+    assert len(provenance) == 3
+    assert merged.set_index(["route_id", "period"]).loc[("101", "2024-02"), "ev_detour"] == 0.5
