@@ -27,7 +27,7 @@ import ridership_from_tides as target  # noqa: E402
 STOP_VISITS = Path("tests/fixtures/stop_visits.csv")
 TRIPS_PERFORMED = Path("tests/fixtures/trips_performed.csv")
 PERIODS_FIXTURE = Path("tests/fixtures/time_periods.txt")
-EXAMPLE_PERIODS = script_dir / "time_periods_example.txt"
+EXAMPLE_PERIODS = Path("sample_data/time_periods_example.txt")
 MOCK_GTFS = Path("tests/fixtures/mock_gtfs_dc.zip")
 HOLIDAY = dt.date(2026, 1, 1)  # the fixtures' holiday-service date, a Thursday
 PRESIDENTS_DAY = dt.date(2026, 2, 16)  # a public holiday running weekday service

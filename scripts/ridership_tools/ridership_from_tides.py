@@ -16,7 +16,7 @@ divide by the dates with observed data (system-wide per day type and month, or p
 for the trip levels); each row's ``days_observed`` shows the divisor.
 
 Time periods come from ``TIME_PERIODS``, a ``TIME_PERIODS_FILE`` (see
-``time_periods_example.txt``) or ``--time-period`` flags, and must cover the day exactly
+``sample_data/time_periods_example.txt``) or ``--time-period`` flags, and must cover the day exactly
 once. A visit falls in a period by its clock time and in an hour of the service day.
 
 Inputs
@@ -245,7 +245,7 @@ TIME_PERIODS: Mapping[str, Tuple[str, str]] = {
 
 # Optional plain-text file of time periods. When set, it replaces TIME_PERIODS.
 # One period per line as "NAME = HH:MM - HH:MM"; blank lines and anything after
-# "#" are ignored. See time_periods_example.txt next to this script. The same
+# "#" are ignored. See sample_data/time_periods_example.txt. The same
 # checks apply. --time-period flags on the command line replace both.
 TIME_PERIODS_FILE: Optional[str] = None  # e.g. r"C:\Data\time_periods.txt"
 

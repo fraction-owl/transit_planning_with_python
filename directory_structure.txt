@@ -27,6 +27,16 @@ transit_planning_with_python/
 │   ├── generate_mock_tides.py
 │   ├── lint_commit.py
 │   └── lint_pr.py
+├── sample_data/
+│   ├── tides/
+│   │   ├── stop_visits.csv
+│   │   └── trips_performed.csv
+│   ├── README.md
+│   ├── gtfs_archive.zip
+│   ├── gtfs_current.zip
+│   ├── ntd_monthly_config_example.txt
+│   ├── time_periods_example.txt
+│   └── tods_current.zip
 ├── scripts/
 │   ├── conversion_tools/
 │   │   ├── convert_to_tides_stop_visits.py
@@ -110,15 +120,13 @@ transit_planning_with_python/
 │   │   ├── district_ridership_share_gpd.py
 │   │   ├── load_factor_monitor.py
 │   │   ├── ntd_anchor_builder.py
-│   │   ├── ntd_monthly_config_example.txt
 │   │   ├── ntd_monthly_summary.py
 │   │   ├── ntd_monthly_trends_export.py
 │   │   ├── ridership_by_hour.py
 │   │   ├── ridership_from_tides.py
 │   │   ├── stop_ridership_change.py
 │   │   ├── stops_ridership_joiner_arcpy.py
-│   │   ├── stops_ridership_joiner_gpd.py
-│   │   └── time_periods_example.txt
+│   │   └── stops_ridership_joiner_gpd.py
 │   ├── service_coverage/
 │   │   ├── cabi_coverage_by_route_gpd.py
 │   │   ├── cordon_crossing_routes_gpd.py
@@ -336,6 +344,7 @@ transit_planning_with_python/
 │   ├── test_runtime_by_route.py
 │   ├── test_runtime_by_segment.py
 │   ├── test_runtime_by_trip.py
+│   ├── test_sample_data.py
 │   ├── test_scheduled_service_hours.py
 │   ├── test_school_coverage_by_route_gpd.py
 │   ├── test_schools_prep_join_gpd.py
