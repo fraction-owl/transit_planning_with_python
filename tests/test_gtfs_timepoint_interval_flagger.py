@@ -1,4 +1,4 @@
-"""Tests for gtfs_timepoint_interval_flagger: scheduled timepoint-gap QA."""
+"""Tests for gtfs_timepoint_interval_flagger: scheduled timepoint-spacing policy check."""
 
 import sys
 from pathlib import Path
@@ -6,7 +6,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-script_dir = Path("scripts/gtfs_data_quality").resolve()
+script_dir = Path("scripts/stop_analysis").resolve()
 sys.path.append(str(script_dir))
 
 import gtfs_timepoint_interval_flagger as target  # noqa: E402
