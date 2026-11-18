@@ -11,8 +11,11 @@ At a high level, the script:
     stops as the representative pattern (its stop sequence and its shape).
   - Builds ordered logical stop sequences using a configurable stop key
     (stop_id or stop_code).
-  - Treats a configurable set of base routes as references and compares each
-    base (route_id, direction_id) against all other route/direction pairs.
+  - Compares every pair of route/directions that includes a target route
+    (all routes by default) in both directions, so it reports stops the
+    target route skips and stops the overlapping route skips. A route that
+    serves the shared stops in the opposite order is not used as a reference
+    by default.
   - Identifies segments bounded by shared stops where one route has a small
     number of interior stops that the other route does not serve, flagging
     these as potential skipped-stop issues.
@@ -30,8 +33,9 @@ All files are written under ``OUTPUT_DIR``:
   per missing route + candidate stop).
 - ``intra_route_skipped_stops.csv``: intra-route trip-level skipped-stop
   findings.
-- ``segment_plots/``: PNG maps of flagged segments plus per-route overview
-  plots.
+- ``segment_plots/run_<timestamp>/``: PNG maps of flagged segments plus
+  per-route overview plots. Each run writes to a new folder, so plots from an
+  earlier run never sit beside the current CSVs.
 
 Typical usage
 -------------
@@ -50,6 +54,7 @@ from collections import Counter
 from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import IO, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, cast
 
@@ -86,7 +91,8 @@ AGGREGATE_FILENAME = "stop_suspicion_scores.csv"
 # Intra-route trip-level skipped-stop findings.
 INTRA_ROUTE_FILENAME = "intra_route_skipped_stops.csv"
 
-# Subfolder for PNG plots.
+# Subfolder for PNG plots. Each run writes its plots to a new
+# run_<timestamp> folder inside it.
 PLOT_DIR = OUTPUT_DIR / "segment_plots"
 
 # CRS settings.
@@ -109,10 +115,27 @@ ROUTE_ID_WHITELIST: Set[str] = set()
 
 # Target routes: leave empty to analyze all routes, or specify a subset.
 # Example: {"101"} or {"101", "202"}.
+# Each pair of routes that includes a target route is checked both ways: stops
+# the target route skips, and stops the other route skips that the target
+# route serves.
 TARGET_ROUTE_IDS: Set[str] = set()
 
 # Minimum number of shared logical stops between two routes to consider the pair.
 MIN_SHARED_STOPS_FOR_PAIR = 2
+
+# Route pairs whose shared stops are all terminals on both routes are skipped
+# when either route has no shape, because nothing can confirm that the routes
+# take the same path between those terminals. When both shapes exist, the
+# segment geometry checks (MAX_SHAPE_HAUSDORFF_M, MAX_STOP_TO_SHAPE_M) decide.
+# Set to False to compare every such pair.
+SKIP_TERMINAL_ONLY_PAIRS = True
+
+# A reference route that serves the shared stops in the opposite order (judged
+# from the stop sequences, since direction_id can differ between routes on the
+# same corridor) can serve stops on the opposite curb that the route under
+# review has no reason to serve. Such pairs are skipped by default. Set to True
+# to compare them anyway, with the reference's stop order reversed.
+COMPARE_REVERSED_REFERENCES = False
 
 # Minimum index distance (in stops) between boundary stops to treat as a segment.
 # For example, 2 means there must be at least one interior stop on at least one route.
@@ -1329,6 +1352,33 @@ def aggregate_candidates(df: pd.DataFrame) -> pd.DataFrame:
     return agg
 
 
+def skipped_positions(sub: Sequence[str], full: Sequence[str]) -> Optional[List[int]]:
+    """Return the positions in full that sub skips, if sub is a subsequence.
+
+    Each item of sub is matched to its earliest available occurrence in full,
+    so a skipped repeat visit is found by position: A-B-X-C skips position 3
+    (the second B) of A-B-X-B-C, although both sequences contain B.
+
+    Args:
+        sub: Candidate subsequence.
+        full: Sequence that may contain sub's items in the same order.
+
+    Returns:
+        Indices of full that no item of sub matched, in order, or None if sub
+        cannot be obtained from full by deleting items only.
+    """
+    matched: Set[int] = set()
+    pos = 0
+    for item in sub:
+        try:
+            pos = full.index(item, pos)
+        except ValueError:
+            return None
+        matched.add(pos)
+        pos += 1
+    return [i for i in range(len(full)) if i not in matched]
+
+
 def is_ordered_subsequence(sub: Sequence[str], full: Sequence[str]) -> bool:
     """Return True if sub can be obtained from full by deleting items only.
 
@@ -1339,13 +1389,7 @@ def is_ordered_subsequence(sub: Sequence[str], full: Sequence[str]) -> bool:
     Returns:
         True if every item of sub appears in full, in order.
     """
-    pos = 0
-    for item in sub:
-        try:
-            pos = full.index(item, pos) + 1
-        except ValueError:
-            return False
-    return True
+    return skipped_positions(sub, full) is not None
 
 
 def find_intra_route_skipped_stops(
@@ -1359,7 +1403,9 @@ def find_intra_route_skipped_stops(
     ordered tuple of stop keys) is treated as canonical.  Any trip whose
     sequence is an ordered subsequence of the canonical sequence (it omits
     stops but adds or reorders none) — and whose first and last stops match
-    the canonical first and last — is flagged for the stops it omits.
+    the canonical first and last — is flagged for the stop visits it omits,
+    listed in travel order. A skipped second visit to a stop the trip also
+    serves earlier (e.g., on a loop) counts as an omission.
     Genuine short-turn or branched patterns are excluded by the first/last
     stop guard, and variants that add or reorder stops (e.g., a deviation)
     by the subsequence test.
@@ -1393,23 +1439,22 @@ def find_intra_route_skipped_stops(
         seqs = group.tolist()
         counter: Counter = Counter(seqs)
         canonical, n_canonical = counter.most_common(1)[0]
-        canonical_set = set(canonical)
         for trip_id, seq in zip(group.index.get_level_values("trip_id"), seqs):
             if seq == canonical:
                 continue
             if not seq or seq[0] != canonical[0] or seq[-1] != canonical[-1]:
                 continue  # genuine short-turn or branch
-            if not is_ordered_subsequence(seq, canonical):
+            skipped = skipped_positions(seq, canonical)
+            if skipped is None:
                 continue  # adds or reorders stops: a different pattern, not an omission
-            missing = canonical_set - set(seq)
-            if missing:
+            if skipped:
                 rows.append(
                     {
                         "route_id": rid,
                         "direction_id": did,
                         "trip_id": trip_id,
                         "n_canonical_trips": n_canonical,
-                        "missing_stop_keys": ";".join(sorted(missing)),
+                        "missing_stop_keys": ";".join(canonical[i] for i in skipped),
                     }
                 )
     return pd.DataFrame(rows, columns=INTRA_ROUTE_COLUMNS)
@@ -1482,6 +1527,7 @@ def plot_mismatch_segment(
     route_shapes_geo: Mapping[RouteKey, LineString],
     stops_gdf_geo: gpd.GeoDataFrame,
     stop_names: Mapping[str, str],
+    plot_dir: Optional[Path] = None,
 ) -> Optional[Path]:
     """Create a PNG plot for one mismatched segment.
 
@@ -1492,6 +1538,7 @@ def plot_mismatch_segment(
             geometries in GTFS_CRS for plotting.
         stops_gdf_geo: Stops GeoDataFrame (GTFS_CRS), indexed by logical stop key.
         stop_names: Mapping from logical stop key to stop_name.
+        plot_dir: Folder for the PNG (created if needed); defaults to PLOT_DIR.
 
     Returns:
         Path to the saved PNG file, or None if plotting was not possible.
@@ -1624,8 +1671,9 @@ def plot_mismatch_segment(
     safe_start = _sanitize_token(start_key)
     safe_end = _sanitize_token(end_key)
     filename = f"seg_{safe_base}_vs_{safe_other}_{safe_start}_{safe_end}.png"
-    PLOT_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = PLOT_DIR / filename
+    out_dir = PLOT_DIR if plot_dir is None else plot_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / filename
 
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -1639,6 +1687,7 @@ def plot_route_pair_overview(
     other_key: RouteKey,
     ctx: GTFSContext,
     buffer_m: float,
+    plot_dir: Optional[Path] = None,
 ) -> Optional[Path]:
     """Plot an overview of a route pair and an additional side-by-side view.
 
@@ -1660,6 +1709,7 @@ def plot_route_pair_overview(
         buffer_m: Buffer distance in meters for each route shape; also used as
             the distance threshold for classifying corridor vs off-corridor
             non-shared stops.
+        plot_dir: Folder for the PNGs (created if needed); defaults to PLOT_DIR.
 
     Returns:
         Path to the saved combined PNG file, or None if plotting was not
@@ -1843,8 +1893,9 @@ def plot_route_pair_overview(
     safe_other = f"{_sanitize_token(other_route_id)}_{_sanitize_token(other_dir)}"
     filename_combined = f"overview_{safe_base}_vs_{safe_other}.png"
 
-    PLOT_DIR.mkdir(parents=True, exist_ok=True)
-    out_path_combined = PLOT_DIR / filename_combined
+    out_dir = PLOT_DIR if plot_dir is None else plot_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path_combined = out_dir / filename_combined
     fig.savefig(out_path_combined, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
@@ -1934,7 +1985,7 @@ def plot_route_pair_overview(
     )
 
     filename_side = f"overview_{safe_base}_vs_{safe_other}_side_by_side.png"
-    out_path_side = PLOT_DIR / filename_side
+    out_path_side = out_dir / filename_side
     fig2.savefig(out_path_side, dpi=150, bbox_inches="tight")
     plt.close(fig2)
 
@@ -2060,18 +2111,55 @@ def prepare_gtfs_context() -> GTFSContext:
     )
 
 
+def route_pairs_to_compare(
+    base_route_keys: Sequence[RouteKey],
+    all_route_keys: Sequence[RouteKey],
+    route_id_whitelist: Set[str],
+) -> List[Tuple[RouteKey, RouteKey]]:
+    """List the ordered (base, other) route pairs to compare.
+
+    compare_segments_for_route_pair reports only stops missing from its base
+    route, so every pair that includes a base route is listed in both orders:
+    once for stops the base route skips, and once for stops the other route
+    skips. Pairs with a whitelisted route are left out.
+
+    Args:
+        base_route_keys: Route/direction keys selected for analysis.
+        all_route_keys: Every route/direction key with a stop sequence.
+        route_id_whitelist: route_ids to leave out entirely.
+
+    Returns:
+        Ordered (base_key, other_key) pairs, each listed once.
+    """
+    pairs: Dict[Tuple[RouteKey, RouteKey], None] = {}
+    for base_key in base_route_keys:
+        if base_key[0] in route_id_whitelist:
+            continue
+        for other_key in all_route_keys:
+            if other_key == base_key or other_key[0] in route_id_whitelist:
+                continue
+            pairs[(base_key, other_key)] = None
+            pairs[(other_key, base_key)] = None
+    return list(pairs)
+
+
 def run_segment_comparison(ctx: GTFSContext) -> pd.DataFrame:
     """Run segment-level stop comparison between routes.
 
-    For each base (route_id, direction_id), compare its logical stop sequence
-    against all other route/direction sequences and identify segments bounded
-    by pairs of shared stops where the interior subsequences differ.
+    Each pair of route/directions that includes a base route is compared in
+    both orders (see route_pairs_to_compare), identifying segments bounded by
+    pairs of shared stops where the interior subsequences differ.
 
     Geometry is used at the *segment* level via a Hausdorff distance gate
     (configured by MAX_SHAPE_HAUSDORFF_M). For each candidate segment
     between two shared stops, the corresponding shape substrings are
     compared; segments whose substrings are too far apart are treated as
     different corridors and skipped.
+
+    Pairs that share only terminal stops are skipped when either route lacks
+    a shape (SKIP_TERMINAL_ONLY_PAIRS), and references that serve the shared
+    stops in the opposite order are skipped unless COMPARE_REVERSED_REFERENCES
+    is True.
 
     Args:
         ctx: Prepared GTFSContext.
@@ -2082,74 +2170,79 @@ def run_segment_comparison(ctx: GTFSContext) -> pd.DataFrame:
     if not ctx.route_sequences:
         return pd.DataFrame(columns=SEGMENT_COLUMNS)
 
+    pairs = route_pairs_to_compare(ctx.base_route_keys, ctx.all_route_keys, ctx.route_id_whitelist)
     logging.info(
-        "Comparing segments for %d base route/direction pairs out of %d total.",
+        "Comparing %d ordered route/direction pairs that involve %d base "
+        "route/direction(s) out of %d total.",
+        len(pairs),
         len(ctx.base_route_keys),
         len(ctx.all_route_keys),
     )
 
     results: List[Dict[str, object]] = []
+    n_reversed_skipped = 0
 
-    for base_key in ctx.base_route_keys:
-        base_route_id, base_dir = base_key
+    for base_key, other_key in pairs:
         base_seq = ctx.route_sequences.get(base_key)
-        if base_seq is None:
+        other_seq = ctx.route_sequences.get(other_key)
+        if base_seq is None or other_seq is None:
             continue
 
-        logging.info("  Base route %s (direction %s)", base_route_id, base_dir)
+        # A pair that shares only terminal stops is compared only when both
+        # shapes exist, so the segment geometry can confirm a shared path.
+        if (
+            SKIP_TERMINAL_ONLY_PAIRS
+            and shares_only_terminal_stops(base_seq, other_seq)
+            and (base_key not in ctx.route_shapes_proj or other_key not in ctx.route_shapes_proj)
+        ):
+            continue
 
-        for other_key in ctx.all_route_keys:
-            if other_key == base_key:
+        # A reference that runs the corridor in the opposite order can serve
+        # opposite-curb stops; compare it only if configured, with its
+        # sequence (and shape) reversed so aligned shared-stop pairs are found.
+        if sequences_are_reversed(base_seq, other_seq):
+            if not COMPARE_REVERSED_REFERENCES:
+                n_reversed_skipped += 1
                 continue
+            effective_other_seq: Sequence[str] = list(reversed(other_seq))
+            raw_other_shape = ctx.route_shapes_proj.get(other_key)
+            effective_shapes_proj: Mapping[RouteKey, LineString | None] = {
+                **ctx.route_shapes_proj,
+                other_key: (
+                    LineString(list(raw_other_shape.coords)[::-1])
+                    if raw_other_shape is not None
+                    else raw_other_shape
+                ),
+            }
+            effective_sequences: Mapping[RouteKey, Sequence[str]] = {
+                **ctx.route_sequences,
+                other_key: effective_other_seq,
+            }
+        else:
+            effective_sequences = ctx.route_sequences
+            effective_shapes_proj = ctx.route_shapes_proj
 
-            other_route_id, _ = other_key
-            if other_route_id in ctx.route_id_whitelist:
-                continue
+        segment_results = compare_segments_for_route_pair(
+            base_key=base_key,
+            other_key=other_key,
+            sequences=effective_sequences,
+            stop_names=ctx.stop_names,
+            shapes_proj=effective_shapes_proj,
+            stops_gdf_proj=ctx.stops_gdf_proj,
+            max_shape_hausdorff_m=MAX_SHAPE_HAUSDORFF_M,
+            max_stop_to_shape_m=MAX_STOP_TO_SHAPE_M,
+            segment_measure_padding_m=SEGMENT_MEASURE_PADDING_M,
+        )
 
-            other_seq = ctx.route_sequences.get(other_key)
-            if other_seq is None:
-                continue
+        if segment_results:
+            results.extend(segment_results)
 
-            # Optional: skip route pairs that only share terminal stops.
-            if shares_only_terminal_stops(base_seq, other_seq):
-                continue
-
-            # Fix 6: if the other route runs the corridor in the opposite
-            # direction, reverse its sequence (and shape) before comparing so
-            # that aligned shared-stop pairs are found correctly.
-            if sequences_are_reversed(base_seq, other_seq):
-                effective_other_seq: Sequence[str] = list(reversed(other_seq))
-                raw_other_shape = ctx.route_shapes_proj.get(other_key)
-                effective_shapes_proj: Mapping[RouteKey, LineString | None] = {
-                    **ctx.route_shapes_proj,
-                    other_key: (
-                        LineString(list(raw_other_shape.coords)[::-1])
-                        if raw_other_shape is not None
-                        else raw_other_shape
-                    ),
-                }
-                effective_sequences: Mapping[RouteKey, Sequence[str]] = {
-                    **ctx.route_sequences,
-                    other_key: effective_other_seq,
-                }
-            else:
-                effective_sequences = ctx.route_sequences
-                effective_shapes_proj = ctx.route_shapes_proj
-
-            segment_results = compare_segments_for_route_pair(
-                base_key=base_key,
-                other_key=other_key,
-                sequences=effective_sequences,
-                stop_names=ctx.stop_names,
-                shapes_proj=effective_shapes_proj,
-                stops_gdf_proj=ctx.stops_gdf_proj,
-                max_shape_hausdorff_m=MAX_SHAPE_HAUSDORFF_M,
-                max_stop_to_shape_m=MAX_STOP_TO_SHAPE_M,
-                segment_measure_padding_m=SEGMENT_MEASURE_PADDING_M,
-            )
-
-            if segment_results:
-                results.extend(segment_results)
+    if n_reversed_skipped:
+        logging.info(
+            "Skipped %d ordered pair(s) whose reference serves the shared stops in the "
+            "opposite order (COMPARE_REVERSED_REFERENCES = False).",
+            n_reversed_skipped,
+        )
 
     if not results:
         logging.info("No segment-level stop mismatches were identified.")
@@ -2171,8 +2264,32 @@ def run_segment_comparison(ctx: GTFSContext) -> pd.DataFrame:
     return df
 
 
+def new_plot_run_dir(plot_dir: Path) -> Path:
+    """Return an unused folder path under plot_dir for this run's plots.
+
+    The folder is named after the run's start time (with a numeric suffix if
+    that name is taken) and is created when the first plot is saved, so plots
+    from an earlier run never sit beside the current run's CSVs.
+
+    Args:
+        plot_dir: Parent folder for every run's plots (PLOT_DIR).
+
+    Returns:
+        Path of a folder that does not exist yet.
+    """
+    stem = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    candidate = plot_dir / stem
+    suffix = 2
+    while candidate.exists():
+        candidate = plot_dir / f"{stem}_{suffix}"
+        suffix += 1
+    return candidate
+
+
 def run_plotting(ctx: GTFSContext, mismatches_df: pd.DataFrame) -> None:
     """Generate PNG plots for mismatched segments or overview plots if none.
+
+    Plots go to a new run folder under PLOT_DIR (see new_plot_run_dir).
 
     If mismatches_df is non-empty, one plot is generated per segment showing:
       - Base and other shapes.
@@ -2184,9 +2301,11 @@ def run_plotting(ctx: GTFSContext, mismatches_df: pd.DataFrame) -> None:
       - Share at least one logical stop, and
       - Do not overlap solely at terminal stops in both sequences.
     """
+    run_plot_dir = new_plot_run_dir(PLOT_DIR)
+
     # Case 1: we have real segment mismatches -> plot them.
     if not mismatches_df.empty:
-        logging.info("Generating plots in: %s", PLOT_DIR)
+        logging.info("Generating plots in: %s", run_plot_dir)
         for _, row in mismatches_df.iterrows():
             plot_mismatch_segment(
                 row=row,
@@ -2194,6 +2313,7 @@ def run_plotting(ctx: GTFSContext, mismatches_df: pd.DataFrame) -> None:
                 route_shapes_geo=ctx.route_shapes_geo,
                 stops_gdf_geo=ctx.stops_gdf_geo,
                 stop_names=ctx.stop_names,
+                plot_dir=run_plot_dir,
             )
         return
 
@@ -2235,6 +2355,7 @@ def run_plotting(ctx: GTFSContext, mismatches_df: pd.DataFrame) -> None:
                 other_key=other_key,
                 ctx=ctx,
                 buffer_m=ROUTE_OVERVIEW_BUFFER_M,
+                plot_dir=run_plot_dir,
             )
 
 
@@ -2264,10 +2385,8 @@ def main() -> int:
         logging.error("Error during GTFS preparation: %s", exc)
         return 1
 
-    if not ctx.route_sequences:
-        # Nothing to compare; bail out.
-        return 0
-
+    # With no route sequences there is nothing to compare, but the steps below
+    # still write header-only CSVs, replacing any from an earlier run.
     try:
         mismatches_df = run_segment_comparison(ctx)
     except (FileNotFoundError, ValueError) as exc:
