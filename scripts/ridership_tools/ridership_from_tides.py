@@ -2508,7 +2508,7 @@ def minute_of_day(values: pd.Series) -> pd.Series:
         Float minutes since midnight, NaN where the value is blank or unreadable.
     """
     text = values.astype("string").str.strip()
-    text = text.mask(text == "")
+    text = text.mask(text == "", pd.NA)
     minutes = pd.Series(np.nan, index=values.index, dtype="float64")
 
     iso = text.str.extract(_ISO_CLOCK_RE)
@@ -2577,7 +2577,7 @@ def service_day_hour(values: pd.Series, service_dates: pd.Series, cutover_hour: 
         Float service-day hours, NaN where the value is blank or unreadable.
     """
     text = values.astype("string").str.strip()
-    text = text.mask(text == "")
+    text = text.mask(text == "", pd.NA)
     days = pd.to_datetime(service_dates, errors="coerce").dt.normalize()
     hours = pd.Series(np.nan, index=values.index, dtype="float64")
 
