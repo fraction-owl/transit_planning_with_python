@@ -3,9 +3,10 @@
 This script reviews every trip in a GTFS feed — for all schedules
 (service_ids) by default — and measures the scheduled running time between
 each pair of consecutive timepoints. Any interval longer than
-MAX_INTERVAL_MINUTES (default 10) is flagged for review. Long gaps
-between timepoints make mid-route on-time performance hard to monitor and
-often signal that a timepoint is missing from the schedule data.
+MAX_INTERVAL_MINUTES (default 10) is flagged for review. Set it to your
+agency's timepoint-spacing policy, if it has one, and the flags show
+where the schedule exceeds that policy. Long gaps between timepoints make
+mid-route on-time performance hard to monitor.
 
 Timepoints are the stop_times.txt rows with ``timepoint == 1``. When the
 feed carries no ``timepoint`` column (or marks no rows), every stop with a
@@ -55,7 +56,8 @@ import pandas as pd
 GTFS_PATH: str = r"Path\To\Your\GTFS_Folder"  # folder of .txt files or a .zip
 OUTPUT_DIR: str = r"Path\To\Your\Output_Folder"
 
-# Maximum scheduled minutes allowed between consecutive timepoints on a trip.
+# Maximum scheduled minutes allowed between consecutive timepoints on a trip;
+# set this to your agency's timepoint-spacing policy, if it has one.
 # Intervals STRICTLY greater than this are flagged. Timepoints are commonly
 # spaced every 5-10 scheduled minutes of running time, so anything over 10
 # merits review; lower this to tighten the review.

@@ -1,4 +1,4 @@
-"""Tests for gtfs_timepoint_interval_flagger: scheduled timepoint-gap QA."""
+"""Tests for gtfs_timepoint_interval_flagger: scheduled timepoint-spacing policy check."""
 
 import sys
 from pathlib import Path
