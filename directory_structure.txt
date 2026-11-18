@@ -56,6 +56,7 @@ transit_planning_with_python/
 │   ├── field_tools/
 │   │   ├── gtfs_route_summary.py
 │   │   ├── gtfs_service_change_dates.py
+│   │   ├── pattern_map_exporter_gpd.py
 │   │   └── printable_block_schedules.py
 │   ├── gbfs_tools/
 │   │   ├── bikeshare_ridership_trends.py
@@ -83,7 +84,6 @@ transit_planning_with_python/
 │   │   ├── gtfs_to_shapefile_gpd.py
 │   │   ├── headway_span_exporter.py
 │   │   ├── interlined_routes_exporter.py
-│   │   ├── pattern_map_exporter_gpd.py
 │   │   ├── route_stops_exporter.py
 │   │   ├── route_transfer_calculator.py
 │   │   └── scheduled_service_hours.py

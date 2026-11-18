@@ -12,7 +12,7 @@ import pandas as pd
 import pytest
 from shapely.geometry import LineString
 
-import scripts.gtfs_exports.pattern_map_exporter_gpd as target
+import scripts.field_tools.pattern_map_exporter_gpd as target
 
 # Stops along 38.90 N from west (A) to east (E); X sits north of the line.
 STOPS = {

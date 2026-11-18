@@ -11,9 +11,9 @@ Saturday and Sunday, and how it differs from the direction's main pattern (P1,
 the one with the most trips), so readers can tell the main pattern from
 occasional variants.
 
-``gtfs_schedule_exporter.py`` lists patterns as Excel tables, and
-``gtfs_to_shapefile_*.py`` export shapes for GIS; this script is the visual
-companion.
+``gtfs_exports/gtfs_schedule_exporter.py`` lists patterns as Excel tables, and
+``gtfs_exports/gtfs_to_shapefile_*.py`` export shapes for GIS; this script is
+the visual companion.
 
 Inputs
 ------
