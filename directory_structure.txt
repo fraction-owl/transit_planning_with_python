@@ -40,7 +40,9 @@ transit_planning_with_python/
 ├── scripts/
 │   ├── conversion_tools/
 │   │   ├── convert_to_tides_stop_visits.py
-│   │   └── convert_to_tides_trips_performed.py
+│   │   ├── convert_to_tides_trips_performed.py
+│   │   ├── trip_runtime_diagnostics_from_avl.py
+│   │   └── tsde_to_tods.py
 │   ├── facilities_tools/
 │   │   ├── bay_assignment_optimizer.py
 │   │   ├── bay_change_sweep.py
@@ -65,7 +67,7 @@ transit_planning_with_python/
 │   │   ├── gtfs_stop_proximity_qc.py
 │   │   ├── gtfs_timepoint_interval_flagger.py
 │   │   ├── route_direction_classifier_arcpy.py
-│   │   ├── route_direction_classifier_pd.py
+│   │   ├── route_direction_classifier_gpd.py
 │   │   ├── stop_v_conflict_checker_arcpy.py
 │   │   ├── stop_v_conflict_checker_gpd.py
 │   │   ├── stop_vs_roadname_checker_arcpy.py
@@ -108,9 +110,7 @@ transit_planning_with_python/
 │   │   ├── otp_monthly_panel.py
 │   │   ├── otp_runtime_from_tides.py
 │   │   ├── runtime_by_route.py
-│   │   ├── runtime_workflow.py
-│   │   ├── trip_runtime_diagnostics_from_avl.py
-│   │   └── tsde_to_tods.py
+│   │   └── runtime_workflow.py
 │   ├── ridership_tools/
 │   │   ├── data_request_by_stop_processor.py
 │   │   ├── district_ridership_share_arcpy.py
@@ -331,7 +331,7 @@ transit_planning_with_python/
 │   ├── test_ridership_from_tides.py
 │   ├── test_ridership_ml_model.py
 │   ├── test_route_direction_classifier_arcpy.py
-│   ├── test_route_direction_classifier_pd.py
+│   ├── test_route_direction_classifier_gpd.py
 │   ├── test_route_length_by_district_gtfs_zip.py
 │   ├── test_route_performance_model.py
 │   ├── test_route_redundancy_profile_gpd.py
