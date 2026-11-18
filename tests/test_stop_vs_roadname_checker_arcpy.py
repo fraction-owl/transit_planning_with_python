@@ -166,6 +166,36 @@ def test_detect_typos_flags_dropped_saint(mod: types.ModuleType) -> None:
     assert out["similar_road_name_orig"].tolist() == ["Mount Albans Rd"]
 
 
+@pytest.mark.parametrize(
+    ("stop_name", "road", "score"),
+    [("Geble Rd", "Glebe Rd", 80.0), ("Alaamba Ave", "Alabama Ave", 85.7)],
+)
+def test_detect_typos_filters_on_reported_score(
+    mod: types.ModuleType, stop_name: str, road: str, score: float
+) -> None:
+    # get_close_matches scored (road, fragment): 60.0 and 71.4 here, below 80,
+    # so these pairs were dropped though their reported score meets it.
+    mods = {"rd", "ave"}
+    stop2roads = {"1": {mod.normalize_street(road, mods): {road}}}
+    out = mod.detect_typos(_stops(("1", stop_name)), stop2roads, mods, 80)
+    assert out["similar_road_name_orig"].tolist() == [road]
+    assert out["similarity_score"].tolist() == [score]
+
+
+def test_detect_typos_reports_at_most_three_roads(mod: types.ModuleType) -> None:
+    # "mainn" scores 88.9 against "main" and 80.0 against the other three.
+    stop2roads = {"1": {name: {name.title()} for name in ("main", "maine", "mains", "mainz")}}
+    out = mod.detect_typos(_stops(("1", "Mainn")), stop2roads, set(), 80)
+    assert len(out) == 3
+    assert out["similar_road_name_clean"].iloc[0] == "main"
+
+
+def test_detect_typos_never_reports_below_threshold(mod: types.ModuleType) -> None:
+    # Reported order scores 69.6; the old filter order scored 87.0.
+    stop2roads = {"1": {"connecticut": {"Connecticut"}}}
+    assert mod.detect_typos(_stops(("1", "Connecttiuct")), stop2roads, set(), 80).empty
+
+
 def test_detect_typos_empty_result_keeps_columns(mod: types.ModuleType) -> None:
     out = mod.detect_typos(_stops(("1", "Main St")), {"1": {"main": {"Main St"}}}, {"st"}, 80)
     assert out.empty

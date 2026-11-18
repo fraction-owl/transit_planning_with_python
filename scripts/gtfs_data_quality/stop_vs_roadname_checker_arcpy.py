@@ -254,7 +254,12 @@ def split_stop_name(stop_name: str, mods: set[str]) -> list[str]:
 
 
 def dl_score(a: str, b: str) -> float:
-    """Calculates the Damerau-Levenshtein similarity ratio between two strings.
+    """Calculates difflib's SequenceMatcher similarity ratio between two strings.
+
+    The ratio is 2*M/T, where M is the number of characters in the matching
+    blocks SequenceMatcher finds and T is the combined length of both strings.
+    It is not an edit distance (Damerau-Levenshtein or otherwise), and swapping
+    the arguments can change the result, so score and filter in the same order.
 
     Args:
         a: The first string.
@@ -458,8 +463,10 @@ def detect_typos(
     For each stop, it splits the stop name into parts. Each part is then
     compared against the set of nearby road names for that stop. If a part
     is very similar (but not identical) to a nearby road name, it's flagged
-    as a potential typo. Stops with no roads in their buffer are skipped and
-    counted as unassessed.
+    as a potential typo: each nearby road is scored once with
+    :func:`dl_score`, and up to three scoring at least ``thresh`` are
+    reported. Stops with no roads in their buffer are skipped and counted as
+    unassessed.
 
     Args:
         stops_df: DataFrame of all GTFS stops.
@@ -488,8 +495,11 @@ def detect_typos(
         for frag in pieces:
             if frag in candidates:
                 continue
-            for match in difflib.get_close_matches(frag, candidates, n=3, cutoff=thresh / 100):
-                score = dl_score(frag, match)
+            # Score each road once, in the order reported. get_close_matches
+            # scored (road, fragment) instead, which can differ, so it dropped
+            # some pairs whose reported score met the threshold.
+            scored = sorted(((dl_score(frag, m), m) for m in candidates), reverse=True)
+            for score, match in scored[:3]:
                 if thresh <= score < 100:
                     for orig in sorted(candidates[match]):
                         out_rows.append(
