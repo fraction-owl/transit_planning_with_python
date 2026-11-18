@@ -40,7 +40,8 @@ Limitations
 - Timestamps are read as written, ignoring any UTC offset, so a running time that
   crosses a daylight-saving change is off by an hour.
 - Canceled and non-revenue trips are dropped. OTP scores Scheduled visits only, and
-  running times leave out Skipped visits.
+  running times leave out Skipped visits. ``LAST_STOP_EARLY_OK`` can count an early
+  arrival at a trip's last stop as on time, for some service types or every route.
 
 Typical usage
 -------------
@@ -238,6 +239,15 @@ ROUTES_TO_EXCLUDE: Sequence[str] = ()
 # minutes, inclusive. The common convention is 1 minute early to 5 minutes late.
 EARLY_MIN: float = -1.0
 LATE_MIN: float = 5.0
+# Riders only get off at a trip's last stop (normally its last timepoint), so some
+# agencies count an early arrival there as on time. When LAST_STOP_EARLY_OK is True,
+# a visit at its trip's last stop (trip_end_stop_id in trips_performed) that would
+# score early scores on time instead, on routes whose route_type_agency is in
+# LAST_STOP_EARLY_OK_SERVICE_TYPES (compared without regard to case); an empty list
+# applies it to every route. Late visits there still score late, and dev_min keeps
+# the measured deviation.
+LAST_STOP_EARLY_OK: bool = False
+LAST_STOP_EARLY_OK_SERVICE_TYPES: Sequence[str] = ("EXPRESS",)
 # Score timepoint visits only (timepoint TRUE). False scores every Scheduled visit.
 TIMEPOINTS_ONLY: bool = True
 # Agency OTP standard (percent), drawn as a dashed line on the charts.
@@ -393,6 +403,7 @@ TRIP_ATTRIBUTE_COLUMNS: Tuple[str, ...] = (
     "trip_id_scheduled",
     "pattern_id",
     "block_id",
+    "trip_end_stop_id",
     "schedule_trip_start",
     "schedule_trip_end",
     "actual_trip_start",
@@ -572,6 +583,8 @@ class RunSettings(NamedTuple):
     routes_to_exclude: Sequence[str] = ROUTES_TO_EXCLUDE
     early_min: float = EARLY_MIN
     late_min: float = LATE_MIN
+    last_stop_early_ok: bool = LAST_STOP_EARLY_OK
+    last_stop_early_ok_service_types: Sequence[str] = LAST_STOP_EARLY_OK_SERVICE_TYPES
     timepoints_only: bool = TIMEPOINTS_ONLY
     otp_standard: float = OTP_STANDARD
     dev_abs_warn_min: float = DEV_ABS_WARN_MIN
@@ -2914,11 +2927,69 @@ def otp_candidates(visits: pd.DataFrame, timepoints_only: bool) -> pd.DataFrame:
     return out
 
 
+def last_stop_early_ok_mask(visits: pd.DataFrame, service_types: Sequence[str]) -> pd.Series:
+    """Mark the visits at their trip's last stop whose early arrival counts as on time.
+
+    A visit qualifies when its ``stop_id`` is the trip's ``trip_end_stop_id`` and it
+    is the trip's last visit by ``trip_stop_sequence`` (row order where that is
+    absent). Requiring both keeps a loop trip's first visit, at the same stop, from
+    qualifying, and keeps a trip whose last-stop visit is missing from qualifying
+    at an earlier stop. Trips without a ``trip_end_stop_id`` are left out.
+
+    Args:
+        visits: Joined stop visits.
+        service_types: ``route_type_agency`` values the rule applies to (compared
+            without regard to case); empty applies it to every route.
+
+    Returns:
+        A boolean mask aligned to *visits*.
+    """
+    none = pd.Series(False, index=visits.index)
+    if visits.empty:
+        return none
+    for col in ("stop_id", "trip_end_stop_id"):
+        if col not in visits.columns:
+            logging.warning(
+                "LAST_STOP_EARLY_OK is on but the visits have no %s column; no early "
+                "arrival at a last stop is counted as on time.",
+                col,
+            )
+            return none
+    applies = pd.Series(True, index=visits.index)
+    if service_types:
+        if "route_type_agency" not in visits.columns:
+            logging.warning(
+                "LAST_STOP_EARLY_OK_SERVICE_TYPES is set but the visits have no "
+                "route_type_agency column; no early arrival at a last stop is counted "
+                "as on time."
+            )
+            return none
+        wanted = {str(s).strip().casefold() for s in service_types}
+        applies = _casefolded(visits["route_type_agency"], "").isin(wanted)
+    end_stop = visits["trip_end_stop_id"].fillna("").astype(str).str.strip()
+    no_end = end_stop.eq("")
+    if (applies & no_end).any():
+        logging.warning(
+            "LAST_STOP_EARLY_OK: %d performed trip(s) have no trip_end_stop_id; early "
+            "arrivals at their last stop still score early.",
+            int(visits.loc[applies & no_end, TRIP_KEY].drop_duplicates().shape[0]),
+        )
+    if "trip_stop_sequence" in visits.columns:
+        seq = pd.to_numeric(visits["trip_stop_sequence"], errors="coerce")
+    else:
+        seq = pd.Series(np.arange(len(visits), dtype="float64"), index=visits.index)
+    is_last = seq.eq(seq.groupby([visits[c] for c in TRIP_KEY]).transform("max"))
+    stop = visits["stop_id"].fillna("").astype(str).str.strip()
+    return applies & is_last & stop.eq(end_stop) & ~no_end
+
+
 def score_otp(
     visits: pd.DataFrame,
     early_min: float = EARLY_MIN,
     late_min: float = LATE_MIN,
     timepoints_only: bool = TIMEPOINTS_ONLY,
+    last_stop_early_ok: bool = LAST_STOP_EARLY_OK,
+    last_stop_early_ok_service_types: Sequence[str] = LAST_STOP_EARLY_OK_SERVICE_TYPES,
 ) -> Tuple[pd.DataFrame, Dict[str, int]]:
     """Score each candidate visit as early, on time or late.
 
@@ -2931,11 +3002,19 @@ def score_otp(
         early_min: Lower (inclusive) bound of the on-time window, in minutes.
         late_min: Upper (inclusive) bound of the on-time window, in minutes.
         timepoints_only: Score timepoint visits only.
+        last_stop_early_ok: Score an early visit at its trip's last stop as on time
+            (see :func:`last_stop_early_ok_mask`).
+        last_stop_early_ok_service_types: The ``route_type_agency`` values that
+            rule applies to; empty applies it to every route.
 
     Returns:
         The scored visits with ``dev_min`` and ``otp_class``, and counts of the
-        candidates, the scored visits and why the rest were not scored.
+        candidates, the scored visits, why the rest were not scored, and the early
+        last-stop visits scored on time.
     """
+    if last_stop_early_ok:
+        mask = last_stop_early_ok_mask(visits, last_stop_early_ok_service_types)
+        visits = visits.assign(_last_stop_early_ok=mask)
     candidates = otp_candidates(visits, timepoints_only)
     dev = (candidates["_actual_ts"] - candidates["_sched_ts"]) / pd.Timedelta(minutes=1)
     no_schedule = candidates["_sched_ts"].isna()
@@ -2951,6 +3030,12 @@ def score_otp(
         ["early", "late"],
         default="on_time",
     )
+    counts["early_ok_at_last_stop"] = 0
+    if "_last_stop_early_ok" in scored.columns:
+        forgiven = scored["otp_class"].eq("early") & scored["_last_stop_early_ok"]
+        scored.loc[forgiven, "otp_class"] = "on_time"
+        counts["early_ok_at_last_stop"] = int(forgiven.sum())
+        scored = scored.drop(columns="_last_stop_early_ok")
     return scored, counts
 
 
@@ -4784,7 +4869,12 @@ def run(settings: RunSettings) -> RunResult:
     otp_counts: Dict[str, int] = {}
     if "otp" in measures:
         scored, otp_counts = score_otp(
-            visits, settings.early_min, settings.late_min, settings.timepoints_only
+            visits,
+            settings.early_min,
+            settings.late_min,
+            settings.timepoints_only,
+            settings.last_stop_early_ok,
+            settings.last_stop_early_ok_service_types,
         )
         logging.info(
             "OTP: %d candidate visit(s), %d scored; %d had no actual time and %d no "
@@ -4794,6 +4884,11 @@ def run(settings: RunSettings) -> RunResult:
             otp_counts["missing_actual_time"],
             otp_counts["missing_schedule_time"],
         )
+        if settings.last_stop_early_ok:
+            logging.info(
+                "OTP: %d early visit(s) at a trip's last stop scored on time (LAST_STOP_EARLY_OK).",
+                otp_counts["early_ok_at_last_stop"],
+            )
         if scored.empty:
             logging.warning("No visit could be scored for OTP; the OTP tables are skipped.")
         else:
@@ -4979,6 +5074,12 @@ def run(settings: RunSettings) -> RunResult:
         f"Routes excluded:    {', '.join(settings.routes_to_exclude) or '(none)'}",
         f"On-time window:     {settings.early_min:g} to {settings.late_min:g} min; "
         f"timepoints only: {settings.timepoints_only}; standard {settings.otp_standard:g}%",
+        "Last-stop early:    "
+        + (
+            "on time for " + (", ".join(settings.last_stop_early_ok_service_types) or "every route")
+            if settings.last_stop_early_ok
+            else "scored early"
+        ),
         f"Running time:       trim {settings.trim_frac:g} per tail; percentiles "
         f"{', '.join(f'{p:g}' for p in settings.percentiles)}; segments between "
         f"{'timepoints' if settings.segment_timepoints_only else 'served stops'}",
@@ -5171,6 +5272,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--late-min", type=float, default=LATE_MIN, help="Latest on-time deviation (minutes)."
     )
     p.add_argument(
+        "--last-stop-early-ok",
+        action=argparse.BooleanOptionalAction,
+        default=LAST_STOP_EARLY_OK,
+        help="Score an early visit at a trip's last stop as on time.",
+    )
+    p.add_argument(
+        "--last-stop-early-ok-service-types",
+        nargs="*",
+        default=list(LAST_STOP_EARLY_OK_SERVICE_TYPES),
+        metavar="TYPE",
+        help="route_type_agency values --last-stop-early-ok applies to; none = every route.",
+    )
+    p.add_argument(
         "--timepoints-only",
         action=argparse.BooleanOptionalAction,
         default=TIMEPOINTS_ONLY,
@@ -5258,6 +5372,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             routes_to_exclude=tuple(args.routes_exclude),
             early_min=args.early_min,
             late_min=args.late_min,
+            last_stop_early_ok=args.last_stop_early_ok,
+            last_stop_early_ok_service_types=tuple(args.last_stop_early_ok_service_types),
             timepoints_only=args.timepoints_only,
             export_stop_flags=args.stop_flags,
             trim_frac=args.trim_frac,

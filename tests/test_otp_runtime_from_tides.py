@@ -275,10 +275,113 @@ def test_score_otp_filters_and_explains_unscored_visits() -> None:
         "scored": 2,
         "missing_schedule_time": 1,
         "missing_actual_time": 1,
+        "early_ok_at_last_stop": 0,
     }
     assert scored["dev_min"].tolist() == [2.0, 10.0]
     everything, _ = target.score_otp(visits, -1.0, 5.0, False)
     assert len(everything) == 3  # the non-timepoint visit now scores too
+
+
+def _loop_trip(route_type: str, end_stop: str = "A") -> list[dict]:
+    """A loop trip A -> B -> A that is 3 minutes early at every stop."""
+    return [
+        {
+            "trip_id_performed": f"T_{route_type}",
+            "trip_stop_sequence": seq,
+            "stop_id": stop,
+            "route_type_agency": route_type,
+            "trip_end_stop_id": end_stop,
+            "schedule_departure_time": "07:10",
+            "actual_departure_time": "07:07",
+        }
+        for seq, stop in ((1, "A"), (2, "B"), (3, "A"))
+    ]
+
+
+def test_score_otp_last_stop_early_ok_by_service_type() -> None:
+    """Only the last visit of an EXPRESS trip is forgiven; the loop's origin visit is not."""
+    visits = _visits([*_loop_trip("Express"), *_loop_trip("LOCAL")])
+    off, counts = target.score_otp(visits, -1.0, 5.0, True)
+    assert set(off["otp_class"]) == {"early"}
+    assert counts["early_ok_at_last_stop"] == 0
+    on, counts = target.score_otp(visits, -1.0, 5.0, True, True, ("EXPRESS",))
+    by_trip = on.groupby("trip_id_performed")["otp_class"].apply(list).to_dict()
+    assert by_trip == {
+        "T_Express": ["early", "early", "on_time"],
+        "T_LOCAL": ["early", "early", "early"],
+    }
+    assert counts["early_ok_at_last_stop"] == 1
+    assert on["dev_min"].eq(-3.0).all()  # the measured deviation is kept
+    every, counts = target.score_otp(visits, -1.0, 5.0, True, True, ())
+    assert counts["early_ok_at_last_stop"] == 2  # empty list = every route
+
+
+def test_score_otp_last_stop_early_ok_needs_the_last_stop_visit(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A trip missing its last-stop visit, or its trip_end_stop_id, is not forgiven."""
+    missing_last = _loop_trip("EXPRESS")[:2]  # AVL lost the visit back at A
+    no_end = _loop_trip("EXPRESS", end_stop="")
+    for row in no_end:
+        row["trip_id_performed"] = "T_no_end"
+    visits = _visits([*missing_last, *no_end])
+    scored, counts = target.score_otp(visits, -1.0, 5.0, True, True, ("EXPRESS",))
+    assert set(scored["otp_class"]) == {"early"}
+    assert counts["early_ok_at_last_stop"] == 0
+    assert "1 performed trip(s) have no trip_end_stop_id" in caplog.text
+
+
+def test_run_last_stop_early_ok_reaches_the_route_tables(tmp_path: Path) -> None:
+    """An express trip early at its last stop counts on time in the run's route table."""
+    day = "2026-01-05"  # a Monday
+    visits = [
+        {
+            "service_date": day,
+            "trip_id_performed": "T1",
+            "trip_stop_sequence": seq,
+            "stop_id": stop,
+            "timepoint": "TRUE",
+            "schedule_relationship": "Scheduled",
+            "schedule_departure_time": _ts(day, sched),
+            "actual_departure_time": _ts(day, actual),
+        }
+        for seq, stop, sched, actual in ((1, "A", "08:00", "08:00"), (2, "B", "08:30", "08:24"))
+    ]
+    trips = [
+        {
+            "service_date": day,
+            "trip_id_performed": "T1",
+            "trip_id_scheduled": "S1",
+            "route_id": "X1",
+            "direction_id": "0",
+            "route_type_agency": "EXPRESS",
+            "trip_end_stop_id": "B",
+            "trip_type": "In service",
+            "schedule_relationship": "Scheduled",
+        }
+    ]
+    sv, tp = _write_tides(tmp_path, visits, trips)
+    common = {
+        "stop_visits_path": sv,
+        "trips_performed_path": tp,
+        "measures": ["otp"],
+        "levels": ["route"],
+        "time_cuts": ["all_day"],
+    }
+    off = target.run(_settings(tmp_path / "off", **common)).otp[("route", "all_day")]
+    on = target.run(_settings(tmp_path / "on", last_stop_early_ok=True, **common)).otp[
+        ("route", "all_day")
+    ]
+    assert off[["early", "on_time"]].iloc[0].tolist() == [1, 1]
+    assert on[["early", "on_time"]].iloc[0].tolist() == [0, 2]
+
+
+def test_score_otp_late_last_stop_still_late() -> None:
+    """The rule never turns a late visit on time."""
+    rows = _loop_trip("EXPRESS")
+    rows[-1]["actual_departure_time"] = "07:20"
+    scored, _ = target.score_otp(_visits(rows), -1.0, 5.0, True, True, ("EXPRESS",))
+    assert scored["otp_class"].tolist() == ["early", "early", "late"]
 
 
 def test_route_month_otp_matches_a_direct_join(full_run: target.RunResult) -> None:
