@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 import zipfile
 from pathlib import Path
@@ -456,6 +457,31 @@ def test_process_typos_empty_when_no_nearby_roads() -> None:
     assert result.empty
 
 
+def test_process_typos_logs_stops_not_assessed(caplog: pytest.LogCaptureFixture) -> None:
+    stops_df = _make_stops_df(
+        [
+            {"stop_id": sid, "stop_name": "Mainn St", "stop_lat": "38.9", "stop_lon": "-77.0"}
+            for sid in ("S1", "S2", "S3")
+        ]
+    )
+    stops_gdf = target.load_stops(stops_df).to_crs(TARGET_CRS)
+    # S1 has a named road; S2 matched nothing (left-join row with no road);
+    # S3's only road has a blank name, which cannot match any street.
+    join_gdf = pd.DataFrame(
+        {
+            "stop_id": ["S1", "S2", "S3"],
+            "FULLNAME": ["Main St", None, ""],
+            "FULLNAME_clean": ["main", None, ""],
+        }
+    )
+    caplog.set_level(logging.INFO)
+    result = target.process_typos(stops_gdf, {"st"}, join_gdf, 80)
+    assert result["stop_id"].tolist() == ["S1"]
+    assert "2 of 3 stop(s) had no named road within the buffer and were not assessed." in (
+        caplog.text
+    )
+
+
 def test_process_typos_respects_buffer_scoping() -> None:
     """A stop is only matched against roads inside its own buffer.
 
@@ -589,13 +615,16 @@ def test_integration_dc_load_and_process(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _run_main(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stop_name: str) -> pd.DataFrame:
+def _run_main(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stop_name: str, stop_y: float = 4_300_000
+) -> pd.DataFrame:
     gtfs = tmp_path / "gtfs"
     gtfs.mkdir(exist_ok=True)
-    # Stop sits on the road below, ~50 m north of the UTM 18N origin line.
+    # By default the stop sits on the road below, ~50 m north of the UTM 18N
+    # origin line; a larger stop_y moves it away from the road.
     stops = gpd.GeoDataFrame(
         {"stop_id": ["NA"], "stop_name": [stop_name]},
-        geometry=[Point(500_000, 4_300_000)],
+        geometry=[Point(500_000, stop_y)],
         crs=TARGET_CRS,
     ).to_crs("EPSG:4326")
     pd.DataFrame(
@@ -644,6 +673,29 @@ def test_main_custom_mapping_utm_na_id_and_clean_rerun(
     second = _run_main(tmp_path, monkeypatch, "Main Rd")
     assert second.empty
     assert "stop_id" in second.columns
+
+
+def test_main_logs_join_counts_for_stop_on_road(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO)
+    _run_main(tmp_path, monkeypatch, "Mainn Rd")
+    assert "Spatial join found 1 stop-road intersection(s) across 1 of 1 stop(s)." in caplog.text
+    assert "not assessed" not in caplog.text
+
+
+def test_main_logs_join_counts_when_no_stop_is_near_a_road(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The left join keeps the unmatched stop as one row; it used to be logged
+    # as "1 candidate matches".
+    caplog.set_level(logging.INFO)
+    out = _run_main(tmp_path, monkeypatch, "Mainn Rd", stop_y=4_310_000)
+    assert out.empty
+    assert "Spatial join found 0 stop-road intersection(s) across 0 of 1 stop(s)." in caplog.text
+    assert "1 of 1 stop(s) had no named road within the buffer and were not assessed." in (
+        caplog.text
+    )
 
 
 # ---------------------------------------------------------------------------

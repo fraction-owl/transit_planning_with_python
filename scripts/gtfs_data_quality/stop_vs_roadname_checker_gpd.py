@@ -526,7 +526,8 @@ def process_typos(
     buffer (the per-stop local set), as determined by ``join_gdf``. A stop is
     therefore never compared against a similarly-named road elsewhere in the
     region, and reported original road names come only from the road
-    features that actually intersect the buffer.
+    features that actually intersect the buffer. Stops with no named road in
+    their buffer are skipped, and their number is logged.
 
     Args:
         stops_gdf (gpd.GeoDataFrame): The GeoDataFrame of stops.
@@ -542,12 +543,16 @@ def process_typos(
     """
     # Build per-stop {normalized name -> original names} from the spatial join,
     # so both the comparison set and the reported names are buffer-local.
+    # A blank cleaned name can never match a street, so it does not make a
+    # stop assessable.
     local = join_gdf.dropna(subset=["FULLNAME_clean", "FULLNAME"])
+    local = local.loc[local["FULLNAME_clean"] != ""]
     nearby_by_stop: Dict[str, Dict[str, Set[str]]] = {}
     for s_id, clean, original in zip(local["stop_id"], local["FULLNAME_clean"], local["FULLNAME"]):
         nearby_by_stop.setdefault(s_id, {}).setdefault(clean, set()).add(original)
 
     potential_typos: List[Dict[str, Any]] = []
+    unassessed = 0
     for _, stop in stops_gdf.iterrows():
         s_id = stop["stop_id"]
         s_name = stop["stop_name"]
@@ -556,10 +561,18 @@ def process_typos(
         local_road_names = nearby_by_stop.get(s_id, {})
         if not local_road_names:
             # No roads within this stop's buffer -- nothing to compare against.
+            unassessed += 1
             continue
 
         typos = compare_stop_to_roads(s_id, s_name, s_streets, local_road_names, threshold)
         potential_typos.extend(typos)
+
+    if unassessed:
+        logging.info(
+            "%d of %d stop(s) had no named road within the buffer and were not assessed.",
+            unassessed,
+            len(stops_gdf),
+        )
 
     logging.info("Total potential typos found before deduplication: %d", len(potential_typos))
     if not potential_typos:
@@ -797,7 +810,15 @@ def main() -> int:
     # 9. Buffer stops, spatial-join with roadways
     stops_buffered = create_buffered_stops(stops_gdf, buffer_distance)
     join_gdf = spatial_join_stops_roadways(stops_buffered, roadways_gdf)
-    logging.info("Spatial join produced %d candidate matches", join_gdf.shape[0])
+    # The left join keeps one row, with no road, for each stop that matched
+    # nothing, so count only rows that carry a road.
+    matched = join_gdf["index_right"].notna()
+    logging.info(
+        "Spatial join found %d stop-road intersection(s) across %d of %d stop(s).",
+        int(matched.sum()),
+        join_gdf.index[matched].nunique(),
+        len(stops_buffered),
+    )
 
     # ------------------------------------------------------------------
     # 10. Fuzzy-match street names to find potential typos
