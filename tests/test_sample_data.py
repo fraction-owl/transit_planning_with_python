@@ -22,6 +22,7 @@ COPIES = {
     "tods_current.zip": "mock_tods_dc.zip",
     "tides/stop_visits.csv": "stop_visits.csv",
     "tides/trips_performed.csv": "trips_performed.csv",
+    "express_routes_example.txt": "express_routes_dc.txt",
 }
 
 

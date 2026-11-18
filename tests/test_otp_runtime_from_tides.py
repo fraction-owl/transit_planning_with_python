@@ -14,6 +14,7 @@ import scripts.operations_tools.otp_runtime_from_tides as target
 STOP_VISITS = Path("tests/fixtures/stop_visits.csv")
 TRIPS_PERFORMED = Path("tests/fixtures/trips_performed.csv")
 PERIODS_FIXTURE = Path("tests/fixtures/time_periods.txt")
+EXPRESS_ROUTES = Path("tests/fixtures/express_routes_dc.txt")
 MOCK_GTFS = Path("tests/fixtures/mock_gtfs_dc.zip")
 HOLIDAY = dt.date(2026, 1, 1)  # the fixtures' holiday-service date, a Thursday
 
@@ -275,6 +276,7 @@ def test_score_otp_filters_and_explains_unscored_visits() -> None:
         "scored": 2,
         "missing_schedule_time": 1,
         "missing_actual_time": 1,
+        "last_stop_excluded": 0,
         "early_ok_at_last_stop": 0,
     }
     assert scored["dev_min"].tolist() == [2.0, 10.0]
@@ -282,57 +284,127 @@ def test_score_otp_filters_and_explains_unscored_visits() -> None:
     assert len(everything) == 3  # the non-timepoint visit now scores too
 
 
-def _loop_trip(route_type: str, end_stop: str = "A") -> list[dict]:
-    """A loop trip A -> B -> A that is 3 minutes early at every stop."""
+def _loop_trip(route_id: str, end_stop: str = "A") -> list[dict]:
+    """A loop trip A -> B -> A on *route_id* that is 3 minutes early at every stop."""
     return [
         {
-            "trip_id_performed": f"T_{route_type}",
+            "trip_id_performed": f"T_{route_id}",
             "trip_stop_sequence": seq,
             "stop_id": stop,
-            "route_type_agency": route_type,
+            "route_id": route_id,
             "trip_end_stop_id": end_stop,
+            "schedule_arrival_time": "07:10",
             "schedule_departure_time": "07:10",
+            "actual_arrival_time": "07:07",
             "actual_departure_time": "07:07",
         }
         for seq, stop in ((1, "A"), (2, "B"), (3, "A"))
     ]
 
 
-def test_score_otp_last_stop_early_ok_by_service_type() -> None:
-    """Only the last visit of an EXPRESS trip is forgiven; the loop's origin visit is not."""
-    visits = _visits([*_loop_trip("Express"), *_loop_trip("LOCAL")])
-    off, counts = target.score_otp(visits, -1.0, 5.0, True)
-    assert set(off["otp_class"]) == {"early"}
-    assert counts["early_ok_at_last_stop"] == 0
-    on, counts = target.score_otp(visits, -1.0, 5.0, True, True, ("EXPRESS",))
-    by_trip = on.groupby("trip_id_performed")["otp_class"].apply(list).to_dict()
-    assert by_trip == {
-        "T_Express": ["early", "early", "on_time"],
-        "T_LOCAL": ["early", "early", "early"],
+def _classes(scored: pd.DataFrame) -> dict:
+    """Each performed trip's OTP classes in stop order."""
+    return scored.groupby("trip_id_performed")["otp_class"].apply(list).to_dict()
+
+
+def test_score_otp_last_stop_treatments() -> None:
+    """Each treatment touches only a treated route's last visit, never a loop's first one."""
+    visits = _visits([*_loop_trip("X1"), *_loop_trip("L1")])
+    express = {"X1"}
+    scored, counts = target.score_otp(visits, -1.0, 5.0, True, "score", express)
+    assert set(scored["otp_class"]) == {"early"}
+    assert (counts["last_stop_excluded"], counts["early_ok_at_last_stop"]) == (0, 0)
+
+    scored, counts = target.score_otp(visits, -1.0, 5.0, True, "early_ok", express)
+    assert _classes(scored) == {
+        "T_X1": ["early", "early", "on_time"],
+        "T_L1": ["early", "early", "early"],
     }
     assert counts["early_ok_at_last_stop"] == 1
-    assert on["dev_min"].eq(-3.0).all()  # the measured deviation is kept
-    every, counts = target.score_otp(visits, -1.0, 5.0, True, True, ())
-    assert counts["early_ok_at_last_stop"] == 2  # empty list = every route
+    assert scored["dev_min"].eq(-3.0).all()  # the measured deviation is kept
+
+    scored, counts = target.score_otp(visits, -1.0, 5.0, True, "exclude", express)
+    assert _classes(scored) == {"T_X1": ["early", "early"], "T_L1": ["early", "early", "early"]}
+    assert (counts["last_stop_excluded"], counts["candidates"]) == (1, 5)
+
+    _, counts = target.score_otp(visits, -1.0, 5.0, True, "early_ok", None)
+    assert counts["early_ok_at_last_stop"] == 2  # None = every route
 
 
-def test_score_otp_last_stop_early_ok_needs_the_last_stop_visit(
+def test_score_otp_scores_the_last_stop_on_arrival() -> None:
+    """The last stop is judged and placed in time by arrival; other stops by departure."""
+    rows = [
+        {
+            "trip_stop_sequence": 1,
+            "stop_id": "A",
+            "trip_end_stop_id": "B",
+            "schedule_arrival_time": "08:00",
+            "schedule_departure_time": "08:00",
+            "actual_arrival_time": "07:58",
+            "actual_departure_time": "08:03",
+        },
+        {
+            "trip_stop_sequence": 2,
+            "stop_id": "B",
+            "trip_end_stop_id": "B",
+            "schedule_arrival_time": "08:30",
+            "schedule_departure_time": "08:30",
+            "actual_arrival_time": "08:31",
+            "actual_departure_time": "08:40",  # sat at the terminal before pulling out
+        },
+    ]
+    scored, _ = target.score_otp(_visits(rows), -1.0, 5.0, True)
+    assert scored["dev_min"].tolist() == [3.0, 1.0]
+    assert scored["otp_class"].tolist() == ["on_time", "on_time"]
+    assert scored["_actual_text"].iloc[1] == "2026-01-05T08:31:00"
+    for row in rows:
+        row["trip_end_stop_id"] = ""  # no known last stop: departure throughout
+    scored, _ = target.score_otp(_visits(rows), -1.0, 5.0, True)
+    assert scored["dev_min"].tolist() == [3.0, 10.0]
+
+
+def test_score_otp_last_stop_needs_the_last_stop_visit(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A trip missing its last-stop visit, or its trip_end_stop_id, is not forgiven."""
-    missing_last = _loop_trip("EXPRESS")[:2]  # AVL lost the visit back at A
-    no_end = _loop_trip("EXPRESS", end_stop="")
+    """A trip missing its last-stop visit, or its trip_end_stop_id, is not treated."""
+    missing_last = _loop_trip("X1")[:2]  # AVL lost the visit back at A
+    no_end = _loop_trip("X1", end_stop="")
     for row in no_end:
         row["trip_id_performed"] = "T_no_end"
     visits = _visits([*missing_last, *no_end])
-    scored, counts = target.score_otp(visits, -1.0, 5.0, True, True, ("EXPRESS",))
+    scored, counts = target.score_otp(visits, -1.0, 5.0, True, "early_ok", {"X1"})
     assert set(scored["otp_class"]) == {"early"}
     assert counts["early_ok_at_last_stop"] == 0
     assert "1 performed trip(s) have no trip_end_stop_id" in caplog.text
 
 
-def test_run_last_stop_early_ok_reaches_the_route_tables(tmp_path: Path) -> None:
-    """An express trip early at its last stop counts on time in the run's route table."""
+def test_score_otp_late_last_stop_still_late() -> None:
+    """early_ok never turns a late visit on time."""
+    rows = _loop_trip("X1")
+    rows[-1]["actual_arrival_time"] = "07:20"
+    scored, _ = target.score_otp(_visits(rows), -1.0, 5.0, True, "early_ok", {"X1"})
+    assert scored["otp_class"].tolist() == ["early", "early", "late"]
+
+
+def test_resolve_express_routes_sources(caplog: pytest.LogCaptureFixture) -> None:
+    """File and inline ids are unioned; with neither, route_type_agency decides."""
+    visits = pd.DataFrame(
+        {
+            "route_id": ["DC_R10", "DC_R20", "DC_R30"],
+            "route_type_agency": ["LOCAL", "Express", "LOCAL"],
+        }
+    )
+    routes, source = target.resolve_express_routes(visits, str(EXPRESS_ROUTES), ["DC_R99"], ())
+    assert routes == {"DC_R20", "DC_R99"}
+    assert "EXPRESS_ROUTES" in source and "express_routes_dc.txt" in source
+    assert "Express route(s) not in the data: DC_R99" in caplog.text
+    routes, source = target.resolve_express_routes(visits, None, (), ("EXPRESS",))
+    assert routes == {"DC_R20"}
+    assert "route_type_agency" in source
+
+
+def _express_tides(tmp_path: Path, route_type_agency: str) -> tuple[Path, Path]:
+    """One DC_R20 trip, on time at A and 6 minutes early arriving at its last stop B."""
     day = "2026-01-05"  # a Monday
     visits = [
         {
@@ -342,7 +414,9 @@ def test_run_last_stop_early_ok_reaches_the_route_tables(tmp_path: Path) -> None
             "stop_id": stop,
             "timepoint": "TRUE",
             "schedule_relationship": "Scheduled",
+            "schedule_arrival_time": _ts(day, sched),
             "schedule_departure_time": _ts(day, sched),
+            "actual_arrival_time": _ts(day, actual),
             "actual_departure_time": _ts(day, actual),
         }
         for seq, stop, sched, actual in ((1, "A", "08:00", "08:00"), (2, "B", "08:30", "08:24"))
@@ -352,36 +426,52 @@ def test_run_last_stop_early_ok_reaches_the_route_tables(tmp_path: Path) -> None
             "service_date": day,
             "trip_id_performed": "T1",
             "trip_id_scheduled": "S1",
-            "route_id": "X1",
+            "route_id": "DC_R20",
             "direction_id": "0",
-            "route_type_agency": "EXPRESS",
+            "route_type_agency": route_type_agency,
             "trip_end_stop_id": "B",
             "trip_type": "In service",
             "schedule_relationship": "Scheduled",
         }
     ]
-    sv, tp = _write_tides(tmp_path, visits, trips)
-    common = {
-        "stop_visits_path": sv,
-        "trips_performed_path": tp,
-        "measures": ["otp"],
-        "levels": ["route"],
-        "time_cuts": ["all_day"],
-    }
-    off = target.run(_settings(tmp_path / "off", **common)).otp[("route", "all_day")]
-    on = target.run(_settings(tmp_path / "on", last_stop_early_ok=True, **common)).otp[
-        ("route", "all_day")
-    ]
-    assert off[["early", "on_time"]].iloc[0].tolist() == [1, 1]
-    assert on[["early", "on_time"]].iloc[0].tolist() == [0, 2]
+    return _write_tides(tmp_path, visits, trips)
 
 
-def test_score_otp_late_last_stop_still_late() -> None:
-    """The rule never turns a late visit on time."""
-    rows = _loop_trip("EXPRESS")
-    rows[-1]["actual_departure_time"] = "07:20"
-    scored, _ = target.score_otp(_visits(rows), -1.0, 5.0, True, True, ("EXPRESS",))
-    assert scored["otp_class"].tolist() == ["early", "early", "late"]
+@pytest.mark.parametrize(
+    ("overrides", "early", "on_time", "evaluated"),
+    [
+        ({}, 1, 1, 2),
+        ({"last_stop_treatment": "early_ok", "express_routes_file": str(EXPRESS_ROUTES)}, 0, 2, 2),
+        ({"last_stop_treatment": "exclude", "express_routes_file": str(EXPRESS_ROUTES)}, 0, 1, 1),
+        ({"last_stop_treatment": "early_ok"}, 1, 1, 2),  # LOCAL by route_type_agency, no file
+        ({"last_stop_treatment": "early_ok", "last_stop_routes": "all"}, 0, 2, 2),
+    ],
+)
+def test_run_last_stop_treatment_reaches_the_route_tables(
+    tmp_path: Path, overrides: dict, early: int, on_time: int, evaluated: int
+) -> None:
+    """The express-routes fixture, not route_type_agency, marks DC_R20 express here."""
+    sv, tp = _express_tides(tmp_path, route_type_agency="LOCAL")
+    settings = _settings(
+        tmp_path / "out",
+        stop_visits_path=sv,
+        trips_performed_path=tp,
+        measures=["otp"],
+        levels=["route"],
+        time_cuts=["all_day"],
+        **overrides,
+    )
+    table = target.run(settings).otp[("route", "all_day")]
+    assert table[["early", "on_time", "evaluated"]].iloc[0].tolist() == [early, on_time, evaluated]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"), [("last_stop_treatment", "forgive"), ("last_stop_routes", "local")]
+)
+def test_run_rejects_unknown_last_stop_settings(tmp_path: Path, field: str, value: str) -> None:
+    """A misspelled treatment or route choice stops the run before any work."""
+    with pytest.raises(target.SettingsError, match=field.upper()):
+        target.run(_settings(tmp_path, **{field: value}))
 
 
 def test_route_month_otp_matches_a_direct_join(full_run: target.RunResult) -> None:
@@ -391,15 +481,24 @@ def test_route_month_otp_matches_a_direct_join(full_run: target.RunResult) -> No
     sv["service_date"] = pd.to_datetime(sv["service_date"])
     tp["service_date"] = pd.to_datetime(tp["service_date"])
     tp = tp[(tp["trip_type"] == "In service") & (tp["schedule_relationship"] != "Canceled")]
-    joined = sv.merge(tp[["service_date", "trip_id_performed", "route_id"]])
+    joined = sv.merge(tp[["service_date", "trip_id_performed", "route_id", "trip_end_stop_id"]])
+    seq = pd.to_numeric(joined["trip_stop_sequence"])
+    last_seq = seq.groupby([joined["service_date"], joined["trip_id_performed"]]).transform("max")
+    at_last = seq.eq(last_seq) & joined["stop_id"].eq(joined["trip_end_stop_id"])
     joined = joined[
         (joined["timepoint"] == "TRUE") & (joined["schedule_relationship"] == "Scheduled")
     ]
-    sched = pd.to_datetime(joined["schedule_departure_time"]).fillna(
-        pd.to_datetime(joined["schedule_arrival_time"])
+    at_last = at_last[joined.index]
+
+    def first(a: str, b: str) -> pd.Series:
+        return pd.to_datetime(joined[a]).fillna(pd.to_datetime(joined[b]))
+
+    # Departure, else arrival -- except arrival, else departure, at a trip's last stop.
+    sched = first("schedule_departure_time", "schedule_arrival_time").where(
+        ~at_last, first("schedule_arrival_time", "schedule_departure_time")
     )
-    actual = pd.to_datetime(joined["actual_departure_time"]).fillna(
-        pd.to_datetime(joined["actual_arrival_time"])
+    actual = first("actual_departure_time", "actual_arrival_time").where(
+        ~at_last, first("actual_arrival_time", "actual_departure_time")
     )
     dev = (actual - sched).dt.total_seconds() / 60
     joined = joined.assign(

@@ -1,0 +1,11 @@
+# Express routes for the mock DC agency behind the GTFS, TODS and TIDES fixtures
+# (mock_gtfs_dc.zip, stop_visits.csv, trips_performed.csv).
+#
+# Read by otp_runtime_from_tides.py (EXPRESS_ROUTES_FILE / --express-routes-file),
+# whose LAST_STOP_TREATMENT can apply to express routes only. For your own agency,
+# copy this file, edit the copy, and point the setting at it.
+#
+# Format: one route_id per line, as it appears in GTFS routes.txt and in the TIDES
+# trips_performed route_id column. Blank lines and anything after "#" are ignored.
+
+DC_R20  # 20 East-West Express (peak only)

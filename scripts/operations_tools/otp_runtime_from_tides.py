@@ -40,8 +40,9 @@ Limitations
 - Timestamps are read as written, ignoring any UTC offset, so a running time that
   crosses a daylight-saving change is off by an hour.
 - Canceled and non-revenue trips are dropped. OTP scores Scheduled visits only, and
-  running times leave out Skipped visits. ``LAST_STOP_EARLY_OK`` can count an early
-  arrival at a trip's last stop as on time, for some service types or every route.
+  running times leave out Skipped visits. A trip's last stop is scored on arrival;
+  ``LAST_STOP_TREATMENT`` can count an early arrival there as on time, or leave the
+  stop out, on express routes (``EXPRESS_ROUTES_FILE``) or every route.
 
 Typical usage
 -------------
@@ -153,8 +154,9 @@ EXPORT_TIME_CUTS: Mapping[str, bool] = {
 TRIP_TIME_BASIS: str = "scheduled_start"
 # The clock time that places a stop visit (OTP) or a segment (by the time at its
 # first timepoint) in a time period and an hour: "scheduled" (scheduled departure,
-# else arrival) or "actual" (actual departure, else arrival). Scheduled time charges
-# a late bus to the period it was supposed to serve.
+# else arrival) or "actual" (actual departure, else arrival); a trip's last stop
+# uses arrival first. Scheduled time charges a late bus to the period it was
+# supposed to serve.
 STOP_TIME_BASIS: str = "scheduled"
 
 # Clock hours before this belong to the previous service day and appear as hours 24
@@ -235,19 +237,11 @@ ROUTES_TO_EXCLUDE: Sequence[str] = ()
 
 # ON-TIME PERFORMANCE ---------------------------------------------------------
 # A visit is on time when its deviation (actual minus scheduled departure, falling
-# back to arrival where a departure is missing) falls within [EARLY_MIN, LATE_MIN]
-# minutes, inclusive. The common convention is 1 minute early to 5 minutes late.
+# back to arrival where a departure is missing; arrival at a trip's last stop, see
+# below) falls within [EARLY_MIN, LATE_MIN] minutes, inclusive. The common
+# convention is 1 minute early to 5 minutes late.
 EARLY_MIN: float = -1.0
 LATE_MIN: float = 5.0
-# Riders only get off at a trip's last stop (normally its last timepoint), so some
-# agencies count an early arrival there as on time. When LAST_STOP_EARLY_OK is True,
-# a visit at its trip's last stop (trip_end_stop_id in trips_performed) that would
-# score early scores on time instead, on routes whose route_type_agency is in
-# LAST_STOP_EARLY_OK_SERVICE_TYPES (compared without regard to case); an empty list
-# applies it to every route. Late visits there still score late, and dev_min keeps
-# the measured deviation.
-LAST_STOP_EARLY_OK: bool = False
-LAST_STOP_EARLY_OK_SERVICE_TYPES: Sequence[str] = ("EXPRESS",)
 # Score timepoint visits only (timepoint TRUE). False scores every Scheduled visit.
 TIMEPOINTS_ONLY: bool = True
 # Agency OTP standard (percent), drawn as a dashed line on the charts.
@@ -257,6 +251,27 @@ OTP_STANDARD: float = 85.0
 DEV_ABS_WARN_MIN: float = 120.0
 # Warn when a day type is backed by fewer service dates than this.
 THIN_DAY_TYPE_DATES: int = 4
+
+# Last stop: a trip's trip_end_stop_id (trips_performed) at its last visit. OTP there
+# is scored on arrival (actual minus scheduled arrival, each falling back to
+# departure), since a bus leaving the end of the line is no longer serving riders.
+# Trips without a trip_end_stop_id are scored on departure like any other stop.
+# LAST_STOP_TREATMENT sets how the last stop counts on the routes LAST_STOP_ROUTES
+# picks ("express" or "all"); every other route uses "score":
+#   "score"    - score it like any other timepoint.
+#   "early_ok" - riders only get off there, so an early arrival counts as on time.
+#                A late arrival still counts as late, and dev_min keeps the
+#                measured deviation.
+#   "exclude"  - leave it out of OTP.
+LAST_STOP_TREATMENT: str = "score"
+LAST_STOP_ROUTES: str = "express"
+# Express routes: the route_ids in EXPRESS_ROUTES_FILE (a .txt with one route_id per
+# line; see sample_data/express_routes_example.txt) and in EXPRESS_ROUTES together.
+# When neither lists any, routes whose route_type_agency is in EXPRESS_SERVICE_TYPES
+# (compared without regard to case) are express.
+EXPRESS_ROUTES_FILE: Optional[str] = None  # e.g. r"C:\Data\express_routes.txt"
+EXPRESS_ROUTES: Sequence[str] = ()
+EXPRESS_SERVICE_TYPES: Sequence[str] = ("EXPRESS",)
 
 # Stop flags (otp_stop_flags.csv): a stop is flagged when at least
 # MIN_ROUTES_FLAGGED of its routes each judge it low-coverage or poor-OTP. A
@@ -369,6 +384,8 @@ CHARTABLE_LEVELS: Tuple[str, ...] = ("system", "service_type", "route", "route_d
 
 TRIP_TIME_BASES: Tuple[str, ...] = ("scheduled_start", "actual_start")
 STOP_TIME_BASES: Tuple[str, ...] = ("scheduled", "actual")
+LAST_STOP_TREATMENTS: Tuple[str, ...] = ("score", "early_ok", "exclude")
+LAST_STOP_ROUTE_CHOICES: Tuple[str, ...] = ("express", "all")
 
 WEEKDAY_NAMES: Tuple[str, ...] = (
     "Monday",
@@ -583,8 +600,11 @@ class RunSettings(NamedTuple):
     routes_to_exclude: Sequence[str] = ROUTES_TO_EXCLUDE
     early_min: float = EARLY_MIN
     late_min: float = LATE_MIN
-    last_stop_early_ok: bool = LAST_STOP_EARLY_OK
-    last_stop_early_ok_service_types: Sequence[str] = LAST_STOP_EARLY_OK_SERVICE_TYPES
+    last_stop_treatment: str = LAST_STOP_TREATMENT
+    last_stop_routes: str = LAST_STOP_ROUTES
+    express_routes_file: Optional[str] = EXPRESS_ROUTES_FILE
+    express_routes: Sequence[str] = EXPRESS_ROUTES
+    express_service_types: Sequence[str] = EXPRESS_SERVICE_TYPES
     timepoints_only: bool = TIMEPOINTS_ONLY
     otp_standard: float = OTP_STANDARD
     dev_abs_warn_min: float = DEV_ABS_WARN_MIN
@@ -1087,6 +1107,67 @@ def classify_service_ids(
             per_year,
         )
     return result
+
+
+def load_id_set(
+    inline_ids: Optional[Sequence[str]] = None,
+    txt_path: Optional[str] = None,
+    *,
+    kind: str = "id",
+) -> set[str]:
+    """Union an inline list and an optional text file of ids into one set.
+
+    Used to resolve override lists (express routes, express origin stops, …) that
+    a caller may supply inline, in an external file, or both — without repeating
+    the parsing for each one.
+
+    Args:
+        inline_ids: Id values supplied directly (e.g. a config list). ``None`` is
+            treated as empty.
+        txt_path: Path to a text file with one id per line. Blank lines are
+            skipped and ``#`` starts a comment (whole-line or inline). ``None``
+            skips the file. A path that is set but missing is logged as a warning
+            and skipped — the inline ids are still returned.
+        kind: Human-readable noun used only in log messages (e.g.
+            ``"express route"``, ``"express origin stop"``).
+
+    Returns:
+        The unioned set of id strings (possibly empty). Every id is coerced to a
+        trimmed ``str`` so it matches GTFS values, which are read as strings.
+    """
+    ids: set[str] = set()
+
+    for raw in inline_ids or ():
+        text = str(raw).strip()
+        if text:
+            ids.add(text)
+
+    if txt_path:
+        if not os.path.exists(txt_path):
+            logging.warning(
+                "%s file '%s' not found; using inline ids only.", kind.capitalize(), txt_path
+            )
+        else:
+            with open(txt_path, encoding="utf-8") as handle:
+                for line in handle:
+                    text = line.split("#", 1)[0].strip()
+                    if text:
+                        ids.add(text)
+            logging.info("Loaded %s ids from '%s'.", kind, txt_path)
+
+    logging.info("Resolved %d %s id(s).", len(ids), kind)
+    return ids
+
+
+def load_express_route_ids(
+    inline_ids: Optional[Sequence[str]] = None,
+    txt_path: Optional[str] = None,
+) -> set[str]:
+    """Resolve the set of express-route ``route_id`` values (see ``load_id_set``).
+
+    Thin wrapper kept for readable call sites and backwards compatibility.
+    """
+    return load_id_set(inline_ids, txt_path, kind="express route")
 
 
 # =============================================================================
@@ -2927,52 +3008,38 @@ def otp_candidates(visits: pd.DataFrame, timepoints_only: bool) -> pd.DataFrame:
     return out
 
 
-def last_stop_early_ok_mask(visits: pd.DataFrame, service_types: Sequence[str]) -> pd.Series:
-    """Mark the visits at their trip's last stop whose early arrival counts as on time.
+def last_stop_mask(visits: pd.DataFrame) -> pd.Series:
+    """Mark each visit made at its trip's last stop.
 
-    A visit qualifies when its ``stop_id`` is the trip's ``trip_end_stop_id`` and it
-    is the trip's last visit by ``trip_stop_sequence`` (row order where that is
-    absent). Requiring both keeps a loop trip's first visit, at the same stop, from
-    qualifying, and keeps a trip whose last-stop visit is missing from qualifying
-    at an earlier stop. Trips without a ``trip_end_stop_id`` are left out.
+    A visit is at the last stop when its ``stop_id`` is the trip's
+    ``trip_end_stop_id`` and it is the trip's last visit by ``trip_stop_sequence``
+    (row order where that is absent). Requiring both keeps a loop trip's first
+    visit, at the same stop, from counting, and keeps an earlier stop from counting
+    when the last-stop visit is missing from the export. Trips without a
+    ``trip_end_stop_id`` have no last stop and are counted in a warning.
 
     Args:
         visits: Joined stop visits.
-        service_types: ``route_type_agency`` values the rule applies to (compared
-            without regard to case); empty applies it to every route.
 
     Returns:
         A boolean mask aligned to *visits*.
     """
     none = pd.Series(False, index=visits.index)
-    if visits.empty:
+    if visits.empty or "stop_id" not in visits.columns:
         return none
-    for col in ("stop_id", "trip_end_stop_id"):
-        if col not in visits.columns:
-            logging.warning(
-                "LAST_STOP_EARLY_OK is on but the visits have no %s column; no early "
-                "arrival at a last stop is counted as on time.",
-                col,
-            )
-            return none
-    applies = pd.Series(True, index=visits.index)
-    if service_types:
-        if "route_type_agency" not in visits.columns:
-            logging.warning(
-                "LAST_STOP_EARLY_OK_SERVICE_TYPES is set but the visits have no "
-                "route_type_agency column; no early arrival at a last stop is counted "
-                "as on time."
-            )
-            return none
-        wanted = {str(s).strip().casefold() for s in service_types}
-        applies = _casefolded(visits["route_type_agency"], "").isin(wanted)
+    if "trip_end_stop_id" not in visits.columns:
+        logging.warning(
+            "trips_performed has no trip_end_stop_id, so no trip's last stop is known: "
+            "every stop is scored on departure and LAST_STOP_TREATMENT has no effect."
+        )
+        return none
     end_stop = visits["trip_end_stop_id"].fillna("").astype(str).str.strip()
     no_end = end_stop.eq("")
-    if (applies & no_end).any():
+    if no_end.any():
         logging.warning(
-            "LAST_STOP_EARLY_OK: %d performed trip(s) have no trip_end_stop_id; early "
-            "arrivals at their last stop still score early.",
-            int(visits.loc[applies & no_end, TRIP_KEY].drop_duplicates().shape[0]),
+            "%d performed trip(s) have no trip_end_stop_id; their last stop is scored on "
+            "departure like any other stop, and LAST_STOP_TREATMENT does not apply to it.",
+            int(visits.loc[no_end, TRIP_KEY].drop_duplicates().shape[0]),
         )
     if "trip_stop_sequence" in visits.columns:
         seq = pd.to_numeric(visits["trip_stop_sequence"], errors="coerce")
@@ -2980,7 +3047,67 @@ def last_stop_early_ok_mask(visits: pd.DataFrame, service_types: Sequence[str]) 
         seq = pd.Series(np.arange(len(visits), dtype="float64"), index=visits.index)
     is_last = seq.eq(seq.groupby([visits[c] for c in TRIP_KEY]).transform("max"))
     stop = visits["stop_id"].fillna("").astype(str).str.strip()
-    return applies & is_last & stop.eq(end_stop) & ~no_end
+    return is_last & stop.eq(end_stop) & ~no_end
+
+
+def resolve_express_routes(
+    visits: pd.DataFrame,
+    routes_file: Optional[str],
+    inline: Sequence[str],
+    service_types: Sequence[str],
+) -> Tuple[frozenset[str], str]:
+    """Pick the express route_ids and say where they came from.
+
+    The route_ids in *inline* and the express-routes file together (see
+    :func:`load_express_route_ids`); when neither lists any, the routes whose
+    ``route_type_agency`` is one of *service_types* (compared without regard to
+    case). Listed routes that do not appear in *visits* are named in a warning.
+
+    Args:
+        visits: Joined stop visits (``route_id`` and, for the fallback,
+            ``route_type_agency``).
+        routes_file: Path to a text file of route_ids, if any.
+        inline: The ``EXPRESS_ROUTES`` list.
+        service_types: The ``EXPRESS_SERVICE_TYPES`` values.
+
+    Returns:
+        The express route_ids and a description of their source.
+    """
+    listed = load_express_route_ids(inline, routes_file)
+    if listed:
+        sources = ["EXPRESS_ROUTES"] if inline else []
+        if routes_file:
+            sources.append(f"express-routes file '{routes_file}'")
+        known = (
+            set(visits["route_id"].dropna().astype(str).str.strip())
+            if "route_id" in visits.columns
+            else set()
+        )
+        absent = sorted(listed - known)
+        if absent:
+            logging.warning("Express route(s) not in the data: %s.", ", ".join(absent))
+        return frozenset(listed), " and ".join(sources)
+    source = f"route_type_agency in EXPRESS_SERVICE_TYPES ({', '.join(service_types)})"
+    if "route_type_agency" not in visits.columns or "route_id" not in visits.columns:
+        logging.warning("No express routes: the visits have no route_type_agency column.")
+        return frozenset(), source
+    wanted = {str(t).strip().casefold() for t in service_types}
+    express = visits.loc[_casefolded(visits["route_type_agency"], "").isin(wanted), "route_id"]
+    return frozenset(express.dropna().astype(str).str.strip()) - {""}, source
+
+
+def _arrival_at_last_stop(candidates: pd.DataFrame) -> pd.DataFrame:
+    """Switch last-stop visits' time columns to arrival, each falling back to departure."""
+    at_last = candidates["_at_last_stop"].to_numpy(dtype=bool)
+    if not at_last.any():
+        return candidates
+    out = candidates.copy()
+    for prefix, kind in (("_sched", "schedule"), ("_actual", "actual")):
+        arrival = out[f"{kind}_arrival_time_ts"].fillna(out[f"{kind}_departure_time_ts"])
+        out[f"{prefix}_ts"] = out[f"{prefix}_ts"].where(~at_last, arrival)
+        text = _first_present(out, (f"{kind}_arrival_time", f"{kind}_departure_time"))
+        out[f"{prefix}_text"] = out[f"{prefix}_text"].where(~at_last, text)
+    return out
 
 
 def score_otp(
@@ -2988,34 +3115,48 @@ def score_otp(
     early_min: float = EARLY_MIN,
     late_min: float = LATE_MIN,
     timepoints_only: bool = TIMEPOINTS_ONLY,
-    last_stop_early_ok: bool = LAST_STOP_EARLY_OK,
-    last_stop_early_ok_service_types: Sequence[str] = LAST_STOP_EARLY_OK_SERVICE_TYPES,
+    last_stop_treatment: str = LAST_STOP_TREATMENT,
+    treated_routes: Optional[Iterable[str]] = None,
 ) -> Tuple[pd.DataFrame, Dict[str, int]]:
     """Score each candidate visit as early, on time or late.
 
     The deviation is the actual minus the scheduled departure in minutes, each
-    falling back to the arrival where the departure is missing; visits without
-    both sides cannot be scored.
+    falling back to the arrival where the departure is missing; at a trip's last
+    stop (:func:`last_stop_mask`) it is arrival, falling back to departure, and the
+    visit is placed in time by its arrival too. Visits without both sides cannot be
+    scored.
 
     Args:
         visits: Stop visits with :func:`add_parsed_timestamps` columns.
         early_min: Lower (inclusive) bound of the on-time window, in minutes.
         late_min: Upper (inclusive) bound of the on-time window, in minutes.
         timepoints_only: Score timepoint visits only.
-        last_stop_early_ok: Score an early visit at its trip's last stop as on time
-            (see :func:`last_stop_early_ok_mask`).
-        last_stop_early_ok_service_types: The ``route_type_agency`` values that
-            rule applies to; empty applies it to every route.
+        last_stop_treatment: How the last stop counts on *treated_routes*: one of
+            :data:`LAST_STOP_TREATMENTS` (see ``LAST_STOP_TREATMENT``).
+        treated_routes: The route_ids the treatment applies to; ``None`` applies it
+            to every route.
 
     Returns:
         The scored visits with ``dev_min`` and ``otp_class``, and counts of the
-        candidates, the scored visits, why the rest were not scored, and the early
-        last-stop visits scored on time.
+        candidates, the scored visits, why the rest were not scored, the last-stop
+        visits left out, and the early last-stop visits scored on time.
     """
-    if last_stop_early_ok:
-        mask = last_stop_early_ok_mask(visits, last_stop_early_ok_service_types)
-        visits = visits.assign(_last_stop_early_ok=mask)
-    candidates = otp_candidates(visits, timepoints_only)
+    candidates = otp_candidates(
+        visits.assign(_at_last_stop=last_stop_mask(visits)), timepoints_only
+    )
+    treated = candidates["_at_last_stop"].to_numpy(dtype=bool)
+    if treated_routes is not None:
+        wanted = {str(r).strip() for r in treated_routes}
+        if "route_id" in candidates.columns:
+            route = candidates["route_id"].fillna("").astype(str).str.strip()
+            treated = treated & route.isin(wanted).to_numpy(dtype=bool)
+        else:
+            treated = np.zeros(len(candidates), dtype=bool)
+    excluded = 0
+    if last_stop_treatment == "exclude":
+        excluded = int(treated.sum())
+        candidates, treated = candidates.loc[~treated], treated[~treated]
+    candidates = _arrival_at_last_stop(candidates.assign(_treated=treated))
     dev = (candidates["_actual_ts"] - candidates["_sched_ts"]) / pd.Timedelta(minutes=1)
     no_schedule = candidates["_sched_ts"].isna()
     counts = {
@@ -3023,6 +3164,8 @@ def score_otp(
         "scored": int(dev.notna().sum()),
         "missing_schedule_time": int(no_schedule.sum()),
         "missing_actual_time": int((~no_schedule & candidates["_actual_ts"].isna()).sum()),
+        "last_stop_excluded": excluded,
+        "early_ok_at_last_stop": 0,
     }
     scored = candidates.assign(dev_min=dev).loc[dev.notna()].copy()
     scored["otp_class"] = np.select(
@@ -3030,13 +3173,11 @@ def score_otp(
         ["early", "late"],
         default="on_time",
     )
-    counts["early_ok_at_last_stop"] = 0
-    if "_last_stop_early_ok" in scored.columns:
-        forgiven = scored["otp_class"].eq("early") & scored["_last_stop_early_ok"]
+    if last_stop_treatment == "early_ok":
+        forgiven = scored["otp_class"].eq("early") & scored["_treated"]
         scored.loc[forgiven, "otp_class"] = "on_time"
         counts["early_ok_at_last_stop"] = int(forgiven.sum())
-        scored = scored.drop(columns="_last_stop_early_ok")
-    return scored, counts
+    return scored.drop(columns=["_at_last_stop", "_treated"]), counts
 
 
 def warn_extreme_deviations(scored: pd.DataFrame, warn_abs_min: float = DEV_ABS_WARN_MIN) -> None:
@@ -4682,6 +4823,16 @@ def _resolve_run_settings(
         raise SettingsError(
             f"EARLY_MIN ({settings.early_min:g}) is later than LATE_MIN ({settings.late_min:g})."
         )
+    if settings.last_stop_treatment not in LAST_STOP_TREATMENTS:
+        raise SettingsError(
+            f"LAST_STOP_TREATMENT must be one of {', '.join(LAST_STOP_TREATMENTS)}, "
+            f"not {settings.last_stop_treatment!r}."
+        )
+    if settings.last_stop_routes not in LAST_STOP_ROUTE_CHOICES:
+        raise SettingsError(
+            f"LAST_STOP_ROUTES must be one of {', '.join(LAST_STOP_ROUTE_CHOICES)}, "
+            f"not {settings.last_stop_routes!r}."
+        )
     if not 0.0 <= settings.trim_frac < 0.5:
         raise SettingsError(
             f"TRIM_FRAC must be at least 0 and below 0.5, not {settings.trim_frac!r}."
@@ -4867,14 +5018,33 @@ def run(settings: RunSettings) -> RunResult:
     otp_tables: Dict[Tuple[str, str], pd.DataFrame] = {}
     stop_flags = stop_detail = pd.DataFrame()
     otp_counts: Dict[str, int] = {}
+    last_stop_scope = "all routes"
     if "otp" in measures:
+        treated_routes: Optional[frozenset[str]] = None
+        if settings.last_stop_treatment != "score" and settings.last_stop_routes == "express":
+            treated_routes, express_source = resolve_express_routes(
+                visits,
+                settings.express_routes_file,
+                settings.express_routes,
+                settings.express_service_types,
+            )
+            last_stop_scope = (
+                f"express routes ({', '.join(sorted(treated_routes)) or 'none'}; "
+                f"from {express_source})"
+            )
+            if not treated_routes:
+                logging.warning(
+                    "LAST_STOP_TREATMENT %r applies to express routes, but none were found; "
+                    "every last stop is scored normally.",
+                    settings.last_stop_treatment,
+                )
         scored, otp_counts = score_otp(
             visits,
             settings.early_min,
             settings.late_min,
             settings.timepoints_only,
-            settings.last_stop_early_ok,
-            settings.last_stop_early_ok_service_types,
+            settings.last_stop_treatment,
+            treated_routes,
         )
         logging.info(
             "OTP: %d candidate visit(s), %d scored; %d had no actual time and %d no "
@@ -4884,10 +5054,18 @@ def run(settings: RunSettings) -> RunResult:
             otp_counts["missing_actual_time"],
             otp_counts["missing_schedule_time"],
         )
-        if settings.last_stop_early_ok:
+        if settings.last_stop_treatment == "exclude":
             logging.info(
-                "OTP: %d early visit(s) at a trip's last stop scored on time (LAST_STOP_EARLY_OK).",
+                "OTP: %d last-stop visit(s) on %s left out (LAST_STOP_TREATMENT 'exclude').",
+                otp_counts["last_stop_excluded"],
+                last_stop_scope,
+            )
+        elif settings.last_stop_treatment == "early_ok":
+            logging.info(
+                "OTP: %d early last-stop visit(s) on %s scored on time "
+                "(LAST_STOP_TREATMENT 'early_ok').",
                 otp_counts["early_ok_at_last_stop"],
+                last_stop_scope,
             )
         if scored.empty:
             logging.warning("No visit could be scored for OTP; the OTP tables are skipped.")
@@ -5074,11 +5252,11 @@ def run(settings: RunSettings) -> RunResult:
         f"Routes excluded:    {', '.join(settings.routes_to_exclude) or '(none)'}",
         f"On-time window:     {settings.early_min:g} to {settings.late_min:g} min; "
         f"timepoints only: {settings.timepoints_only}; standard {settings.otp_standard:g}%",
-        "Last-stop early:    "
+        "Last stop:          scored on arrival; "
         + (
-            "on time for " + (", ".join(settings.last_stop_early_ok_service_types) or "every route")
-            if settings.last_stop_early_ok
-            else "scored early"
+            "scored like any timepoint"
+            if settings.last_stop_treatment == "score"
+            else f"{settings.last_stop_treatment} on {last_stop_scope}"
         ),
         f"Running time:       trim {settings.trim_frac:g} per tail; percentiles "
         f"{', '.join(f'{p:g}' for p in settings.percentiles)}; segments between "
@@ -5272,17 +5450,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--late-min", type=float, default=LATE_MIN, help="Latest on-time deviation (minutes)."
     )
     p.add_argument(
-        "--last-stop-early-ok",
-        action=argparse.BooleanOptionalAction,
-        default=LAST_STOP_EARLY_OK,
-        help="Score an early visit at a trip's last stop as on time.",
+        "--last-stop-treatment",
+        choices=LAST_STOP_TREATMENTS,
+        default=LAST_STOP_TREATMENT,
+        help="How a trip's last stop counts toward OTP on the --last-stop-routes.",
     )
     p.add_argument(
-        "--last-stop-early-ok-service-types",
-        nargs="*",
-        default=list(LAST_STOP_EARLY_OK_SERVICE_TYPES),
-        metavar="TYPE",
-        help="route_type_agency values --last-stop-early-ok applies to; none = every route.",
+        "--last-stop-routes",
+        choices=LAST_STOP_ROUTE_CHOICES,
+        default=LAST_STOP_ROUTES,
+        help="Apply --last-stop-treatment to express routes only or to every route.",
+    )
+    p.add_argument(
+        "--express-routes-file",
+        default=EXPRESS_ROUTES_FILE,
+        help="Text file of express route_ids, one per line.",
+    )
+    p.add_argument(
+        "--express-routes",
+        nargs="+",
+        metavar="ROUTE_ID",
+        help="Express route_ids (replace EXPRESS_ROUTES; added to the express-routes file).",
     )
     p.add_argument(
         "--timepoints-only",
@@ -5372,8 +5560,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             routes_to_exclude=tuple(args.routes_exclude),
             early_min=args.early_min,
             late_min=args.late_min,
-            last_stop_early_ok=args.last_stop_early_ok,
-            last_stop_early_ok_service_types=tuple(args.last_stop_early_ok_service_types),
+            last_stop_treatment=args.last_stop_treatment,
+            last_stop_routes=args.last_stop_routes,
+            express_routes_file=args.express_routes_file,
+            express_routes=tuple(args.express_routes or EXPRESS_ROUTES),
             timepoints_only=args.timepoints_only,
             export_stop_flags=args.stop_flags,
             trim_frac=args.trim_frac,

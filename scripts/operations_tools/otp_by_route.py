@@ -7,7 +7,8 @@ per route, so it can join the route-level modeling table on the secured box (see
 
 It deliberately does NOT re-score OTP from raw TIDES events. ``otp_runtime_from_tides``
 already owns the OTP definition (the early/late window, timepoint-only filter,
-``Scheduled``-only rule, and departure-with-arrival fallback) and writes one row per
+``Scheduled``-only rule, departure-with-arrival fallback, arrival at a trip's last
+stop, and last-stop treatment) and writes one row per
 ``(day type, route, month)`` carrying the early / on-time / late counts. Keeping the
 scoring in one place means "on-time" cannot quietly come to mean two different
 things; this script's only job is the temporal reduction. Point it at any CSV that
