@@ -201,8 +201,11 @@ def load_gtfs_stops(folder: str) -> pd.DataFrame:
 def normalize_street(name: str, mods: set[str]) -> str:
     """Cleans and standardizes a street name string.
 
-    Removes modifiers (e.g., 'St', 'Ave'), punctuation, and extra whitespace,
-    and converts the string to lowercase.
+    Removes one modifier (e.g., 'St', 'Ave'), punctuation, and extra whitespace,
+    and converts the string to lowercase. The modifier removed is the last one
+    that is not the first word: the street type follows the name ("Johns Rd",
+    "Park St SE"), so "St Johns Rd" becomes "st johns" rather than "johns",
+    which would equal "Johns Rd".
 
     Args:
         name: The street name to normalize.
@@ -214,12 +217,14 @@ def normalize_street(name: str, mods: set[str]) -> str:
     if not isinstance(name, str):
         return ""
     if mods:
-        name = re.sub(
-            r"\b(" + "|".join(map(re.escape, mods)) + r")\b",
-            " ",
-            name,
-            flags=re.IGNORECASE,
-        )
+        pattern = r"\b(" + "|".join(map(re.escape, mods)) + r")\b"
+        matches = [
+            m
+            for m in re.finditer(pattern, name, flags=re.IGNORECASE)
+            if re.search(r"\w", name[: m.start()])
+        ]
+        if matches:
+            name = name[: matches[-1].start()] + " " + name[matches[-1].end() :]
     name = re.sub(r"[^\w\s]", " ", name)
     return re.sub(r"\s+", " ", name).strip().lower()
 

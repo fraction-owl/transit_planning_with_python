@@ -212,6 +212,24 @@ def test_normalize_street_name_collapses_spaces() -> None:
     assert "  " not in result
 
 
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("St Johns Rd", "st johns"),
+        ("Johns Rd", "johns"),
+        ("St Paul St", "st paul"),
+        ("Mount St Albans Rd", "mount st albans"),
+        ("N St Johns Rd", "n st johns"),
+        ("N St NW", "n nw"),
+        ("St", "st"),
+    ],
+)
+def test_normalize_street_name_strips_only_last_non_leading_modifier(
+    name: str, expected: str
+) -> None:
+    assert target.normalize_street_name(name, {"st", "rd"}) == expected
+
+
 # ---------------------------------------------------------------------------
 # extract_modifiers
 # ---------------------------------------------------------------------------
@@ -287,6 +305,18 @@ def test_extract_street_names_splits_at_and_leading_intersection_of(stop_name: s
 
 def test_extract_street_names_keeps_at_inside_words() -> None:
     assert target.extract_street_names("Battery Ln", {"ln"}) == ["battery"]
+
+
+@pytest.mark.parametrize(
+    ("stop_name", "road"), [("St Johns Rd", "Johns Rd"), ("Johns Rd", "St Johns Rd")]
+)
+def test_compare_stop_to_roads_flags_saint_dropped_or_added(stop_name: str, road: str) -> None:
+    # Stripping every "St" made both names "johns", so the exact-match skip hid them.
+    mods = {"st", "rd"}
+    streets = target.extract_street_names(stop_name, mods)
+    roads = {target.normalize_street_name(road, mods): {road}}
+    typos = target.compare_stop_to_roads("1", stop_name, streets, roads, 80)
+    assert [t["similar_road_name_original"] for t in typos] == [road]
 
 
 def test_compare_stop_to_roads_flags_typo_after_at() -> None:

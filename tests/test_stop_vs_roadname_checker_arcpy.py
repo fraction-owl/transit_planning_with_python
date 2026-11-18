@@ -69,6 +69,29 @@ def test_load_gtfs_stops_missing_stops_raises(mod: types.ModuleType, tmp_path: P
 
 
 # ---------------------------------------------------------------------------
+# normalize_street
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("St Johns Rd", "st johns"),
+        ("Johns Rd", "johns"),
+        ("St Paul St", "st paul"),
+        ("Mount St Albans Rd", "mount st albans"),
+        ("N St Johns Rd", "n st johns"),
+        ("N St NW", "n nw"),
+        ("St", "st"),
+    ],
+)
+def test_normalize_street_strips_only_last_non_leading_modifier(
+    mod: types.ModuleType, name: str, expected: str
+) -> None:
+    assert mod.normalize_street(name, {"st", "rd"}) == expected
+
+
+# ---------------------------------------------------------------------------
 # split_stop_name
 # ---------------------------------------------------------------------------
 
@@ -132,6 +155,15 @@ def test_detect_typos_flags_typo_after_at(mod: types.ModuleType) -> None:
     out = mod.detect_typos(stops, stop2roads, {"hwy", "blvd"}, 80)
     assert out["street_in_stop_name"].tolist() == ["lockhed"]
     assert out["similar_road_name_orig"].tolist() == ["Lockheed Blvd"]
+
+
+def test_detect_typos_flags_dropped_saint(mod: types.ModuleType) -> None:
+    # Stripping every "St" made both names "mount albans", so the exact-match skip hid them.
+    mods = {"st", "rd"}
+    stop2roads = {"1": {mod.normalize_street("Mount Albans Rd", mods): {"Mount Albans Rd"}}}
+    out = mod.detect_typos(_stops(("1", "Mount St Albans Rd")), stop2roads, mods, 80)
+    assert out["street_in_stop_name"].tolist() == ["mount st albans"]
+    assert out["similar_road_name_orig"].tolist() == ["Mount Albans Rd"]
 
 
 def test_detect_typos_empty_result_keeps_columns(mod: types.ModuleType) -> None:

@@ -382,6 +382,10 @@ def extract_modifiers(
 def normalize_street_name(name: str, modifiers_set: Set[str]) -> str:
     """Normalize a street name by removing known modifiers, punctuation, and extra spaces.
 
+    Only one modifier is removed: the last one that is not the first word. The
+    street type follows the name ("Johns Rd", "Park St SE"), so "St Johns Rd"
+    becomes "st johns" rather than "johns", which would equal "Johns Rd".
+
     Args:
         name (str): The street name to normalize.
         modifiers_set (set): A set of known modifiers to remove from the name.
@@ -393,7 +397,13 @@ def normalize_street_name(name: str, modifiers_set: Set[str]) -> str:
         return ""
     if modifiers_set:
         pattern = r"\b(" + "|".join(re.escape(m) for m in modifiers_set) + r")\b"
-        name = re.sub(pattern, "", name, flags=re.IGNORECASE)
+        matches = [
+            m
+            for m in re.finditer(pattern, name, flags=re.IGNORECASE)
+            if re.search(r"\w", name[: m.start()])
+        ]
+        if matches:
+            name = name[: matches[-1].start()] + " " + name[matches[-1].end() :]
     name = re.sub(r"[^\w\s]", "", name)
     return re.sub(r"\s+", " ", name).strip().lower()
 
