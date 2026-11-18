@@ -25,6 +25,11 @@ _M_PER_DEG_LAT = 110_574.0
 _M_PER_DEG_LON = 111_320.0 * math.cos(math.radians(38.9))
 
 
+class _SpatialReference:
+    def __init__(self, wkid: int) -> None:
+        self.type = "Geographic" if wkid == 4326 else "Projected"
+
+
 class _Point:
     def __init__(self, x: float, y: float) -> None:
         self.X = x
@@ -50,7 +55,7 @@ class _Polyline:
 def mod(monkeypatch: pytest.MonkeyPatch) -> Iterator[types.ModuleType]:
     """Import the script against a stand-in ``arcpy`` without leaking either module."""
     stub = types.ModuleType("arcpy")
-    stub.SpatialReference = lambda wkid: wkid  # type: ignore[attr-defined]
+    stub.SpatialReference = _SpatialReference  # type: ignore[attr-defined]
     stub.Point = _Point  # type: ignore[attr-defined]
     stub.Array = list  # type: ignore[attr-defined]
     stub.Polyline = _Polyline  # type: ignore[attr-defined]
@@ -88,6 +93,42 @@ def test_classify_direction_compares_ground_distance_not_degrees(mod: types.Modu
     # ~5.0 km north and ~4.3 km east: more degrees of longitude than latitude.
     projected = mod.project_shapes({"S": [(-77.0, 38.9), (-76.95, 38.945)]}, 26985)
     assert mod.classify_direction(projected["S"]) == "NB"
+
+
+def test_project_shapes_rejects_geographic_crs(mod: types.ModuleType) -> None:
+    with pytest.raises(ValueError, match="not a projected coordinate system"):
+        mod.project_shapes({"S": [(-77.0, 38.9), (-77.0, 39.0)]}, 4326)
+
+
+def test_plot_route_shape_leaves_session_backend_and_figures_alone(
+    mod: types.ModuleType, tmp_path: Path
+) -> None:
+    import matplotlib
+    import matplotlib.pyplot as plt
+
+    original = matplotlib.get_backend()
+    plt.switch_backend("svg")  # stands in for a notebook or ArcGIS Pro backend
+    try:
+        open_figure = plt.figure()
+        mod.plot_route_shape([(-77.0, 38.8), (-76.9, 39.0)], "1", "0", tmp_path / "map.jpeg")
+        assert matplotlib.get_backend() == "svg"
+        assert plt.fignum_exists(open_figure.number)
+        assert (tmp_path / "map.jpeg").stat().st_size > 0
+    finally:
+        plt.close("all")
+        plt.switch_backend(original)
+
+
+def test_plot_route_shape_keeps_ground_proportions(
+    mod: types.ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from matplotlib.figure import Figure
+
+    saved: list[Any] = []
+    monkeypatch.setattr(Figure, "savefig", lambda self, *args, **kwargs: saved.append(self))
+    mod.plot_route_shape([(-77.0, 38.8), (-76.9, 39.0)], "1", "0", tmp_path / "map.jpeg")
+    aspect = saved[0].axes[0].get_aspect()
+    assert aspect == pytest.approx(1 / math.cos(math.radians(38.9)))
 
 
 @pytest.mark.parametrize(
@@ -157,6 +198,13 @@ def test_add_route_labels_separates_labels_that_share_a_file_name(mod: types.Mod
         {"route_id": ["R1", "R2", "R3"], "route_short_name": ["A/B", "A:B", "a/b"]}
     )
     assert mod.add_route_labels(routes)["route_label"].tolist() == ["A/B_R1", "A:B_R2", "a/b_R3"]
+
+
+def test_filter_routes_compares_values_as_text(mod: types.ModuleType) -> None:
+    routes = pd.DataFrame({"route_id": ["R1", "R2"], "route_short_name": ["10", "20"]})
+    assert mod.filter_routes(routes, routes_include=[10])["route_id"].tolist() == ["R1"]
+    with pytest.raises(ValueError, match="No routes are left"):
+        mod.filter_routes(routes, routes_include=["99"])
 
 
 def test_check_unique_file_names_ignores_case(mod: types.ModuleType) -> None:
@@ -336,6 +384,18 @@ def test_main_warns_about_route_files_from_an_earlier_run(
     assert mod.main(argv) == 0
     assert "1 per-route file(s)" in caplog.text
     assert (out / "Route_9_Dir_0_Shape_X.jpeg").exists()
+
+
+def test_main_reports_missing_required_column(
+    mod: types.ModuleType, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    _write_feed(tmp_path / "gtfs")
+    (tmp_path / "gtfs" / "trips.txt").write_text(
+        "service_id,trip_id,direction_id,shape_id\nWK,T1,0,S1\n", encoding="utf-8"
+    )
+    argv = ["--gtfs", str(tmp_path / "gtfs"), "--output-dir", str(tmp_path / "out")]
+    assert mod.main(argv) == 1
+    assert "trips.txt is missing required column(s): route_id" in caplog.text
 
 
 def test_main_reports_missing_feed(mod: types.ModuleType, tmp_path: Path) -> None:

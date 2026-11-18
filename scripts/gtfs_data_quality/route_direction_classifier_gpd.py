@@ -54,6 +54,7 @@ from typing import IO, Any, List, Optional
 import geopandas as gpd
 import matplotlib.pyplot as plt
 import pandas as pd
+from pyproj import CRS
 from shapely.geometry import LineString
 
 # =============================================================================
@@ -99,8 +100,8 @@ REQUIRE_RUN_LOG: bool = True
 _PLACEHOLDER_GTFS = r"Path\To\Your\GTFS_Folder"
 _PLACEHOLDER_OUTPUT = r"Path\To\Your\Output_Folder"
 
-# Characters Windows does not allow in file names.
-_UNSAFE_FILE_CHARS = r'[\\/:*?"<>|]+'
+# Characters Windows does not allow in file names, control characters included.
+_UNSAFE_FILE_CHARS = r'[\\/:*?"<>|\x00-\x1f]+'
 # Names of the per-route files this script writes, used to spot leftovers.
 _ROUTE_FILE_PATTERN = re.compile(
     r"Route_.+_Dir_.+_(departures\.xlsx|DominantShape\.jpeg|Shape_.+\.jpeg)"
@@ -252,10 +253,13 @@ def plot_route_shape(
 
     ax.set_title(f"Route {route}, Direction {direction} - {shape_label}")
     ax.legend()
-    plt.axis("equal")
+    # Degrees of longitude are shorter than degrees of latitude away from the
+    # equator; stretch the y axis so the map keeps its ground proportions.
+    mid_lat = (shape_line.bounds[1] + shape_line.bounds[3]) / 2
+    ax.set_aspect(1 / math.cos(math.radians(mid_lat)), adjustable="datalim")
 
-    plt.savefig(output_path, dpi=300, bbox_inches="tight")
-    plt.close()
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
 
 
 def to_numeric_column(df: pd.DataFrame, column: str, table: str) -> pd.Series:
@@ -274,6 +278,17 @@ def to_numeric_column(df: pd.DataFrame, column: str, table: str) -> pd.Series:
             f"e.g. {bad.iloc[0]!r}."
         )
     return values
+
+
+def require_columns(df: pd.DataFrame, columns: Sequence[str], table: str) -> None:
+    """Check that *df* has every column in *columns*.
+
+    Raises:
+        ValueError: One or more columns are missing.
+    """
+    missing = [column for column in columns if column not in df.columns]
+    if missing:
+        raise ValueError(f"{table} is missing required column(s): {', '.join(missing)}.")
 
 
 def require_unique(df: pd.DataFrame, column: str, table: str) -> None:
@@ -328,7 +343,8 @@ def read_gtfs_data(
     Raises:
         OSError: The feed or one of its files is missing, or cannot be read.
         ValueError: A file is empty or malformed, a sequence or coordinate is
-            blank or non-numeric, or a route_id, trip_id, or stop_id repeats.
+            blank or non-numeric, a route_id, trip_id, or stop_id repeats, or a
+            required column is missing.
     """
     routes, trips, stop_times, shapes, stops = (
         read_gtfs_table(gtfs_path, name)
@@ -341,6 +357,9 @@ def read_gtfs_data(
         (stops, "stop_id", "stops.txt"),
     ):
         require_unique(df, column, table)
+    require_columns(trips, ["route_id"], "trips.txt")
+    require_columns(stop_times, ["trip_id", "stop_id", "departure_time"], "stop_times.txt")
+    require_columns(shapes, ["shape_id"], "shapes.txt")
 
     stop_times["stop_sequence"] = to_numeric_column(stop_times, "stop_sequence", "stop_times.txt")
     for col in ("shape_pt_sequence", "shape_pt_lat", "shape_pt_lon"):
@@ -348,6 +367,7 @@ def read_gtfs_data(
     for df, columns in (
         (routes, ("route_short_name", "route_long_name")),
         (trips, ("direction_id", "shape_id")),
+        (stops, ("stop_name",)),
     ):
         for col in columns:
             df[col] = df[col].fillna("") if col in df.columns else ""
@@ -360,12 +380,31 @@ def filter_routes(
     routes_include: Sequence[str] = (),
     routes_exclude: Sequence[str] = (),
 ) -> pd.DataFrame:
-    """Apply the route_short_name include/exclude lists and return the kept routes."""
+    """Apply the route_short_name include/exclude lists and return the kept routes.
+
+    Filter values are compared as text, so ``10`` matches route_short_name
+    ``"10"``. Include values that match no route are logged.
+
+    Raises:
+        ValueError: The filters leave no routes to analyze.
+    """
+    include = [str(value) for value in routes_include]
+    exclude = [str(value) for value in routes_exclude]
     routes_filtered = routes.copy()
-    if routes_include:
-        routes_filtered = routes_filtered[routes_filtered["route_short_name"].isin(routes_include)]
-    if routes_exclude:
-        routes_filtered = routes_filtered[~routes_filtered["route_short_name"].isin(routes_exclude)]
+    if include:
+        unmatched = sorted(set(include) - set(routes["route_short_name"]))
+        if unmatched:
+            logging.warning(
+                "Route include value(s) match no route_short_name: %s", ", ".join(unmatched)
+            )
+        routes_filtered = routes_filtered[routes_filtered["route_short_name"].isin(include)]
+    if exclude:
+        routes_filtered = routes_filtered[~routes_filtered["route_short_name"].isin(exclude)]
+    if routes_filtered.empty:
+        raise ValueError(
+            "No routes are left to analyze. Check ROUTE_FILTER_IN and ROUTE_FILTER_OUT "
+            "(or --routes-include / --routes-exclude) against route_short_name in routes.txt."
+        )
     return routes_filtered
 
 
@@ -389,8 +428,9 @@ def add_route_labels(routes: pd.DataFrame) -> pd.DataFrame:
 def create_lines_from_shapes(shapes: pd.DataFrame) -> gpd.GeoDataFrame:
     """Sorts shapes, builds LineString geometries, and returns a GeoDataFrame (EPSG:4326).
 
-    Shapes with fewer than two points cannot form a line and are skipped; their
-    trips are listed in the exceptions report.
+    Shapes with fewer than two points, or whose points all coincide, cannot form
+    a line and are skipped, as in the ArcPy script; their trips are listed in
+    the exceptions report.
     """
     shapes_grouped = shapes.sort_values(["shape_id", "shape_pt_sequence"]).groupby("shape_id")
 
@@ -400,6 +440,9 @@ def create_lines_from_shapes(shapes: pd.DataFrame) -> gpd.GeoDataFrame:
             logging.warning("Shape %s has fewer than two points; skipped.", sid)
             continue
         line = LineString(zip(group["shape_pt_lon"], group["shape_pt_lat"]))
+        if line.length == 0:
+            logging.warning("Shape %s has no length; skipped.", sid)
+            continue
         lines.append((sid, line))
 
     gdf = gpd.GeoDataFrame(lines, columns=["shape_id", "geometry"], crs="EPSG:4326")
@@ -419,7 +462,15 @@ def merge_and_classify_shapes(
     `route_label` from :func:`add_route_labels`) and a derived
     `shape_direction` for each `shape_id`. Trips whose shape is blank or
     missing from shapes.txt are kept with a blank `shape_direction`.
+
+    Raises:
+        ValueError: *projected_crs* is a geographic (degree-based) system.
     """
+    if not CRS.from_user_input(projected_crs).is_projected:
+        raise ValueError(
+            f"PROJECTED_CRS {projected_crs!r} is not a projected coordinate system, so "
+            "distances would be in degrees. Use one in meters or feet, such as EPSG:26985."
+        )
     trips_filtered = trips[trips["route_id"].isin(routes_filtered["route_id"])]
     trips_merged = trips_filtered.merge(
         routes_filtered[["route_id", "route_short_name", "route_long_name", "route_label"]],
@@ -584,7 +635,7 @@ def split_trip_exceptions(
         (final_data["shape_id"] == "", "shape_id is blank", True),
         (
             (final_data["shape_id"] != "") & final_data["shape_direction"].isna(),
-            "shape_id not in shapes.txt, or its shape has fewer than two points",
+            "shape_id not in shapes.txt, or its shape has fewer than two distinct points",
             True,
         ),
         (~has_stop_times, "no rows in stop_times.txt", True),

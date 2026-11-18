@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any
 
@@ -159,6 +160,64 @@ def test_create_lines_from_shapes_skips_single_point_shape() -> None:
         }
     )
     assert create_lines_from_shapes(shapes)["shape_id"].tolist() == ["S1"]
+
+
+def test_create_lines_from_shapes_skips_shape_whose_points_coincide() -> None:
+    # The ArcPy script drops such shapes; this one must not call them LOOP.
+    shapes = pd.DataFrame(
+        {
+            "shape_id": ["S1", "S1", "S2", "S2"],
+            "shape_pt_sequence": [1, 2, 1, 2],
+            "shape_pt_lat": [38.0, 38.1, 38.2, 38.2],
+            "shape_pt_lon": [-77.0, -77.0, -77.0, -77.0],
+        }
+    )
+    assert create_lines_from_shapes(shapes)["shape_id"].tolist() == ["S1"]
+
+
+# ---------------------------------------------------------------------------
+# filter_routes
+# ---------------------------------------------------------------------------
+
+
+def test_filter_routes_compares_values_as_text(caplog: pytest.LogCaptureFixture) -> None:
+    routes = pd.DataFrame({"route_id": ["R1", "R2"], "route_short_name": ["10", "20"]})
+    kept = mod.filter_routes(routes, routes_include=[10, 99])  # type: ignore[list-item]
+    assert kept["route_id"].tolist() == ["R1"]
+    assert "match no route_short_name: 99" in caplog.text
+
+
+def test_filter_routes_rejects_filters_that_leave_no_routes() -> None:
+    routes = pd.DataFrame({"route_id": ["R1"], "route_short_name": ["10"]})
+    with pytest.raises(ValueError, match="No routes are left"):
+        mod.filter_routes(routes, routes_include=["1O"])
+
+
+# ---------------------------------------------------------------------------
+# plot_route_shape
+# ---------------------------------------------------------------------------
+
+
+def test_plot_route_shape_keeps_ground_proportions(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from matplotlib.figure import Figure
+
+    saved: list[Any] = []
+    real_savefig = Figure.savefig
+
+    def record(self: Figure, *args: Any, **kwargs: Any) -> None:
+        saved.append(self)
+        real_savefig(self, *args, **kwargs)
+
+    monkeypatch.setattr(Figure, "savefig", record)
+    shape = gpd.GeoDataFrame(
+        {"shape_id": ["S"]}, geometry=[LineString([(-77.0, 38.8), (-76.9, 39.0)])], crs=4326
+    )
+    mod.plot_route_shape(shape, "1", "0", tmp_path / "map.jpeg")
+    assert (tmp_path / "map.jpeg").stat().st_size > 0
+    aspect = saved[0].axes[0].get_aspect()
+    assert aspect == pytest.approx(1 / math.cos(math.radians(38.9)))
 
 
 # ---------------------------------------------------------------------------
@@ -457,6 +516,12 @@ def test_check_unique_file_names_rejects_names_differing_only_in_case() -> None:
         mod.check_unique_file_names(planned)
 
 
+def test_output_file_name_replaces_control_characters() -> None:
+    assert (
+        mod.output_file_name("10\tX", "0", "departures.xlsx") == "Route_10-X_Dir_0_departures.xlsx"
+    )
+
+
 # ---------------------------------------------------------------------------
 # export_jpegs
 # ---------------------------------------------------------------------------
@@ -589,6 +654,34 @@ def test_main_writes_nothing_when_all_exports_off(feed: Path, tmp_path: Path) ->
 
 def test_main_returns_2_for_placeholder_paths() -> None:
     assert mod.main([]) == 2
+
+
+def test_main_reports_missing_required_column(
+    feed: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    (feed / "stop_times.txt").write_text(
+        "trip_id,stop_id,stop_sequence\nT1,A,1\nT1,B,2\n", encoding="utf-8"
+    )
+    assert mod.main(_argv(feed, tmp_path / "out")) == 1
+    assert "stop_times.txt is missing required column(s): departure_time" in caplog.text
+
+
+def test_main_runs_without_stop_names(feed: Path, tmp_path: Path) -> None:
+    (feed / "stops.txt").write_text(
+        "stop_id,stop_lat,stop_lon\nA,38.9,-77.0\nB,39.0,-77.0\n", encoding="utf-8"
+    )
+    out = tmp_path / "out"
+    assert mod.main(_argv(feed, out, "--no-export-jpeg")) == 0
+    summary = pd.read_excel(out / "Directions_Summary.xlsx", dtype=str)
+    assert summary["first_stop_id"].tolist() == ["A"]
+
+
+def test_main_rejects_geographic_crs(
+    feed: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    argv = _argv(feed, tmp_path / "out")
+    assert mod.main([*argv[:4], "--projected-crs", "EPSG:4326", *argv[4:]]) == 1
+    assert "not a projected coordinate system" in caplog.text
 
 
 def test_main_rejects_repeated_stop_id(

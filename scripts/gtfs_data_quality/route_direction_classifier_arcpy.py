@@ -110,8 +110,8 @@ REQUIRE_RUN_LOG: bool = True
 _PLACEHOLDER_GTFS = r"Path\To\Your\GTFS_Folder"
 _PLACEHOLDER_OUTPUT = r"Path\To\Your\Output_Folder"
 
-# Characters Windows does not allow in file names.
-_UNSAFE_FILE_CHARS = r'[\\/:*?"<>|]+'
+# Characters Windows does not allow in file names, control characters included.
+_UNSAFE_FILE_CHARS = r'[\\/:*?"<>|\x00-\x1f]+'
 # Names of the per-route files this script writes, used to spot leftovers.
 _ROUTE_FILE_PATTERN = re.compile(
     r"Route_.+_Dir_.+_(departures\.xlsx|DominantShape\.jpeg|Shape_.+\.jpeg)"
@@ -196,6 +196,17 @@ def to_numeric_column(df: pd.DataFrame, column: str, table: str) -> pd.Series:
     return values
 
 
+def require_columns(df: pd.DataFrame, columns: Sequence[str], table: str) -> None:
+    """Check that *df* has every column in *columns*.
+
+    Raises:
+        ValueError: One or more columns are missing.
+    """
+    missing = [column for column in columns if column not in df.columns]
+    if missing:
+        raise ValueError(f"{table} is missing required column(s): {', '.join(missing)}.")
+
+
 def require_unique(df: pd.DataFrame, column: str, table: str) -> None:
     """Check that no value of *column* repeats, so joins on it cannot duplicate trips.
 
@@ -248,7 +259,8 @@ def read_gtfs_data(
     Raises:
         OSError: The feed or one of its files is missing, or cannot be read.
         ValueError: A file is empty or malformed, a sequence or coordinate is
-            blank or non-numeric, or a route_id, trip_id, or stop_id repeats.
+            blank or non-numeric, a route_id, trip_id, or stop_id repeats, or a
+            required column is missing.
     """
     routes, trips, stop_times, shapes, stops = (
         read_gtfs_table(gtfs_path, name)
@@ -261,6 +273,9 @@ def read_gtfs_data(
         (stops, "stop_id", "stops.txt"),
     ):
         require_unique(df, column, table)
+    require_columns(trips, ["route_id"], "trips.txt")
+    require_columns(stop_times, ["trip_id", "stop_id", "departure_time"], "stop_times.txt")
+    require_columns(shapes, ["shape_id"], "shapes.txt")
 
     stop_times["stop_sequence"] = to_numeric_column(stop_times, "stop_sequence", "stop_times.txt")
     for col in ("shape_pt_sequence", "shape_pt_lat", "shape_pt_lon"):
@@ -268,6 +283,7 @@ def read_gtfs_data(
     for df, columns in (
         (routes, ("route_short_name", "route_long_name")),
         (trips, ("direction_id", "shape_id")),
+        (stops, ("stop_name",)),
     ):
         for col in columns:
             df[col] = df[col].fillna("") if col in df.columns else ""
@@ -280,12 +296,31 @@ def filter_routes(
     routes_include: Sequence[str] = (),
     routes_exclude: Sequence[str] = (),
 ) -> pd.DataFrame:
-    """Apply the route_short_name include/exclude lists and return the kept routes."""
+    """Apply the route_short_name include/exclude lists and return the kept routes.
+
+    Filter values are compared as text, so ``10`` matches route_short_name
+    ``"10"``. Include values that match no route are logged.
+
+    Raises:
+        ValueError: The filters leave no routes to analyze.
+    """
+    include = [str(value) for value in routes_include]
+    exclude = [str(value) for value in routes_exclude]
     routes_filtered = routes.copy()
-    if routes_include:
-        routes_filtered = routes_filtered[routes_filtered["route_short_name"].isin(routes_include)]
-    if routes_exclude:
-        routes_filtered = routes_filtered[~routes_filtered["route_short_name"].isin(routes_exclude)]
+    if include:
+        unmatched = sorted(set(include) - set(routes["route_short_name"]))
+        if unmatched:
+            logging.warning(
+                "Route include value(s) match no route_short_name: %s", ", ".join(unmatched)
+            )
+        routes_filtered = routes_filtered[routes_filtered["route_short_name"].isin(include)]
+    if exclude:
+        routes_filtered = routes_filtered[~routes_filtered["route_short_name"].isin(exclude)]
+    if routes_filtered.empty:
+        raise ValueError(
+            "No routes are left to analyze. Check ROUTE_FILTER_IN and ROUTE_FILTER_OUT "
+            "(or --routes-include / --routes-exclude) against route_short_name in routes.txt."
+        )
     return routes_filtered
 
 
@@ -333,9 +368,15 @@ def project_shapes(
 
     Raises:
         RuntimeError: ArcPy does not recognize *projected_crs*.
+        ValueError: *projected_crs* is a geographic (degree-based) system.
     """
     sr_wgs84 = arcpy.SpatialReference(4326)
     sr_projected = arcpy.SpatialReference(projected_crs)
+    if sr_projected.type != "Projected":
+        raise ValueError(
+            f"PROJECTED_CRS {projected_crs!r} is not a projected coordinate system, so "
+            "distances would be in degrees. Use one in meters or feet, such as 26985."
+        )
 
     projected: dict[str, list[tuple[float, float]]] = {}
     for shape_id, coords in shape_coords.items():
@@ -554,7 +595,7 @@ def split_trip_exceptions(
         (final_data["shape_id"] == "", "shape_id is blank", True),
         (
             (final_data["shape_id"] != "") & final_data["shape_direction"].isna(),
-            "shape_id not in shapes.txt, or its shape has fewer than two points",
+            "shape_id not in shapes.txt, or its shape has fewer than two distinct points",
             True,
         ),
         (~has_stop_times, "no rows in stop_times.txt", True),
@@ -838,16 +879,18 @@ def plot_route_shape(
 
     Highlights the start and end of the route shape, and includes a simple
     'N' arrow for orientation in the top-left corner of the map.
-    """
-    import matplotlib
 
-    matplotlib.use("Agg", force=False)  # file output; leaves an active GUI backend alone
-    import matplotlib.pyplot as plt
+    Draws on a standalone :class:`matplotlib.figure.Figure` rather than through
+    pyplot, so it never changes the session's matplotlib backend or closes the
+    figures open in ArcGIS Pro or a notebook.
+    """
+    from matplotlib.figure import Figure
 
     lons = [lon for lon, _ in coords]
     lats = [lat for _, lat in coords]
 
-    fig, ax = plt.subplots(figsize=(6, 6))
+    fig = Figure(figsize=(6, 6))
+    ax = fig.subplots()
     ax.plot(lons, lats, color="blue", linewidth=2, alpha=0.8)
 
     ax.plot(lons[0], lats[0], "go", label="Start")
@@ -875,10 +918,12 @@ def plot_route_shape(
 
     ax.set_title(f"Route {route}, Direction {direction} - {shape_label}")
     ax.legend()
-    ax.axis("equal")
+    # Degrees of longitude are shorter than degrees of latitude away from the
+    # equator; stretch the y axis so the map keeps its ground proportions.
+    mid_lat = (min(lats) + max(lats)) / 2
+    ax.set_aspect(1 / math.cos(math.radians(mid_lat)), adjustable="datalim")
 
     fig.savefig(output_path, dpi=300, bbox_inches="tight")
-    plt.close(fig)
 
 
 def export_jpegs(
