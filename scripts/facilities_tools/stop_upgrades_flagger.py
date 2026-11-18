@@ -475,7 +475,7 @@ def main() -> int:
         dup_ct = df_merged.shape[0] - df_processed.shape[0]
         logging.info("  (Aggregated %d duplicate STOP_ID rows.)", dup_ct)
 
-    logging.info("flag_stop_upgrades.py completed successfully.")
+    logging.info("stop_upgrades_flagger.py completed successfully.")
     logging.info("Script completed successfully.")
     return 0
 
