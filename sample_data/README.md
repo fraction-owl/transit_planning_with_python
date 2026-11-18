@@ -12,9 +12,17 @@ The GTFS, TODS and TIDES files are copies of fixtures in [`tests/fixtures/`](../
 | `gtfs_archive.zip` | Three yearly editions of that feed, in folders `dc_2024/`, `dc_2025/` and `dc_2026/`. See [Archive editions](#archive-editions). | Copy of `tests/fixtures/mock_gtfs_dc_archive.zip` |
 | `tods_current.zip` | TODS 2.1 supplements for `gtfs_current.zip`: garages, pull-outs, pull-backs and deadheads between trips. | Copy of `tests/fixtures/mock_tods_dc.zip` |
 | `tides/stop_visits.csv`, `tides/trips_performed.csv` | TIDES tables for a sample of service dates from January to March 2026 on routes 10, 20 and 30, plus the 50H loop on January 1. Pull-outs, pull-ins and deadheads carry the TODS trip IDs. | Copies of `tests/fixtures/stop_visits.csv` and `tests/fixtures/trips_performed.csv` |
-| `express_routes_example.txt` | Express route_ids (route 20) for `otp_runtime_from_tides.py` (`EXPRESS_ROUTES_FILE`), one per line. | Copy of `tests/fixtures/express_routes_dc.txt` |
 | `time_periods_example.txt` | Time-of-day periods for `ridership_from_tides.py` and `otp_runtime_from_tides.py` (`TIME_PERIODS_FILE`). | Moved from `scripts/ridership_tools/` |
 | `ntd_monthly_config_example.txt` | Settings template for `ntd_monthly_summary.py`. Its paths are placeholders, and the workbooks it lists aren't included. | Moved from `scripts/ridership_tools/` |
+
+## Optional lists
+
+`optional/` holds route and stop lists that some scripts take as an extra input. Each is a copy of a file in `tests/fixtures/`, checked by the same test. To use your own, copy the file, edit the copy, and point the script's setting at it.
+
+| File | Contents | Read by |
+|---|---|---|
+| `optional/express_routes.txt` | Express route_ids: route 20 (`DC_R20`). | `gtfs_service_demographics_gpd.py` and `otp_runtime_from_tides.py` (`EXPRESS_ROUTES_FILE`) |
+| `optional/express_origin_stops.txt` | Park-and-ride origin stop_ids. They are placeholders (`1001`, `2005`), not stops in `gtfs_current.zip`. | `gtfs_service_demographics_gpd.py` (`EXPRESS_ORIGIN_STOPS_FILE`) |
 
 ## Archive editions
 

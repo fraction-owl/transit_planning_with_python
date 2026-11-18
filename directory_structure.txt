@@ -28,11 +28,13 @@ transit_planning_with_python/
 │   ├── lint_commit.py
 │   └── lint_pr.py
 ├── sample_data/
+│   ├── optional/
+│   │   ├── express_origin_stops.txt
+│   │   └── express_routes.txt
 │   ├── tides/
 │   │   ├── stop_visits.csv
 │   │   └── trips_performed.csv
 │   ├── README.md
-│   ├── express_routes_example.txt
 │   ├── gtfs_archive.zip
 │   ├── gtfs_current.zip
 │   ├── ntd_monthly_config_example.txt
@@ -234,7 +236,6 @@ transit_planning_with_python/
 │   │   ├── effy2019_sample.csv
 │   │   ├── express_origin_stops.txt
 │   │   ├── express_routes.txt
-│   │   ├── express_routes_dc.txt
 │   │   ├── md_wac_S000_JT00_2023.csv.gz
 │   │   ├── mock_cbd_dc.zip
 │   │   ├── mock_gtfs_dc.zip

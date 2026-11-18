@@ -266,7 +266,7 @@ THIN_DAY_TYPE_DATES: int = 4
 LAST_STOP_TREATMENT: str = "score"
 LAST_STOP_ROUTES: str = "express"
 # Express routes: the route_ids in EXPRESS_ROUTES_FILE (a .txt with one route_id per
-# line; see sample_data/express_routes_example.txt) and in EXPRESS_ROUTES together.
+# line; see sample_data/optional/express_routes.txt) and in EXPRESS_ROUTES together.
 # When neither lists any, routes whose route_type_agency is in EXPRESS_SERVICE_TYPES
 # (compared without regard to case) are express.
 EXPRESS_ROUTES_FILE: Optional[str] = None  # e.g. r"C:\Data\express_routes.txt"

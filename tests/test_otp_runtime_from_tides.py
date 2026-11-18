@@ -14,7 +14,7 @@ import scripts.operations_tools.otp_runtime_from_tides as target
 STOP_VISITS = Path("tests/fixtures/stop_visits.csv")
 TRIPS_PERFORMED = Path("tests/fixtures/trips_performed.csv")
 PERIODS_FIXTURE = Path("tests/fixtures/time_periods.txt")
-EXPRESS_ROUTES = Path("tests/fixtures/express_routes_dc.txt")
+EXPRESS_ROUTES = Path("tests/fixtures/express_routes.txt")
 MOCK_GTFS = Path("tests/fixtures/mock_gtfs_dc.zip")
 HOLIDAY = dt.date(2026, 1, 1)  # the fixtures' holiday-service date, a Thursday
 
@@ -396,7 +396,7 @@ def test_resolve_express_routes_sources(caplog: pytest.LogCaptureFixture) -> Non
     )
     routes, source = target.resolve_express_routes(visits, str(EXPRESS_ROUTES), ["DC_R99"], ())
     assert routes == {"DC_R20", "DC_R99"}
-    assert "EXPRESS_ROUTES" in source and "express_routes_dc.txt" in source
+    assert "EXPRESS_ROUTES" in source and "express_routes.txt" in source
     assert "Express route(s) not in the data: DC_R99" in caplog.text
     routes, source = target.resolve_express_routes(visits, None, (), ("EXPRESS",))
     assert routes == {"DC_R20"}

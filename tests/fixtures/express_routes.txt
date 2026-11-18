@@ -1,5 +1,12 @@
-# Example express-route list for gtfs_service_demographics_gpd.py
-# One GTFS route_id per line. Blank lines and anything after '#' are ignored,
+# Express routes for the mock DC agency behind the GTFS, TODS and TIDES fixtures
+# (mock_gtfs_dc.zip, stop_visits.csv, trips_performed.csv).
+#
+# Read by gtfs_service_demographics_gpd.py (EXPRESS_ROUTES_FILE) and
+# otp_runtime_from_tides.py (EXPRESS_ROUTES_FILE / --express-routes-file). For your
+# own agency, copy this file, edit the copy, and point the setting at it.
+#
+# Format: one route_id per line, as it appears in GTFS routes.txt and in the TIDES
+# trips_performed route_id column. Blank lines and anything after "#" are ignored,
 # so you can annotate entries inline.
-101
-303  # crosstown express
+
+DC_R20  # 20 East-West Express (peak only)

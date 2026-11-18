@@ -1,0 +1,6 @@
+# Example express-origin stop list for gtfs_service_demographics_gpd.py
+# One GTFS stop_id per line: the park-and-ride / drive-access *origin* stops on
+# express routes. Each gets the wide drive-access buffer; every other stop keeps
+# the standard walk buffer. Blank lines and anything after '#' are ignored.
+1001
+2005  # downtown park-and-ride garage

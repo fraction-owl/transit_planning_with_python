@@ -937,7 +937,7 @@ def test_load_express_route_ids_missing_file_warns_and_keeps_inline(
 def test_load_express_route_ids_reads_repo_fixture() -> None:
     # The shipped example fixture demonstrates the on-disk format.
     result = load_express_route_ids(None, str(FIXTURES / "express_routes.txt"))
-    assert result == {"101", "303"}
+    assert result == {"DC_R20"}
 
 
 # ---------------------------------------------------------------------------

@@ -152,6 +152,7 @@ EXPRESS_BIDIRECTIONAL_ROUTES_FILE: str | None = None
 # list. Routes listed here (and not in either list above) are still labeled
 # "express" and get the wide origin buffer, but keep symmetric accounting — i.e.
 # they behave like bidirectional express. Kept for backward compatibility.
+# Example file: sample_data/optional/express_routes.txt.
 EXPRESS_ROUTE_IDS: list[str] = []
 EXPRESS_ROUTES_FILE: str | None = None
 
@@ -184,6 +185,7 @@ EXPRESS_ORIGIN_BUFFER_DISTANCE = 2.0  # Drive-access buffer for express origin s
 #   1) EXPRESS_ORIGIN_STOP_IDS: stop_id values listed inline.
 #   2) EXPRESS_ORIGIN_STOPS_FILE: path to a text file with one stop_id per line
 #      ("#" starts a comment). Set to None to use the inline list only.
+#      Example file: sample_data/optional/express_origin_stops.txt.
 # Tip: set the express route lists first; those routes' stops are the only
 # candidates, and the advisory can suggest which of them are origins.
 EXPRESS_ORIGIN_STOP_IDS: list[str] = []
