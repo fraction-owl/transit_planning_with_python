@@ -201,8 +201,11 @@ def load_gtfs_stops(folder: str) -> pd.DataFrame:
 def normalize_street(name: str, mods: set[str]) -> str:
     """Cleans and standardizes a street name string.
 
-    Removes modifiers (e.g., 'St', 'Ave'), punctuation, and extra whitespace,
-    and converts the string to lowercase.
+    Removes one modifier (e.g., 'St', 'Ave'), punctuation, and extra whitespace,
+    and converts the string to lowercase. The modifier removed is the last one
+    that is not the first word: the street type follows the name ("Johns Rd",
+    "Park St SE"), so "St Johns Rd" becomes "st johns" rather than "johns",
+    which would equal "Johns Rd".
 
     Args:
         name: The street name to normalize.
@@ -214,12 +217,14 @@ def normalize_street(name: str, mods: set[str]) -> str:
     if not isinstance(name, str):
         return ""
     if mods:
-        name = re.sub(
-            r"\b(" + "|".join(map(re.escape, mods)) + r")\b",
-            " ",
-            name,
-            flags=re.IGNORECASE,
-        )
+        pattern = r"\b(" + "|".join(map(re.escape, mods)) + r")\b"
+        matches = [
+            m
+            for m in re.finditer(pattern, name, flags=re.IGNORECASE)
+            if re.search(r"\w", name[: m.start()])
+        ]
+        if matches:
+            name = name[: matches[-1].start()] + " " + name[matches[-1].end() :]
     name = re.sub(r"[^\w\s]", " ", name)
     return re.sub(r"\s+", " ", name).strip().lower()
 
@@ -227,8 +232,9 @@ def normalize_street(name: str, mods: set[str]) -> str:
 def split_stop_name(stop_name: str, mods: set[str]) -> list[str]:
     """Splits a GTFS stop name into normalized street name components.
 
-    Uses common intersection separators (e.g., '@', '&', '/', '+') to divide the
-    stop name and then normalizes each resulting part.
+    Uses common intersection separators (e.g., '@', '&', '/', '+', 'and', 'at',
+    'intersection of') to divide the stop name and then normalizes each
+    resulting part.
 
     Args:
         stop_name: The full stop name string.
@@ -239,14 +245,21 @@ def split_stop_name(stop_name: str, mods: set[str]) -> list[str]:
     """
     if not isinstance(stop_name, str):
         return []
-    # Symbol separators split with or without surrounding spaces ("A&B", "A @ B").
-    pattern = r"\s*[@&/+]\s*| and | intersection of "
+    # Symbol separators split with or without surrounding spaces ("A&B", "A @ B");
+    # word separators ("and", "at") need them. "Intersection of" also splits at
+    # the start of the name, so it is not left attached to the first street.
+    pattern = r"\s*[@&/+]\s*| and | at |(?:^|\s)intersection of "
     parts = re.split(pattern, stop_name, flags=re.IGNORECASE)
     return [normalize_street(p, mods) for p in parts if p.strip()]
 
 
 def dl_score(a: str, b: str) -> float:
-    """Calculates the Damerau-Levenshtein similarity ratio between two strings.
+    """Calculates difflib's SequenceMatcher similarity ratio between two strings.
+
+    The ratio is 2*M/T, where M is the number of characters in the matching
+    blocks SequenceMatcher finds and T is the combined length of both strings.
+    It is not an edit distance (Damerau-Levenshtein or otherwise), and swapping
+    the arguments can change the result, so score and filter in the same order.
 
     Args:
         a: The first string.
@@ -285,9 +298,15 @@ def make_stops_fc(df: pd.DataFrame, out_fc: str, sr: int) -> None:
 
 
 def safe_project_or_copy(in_fc: str, out_fc: str, out_sr: int) -> None:
-    """Project `in_fc` to `out_fc`. If Project fails, fall back to CopyFeatures.
+    """Project `in_fc` to `out_fc`, or copy it if it already uses `out_sr`.
 
-    Ensures `out_fc` exists on return.
+    Ensures `out_fc` exists, in `out_sr`, on return. A failed projection stops
+    the run: copying the input unprojected would let the buffer and spatial
+    join run with layers in different coordinate systems.
+
+    Raises:
+        RuntimeError: If `in_fc` has no defined coordinate system, Project
+            fails, or `out_fc` is not created.
     """
     if arcpy.Exists(out_fc):
         arcpy.management.Delete(out_fc)
@@ -296,6 +315,12 @@ def safe_project_or_copy(in_fc: str, out_fc: str, out_sr: int) -> None:
     src_sr = desc.spatialReference
     tgt_sr = arcpy.SpatialReference(out_sr)
 
+    if not src_sr.name or src_sr.name == "Unknown":
+        raise RuntimeError(
+            f"{in_fc} has no defined coordinate system (a shapefile may be missing "
+            "its .prj file). Set it with ArcGIS Pro's Define Projection tool, then rerun."
+        )
+
     try:
         if src_sr.name and src_sr.factoryCode == tgt_sr.factoryCode:
             # Already in target SR
@@ -303,8 +328,7 @@ def safe_project_or_copy(in_fc: str, out_fc: str, out_sr: int) -> None:
         else:
             arcpy.management.Project(in_fc, out_fc, tgt_sr)
     except arcpy.ExecuteError as exc:
-        logging.warning("Project failed (%s). Copying features instead.", exc)
-        arcpy.management.CopyFeatures(in_fc, out_fc)
+        raise RuntimeError(f"Could not project {in_fc} to WKID {out_sr}: {exc}") from exc
 
     if not arcpy.Exists(out_fc):
         raise RuntimeError(f"Failed to create {out_fc}")
@@ -439,8 +463,10 @@ def detect_typos(
     For each stop, it splits the stop name into parts. Each part is then
     compared against the set of nearby road names for that stop. If a part
     is very similar (but not identical) to a nearby road name, it's flagged
-    as a potential typo. Stops with no roads in their buffer are skipped and
-    counted as unassessed.
+    as a potential typo: each nearby road is scored once with
+    :func:`dl_score`, and up to three scoring at least ``thresh`` are
+    reported. Stops with no roads in their buffer are skipped and counted as
+    unassessed.
 
     Args:
         stops_df: DataFrame of all GTFS stops.
@@ -469,8 +495,11 @@ def detect_typos(
         for frag in pieces:
             if frag in candidates:
                 continue
-            for match in difflib.get_close_matches(frag, candidates, n=3, cutoff=thresh / 100):
-                score = dl_score(frag, match)
+            # Score each road once, in the order reported. get_close_matches
+            # scored (road, fragment) instead, which can differ, so it dropped
+            # some pairs whose reported score met the threshold.
+            scored = sorted(((dl_score(frag, m), m) for m in candidates), reverse=True)
+            for score, match in scored[:3]:
                 if thresh <= score < 100:
                     for orig in sorted(candidates[match]):
                         out_rows.append(

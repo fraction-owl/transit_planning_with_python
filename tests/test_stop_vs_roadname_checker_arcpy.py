@@ -69,6 +69,29 @@ def test_load_gtfs_stops_missing_stops_raises(mod: types.ModuleType, tmp_path: P
 
 
 # ---------------------------------------------------------------------------
+# normalize_street
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("St Johns Rd", "st johns"),
+        ("Johns Rd", "johns"),
+        ("St Paul St", "st paul"),
+        ("Mount St Albans Rd", "mount st albans"),
+        ("N St Johns Rd", "n st johns"),
+        ("N St NW", "n nw"),
+        ("St", "st"),
+    ],
+)
+def test_normalize_street_strips_only_last_non_leading_modifier(
+    mod: types.ModuleType, name: str, expected: str
+) -> None:
+    assert mod.normalize_street(name, {"st", "rd"}) == expected
+
+
+# ---------------------------------------------------------------------------
 # split_stop_name
 # ---------------------------------------------------------------------------
 
@@ -85,6 +108,25 @@ def test_split_stop_name_splits_symbols_with_or_without_spaces(
 
 def test_split_stop_name_keeps_and_inside_words(mod: types.ModuleType) -> None:
     assert mod.split_stop_name("Anderson Rd and Elm St", set()) == ["anderson rd", "elm st"]
+
+
+@pytest.mark.parametrize(
+    "stop_name",
+    [
+        "Richmond Hwy at Lockhed Blvd",
+        "RICHMOND HWY AT LOCKHED BLVD",
+        "Intersection of Richmond Hwy and Lockhed Blvd",
+        "Intersection of Richmond Hwy & Lockhed Blvd",
+    ],
+)
+def test_split_stop_name_splits_at_and_leading_intersection_of(
+    mod: types.ModuleType, stop_name: str
+) -> None:
+    assert mod.split_stop_name(stop_name, {"hwy", "blvd"}) == ["richmond", "lockhed"]
+
+
+def test_split_stop_name_keeps_at_inside_words(mod: types.ModuleType) -> None:
+    assert mod.split_stop_name("Battery Ln", {"ln"}) == ["battery"]
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +146,54 @@ def test_detect_typos_reports_only_originals_inside_buffer(mod: types.ModuleType
     stop2roads = {"1": {"main": {"Main St"}}}
     out = mod.detect_typos(_stops(("1", "Mainn St")), stop2roads, {"st", "rd"}, 80)
     assert out["similar_road_name_orig"].tolist() == ["Main St"]
+
+
+def test_detect_typos_flags_typo_after_at(mod: types.ModuleType) -> None:
+    # Unsplit, "richmond at lockhed" scored 51.9 against "lockheed" and was dropped.
+    stop2roads = {"1": {"richmond": {"Richmond Hwy"}, "lockheed": {"Lockheed Blvd"}}}
+    stops = _stops(("1", "Richmond Hwy at Lockhed Blvd"))
+    out = mod.detect_typos(stops, stop2roads, {"hwy", "blvd"}, 80)
+    assert out["street_in_stop_name"].tolist() == ["lockhed"]
+    assert out["similar_road_name_orig"].tolist() == ["Lockheed Blvd"]
+
+
+def test_detect_typos_flags_dropped_saint(mod: types.ModuleType) -> None:
+    # Stripping every "St" made both names "mount albans", so the exact-match skip hid them.
+    mods = {"st", "rd"}
+    stop2roads = {"1": {mod.normalize_street("Mount Albans Rd", mods): {"Mount Albans Rd"}}}
+    out = mod.detect_typos(_stops(("1", "Mount St Albans Rd")), stop2roads, mods, 80)
+    assert out["street_in_stop_name"].tolist() == ["mount st albans"]
+    assert out["similar_road_name_orig"].tolist() == ["Mount Albans Rd"]
+
+
+@pytest.mark.parametrize(
+    ("stop_name", "road", "score"),
+    [("Geble Rd", "Glebe Rd", 80.0), ("Alaamba Ave", "Alabama Ave", 85.7)],
+)
+def test_detect_typos_filters_on_reported_score(
+    mod: types.ModuleType, stop_name: str, road: str, score: float
+) -> None:
+    # get_close_matches scored (road, fragment): 60.0 and 71.4 here, below 80,
+    # so these pairs were dropped though their reported score meets it.
+    mods = {"rd", "ave"}
+    stop2roads = {"1": {mod.normalize_street(road, mods): {road}}}
+    out = mod.detect_typos(_stops(("1", stop_name)), stop2roads, mods, 80)
+    assert out["similar_road_name_orig"].tolist() == [road]
+    assert out["similarity_score"].tolist() == [score]
+
+
+def test_detect_typos_reports_at_most_three_roads(mod: types.ModuleType) -> None:
+    # "mainn" scores 88.9 against "main" and 80.0 against the other three.
+    stop2roads = {"1": {name: {name.title()} for name in ("main", "maine", "mains", "mainz")}}
+    out = mod.detect_typos(_stops(("1", "Mainn")), stop2roads, set(), 80)
+    assert len(out) == 3
+    assert out["similar_road_name_clean"].iloc[0] == "main"
+
+
+def test_detect_typos_never_reports_below_threshold(mod: types.ModuleType) -> None:
+    # Reported order scores 69.6; the old filter order scored 87.0.
+    stop2roads = {"1": {"connecticut": {"Connecticut"}}}
+    assert mod.detect_typos(_stops(("1", "Connecttiuct")), stop2roads, set(), 80).empty
 
 
 def test_detect_typos_empty_result_keeps_columns(mod: types.ModuleType) -> None:
@@ -148,6 +238,71 @@ def test_make_stops_fc_sets_text_field_lengths(mod: types.ModuleType) -> None:
     lengths = {a[1]: k["field_length"] for a, k in calls}
     assert lengths == {"stop_id": 60, "stop_name": 255}
     assert all(len(a) == 3 for a, _ in calls)  # nothing passed as field_precision
+
+
+# ---------------------------------------------------------------------------
+# safe_project_or_copy
+# ---------------------------------------------------------------------------
+
+
+def _fake_projection(
+    mod: types.ModuleType, src_name: str, src_wkid: int, project_fails: bool = False
+) -> list[str]:
+    """Fake the geoprocessing ``safe_project_or_copy`` uses; return the tools it runs."""
+    calls: list[str] = []
+    created: set[str] = set()
+
+    class ExecuteError(Exception):
+        pass
+
+    def project(in_fc: str, out_fc: str, sr: Any) -> None:
+        calls.append("Project")
+        if project_fails:
+            raise ExecuteError("ERROR 999999: simulated failure")
+        created.add(out_fc)
+
+    def copy(in_fc: str, out_fc: str) -> None:
+        calls.append("CopyFeatures")
+        created.add(out_fc)
+
+    arcpy = mod.arcpy
+    arcpy.ExecuteError = ExecuteError
+    arcpy.Exists = lambda path: path in created
+    arcpy.Describe = lambda path: types.SimpleNamespace(
+        spatialReference=types.SimpleNamespace(name=src_name, factoryCode=src_wkid)
+    )
+    arcpy.SpatialReference = lambda wkid: types.SimpleNamespace(name="Target", factoryCode=wkid)
+    arcpy.management = types.SimpleNamespace(
+        Project=project, CopyFeatures=copy, Delete=created.discard
+    )
+    return calls
+
+
+def test_safe_project_or_copy_projects_other_sr(mod: types.ModuleType) -> None:
+    calls = _fake_projection(mod, "GCS_WGS_1984", 4326)
+    mod.safe_project_or_copy("roads.shp", "work.gdb/roads_proj", 2248)
+    assert calls == ["Project"]
+
+
+def test_safe_project_or_copy_copies_when_already_in_target_sr(mod: types.ModuleType) -> None:
+    calls = _fake_projection(mod, "NAD_1983_StatePlane_Maryland_FIPS_1900_Feet", 2248)
+    mod.safe_project_or_copy("roads.shp", "work.gdb/roads_proj", 2248)
+    assert calls == ["CopyFeatures"]
+
+
+def test_safe_project_or_copy_failed_projection_stops(mod: types.ModuleType) -> None:
+    # The old fallback copied the input unprojected and carried on.
+    calls = _fake_projection(mod, "GCS_WGS_1984", 4326, project_fails=True)
+    with pytest.raises(RuntimeError, match="Could not project roads.shp to WKID 2248"):
+        mod.safe_project_or_copy("roads.shp", "work.gdb/roads_proj", 2248)
+    assert calls == ["Project"]
+
+
+def test_safe_project_or_copy_unknown_sr_stops_before_projecting(mod: types.ModuleType) -> None:
+    calls = _fake_projection(mod, "Unknown", 0)
+    with pytest.raises(RuntimeError, match="no defined coordinate system"):
+        mod.safe_project_or_copy("roads.shp", "work.gdb/roads_proj", 2248)
+    assert calls == []
 
 
 # ---------------------------------------------------------------------------
