@@ -6,7 +6,7 @@ import pytest
 
 # Add the script directory to path to import the module
 # We need to make sure we point to the directory containing the script
-script_dir = Path("scripts/operations_tools").resolve()
+script_dir = Path("scripts/conversion_tools").resolve()
 sys.path.append(str(script_dir))
 
 import trip_runtime_diagnostics_from_avl as target  # noqa: E402

@@ -11,7 +11,7 @@ from xml.etree.ElementTree import Element, SubElement, tostring
 
 import pytest
 
-import scripts.operations_tools.tsde_to_tods as converter
+import scripts.conversion_tools.tsde_to_tods as converter
 
 
 def xml_bytes(tag: str, rows: list[dict]) -> bytes:
