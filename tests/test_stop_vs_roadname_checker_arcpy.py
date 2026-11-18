@@ -87,6 +87,25 @@ def test_split_stop_name_keeps_and_inside_words(mod: types.ModuleType) -> None:
     assert mod.split_stop_name("Anderson Rd and Elm St", set()) == ["anderson rd", "elm st"]
 
 
+@pytest.mark.parametrize(
+    "stop_name",
+    [
+        "Richmond Hwy at Lockhed Blvd",
+        "RICHMOND HWY AT LOCKHED BLVD",
+        "Intersection of Richmond Hwy and Lockhed Blvd",
+        "Intersection of Richmond Hwy & Lockhed Blvd",
+    ],
+)
+def test_split_stop_name_splits_at_and_leading_intersection_of(
+    mod: types.ModuleType, stop_name: str
+) -> None:
+    assert mod.split_stop_name(stop_name, {"hwy", "blvd"}) == ["richmond", "lockhed"]
+
+
+def test_split_stop_name_keeps_at_inside_words(mod: types.ModuleType) -> None:
+    assert mod.split_stop_name("Battery Ln", {"ln"}) == ["battery"]
+
+
 # ---------------------------------------------------------------------------
 # detect_typos
 # ---------------------------------------------------------------------------
@@ -104,6 +123,15 @@ def test_detect_typos_reports_only_originals_inside_buffer(mod: types.ModuleType
     stop2roads = {"1": {"main": {"Main St"}}}
     out = mod.detect_typos(_stops(("1", "Mainn St")), stop2roads, {"st", "rd"}, 80)
     assert out["similar_road_name_orig"].tolist() == ["Main St"]
+
+
+def test_detect_typos_flags_typo_after_at(mod: types.ModuleType) -> None:
+    # Unsplit, "richmond at lockhed" scored 51.9 against "lockheed" and was dropped.
+    stop2roads = {"1": {"richmond": {"Richmond Hwy"}, "lockheed": {"Lockheed Blvd"}}}
+    stops = _stops(("1", "Richmond Hwy at Lockhed Blvd"))
+    out = mod.detect_typos(stops, stop2roads, {"hwy", "blvd"}, 80)
+    assert out["street_in_stop_name"].tolist() == ["lockhed"]
+    assert out["similar_road_name_orig"].tolist() == ["Lockheed Blvd"]
 
 
 def test_detect_typos_empty_result_keeps_columns(mod: types.ModuleType) -> None:

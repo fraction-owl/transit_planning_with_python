@@ -435,6 +435,8 @@ def spatial_join_stops_roadways(
 def extract_street_names(stop_name: str, modifiers: Set[str]) -> List[str]:
     """Extract potential street names from a stop name using common separators.
 
+    Splits on '@', '&', '/', '+', 'and', 'at', and 'intersection of'.
+
     Args:
         stop_name (str): The name of the stop.
         modifiers (set): A set of known modifiers to assist in normalization.
@@ -444,8 +446,10 @@ def extract_street_names(stop_name: str, modifiers: Set[str]) -> List[str]:
     """
     if pd.isna(stop_name) or not isinstance(stop_name, str):
         return []
-    # Symbol separators split with or without surrounding spaces ("A&B", "A @ B").
-    pattern = r"\s*[@&/+]\s*| and | intersection of "
+    # Symbol separators split with or without surrounding spaces ("A&B", "A @ B");
+    # word separators ("and", "at") need them. "Intersection of" also splits at
+    # the start of the name, so it is not left attached to the first street.
+    pattern = r"\s*[@&/+]\s*| and | at |(?:^|\s)intersection of "
     streets = re.split(pattern, stop_name, flags=re.IGNORECASE)
     return [normalize_street_name(street, modifiers) for street in streets if street]
 

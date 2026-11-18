@@ -272,6 +272,34 @@ def test_extract_street_names_splits_symbols_without_spaces(stop_name: str) -> N
     assert target.extract_street_names(stop_name, {"st"}) == ["mainn", "elm"]
 
 
+@pytest.mark.parametrize(
+    "stop_name",
+    [
+        "Richmond Hwy at Lockhed Blvd",
+        "RICHMOND HWY AT LOCKHED BLVD",
+        "Intersection of Richmond Hwy and Lockhed Blvd",
+        "Intersection of Richmond Hwy & Lockhed Blvd",
+    ],
+)
+def test_extract_street_names_splits_at_and_leading_intersection_of(stop_name: str) -> None:
+    assert target.extract_street_names(stop_name, {"hwy", "blvd"}) == ["richmond", "lockhed"]
+
+
+def test_extract_street_names_keeps_at_inside_words() -> None:
+    assert target.extract_street_names("Battery Ln", {"ln"}) == ["battery"]
+
+
+def test_compare_stop_to_roads_flags_typo_after_at() -> None:
+    # Unsplit, "richmond at lockhed" scored 100 against "richmond" (token subset)
+    # and 51.9 against "lockheed", so the typo was missed and Richmond misreported.
+    streets = target.extract_street_names("Richmond Hwy at Lockhed Blvd", {"hwy", "blvd"})
+    roads = {"richmond": {"Richmond Hwy"}, "lockheed": {"Lockheed Blvd"}}
+    typos = target.compare_stop_to_roads("1", "Richmond Hwy at Lockhed Blvd", streets, roads, 80)
+    assert [(t["street_in_stop_name"], t["similar_road_name_original"]) for t in typos] == [
+        ("lockhed", "Lockheed Blvd")
+    ]
+
+
 def test_extract_street_names_single_name() -> None:
     names = target.extract_street_names("Main Street", set())
     assert len(names) == 1

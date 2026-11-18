@@ -227,8 +227,9 @@ def normalize_street(name: str, mods: set[str]) -> str:
 def split_stop_name(stop_name: str, mods: set[str]) -> list[str]:
     """Splits a GTFS stop name into normalized street name components.
 
-    Uses common intersection separators (e.g., '@', '&', '/', '+') to divide the
-    stop name and then normalizes each resulting part.
+    Uses common intersection separators (e.g., '@', '&', '/', '+', 'and', 'at',
+    'intersection of') to divide the stop name and then normalizes each
+    resulting part.
 
     Args:
         stop_name: The full stop name string.
@@ -239,8 +240,10 @@ def split_stop_name(stop_name: str, mods: set[str]) -> list[str]:
     """
     if not isinstance(stop_name, str):
         return []
-    # Symbol separators split with or without surrounding spaces ("A&B", "A @ B").
-    pattern = r"\s*[@&/+]\s*| and | intersection of "
+    # Symbol separators split with or without surrounding spaces ("A&B", "A @ B");
+    # word separators ("and", "at") need them. "Intersection of" also splits at
+    # the start of the name, so it is not left attached to the first street.
+    pattern = r"\s*[@&/+]\s*| and | at |(?:^|\s)intersection of "
     parts = re.split(pattern, stop_name, flags=re.IGNORECASE)
     return [normalize_street(p, mods) for p in parts if p.strip()]
 
