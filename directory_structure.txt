@@ -66,7 +66,6 @@ transit_planning_with_python/
 │   │   ├── gtfs_calendar_inspector.py
 │   │   ├── gtfs_skipped_stop_flagger_gpd.py
 │   │   ├── gtfs_stop_proximity_qc.py
-│   │   ├── gtfs_timepoint_interval_flagger.py
 │   │   ├── route_direction_classifier_arcpy.py
 │   │   ├── route_direction_classifier_gpd.py
 │   │   ├── stop_v_conflict_checker_arcpy.py
@@ -147,6 +146,7 @@ transit_planning_with_python/
 │       ├── gtfs_linear_diff_gpd.py
 │       ├── gtfs_route_diff.py
 │       ├── gtfs_stop_diff.py
+│       ├── gtfs_timepoint_interval_flagger.py
 │       ├── service_cut_impact_arcpy.py
 │       ├── service_cut_impact_gpd.py
 │       ├── stop_impacts_target_routes.py
