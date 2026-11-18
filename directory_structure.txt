@@ -40,7 +40,10 @@ transit_planning_with_python/
 ├── scripts/
 │   ├── conversion_tools/
 │   │   ├── convert_to_tides_stop_visits.py
-│   │   └── convert_to_tides_trips_performed.py
+│   │   ├── convert_to_tides_trips_performed.py
+│   │   ├── otp_by_timepoint_from_avl.py
+│   │   ├── trip_runtime_diagnostics_from_avl.py
+│   │   └── tsde_to_tods.py
 │   ├── facilities_tools/
 │   │   ├── bay_assignment_optimizer.py
 │   │   ├── bay_change_sweep.py
@@ -104,13 +107,10 @@ transit_planning_with_python/
 │   │   └── uscensus_tiger_join_gpd.py
 │   ├── operations_tools/
 │   │   ├── otp_by_route.py
-│   │   ├── otp_by_timepoint_from_avl.py
 │   │   ├── otp_monthly_panel.py
 │   │   ├── otp_runtime_from_tides.py
 │   │   ├── runtime_by_route.py
-│   │   ├── runtime_workflow.py
-│   │   ├── trip_runtime_diagnostics_from_avl.py
-│   │   └── tsde_to_tods.py
+│   │   └── runtime_workflow.py
 │   ├── ridership_tools/
 │   │   ├── data_request_by_stop_processor.py
 │   │   ├── district_ridership_share_arcpy.py

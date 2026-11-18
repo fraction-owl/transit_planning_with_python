@@ -4,7 +4,7 @@ import pandas as pd
 import pytest
 
 # Import the script module
-from scripts.operations_tools import otp_by_timepoint_from_avl
+from scripts.conversion_tools import otp_by_timepoint_from_avl
 
 
 @pytest.fixture
