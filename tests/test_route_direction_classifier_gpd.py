@@ -8,8 +8,8 @@ import pandas as pd
 import pytest
 from shapely.geometry import LineString
 
-import scripts.gtfs_data_quality.route_direction_classifier_pd as mod
-from scripts.gtfs_data_quality.route_direction_classifier_pd import (
+import scripts.gtfs_data_quality.route_direction_classifier_gpd as mod
+from scripts.gtfs_data_quality.route_direction_classifier_gpd import (
     add_route_labels,
     classify_direction,
     create_lines_from_shapes,
@@ -76,6 +76,18 @@ def test_classify_direction_compares_ground_distance_not_degrees() -> None:
         mod.PROJECTED_CRS
     )
     assert classify_direction(line.iloc[0]) == "NB"
+
+
+# ---------------------------------------------------------------------------
+# read_gtfs_table
+# ---------------------------------------------------------------------------
+
+
+def test_read_gtfs_table_keeps_ids_spelled_like_missing_values(tmp_path: Path) -> None:
+    (tmp_path / "shapes.txt").write_text("shape_id,note\nNA,\nNULL,x\n", encoding="utf-8")
+    table = mod.read_gtfs_table(str(tmp_path), "shapes.txt")
+    assert table["shape_id"].tolist() == ["NA", "NULL"]
+    assert pd.isna(table.loc[0, "note"])
 
 
 # ---------------------------------------------------------------------------
@@ -159,6 +171,23 @@ def test_add_route_labels_keeps_routes_sharing_a_short_name_apart() -> None:
     assert add_route_labels(routes)["route_label"].tolist() == ["10_A", "10_B", "C"]
 
 
+def test_add_route_labels_separates_labels_that_share_a_file_name() -> None:
+    # "A/B" and "A:B" both become "A-B" in a file name; Windows ignores case.
+    routes = pd.DataFrame(
+        {
+            "route_id": ["R1", "R2", "R3", "R4", "R5"],
+            "route_short_name": ["A/B", "A:B", "1a", "1A", "2"],
+        }
+    )
+    assert add_route_labels(routes)["route_label"].tolist() == [
+        "A/B_R1",
+        "A:B_R2",
+        "1a_R3",
+        "1A_R4",
+        "2",
+    ]
+
+
 # ---------------------------------------------------------------------------
 # identify_first_last_stops
 # ---------------------------------------------------------------------------
@@ -195,6 +224,33 @@ def test_identify_first_last_stops_keeps_trips_without_stop_times() -> None:
     assert out["trip_id"].tolist() == ["T1", "T2"]
 
 
+def test_identify_first_last_stops_rejects_repeated_stop_id() -> None:
+    # A loop starting and ending at a stop listed twice would become four rows.
+    trips = pd.DataFrame({"trip_id": ["T1"]})
+    stop_times = pd.DataFrame(
+        {
+            "trip_id": ["T1", "T1"],
+            "stop_sequence": [1, 2],
+            "stop_id": ["A", "A"],
+            "departure_time": ["7:00", "7:30"],
+        }
+    )
+    stops = pd.DataFrame({"stop_id": ["A", "A"], "stop_name": ["Alpha", "Alpha"]})
+    with pytest.raises(pd.errors.MergeError):
+        identify_first_last_stops(trips, stop_times, stops)
+
+
+def test_departure_sort_key_orders_by_seconds() -> None:
+    trips = pd.DataFrame(
+        {
+            "trip_id": ["T1", "T2", "T3", "T4"],
+            "departure_time": ["07:00:29", "7:00:01", "25:00:00", None],
+        }
+    )
+    ordered = trips.sort_values(["departure_time", "trip_id"], key=mod.departure_sort_key)
+    assert ordered["trip_id"].tolist() == ["T2", "T1", "T3", "T4"]
+
+
 # ---------------------------------------------------------------------------
 # split_trip_exceptions
 # ---------------------------------------------------------------------------
@@ -224,12 +280,71 @@ def test_split_trip_exceptions_lists_broken_references() -> None:
     )
     routes = pd.DataFrame({"route_id": ["R1"]})
     stops = pd.DataFrame({"stop_id": ["A", "B"]})
+    stop_times = pd.DataFrame({"trip_id": ["OK", "NOSHAPE", "BADSHAPE", "BADSTOP"]})
 
-    kept, exceptions = split_trip_exceptions(final_data, trips, routes, stops)
+    kept, exceptions = split_trip_exceptions(final_data, trips, routes, stops, stop_times)
 
     assert kept["trip_id"].tolist() == ["OK", "BADSTOP"]
     listed = dict(zip(exceptions["trip_id"], exceptions["excluded"]))
     assert listed == {"ORPHAN": True, "NOSHAPE": True, "BADSHAPE": True, "BADSTOP": False}
+
+
+def test_split_trip_exceptions_tells_blank_first_stop_from_missing_stop_times() -> None:
+    final_data = pd.DataFrame(
+        {
+            "route_id": ["R1", "R1"],
+            "route_short_name": ["1", "1"],
+            "direction_id": ["0", "0"],
+            "trip_id": ["BLANK", "NOROWS"],
+            "shape_id": ["S1", "S1"],
+            "shape_direction": ["NB", "NB"],
+            "first_stop_id": [None, None],
+            "last_stop_id": ["B", None],
+            "departure_minutes": [420, None],
+        }
+    )
+    stop_times = pd.DataFrame({"trip_id": ["BLANK", "BLANK"]})
+    kept, exceptions = split_trip_exceptions(
+        final_data,
+        final_data,
+        pd.DataFrame({"route_id": ["R1"]}),
+        pd.DataFrame({"stop_id": ["B"]}),
+        stop_times,
+    )
+    assert kept["trip_id"].tolist() == ["BLANK"]
+    problems = exceptions[["trip_id", "problem", "excluded"]].to_numpy().tolist()
+    assert problems == [
+        ["NOROWS", "no rows in stop_times.txt", True],
+        ["BLANK", "first stop_id is blank", False],
+    ]
+
+
+# ---------------------------------------------------------------------------
+# summarize_patterns
+# ---------------------------------------------------------------------------
+
+
+def test_summarize_patterns_keeps_terminals_with_the_same_name_apart() -> None:
+    data = pd.DataFrame(
+        {
+            "route_id": ["R1"] * 2,
+            "route_short_name": ["1"] * 2,
+            "route_label": ["1"] * 2,
+            "direction_id": ["0"] * 2,
+            "shape_id": ["S1"] * 2,
+            "shape_direction": ["NB"] * 2,
+            "is_dominant": [True] * 2,
+            "first_stop_id": ["BAY1", "BAY2"],
+            "first_stop_name": ["Station"] * 2,
+            "last_stop_id": ["B"] * 2,
+            "last_stop_name": ["Bravo"] * 2,
+        }
+    )
+    summary = mod.summarize_patterns(data)
+    assert summary[["first_stop_id", "trip_count"]].to_numpy().tolist() == [
+        ["BAY1", 1],
+        ["BAY2", 1],
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -322,6 +437,24 @@ def test_flag_suspicious_data_flags_minority_shape_running_the_other_way() -> No
     summary = _summary(direction_id=["0", "0"], shape_direction=["NB", "SB"])
     flags = flag_suspicious_data(summary)
     assert flags["problem"].str.contains("Conflicting cardinal").tolist() == [True]
+
+
+def test_flag_suspicious_data_flags_opposite_loops_in_one_direction() -> None:
+    summary = _summary(direction_id=["0", "0"], shape_direction=["CW", "CCW"])
+    assert flag_suspicious_data(summary)["problem"].tolist() == [
+        "Conflicting loop directions ['CCW', 'CW']"
+    ]
+
+
+# ---------------------------------------------------------------------------
+# output file names
+# ---------------------------------------------------------------------------
+
+
+def test_check_unique_file_names_rejects_names_differing_only_in_case() -> None:
+    planned = [("Route_x_Dir_0_Shape_S.jpeg", "map one"), ("Route_x_Dir_0_Shape_s.jpeg", "map two")]
+    with pytest.raises(ValueError, match="map one.*map two"):
+        mod.check_unique_file_names(planned)
 
 
 # ---------------------------------------------------------------------------
@@ -456,6 +589,47 @@ def test_main_writes_nothing_when_all_exports_off(feed: Path, tmp_path: Path) ->
 
 def test_main_returns_2_for_placeholder_paths() -> None:
     assert mod.main([]) == 2
+
+
+def test_main_rejects_repeated_stop_id(
+    feed: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with (feed / "stops.txt").open("a", encoding="utf-8") as handle:
+        handle.write("A,Alpha again,38.9,-77.0\n")
+    assert mod.main(_argv(feed, tmp_path / "out")) == 1
+    assert "repeated 'stop_id'" in caplog.text
+
+
+def test_main_writes_nothing_when_maps_would_share_a_file_name(
+    feed: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Shapes "S/1" and "S:1" both map to Route_1_Dir_0_Shape_S-1.jpeg.
+    names = _record_plots(monkeypatch)
+    trips = (feed / "trips.txt").read_text(encoding="utf-8")
+    trips = trips.replace("T1,0,S1", "T1,0,S/1").replace("T2,0,S1", "T2,0,S:1")
+    (feed / "trips.txt").write_text(trips, encoding="utf-8")
+    header, *rows = (feed / "shapes.txt").read_text(encoding="utf-8").splitlines()
+    rows = [row.replace("S1", sid, 1) for sid in ("S/1", "S:1") for row in rows]
+    (feed / "shapes.txt").write_text("\n".join([header, *rows]) + "\n", encoding="utf-8")
+    out = tmp_path / "out"
+    assert mod.main(_argv(feed, out, "--no-map-only-dominant-shape")) == 1
+    assert "Route_1_Dir_0_Shape_S-1.jpeg" in caplog.text
+    assert names == []
+    assert not out.exists()
+
+
+def test_main_warns_about_route_files_from_an_earlier_run(
+    feed: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "Route_9_Dir_0_departures.xlsx").write_bytes(b"")
+    (out / "notes.txt").write_text("not a route file", encoding="utf-8")
+    assert mod.main(_argv(feed, out, "--no-export-jpeg")) == 0
+    assert "1 per-route file(s)" in caplog.text
+    assert (out / "Route_9_Dir_0_departures.xlsx").exists()
+    run_log = (out / "Directions_Summary_runlog.txt").read_text(encoding="utf-8")
+    assert "Leftover route files:    1" in run_log
 
 
 def test_main_reports_non_numeric_sequence(

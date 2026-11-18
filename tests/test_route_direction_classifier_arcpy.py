@@ -134,8 +134,63 @@ def test_flag_suspicious_data_flags_minority_shape(mod: types.ModuleType) -> Non
     assert len(mod.flag_suspicious_data(summary)) == 1
 
 
+def test_flag_suspicious_data_flags_opposite_loops(mod: types.ModuleType) -> None:
+    summary = pd.DataFrame(
+        {
+            "route_id": ["R1", "R1"],
+            "route_short_name": ["1", "1"],
+            "direction_id": ["0", "0"],
+            "shape_direction": ["CW", "CCW"],
+        }
+    )
+    assert mod.flag_suspicious_data(summary)["problem"].tolist() == [
+        "Conflicting loop directions ['CCW', 'CW']"
+    ]
+
+
 def test_output_file_name_replaces_unsafe_characters(mod: types.ModuleType) -> None:
     assert mod.output_file_name("1/X", "", "Shape_a:b.jpeg") == "Route_1-X_Dir_none_Shape_a-b.jpeg"
+
+
+def test_add_route_labels_separates_labels_that_share_a_file_name(mod: types.ModuleType) -> None:
+    routes = pd.DataFrame(
+        {"route_id": ["R1", "R2", "R3"], "route_short_name": ["A/B", "A:B", "a/b"]}
+    )
+    assert mod.add_route_labels(routes)["route_label"].tolist() == ["A/B_R1", "A:B_R2", "a/b_R3"]
+
+
+def test_check_unique_file_names_ignores_case(mod: types.ModuleType) -> None:
+    with pytest.raises(ValueError, match="2 output file name"):
+        mod.check_unique_file_names(
+            [("A.xlsx", "one"), ("a.xlsx", "two"), ("B.jpeg", "three"), ("b.JPEG", "four")]
+        )
+
+
+def test_split_trip_exceptions_tells_blank_first_stop_from_missing_stop_times(
+    mod: types.ModuleType,
+) -> None:
+    final_data = pd.DataFrame(
+        {
+            "route_id": ["R1", "R1"],
+            "route_short_name": ["1", "1"],
+            "direction_id": ["0", "0"],
+            "trip_id": ["BLANK", "NOROWS"],
+            "shape_id": ["S1", "S1"],
+            "shape_direction": ["NB", "NB"],
+            "first_stop_id": [None, None],
+            "last_stop_id": ["B", None],
+            "departure_minutes": [420, None],
+        }
+    )
+    kept, exceptions = mod.split_trip_exceptions(
+        final_data,
+        final_data,
+        pd.DataFrame({"route_id": ["R1"]}),
+        pd.DataFrame({"stop_id": ["B"]}),
+        pd.DataFrame({"trip_id": ["BLANK"]}),
+    )
+    assert kept["trip_id"].tolist() == ["BLANK"]
+    assert exceptions["problem"].tolist() == ["no rows in stop_times.txt", "first stop_id is blank"]
 
 
 # ---------------------------------------------------------------------------
@@ -149,23 +204,26 @@ def _write_feed(folder: Path) -> None:
         "routes.txt": "route_id,route_short_name,route_long_name\nR1,1,Main\nR2,1,Main Exp\n",
         "stops.txt": (
             "stop_id,stop_name,stop_lat,stop_lon\nA,Alpha,38.9,-77.0\nB,Bravo,39.0,-77.0\n"
+            "A2,Alpha,38.9,-77.0\n"
         ),
         "trips.txt": (
             "route_id,service_id,trip_id,direction_id,shape_id\n"
-            "R1,WK,T1,0,S1\nR1,WK,T2,0,S1\nR1,WK,T3,0,S2\nR2,WK,T4,0,S1\nR1,WK,T5,1,\n"
+            "R1,WK,T1,0,S1\nR1,WK,T2,0,S1\nR1,WK,T3,0,NA\nR2,WK,T4,0,S1\nR1,WK,T5,1,\n"
+            "R1,WK,T6,0,S1\n"
         ),
         "stop_times.txt": (
             "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
             "T1,10:00:00,10:00:00,A,1\nT1,10:20:00,10:20:00,B,10\n"
-            "T2,9:00:00,9:00:00,A,1\nT2,9:20:00,9:20:00,B,10\n"
+            "T2,9:00:01,9:00:01,A,1\nT2,9:20:00,9:20:00,B,10\n"
             "T3,8:00:00,8:00:00,B,1\nT3,8:20:00,8:20:00,A,10\n"
             "T4,8:00:00,8:00:00,A,1\nT4,8:20:00,8:20:00,B,10\n"
             "T5,8:00:00,8:00:00,B,1\nT5,8:20:00,8:20:00,A,10\n"
+            "T6,9:00:29,9:00:29,A2,1\nT6,9:20:00,9:20:00,B,10\n"
         ),
         "shapes.txt": (
             "shape_id,shape_pt_lat,shape_pt_lon,shape_pt_sequence\n"
             "S1,38.9,-77.0,1\nS1,38.95,-77.0,2\nS1,39.0,-77.0,10\n"
-            "S2,39.0,-77.0,1\nS2,38.95,-77.0,2\nS2,38.9,-77.0,10\n"
+            "NA,39.0,-77.0,1\nNA,38.95,-77.0,2\nNA,38.9,-77.0,10\n"
         ),
     }
     for name, text in files.items():
@@ -178,19 +236,21 @@ def test_main_end_to_end(mod: types.ModuleType, tmp_path: Path) -> None:
     argv = ["--gtfs", str(tmp_path / "gtfs"), "--output-dir", str(out), "--no-export-jpeg"]
     assert mod.main(argv) == 0
 
-    summary = pd.read_excel(out / "Directions_Summary.xlsx", dtype=str)
-    rows = summary[["route_id", "shape_id", "shape_direction", "is_dominant", "trip_count"]]
+    summary = pd.read_excel(out / "Directions_Summary.xlsx", dtype=str, keep_default_na=False)
+    columns = ["route_id", "shape_id", "shape_direction", "is_dominant", "first_stop_id"]
+    rows = summary[[*columns, "trip_count"]]
     assert rows.to_numpy().tolist() == [
-        ["R1", "S1", "NB", "True", "2"],
-        ["R1", "S2", "SB", "False", "1"],
-        ["R2", "S1", "NB", "True", "1"],
+        ["R1", "NA", "SB", "False", "B", "1"],
+        ["R1", "S1", "NB", "True", "A", "2"],
+        ["R1", "S1", "NB", "True", "A2", "1"],
+        ["R2", "S1", "NB", "True", "A", "1"],
     ]
     flagged = pd.read_excel(out / "Suspicious_RouteDirections.xlsx", dtype=str)
     assert flagged["route_id"].tolist() == ["R1"]
     exceptions = pd.read_excel(out / "Trip_Exceptions.xlsx", dtype=str)
     assert exceptions["trip_id"].tolist() == ["T5"]
     departures = pd.read_excel(out / "Route_1_R1_Dir_0_departures.xlsx", dtype=str)
-    assert departures["trip_id"].tolist() == ["T3", "T2", "T1"]
+    assert departures["trip_id"].tolist() == ["T3", "T2", "T6", "T1"]
     run_log = (out / "Directions_Summary_runlog.txt").read_text(encoding="utf-8")
     assert "GTFS_PATH = " in run_log
     assert "Trips excluded:          1" in run_log
@@ -217,7 +277,7 @@ def test_main_writes_header_only_review_workbooks_for_clean_feed(
     _write_feed(tmp_path / "gtfs")
     trips = tmp_path / "gtfs" / "trips.txt"
     trips.write_text(
-        "route_id,service_id,trip_id,direction_id,shape_id\nR1,WK,T1,0,S1\nR1,WK,T3,1,S2\n",
+        "route_id,service_id,trip_id,direction_id,shape_id\nR1,WK,T1,0,S1\nR1,WK,T3,1,NA\n",
         encoding="utf-8",
     )
     out = tmp_path / "out"
@@ -244,14 +304,38 @@ def test_main_maps_every_shape_when_asked(
     ]
     assert mod.main(argv) == 0
     assert names == [
+        "Route_1_R1_Dir_0_Shape_NA.jpeg",
         "Route_1_R1_Dir_0_Shape_S1.jpeg",
-        "Route_1_R1_Dir_0_Shape_S2.jpeg",
         "Route_1_R2_Dir_0_Shape_S1.jpeg",
     ]
 
 
 def test_main_returns_2_for_placeholder_paths(mod: types.ModuleType) -> None:
     assert mod.main([]) == 2
+
+
+def test_main_rejects_repeated_stop_id(
+    mod: types.ModuleType, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    _write_feed(tmp_path / "gtfs")
+    with (tmp_path / "gtfs" / "stops.txt").open("a", encoding="utf-8") as handle:
+        handle.write("B,Bravo again,39.0,-77.0\n")
+    argv = ["--gtfs", str(tmp_path / "gtfs"), "--output-dir", str(tmp_path / "out")]
+    assert mod.main(argv) == 1
+    assert "repeated 'stop_id'" in caplog.text
+
+
+def test_main_warns_about_route_files_from_an_earlier_run(
+    mod: types.ModuleType, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    _write_feed(tmp_path / "gtfs")
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "Route_9_Dir_0_Shape_X.jpeg").write_bytes(b"")
+    argv = ["--gtfs", str(tmp_path / "gtfs"), "--output-dir", str(out), "--no-export-jpeg"]
+    assert mod.main(argv) == 0
+    assert "1 per-route file(s)" in caplog.text
+    assert (out / "Route_9_Dir_0_Shape_X.jpeg").exists()
 
 
 def test_main_reports_missing_feed(mod: types.ModuleType, tmp_path: Path) -> None:

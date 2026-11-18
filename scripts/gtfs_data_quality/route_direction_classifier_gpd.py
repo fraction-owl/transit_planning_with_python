@@ -19,6 +19,8 @@ Outputs:
     - Trip_Exceptions.xlsx (trips with broken references; rewritten every run)
     - Directions_Summary_runlog.txt: run-log sidecar with the verbatim CONFIGURATION
       block and the effective settings.
+    - Per-route files from an earlier run that this run does not rewrite are kept
+      and listed in a warning.
 
     <route> is route_short_name, or route_id when the short name is blank; route_id is
     appended when several routes share a short name.
@@ -43,10 +45,11 @@ import os
 import re
 import sys
 import zipfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Generator, Hashable, Iterable, Sequence
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import IO, Any, List, Optional
 
 import geopandas as gpd
 import matplotlib.pyplot as plt
@@ -96,133 +99,72 @@ REQUIRE_RUN_LOG: bool = True
 _PLACEHOLDER_GTFS = r"Path\To\Your\GTFS_Folder"
 _PLACEHOLDER_OUTPUT = r"Path\To\Your\Output_Folder"
 
+# Characters Windows does not allow in file names.
+_UNSAFE_FILE_CHARS = r'[\\/:*?"<>|]+'
+# Names of the per-route files this script writes, used to spot leftovers.
+_ROUTE_FILE_PATTERN = re.compile(
+    r"Route_.+_Dir_.+_(departures\.xlsx|DominantShape\.jpeg|Shape_.+\.jpeg)"
+)
+
 # =============================================================================
 # FUNCTIONS
 # =============================================================================
 
 
-def load_gtfs_data(
-    gtfs_path: str,
-    files: Optional[Sequence[str]] = None,
-    dtype: str | type[str] | Mapping[str, Any] = str,
-    logger: Optional[logging.Logger] = None,
-) -> dict[str, pd.DataFrame]:
-    """Load one or more GTFS text files into memory.
+@contextmanager
+def open_gtfs_file(
+    gtfs_path: str | os.PathLike[str], file_name: str
+) -> Generator[IO[bytes], None, None]:
+    """Open one GTFS text file from a feed folder or a ``.zip`` of the feed.
+
+    The counterpart of :func:`load_gtfs_data` for scripts that read a file with
+    their own options (``pandas.read_csv`` with ``usecols`` or
+    ``keep_default_na=False``, or the :mod:`csv` module), so they accept a
+    zipped feed without extracting it. Zip members are found the way
+    :func:`load_gtfs_data` finds them: at the archive root or inside a single
+    wrapper folder.
 
     Args:
-        gtfs_path: Absolute or relative path to the folder containing the
-            GTFS feed, or to a ``.zip`` archive of it — the form GTFS
-            producers and most open-data portals distribute feeds in. Zip
-            members may sit at the archive root or nested one level inside
-            a single wrapper folder; both layouts are handled.
-        files: Explicit sequence of file names to load. If ``None``,
-            the standard 13 GTFS text files are attempted.
-        dtype: Value forwarded to :pyfunc:`pandas.read_csv(dtype=…)` to
-            control column dtypes. Supply a mapping for per-column dtypes.
-        logger: Logger for progress messages. Defaults to this module's
-            logger (``logging.getLogger(__name__)``) rather than the root
-            logger, so callers keep control of handler configuration.
+        gtfs_path: Folder containing the GTFS feed, or a ``.zip`` archive of it.
+        file_name: GTFS file to open, e.g. ``"stops.txt"``.
 
-    Returns:
-        Mapping of file stem → :class:`pandas.DataFrame`; for example,
-        ``data["trips"]`` holds the parsed *trips.txt* table.
+    Yields:
+        A binary file handle. ``pandas.read_csv`` reads it directly; wrap it in
+        :class:`io.TextIOWrapper` for the :mod:`csv` module.
 
     Raises:
-        OSError: Path missing, one of *files* not present in the feed, or
-            an OS-level failure while reading a file.
+        FileNotFoundError: *gtfs_path* does not exist, or the feed has no
+            *file_name*.
         ValueError: *gtfs_path* is neither a directory nor a valid ``.zip``
-            file, a requested file matches more than one location inside
-            the zip, a file is empty, or the CSV parser fails.
-
-    Notes:
-        All columns default to ``str`` to avoid pandas’ type-inference
-        pitfalls (e.g. leading zeros in IDs).
+            file, or *file_name* is found in more than one place in the zip.
     """
-    log = logger if logger is not None else logging.getLogger(__name__)
+    path = os.fspath(gtfs_path)
+    if os.path.isdir(path):
+        file_path = os.path.join(path, file_name)
+        if not os.path.isfile(file_path):
+            raise FileNotFoundError(f"Missing GTFS file in '{path}': {file_name}")
+        with open(file_path, "rb") as handle:
+            yield handle
+        return
 
-    if not os.path.exists(gtfs_path):
-        raise OSError(f"The path '{gtfs_path}' does not exist.")
-
-    if files is None:
-        files = (
-            "agency.txt",
-            "stops.txt",
-            "routes.txt",
-            "trips.txt",
-            "stop_times.txt",
-            "calendar.txt",
-            "calendar_dates.txt",
-            "fare_attributes.txt",
-            "fare_rules.txt",
-            "feed_info.txt",
-            "frequencies.txt",
-            "shapes.txt",
-            "transfers.txt",
-        )
-
-    is_zip = os.path.isfile(gtfs_path) and gtfs_path.lower().endswith(".zip")
-    if not is_zip and not os.path.isdir(gtfs_path):
-        raise ValueError(f"'{gtfs_path}' is neither a directory nor a .zip file.")
-
-    archive: zipfile.ZipFile | None = None
-    members_by_name: dict[str, list[str]] = {}
-    if is_zip:
-        try:
-            archive = zipfile.ZipFile(gtfs_path)
-        except zipfile.BadZipFile as exc:
-            raise ValueError(f"'{gtfs_path}' is not a valid zip archive.") from exc
-        for name in archive.namelist():
-            members_by_name.setdefault(os.path.basename(name), []).append(name)
-
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"The path '{path}' does not exist.")
+    if not (os.path.isfile(path) and path.lower().endswith(".zip")):
+        raise ValueError(f"'{path}' is neither a directory nor a .zip file.")
     try:
-        missing: list[str] = []
-        ambiguous: list[str] = []
-        resolved: dict[str, str] = {}
-        for file_name in files:
-            if archive is None:
-                if not os.path.exists(os.path.join(gtfs_path, file_name)):
-                    missing.append(file_name)
-                continue
-            candidates = members_by_name.get(file_name, [])
-            if not candidates:
-                missing.append(file_name)
-            elif len(candidates) > 1:
-                ambiguous.append(file_name)
-            else:
-                resolved[file_name] = candidates[0]
-
-        if ambiguous:
+        archive = zipfile.ZipFile(path)
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"'{path}' is not a valid zip archive.") from exc
+    with archive:
+        matches = [name for name in archive.namelist() if os.path.basename(name) == file_name]
+        if not matches:
+            raise FileNotFoundError(f"Missing GTFS file in '{path}': {file_name}")
+        if len(matches) > 1:
             raise ValueError(
-                f"Ambiguous GTFS files in '{gtfs_path}' (found in multiple "
-                f"locations): {', '.join(ambiguous)}"
+                f"Ambiguous GTFS file in '{path}' (found in multiple locations): {file_name}"
             )
-        if missing:
-            raise OSError(f"Missing GTFS files in '{gtfs_path}': {', '.join(missing)}")
-
-        data: dict[str, pd.DataFrame] = {}
-        for file_name in files:
-            key = file_name.replace(".txt", "")
-            try:
-                if archive is None:
-                    df = pd.read_csv(
-                        os.path.join(gtfs_path, file_name), dtype=dtype, low_memory=False
-                    )
-                else:
-                    with archive.open(resolved[file_name]) as handle:
-                        df = pd.read_csv(handle, dtype=dtype, low_memory=False)
-                data[key] = df
-                log.info("Loaded %s (%d records).", file_name, len(df))
-
-            except pd.errors.EmptyDataError as exc:
-                raise ValueError(f"File '{file_name}' in '{gtfs_path}' is empty.") from exc
-
-            except pd.errors.ParserError as exc:
-                raise ValueError(f"Parser error in '{file_name}' in '{gtfs_path}': {exc}") from exc
-
-        return data
-    finally:
-        if archive is not None:
-            archive.close()
+        with archive.open(matches[0]) as handle:
+            yield handle
 
 
 def classify_direction(
@@ -334,6 +276,46 @@ def to_numeric_column(df: pd.DataFrame, column: str, table: str) -> pd.Series:
     return values
 
 
+def require_unique(df: pd.DataFrame, column: str, table: str) -> None:
+    """Check that no value of *column* repeats, so joins on it cannot duplicate trips.
+
+    Raises:
+        ValueError: The column is missing, or a value appears more than once.
+    """
+    if column not in df.columns:
+        raise ValueError(f"{table} is missing required column '{column}'.")
+    repeated = df.loc[df[column].duplicated(), column].unique()
+    if len(repeated):
+        raise ValueError(
+            f"{table} has {len(repeated)} repeated '{column}' value(s), e.g. "
+            f"{repeated[0]!r}; each {column} must appear once."
+        )
+
+
+def read_gtfs_table(gtfs_path: str, file_name: str) -> pd.DataFrame:
+    """Read one GTFS file from a feed folder or ``.zip`` with every column as text.
+
+    Only empty fields become missing values. By default pandas also reads text
+    such as ``NA`` and ``NULL`` as missing, which would erase IDs spelled that way.
+
+    Raises:
+        OSError: The feed or *file_name* is missing, or cannot be read.
+        ValueError: *gtfs_path* is neither a folder nor a ``.zip``, or the
+            file is empty or malformed.
+    """
+    try:
+        with open_gtfs_file(gtfs_path, file_name) as handle:
+            df = pd.read_csv(
+                handle, dtype=str, keep_default_na=False, na_values=[""], low_memory=False
+            )
+    except pd.errors.EmptyDataError as exc:
+        raise ValueError(f"File '{file_name}' in '{gtfs_path}' is empty.") from exc
+    except pd.errors.ParserError as exc:
+        raise ValueError(f"Parser error in '{file_name}' in '{gtfs_path}': {exc}") from exc
+    logging.info("Loaded %s (%d records).", file_name, len(df))
+    return df
+
+
 def read_gtfs_data(
     gtfs_path: str,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -342,15 +324,23 @@ def read_gtfs_data(
     Sequence and coordinate columns become numbers, so sequences sort as
     1, 2, 10 rather than 1, 10, 2; IDs stay text. Blank or absent optional
     text columns become empty strings so that groupings keep their rows.
-    """
-    files = ["routes.txt", "trips.txt", "stop_times.txt", "shapes.txt", "stops.txt"]
-    gtfs_data = load_gtfs_data(gtfs_path, files=files, dtype=str)
 
-    routes = gtfs_data["routes"]
-    trips = gtfs_data["trips"]
-    stop_times = gtfs_data["stop_times"]
-    shapes = gtfs_data["shapes"]
-    stops = gtfs_data["stops"]
+    Raises:
+        OSError: The feed or one of its files is missing, or cannot be read.
+        ValueError: A file is empty or malformed, a sequence or coordinate is
+            blank or non-numeric, or a route_id, trip_id, or stop_id repeats.
+    """
+    routes, trips, stop_times, shapes, stops = (
+        read_gtfs_table(gtfs_path, name)
+        for name in ("routes.txt", "trips.txt", "stop_times.txt", "shapes.txt", "stops.txt")
+    )
+    # A repeated ID would match a trip more than once and inflate its trip count.
+    for df, column, table in (
+        (routes, "route_id", "routes.txt"),
+        (trips, "trip_id", "trips.txt"),
+        (stops, "stop_id", "stops.txt"),
+    ):
+        require_unique(df, column, table)
 
     stop_times["stop_sequence"] = to_numeric_column(stop_times, "stop_sequence", "stop_times.txt")
     for col in ("shape_pt_sequence", "shape_pt_lat", "shape_pt_lon"):
@@ -384,11 +374,14 @@ def add_route_labels(routes: pd.DataFrame) -> pd.DataFrame:
 
     The label is route_short_name (route_id when that is blank), with route_id
     appended when several routes share a short name, so each route keeps its own
-    files.
+    files. Names are compared as Windows file names, ignoring case and treating
+    characters a file name cannot hold as the same, so ``A/B`` and ``A:B``, or
+    ``1a`` and ``1A``, also count as shared.
     """
     routes = routes.copy()
     label = routes["route_short_name"].where(routes["route_short_name"] != "", routes["route_id"])
-    shared = label.duplicated(keep=False)
+    file_key = label.str.replace(_UNSAFE_FILE_CHARS, "-", regex=True).str.casefold()
+    shared = file_key.duplicated(keep=False)
     routes["route_label"] = label.where(~shared, label + "_" + routes["route_id"])
     return routes
 
@@ -431,6 +424,7 @@ def merge_and_classify_shapes(
     trips_merged = trips_filtered.merge(
         routes_filtered[["route_id", "route_short_name", "route_long_name", "route_label"]],
         on="route_id",
+        validate="many_to_one",
     )
 
     gdf_shapes_proj = gdf_shapes.to_crs(projected_crs)
@@ -455,6 +449,10 @@ def identify_first_last_stops(
     sorting. The first stop is the row with the lowest numeric stop_sequence,
     whatever its value. Trips without stop_times, or whose stops are missing
     from stops.txt, are kept with blank values.
+
+    Raises:
+        pandas.errors.MergeError: stops.txt repeats a stop_id, which would
+            duplicate trips.
     """
     stop_times_sorted = stop_times.sort_values(["trip_id", "stop_sequence"])
     # drop_duplicates keeps whole rows; groupby().first() would take the first
@@ -476,8 +474,12 @@ def identify_first_last_stops(
         columns={"stop_id": "last_stop_id", "stop_name": "last_stop_name"}
     )
 
-    trips_merged = trips_merged.merge(stops_ren_first, on="first_stop_id", how="left")
-    trips_merged = trips_merged.merge(stops_ren_last, on="last_stop_id", how="left")
+    trips_merged = trips_merged.merge(
+        stops_ren_first, on="first_stop_id", how="left", validate="many_to_one"
+    )
+    trips_merged = trips_merged.merge(
+        stops_ren_last, on="last_stop_id", how="left", validate="many_to_one"
+    )
 
     trips_merged["departure_minutes"] = trips_merged["departure_time"].map(parse_time_to_minutes)
     return trips_merged
@@ -515,32 +517,69 @@ def parse_time_to_minutes(time_value: Optional[str]) -> Optional[int]:
     return hours * 60 + minutes + round(seconds / 60)
 
 
+def parse_time_to_seconds(time_value: Optional[str]) -> Optional[int]:
+    """Convert an ``HH:MM[:SS]`` time string to integer seconds past midnight.
+
+    The unrounded counterpart of :func:`parse_time_to_minutes`, used to order
+    departures that fall in the same minute. Hours past 24 are kept, so
+    ``"25:30:00"`` sorts after ``"23:59:59"``.
+
+    Returns:
+        Seconds since midnight, or ``None`` if the value cannot be parsed.
+    """
+    if not isinstance(time_value, str):
+        return None
+    parts = time_value.strip().split(":")
+    if len(parts) not in (2, 3):
+        return None
+    try:
+        hours = int(parts[0])
+        minutes = int(parts[1])
+        seconds = int(parts[2]) if len(parts) == 3 else 0
+    except ValueError:
+        return None
+    if hours < 0 or not 0 <= minutes < 60 or not 0 <= seconds < 60:
+        return None
+    return hours * 3600 + minutes * 60 + seconds
+
+
+def departure_sort_key(column: pd.Series) -> pd.Series:
+    """``sort_values`` key that orders departure_time by exact seconds, not as text."""
+    if column.name == "departure_time":
+        return column.map(parse_time_to_seconds)
+    return column
+
+
 def split_trip_exceptions(
     final_data: pd.DataFrame,
     trips: pd.DataFrame,
     routes: pd.DataFrame,
     stops: pd.DataFrame,
+    stop_times: pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """List trips with broken references and remove those that cannot be classified.
 
     A trip is removed from the analysis when its shape is blank or unusable, or
-    when it has no stop_times rows. Trips whose terminal stops are missing from
-    stops.txt, or whose first stop has no departure_time, stay in the analysis
-    but are still listed. Trips whose route_id is not in routes.txt are listed
-    regardless of the route filters, since their route is unknown.
+    when it has no stop_times rows. Trips whose terminal stop_id is blank or
+    missing from stops.txt, or whose first stop has no departure_time, stay in
+    the analysis but are still listed. Trips whose route_id is not in
+    routes.txt are listed regardless of the route filters, since their route
+    is unknown.
 
     Args:
         final_data: Output of :func:`identify_first_last_stops`.
         trips: The full trips table.
         routes: The full (unfiltered) routes table.
         stops: The stops table.
+        stop_times: The stop_times table.
 
     Returns:
         ``(kept, exceptions)``: the trips that remain in the analysis, and one
         row per (trip, problem) with an ``excluded`` column.
     """
     known_stops = stops["stop_id"]
-    has_stop_times = final_data["first_stop_id"].notna()
+    first_ids, last_ids = final_data["first_stop_id"], final_data["last_stop_id"]
+    has_stop_times = final_data["trip_id"].isin(stop_times["trip_id"])
     checks = [
         (final_data["shape_id"] == "", "shape_id is blank", True),
         (
@@ -549,13 +588,15 @@ def split_trip_exceptions(
             True,
         ),
         (~has_stop_times, "no rows in stop_times.txt", True),
+        (has_stop_times & first_ids.isna(), "first stop_id is blank", False),
         (
-            has_stop_times & ~final_data["first_stop_id"].isin(known_stops),
+            has_stop_times & first_ids.notna() & ~first_ids.isin(known_stops),
             "first stop_id not in stops.txt",
             False,
         ),
+        (has_stop_times & last_ids.isna(), "last stop_id is blank", False),
         (
-            has_stop_times & ~final_data["last_stop_id"].isin(known_stops),
+            has_stop_times & last_ids.notna() & ~last_ids.isin(known_stops),
             "last stop_id not in stops.txt",
             False,
         ),
@@ -622,7 +663,9 @@ def summarize_patterns(final_data: pd.DataFrame) -> pd.DataFrame:
                 "shape_id",
                 "shape_direction",
                 "is_dominant",
+                "first_stop_id",
                 "first_stop_name",
+                "last_stop_id",
                 "last_stop_name",
             ],
             dropna=False,
@@ -639,7 +682,96 @@ def output_file_name(route_label: str, direction_id: str, suffix: str) -> str:
     allow in file names become "-".
     """
     name = f"Route_{route_label}_Dir_{direction_id or 'none'}_{suffix}"
-    return re.sub(r'[\\/:*?"<>|]+', "-", name)
+    return re.sub(_UNSAFE_FILE_CHARS, "-", name)
+
+
+def departure_files(final_data: pd.DataFrame) -> list[tuple[str, pd.DataFrame]]:
+    """Return ``(file name, trips)`` for each route_id and direction_id's departures file."""
+    return [
+        (output_file_name(group["route_label"].iloc[0], direction, "departures.xlsx"), group)
+        for (_route_id, direction), group in final_data.groupby(["route_id", "direction_id"])
+    ]
+
+
+def map_files(summary: pd.DataFrame, dominant_only: bool) -> list[tuple[str, dict[Hashable, Any]]]:
+    """Return ``(file name, summary row)`` for each map :func:`export_jpegs` draws.
+
+    One map per route_id, direction_id, and shape_id, or only each route and
+    direction's dominant shape when *dominant_only* is True.
+    """
+    maps = summary.drop_duplicates(["route_id", "direction_id", "shape_id"])
+    if dominant_only:
+        maps = maps[maps["is_dominant"]]
+    files: list[tuple[str, dict[Hashable, Any]]] = []
+    for row in maps.to_dict("records"):
+        suffix = "DominantShape.jpeg" if dominant_only else f"Shape_{row['shape_id']}.jpeg"
+        files.append((output_file_name(row["route_label"], row["direction_id"], suffix), row))
+    return files
+
+
+def planned_output_files(
+    summary: pd.DataFrame,
+    final_data: pd.DataFrame,
+    export_xlsx: bool,
+    export_jpeg: bool,
+    dominant_only: bool,
+) -> list[tuple[str, str]]:
+    """Return ``(file name, what it holds)`` for every workbook and map this run writes."""
+    planned: list[tuple[str, str]] = []
+    if export_xlsx:
+        for name in (SUMMARY_FILENAME, SUSPICIOUS_FILENAME, EXCEPTIONS_FILENAME):
+            planned.append((name, "review workbook"))
+        for name, group in departure_files(final_data):
+            route_id, direction = group["route_id"].iloc[0], group["direction_id"].iloc[0]
+            planned.append((name, f"departures, route_id {route_id!r}, direction {direction!r}"))
+    if export_jpeg:
+        for name, row in map_files(summary, dominant_only):
+            planned.append(
+                (
+                    name,
+                    f"map, route_id {row['route_id']!r}, direction {row['direction_id']!r}, "
+                    f"shape_id {row['shape_id']!r}",
+                )
+            )
+    return planned
+
+
+def check_unique_file_names(planned: Sequence[tuple[str, str]]) -> None:
+    """Stop the run, before anything is written, if two outputs share a file name.
+
+    Names are compared ignoring case, because Windows treats ``Route_a`` and
+    ``Route_A`` as the same file.
+
+    Raises:
+        ValueError: Two or more outputs would be written to the same file.
+    """
+    by_name: dict[str, list[str]] = {}
+    for name, source in planned:
+        by_name.setdefault(name.casefold(), []).append(f"{name} ({source})")
+    clashes = [entries for entries in by_name.values() if len(entries) > 1]
+    if clashes:
+        raise ValueError(
+            f"{len(clashes)} output file name(s) would be written by more than one output, "
+            "so one would overwrite the other. Exclude one of the routes involved, or map "
+            "only dominant shapes if the clash is between shape maps: "
+            + "; ".join(" vs. ".join(entries) for entries in clashes[:5])
+        )
+
+
+def find_stale_route_files(output_dir: Path, written: Iterable[str]) -> list[str]:
+    """List per-route workbooks and maps in *output_dir* that this run did not write.
+
+    They are left over from an earlier run, for example one with other route
+    filters, and may not match this run's summary. Nothing is deleted.
+    """
+    if not output_dir.is_dir():
+        return []
+    current = {name.casefold() for name in written}
+    return sorted(
+        path.name
+        for path in output_dir.iterdir()
+        if _ROUTE_FILE_PATTERN.fullmatch(path.name) and path.name.casefold() not in current
+    )
 
 
 def export_excel_summaries(
@@ -663,10 +795,8 @@ def export_excel_summaries(
     ):
         frame.to_excel(output_dir / name, index=False)
 
-    grouped_fd = final_data.groupby(["route_id", "direction_id"])
-    for (_route_id, direction), group in grouped_fd:
-        output_name = output_file_name(group["route_label"].iloc[0], direction, "departures.xlsx")
-        group.sort_values(["departure_minutes", "trip_id"]).to_excel(
+    for output_name, group in departure_files(final_data):
+        group.sort_values(["departure_time", "trip_id"], key=departure_sort_key).to_excel(
             output_dir / output_name, index=False
         )
 
@@ -684,28 +814,22 @@ def export_jpegs(
     ``..._Shape_<shape_id>.jpeg``. A shape used by several routes is mapped once
     per route.
     """
-    maps = summary.drop_duplicates(["route_id", "direction_id", "shape_id"])
-    if dominant_only:
-        maps = maps[maps["is_dominant"]]
-
-    for row in maps.to_dict("records"):
+    for file_name, row in map_files(summary, dominant_only):
         shape_id, route, direction = row["shape_id"], row["route_label"], row["direction_id"]
         route_shape_gdf = gdf_shapes[gdf_shapes["shape_id"] == shape_id]
         if dominant_only:
-            suffix, shape_label = "DominantShape.jpeg", "Most Common Shape"
+            shape_label = "Most Common Shape"
         else:
-            suffix = f"Shape_{shape_id}.jpeg"
             shape_label = f"Shape {shape_id}" + (" (most common)" if row["is_dominant"] else "")
-
-        output_path = output_dir / output_file_name(route, direction, suffix)
-        plot_route_shape(route_shape_gdf, route, direction, output_path, shape_label)
+        plot_route_shape(route_shape_gdf, route, direction, output_dir / file_name, shape_label)
 
 
 def flag_suspicious_data(summary: pd.DataFrame) -> pd.DataFrame:
     """Flag inconsistent shape_direction vs. direction_id combinations.
 
     Uses every shape in *summary*, not only dominant ones, so a minority shape
-    running the opposite way is still caught.
+    running the opposite way is still caught. Within one direction_id, two
+    different cardinal directions, or both CW and CCW, are flagged.
 
     Returns:
         One row per flagged route or route/direction, with columns route_id,
@@ -733,21 +857,20 @@ def flag_suspicious_data(summary: pd.DataFrame) -> pd.DataFrame:
                 }
             )
 
-    def is_cardinal_direction(direct: str) -> bool:
-        return direct in ("NB", "SB", "EB", "WB")
-
+    direction_sets = (("cardinal", {"NB", "SB", "EB", "WB"}), ("loop", {"CW", "CCW"}))
     rd_group = summary_simplified.groupby(["route_id", "route_short_name", "direction_id"])
     for (route_id, rname, did), subgrp in rd_group:
-        cardinal_dirs = sorted({d for d in subgrp["shape_direction"] if is_cardinal_direction(d)})
-        if len(cardinal_dirs) > 1:
-            flags.append(
-                {
-                    "route_id": route_id,
-                    "route_short_name": rname,
-                    "direction_id": did,
-                    "problem": f"Conflicting cardinal directions {cardinal_dirs}",
-                }
-            )
+        for kind, labels in direction_sets:
+            found = sorted(labels.intersection(subgrp["shape_direction"]))
+            if len(found) > 1:
+                flags.append(
+                    {
+                        "route_id": route_id,
+                        "route_short_name": rname,
+                        "direction_id": did,
+                        "problem": f"Conflicting {kind} directions {found}",
+                    }
+                )
 
     return pd.DataFrame(flags, columns=["route_id", "route_short_name", "direction_id", "problem"])
 
@@ -916,7 +1039,8 @@ def run(
        aside trips with broken references.
     5. Determines dominant shapes within each route/direction based on trip counts.
     6. Flags data where shape_direction and direction_id seem inconsistent.
-    7. Exports summaries, per-route files, and review workbooks to Excel, if enabled.
+    7. Checks that no two outputs share a file name, then exports summaries,
+       per-route files, and review workbooks to Excel, if enabled.
     8. Exports JPEG maps of dominant (or all) shapes, if enabled.
 
     Returns:
@@ -924,7 +1048,7 @@ def run(
 
     Raises:
         OSError: The feed cannot be read or an output cannot be written.
-        ValueError: The feed is malformed.
+        ValueError: The feed is malformed, or two outputs would share a file name.
         RuntimeError: The run log could not be written while
             ``REQUIRE_RUN_LOG`` is True.
     """
@@ -942,7 +1066,7 @@ def run(
 
     # Step 4: Identify first and last stops; set aside trips with broken references
     final_data = identify_first_last_stops(trips_merged, stop_times, stops)
-    final_data, exceptions = split_trip_exceptions(final_data, trips, routes, stops)
+    final_data, exceptions = split_trip_exceptions(final_data, trips, routes, stops, stop_times)
     excluded_trips = exceptions.loc[exceptions["excluded"], "trip_id"].nunique()
     if not exceptions.empty:
         logging.warning(
@@ -964,6 +1088,10 @@ def run(
 
     if not (export_xlsx or export_jpeg):
         return summary
+    planned = planned_output_files(
+        summary, final_data, export_xlsx, export_jpeg, map_only_dominant_shape
+    )
+    check_unique_file_names(planned)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Step 7: Export to Excel
@@ -973,6 +1101,16 @@ def run(
     # Step 8: Export JPEGs
     if export_jpeg:
         export_jpegs(summary, gdf_shapes, output_dir, map_only_dominant_shape)
+
+    stale = find_stale_route_files(output_dir, [name for name, _ in planned])
+    if stale:
+        logging.warning(
+            "%d per-route file(s) in '%s' were not written by this run and may be left "
+            "from an earlier one, e.g. %s. Delete them or use an empty output folder.",
+            len(stale),
+            output_dir,
+            stale[0],
+        )
 
     summary_lines = [
         f"GTFS feed:               {gtfs_path}",
@@ -986,6 +1124,7 @@ def run(
         f"Trips excluded:          {excluded_trips}",
         f"Patterns:                {len(summary)}",
         f"Suspicious combinations: {len(flagged)}",
+        f"Leftover route files:    {len(stale)}",
     ]
     if not write_run_log(output_dir, summary_lines) and REQUIRE_RUN_LOG:
         raise RuntimeError(
