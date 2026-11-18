@@ -1,14 +1,14 @@
 """Compute route-level running-time features from TIDES, windowed for ridership modeling.
 
-This is the *modeling-feature* counterpart to ``runtime_by_trip.py``. Where
-that script diagnoses individual scheduled trips (per-trip stats, variation
-flags, day-of-week anomalies), this one rolls observed running time up to one
-value per route so it can join the route-level modeling table on the secured
-box (see ``scripts/modeling/prep_features_private.py``).
+This is the *modeling-feature* counterpart to the trip running-time tables of
+``otp_runtime_from_tides.py``. Where that script diagnoses individual scheduled
+trips (per-trip stats, variation flags, day-of-week anomalies), this one rolls
+observed running time up to one value per route so it can join the route-level
+modeling table on the secured box (see ``scripts/modeling/prep_features_private.py``).
 
-It runs in two stages, mirroring the OTP pipeline (``otp_monthly_panel.py`` ->
-``otp_by_route.py``) but packaged in a single file because no monthly-runtime
-panel exists elsewhere to consume:
+It runs in two stages, mirroring the OTP pipeline (``otp_runtime_from_tides.py`` ->
+``otp_by_route.py``) but packaged in a single file with its own all-days panel
+(the exporter's route x month running times are split by day type):
 
     derive -> panel        Observed trip running times (last served arrival minus
                            first served departure) are derived from a TIDES
@@ -139,7 +139,7 @@ class Config:
 
 # =============================================================================
 # LOADING & RUNTIME DERIVATION
-#   (mechanics mirror runtime_by_trip.py; kept self-contained on purpose)
+#   (mechanics mirror otp_runtime_from_tides.py; kept self-contained on purpose)
 # =============================================================================
 
 # TIDES identifies a performed trip by (service_date, trip_id_performed): the same
