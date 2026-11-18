@@ -49,8 +49,8 @@ transit_planning_with_python/
 │   │   ├── bay_usage_analyzer.py
 │   │   ├── cluster_stops_from_zones_arcpy.py
 │   │   ├── cluster_stops_from_zones_gpd.py
-│   │   ├── flag_stop_upgrades.py
-│   │   ├── stop_improvement_coverage_summary.py
+│   │   ├── stop_upgrades_flagger.py
+│   │   ├── stop_upgrades_survey.py
 │   │   ├── walking_network_qa_arcpy.py
 │   │   └── walking_network_qa_gpd.py
 │   ├── field_tools/
@@ -280,7 +280,6 @@ transit_planning_with_python/
 │   ├── test_distance_helpers.py
 │   ├── test_district_ridership_share_arcpy.py
 │   ├── test_district_ridership_share_gpd.py
-│   ├── test_flag_stop_upgrades.py
 │   ├── test_gbfs_ridership_join.py
 │   ├── test_gbfs_stations_exporter.py
 │   ├── test_generate_mock_cbd.py
@@ -348,13 +347,14 @@ transit_planning_with_python/
 │   ├── test_shapefile_helpers.py
 │   ├── test_site_route_proximity_gpd.py
 │   ├── test_stop_impacts_target_routes.py
-│   ├── test_stop_improvement_coverage_summary.py
 │   ├── test_stop_pattern_id.py
 │   ├── test_stop_removal_impact_gpd.py
 │   ├── test_stop_removal_impact_gtfs_zip.py
 │   ├── test_stop_ridership_change.py
 │   ├── test_stop_spacing_flagger_arcpy.py
 │   ├── test_stop_spacing_flagger_gpd.py
+│   ├── test_stop_upgrades_flagger.py
+│   ├── test_stop_upgrades_survey.py
 │   ├── test_stop_v_conflict_checker_arcpy.py
 │   ├── test_stop_v_conflict_checker_gpd.py
 │   ├── test_stop_vs_roadname_checker_arcpy.py

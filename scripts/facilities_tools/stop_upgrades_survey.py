@@ -1,4 +1,4 @@
-"""Summarize system-level stop improvement coverage.
+"""Survey system-level stop upgrade coverage.
 
 Computes aggregate metrics about bus stop improvements (e.g., shelters,
 benches, trash cans, ADA pads) across a GTFS feed, with optional support for
