@@ -293,9 +293,15 @@ def make_stops_fc(df: pd.DataFrame, out_fc: str, sr: int) -> None:
 
 
 def safe_project_or_copy(in_fc: str, out_fc: str, out_sr: int) -> None:
-    """Project `in_fc` to `out_fc`. If Project fails, fall back to CopyFeatures.
+    """Project `in_fc` to `out_fc`, or copy it if it already uses `out_sr`.
 
-    Ensures `out_fc` exists on return.
+    Ensures `out_fc` exists, in `out_sr`, on return. A failed projection stops
+    the run: copying the input unprojected would let the buffer and spatial
+    join run with layers in different coordinate systems.
+
+    Raises:
+        RuntimeError: If `in_fc` has no defined coordinate system, Project
+            fails, or `out_fc` is not created.
     """
     if arcpy.Exists(out_fc):
         arcpy.management.Delete(out_fc)
@@ -304,6 +310,12 @@ def safe_project_or_copy(in_fc: str, out_fc: str, out_sr: int) -> None:
     src_sr = desc.spatialReference
     tgt_sr = arcpy.SpatialReference(out_sr)
 
+    if not src_sr.name or src_sr.name == "Unknown":
+        raise RuntimeError(
+            f"{in_fc} has no defined coordinate system (a shapefile may be missing "
+            "its .prj file). Set it with ArcGIS Pro's Define Projection tool, then rerun."
+        )
+
     try:
         if src_sr.name and src_sr.factoryCode == tgt_sr.factoryCode:
             # Already in target SR
@@ -311,8 +323,7 @@ def safe_project_or_copy(in_fc: str, out_fc: str, out_sr: int) -> None:
         else:
             arcpy.management.Project(in_fc, out_fc, tgt_sr)
     except arcpy.ExecuteError as exc:
-        logging.warning("Project failed (%s). Copying features instead.", exc)
-        arcpy.management.CopyFeatures(in_fc, out_fc)
+        raise RuntimeError(f"Could not project {in_fc} to WKID {out_sr}: {exc}") from exc
 
     if not arcpy.Exists(out_fc):
         raise RuntimeError(f"Failed to create {out_fc}")

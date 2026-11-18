@@ -211,6 +211,71 @@ def test_make_stops_fc_sets_text_field_lengths(mod: types.ModuleType) -> None:
 
 
 # ---------------------------------------------------------------------------
+# safe_project_or_copy
+# ---------------------------------------------------------------------------
+
+
+def _fake_projection(
+    mod: types.ModuleType, src_name: str, src_wkid: int, project_fails: bool = False
+) -> list[str]:
+    """Fake the geoprocessing ``safe_project_or_copy`` uses; return the tools it runs."""
+    calls: list[str] = []
+    created: set[str] = set()
+
+    class ExecuteError(Exception):
+        pass
+
+    def project(in_fc: str, out_fc: str, sr: Any) -> None:
+        calls.append("Project")
+        if project_fails:
+            raise ExecuteError("ERROR 999999: simulated failure")
+        created.add(out_fc)
+
+    def copy(in_fc: str, out_fc: str) -> None:
+        calls.append("CopyFeatures")
+        created.add(out_fc)
+
+    arcpy = mod.arcpy
+    arcpy.ExecuteError = ExecuteError
+    arcpy.Exists = lambda path: path in created
+    arcpy.Describe = lambda path: types.SimpleNamespace(
+        spatialReference=types.SimpleNamespace(name=src_name, factoryCode=src_wkid)
+    )
+    arcpy.SpatialReference = lambda wkid: types.SimpleNamespace(name="Target", factoryCode=wkid)
+    arcpy.management = types.SimpleNamespace(
+        Project=project, CopyFeatures=copy, Delete=created.discard
+    )
+    return calls
+
+
+def test_safe_project_or_copy_projects_other_sr(mod: types.ModuleType) -> None:
+    calls = _fake_projection(mod, "GCS_WGS_1984", 4326)
+    mod.safe_project_or_copy("roads.shp", "work.gdb/roads_proj", 2248)
+    assert calls == ["Project"]
+
+
+def test_safe_project_or_copy_copies_when_already_in_target_sr(mod: types.ModuleType) -> None:
+    calls = _fake_projection(mod, "NAD_1983_StatePlane_Maryland_FIPS_1900_Feet", 2248)
+    mod.safe_project_or_copy("roads.shp", "work.gdb/roads_proj", 2248)
+    assert calls == ["CopyFeatures"]
+
+
+def test_safe_project_or_copy_failed_projection_stops(mod: types.ModuleType) -> None:
+    # The old fallback copied the input unprojected and carried on.
+    calls = _fake_projection(mod, "GCS_WGS_1984", 4326, project_fails=True)
+    with pytest.raises(RuntimeError, match="Could not project roads.shp to WKID 2248"):
+        mod.safe_project_or_copy("roads.shp", "work.gdb/roads_proj", 2248)
+    assert calls == ["Project"]
+
+
+def test_safe_project_or_copy_unknown_sr_stops_before_projecting(mod: types.ModuleType) -> None:
+    calls = _fake_projection(mod, "Unknown", 0)
+    with pytest.raises(RuntimeError, match="no defined coordinate system"):
+        mod.safe_project_or_copy("roads.shp", "work.gdb/roads_proj", 2248)
+    assert calls == []
+
+
+# ---------------------------------------------------------------------------
 # main (geoprocessing faked)
 # ---------------------------------------------------------------------------
 
