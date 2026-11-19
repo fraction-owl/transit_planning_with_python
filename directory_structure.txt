@@ -97,6 +97,7 @@ transit_planning_with_python/
 │   │   ├── clean_eia_gas_prices.py
 │   │   ├── clean_fred_unrate.py
 │   │   ├── clean_noaa_weather.py
+│   │   ├── county_fips_picker.py
 │   │   ├── schools_prep_join_gpd.py
 │   │   ├── uscensus_table_build.py
 │   │   ├── uscensus_tiger_join_arcpy.py
@@ -274,10 +275,12 @@ transit_planning_with_python/
 │   ├── test_convert_to_tides_stop_visits.py
 │   ├── test_convert_to_tides_trips_performed.py
 │   ├── test_cordon_crossing_routes_gpd.py
+│   ├── test_county_fips_picker.py
 │   ├── test_data_request_by_stop_processor.py
 │   ├── test_distance_helpers.py
 │   ├── test_district_ridership_share_arcpy.py
 │   ├── test_district_ridership_share_gpd.py
+│   ├── test_fips_helpers.py
 │   ├── test_gbfs_ridership_join.py
 │   ├── test_gbfs_stations_exporter.py
 │   ├── test_generate_mock_cbd.py
@@ -370,6 +373,7 @@ transit_planning_with_python/
 │   ├── calendar_helpers.py
 │   ├── cli_helpers.py
 │   ├── distance_helpers.py
+│   ├── fips_helpers.py
 │   ├── gtfs_helpers.py
 │   ├── network_helpers.py
 │   ├── run_log.py
