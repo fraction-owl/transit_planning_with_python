@@ -3282,19 +3282,30 @@ def write_monthly_reports(
             )
         )
     )
+    # Lead with the group keys, as the wide tables do; concat would leave them after
+    # the measures, in the order it first met them.
+    keys = list(dict.fromkeys(col for level in tables for col in monthly_group_columns(level)))
+    lead = ["level", *keys, "month"]
+    processed = processed[[*lead, *[col for col in processed.columns if col not in lead]]]
     _write_csv(processed, out_dir / MONTHLY_PROCESSED_FILENAME, files)
     _write_csv(coverage, out_dir / MONTHLY_COVERAGE_FILENAME, files)
     low = coverage.loc[coverage["pct_trips_scored"] < coverage_warn_pct]
-    for row in low.itertuples(index=False):
+    if not low.empty:
+        # One summary line: a warning per row would flood the log on long, wide runs.
+        worst = low.loc[low["pct_trips_scored"].idxmin()]
         logging.warning(
-            "Monthly OTP coverage: %s %s in %s has scored visits on %.1f%% of %d "
-            "eligible trips listed in TIDES (threshold %.1f%%).",
-            row.level,
-            row.route_id,
-            row.month,
-            row.pct_trips_scored,
-            row.trips_listed,
+            "Monthly OTP coverage: %d of %d system and route month row(s) have scored "
+            "visits on fewer than %.1f%% of the eligible trips listed in TIDES (lowest: "
+            "%s %s in %s, %.1f%% of %d trips); see %s.",
+            len(low),
+            len(coverage),
             coverage_warn_pct,
+            worst["level"],
+            worst["route_id"],
+            worst["month"],
+            worst["pct_trips_scored"],
+            worst["trips_listed"],
+            MONTHLY_COVERAGE_FILENAME,
         )
 
 
@@ -5246,7 +5257,7 @@ def run(settings: RunSettings) -> RunResult:
             segment_observations = _observation_export(segments, SEGMENT_OBSERVATION_COLUMNS)
             _write_csv(segment_observations, segment_dir / SEGMENT_OBSERVATIONS_FILENAME, files)
 
-    if not (otp_tables or trip_tables or segment_tables) and monthly_coverage.empty:
+    if not (otp_tables or trip_tables or segment_tables or monthly_tables):
         raise InputDataError(
             "No table could be built: no visit was scored for OTP and no running time could "
             "be measured. Check the timestamps, the timepoint column and the measures."
@@ -5320,10 +5331,10 @@ def run(settings: RunSettings) -> RunResult:
         f"Routes excluded:    {', '.join(settings.routes_to_exclude) or '(none)'}",
         f"On-time window:     {settings.early_min:g} to {settings.late_min:g} min; "
         f"timepoints only: {settings.timepoints_only}; standard {settings.otp_standard:g}%",
-        f"Monthly OTP reports: {settings.export_monthly_reports}; pooled included dates; "
+        f"Monthly reports:    {settings.export_monthly_reports}; pooled included dates; "
         f"coverage warning below {settings.monthly_coverage_warn_pct:g}%",
-        f"Monthly corridors: {dict(corridors)!r}",
-        "Monthly coverage:  denominator = eligible trips listed in TIDES; "
+        f"Monthly corridors:  {dict(corridors)!r}",
+        "Monthly coverage:   denominator = eligible trips listed in TIDES; "
         "numerator = listed trips with at least one scored visit (not GTFS schedule coverage).",
         f"Running time:       trim {settings.trim_frac:g} per tail; percentiles "
         f"{', '.join(f'{p:g}' for p in settings.percentiles)}; segments between "

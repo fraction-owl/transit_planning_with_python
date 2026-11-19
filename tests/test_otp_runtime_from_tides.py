@@ -281,6 +281,23 @@ def test_score_otp_filters_and_explains_unscored_visits() -> None:
     assert len(everything) == 3  # the non-timepoint visit now scores too
 
 
+def test_join_drops_visits_from_the_canceled_date_only() -> None:
+    """A trip ID canceled on one date keeps only the other date's visits."""
+    trips = pd.DataFrame(
+        {
+            "service_date": ["2025-01-06", "2025-01-07"],
+            "trip_id_performed": ["T1", "T1"],
+            "route_id": ["101", "101"],
+            "schedule_relationship": ["Scheduled", "Canceled"],
+        }
+    )
+    visits = pd.DataFrame(
+        {"service_date": ["2025-01-06", "2025-01-07"], "trip_id_performed": ["T1", "T1"]}
+    )
+    joined = target.join_trips(visits, trips)
+    assert joined["service_date"].tolist() == [pd.Timestamp("2025-01-06")]
+
+
 def test_route_month_otp_matches_a_direct_join(full_run: target.RunResult) -> None:
     """Route x month counts (all day types) equal an independent scoring of the fixtures."""
     sv = pd.read_csv(STOP_VISITS, dtype=str)
@@ -786,6 +803,12 @@ def test_selected_grains_limit_what_is_written(tmp_path: Path) -> None:
         ({"measures": ["segment_runtime"], "levels": ["route"]}, "None of the levels"),
         ({"measures": ["speed"]}, "unknown entries"),
         ({"chart_levels": ("trip",)}, "cannot be charted"),
+        ({"export_monthly_reports": True, "measures": ["trip_runtime"]}, "require the otp"),
+        ({"monthly_coverage_warn_pct": 120.0}, "MONTHLY_COVERAGE_WARN_PCT"),
+        ({"corridors": {"North": ()}}, "nonempty sequence"),
+        ({"corridors": {"North": "DC_R10"}}, "nonempty sequence"),
+        ({"corridors": {" ": ("DC_R10",)}}, "nonblank and unique"),
+        ({"corridors": {"North": ("DC_R10",), "North ": ("DC_R20",)}}, "nonblank and unique"),
     ],
 )
 def test_unusable_settings_are_reported(tmp_path: Path, overrides: dict, fragment: str) -> None:
@@ -864,3 +887,265 @@ def test_main_end_to_end_with_a_periods_file(tmp_path: Path) -> None:
     assert "Measures:           otp, trip_runtime" in log
     assert "# === BEGIN CONFIG ===" not in log
     assert "TRIP_TIME_BASIS: str" in log
+
+
+# --- monthly OTP reports ------------------------------------------------------------
+
+MONTHLY_DIR = Path(target.OTP_SUBDIR) / target.MONTHLY_SUBDIR
+COUNTS = ["early", "on_time", "late", "evaluated"]
+CORRIDORS = {"North": ("DC_R10", "DC_R20"), "Crosstown": ("DC_R20", "DC_R30")}
+
+
+def _read_processed(monthly_dir: Path) -> pd.DataFrame:
+    return pd.read_csv(monthly_dir / target.MONTHLY_PROCESSED_FILENAME, dtype={"direction_id": str})
+
+
+@pytest.fixture(scope="module")
+def monthly_run(tmp_path_factory: pytest.TempPathFactory) -> tuple[target.RunResult, Path]:
+    """Monthly reports at the four chartable levels with two overlapping corridors."""
+    out_dir = tmp_path_factory.mktemp("monthly_run")
+    result = target.run(
+        _settings(
+            out_dir,
+            measures=["otp"],
+            levels=list(target.CHARTABLE_LEVELS),
+            time_cuts=["month"],
+            export_stop_flags=False,
+            export_monthly_reports=True,
+            corridors=CORRIDORS,
+            export_charts=True,
+            chart_levels=(),
+        )
+    )
+    return result, out_dir / MONTHLY_DIR
+
+
+def test_monthly_tables_pool_the_day_types(monthly_run: tuple[target.RunResult, Path]) -> None:
+    """Route x month counts equal the standard route x month table summed over day types."""
+    result, monthly_dir = monthly_run
+    standard = result.otp[("route", "month")].groupby(["route_id", "month"])[COUNTS].sum()
+    processed = _read_processed(monthly_dir)
+    route = processed.loc[processed["level"] == "route"].set_index(["route_id", "month"])[COUNTS]
+    pd.testing.assert_frame_equal(route.sort_index(), standard.sort_index(), check_dtype=False)
+    assert (processed[COUNTS[:3]].sum(axis=1) == processed["evaluated"]).all()
+
+
+def test_monthly_reports_count_each_visit_once(tmp_path: Path) -> None:
+    """With overlapping day types, monthly counts match one day type, not their sum."""
+    weekdays = target.WEEKDAY_NAMES[:5]
+    result = target.run(
+        _settings(
+            tmp_path,
+            measures=["otp"],
+            levels=["system"],
+            time_cuts=["month"],
+            export_stop_flags=False,
+            day_types={"Weekday": weekdays, "Every day": target.WEEKDAY_NAMES},
+            export_monthly_reports=True,
+        )
+    )
+    standard = result.otp[("system", "month")]
+    every_day = standard.loc[standard["day_type"] == "Every day"].set_index("month")["evaluated"]
+    monthly = _read_processed(tmp_path / MONTHLY_DIR).set_index("month")["evaluated"]
+    pd.testing.assert_series_equal(monthly, every_day, check_names=False)
+    assert standard["evaluated"].sum() > monthly.sum()
+
+
+def test_corridors_pool_their_routes(monthly_run: tuple[target.RunResult, Path]) -> None:
+    """A corridor sums its routes; a route may sit in two corridors; system totals stay put."""
+    _, monthly_dir = monthly_run
+    processed = _read_processed(monthly_dir)
+    route = processed.loc[processed["level"] == "route"]
+    corridor = processed.loc[processed["level"] == "corridor"]
+    for name, routes in CORRIDORS.items():
+        got = corridor.loc[corridor["corridor"] == name].set_index("month")["evaluated"]
+        expected = route.loc[route["route_id"].isin(routes)].groupby("month")["evaluated"].sum()
+        pd.testing.assert_series_equal(got, expected, check_names=False)
+    system = processed.loc[processed["level"] == "system"].set_index("month")["evaluated"]
+    pd.testing.assert_series_equal(
+        system, route.groupby("month")["evaluated"].sum(), check_names=False
+    )
+
+
+def test_monthly_tables_lead_with_the_group_keys(
+    monthly_run: tuple[target.RunResult, Path],
+) -> None:
+    """The long table starts with level, keys and month; wide tables have a column per month."""
+    _, monthly_dir = monthly_run
+    header = pd.read_csv(monthly_dir / target.MONTHLY_PROCESSED_FILENAME, nrows=0).columns
+    assert list(header[:6]) == [
+        "level",
+        "route_type_agency",
+        "route_id",
+        "direction_id",
+        "corridor",
+        "month",
+    ]
+    wide = pd.read_csv(monthly_dir / "otp_monthly_route_direction.csv", dtype=str)
+    assert list(wide.columns) == ["route_id", "direction_id", "2026-01", "2026-02", "2026-03"]
+    system = pd.read_csv(monthly_dir / "otp_monthly_system.csv")
+    assert system["group"].tolist() == ["ALL"]
+
+
+def test_monthly_line_charts_are_drawn(monthly_run: tuple[target.RunResult, Path]) -> None:
+    """One chart per group at each level, corridors included."""
+    _, monthly_dir = monthly_run
+    plots = monthly_dir / "plots"
+    counts = {level: len(list((plots / level).glob("*.png"))) for level in ("system", "corridor")}
+    assert counts == {"system": 1, "corridor": 2}
+    assert len(list((plots / "route").glob("*.png"))) == 4
+
+
+def test_monthly_pivot_leaves_unobserved_months_blank() -> None:
+    """A month with no visits is blank, not 0% on time; duplicate keys are refused."""
+    table = pd.DataFrame(
+        {"route_id": ["R1", "R1"], "month": ["2026-01", "2026-03"], "pct_on_time": [80.0, 90.0]}
+    )
+    wide = target.monthly_otp_pivot(table, "route", ["2026-01", "2026-02", "2026-03"])
+    assert list(wide.columns) == ["route_id", "2026-01", "2026-02", "2026-03"]
+    assert wide["2026-01"].tolist() == [80.0]
+    assert wide["2026-02"].isna().all()
+    with pytest.raises(ValueError, match="duplicate"):
+        target.monthly_otp_pivot(pd.concat([table, table]), "route", ["2026-01"])
+
+
+def test_monthly_trip_coverage_counts_unscored_trips() -> None:
+    """Listed in-service trips without a scored visit stay in the denominator."""
+    trips = pd.DataFrame(
+        {
+            "trip_id_performed": ["T1", "T2", "T3", "T4", "T1"],
+            "route_id": ["101"] * 5,
+            "service_date": ["2025-01-02"] * 4 + ["2025-01-03"],
+            "schedule_relationship": [
+                "Scheduled",
+                "Scheduled",
+                "Scheduled",
+                "Canceled",
+                "Scheduled",
+            ],
+            "trip_type": ["In service"] * 5,
+        }
+    )
+    scored = pd.DataFrame(
+        {
+            "service_date": pd.to_datetime(["2025-01-02"] * 3),
+            "trip_id_performed": ["T1", "T1", "T2"],
+        }
+    )
+    coverage = target.monthly_trip_coverage(target.in_service_trips(trips), scored)
+    route = coverage.loc[coverage["level"] == "route"]
+    assert len(route) == 1
+    row = route.iloc[0]
+    assert row["month"] == "2025-01"
+    assert row["trips_listed"] == 4  # T4 is Canceled; T1 counts once per date
+    assert row["trips_scored"] == 2  # T3 and T1's second date have no scored visit
+    assert row["pct_trips_scored"] == pytest.approx(50.0)
+    assert row["evaluated_visits"] == 3
+    assert row["visits_per_scored_trip"] == pytest.approx(1.5)
+    system = coverage.loc[coverage["level"] == "system"].iloc[0]
+    assert (system["route_id"], system["trips_listed"]) == ("ALL", 4)
+
+
+def test_low_coverage_is_one_warning(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """Rows below the threshold are summed up in a single warning naming the lowest."""
+    coverage = pd.DataFrame(
+        {
+            "level": ["system", "route", "route", "route"],
+            "route_id": ["ALL", "101", "102", "103"],
+            "month": ["2026-01"] * 4,
+            "trips_listed": [40, 10, 10, 20],
+            "trips_scored": [30, 9, 5, 16],
+            "pct_trips_scored": [75.0, 90.0, 50.0, 80.0],
+            "evaluated_visits": [60, 18, 10, 32],
+            "visits_per_scored_trip": [2.0, 2.0, 2.0, 2.0],
+        }
+    )
+    with caplog.at_level("WARNING"):
+        target.write_monthly_reports({}, coverage, ["2026-01"], tmp_path, [], 90.0)
+    warnings_logged = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings_logged) == 1
+    assert "3 of 4" in warnings_logged[0]
+    assert "route 102 in 2026-01, 50.0% of 10 trips" in warnings_logged[0]
+
+
+def test_monthly_reports_do_not_hide_an_empty_run(tmp_path: Path) -> None:
+    """With nothing scorable, the coverage table alone does not count as a result."""
+    visits = pd.read_csv(STOP_VISITS, dtype=str)
+    visits[["actual_arrival_time", "actual_departure_time"]] = None
+    blank_path = tmp_path / "stop_visits.csv"
+    visits.to_csv(blank_path, index=False)
+    settings = _settings(
+        tmp_path / "out", stop_visits_path=blank_path, measures=["otp"], export_monthly_reports=True
+    )
+    with pytest.raises(target.InputDataError, match="No table could be built"):
+        target.run(settings)
+
+
+def test_rerun_with_fewer_corridors_removes_their_outputs(tmp_path: Path) -> None:
+    """Tables and charts of corridors dropped from the settings do not linger."""
+    base = {
+        "measures": ["otp"],
+        "levels": ["system"],
+        "time_cuts": ["all_day"],
+        "export_stop_flags": False,
+        "export_monthly_reports": True,
+        "export_charts": True,
+        "chart_levels": (),
+    }
+    corridor_plots = tmp_path / MONTHLY_DIR / "plots" / "corridor"
+    target.run(_settings(tmp_path, corridors=CORRIDORS, **base))
+    assert len(list(corridor_plots.glob("*.png"))) == 2
+    target.run(_settings(tmp_path, corridors={"North": CORRIDORS["North"]}, **base))
+    assert [p.name for p in corridor_plots.glob("*.png")] == ["0001_North.png"]
+    wide = pd.read_csv(tmp_path / MONTHLY_DIR / "otp_monthly_corridor.csv")
+    assert wide["corridor"].tolist() == ["North"]
+    target.run(_settings(tmp_path, corridors={}, **base))
+    assert not list(corridor_plots.glob("*.png"))
+    assert not (tmp_path / MONTHLY_DIR / "otp_monthly_corridor.csv").exists()
+
+
+def test_parse_corridors_reads_repeated_flags() -> None:
+    assert target.parse_corridors(None) == target.CORRIDORS
+    assert target.parse_corridors(["North = DC_R10, DC_R20", "South=DC_R30"]) == {
+        "North": ["DC_R10", "DC_R20"],
+        "South": ["DC_R30"],
+    }
+    for bad in (["North"], ["North="], ["=DC_R10"], ["North=DC_R10,,DC_R20"], ["A=1", "A=2"]):
+        with pytest.raises(target.SettingsError, match="--corridor"):
+            target.parse_corridors(bad)
+
+
+def test_main_writes_monthly_reports(tmp_path: Path) -> None:
+    """The CLI flags reach the run, and the run log records them in its aligned block."""
+    code = target.main(
+        [
+            "--stop-visits",
+            str(STOP_VISITS),
+            "--trips-performed",
+            str(TRIPS_PERFORMED),
+            "--output-dir",
+            str(tmp_path),
+            "--measures",
+            "otp",
+            "--levels",
+            "route",
+            "--time-cuts",
+            "all_day",
+            "--monthly-reports",
+            "--corridor",
+            "North=DC_R10,DC_R20",
+            "--monthly-coverage-warn-pct",
+            "80",
+            "--no-charts",
+        ]
+    )
+    assert code == 0
+    monthly_dir = tmp_path / MONTHLY_DIR
+    assert (monthly_dir / "otp_monthly_route.csv").exists()
+    assert (monthly_dir / target.MONTHLY_COVERAGE_FILENAME).exists()
+    corridor = pd.read_csv(monthly_dir / "otp_monthly_corridor.csv")
+    assert corridor["corridor"].tolist() == ["North"]
+    log = (tmp_path / target.RUN_LOG_FILENAME).read_text("utf-8")
+    assert "Monthly reports:    True; pooled included dates; coverage warning below 80%" in log
+    assert "Monthly corridors:  {'North': ['DC_R10', 'DC_R20']}" in log
+    assert "Monthly coverage:   denominator" in log
