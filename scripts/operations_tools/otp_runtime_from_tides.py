@@ -20,7 +20,8 @@ or ``--time-period`` flags, and must cover the day exactly once.
 Inputs
 ------
 - TIDES ``stop_visits.csv`` and ``trips_performed.csv`` (for example from
-  ``convert_to_tides_stop_visits.py`` and ``convert_to_tides_trips_performed.py``).
+  ``convert_to_tides_stop_visits.py`` and ``convert_to_tides_trips_performed.py``), or a
+  folder of each, combined by ``STOP_VISITS_PATTERN`` / ``TRIPS_PERFORMED_PATTERN``.
 - Optional: GTFS feeds covering the TIDES dates, and a time-periods ``.txt`` file.
 
 Outputs
@@ -61,6 +62,8 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import fnmatch
+import hashlib
 import itertools
 import logging
 import os
@@ -99,6 +102,15 @@ import pandas as pd
 STOP_VISITS_PATH: str = r"Path\To\Your\stop_visits.csv"
 TRIPS_PERFORMED_PATH: str = r"Path\To\Your\trips_performed.csv"
 OUTPUT_DIR: str = r"Path\To\Your\Output_Folder"
+
+# Either input path may be a folder instead of a file: its CSVs whose names match
+# the pattern below (case ignored; subfolders are not searched) are read in name
+# order and combined, and both paths may name the same folder. A file identical to
+# an earlier one is skipped; files with different columns or shared service dates
+# are reported. Repeated rows then meet the usual duplicate checks: exact copies are
+# dropped, and where copies differ the row from the earliest-named file is kept.
+STOP_VISITS_PATTERN: str = "*stop_visits*.csv"
+TRIPS_PERFORMED_PATTERN: str = "*trips_performed*.csv"
 
 # MEASURES --------------------------------------------------------------------
 #   otp             - on-time performance at stop visits (timepoints by default)
@@ -623,6 +635,8 @@ class RunSettings(NamedTuple):
     export_monthly_reports: bool = EXPORT_MONTHLY_REPORTS
     corridors: Optional[Mapping[str, Sequence[str]]] = None
     monthly_coverage_warn_pct: float = MONTHLY_COVERAGE_WARN_PCT
+    stop_visits_pattern: str = STOP_VISITS_PATTERN
+    trips_performed_pattern: str = TRIPS_PERFORMED_PATTERN
 
 
 class RunResult(NamedTuple):
@@ -1570,6 +1584,139 @@ def load_tides_csv(path: Path, table: str, keep_text: bool = False) -> pd.DataFr
         raise InputDataError(f"Could not read {table} from '{path}': {exc}") from exc
 
 
+def tides_input_files(path: Path, pattern: str, table: str) -> List[Path]:
+    """Return the CSVs to read for one table: *path* itself, or its folder's matches.
+
+    Args:
+        path: A CSV file, or a folder of them.
+        pattern: ``fnmatch`` filename pattern for a folder, compared without regard
+            to case; subfolders are not searched.
+        table: The table's name, for messages.
+
+    Returns:
+        The files in name order, compared without the extension.
+
+    Raises:
+        InputDataError: If a folder holds no matching file.
+    """
+    if not path.is_dir():
+        return [path]
+    wanted = pattern.casefold()
+    files = sorted(
+        (p for p in path.iterdir() if p.is_file() and fnmatch.fnmatch(p.name.casefold(), wanted)),
+        # By stem first, so "x.csv" comes before a re-download "x (1).csv".
+        key=lambda p: (p.stem.casefold(), p.name.casefold()),
+    )
+    if not files:
+        raise InputDataError(f"No {table} file in '{path}' matches '{pattern}'.")
+    return files
+
+
+def _file_digest(path: Path) -> str:
+    """Return the SHA-256 of a file's bytes, read in 1 MB chunks."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def load_tides_table(path: Path, table: str, pattern: str) -> Tuple[pd.DataFrame, List[Path]]:
+    """Read one TIDES table from a CSV, or combine a folder's matching CSVs.
+
+    Files are read in name order. A file with the same bytes as an earlier one is
+    skipped. Files whose columns differ from the first file's, or that share service
+    dates, are reported: their repeated rows meet the row-level checks
+    (:func:`dedupe_stop_visits`, :func:`join_trips`), which keep the first copy.
+
+    Args:
+        path: A CSV file, or a folder of them.
+        table: The table's name, for messages.
+        pattern: Filename pattern for a folder (see :func:`tides_input_files`).
+
+    Returns:
+        The combined table, all columns as text, and the files read.
+
+    Raises:
+        InputDataError: If no file matches or a file cannot be parsed as CSV.
+    """
+    files = tides_input_files(path, pattern, table)
+    if len(files) == 1:
+        return load_tides_csv(files[0], table), files
+
+    # Only files of equal size can be identical, so only those are hashed.
+    sizes = [p.stat().st_size for p in files]
+    first_with: Dict[str, Path] = {}
+    kept: List[Path] = []
+    copies: List[str] = []
+    for file, size in zip(files, sizes):
+        if sizes.count(size) > 1:
+            digest = _file_digest(file)
+            if digest in first_with:
+                copies.append(f"{file.name} = {first_with[digest].name}")
+                continue
+            first_with[digest] = file
+        kept.append(file)
+    if copies:
+        logging.warning(
+            "Skipped %d %s file(s) identical to an earlier one: %s.",
+            len(copies),
+            table,
+            "; ".join(copies),
+        )
+
+    frames: List[pd.DataFrame] = []
+    dates: Dict[Path, set[dt.date]] = {}
+    for file in kept:
+        frame = load_tides_csv(file, table)
+        frames.append(frame)
+        if "service_date" in frame.columns:
+            unique = pd.Series(frame["service_date"].dropna().unique())
+            dates[file] = set(_parse_dates(unique).dropna().dt.date)
+        logging.info("Read %d %s row(s) from %s.", len(frame), table, file.name)
+
+    for file, frame in zip(kept[1:], frames[1:]):
+        missing = [c for c in frames[0].columns if c not in frame.columns]
+        extra = [c for c in frame.columns if c not in frames[0].columns]
+        if missing or extra:
+            logging.warning(
+                "%s columns differ from %s (missing: %s; extra: %s); a missing column "
+                "reads as blank for that file's rows.",
+                file.name,
+                kept[0].name,
+                ", ".join(missing) or "none",
+                ", ".join(extra) or "none",
+            )
+
+    overlaps: List[str] = []
+    for (file_a, dates_a), (file_b, dates_b) in itertools.combinations(dates.items(), 2):
+        shared = dates_a & dates_b
+        if shared:
+            overlaps.append(
+                f"{file_a.name} & {file_b.name} ({len(shared)} date(s), "
+                f"{min(shared).isoformat()} to {max(shared).isoformat()})"
+            )
+    if overlaps:
+        logging.warning(
+            "%d pair(s) of %s files share service dates: %s%s. Rows repeated exactly are "
+            "dropped; where copies differ, the earlier file's row is kept.",
+            len(overlaps),
+            table,
+            "; ".join(overlaps[:5]),
+            "; ..." if len(overlaps) > 5 else "",
+        )
+    combined = pd.concat(frames, ignore_index=True, sort=False)
+    logging.info("Combined %d %s file(s): %d row(s).", len(kept), table, len(combined))
+    return combined, kept
+
+
+def _input_text(path: Path, files: Sequence[Path]) -> str:
+    """Describe an input for the run log: the file, or the folder and the files read."""
+    if list(files) == [path]:
+        return str(path)
+    return f"{path} ({len(files)} file(s): {', '.join(p.name for p in files)})"
+
+
 def _require_columns(df: pd.DataFrame, columns: Sequence[str], table: str, why: str) -> None:
     """Raise :class:`InputDataError` naming any of *columns* missing from *df*."""
     missing = [c for c in columns if c not in df.columns]
@@ -1632,10 +1779,13 @@ def join_trips(
     trips = trips.loc[trips["service_date"].notna()]
     duplicated = trips.duplicated(keys)
     if duplicated.any():
+        exact = int((duplicated & trips.duplicated()).sum())
         logging.warning(
-            "trips_performed repeats %d service_date + trip_id_performed pair(s); "
-            "the first row of each is used.",
+            "trips_performed repeats %d service_date + trip_id_performed pair(s) (%d exact "
+            "copies, %d with different values); the first row of each is used.",
             int(duplicated.sum()),
+            exact,
+            int(duplicated.sum()) - exact,
         )
         trips = trips.loc[~duplicated]
 
@@ -5003,8 +5153,12 @@ def run(settings: RunSettings) -> RunResult:
     order = day_type_order(day_types, holiday)
     periods = list(settings.periods)
 
-    stop_visits = load_tides_csv(settings.stop_visits_path, "stop_visits")
-    trips = load_tides_csv(settings.trips_performed_path, "trips_performed")
+    stop_visits, stop_visit_files = load_tides_table(
+        settings.stop_visits_path, "stop_visits", settings.stop_visits_pattern
+    )
+    trips, trip_files = load_tides_table(
+        settings.trips_performed_path, "trips_performed", settings.trips_performed_pattern
+    )
     if settings.routes_to_include or settings.routes_to_exclude:
         _require_columns(trips, ["route_id"], "trips_performed", "the route filters need")
 
@@ -5306,8 +5460,8 @@ def run(settings: RunSettings) -> RunResult:
     # --- run log -----------------------------------------------------------------
     holidays_text = ", ".join(d.isoformat() for d in settings.holidays) or "(none)"
     settings_lines = [
-        f"stop_visits:        {settings.stop_visits_path}",
-        f"trips_performed:    {settings.trips_performed_path}",
+        f"stop_visits:        {_input_text(settings.stop_visits_path, stop_visit_files)}",
+        f"trips_performed:    {_input_text(settings.trips_performed_path, trip_files)}",
         f"Measures:           {', '.join(measures)}",
         f"Levels:             {', '.join(levels)}",
         f"Time cuts:          {', '.join(cuts)}",
@@ -5455,9 +5609,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description="Export TIDES on-time performance and running times at every grain.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--stop-visits", default=STOP_VISITS_PATH, help="TIDES stop_visits CSV.")
     p.add_argument(
-        "--trips-performed", default=TRIPS_PERFORMED_PATH, help="TIDES trips_performed CSV."
+        "--stop-visits",
+        default=STOP_VISITS_PATH,
+        help="TIDES stop_visits CSV, or a folder whose matching CSVs are combined.",
+    )
+    p.add_argument(
+        "--trips-performed",
+        default=TRIPS_PERFORMED_PATH,
+        help="TIDES trips_performed CSV, or a folder whose matching CSVs are combined.",
+    )
+    p.add_argument(
+        "--stop-visits-pattern",
+        default=STOP_VISITS_PATTERN,
+        help="Filename pattern for the stop_visits CSVs when --stop-visits is a folder.",
+    )
+    p.add_argument(
+        "--trips-performed-pattern",
+        default=TRIPS_PERFORMED_PATTERN,
+        help="Filename pattern for the trips_performed CSVs when --trips-performed is a folder.",
     )
     p.add_argument("--output-dir", default=OUTPUT_DIR, help="Folder for the tables and run log.")
     p.add_argument(
@@ -5664,6 +5834,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             export_monthly_reports=args.monthly_reports,
             corridors=parse_corridors(args.corridor),
             monthly_coverage_warn_pct=args.monthly_coverage_warn_pct,
+            stop_visits_pattern=args.stop_visits_pattern,
+            trips_performed_pattern=args.trips_performed_pattern,
         )
         _resolve_run_settings(settings)
     except SettingsError as exc:
@@ -5687,8 +5859,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         return 2
     for path in (settings.stop_visits_path, settings.trips_performed_path):
-        if not path.is_file():
-            logging.error("Input file not found: %s", path)
+        if not path.exists():
+            logging.error("Input file or folder not found: %s", path)
             return 1
     for feed in settings.gtfs_paths:
         if not Path(feed).expanduser().exists():

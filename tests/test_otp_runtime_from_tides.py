@@ -1149,3 +1149,149 @@ def test_main_writes_monthly_reports(tmp_path: Path) -> None:
     assert "Monthly reports:    True; pooled included dates; coverage warning below 80%" in log
     assert "Monthly corridors:  {'North': ['DC_R10', 'DC_R20']}" in log
     assert "Monthly coverage:   denominator" in log
+
+
+# --- folder inputs ------------------------------------------------------------------
+
+FOLDER_RUN = {
+    "measures": ["otp", "trip_runtime"],
+    "levels": ["route"],
+    "time_cuts": ["month"],
+    "export_stop_flags": False,
+}
+
+
+def _split_by_month(
+    folder: Path, names: tuple[str, str] = ("stop_visits", "trips_performed")
+) -> None:
+    """Write each fixture table as one CSV per service month, named ``<name>_<month>.csv``."""
+    folder.mkdir(parents=True, exist_ok=True)
+    for name, path in zip(names, (STOP_VISITS, TRIPS_PERFORMED)):
+        table = pd.read_csv(path, dtype=str)
+        month = pd.to_datetime(table["service_date"]).dt.strftime("%Y-%m")
+        for value, part in table.groupby(month):
+            part.to_csv(folder / f"{name}_{value}.csv", index=False)
+
+
+def _assert_same_tables(got: target.RunResult, expected: target.RunResult) -> None:
+    for measure in ("otp", "trip_runtime"):
+        for key, table in getattr(expected, measure).items():
+            pd.testing.assert_frame_equal(getattr(got, measure)[key], table)
+
+
+@pytest.fixture(scope="module")
+def single_file_run(tmp_path_factory: pytest.TempPathFactory) -> target.RunResult:
+    """The fixtures read from their single files, for comparison with folder runs."""
+    return target.run(_settings(tmp_path_factory.mktemp("single"), **FOLDER_RUN))
+
+
+def test_tides_input_files_match_the_pattern(tmp_path: Path) -> None:
+    """Matching ignores case and subfolders, and puts a re-download after its original."""
+    for name in ("B_STOP_VISITS.CSV", "a_stop_visits (1).csv", "a_stop_visits.csv", "notes.csv"):
+        (tmp_path / name).write_text("service_date\n", encoding="utf-8")
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "c_stop_visits.csv").write_text("service_date\n", encoding="utf-8")
+    files = target.tides_input_files(tmp_path, "*stop_visits*.csv", "stop_visits")
+    assert [p.name for p in files] == [
+        "a_stop_visits.csv",
+        "a_stop_visits (1).csv",
+        "B_STOP_VISITS.CSV",
+    ]
+    assert target.tides_input_files(STOP_VISITS, "*.csv", "stop_visits") == [STOP_VISITS]
+    with pytest.raises(target.InputDataError, match="matches"):
+        target.tides_input_files(tmp_path, "*trips_performed*.csv", "trips_performed")
+
+
+def test_folder_inputs_match_the_single_files(
+    tmp_path: Path, single_file_run: target.RunResult
+) -> None:
+    """Monthly files in one shared folder give the same tables as the single files."""
+    folder = tmp_path / "tides"
+    _split_by_month(folder)
+    result = target.run(
+        _settings(
+            tmp_path / "out", stop_visits_path=folder, trips_performed_path=folder, **FOLDER_RUN
+        )
+    )
+    _assert_same_tables(result, single_file_run)
+    log = (tmp_path / "out" / target.RUN_LOG_FILENAME).read_text("utf-8")
+    assert "(3 file(s): stop_visits_2026-01.csv, stop_visits_2026-02.csv," in log
+    assert "(3 file(s): trips_performed_2026-01.csv," in log
+
+
+def test_repeated_files_and_dates_are_checked(
+    tmp_path: Path, single_file_run: target.RunResult, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Identical files are skipped; repeated rows keep the earlier file's copy."""
+    folder = tmp_path / "tides"
+    _split_by_month(folder)
+    feb_visits = folder / "stop_visits_2026-02.csv"
+    (folder / "stop_visits_2026-02 (1).csv").write_bytes(feb_visits.read_bytes())
+    # A partial re-export of February: one visit's time and one trip's route changed.
+    visits = pd.read_csv(feb_visits, dtype=str).head(40)
+    visits.loc[0, "actual_departure_time"] = "2026-02-01T23:59:00"
+    visits.to_csv(folder / "stop_visits_2026-02_v2.csv", index=False)
+    trips = pd.read_csv(folder / "trips_performed_2026-02.csv", dtype=str)
+    trips.loc[0, "route_id"] = "DC_R99"
+    trips.to_csv(folder / "trips_performed_2026-02_v2.csv", index=False)
+
+    with caplog.at_level("INFO"):
+        result = target.run(
+            _settings(
+                tmp_path / "out", stop_visits_path=folder, trips_performed_path=folder, **FOLDER_RUN
+            )
+        )
+    _assert_same_tables(result, single_file_run)
+    text = caplog.text
+    assert "identical to an earlier one: stop_visits_2026-02 (1).csv = stop_visits_2026-02" in text
+    assert "1 pair(s) of stop_visits files share service dates" in text
+    assert "1 pair(s) of trips_performed files share service dates" in text
+    assert f"({len(trips) - 1} exact copies, 1 with different values)" in text
+    conflicts = result.date_classification.set_index("service_date")["conflicting_visits_dropped"]
+    assert conflicts.sum() == 1
+    assert conflicts.idxmax() == pd.Timestamp(visits.loc[0, "service_date"]).date().isoformat()
+
+
+def test_column_differences_are_reported(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    folder = tmp_path / "tides"
+    _split_by_month(folder)
+    march = folder / "stop_visits_2026-03.csv"
+    pd.read_csv(march, dtype=str).drop(columns="vehicle_id").to_csv(march, index=False)
+    with caplog.at_level("WARNING"):
+        target.load_tides_table(folder, "stop_visits", target.STOP_VISITS_PATTERN)
+    assert (
+        "stop_visits_2026-03.csv columns differ from stop_visits_2026-01.csv "
+        "(missing: vehicle_id; extra: none)"
+    ) in caplog.text
+
+
+def test_main_reads_folders_with_custom_patterns(tmp_path: Path) -> None:
+    """The CLI accepts folders, and the pattern flags pick out each table's files."""
+    folder = tmp_path / "exports"
+    _split_by_month(folder, names=("events", "runtimes"))
+    code = target.main(
+        [
+            "--stop-visits",
+            str(folder),
+            "--trips-performed",
+            str(folder),
+            "--stop-visits-pattern",
+            "events_*.csv",
+            "--trips-performed-pattern",
+            "runtimes_*.csv",
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--measures",
+            "otp",
+            "--levels",
+            "route",
+            "--time-cuts",
+            "all_day",
+            "--no-charts",
+        ]
+    )
+    assert code == 0
+    log = (tmp_path / "out" / target.RUN_LOG_FILENAME).read_text("utf-8")
+    assert "(3 file(s): events_2026-01.csv, events_2026-02.csv, events_2026-03.csv)" in log
+    missing = ["--stop-visits", str(tmp_path / "missing"), "--trips-performed", str(folder)]
+    assert target.main([*missing, "--output-dir", str(tmp_path / "out2")]) == 1
