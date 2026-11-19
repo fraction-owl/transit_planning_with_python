@@ -28,8 +28,7 @@ Turn NTD-format monthly summaries into route-level trend reports, process riders
 ### OTP & Runtime Diagnostics
 Choose the tool for your input and intended output:
 
-- **TIDES events:** `otp_runtime_from_tides.py` exports OTP, trip runtimes, and timepoint-segment runtimes by route, direction, trip, and other levels, split by day type and time period. It also reports data coverage and flags unusual stop performance and runtime variability.
-- **Monthly OTP reporting:** `otp_monthly_panel.py` produces monthly tables and charts for routes, directions, service types, corridors, and the system. It independently scores TIDES events; check scoring settings and input conventions when comparing its results with the combined exporter.
+- **TIDES events:** `otp_runtime_from_tides.py` exports OTP, trip runtimes, and timepoint-segment runtimes by route, direction, trip, and other levels, split by day type and time period. It also reports data coverage and flags unusual stop performance and runtime variability. With `--monthly-reports`, it adds monthly OTP tables and charts for routes, directions, service types, named corridors, and the system, with each month's share of trips that have scored visits.
 - **Schedule drafting:** `runtime_workflow.py` compares prepared CLEVER trip and timepoint exports with scheduled runtimes and provides segment recommendations for planner review. `trip_runtime_diagnostics_from_avl.py` provides trip-level diagnostics and suggested time bands from vendor CSVs.
 - **Vendor timepoint summaries:** `otp_by_timepoint_from_avl.py` produces monthly outputs by route, direction, and variation.
 
