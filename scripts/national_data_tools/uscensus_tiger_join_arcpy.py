@@ -11,7 +11,8 @@ Workflow:
        tract's blocks by block population (P1) or households (H9), so block rows
        sum back to the tract total (the same method as uscensus_tiger_join_gpd).
     2) TIGER stage (ArcPy): discover, merge, and (optionally) FIPS-filter TIGER/Line
-       tabblock shapefiles into a single polygon feature class.
+       tabblock shapefiles into a single polygon feature class. FIPS codes can be
+       listed inline and/or in a .txt file such as the one county_fips_picker.py writes.
     3) Join stage (ArcPy): join the attribute CSV from step 1 to the block polygons
        from step 2 using a normalized 15-digit block identifier, then write final output.
 
@@ -83,6 +84,10 @@ FIPS_TO_FILTER: list[str] = [
     #    "24031", "24033",
     #    "51683", "51685", "51059", "51013", "51510", "51600", "51610", "51107", "51153",
 ]
+# Optional .txt file of county FIPS codes (one per line, '#' starts a comment),
+# e.g. the output of county_fips_picker.py. Its codes are added to
+# FIPS_TO_FILTER. None to skip.
+FIPS_TO_FILTER_FILE: str | None = None
 
 # ---- Outputs ----
 INTERMEDIATE_OUTPUT_DIR: str = r"File\Path\To\Your\output_intermediate"  # <<< EDIT ME
@@ -1441,6 +1446,74 @@ def filter_by_fips(
     return out_fc
 
 
+def load_fips_codes(
+    inline_codes: Sequence[str] | None = None,
+    txt_path: str | Path | None = None,
+) -> list[str]:
+    """Combine an inline list and an optional text file of county FIPS codes.
+
+    The text file holds one or more codes per line, separated by commas or
+    spaces. Blank lines are skipped and ``#`` starts a comment, so a line such as
+    ``51059  # Fairfax County, VA`` reads as ``51059``. Four-digit codes are
+    zero-padded to five, which restores the leading ``0`` a spreadsheet drops
+    from states 01-09 (``1001`` becomes ``01001``).
+
+    Unlike a general id-list loader, a file path that is set but missing is an
+    error rather than a warning: an empty FIPS filter means "keep every county",
+    so a mistyped path would otherwise process the whole country silently.
+
+    Canonical implementation: ``utils/fips_helpers.py``.
+
+    Args:
+        inline_codes: Codes supplied directly (e.g. a CONFIGURATION list).
+            ``None`` is treated as empty.
+        txt_path: Path to a text file of codes, or ``None``/``""`` to skip.
+
+    Returns:
+        The combined codes as sorted, de-duplicated 5-digit strings. An empty
+        list means no filter.
+
+    Raises:
+        FileNotFoundError: *txt_path* is set but no file exists there.
+        ValueError: An entry is not a 4- or 5-digit number. The message lists
+            every bad entry and where it came from.
+    """
+    entries: list[tuple[str, str]] = [(str(code), "inline list") for code in inline_codes or ()]
+
+    if txt_path:
+        path = Path(txt_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"FIPS file not found: {path}")
+        with path.open(encoding="utf-8-sig") as handle:
+            for line_no, line in enumerate(handle, start=1):
+                for token in line.split("#", 1)[0].replace(",", " ").split():
+                    entries.append((token, f"{path.name} line {line_no}"))
+
+    codes: set[str] = set()
+    bad: list[str] = []
+    for raw, source in entries:
+        text = raw.strip()
+        if not text:
+            continue
+        if len(text) in (4, 5) and text.isascii() and text.isdigit():
+            codes.add(text.zfill(5))
+        else:
+            bad.append(f"'{text}' ({source})")
+
+    if bad:
+        raise ValueError(
+            "These entries are not 5-digit county FIPS codes: "
+            + ", ".join(bad)
+            + ". Each code is a 2-digit state code followed by a 3-digit county code, "
+            "e.g. 51059 for Fairfax County, VA."
+        )
+
+    if txt_path:
+        logging.info("Read county FIPS codes from %s.", txt_path)
+    logging.info("Resolved %d county FIPS code(s).", len(codes))
+    return sorted(codes)
+
+
 def write_output(in_fc: str, out_path: str) -> None:
     """Copy final FC to the requested output path (FGDB/shapefile)."""
     out_dir = os.path.dirname(out_path)
@@ -1678,8 +1751,14 @@ def join_blocks_to_attributes(
 # =============================================================================
 
 
-def run_pipeline() -> None:
-    """Run CSV merge → TIGER merge/filter → join → outputs."""
+def run_pipeline(fips_to_filter: Sequence[str] | None = None) -> None:
+    """Run CSV merge → TIGER merge/filter → join → outputs.
+
+    Args:
+        fips_to_filter: Resolved county FIPS codes to keep. ``None`` reads
+            ``FIPS_TO_FILTER`` and ``FIPS_TO_FILTER_FILE`` from the CONFIGURATION
+            block; an empty list keeps every county.
+    """
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -1712,10 +1791,13 @@ def run_pipeline() -> None:
         logging.info("No processing performed. Update the configuration paths and re-run.")
         return
 
+    if fips_to_filter is None:
+        fips_to_filter = load_fips_codes(FIPS_TO_FILTER, FIPS_TO_FILTER_FILE)
+
     try:
         # 1) CSV stage: build combined attributes
         logging.info("Discovering & merging CSVs under %s ...", INPUT_CSV_DIR)
-        df_joined = build_joined_table_from_folder(INPUT_CSV_DIR, county_fips_filter=FIPS_TO_FILTER)
+        df_joined = build_joined_table_from_folder(INPUT_CSV_DIR, county_fips_filter=fips_to_filter)
         out_csv = Path(INTERMEDIATE_COMBINED_CSV).expanduser().resolve()
         out_csv.parent.mkdir(parents=True, exist_ok=True)
         df_joined.to_csv(out_csv, index=False)
@@ -1726,7 +1808,7 @@ def run_pipeline() -> None:
         shp_paths = discover_tiger_datasets(INPUT_SHP_DIR, TIGER_INPUT_GLOB)
         merged_fc_tmp = merge_shapefiles(shp_paths)
         ensure_fips_field(merged_fc_tmp, fips_field=FIPS_FIELD_NAME)
-        filtered_fc_tmp = filter_by_fips(merged_fc_tmp, FIPS_TO_FILTER, fips_field=FIPS_FIELD_NAME)
+        filtered_fc_tmp = filter_by_fips(merged_fc_tmp, fips_to_filter, fips_field=FIPS_FIELD_NAME)
 
         # Copy merged/filtered to requested intermediate location
         write_output(filtered_fc_tmp, INTERMEDIATE_MERGED_SHP)
@@ -1768,7 +1850,12 @@ def main() -> int:
             "Please update them in the CONFIGURATION section before running."
         )
         return 2
-    run_pipeline()
+    try:
+        fips_to_filter = load_fips_codes(FIPS_TO_FILTER, FIPS_TO_FILTER_FILE)
+    except (FileNotFoundError, ValueError) as exc:
+        logging.error("Invalid FIPS setting: %s", exc)
+        return 2
+    run_pipeline(fips_to_filter)
     logging.info("Script completed successfully.")
     return 0
 

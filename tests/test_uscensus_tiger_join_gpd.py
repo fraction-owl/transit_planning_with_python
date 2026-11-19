@@ -2045,3 +2045,63 @@ def test_run_proceeds_when_only_intermediates_are_placeholders(
     messages = "\n".join(r.getMessage() for r in caplog.records)
     assert "No processing performed" not in messages
     assert "Stage 1/3" in messages  # got past the guard and began real work
+
+
+# ---------------------------------------------------------------------------
+# FIPS file setting
+# ---------------------------------------------------------------------------
+
+
+def test_run_filters_with_fips_file(tmp_path: Path) -> None:
+    csv_dir = tmp_path / "census"
+    csv_dir.mkdir()
+    shp_dir = tmp_path / "tiger"
+    shp_dir.mkdir()
+    for name in FIXTURE_ZIPS:
+        shutil.copy(FIXTURE_DIR / name, shp_dir / name)
+    _write_plain_csv(
+        csv_dir / "DECENNIALDHC2020.H9-Data.csv",
+        _census_csv(
+            "GEO_ID,NAME,H9_001N",
+            "Geography,Geographic Area Name,!!Total:",
+            "1000000US110010022021001,Block A,200",
+        ),
+    )
+    fips_file = tmp_path / "planning_area_fips.txt"
+    fips_file.write_text("11001  # District of Columbia, DC\n", encoding="utf-8")
+    out = tmp_path / "out" / "blocks.gpkg"
+    assert (
+        mod.run(
+            input_csv_dir=str(csv_dir),
+            input_shp_dir=str(shp_dir),
+            final_joined_features=str(out),
+            tiger_input_glob="tl_*_*_*.shp",
+            fips_to_filter=[],
+            intermediate_combined_csv="",
+            intermediate_merged_shp="",
+            fips_to_filter_file=str(fips_file),
+        )
+        == 0
+    )
+    geoids = gpd.read_file(out)["GEOID20"].astype(str)
+    assert len(geoids) == EXPECTED_COUNTS[0]
+    assert geoids.str.startswith("11001").all()
+
+
+def test_run_missing_fips_file_is_a_config_error(tmp_path: Path) -> None:
+    assert (
+        mod.run(
+            input_csv_dir=str(tmp_path),
+            input_shp_dir=str(tmp_path),
+            final_joined_features=str(tmp_path / "out.gpkg"),
+            intermediate_combined_csv="",
+            intermediate_merged_shp="",
+            fips_to_filter_file=str(tmp_path / "missing.txt"),
+        )
+        == 2
+    )
+
+
+def test_parse_args_fips_file() -> None:
+    assert mod.parse_args([]).fips_file == mod.FIPS_TO_FILTER_FILE
+    assert mod.parse_args(["--fips-file", "area.txt"]).fips_file == "area.txt"

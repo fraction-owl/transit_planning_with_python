@@ -8,7 +8,7 @@ Workflow
 --------
 1) CSV stage (pandas):
         Discover and merge Census + LODES CSVs into a single block-level
-        attribute table, optionally filtered by county FIPS.
+        attribute table, optionally filtered by county FIPS (inline and/or a .txt file).
 2) TIGER stage (GeoPandas):
         Discover and merge TIGER/Line tabblock shapefiles into a single
         GeoDataFrame, with the same optional FIPS filter applied.
@@ -125,6 +125,10 @@ FIPS_TO_FILTER: List[str] = [
     "51107",
     "51153",
 ]
+#: Optional .txt file of county FIPS codes (one per line, '#' starts a comment),
+#: e.g. the output of county_fips_picker.py. Its codes are added to
+#: FIPS_TO_FILTER. None to skip.
+FIPS_TO_FILTER_FILE: str | None = None
 
 # ---- Outputs ----------------------------------------------------------------
 #: Folder all three outputs below are written into.
@@ -1114,6 +1118,74 @@ def _apply_fips_filter_df(
     return df[df[dst_col].isin(wanted)].copy()
 
 
+def load_fips_codes(
+    inline_codes: Sequence[str] | None = None,
+    txt_path: str | Path | None = None,
+) -> list[str]:
+    """Combine an inline list and an optional text file of county FIPS codes.
+
+    The text file holds one or more codes per line, separated by commas or
+    spaces. Blank lines are skipped and ``#`` starts a comment, so a line such as
+    ``51059  # Fairfax County, VA`` reads as ``51059``. Four-digit codes are
+    zero-padded to five, which restores the leading ``0`` a spreadsheet drops
+    from states 01-09 (``1001`` becomes ``01001``).
+
+    Unlike a general id-list loader, a file path that is set but missing is an
+    error rather than a warning: an empty FIPS filter means "keep every county",
+    so a mistyped path would otherwise process the whole country silently.
+
+    Canonical implementation: ``utils/fips_helpers.py``.
+
+    Args:
+        inline_codes: Codes supplied directly (e.g. a CONFIGURATION list).
+            ``None`` is treated as empty.
+        txt_path: Path to a text file of codes, or ``None``/``""`` to skip.
+
+    Returns:
+        The combined codes as sorted, de-duplicated 5-digit strings. An empty
+        list means no filter.
+
+    Raises:
+        FileNotFoundError: *txt_path* is set but no file exists there.
+        ValueError: An entry is not a 4- or 5-digit number. The message lists
+            every bad entry and where it came from.
+    """
+    entries: list[tuple[str, str]] = [(str(code), "inline list") for code in inline_codes or ()]
+
+    if txt_path:
+        path = Path(txt_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"FIPS file not found: {path}")
+        with path.open(encoding="utf-8-sig") as handle:
+            for line_no, line in enumerate(handle, start=1):
+                for token in line.split("#", 1)[0].replace(",", " ").split():
+                    entries.append((token, f"{path.name} line {line_no}"))
+
+    codes: set[str] = set()
+    bad: list[str] = []
+    for raw, source in entries:
+        text = raw.strip()
+        if not text:
+            continue
+        if len(text) in (4, 5) and text.isascii() and text.isdigit():
+            codes.add(text.zfill(5))
+        else:
+            bad.append(f"'{text}' ({source})")
+
+    if bad:
+        raise ValueError(
+            "These entries are not 5-digit county FIPS codes: "
+            + ", ".join(bad)
+            + ". Each code is a 2-digit state code followed by a 3-digit county code, "
+            "e.g. 51059 for Fairfax County, VA."
+        )
+
+    if txt_path:
+        logging.info("Read county FIPS codes from %s.", txt_path)
+    logging.info("Resolved %d county FIPS code(s).", len(codes))
+    return sorted(codes)
+
+
 # ----- Tract -> block disaggregation -----------------------------------------
 
 
@@ -2073,6 +2145,7 @@ def run(
     intermediate_combined_csv: str | None = None,
     intermediate_merged_shp: str | None = None,
     supplemental_jobs_csv: str | Path | None = None,
+    fips_to_filter_file: str | Path | None = None,
 ) -> int:
     """Run the full three-stage pipeline.
 
@@ -2091,6 +2164,9 @@ def run(
     )
     tiger_input_glob = TIGER_INPUT_GLOB if tiger_input_glob is None else tiger_input_glob
     fips_to_filter = list(FIPS_TO_FILTER if fips_to_filter is None else fips_to_filter)
+    fips_to_filter_file = (
+        FIPS_TO_FILTER_FILE if fips_to_filter_file is None else fips_to_filter_file
+    )
     intermediate_combined_csv = (
         INTERMEDIATE_COMBINED_CSV
         if intermediate_combined_csv is None
@@ -2121,6 +2197,12 @@ def run(
         intermediate_merged_shp,
     ):
         logging.info("No processing performed. Update the configuration paths and re-run.")
+        return 2
+
+    try:
+        fips_to_filter = load_fips_codes(fips_to_filter, fips_to_filter_file)
+    except (FileNotFoundError, ValueError) as exc:
+        logging.error("Invalid FIPS setting: %s", exc)
         return 2
 
     try:
@@ -2263,6 +2345,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="5-digit county FIPS codes to keep (empty = all).",
     )
     parser.add_argument(
+        "--fips-file",
+        default=FIPS_TO_FILTER_FILE,
+        help="Optional .txt file of county FIPS codes, added to --fips.",
+    )
+    parser.add_argument(
         "--output",
         default=FINAL_JOINED_FEATURES,
         help="Final joined geometry + attributes output path.",
@@ -2319,6 +2406,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         intermediate_combined_csv=args.intermediate_csv,
         intermediate_merged_shp=args.intermediate_shp,
         supplemental_jobs_csv=args.supplemental_jobs,
+        fips_to_filter_file=args.fips_file,
     )
 
 
