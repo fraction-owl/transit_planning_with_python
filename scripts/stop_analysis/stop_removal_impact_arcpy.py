@@ -1004,8 +1004,14 @@ def stop_to_stop_network(
     u_b, v_b = edge_endpoints[eid_b]
     seg_a = segments[eid_a]
     seg_b = segments[eid_b]
+    s_a, s_b = float(row_a.s_u), float(row_b.s_u)
 
-    candidates: List[Tuple[float, Tuple[NodeKey, NodeKey], Tuple[bool, bool]]] = []
+    # Each candidate: (length, (exit node of A's segment, entry node of B's), (exits via u?)).
+    candidates: List[Tuple[float, Optional[Tuple[NodeKey, NodeKey]], Tuple[bool, bool]]] = []
+    if eid_a == eid_b:
+        # Both stops on one segment: walking straight along it is a candidate too.
+        # Listed first so it wins ties; no end nodes (None) means no node path.
+        candidates.append((abs(s_a - s_b), None, (False, False)))
     for a_end, a_cost, a_is_u in (
         (u_a, float(row_a.to_u_u), True),
         (v_a, float(row_a.to_v_u), False),
@@ -1023,7 +1029,13 @@ def stop_to_stop_network(
     if not candidates:
         return math.inf, None
 
-    total_u, (a_end, b_end), (a_is_u, b_is_u) = min(candidates, key=lambda item: item[0])
+    total_u, ends, (a_is_u, b_is_u) = min(candidates, key=lambda item: item[0])
+    if ends is None:
+        direct = polyline_substring(seg_a, s_a, s_b)  # None when the stops coincide
+        if direct is not None and s_a > s_b:
+            direct = _reverse_polyline(direct, sr)  # run from stop A toward stop B
+        return total_u, direct
+    a_end, b_end = ends
 
     try:
         node_path: List[NodeKey] = nx.shortest_path(graph, a_end, b_end, weight="length")
@@ -1033,11 +1045,11 @@ def stop_to_stop_network(
     path_geom = _build_path_geometry(
         graph,
         a_seg=seg_a,
-        a_s_u=float(row_a.s_u),
+        a_s_u=s_a,
         a_to_u=a_is_u,
         node_path=node_path,
         b_seg=seg_b,
-        b_s_u=float(row_b.s_u),
+        b_s_u=s_b,
         b_from_u=b_is_u,
         sr=sr,
     )

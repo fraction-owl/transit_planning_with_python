@@ -615,8 +615,8 @@ def _min_edge_data(G: nx.MultiGraph, u: NodeKey, v: NodeKey) -> dict:
     return data[k_min]
 
 
-def _concat_lines(lines: Sequence[LineString]) -> LineString:
-    """Concatenate a sequence of LineStrings into a single LineString."""
+def _concat_lines(lines: Sequence[LineString]) -> Optional[LineString]:
+    """Concatenate LineStrings into one; None if they span a single point (coincident stops)."""
     coords: List[Tuple[float, float]] = []
     for ln in lines:
         if ln.is_empty:
@@ -629,9 +629,18 @@ def _concat_lines(lines: Sequence[LineString]) -> LineString:
                 coords.extend(cs[1:])
             else:
                 coords.extend(cs)
-    if len(coords) < 2:
-        return LineString(coords)
+    if len(coords) < 2 or all(c == coords[0] for c in coords):
+        return None
     return LineString(coords)
+
+
+def _directed_substring(line: LineString, start_m: float, end_m: float) -> LineString:
+    """Return the part of *line* between two measures, running from *start_m* to *end_m*."""
+    piece = linestring_substring(line, start_m, end_m)
+    coords = list(piece.coords)
+    if start_m > end_m and len(coords) > 1:
+        return LineString(coords[::-1])
+    return piece
 
 
 def _ensure_oriented(lines: Sequence[LineString], nodes: Sequence[NodeKey]) -> List[LineString]:
@@ -659,14 +668,12 @@ def _build_path_geometry(
     b_seg: LineString,
     b_s: float,
     b_from_u: bool,
-) -> LineString:
-    """Construct full path geometry: A partial, node path, B partial."""
+) -> Optional[LineString]:
+    """Construct full path geometry: A partial, node path, B partial, from A to B."""
     L_a = linestring_length(a_seg)
     L_b = linestring_length(b_seg)
 
-    a_part = (
-        linestring_substring(a_seg, a_s, 0.0) if a_to_u else linestring_substring(a_seg, a_s, L_a)
-    )
+    a_part = _directed_substring(a_seg, a_s, 0.0 if a_to_u else L_a)
 
     fulls: List[LineString] = []
     for u, v in zip(node_path[:-1], node_path[1:]):
@@ -677,9 +684,7 @@ def _build_path_geometry(
             geom = LineString(list(reversed(gcoords)))
         fulls.append(geom)
 
-    b_part = (
-        linestring_substring(b_seg, 0.0, b_s) if b_from_u else linestring_substring(b_seg, L_b, b_s)
-    )
+    b_part = _directed_substring(b_seg, 0.0 if b_from_u else L_b, b_s)
 
     return _concat_lines([a_part, *_ensure_oriented(fulls, node_path), b_part])
 
@@ -712,7 +717,12 @@ def stop_to_stop_network(
     to_u_a, to_v_a = float(ra.to_u_ft), float(ra.to_v_ft)
     to_u_b, to_v_b = float(rb.to_u_ft), float(rb.to_v_ft)
 
-    candidates: List[Tuple[float, Tuple[NodeKey, NodeKey], Tuple[bool, bool]]] = []
+    # Each candidate: (feet, (exit node of A's segment, entry node of B's), (exits via u?)).
+    candidates: List[Tuple[float, Optional[Tuple[NodeKey, NodeKey]], Tuple[bool, bool]]] = []
+    if eid_a == eid_b:
+        # Both stops on one segment: walking straight along it is a candidate too.
+        # Listed first so it wins ties; no end nodes (None) means no node path.
+        candidates.append((abs(s_a - s_b), None, (False, False)))
 
     for a_end, a_cost, a_is_u in ((u_a, to_u_a, True), (v_a, to_v_a, False)):
         for b_end, b_cost, b_is_u in ((u_b, to_u_b, True), (v_b, to_v_b, False)):
@@ -726,7 +736,10 @@ def stop_to_stop_network(
     if not candidates:
         return math.inf, None
 
-    total_ft, (a_end, b_end), (a_is_u, b_is_u) = min(candidates, key=lambda t: t[0])
+    total_ft, ends, (a_is_u, b_is_u) = min(candidates, key=lambda t: t[0])
+    if ends is None:
+        return total_ft, _concat_lines([_directed_substring(seg_a, s_a, s_b)])
+    a_end, b_end = ends
 
     try:
         node_path: List[NodeKey] = nx.shortest_path(G, a_end, b_end, weight="length")

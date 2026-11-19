@@ -23,7 +23,8 @@ HOLIDAY_DATES (and optionally U.S. federal holidays) as holidays.
 
 Inputs
 ------
-- GTFS_PATH: GTFS feed, as a folder or ``.zip``.
+- GTFS_PATH: GTFS feed, as a folder or ``.zip``. A feed with frequency-based
+  trips (rows in frequencies.txt) stops the run: their repetitions are not expanded.
 - TODS_PATH (optional): TODS supplement files for that feed, as a folder or
   ``.zip`` (for example from ``tsde_to_tods.py``).
 
@@ -776,15 +777,34 @@ def load_schedule(gtfs_path: Path, tods_path: Optional[Path]) -> Schedule:
 
     Raises:
         OSError: If an input path is missing.
-        ValueError: If required GTFS tables are missing or inconsistent.
+        ValueError: If required GTFS tables are missing or inconsistent, or the
+            feed has frequency-based trips.
     """
     gtfs = load_tables(
         gtfs_path,
-        ("trips.txt", "stop_times.txt", "stops.txt", "calendar.txt", "calendar_dates.txt"),
+        (
+            "trips.txt",
+            "stop_times.txt",
+            "stops.txt",
+            "calendar.txt",
+            "calendar_dates.txt",
+            "frequencies.txt",
+        ),
     )
     for name in ("trips", "stop_times"):
         if name not in gtfs:
             raise ValueError(f"GTFS feed '{gtfs_path}' has no {name}.txt.")
+    frequencies = gtfs.get("frequencies")
+    if frequencies is not None and not frequencies.empty:
+        # Each frequencies.txt row repeats a template trip; counting the template
+        # once would undercount trips and hours, so stop rather than guess.
+        ids = sorted(set(frequencies.get("trip_id", pd.Series(dtype=str))))
+        listed = ", ".join(ids[:5]) + (", ..." if len(ids) > 5 else "")
+        raise ValueError(
+            f"GTFS feed '{gtfs_path}' has frequency-based trips ({listed}) in frequencies.txt, "
+            "which this script does not expand: each would count as a single trip. Expand them "
+            "into individually scheduled trips in trips.txt and stop_times.txt, then rerun."
+        )
     tods: dict[str, pd.DataFrame] = {}
     if tods_path is not None:
         tods = load_tables(
