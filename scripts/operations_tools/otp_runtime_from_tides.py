@@ -10,7 +10,7 @@ level crossed with a time cut; ``EXPORT_MEASURES``, ``EXPORT_LEVELS`` and
   trip, and segment (segment running time only).
 - Time cuts: all_day, time_period, hour, month, month_time_period, day_of_week.
 
-Every table is split by day type, found from GTFS and ``HOLIDAYS`` the same way as in
+Standard tables are split by day type, found from GTFS and ``HOLIDAYS`` the same way as in
 ``ridership_from_tides.py``. ``TRIP_TIME_BASIS`` places a trip in a time period and hour by
 its scheduled (default) or actual start; ``STOP_TIME_BASIS`` places a stop visit or a
 segment by the scheduled (default) or actual time at its stop. Time periods come from
@@ -34,6 +34,9 @@ Outputs
   per route, direction and day type with the segments in stop order.
 - ``date_classification.csv``, ``trip_coverage.csv`` (with GTFS), ``charts/`` and a
   run log with the CONFIGURATION block.
+- Optional ``otp/monthly/``: pooled monthly counts, month-column OTP tables, corridor
+  summaries, line charts and scored-trip coverage. Enable ``EXPORT_MONTHLY_REPORTS``
+  or ``--monthly-reports``; uses the same scored visits and date/route filters.
 
 Limitations
 -----------
@@ -41,6 +44,8 @@ Limitations
   crosses a daylight-saving change is off by an hour.
 - Canceled and non-revenue trips are dropped. OTP scores Scheduled visits only, and
   running times leave out Skipped visits.
+- Monthly coverage measures scored trips among those listed in TIDES, not the full
+  schedule. Use the GTFS coverage outputs to check trips absent from TIDES entirely.
 
 Typical usage
 -------------
@@ -300,6 +305,23 @@ EXPORT_CHARTS: bool = True
 CHART_LEVELS: Sequence[str] = ("system", "route")
 MAX_TRIPS_PER_CHART: int = 120
 
+# MONTHLY OTP REPORTS ----------------------------------------------------------
+# Optional reporting companion to the standard day-type tables. Pools included
+# dates once, even with overlapping DAY_TYPES; does not average percentages.
+# Writes otp/monthly/otp_monthly_processed.csv, otp_monthly_<level>.csv (months
+# as columns), otp_coverage_monthly.csv and plots/ line charts with the OTP target.
+# Uses enabled system/service_type/route/route_direction EXPORT_LEVELS, regardless
+# of EXPORT_TIME_CUTS. Requires the otp measure. EXPORT_CHARTS also controls these
+# line charts (one per monthly group, including corridors).
+EXPORT_MONTHLY_REPORTS: bool = False
+# Named groups of route_ids, e.g. {"Richmond Highway": ("151", "159", "161") }.
+# A route may belong to several corridors; each is reported separately. These
+# groups do not change system totals. Empty = no corridor reports.
+CORRIDORS: Mapping[str, Sequence[str]] = {}
+# Warn below this % of eligible trips listed in trips_performed with >=1 scored
+# visit. This is a warning only; it does not remove observations from OTP.
+MONTHLY_COVERAGE_WARN_PCT: float = 90.0
+
 LOG_LEVEL: int = logging.INFO
 
 # When True, a failed run-log write aborts the script so an output is never left
@@ -414,6 +436,9 @@ GROUP_KEY_COLUMNS: Tuple[str, ...] = (
 TRUE_TEXT: frozenset[str] = frozenset({"true", "t", "1", "yes", "y"})
 
 OTP_SUBDIR: str = "otp"
+MONTHLY_SUBDIR: str = "monthly"
+MONTHLY_PROCESSED_FILENAME: str = "otp_monthly_processed.csv"
+MONTHLY_COVERAGE_FILENAME: str = "otp_coverage_monthly.csv"
 TRIP_RUNTIME_SUBDIR: str = "trip_runtime"
 SEGMENT_RUNTIME_SUBDIR: str = "segment_runtime"
 SEGMENT_ROUTE_SUBDIR: str = "by_route"
@@ -596,6 +621,9 @@ class RunSettings(NamedTuple):
     chart_levels: Sequence[str] = CHART_LEVELS
     max_trips_per_chart: int = MAX_TRIPS_PER_CHART
     require_run_log: bool = REQUIRE_RUN_LOG
+    export_monthly_reports: bool = EXPORT_MONTHLY_REPORTS
+    corridors: Optional[Mapping[str, Sequence[str]]] = None
+    monthly_coverage_warn_pct: float = MONTHLY_COVERAGE_WARN_PCT
 
 
 class RunResult(NamedTuple):
@@ -3068,6 +3096,274 @@ def summarize_otp(
     return table[[*date_keys, *level_cols, *lead, *time_cols, *measures]]
 
 
+# --- monthly reporting (reuses scored visits and summarize_otp) ---------------
+
+
+def monthly_group_columns(level: str) -> List[str]:
+    """Return the actual group keys (display labels are never used as join keys)."""
+    if level == "corridor":
+        return ["corridor"]
+    return [col for col, _required in LEVELS[level]]
+
+
+def build_monthly_otp_tables(
+    scored: pd.DataFrame,
+    levels: Sequence[str],
+    corridors: Mapping[str, Sequence[str]],
+    periods: Sequence[TimePeriod],
+) -> Dict[str, pd.DataFrame]:
+    """Summarize monthly OTP before day-type expansion, counting each visit once.
+
+    Args:
+        scored: Already scored visits after the run's date and route filters.
+        levels: Enabled export levels; only the four monthly reporting levels apply.
+        corridors: Named route groups; overlap between groups is allowed.
+        periods: Checked time periods passed to the existing summary function.
+
+    Returns:
+        Tables keyed by level, using the exporter's counts and percentages.
+    """
+    if scored.empty:
+        return {}
+    rows = scored.assign(
+        month=scored["service_date"].dt.strftime("%Y-%m"), day_type="All included days"
+    )
+    tables: Dict[str, pd.DataFrame] = {}
+    for level in levels:
+        if level not in CHARTABLE_LEVELS:
+            continue
+        missing = missing_level_columns(level, rows.columns)
+        if missing:
+            logging.warning("Skipping monthly %s: missing %s.", level, ", ".join(missing))
+            continue
+        tables[level] = summarize_otp(rows, level, "month", periods, []).drop(columns="day_type")
+    corridor_tables: List[pd.DataFrame] = []
+    if corridors and "route_id" not in rows.columns:
+        logging.warning("Skipping monthly corridors: no route_id column.")
+        return tables
+    for name, route_ids in corridors.items():
+        route_set = {str(route).strip() for route in route_ids}
+        absent = route_set - set(rows["route_id"])
+        if absent:
+            logging.warning(
+                "Corridor %r has no scored visits for routes: %s.", name, ", ".join(sorted(absent))
+            )
+        subset = rows.loc[rows["route_id"].isin(route_set)]
+        if subset.empty:
+            continue
+        table = summarize_otp(subset, "system", "month", periods, []).drop(columns="day_type")
+        table.insert(1, "corridor", name.strip())
+        corridor_tables.append(table)
+    if corridor_tables:
+        tables["corridor"] = pd.concat(corridor_tables, ignore_index=True)
+    return tables
+
+
+def monthly_trip_coverage(trips: pd.DataFrame, scored: pd.DataFrame) -> pd.DataFrame:
+    """Measure scored-trip coverage among eligible TIDES records, by month.
+
+    Args:
+        trips: In-service, non-canceled trips after the same date/route filters as
+            OTP, before any day-type expansion. Includes trips without stop visits.
+        scored: Scored visits before day-type expansion.
+
+    Returns:
+        Route and system rows with trips listed, trips scored, visit counts and
+        coverage percentages. The denominator cannot include trips absent from
+        trips_performed; GTFS schedule coverage remains a separate diagnostic.
+    """
+    work = trips.drop_duplicates(TRIP_KEY).copy()
+    work["month"] = work["service_date"].dt.strftime("%Y-%m")
+    counts = scored.groupby(TRIP_KEY, as_index=False).agg(
+        evaluated_visits=("trip_id_performed", "size")
+    )
+    work = work.merge(counts, on=TRIP_KEY, how="left", validate="one_to_one")
+    work["evaluated_visits"] = work["evaluated_visits"].fillna(0).astype(int)
+    work["_scored"] = work["evaluated_visits"] > 0
+    frames: List[pd.DataFrame] = []
+    for level, keys in (("system", ["month"]), ("route", ["route_id", "month"])):
+        if any(key not in work.columns for key in keys):
+            continue
+        table = (
+            work.groupby(keys, dropna=False)
+            .agg(
+                trips_listed=("trip_id_performed", "size"),
+                trips_scored=("_scored", "sum"),
+                evaluated_visits=("evaluated_visits", "sum"),
+            )
+            .reset_index()
+        )
+        table.insert(0, "level", level)
+        if level == "system":
+            table.insert(1, "route_id", "ALL")
+        frames.append(table)
+    coverage = pd.concat(frames, ignore_index=True)
+    coverage["pct_trips_scored"] = _pct(coverage["trips_scored"], coverage["trips_listed"])
+    coverage["visits_per_scored_trip"] = (
+        coverage["evaluated_visits"] / coverage["trips_scored"].where(coverage["trips_scored"] > 0)
+    ).round(1)
+    return coverage[
+        [
+            "level",
+            "route_id",
+            "month",
+            "trips_listed",
+            "trips_scored",
+            "pct_trips_scored",
+            "evaluated_visits",
+            "visits_per_scored_trip",
+        ]
+    ]
+
+
+def monthly_otp_pivot(table: pd.DataFrame, level: str, months: Sequence[str]) -> pd.DataFrame:
+    """Make a month-column table; absent observations stay blank, not zero OTP."""
+    keys = monthly_group_columns(level)
+    work = table
+    if not keys:
+        work = table.assign(group="ALL")
+        keys = ["group"]
+    # Fail on duplicate keys rather than silently average already aggregated OTP.
+    wide = work.pivot(index=keys, columns="month", values="pct_on_time")  # noqa: PD010
+    return wide.reindex(columns=list(months)).reset_index()
+
+
+def write_monthly_reports(
+    tables: Mapping[str, pd.DataFrame],
+    coverage: pd.DataFrame,
+    months: Sequence[str],
+    out_dir: Path,
+    files: List[Path],
+    coverage_warn_pct: float,
+) -> None:
+    """Write monthly counts, wide OTP tables and coverage alongside the normal exports.
+
+    Args:
+        tables: Pooled monthly OTP tables keyed by level.
+        coverage: Monthly scored-trip coverage table.
+        months: Continuous month labels, including gaps with no observations.
+        out_dir: Monthly report folder.
+        files: Run's output paths, appended to.
+        coverage_warn_pct: Warn below this percentage of listed trips scored.
+    """
+    # Refresh only this report family's known outputs, including now-absent groups.
+    # Otherwise a rerun with fewer routes/corridors can leave misleading old files.
+    for level in (*CHARTABLE_LEVELS, "corridor"):
+        path = out_dir / f"otp_monthly_{level}.csv"
+        if path.exists():
+            path.unlink()
+        for path in (out_dir / "plots" / level).glob("*.png"):
+            if re.fullmatch(r"\d{4,}_.*\.png", path.name):
+                path.unlink()
+    frames: List[pd.DataFrame] = []
+    for level, table in tables.items():
+        frame = table.copy()
+        frame.insert(0, "level", level)
+        frames.append(frame)
+        _write_csv(
+            monthly_otp_pivot(table, level, months), out_dir / f"otp_monthly_{level}.csv", files
+        )
+    processed = (
+        pd.concat(frames, ignore_index=True)
+        if frames
+        else pd.DataFrame(
+            columns=pd.Index(
+                [
+                    "level",
+                    "month",
+                    "early",
+                    "on_time",
+                    "late",
+                    "evaluated",
+                    "pct_on_time",
+                    "pct_early",
+                    "pct_late",
+                ]
+            )
+        )
+    )
+    _write_csv(processed, out_dir / MONTHLY_PROCESSED_FILENAME, files)
+    _write_csv(coverage, out_dir / MONTHLY_COVERAGE_FILENAME, files)
+    low = coverage.loc[coverage["pct_trips_scored"] < coverage_warn_pct]
+    for row in low.itertuples(index=False):
+        logging.warning(
+            "Monthly OTP coverage: %s %s in %s has scored visits on %.1f%% of %d "
+            "eligible trips listed in TIDES (threshold %.1f%%).",
+            row.level,
+            row.route_id,
+            row.month,
+            row.pct_trips_scored,
+            row.trips_listed,
+            coverage_warn_pct,
+        )
+
+
+def export_monthly_line_charts(
+    tables: Mapping[str, pd.DataFrame],
+    months: Sequence[str],
+    out_dir: Path,
+    otp_standard: float,
+    files: List[Path],
+) -> int:
+    """Draw pooled monthly OTP with gaps for unobserved months and a target line.
+
+    Args:
+        tables: Monthly OTP tables keyed by level (including corridors).
+        months: Continuous month labels shared by all groups.
+        out_dir: Monthly charts folder.
+        otp_standard: Target percentage, drawn as a dashed line.
+        files: Run's output paths, appended to.
+
+    Returns:
+        Number of PNGs written.
+    """
+    written = 0
+    for level, table in tables.items():
+        keys = monthly_group_columns(level)
+        groups = table.groupby(keys, sort=True) if keys else [((), table)]
+        for index, (values, subset) in enumerate(groups, start=1):
+            values = values if isinstance(values, tuple) else (values,)
+            if level == "corridor":
+                label, token = f"Corridor {values[0]}", str(values[0])
+            else:
+                label, token = _group_label(level, values)
+            values_by_month = subset.set_index("month")["pct_on_time"].reindex(list(months))
+            folder = out_dir / level
+            folder.mkdir(parents=True, exist_ok=True)
+            # The index prevents overwrites when distinct labels sanitize alike.
+            path = folder / f"{index:04d}_{_sanitize_token(token)[:100]}.png"
+            fig, ax = plt.subplots(figsize=(8.0, 3.2))
+            try:
+                x = np.arange(len(months))
+                ax.plot(
+                    x,
+                    values_by_month.to_numpy(dtype=float),
+                    marker="o",
+                    color=_SERIES_COLORS[0],
+                    label="% on time",
+                )
+                ax.axhline(
+                    otp_standard,
+                    linestyle="--",
+                    color=_FLAG_COLOR,
+                    label=f"standard ({otp_standard:g}%)",
+                )
+                step = max(1, (len(months) + 23) // 24)
+                ax.set_xticks(x[::step])
+                ax.set_xticklabels(list(months)[::step], rotation=45, ha="right", fontsize=7)
+                ax.set_ylim(0, 100)
+                ax.set_xlabel("Service month", fontsize=9)
+                _style_axes(ax, f"{label} — all included days", "% on time")
+                ax.legend(fontsize=7, frameon=False)
+                fig.tight_layout()
+                fig.savefig(path, dpi=150)
+            finally:
+                plt.close(fig)
+            files.append(path)
+            written += 1
+    return written
+
+
 # --- stop flags (coverage and OTP by stop, judged route by route) ---------------
 
 
@@ -4618,6 +4914,22 @@ def _resolve_run_settings(
         raise SettingsError(
             f"START_DATE {settings.start_date} is after END_DATE {settings.end_date}."
         )
+    if settings.export_monthly_reports and "otp" not in measures:
+        raise SettingsError(
+            "Monthly OTP reports require the otp measure; include it in --measures."
+        )
+    if not 0.0 <= settings.monthly_coverage_warn_pct <= 100.0:
+        raise SettingsError("MONTHLY_COVERAGE_WARN_PCT must be between 0 and 100.")
+    corridors = CORRIDORS if settings.corridors is None else settings.corridors
+    names: set[str] = set()
+    for name, routes in corridors.items():
+        if not isinstance(name, str) or not name.strip() or name.strip() in names:
+            raise SettingsError(
+                "CORRIDORS names must be nonblank and unique after trimming spaces."
+            )
+        if isinstance(routes, str) or not routes or any(not str(r).strip() for r in routes):
+            raise SettingsError(f"CORRIDORS[{name!r}] must be a nonempty sequence of route IDs.")
+        names.add(name.strip())
     return measures, levels, cuts, day_types, list(settings.chart_levels)
 
 
@@ -4780,6 +5092,10 @@ def run(settings: RunSettings) -> RunResult:
 
     # --- on-time performance -----------------------------------------------------
     otp_tables: Dict[Tuple[str, str], pd.DataFrame] = {}
+    monthly_tables: Dict[str, pd.DataFrame] = {}
+    monthly_coverage = pd.DataFrame()
+    monthly_months: List[str] = []
+    corridors = CORRIDORS if settings.corridors is None else settings.corridors
     stop_flags = stop_detail = pd.DataFrame()
     otp_counts: Dict[str, int] = {}
     if "otp" in measures:
@@ -4794,6 +5110,36 @@ def run(settings: RunSettings) -> RunResult:
             otp_counts["missing_actual_time"],
             otp_counts["missing_schedule_time"],
         )
+        trips_kept = pd.DataFrame()
+        if settings.export_monthly_reports or settings.export_stop_flags:
+            trips_kept = in_service_trips(trips)
+            trips_kept = trips_kept.loc[trips_kept["service_date"].isin(kept_dates)]
+            try:
+                trips_kept = filter_routes(
+                    trips_kept, settings.routes_to_include, settings.routes_to_exclude, warn=False
+                )
+            except InputDataError:
+                trips_kept = trips_kept.iloc[0:0]
+            trips_kept = label_blank_groups(trips_kept, GROUP_KEY_COLUMNS, warn=False)
+        if settings.export_monthly_reports:
+            monthly_tables = build_monthly_otp_tables(scored, levels, corridors, periods)
+            monthly_coverage = monthly_trip_coverage(trips_kept, scored)
+            monthly_months = (
+                pd.period_range(min(kept_dates), max(kept_dates), freq="M").astype(str).tolist()
+            )
+            write_monthly_reports(
+                monthly_tables,
+                monthly_coverage,
+                monthly_months,
+                out_dir / OTP_SUBDIR / MONTHLY_SUBDIR,
+                files,
+                settings.monthly_coverage_warn_pct,
+            )
+            logging.info(
+                "Wrote %d monthly OTP level(s) and %d coverage row(s); included dates pooled once.",
+                len(monthly_tables),
+                len(monthly_coverage),
+            )
         if scored.empty:
             logging.warning("No visit could be scored for OTP; the OTP tables are skipped.")
         else:
@@ -4808,18 +5154,6 @@ def run(settings: RunSettings) -> RunResult:
                 rows, "otp", levels, cuts, otp_table, out_dir / OTP_SUBDIR, files
             )
             if settings.export_stop_flags and "stop_id" in visits.columns:
-                trips_kept = in_service_trips(trips)
-                trips_kept = trips_kept.loc[trips_kept["service_date"].isin(kept_dates)]
-                try:
-                    trips_kept = filter_routes(
-                        trips_kept,
-                        settings.routes_to_include,
-                        settings.routes_to_exclude,
-                        warn=False,
-                    )
-                except InputDataError:
-                    trips_kept = trips_kept.iloc[0:0]
-                trips_kept = label_blank_groups(trips_kept, GROUP_KEY_COLUMNS, warn=False)
                 stop_flags, stop_detail = build_stop_flags(visits, scored, trips_kept, settings)
                 _write_csv(stop_flags, out_dir / OTP_SUBDIR / STOP_FLAGS_FILENAME, files)
                 _write_csv(stop_detail, out_dir / OTP_SUBDIR / STOP_ROUTE_DETAIL_FILENAME, files)
@@ -4912,7 +5246,7 @@ def run(settings: RunSettings) -> RunResult:
             segment_observations = _observation_export(segments, SEGMENT_OBSERVATION_COLUMNS)
             _write_csv(segment_observations, segment_dir / SEGMENT_OBSERVATIONS_FILENAME, files)
 
-    if not (otp_tables or trip_tables or segment_tables):
+    if not (otp_tables or trip_tables or segment_tables) and monthly_coverage.empty:
         raise InputDataError(
             "No table could be built: no visit was scored for OTP and no running time could "
             "be measured. Check the timestamps, the timepoint column and the measures."
@@ -4922,6 +5256,13 @@ def run(settings: RunSettings) -> RunResult:
     charts = 0
     if settings.export_charts:
         charts_dir = out_dir / CHARTS_SUBDIR
+        charts += export_monthly_line_charts(
+            monthly_tables,
+            monthly_months,
+            out_dir / OTP_SUBDIR / MONTHLY_SUBDIR / "plots",
+            settings.otp_standard,
+            files,
+        )
         charts += export_summary_charts(
             otp_tables,
             chart_levels,
@@ -4950,7 +5291,7 @@ def run(settings: RunSettings) -> RunResult:
             charts += export_runtime_boxplots(
                 trip_rows, charts_dir / "trip_runtime_boxplots", settings.max_trips_per_chart
             )
-        logging.info("Wrote %d chart PNG(s) to %s.", charts, charts_dir)
+        logging.info("Wrote %d chart PNG(s) under %s.", charts, out_dir)
 
     # --- run log -----------------------------------------------------------------
     holidays_text = ", ".join(d.isoformat() for d in settings.holidays) or "(none)"
@@ -4979,6 +5320,11 @@ def run(settings: RunSettings) -> RunResult:
         f"Routes excluded:    {', '.join(settings.routes_to_exclude) or '(none)'}",
         f"On-time window:     {settings.early_min:g} to {settings.late_min:g} min; "
         f"timepoints only: {settings.timepoints_only}; standard {settings.otp_standard:g}%",
+        f"Monthly OTP reports: {settings.export_monthly_reports}; pooled included dates; "
+        f"coverage warning below {settings.monthly_coverage_warn_pct:g}%",
+        f"Monthly corridors: {dict(corridors)!r}",
+        "Monthly coverage:  denominator = eligible trips listed in TIDES; "
+        "numerator = listed trips with at least one scored visit (not GTFS schedule coverage).",
         f"Running time:       trim {settings.trim_frac:g} per tail; percentiles "
         f"{', '.join(f'{p:g}' for p in settings.percentiles)}; segments between "
         f"{'timepoints' if settings.segment_timepoints_only else 'served stops'}",
@@ -4991,6 +5337,7 @@ def run(settings: RunSettings) -> RunResult:
     )
     summary_lines = [
         f"OTP tables:         {len(otp_tables)}",
+        f"Monthly OTP levels: {len(monthly_tables)}; coverage rows: {len(monthly_coverage)}",
         f"Trip runtime tables: {len(trip_tables)}",
         f"Segment tables:     {len(segment_tables)}",
         f"Visits scored:      {otp_counts.get('scored', 0)} of {otp_counts.get('candidates', 0)}",
@@ -5069,6 +5416,27 @@ def _percentile_list(text: str) -> List[float]:
     if not values:
         raise argparse.ArgumentTypeError("give at least one percentile")
     return values
+
+
+def parse_corridors(specs: Optional[Sequence[str]]) -> Mapping[str, Sequence[str]]:
+    """Parse repeated NAME=ROUTE_ID,ROUTE_ID flags, or use CORRIDORS when absent.
+
+    Raises:
+        SettingsError: If a flag lacks a name, routes or has a repeated name.
+    """
+    if specs is None:
+        return CORRIDORS
+    corridors: Dict[str, Sequence[str]] = {}
+    for spec in specs:
+        name, sep, text = spec.partition("=")
+        name = name.strip()
+        routes = [route.strip() for route in text.split(",")]
+        if not sep or not name or not all(routes) or name in corridors:
+            raise SettingsError(
+                f"Invalid --corridor {spec!r}; use NAME=ROUTE_ID,ROUTE_ID with a unique name."
+            )
+        corridors[name] = routes
+    return corridors
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -5183,6 +5551,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Write otp_stop_flags.csv and its per-route detail.",
     )
     p.add_argument(
+        "--monthly-reports",
+        action=argparse.BooleanOptionalAction,
+        default=EXPORT_MONTHLY_REPORTS,
+        help="Write pooled monthly OTP tables, coverage and line charts under otp/monthly; "
+        "requires the otp measure. Independent of --time-cuts; --no-charts skips plots.",
+    )
+    p.add_argument(
+        "--corridor",
+        action="append",
+        metavar="NAME=ROUTE_ID,ROUTE_ID",
+        help="Monthly route group; repeat for each. Replaces CORRIDORS; "
+        "use with --monthly-reports.",
+    )
+    p.add_argument(
+        "--monthly-coverage-warn-pct",
+        type=float,
+        default=MONTHLY_COVERAGE_WARN_PCT,
+        help="Warn below this percentage of eligible listed TIDES trips with scored visits.",
+    )
+    p.add_argument(
         "--trim-frac",
         type=float,
         default=TRIM_FRAC,
@@ -5263,6 +5651,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             trim_frac=args.trim_frac,
             percentiles=tuple(args.percentiles),
             export_charts=args.charts,
+            export_monthly_reports=args.monthly_reports,
+            corridors=parse_corridors(args.corridor),
+            monthly_coverage_warn_pct=args.monthly_coverage_warn_pct,
         )
         _resolve_run_settings(settings)
     except SettingsError as exc:
