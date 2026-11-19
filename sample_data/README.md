@@ -13,7 +13,6 @@ The GTFS, TODS and TIDES files are copies of fixtures in [`tests/fixtures/`](../
 | `tods_current.zip` | TODS 2.1 supplements for `gtfs_current.zip`: garages, pull-outs, pull-backs and deadheads between trips. | Copy of `tests/fixtures/mock_tods_dc.zip` |
 | `tides/stop_visits.csv`, `tides/trips_performed.csv` | TIDES tables for a sample of service dates from January to March 2026 on routes 10, 20 and 30, plus the 50H loop on January 1. Pull-outs, pull-ins and deadheads carry the TODS trip IDs. | Copies of `tests/fixtures/stop_visits.csv` and `tests/fixtures/trips_performed.csv` |
 | `time_periods_example.txt` | Time-of-day periods for `ridership_from_tides.py` and `otp_runtime_from_tides.py` (`TIME_PERIODS_FILE`). | Moved from `scripts/ridership_tools/` |
-| `ntd_monthly_config_example.txt` | Settings template for `ntd_monthly_summary.py`. Its paths are placeholders, and the workbooks it lists aren't included. | Moved from `scripts/ridership_tools/` |
 
 ## Archive editions
 
