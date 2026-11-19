@@ -34,7 +34,6 @@ transit_planning_with_python/
 │   ├── README.md
 │   ├── gtfs_archive.zip
 │   ├── gtfs_current.zip
-│   ├── ntd_monthly_config_example.txt
 │   ├── time_periods_example.txt
 │   └── tods_current.zip
 ├── scripts/
@@ -237,6 +236,7 @@ transit_planning_with_python/
 │   │   ├── mock_gtfs_dc.zip
 │   │   ├── mock_gtfs_dc_archive.zip
 │   │   ├── mock_tods_dc.zip
+│   │   ├── ntd_monthly_config_example.txt
 │   │   ├── ntd_monthly_multi_month.csv
 │   │   ├── output_road_shps_dc.zip
 │   │   ├── private_shuttles_sample.csv
