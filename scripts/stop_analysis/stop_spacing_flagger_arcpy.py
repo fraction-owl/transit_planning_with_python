@@ -53,7 +53,7 @@ OUTPUT_FOLDER: str = r"Path\To\Your\Output_Folder"
 
 # Route filtering
 FILTER_OUT_LIST: list[str] = []
-INCLUDE_ROUTE_IDS: list[str] = ["101", "202", "303"]  # empty list → all routes except filtered-out
+INCLUDE_ROUTE_IDS: list[str] = []  # e.g. ["101", "202"]; empty → all routes except filtered-out
 
 # Route geometry options – union each route/direction's shapes in routes.shp
 # only; spacing is always measured along each stopping pattern's own shape.

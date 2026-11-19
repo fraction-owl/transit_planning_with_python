@@ -65,11 +65,7 @@ LAYER_SPECS: List[Tuple[str, str]] = [
 
 # Optional filter: only analyze these route_id values using shape-based buffers.
 # Leave empty (`[]`) to process every route in routes.txt
-ROUTE_FILTER: List[str] = [
-    "101",
-    "202",
-    "303",
-]
+ROUTE_FILTER: List[str] = []  # e.g. ["101", "202", "303"]
 
 # Routes that should use stop-based buffers instead of shape-based buffers.
 EXPRESS_ROUTES: List[str] = [

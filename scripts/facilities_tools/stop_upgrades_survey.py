@@ -84,11 +84,11 @@ IMPROVEMENT_ALIASES: Dict[str, str] = {
 # ---- Optional route filters (matched against route_short_name)
 # Whitelist: priority routes whose stops are also reported as a share of the
 # system total. Leave empty to skip the whitelist metric.
-ROUTE_WHITELIST: Set[str] = {"101", "202"}
+ROUTE_WHITELIST: Set[str] = set()  # e.g. {"101", "202"}
 
 # Blacklist: routes excluded from the system universe entirely (e.g., shuttle,
 # charter, or non-fixed-route services). Leave empty for no exclusions.
-ROUTE_BLACKLIST: Set[str] = {"9999A", "9999B"}
+ROUTE_BLACKLIST: Set[str] = set()  # e.g. {"9999A", "9999B"}
 
 # ---- Output
 OUTPUT_DIR: Path = Path(r"Path\To\Your\Output_Folder")
