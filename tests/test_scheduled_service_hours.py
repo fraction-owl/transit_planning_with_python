@@ -202,6 +202,47 @@ def test_service_day_types_explicit_mapping() -> None:
 
 
 # =============================================================================
+# FREQUENCY-BASED TRIPS
+# =============================================================================
+
+FREQUENCIES_HEADER = "trip_id,start_time,end_time,headway_secs,exact_times\n"
+
+
+def frequency_feed(folder: Path, frequencies: str) -> Path:
+    """One 30-minute trip, repeated as *frequencies* (the frequencies.txt text) says."""
+    gtfs = write_feed(
+        folder,
+        {
+            "trips.txt": [{"route_id": "R", "service_id": "wk", "trip_id": "T1"}],
+            "stop_times.txt": [
+                stop_time("T1", 1, "A", "06:00:00"),
+                stop_time("T1", 2, "B", "06:30:00"),
+            ],
+        },
+    )
+    (gtfs / "frequencies.txt").write_text(frequencies, encoding="utf-8")
+    return gtfs
+
+
+def test_frequency_based_trips_stop_the_run(tmp_path: Path) -> None:
+    # Every 30 minutes from 06:00 to 18:00 is 24 trips and 12 revenue trip hours;
+    # counting T1 once would report 1 trip and 0.5 hours.
+    rows = FREQUENCIES_HEADER + "T1,06:00:00,18:00:00,1800,1\n"
+    gtfs = frequency_feed(tmp_path / "gtfs", rows)
+    with pytest.raises(ValueError, match=r"frequency-based trips \(T1\)"):
+        target.load_schedule(gtfs, None)
+    out = tmp_path / "out"
+    argv = ["--gtfs", str(gtfs), "--no-tods", "--output-dir", str(out)]
+    assert target.main([*argv, "--period", "Nov", "20261101", "20261130"]) == 1
+    assert not out.exists()  # No CSVs, workbook or run log.
+
+
+def test_header_only_frequencies_file_is_ignored(tmp_path: Path) -> None:
+    gtfs = frequency_feed(tmp_path / "gtfs", FREQUENCIES_HEADER)
+    assert list(target.load_schedule(gtfs, None).movements["trip_id"]) == ["T1"]
+
+
+# =============================================================================
 # MOCK FIXTURES (GTFS + TODS)
 # =============================================================================
 

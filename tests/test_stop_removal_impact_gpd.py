@@ -5,6 +5,7 @@ import networkx as nx
 import pytest
 from shapely.geometry import LineString, Point
 
+import scripts.stop_analysis.stop_removal_impact_gpd as target
 from scripts.stop_analysis.stop_removal_impact_gpd import (
     NODE_GRID_FT,
     build_graph,
@@ -255,3 +256,54 @@ def test_coverage_polygon_larger_buffer_gives_larger_area() -> None:
     small = coverage_polygon(stops, buffer_miles=0.1).area.sum()
     large = coverage_polygon(stops, buffer_miles=0.5).area.sum()
     assert large > small
+
+
+# ---------------------------------------------------------------------------
+# stop_to_stop_network
+# ---------------------------------------------------------------------------
+
+# A 1,000 ft sidewalk, and a 2,100 ft U-shaped one whose ends a 100 ft connector joins.
+STRAIGHT = [[(0, 0), (1000, 0)]]
+U_LOOP = [[(0, 0), (0, 1000), (100, 1000), (100, 0)], [(100, 0), (0, 0)]]
+
+
+def walk(
+    lines: list[list[tuple[float, float]]], stops: dict[str, tuple[float, float]], a: str, b: str
+) -> tuple[float, LineString | None]:
+    """Snap *stops* to a network of *lines* (feet) and route stop *a* to stop *b*."""
+    target._node_dist_cache.clear()  # Node keys repeat across these networks.
+    segments = explode_segments(
+        gpd.GeoDataFrame(geometry=[LineString(c) for c in lines], crs="EPSG:2248")
+    )
+    graph, endpoints = build_graph(segments, node_grid_ft=NODE_GRID_FT)
+    index, _geoms, wkb_to_eid = target.build_segment_index(segments)
+    points = gpd.GeoDataFrame(
+        {"stop_id": list(stops)}, geometry=[Point(xy) for xy in stops.values()], crs="EPSG:2248"
+    )
+    snap = target.snap_stops_to_segments(points, index, wkb_to_eid, segments, endpoints)
+    return target.stop_to_stop_network(graph, segments, endpoints, snap, a, b)
+
+
+@pytest.mark.parametrize(("a", "b"), [("A", "B"), ("B", "A")])
+def test_stops_on_one_segment_walk_straight_between(a: str, b: str) -> None:
+    stops = {"A": (400, 0), "B": (600, 0)}
+    distance, path = walk(STRAIGHT, stops, a, b)
+    assert distance == pytest.approx(200.0)  # Not 1,000 ft out to an end and back.
+    assert path is not None and path.length == pytest.approx(distance)
+    assert path.coords[0] == stops[a] and path.coords[-1] == stops[b]
+
+
+def test_coincident_stops_are_zero_feet_apart() -> None:
+    distance, path = walk(STRAIGHT, {"A": (400, 0), "B": (400, 0)}, "A", "B")
+    assert distance == 0.0
+    assert path is None  # No line to draw.
+
+
+@pytest.mark.parametrize(("a", "b"), [("A", "B"), ("B", "A")])
+def test_a_shorter_network_path_beats_walking_along_the_segment(a: str, b: str) -> None:
+    # Both stops are on the U, 1,900 ft apart along it, but 300 ft via the connector.
+    stops = {"A": (0, 100), "B": (100, 100)}
+    distance, path = walk(U_LOOP, stops, a, b)
+    assert distance == pytest.approx(300.0)
+    assert path is not None and path.length == pytest.approx(distance)
+    assert path.coords[0] == stops[a] and path.coords[-1] == stops[b]
