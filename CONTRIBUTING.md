@@ -187,7 +187,7 @@ Guidelines:
 
   ```python
   See Also:
-      - ``otp_monthly_panel.py``
+      - ``otp_runtime_from_tides.py``
       - ``prep_features_private.py``
   ```
 

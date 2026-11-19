@@ -54,7 +54,6 @@ Update the paths in CONFIGURATION (or pass ``--stop-visits`` / ``--trips-perform
 
 See Also:
     - ``ridership_from_tides.py``
-    - ``otp_monthly_panel.py``
     - ``otp_by_route.py``
 """
 
