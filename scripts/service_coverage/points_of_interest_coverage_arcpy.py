@@ -68,9 +68,7 @@ LAYER_SPECS: List[Tuple[str, str]] = [
 ROUTE_FILTER: List[str] = []  # e.g. ["101", "202", "303"]
 
 # Routes that should use stop-based buffers instead of shape-based buffers.
-EXPRESS_ROUTES: List[str] = [
-    "909",
-]
+EXPRESS_ROUTES: List[str] = []  # e.g. ["909"]
 
 # Analysis options
 USE_SHAPE_BUFFER = True  # True → buffer route geometry; False → buffer stops
