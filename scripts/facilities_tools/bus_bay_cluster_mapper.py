@@ -1,7 +1,7 @@
 """Map bus-bay clusters from one or more GTFS feeds and polygon layers.
 
-Produces one PNG per cluster, a CSV matching its numbered stop legend, a
-route/direction detail CSV, and spatial-review CSVs. Stops are joined to
+Draws one PNG per cluster with numbered stops and a legend of each stop's
+routes and directions. Stops are joined to
 polygons by coordinates, never by cross-agency stop IDs or stop codes.
 Identifiers remain text and are namespaced by feed_id. Nearby records from
 different feeds are reported for review, not silently merged into one bay.
@@ -11,10 +11,33 @@ route runs on the same day. Set SERVICE_DATE to apply calendar.txt plus
 calendar_dates.txt independently to each feed. Direction labels default to
 the literal GTFS direction_id; 0/1 are not inferred compass directions.
 
-Dependencies: pandas, geopandas, shapely, pyproj, numpy, matplotlib.
-Standalone: no repository checkout, internet connection or vehicle blocks needed.
+Inputs
+------
+- One or more GTFS feeds (folder or .zip): stops, routes, trips and
+  stop_times, plus agency, calendar, calendar_dates and feed_info if present.
+- One or more cluster polygon layers (.shp, a .zip holding a shapefile, or a
+  GeoPackage) with a defined CRS and an optional name field.
+- Optional local backdrop layer (streets, parcels); no online tiles are fetched.
+
+Outputs
+-------
+Each run writes a new ``bus_bay_maps_<timestamp>`` folder in OUTPUT_DIR:
+- maps/*.png: one map per cluster.
+- cluster_stop_assignments.csv: one row per numbered stop in the map legends.
+- route_direction_assignments.csv: stop, route and direction detail, with
+  headsigns and trip counts.
+- near_miss_stops.csv and cross_feed_nearby_stops.csv: spatial-review lists.
+- cluster_index.csv, run.log, run_manifest.json and rerun_config.json.
+- bus_bay_cluster_mapper_runlog.txt: run-log sidecar with the verbatim
+  CONFIGURATION block, the settings used and input fingerprints.
+
+Typical usage
+-------------
 Edit CONFIGURATION or run: python bus_bay_cluster_mapper.py --config settings.json
 Relative JSON paths resolve against the JSON file, not the working directory.
+A run's rerun_config.json can be passed back with --config to repeat it.
+Dependencies: pandas, geopandas, shapely, pyproj, numpy, matplotlib.
+Standalone: no repository checkout, internet connection or vehicle blocks needed.
 """
 
 from __future__ import annotations
@@ -71,16 +94,20 @@ CLUSTER_NAMES: list[str] = []  # Blank = every cluster; match names exactly.
 ROUTE_TYPES: list[str] = []  # Blank = all modes; ["3"] restricts to standard bus.
 INCLUDE_UNSERVED_STOPS = True
 INCLUDE_NON_PASSENGER_VISITS = False  # False excludes pickup=1 AND drop_off=1.
-NEAR_MISS_METERS = 40.0  # Report outside stops this close to a cluster; do not add them.
-CROSS_FEED_REVIEW_METERS = 15.0  # Flag close records; never auto-merge agencies.
+NEAR_MISS_FEET = 130.0  # Report outside stops this close to a cluster; do not add them.
+CROSS_FEED_REVIEW_FEET = 50.0  # Flag close records; never auto-merge agencies.
 SHORT_BAY_LABELS = True  # "Bay C" on map where possible; full names in legend/CSV.
 FIGURE_DPI = 160
 BACKDROP_PATH = ""  # Optional local street/parcel layer; no online tiles are fetched.
 # Optional exact direction display labels: "feed_id|route_id|direction_id": label.
 # Example: {"Connector|101|0": "Southbound"}. Unlisted values retain 0/1/? labels.
 DIRECTION_LABELS: dict[str, str] = {}
+# Every output must be traceable: a failed run-log write aborts the script.
+# Set to False only when writing to a genuinely read-only location.
+REQUIRE_RUN_LOG = True
 # === END CONFIG ===
 
+METERS_PER_FOOT = 0.3048
 PALETTE = ("#17689B", "#B44D22", "#347C50", "#8055A3", "#A27900", "#327B80")
 MARKERS = ("o", "s", "^", "D", "P", "v")
 DETAIL_COLUMNS = [
@@ -113,12 +140,13 @@ class Settings:
     route_types: list[str] = field(default_factory=list)
     include_unserved_stops: bool = True
     include_non_passenger_visits: bool = False
-    near_miss_meters: float = 40.0
-    cross_feed_review_meters: float = 15.0
+    near_miss_feet: float = 130.0
+    cross_feed_review_feet: float = 50.0
     short_bay_labels: bool = True
     figure_dpi: int = 160
     backdrop_path: str = ""
     direction_labels: dict[str, str] = field(default_factory=dict)
+    require_run_log: bool = True
 
 
 def require_columns(frame: pd.DataFrame, columns: Sequence[str], context: str) -> None:
@@ -543,7 +571,7 @@ def short_stop_name(name: str, short_bays: bool) -> str:
 
 
 def local_crs(geometry: Any) -> CRS:
-    """Use a local UTM projection so distances and map scale are in metres."""
+    """Use a local UTM projection; distances are measured in metres, reported in feet."""
     crs = gpd.GeoSeries([geometry], crs=4326).estimate_utm_crs()
     if crs is None:
         raise ValueError("Could not select a local projected CRS for this cluster.")
@@ -563,10 +591,11 @@ def spatial_review(
         polygon = gpd.GeoSeries([cluster.geometry], crs=4326).to_crs(crs).iloc[0]
         projected = stops.to_crs(crs)
         inside = memberships[memberships.cluster_id.eq(cluster.cluster_id)]
-        if settings.near_miss_meters > 0:
+        if settings.near_miss_feet > 0:
             distances = projected.distance(polygon)
             near = projected[
-                ~projected.stop_key.isin(inside.stop_key) & distances.le(settings.near_miss_meters)
+                ~projected.stop_key.isin(inside.stop_key)
+                & distances.le(settings.near_miss_feet * METERS_PER_FOOT)
             ]
             for point in near.itertuples():
                 near_rows.append(
@@ -577,7 +606,9 @@ def spatial_review(
                         "stop_id": point.stop_id,
                         "stop_code": point.stop_code,
                         "stop_name": point.stop_name,
-                        "distance_m": round(float(distances.loc[point.Index]), 2),
+                        "distance_ft": round(
+                            float(distances.loc[point.Index]) / METERS_PER_FOOT, 1
+                        ),
                     }
                 )
         members = projected[projected.stop_key.isin(inside.stop_key)]
@@ -587,7 +618,7 @@ def spatial_review(
                 if first.feed_id == second.feed_id:
                     continue
                 distance = first.geometry.distance(second.geometry)
-                if distance <= settings.cross_feed_review_meters:
+                if distance <= settings.cross_feed_review_feet * METERS_PER_FOOT:
                     shared_rows.append(
                         {
                             "cluster_id": cluster.cluster_id,
@@ -600,7 +631,7 @@ def spatial_review(
                             "stop_id_b": second.stop_id,
                             "stop_code_b": second.stop_code,
                             "stop_name_b": second.stop_name,
-                            "distance_m": round(float(distance), 2),
+                            "distance_ft": round(float(distance) / METERS_PER_FOOT, 1),
                         }
                     )
     return (
@@ -613,7 +644,7 @@ def spatial_review(
                 "stop_id",
                 "stop_code",
                 "stop_name",
-                "distance_m",
+                "distance_ft",
             ],
         ),
         pd.DataFrame(
@@ -629,7 +660,7 @@ def spatial_review(
                 "stop_id_b",
                 "stop_code_b",
                 "stop_name_b",
-                "distance_m",
+                "distance_ft",
             ],
         ),
     )
@@ -776,6 +807,8 @@ def render_map(
     ax.set_aspect("equal")
     ax.set_xticks([])
     ax.set_yticks([])
+    ax.set_xlabel("")  # GeoPandas adds Easting/Northing labels that overlap the footer.
+    ax.set_ylabel("")
     for spine in ax.spines.values():
         spine.set_color("#C7D2D8")
     ax.annotate(
@@ -789,13 +822,14 @@ def render_map(
         color="#243746",
         arrowprops={"arrowstyle": "-|>", "color": "#243746", "lw": 1.3},
     )
-    target = (limits[2] - limits[0]) * 0.23
+    target = (limits[2] - limits[0]) * 0.23 / METERS_PER_FOOT
     power = 10 ** math.floor(math.log10(target))
-    scale = max(value * power for value in (0.1, 0.2, 0.5, 1, 2, 5) if value * power <= target)
+    scale_ft = max(value * power for value in (0.1, 0.2, 0.5, 1, 2, 5) if value * power <= target)
+    scale = scale_ft * METERS_PER_FOOT
     sx, sy = limits[0] + (limits[2] - limits[0]) * 0.07, limits[1] + (limits[3] - limits[1]) * 0.055
     ax.plot([sx, sx + scale], [sy, sy], color="#243746", linewidth=2.2, zorder=7)
     ax.annotate(
-        f"{scale:g} m",
+        f"{scale_ft:g} ft",
         (sx + scale / 2, sy),
         xytext=(0, 6),
         textcoords="offset points",
@@ -878,6 +912,116 @@ def input_fingerprints(sources: list[dict[str, str]]) -> dict[str, str]:
     return result
 
 
+# Canonical version lives in utils/run_log.py -- keep this copy in sync.
+def extract_config_block(source_file: Path) -> str:
+    r"""Return the text between the CONFIG markers in *source_file*.
+
+    Reads ``source_file`` as UTF-8 text and slices out the lines strictly
+    *between* the first occurrence of ``# === BEGIN CONFIG ===`` and the first
+    subsequent occurrence of ``# === END CONFIG ===``.  The marker lines
+    themselves are excluded; whitespace and inline comments inside the block
+    are preserved verbatim.
+
+    Args:
+        source_file: Path to the Python source file to scan (typically
+            ``Path(__file__)`` from the calling script).
+
+    Returns:
+        The verbatim text of the configuration block, joined with ``\n``.
+
+    Raises:
+        ValueError: If either marker is missing or they appear out of order.
+        OSError: If ``source_file`` cannot be read.
+    """
+    _BEGIN = "# === BEGIN CONFIG ==="
+    _END = "# === END CONFIG ==="
+
+    lines: list[str] = source_file.read_text(encoding="utf-8").splitlines()
+
+    begin_idx: int | None = None
+    end_idx: int | None = None
+    for i, line in enumerate(lines):
+        stripped: str = line.strip()
+        if begin_idx is None and stripped == _BEGIN:
+            begin_idx = i
+        elif begin_idx is not None and stripped == _END:
+            end_idx = i
+            break
+
+    if begin_idx is None or end_idx is None:
+        raise ValueError(
+            f"Config markers not found in '{source_file}'. Expected '{_BEGIN}' and '{_END}'."
+        )
+
+    return "\n".join(lines[begin_idx + 1 : end_idx])
+
+
+def write_run_log(output: Path, settings: Settings, fingerprints: dict[str, str]) -> bool:
+    """Write ``bus_bay_cluster_mapper_runlog.txt`` into the run's output folder.
+
+    The log captures the CONFIGURATION block verbatim, the settings actually
+    used (which --config JSON or CLI flags may have changed), and input
+    fingerprints.
+
+    Args:
+        output: The run's output folder.
+        settings: The resolved settings for this run.
+        fingerprints: Input path to SHA-256 digest, from :func:`input_fingerprints`.
+
+    Returns:
+        ``True`` if the log was written, ``False`` otherwise.
+    """
+    log_path = output / "bus_bay_cluster_mapper_runlog.txt"
+    try:
+        source_file: Path | None = Path(__file__).resolve()
+    except NameError:  # Pasted into a notebook cell: no source file on disk.
+        source_file = None
+    if source_file is None:
+        config_text = "(config block unavailable: interactive session, no __file__ on disk)"
+    else:
+        try:
+            config_text = extract_config_block(source_file)
+        except (OSError, ValueError) as exc:
+            LOGGER.error("Could not extract config block for run log: %s", exc)
+            return False
+    lines = [
+        "=" * 72,
+        "BUS BAY CLUSTER MAPPER RUN LOG",
+        "=" * 72,
+        f"Run timestamp:    {dt.datetime.now().isoformat(timespec='seconds')}",
+        f"Output folder:    {output}",
+        f"Source script:    {source_file or '<interactive>'}",
+        "",
+        "-" * 72,
+        "EFFECTIVE SETTINGS (CONFIGURATION, --config JSON or CLI flags, as resolved)",
+        "-" * 72,
+        json.dumps(asdict(settings), indent=2),
+        "",
+        "-" * 72,
+        "INPUT FINGERPRINTS (SHA-256)",
+        "-" * 72,
+        *(f"{path}\n  sha256: {digest}" for path, digest in fingerprints.items()),
+        "",
+        "-" * 72,
+        "CONFIGURATION (verbatim from source)",
+        "-" * 72,
+        config_text,
+        "=" * 72,
+    ]
+    try:
+        log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except OSError as exc:
+        LOGGER.error("Error writing run log: %s", exc)
+        return False
+    LOGGER.info("Run log saved to %s", log_path)
+    return True
+
+
+def is_placeholder(path: str) -> bool:
+    r"""Return whether *path* still holds the template's ``Path\To`` placeholder."""
+    return bool(re.search(r"(^|[\\/])path[\\/]to([\\/]|$)", str(path), flags=re.IGNORECASE))
+
+
 def validate_settings(settings: Settings) -> None:
     """Reject ambiguous source identifiers and invalid plotting/filter settings."""
     for sources, key in (
@@ -891,14 +1035,33 @@ def validate_settings(settings: Settings) -> None:
             raise ValueError(f"{key} values must use letters, numbers, underscores or hyphens.")
         if any("path" not in source for source in sources):
             raise ValueError("Every source needs a path.")
+    # Check inputs before the run folder is created, so a mistake leaves no empty output.
+    problems = [
+        f"{label} {source[key]!r}: {source['path']}"
+        for label, sources, key in (
+            ("GTFS_SOURCES", settings.gtfs_sources, "feed_id"),
+            ("CLUSTER_SOURCES", settings.cluster_sources, "source_id"),
+        )
+        for source in sources
+        if not Path(source["path"]).exists()
+    ]
+    if settings.backdrop_path and not Path(settings.backdrop_path).exists():
+        problems.append(f"BACKDROP_PATH: {settings.backdrop_path}")
+    if is_placeholder(settings.output_dir):
+        problems.append(f"OUTPUT_DIR: {settings.output_dir}")
+    if problems:
+        raise ValueError(
+            "Edit the CONFIGURATION section (or the --config JSON) before running. "
+            "Not found or still a placeholder: " + "; ".join(problems)
+        )
     if settings.service_date:
         settings.service_date = dt.datetime.strptime(
             settings.service_date.replace("-", ""), "%Y%m%d"
         ).strftime("%Y-%m-%d")
     if (
         settings.figure_dpi < 72
-        or settings.near_miss_meters < 0
-        or settings.cross_feed_review_meters < 0
+        or settings.near_miss_feet < 0
+        or settings.cross_feed_review_feet < 0
     ):
         raise ValueError("DPI must be >=72 and review distances nonnegative.")
 
@@ -1022,11 +1185,12 @@ def run(settings: Settings) -> Path:
         sources = settings.gtfs_sources + settings.cluster_sources
         if settings.backdrop_path:
             sources = sources + [{"path": settings.backdrop_path}]
+        fingerprints = input_fingerprints(sources)
         manifest = {
             "created_at": dt.datetime.now().astimezone().isoformat(),
             "configuration": asdict(settings),
             "feeds": feed_metadata,
-            "input_sha256": input_fingerprints(sources),
+            "input_sha256": fingerprints,
             "feed_periods_have_no_common_date": no_common_dates,
             "clusters": cluster_rows,
             "notes": [
@@ -1040,6 +1204,11 @@ def run(settings: Settings) -> Path:
         (output / "rerun_config.json").write_text(
             json.dumps(asdict(settings), indent=2), encoding="utf-8"
         )
+        if not write_run_log(output, settings, fingerprints) and settings.require_run_log:
+            raise RuntimeError(
+                "Run log could not be written. Set REQUIRE_RUN_LOG = False to suppress this "
+                "error when a sidecar file is genuinely impossible."
+            )
         LOGGER.info("Finished: %s", output)
         return output
     finally:
@@ -1083,12 +1252,13 @@ def parse_settings(argv: Sequence[str] | None = None) -> Settings:
             route_types=ROUTE_TYPES,
             include_unserved_stops=INCLUDE_UNSERVED_STOPS,
             include_non_passenger_visits=INCLUDE_NON_PASSENGER_VISITS,
-            near_miss_meters=NEAR_MISS_METERS,
-            cross_feed_review_meters=CROSS_FEED_REVIEW_METERS,
+            near_miss_feet=NEAR_MISS_FEET,
+            cross_feed_review_feet=CROSS_FEED_REVIEW_FEET,
             short_bay_labels=SHORT_BAY_LABELS,
             figure_dpi=FIGURE_DPI,
             backdrop_path=BACKDROP_PATH,
             direction_labels=DIRECTION_LABELS,
+            require_run_log=REQUIRE_RUN_LOG,
         )
     if parsed.output:
         settings.output_dir = parsed.output
@@ -1107,6 +1277,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (ValueError, OSError, KeyError) as exc:
         LOGGER.error("%s", exc)
         return 2
+    except RuntimeError as exc:
+        LOGGER.error("%s", exc)
+        return 1
     return 0
 
 
