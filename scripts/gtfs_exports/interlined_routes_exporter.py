@@ -8,9 +8,9 @@ order by scheduled start time. The script then reports which routes share
 blocks and every point where a block's next trip is on a different route (a
 hand-off), with the layover between the two trips.
 
-``bus_block_exporter.py`` traces individual blocks minute by minute, and
-``gtfs_route_diff.py`` flags routes whose interline partners changed between
-two feeds; this script is the feed-wide list.
+``block_status_timeline_exporter.py`` traces individual blocks minute by
+minute, and ``gtfs_route_diff.py`` flags routes whose interline partners
+changed between two feeds; this script is the feed-wide list.
 
 Inputs
 ------

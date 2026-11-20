@@ -72,7 +72,6 @@ transit_planning_with_python/
 │   │   └── stop_vs_roadname_checker_gpd.py
 │   ├── gtfs_exports/
 │   │   ├── block_status_timeline_exporter.py
-│   │   ├── bus_block_exporter.py
 │   │   ├── gtfs_feed_merger.py
 │   │   ├── gtfs_route_features_gpd.py
 │   │   ├── gtfs_route_timeline.py
@@ -259,7 +258,6 @@ transit_planning_with_python/
 │   ├── test_bikeshare_ridership_trends.py
 │   ├── test_block_status_timeline_exporter.py
 │   ├── test_block_timeline_helpers.py
-│   ├── test_bus_block_exporter.py
 │   ├── test_cabi_coverage_by_route_gpd.py
 │   ├── test_calendar_helpers.py
 │   ├── test_check_style.py
