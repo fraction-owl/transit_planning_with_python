@@ -6,10 +6,12 @@ import gzip
 import logging
 import zipfile
 from pathlib import Path
+from types import ModuleType
 
 import pandas as pd
 import pytest
 
+from scripts.national_data_tools import uscensus_table_build as tb_mod
 from scripts.national_data_tools.uscensus_table_build import (
     GEO_ID_COL,
     _apply_fips_filter,
@@ -1028,3 +1030,57 @@ def test_discover_census_files_with_real_fixtures() -> None:
     assert len(result["POP_FILES"]) >= 1
     assert len(result["INCOME_FILES"]) >= 1
     assert len(result["COMMUTE_FILES"]) >= 1
+
+
+# ---------------------------------------------------------------------------
+# COUNTY_FIPS_FILE
+# ---------------------------------------------------------------------------
+
+
+def _configure_main(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fips_file: Path
+) -> tuple[ModuleType, Path]:
+    """Point main() at two blocks in counties 11001 and 24031 and *fips_file*."""
+    data_dir = tmp_path / "census"
+    data_dir.mkdir()
+    _write_plain_csv(
+        data_dir / "DECENNIALPL2020.P1-Data.csv",
+        _census_csv(
+            "GEO_ID,NAME,P1_001N",
+            "Geography,Geographic Area Name,!!Total:",
+            f"{_BLOCK_GEO_ID},DC Block,100",
+            "1000000US240310001001001,MD Block,200",
+        ),
+    )
+    out_csv = tmp_path / "out" / "joined_blocks.csv"
+    monkeypatch.setattr(tb_mod, "ROOT_DATA_DIR", str(data_dir))
+    monkeypatch.setattr(tb_mod, "OUTPUT_DIR", None)
+    monkeypatch.setattr(tb_mod, "CSV_OUTPUT_PATH", str(out_csv))
+    monkeypatch.setattr(tb_mod, "COUNTY_FIPS_FILTER", [_COUNTY_FIPS])
+    monkeypatch.setattr(tb_mod, "COUNTY_FIPS_FILE", str(fips_file))
+    return tb_mod, out_csv
+
+
+def test_main_filters_on_county_fips_file_instead_of_inline_list(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    fips_file = tmp_path / "county_fips.txt"
+    fips_file.write_text("24031  Montgomery County\n", encoding="utf-8")
+    mod, out_csv = _configure_main(monkeypatch, tmp_path, fips_file)
+    with caplog.at_level(logging.WARNING):
+        assert mod.main() == 0
+    out = pd.read_csv(out_csv, dtype={"FIPS": str})
+    assert out["FIPS"].tolist() == ["24031"]
+    assert "ignoring the inline list" in caplog.text
+
+
+def test_main_returns_2_when_county_fips_file_lists_no_codes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    mod, out_csv = _configure_main(
+        monkeypatch, tmp_path, Path("sample_data/county_fips_example.txt")
+    )
+    with caplog.at_level(logging.ERROR):
+        assert mod.main() == 2
+    assert "lists no codes" in caplog.text
+    assert not out_csv.exists()

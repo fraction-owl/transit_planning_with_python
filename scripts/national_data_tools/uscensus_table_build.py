@@ -7,10 +7,12 @@ proficiency, vehicle availability, age group, and commuting (journey-to-work)
 statistics.
 
 Supports input as CSV, GZ, or ZIP files (containing '-Data.csv'), and can filter
-by county FIPS codes. Output may be saved as a flat CSV. Tract counts are split
-across each tract's blocks by block population (P1) or households (H9), the same
-count allocation uscensus_tiger_join_gpd uses, so every count column can be
-summed over blocks; tract percentages ride along unchanged.
+by county FIPS codes, listed inline (COUNTY_FIPS_FILTER) or in a text file
+(COUNTY_FIPS_FILE; see sample_data/county_fips_example.txt). Output may be
+saved as a flat CSV. Tract counts are split across each tract's blocks by block
+population (P1) or households (H9), the same count allocation
+uscensus_tiger_join_gpd uses, so every count column can be summed over blocks;
+tract percentages ride along unchanged.
 
 Outputs:
     - joined_blocks.csv (OUTPUT_CSV_NAME, written into OUTPUT_DIR): the joined
@@ -20,6 +22,7 @@ Outputs:
 Helpful links:
     https://data.census.gov/table
     https://lehd.ces.census.gov/data/
+    County FIPS codes: https://transition.fcc.gov/oet/info/maps/census/fips/fips.txt
 
 Typical usage:
     Update ROOT_DATA_DIR and OUTPUT_DIR in the CONFIGURATION section and run
@@ -71,6 +74,10 @@ COUNTY_FIPS_FILTER: list[str] = [
     "51107",
     "51153",
 ]
+
+#: Optional text file of county FIPS codes, one per line, used instead of
+#: COUNTY_FIPS_FILTER when set. See sample_data/county_fips_example.txt.
+COUNTY_FIPS_FILE: str | Path | None = None  # e.g. r"C:\Data\county_fips.txt"
 
 # -----------------------------------------------------------------------------
 # Signatures that map a file name to a *topic* variable.
@@ -977,6 +984,88 @@ def _build_tract_df(inp: _TractInputs) -> pd.DataFrame:
 # -----------------------------------------------------------------------------
 # FIPS HELPERS
 # -----------------------------------------------------------------------------
+def load_fips_file(path: str | Path) -> list[str]:
+    """Read 5-digit county FIPS codes from a text file, one code per line.
+
+    The code is the first word on its line. Anything after it on the same line,
+    such as the county name in a line copied from the FCC list at
+    https://transition.fcc.gov/oet/info/maps/census/fips/fips.txt, is ignored,
+    as are blank lines and anything after ``#``. A code listed twice is kept
+    once, in first-seen order.
+
+    Canonical implementation: ``utils/census_helpers.py``.
+
+    Args:
+        path: The text file.
+
+    Returns:
+        The codes as 5-character strings, in file order.
+
+    Raises:
+        ValueError: If the file cannot be read, a line does not start with a
+            5-digit code, or the file lists no codes.
+    """
+    file_path = Path(path).expanduser()
+    try:
+        text = file_path.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeError) as exc:
+        raise ValueError(f"Could not read the FIPS file '{file_path}': {exc}") from exc
+    codes: list[str] = []
+    seen: set[str] = set()
+    problems: list[str] = []
+    for number, raw in enumerate(text.splitlines(), start=1):
+        words = raw.split("#", 1)[0].split()
+        if not words:
+            continue
+        code = words[0]
+        if len(code) != 5 or not (code.isascii() and code.isdigit()):
+            problems.append(f"line {number}: expected a 5-digit county FIPS code, got {code!r}")
+        elif code not in seen:
+            seen.add(code)
+            codes.append(code)
+    if problems:
+        raise ValueError(f"Could not read the FIPS file '{file_path}':\n  " + "\n  ".join(problems))
+    if not codes:
+        raise ValueError(
+            f"The FIPS file '{file_path}' lists no codes. Add one 5-digit county code "
+            "per line (or uncomment the ones you want), or unset the FIPS file setting "
+            "to use the inline FIPS list instead."
+        )
+    return codes
+
+
+def resolve_fips_filter(
+    inline_codes: Sequence[str] | None, fips_file: str | Path | None
+) -> list[str]:
+    """Pick the county FIPS codes to filter on: the FIPS file if set, else the inline list.
+
+    Canonical implementation: ``utils/census_helpers.py``.
+
+    Args:
+        inline_codes: The inline FIPS list from the CONFIGURATION block. Empty or
+            ``None`` keeps every county.
+        fips_file: Path to a text file read by ``load_fips_file``, or ``None`` /
+            ``""`` to use *inline_codes*.
+
+    Returns:
+        The codes to keep; an empty list keeps every county.
+
+    Raises:
+        ValueError: If *fips_file* is set and cannot be used (see ``load_fips_file``).
+    """
+    if fips_file is None or not str(fips_file).strip():
+        return list(inline_codes or [])
+    codes = load_fips_file(fips_file)
+    if inline_codes:
+        logging.warning(
+            "Both the inline FIPS list and a FIPS file are set; using the FIPS file '%s' "
+            "and ignoring the inline list.",
+            fips_file,
+        )
+    logging.info("Loaded %d county FIPS code(s) from '%s'.", len(codes), fips_file)
+    return codes
+
+
 def _ensure_fips_column(
     df: pd.DataFrame,
     *,
@@ -1157,7 +1246,8 @@ def main() -> int:
 
     Returns:
         Process exit code: 0 on success, 1 on failure, 2 if required
-        CONFIGURATION values are still placeholders.
+        CONFIGURATION values are still placeholders or COUNTY_FIPS_FILE
+        cannot be used.
     """
     logging.basicConfig(
         level=LOG_LEVEL,
@@ -1177,6 +1267,12 @@ def main() -> int:
         return 2
 
     try:
+        county_fips = resolve_fips_filter(COUNTY_FIPS_FILTER, COUNTY_FIPS_FILE)
+    except ValueError as exc:
+        logging.error("%s", exc)
+        return 2
+
+    try:
         logging.info("Discovering Census datasets under %s …", ROOT_DATA_DIR)
         discovered = discover_census_files(ROOT_DATA_DIR)
 
@@ -1190,7 +1286,7 @@ def main() -> int:
             vehicle_files=discovered["VEHICLE_FILES"],
             age_files=discovered["AGE_FILES"],
             commute_files=discovered["COMMUTE_FILES"],
-            county_fips_filter=COUNTY_FIPS_FILTER,
+            county_fips_filter=county_fips,
         )
         logging.info("Created DataFrame with shape %s", df_joined.shape)
 

@@ -32,6 +32,7 @@ transit_planning_with_python/
 │   │   ├── stop_visits.csv
 │   │   └── trips_performed.csv
 │   ├── README.md
+│   ├── county_fips_example.txt
 │   ├── gtfs_archive.zip
 │   ├── gtfs_current.zip
 │   ├── time_periods_example.txt
@@ -226,6 +227,7 @@ transit_planning_with_python/
 │   │   ├── UNRATE_sample.csv
 │   │   ├── capitalbikeshare_fixtures_24mo.zip
 │   │   ├── ccd_sch_052_1920_sample.zip
+│   │   ├── county_fips.txt
 │   │   ├── dc_wac_S000_JT00_2023.csv.gz
 │   │   ├── effy2019_sample.csv
 │   │   ├── express_origin_stops.txt
@@ -262,6 +264,7 @@ transit_planning_with_python/
 │   ├── test_bus_block_exporter.py
 │   ├── test_cabi_coverage_by_route_gpd.py
 │   ├── test_calendar_helpers.py
+│   ├── test_census_helpers.py
 │   ├── test_check_style.py
 │   ├── test_check_style_config_section.py
 │   ├── test_check_style_docstring_length.py
@@ -368,6 +371,7 @@ transit_planning_with_python/
 ├── utils/
 │   ├── block_timeline_helpers.py
 │   ├── calendar_helpers.py
+│   ├── census_helpers.py
 │   ├── cli_helpers.py
 │   ├── distance_helpers.py
 │   ├── gtfs_helpers.py

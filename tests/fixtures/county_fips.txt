@@ -1,0 +1,9 @@
+# Sample FIPS_FILE fixture for the uscensus_* script tests and utils/census_helpers.py.
+# Blank lines, comments, and anything after the code on a line are ignored.
+
+11001  District of Columbia
+24031
+
+# 51013  Arlington County is commented out, so it must not load.
+51059        Fairfax County   # inline comments are fine too
+11001  listed twice, kept once

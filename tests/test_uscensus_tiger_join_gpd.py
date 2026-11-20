@@ -2045,3 +2045,66 @@ def test_run_proceeds_when_only_intermediates_are_placeholders(
     messages = "\n".join(r.getMessage() for r in caplog.records)
     assert "No processing performed" not in messages
     assert "Stage 1/3" in messages  # got past the guard and began real work
+
+
+# =============================================================================
+# FIPS_FILE / --fips-file
+# =============================================================================
+
+
+def _run_on_tiger_fixtures(tmp_path: Path, **kwargs: Any) -> tuple[int, Path]:
+    """Run the pipeline on all three TIGER fixtures with a one-block H9 table."""
+    csv_dir = tmp_path / "census"
+    csv_dir.mkdir()
+    shp_dir = tmp_path / "tiger"
+    shp_dir.mkdir()
+    for name in FIXTURE_ZIPS:
+        shutil.copy(FIXTURE_DIR / name, shp_dir / name)
+    _write_plain_csv(
+        csv_dir / "DECENNIALDHC2020.H9-Data.csv",
+        _census_csv(
+            "GEO_ID,NAME,H9_001N",
+            "Geography,Geographic Area Name,!!Total:",
+            "1000000US110010022021001,Block A,200",
+        ),
+    )
+    out = tmp_path / "out" / "blocks.gpkg"
+    code = mod.run(
+        input_csv_dir=str(csv_dir),
+        input_shp_dir=str(shp_dir),
+        final_joined_features=str(out),
+        tiger_input_glob="tl_*_*_*.shp",  # the fixture archives carry a _sample suffix
+        intermediate_combined_csv="",
+        intermediate_merged_shp="",
+        **kwargs,
+    )
+    return code, out
+
+
+def test_run_filters_on_fips_file_instead_of_inline_list(tmp_path: Path) -> None:
+    # tests/fixtures/county_fips.txt lists 11001, 24031 and 51059; 51013 is ignored.
+    code, out = _run_on_tiger_fixtures(
+        tmp_path, fips_to_filter=["51013"], fips_file=str(FIXTURE_DIR / "county_fips.txt")
+    )
+    assert code == 0
+    result = gpd.read_file(out)
+    assert set(result["GEOID20"].str[:5]) == {"11001", "24031", "51059"}
+    assert len(result) == 14 + 15 + 15
+
+
+def test_run_returns_2_when_fips_file_is_unusable(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.ERROR):
+        code, out = _run_on_tiger_fixtures(
+            tmp_path, fips_file="sample_data/county_fips_example.txt"
+        )
+    assert code == 2
+    assert "lists no codes" in caplog.text
+    assert not out.exists()
+
+
+def test_parse_args_accepts_fips_file() -> None:
+    args = mod.parse_args(["--fips-file", "county_fips.txt"])
+    assert args.fips_file == "county_fips.txt"
+    assert mod.parse_args([]).fips_file == mod.FIPS_FILE

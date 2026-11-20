@@ -22,10 +22,9 @@ Workflow
 
 Configuration
 -------------
-At minimum, set INPUT_CSV_DIR, INPUT_SHP_DIR, and OUTPUT_DIR.
-Set INTERMEDIATE_COMBINED_CSV_NAME or INTERMEDIATE_MERGED_SHP_NAME to an
-empty string or None to skip writing those intermediate artifacts; the
-pipeline will still run in memory.
+At minimum, set INPUT_CSV_DIR, INPUT_SHP_DIR, and OUTPUT_DIR. Set
+INTERMEDIATE_COMBINED_CSV_NAME or INTERMEDIATE_MERGED_SHP_NAME to an empty string or None to
+skip writing those intermediate artifacts; the pipeline will still run in memory.
 
 Outputs
 -------
@@ -50,11 +49,12 @@ Helpful links
     Demographic data: https://data.census.gov/table
     Jobs data:        https://lehd.ces.census.gov/data/
     Geographic data:  https://www.census.gov/cgi-bin/geo/shapefiles/index.php
+    County FIPS codes: https://transition.fcc.gov/oet/info/maps/census/fips/fips.txt
 
 Typical usage
 -------------
 Update the paths in the CONFIGURATION section (or pass the matching CLI flags:
-``--input-csv-dir``, ``--input-shp-dir``, ``--output``, ``--fips``, ...) and
+``--input-csv-dir``, ``--input-shp-dir``, ``--output``, ``--fips``, ``--fips-file``, ...) and
 run from a shell or a Jupyter notebook.
 """
 
@@ -125,6 +125,10 @@ FIPS_TO_FILTER: List[str] = [
     "51107",
     "51153",
 ]
+
+#: Optional text file of county FIPS codes, one per line, used instead of
+#: FIPS_TO_FILTER when set. See sample_data/county_fips_example.txt.
+FIPS_FILE: str | Path | None = None  # e.g. r"C:\Data\county_fips.txt"
 
 # ---- Outputs ----------------------------------------------------------------
 #: Folder all three outputs below are written into.
@@ -1081,6 +1085,88 @@ def _build_tract_df(inp: _TractInputs) -> pd.DataFrame:
 
 
 # ----- CSV-stage FIPS helpers ------------------------------------------------
+
+
+def load_fips_file(path: str | Path) -> list[str]:
+    """Read 5-digit county FIPS codes from a text file, one code per line.
+
+    The code is the first word on its line. Anything after it on the same line,
+    such as the county name in a line copied from the FCC list at
+    https://transition.fcc.gov/oet/info/maps/census/fips/fips.txt, is ignored,
+    as are blank lines and anything after ``#``. A code listed twice is kept
+    once, in first-seen order.
+
+    Canonical implementation: ``utils/census_helpers.py``.
+
+    Args:
+        path: The text file.
+
+    Returns:
+        The codes as 5-character strings, in file order.
+
+    Raises:
+        ValueError: If the file cannot be read, a line does not start with a
+            5-digit code, or the file lists no codes.
+    """
+    file_path = Path(path).expanduser()
+    try:
+        text = file_path.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeError) as exc:
+        raise ValueError(f"Could not read the FIPS file '{file_path}': {exc}") from exc
+    codes: list[str] = []
+    seen: set[str] = set()
+    problems: list[str] = []
+    for number, raw in enumerate(text.splitlines(), start=1):
+        words = raw.split("#", 1)[0].split()
+        if not words:
+            continue
+        code = words[0]
+        if len(code) != 5 or not (code.isascii() and code.isdigit()):
+            problems.append(f"line {number}: expected a 5-digit county FIPS code, got {code!r}")
+        elif code not in seen:
+            seen.add(code)
+            codes.append(code)
+    if problems:
+        raise ValueError(f"Could not read the FIPS file '{file_path}':\n  " + "\n  ".join(problems))
+    if not codes:
+        raise ValueError(
+            f"The FIPS file '{file_path}' lists no codes. Add one 5-digit county code "
+            "per line (or uncomment the ones you want), or unset the FIPS file setting "
+            "to use the inline FIPS list instead."
+        )
+    return codes
+
+
+def resolve_fips_filter(
+    inline_codes: Sequence[str] | None, fips_file: str | Path | None
+) -> list[str]:
+    """Pick the county FIPS codes to filter on: the FIPS file if set, else the inline list.
+
+    Canonical implementation: ``utils/census_helpers.py``.
+
+    Args:
+        inline_codes: The inline FIPS list from the CONFIGURATION block. Empty or
+            ``None`` keeps every county.
+        fips_file: Path to a text file read by ``load_fips_file``, or ``None`` /
+            ``""`` to use *inline_codes*.
+
+    Returns:
+        The codes to keep; an empty list keeps every county.
+
+    Raises:
+        ValueError: If *fips_file* is set and cannot be used (see ``load_fips_file``).
+    """
+    if fips_file is None or not str(fips_file).strip():
+        return list(inline_codes or [])
+    codes = load_fips_file(fips_file)
+    if inline_codes:
+        logging.warning(
+            "Both the inline FIPS list and a FIPS file are set; using the FIPS file '%s' "
+            "and ignoring the inline list.",
+            fips_file,
+        )
+    logging.info("Loaded %d county FIPS code(s) from '%s'.", len(codes), fips_file)
+    return codes
 
 
 def _ensure_fips_column_df(
@@ -2073,16 +2159,19 @@ def run(
     intermediate_combined_csv: str | None = None,
     intermediate_merged_shp: str | None = None,
     supplemental_jobs_csv: str | Path | None = None,
+    fips_file: str | Path | None = None,
 ) -> int:
     """Run the full three-stage pipeline.
 
     Unset args fall back to the CONFIGURATION block at the top of this file, so
     ``m.INPUT_CSV_DIR = ...; m.run()`` works after a plain import. Pass an empty
-    string for an intermediate path to skip writing that artifact.
+    string for an intermediate path to skip writing that artifact, and for
+    *fips_file* to use *fips_to_filter* when ``FIPS_FILE`` is set.
 
     Returns:
         Process exit code: 0 on success, 2 if required CONFIGURATION values
-        are still placeholders. Pipeline failures raise ``SystemExit(1)``.
+        are still placeholders or the FIPS file cannot be used. Pipeline
+        failures raise ``SystemExit(1)``.
     """
     input_csv_dir = INPUT_CSV_DIR if input_csv_dir is None else input_csv_dir
     input_shp_dir = INPUT_SHP_DIR if input_shp_dir is None else input_shp_dir
@@ -2091,6 +2180,7 @@ def run(
     )
     tiger_input_glob = TIGER_INPUT_GLOB if tiger_input_glob is None else tiger_input_glob
     fips_to_filter = list(FIPS_TO_FILTER if fips_to_filter is None else fips_to_filter)
+    fips_file = FIPS_FILE if fips_file is None else fips_file
     intermediate_combined_csv = (
         INTERMEDIATE_COMBINED_CSV
         if intermediate_combined_csv is None
@@ -2121,6 +2211,12 @@ def run(
         intermediate_merged_shp,
     ):
         logging.info("No processing performed. Update the configuration paths and re-run.")
+        return 2
+
+    try:
+        fips_to_filter = resolve_fips_filter(fips_to_filter, fips_file)
+    except ValueError as exc:
+        logging.error("%s", exc)
         return 2
 
     try:
@@ -2263,6 +2359,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="5-digit county FIPS codes to keep (empty = all).",
     )
     parser.add_argument(
+        "--fips-file",
+        default=FIPS_FILE,
+        help=(
+            "Text file of county FIPS codes, one per line, used instead of --fips "
+            "(see sample_data/county_fips_example.txt)."
+        ),
+    )
+    parser.add_argument(
         "--output",
         default=FINAL_JOINED_FEATURES,
         help="Final joined geometry + attributes output path.",
@@ -2302,7 +2406,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     Returns:
         Process exit code: 0 on success, 1 on failure, 2 if required
-        CONFIGURATION values are still placeholders.
+        CONFIGURATION values are still placeholders or the FIPS file cannot
+        be used.
     """
     args = parse_args(notebook_safe_argv(argv))
     logging.basicConfig(
@@ -2319,6 +2424,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         intermediate_combined_csv=args.intermediate_csv,
         intermediate_merged_shp=args.intermediate_shp,
         supplemental_jobs_csv=args.supplemental_jobs,
+        fips_file=args.fips_file,
     )
 
 
