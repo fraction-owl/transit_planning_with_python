@@ -1014,7 +1014,7 @@ def _locate_review_patterns(
     stop_key: str,
 ) -> list[LocatedPattern]:
     """Locate full patterns; fail rather than bridge across an unlocated stop."""
-    by_id = stops.set_index("stop_id")
+    by_id = stops.set_index("stop_id", drop=False)
     factor = _feet_factor(stops.crs)
     result: list[LocatedPattern] = []
     for _, pattern in patterns.iterrows():
