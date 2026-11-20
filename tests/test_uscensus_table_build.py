@@ -1028,3 +1028,50 @@ def test_discover_census_files_with_real_fixtures() -> None:
     assert len(result["POP_FILES"]) >= 1
     assert len(result["INCOME_FILES"]) >= 1
     assert len(result["COMMUTE_FILES"]) >= 1
+
+
+# ---------------------------------------------------------------------------
+# FIPS file setting
+# ---------------------------------------------------------------------------
+
+
+def _point_main_at(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from scripts.national_data_tools import uscensus_table_build as mod
+
+    monkeypatch.setattr(mod, "ROOT_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(mod, "OUTPUT_DIR", None)
+    monkeypatch.setattr(mod, "CSV_OUTPUT_PATH", None)
+
+
+def test_main_combines_inline_fips_and_fips_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from scripts.national_data_tools import uscensus_table_build as mod
+
+    _point_main_at(monkeypatch, tmp_path)
+    fips_file = tmp_path / "planning_area_fips.txt"
+    fips_file.write_text("# area\n24031  # Montgomery County, MD\n1001\n", encoding="utf-8")
+    monkeypatch.setattr(mod, "COUNTY_FIPS_FILTER", ["11001"])
+    monkeypatch.setattr(mod, "COUNTY_FIPS_FILTER_FILE", str(fips_file))
+    monkeypatch.setattr(
+        mod, "discover_census_files", lambda _root: {k: [] for k in mod.TOPIC_SIGNATURES}
+    )
+    seen: dict[str, object] = {}
+
+    def fake_build(**kwargs: object) -> pd.DataFrame:
+        seen.update(kwargs)
+        return pd.DataFrame()
+
+    monkeypatch.setattr(mod, "build_joined_table", fake_build)
+    assert mod.main() == 0
+    assert seen["county_fips_filter"] == ["01001", "11001", "24031"]
+
+
+def test_main_missing_fips_file_is_a_config_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from scripts.national_data_tools import uscensus_table_build as mod
+
+    _point_main_at(monkeypatch, tmp_path)
+    monkeypatch.setattr(mod, "COUNTY_FIPS_FILTER_FILE", str(tmp_path / "missing.txt"))
+    assert mod.main() == 2

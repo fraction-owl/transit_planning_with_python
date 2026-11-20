@@ -1610,3 +1610,51 @@ def test_run_route_mode_origin_employment_knob_changes_total(
     keep = _empl(tmp_path / "keep", zero_origin_empl=False)
     drop = _empl(tmp_path / "drop", zero_origin_empl=True)
     assert keep > drop
+
+
+# ---------------------------------------------------------------------------
+# FIPS file setting
+# ---------------------------------------------------------------------------
+
+
+def test_main_folds_fips_file_into_filter(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import scripts.service_coverage.gtfs_service_demographics_gpd as mod
+
+    fips_file = tmp_path / "planning_area_fips.txt"
+    fips_file.write_text("51059\n51013  # Arlington County, VA\n", encoding="utf-8")
+    seen: dict[str, object] = {}
+    monkeypatch.setattr(mod, "run", lambda **kwargs: seen.update(kwargs))
+    argv = [
+        "--gtfs-path",
+        str(tmp_path / "gtfs"),
+        "--demographics-shp",
+        str(tmp_path / "blocks.shp"),
+        "--output-dir",
+        str(tmp_path / "out"),
+        "--fips",
+        "11001",
+        "--fips-file",
+        str(fips_file),
+    ]
+    assert mod.main(argv) == 0
+    assert seen["fips_filter"] == ["11001", "51013", "51059"]
+    assert seen["fips_filter_file"] == ""
+
+
+def test_main_missing_fips_file_is_a_config_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import scripts.service_coverage.gtfs_service_demographics_gpd as mod
+
+    monkeypatch.setattr(mod, "run", lambda **_kwargs: pytest.fail("run() was called"))
+    argv = [
+        "--gtfs-path",
+        str(tmp_path / "gtfs"),
+        "--demographics-shp",
+        str(tmp_path / "blocks.shp"),
+        "--output-dir",
+        str(tmp_path / "out"),
+        "--fips-file",
+        str(tmp_path / "missing.txt"),
+    ]
+    assert mod.main(argv) == 2

@@ -7,7 +7,8 @@ proficiency, vehicle availability, age group, and commuting (journey-to-work)
 statistics.
 
 Supports input as CSV, GZ, or ZIP files (containing '-Data.csv'), and can filter
-by county FIPS codes. Output may be saved as a flat CSV. Tract counts are split
+by county FIPS codes, listed inline and/or in a .txt file such as the one
+county_fips_picker.py writes. Output may be saved as a flat CSV. Tract counts are split
 across each tract's blocks by block population (P1) or households (H9), the same
 count allocation uscensus_tiger_join_gpd uses, so every count column can be
 summed over blocks; tract percentages ride along unchanged.
@@ -71,6 +72,10 @@ COUNTY_FIPS_FILTER: list[str] = [
     "51107",
     "51153",
 ]
+#: Optional .txt file of county FIPS codes (one per line, '#' starts a comment),
+#: e.g. the output of county_fips_picker.py. Its codes are added to
+#: COUNTY_FIPS_FILTER. None to skip.
+COUNTY_FIPS_FILTER_FILE: str | None = None
 
 # -----------------------------------------------------------------------------
 # Signatures that map a file name to a *topic* variable.
@@ -1008,6 +1013,74 @@ def _apply_fips_filter(
     return df[df[dst_col].isin(wanted)].copy()
 
 
+def load_fips_codes(
+    inline_codes: Sequence[str] | None = None,
+    txt_path: str | Path | None = None,
+) -> list[str]:
+    """Combine an inline list and an optional text file of county FIPS codes.
+
+    The text file holds one or more codes per line, separated by commas or
+    spaces. Blank lines are skipped and ``#`` starts a comment, so a line such as
+    ``51059  # Fairfax County, VA`` reads as ``51059``. Four-digit codes are
+    zero-padded to five, which restores the leading ``0`` a spreadsheet drops
+    from states 01-09 (``1001`` becomes ``01001``).
+
+    Unlike a general id-list loader, a file path that is set but missing is an
+    error rather than a warning: an empty FIPS filter means "keep every county",
+    so a mistyped path would otherwise process the whole country silently.
+
+    Canonical implementation: ``utils/fips_helpers.py``.
+
+    Args:
+        inline_codes: Codes supplied directly (e.g. a CONFIGURATION list).
+            ``None`` is treated as empty.
+        txt_path: Path to a text file of codes, or ``None``/``""`` to skip.
+
+    Returns:
+        The combined codes as sorted, de-duplicated 5-digit strings. An empty
+        list means no filter.
+
+    Raises:
+        FileNotFoundError: *txt_path* is set but no file exists there.
+        ValueError: An entry is not a 4- or 5-digit number. The message lists
+            every bad entry and where it came from.
+    """
+    entries: list[tuple[str, str]] = [(str(code), "inline list") for code in inline_codes or ()]
+
+    if txt_path:
+        path = Path(txt_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"FIPS file not found: {path}")
+        with path.open(encoding="utf-8-sig") as handle:
+            for line_no, line in enumerate(handle, start=1):
+                for token in line.split("#", 1)[0].replace(",", " ").split():
+                    entries.append((token, f"{path.name} line {line_no}"))
+
+    codes: set[str] = set()
+    bad: list[str] = []
+    for raw, source in entries:
+        text = raw.strip()
+        if not text:
+            continue
+        if len(text) in (4, 5) and text.isascii() and text.isdigit():
+            codes.add(text.zfill(5))
+        else:
+            bad.append(f"'{text}' ({source})")
+
+    if bad:
+        raise ValueError(
+            "These entries are not 5-digit county FIPS codes: "
+            + ", ".join(bad)
+            + ". Each code is a 2-digit state code followed by a 3-digit county code, "
+            "e.g. 51059 for Fairfax County, VA."
+        )
+
+    if txt_path:
+        logging.info("Read county FIPS codes from %s.", txt_path)
+    logging.info("Resolved %d county FIPS code(s).", len(codes))
+    return sorted(codes)
+
+
 def _tract_count_columns(tract_df: pd.DataFrame) -> list[str]:
     """Return the additive count columns of a tract table (numeric, not ``perc_*`` or ids)."""
     ids = {GEO_ID_COL, "tract_id_clean", "FIPS"}
@@ -1177,6 +1250,12 @@ def main() -> int:
         return 2
 
     try:
+        county_fips = load_fips_codes(COUNTY_FIPS_FILTER, COUNTY_FIPS_FILTER_FILE)
+    except (FileNotFoundError, ValueError) as exc:
+        logging.error("Invalid county FIPS setting: %s", exc)
+        return 2
+
+    try:
         logging.info("Discovering Census datasets under %s …", ROOT_DATA_DIR)
         discovered = discover_census_files(ROOT_DATA_DIR)
 
@@ -1190,7 +1269,7 @@ def main() -> int:
             vehicle_files=discovered["VEHICLE_FILES"],
             age_files=discovered["AGE_FILES"],
             commute_files=discovered["COMMUTE_FILES"],
-            county_fips_filter=COUNTY_FIPS_FILTER,
+            county_fips_filter=county_fips,
         )
         logging.info("Created DataFrame with shape %s", df_joined.shape)
 

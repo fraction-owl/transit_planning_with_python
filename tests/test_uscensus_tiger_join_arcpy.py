@@ -191,3 +191,35 @@ def test_block_group_download_missing_part_of_a_tract_warns(
         mod.build_joined_table_from_folder(tmp_path, county_fips_filter=["11001"])
     assert "INCOME_FILES: 1 tract(s) (e.g. 11001000100)" in caplog.text
     assert "110010001001" in caplog.text and "300 residents" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# FIPS file setting
+# ---------------------------------------------------------------------------
+
+
+def test_main_passes_fips_file_codes_to_pipeline(
+    mod: types.ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    fips_file = tmp_path / "planning_area_fips.txt"
+    fips_file.write_text("51059  # Fairfax County, VA\n", encoding="utf-8")
+    monkeypatch.setattr(mod, "INPUT_CSV_DIR", str(tmp_path))
+    monkeypatch.setattr(mod, "INPUT_SHP_DIR", str(tmp_path))
+    monkeypatch.setattr(mod, "FIPS_TO_FILTER", ["11001"])
+    monkeypatch.setattr(mod, "FIPS_TO_FILTER_FILE", str(fips_file))
+    seen: list[object] = []
+    monkeypatch.setattr(mod, "run_pipeline", seen.append)
+    assert mod.main() == 0
+    assert seen == [["11001", "51059"]]
+
+
+def test_main_bad_fips_file_entry_is_a_config_error(
+    mod: types.ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    fips_file = tmp_path / "planning_area_fips.txt"
+    fips_file.write_text("Fairfax County\n", encoding="utf-8")
+    monkeypatch.setattr(mod, "INPUT_CSV_DIR", str(tmp_path))
+    monkeypatch.setattr(mod, "INPUT_SHP_DIR", str(tmp_path))
+    monkeypatch.setattr(mod, "FIPS_TO_FILTER_FILE", str(fips_file))
+    monkeypatch.setattr(mod, "run_pipeline", lambda _codes: pytest.fail("pipeline ran"))
+    assert mod.main() == 2
