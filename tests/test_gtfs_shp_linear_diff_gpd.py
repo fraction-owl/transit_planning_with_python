@@ -20,7 +20,7 @@ import pandas as pd
 import pytest
 from pyproj import Transformer
 from shapely.affinity import translate
-from shapely.geometry import LineString
+from shapely.geometry import LineString, MultiLineString
 
 from scripts.stop_analysis import gtfs_shp_linear_diff_gpd as mod
 
@@ -288,31 +288,42 @@ def test_select_patterns_falls_back_to_all_trips() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_combine_lines_counts_a_two_way_street_once() -> None:
+def test_measure_lines_counts_a_two_way_street_once() -> None:
     out = LineString([(0, 0), (3_000, 0)])
     back = LineString([(3_000, 8), (0, 8)])  # same street, drawn 8 m off
-    combined = mod.combine_lines([out, back], buffer_dist=25.0, min_segment_dist=45.0)
-    assert combined is not None
-    assert combined.length == pytest.approx(3_000.0)
+    kept = mod.measure_lines([out, back], buffer_dist=25.0)
+    assert sum(line.length for line in kept) == pytest.approx(3_000.0)
 
 
-def test_combine_lines_keeps_both_streets_of_a_couplet() -> None:
+def test_measure_lines_keeps_both_streets_of_a_couplet() -> None:
     out = LineString([(0, 0), (3_000, 0)])
     back = LineString([(3_000, 5), (2_000, 5), (2_000, 200), (1_000, 200), (1_000, 5), (0, 5)])
-    combined = mod.combine_lines([out, back], buffer_dist=25.0, min_segment_dist=45.0)
-    assert combined is not None
+    kept = mod.measure_lines([out, back], buffer_dist=25.0)
     # 3000 + the 1000 m parallel street + two connectors from 25 m to 200 m.
-    assert combined.length == pytest.approx(3_000 + 1_000 + 2 * 175, rel=0.01)
+    assert sum(line.length for line in kept) == pytest.approx(3_000 + 1_000 + 2 * 175, rel=0.01)
 
 
-def test_combine_lines_drops_terminal_stubs_and_empty_input() -> None:
-    out = LineString([(0, 0), (3_000, 0)])
-    loop = LineString([(3_000, 0), (3_030, 30), (3_000, 10), (0, 10)])  # tiny turnaround
-    combined = mod.combine_lines([out, loop], buffer_dist=25.0, min_segment_dist=45.0)
-    assert combined is not None
-    assert combined.length == pytest.approx(3_000.0)
-    assert mod.combine_lines([], buffer_dist=25.0, min_segment_dist=45.0) is None
-    assert mod.combine_lines([LineString()], buffer_dist=25.0, min_segment_dist=45.0) is None
+def test_measure_lines_never_trims_a_line_against_itself() -> None:
+    # One line in three pieces that meet end to end: nothing is trimmed where
+    # its own pieces meet.
+    pieces = MultiLineString(
+        [[(0, 0), (1_000, 0)], [(1_000, 0), (1_000, 900)], [(1_000, 900), (0, 900)]]
+    )
+    assert sum(line.length for line in mod.measure_lines([pieces], 25.0)) == pytest.approx(2_900.0)
+    assert mod.measure_lines([], 25.0) == []
+    assert mod.measure_lines([LineString()], 25.0) == []
+
+
+def test_split_by_length() -> None:
+    short, long = LineString([(0, 0), (10, 0)]), LineString([(0, 0), (100, 0)])
+    assert mod.split_by_length([short, long], 45.0) == ([long], [short])
+
+
+def test_chain_lines_joins_segments_without_noding() -> None:
+    segments = [LineString([(x, 0), (x + 100, 0)]) for x in range(0, 1_000, 100)]
+    crossing = LineString([(500, -50), (500, 50)])
+    chained = mod.chain_lines([*segments[::-1], crossing])
+    assert sorted(round(line.length) for line in chained) == [100, 1_000]
 
 
 def test_compare_alignments_splits_a_detour() -> None:
@@ -394,10 +405,13 @@ def test_reference_routes_combine_directions_and_numeric_names(tmp_path: Path) -
         ],
         field="RTE_NUM",
     )
-    refs = mod.load_reference_routes(shp, "rte_num", None, True, "EPSG:2248", 80.0, 150.0)
+    refs = mod.load_reference_routes(shp, "rte_num", None, True, "EPSG:2248")
     assert sorted(refs) == ["10", "7"]
     assert refs["10"].feature_count == 2
-    assert refs["10"].geometry.length == pytest.approx(6_000.0)  # EPSG:2248 is in feet
+    # Both directions are kept as drawn; measuring them counts the street once.
+    assert len(refs["10"].lines) == 2
+    measured = mod.measure_lines(refs["10"].lines, 80.0)  # EPSG:2248 is in feet
+    assert sum(line.length for line in measured) == pytest.approx(6_000.0)
     assert refs["10"].names == ("10",)
 
 
@@ -406,7 +420,7 @@ def test_reference_routes_from_folder_and_zip(tmp_path: Path) -> None:
     write_reference(folder / "Route_010.shp", [("x", REF_10_MAIN)], field="NOTE")
     write_reference(folder / "Route_99.shp", [("x", REF_99)], field="NOTE")
     pattern = re.compile(r"(?i)route_(\w+)")
-    from_folder = mod.load_reference_routes(folder, "", pattern, True, "EPSG:2248", 25.0, 45.0)
+    from_folder = mod.load_reference_routes(folder, "", pattern, True, "EPSG:2248")
     assert sorted(from_folder) == ["10", "99"]
     assert from_folder["10"].sources == ("Route_010",)
 
@@ -414,24 +428,22 @@ def test_reference_routes_from_folder_and_zip(tmp_path: Path) -> None:
     with zipfile.ZipFile(archive, "w") as zf:
         for f in folder.iterdir():
             zf.write(f, f"exports/{f.name}")
-    from_zip = mod.load_reference_routes(archive, "", pattern, True, "EPSG:2248", 25.0, 45.0)
+    from_zip = mod.load_reference_routes(archive, "", pattern, True, "EPSG:2248")
     assert sorted(from_zip) == ["10", "99"]
 
 
 def test_reference_routes_reject_missing_field_and_crs(tmp_path: Path) -> None:
     shp = write_reference(tmp_path / "ref.shp", [("10", REF_10_MAIN)])
     with pytest.raises(mod.ConfigError, match="no field 'LINE'.*ROUTE"):
-        mod.load_reference_routes(shp, "LINE", None, True, "EPSG:2248", 25.0, 45.0)
+        mod.load_reference_routes(shp, "LINE", None, True, "EPSG:2248")
     shp.with_suffix(".prj").unlink()
     with pytest.raises(ValueError, match="no coordinate system"):
-        mod.load_reference_routes(shp, "ROUTE", None, True, "EPSG:2248", 25.0, 45.0)
+        mod.load_reference_routes(shp, "ROUTE", None, True, "EPSG:2248")
     with pytest.raises(OSError, match="does not exist"):
-        mod.load_reference_routes(
-            tmp_path / "nope.shp", "ROUTE", None, True, "EPSG:2248", 25.0, 45.0
-        )
+        mod.load_reference_routes(tmp_path / "nope.shp", "ROUTE", None, True, "EPSG:2248")
     (tmp_path / "empty").mkdir()
     with pytest.raises(ValueError, match="No .shp files"):
-        mod.load_reference_routes(tmp_path / "empty", "", None, True, "EPSG:2248", 25.0, 45.0)
+        mod.load_reference_routes(tmp_path / "empty", "", None, True, "EPSG:2248")
 
 
 # ---------------------------------------------------------------------------
@@ -488,7 +500,8 @@ def test_run_classifies_every_route(tmp_path: Path) -> None:
     assert gtfs_only.crs.to_epsg() == 4326
     assert set(gtfs_only["rt_status"]) == {"mismatch", "missing_from_shp"}
     shp_only = gpd.read_file(out / mod.SEGMENTS_SHP_ONLY_FILENAME)
-    assert set(shp_only["rt_key"]) == {"7", "99"}
+    # Route 30's reference line has no GTFS shape to match, so it is listed too.
+    assert set(shp_only["rt_key"]) == {"7", "99", "30"}
     combined = gpd.read_file(out / mod.COMBINED_ROUTES_FILENAME)
     assert sorted(combined["rt_key"]) == ["10", "40", "7"]
     selected = gpd.read_file(out / mod.PATTERNS_SHP_FILENAME)
@@ -726,3 +739,46 @@ def test_routes_without_trips_are_noted(tmp_path: Path) -> None:
     row = route_table(tmp_path / "out").loc["80"]
     assert row["status"] == "missing_from_gtfs"
     assert row["note"] == "routes.txt lists this route, but no trip runs it"
+
+
+# ---------------------------------------------------------------------------
+# Second review: one measurement basis for totals and classes
+# ---------------------------------------------------------------------------
+
+
+def _weave(length: float, near: float, far: float, step: float) -> list[tuple[float, float]]:
+    """A line whose distance from y=0 alternates between *near* and *far* every *step*."""
+    xs = [x * step for x in range(int(length / step) + 1)]
+    return [(x, near if i % 2 == 0 else far) for i, x in enumerate(xs)]
+
+
+def test_divided_road_lengths_reconcile() -> None:
+    # Two directions of a divided road: the second weaves 60-100 ft from the
+    # first, in and out of the 80 ft tolerance in short pieces. The reference
+    # is the median line. Matched length can never exceed the route total.
+    out = LineString([(0, 0), (6_000, 0)])
+    back = LineString(_weave(6_000, 60, 100, 120)[::-1])
+    median = LineString([(0, 40), (6_000, 40)])
+    classes = mod.compare_alignments([out, back], [median], 80.0, 150.0)
+    lengths = _class_lengths(classes)
+    gtfs_total = lengths["matched"] + lengths["gtfs_only"] + lengths["gtfs_short"]
+    assert lengths["gtfs_only"] == 0 and lengths["shp_only"] == 0
+    assert gtfs_total == pytest.approx(6_000, rel=0.02)  # the street, counted once
+    assert lengths["shp_matched"] == pytest.approx(6_000, rel=0.001)
+
+
+def test_route_table_lengths_add_up(tmp_path: Path) -> None:
+    gtfs = write_feed(tmp_path / "gtfs")
+    shp = write_reference(tmp_path / "ref" / "routes.shp", DEFAULT_REFERENCE)
+    for rule in ("most_trips", "all"):
+        out = tmp_path / rule
+        mod.run(make_config(gtfs, shp, out, pattern_rule=rule))
+        table = route_table(out)
+        gtfs_sum = table["matched_len_ft"] + table["gtfs_only_len_ft"] + table["gtfs_short_len_ft"]
+        shp_sum = table["shp_matched_len_ft"] + table["shp_only_len_ft"] + table["shp_short_len_ft"]
+        assert table["gtfs_len_ft"].to_numpy() == pytest.approx(gtfs_sum.to_numpy(), abs=0.2)
+        assert table["shp_len_ft"].to_numpy() == pytest.approx(shp_sum.to_numpy(), abs=0.2)
+        assert (table["matched_len_ft"] <= table["gtfs_len_ft"] + 0.2).all()
+        combined = gpd.read_file(out / mod.COMBINED_ROUTES_FILENAME).set_index("rt_key")
+        for key, length in combined["len_ft"].items():
+            assert length == pytest.approx(table.loc[key, "gtfs_len_ft"], abs=0.2)

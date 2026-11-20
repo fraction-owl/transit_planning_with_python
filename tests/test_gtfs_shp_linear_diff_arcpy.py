@@ -79,6 +79,9 @@ def _fake_arcpy() -> types.ModuleType:
         def __init__(self, geom: Any, sr: SpatialReference) -> None:
             self._g, self.spatialReference = geom, sr
 
+        def union(self, other: Polygon) -> Polygon:
+            return Polygon(self._g.union(other._g), self.spatialReference)
+
     class Polyline:
         def __init__(self, array: Sequence[Any] | None, sr: SpatialReference) -> None:
             self.spatialReference = sr
@@ -102,6 +105,11 @@ def _fake_arcpy() -> types.ModuleType:
         @property
         def length(self) -> float:
             return self._g.length
+
+        @property
+        def extent(self) -> types.SimpleNamespace:
+            xmin, ymin, xmax, ymax = self._g.bounds
+            return types.SimpleNamespace(XMin=xmin, YMin=ymin, XMax=xmax, YMax=ymax)
 
         @property
         def partCount(self) -> int:
@@ -375,13 +383,33 @@ def test_extract_lines_merges_split_overlay_parts(mod: types.ModuleType) -> None
     assert mod.filter_short_lines(lines, 250.0) == []
 
 
-def test_combine_lines_counts_a_two_way_street_once(mod: types.ModuleType) -> None:
+def test_measure_lines_counts_a_two_way_street_once(mod: types.ModuleType) -> None:
     sr = mod.arcpy.SpatialReference(2248)
     out = mod._polyline([(0, 0), (10_000, 0)], sr)
     back = mod._polyline([(10_000, 20), (0, 20)], sr)
-    combined = mod.combine_lines([out, back], 80.0, 150.0)
-    assert combined.length == pytest.approx(10_000.0)
-    assert mod.combine_lines([], 80.0, 150.0) is None
+    kept = mod.measure_lines([out, back], 80.0, 150.0)
+    assert sum(line.length for line in kept) == pytest.approx(10_000.0)
+    assert mod.measure_lines([], 80.0) == []
+
+
+def test_chain_lines_joins_segments(mod: types.ModuleType) -> None:
+    sr = mod.arcpy.SpatialReference(2248)
+    segments = [mod._polyline([(x, 0), (x + 100, 0)], sr) for x in range(0, 1_000, 100)]
+    chained = mod.chain_lines(segments[::-1])
+    assert len(chained) == 1 and chained[0].length == pytest.approx(1_000.0)
+
+
+def test_divided_road_lengths_reconcile(mod: types.ModuleType) -> None:
+    sr = mod.arcpy.SpatialReference(2248)
+    weave = [(x * 120, 60 if i % 2 == 0 else 100) for i, x in enumerate(range(51))]
+    gtfs = [mod._polyline([(0, 0), (6_000, 0)], sr), mod._polyline(weave[::-1], sr)]
+    median = [mod._polyline([(0, 40), (6_000, 40)], sr)]
+    lengths = {
+        name: sum(line.length for line in lines)
+        for name, lines in mod.compare_alignments(gtfs, median, 80.0, 150.0).items()
+    }
+    total = lengths["matched"] + lengths["gtfs_only"] + lengths["gtfs_short"]
+    assert total == pytest.approx(6_000, rel=0.02) and lengths["matched"] <= total
 
 
 def test_spatial_reference_rejects_unusable_wkids(mod: types.ModuleType) -> None:
@@ -434,10 +462,13 @@ def test_run_matches_the_geopandas_twin(mod: types.ModuleType, tmp_path: Path) -
     assert table["shape_ids"].to_dict() == twin["shape_ids"].to_dict()
     for col in (
         "gtfs_len_ft",
-        "shp_len_ft",
         "matched_len_ft",
         "gtfs_only_len_ft",
+        "gtfs_short_len_ft",
+        "shp_len_ft",
+        "shp_matched_len_ft",
         "shp_only_len_ft",
+        "shp_short_len_ft",
     ):
         assert table[col].to_numpy() == pytest.approx(twin[col].to_numpy(), rel=0.01, abs=5.0)
 
@@ -453,7 +484,7 @@ def test_run_matches_the_geopandas_twin(mod: types.ModuleType, tmp_path: Path) -
     assert gtfs_only["sr"].name == "WGS_84"
     assert {row["rt_status"] for row in gtfs_only["rows"]} == {"mismatch", "missing_from_shp"}
     shp_only = features[str(out / "gtfs_shp_segments_shp_only.shp")]["rows"]
-    assert {row["rt_key"] for row in shp_only} == {"7", "99"}
+    assert {row["rt_key"] for row in shp_only} == {"7", "99", "30"}  # 30 has no GTFS shape
     combined = features[str(out / "gtfs_shp_combined_routes.shp")]["rows"]
     assert sorted(row["rt_key"] for row in combined) == ["10", "40", "7"]
     assert all(isinstance(row["n_patterns"], int) for row in combined)
