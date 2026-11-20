@@ -50,8 +50,8 @@ from shapely.ops import substring
 GTFS_PATH: str = r"Path\To\Your\GTFS_Data_Folder"  # folder or .zip
 OUTPUT_FOLDER: str = r"Path\To\Your\Output_Folder"
 
-FILTER_OUT_LIST: list[str] = ["9999A", "9999B", "9999C"]
-INCLUDE_ROUTE_IDS: list[str] = ["101", "202"]
+FILTER_OUT_LIST: list[str] = []  # route_id values to drop, e.g. ["9999A", "9999B", "9999C"]
+INCLUDE_ROUTE_IDS: list[str] = []  # e.g. ["101", "202"]; empty → all routes except filtered-out
 
 # Union each route/direction's shapes in routes.shp only; spacing is always
 # measured along each stopping pattern's own shape.
