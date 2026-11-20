@@ -73,7 +73,7 @@ def test_load_gtfs_data_keeps_literal_na_values(tmp_path: Path) -> None:
     (tmp_path / "routes.txt").write_text("route_id,route_short_name\nR1,NA\nR2,\n")
     routes = target.load_gtfs_data(str(tmp_path), files=("routes.txt",))["routes"]
     assert list(routes["route_short_name"]) == ["NA", ""]
-    assert target.resolve_route_ids_by_short_name(routes, {"NA"}) == {"R1"}
+    assert target.resolve_route_ids_by_short_name(routes, ["NA"]) == {"R1"}
 
 
 # ---------------------------------------------------------------------------
@@ -82,24 +82,24 @@ def test_load_gtfs_data_keeps_literal_na_values(tmp_path: Path) -> None:
 
 
 def test_resolve_route_ids_matches_short_names() -> None:
-    ids = target.resolve_route_ids_by_short_name(_routes_df(), {"101", "303"})
+    ids = target.resolve_route_ids_by_short_name(_routes_df(), ["101", "303"])
     assert ids == {"R1", "R3"}
 
 
 def test_resolve_route_ids_empty_input_returns_empty() -> None:
-    assert target.resolve_route_ids_by_short_name(_routes_df(), set()) == set()
+    assert target.resolve_route_ids_by_short_name(_routes_df(), []) == set()
 
 
 def test_resolve_route_ids_missing_token_logs_warning(caplog) -> None:
     with caplog.at_level("WARNING"):
-        ids = target.resolve_route_ids_by_short_name(_routes_df(), {"101", "888"})
+        ids = target.resolve_route_ids_by_short_name(_routes_df(), ["101", "888"])
     assert ids == {"R1"}
     assert "888" in caplog.text
 
 
 def test_resolve_route_ids_no_short_name_column_returns_empty() -> None:
     routes = pd.DataFrame({"route_id": ["R1"]})
-    assert target.resolve_route_ids_by_short_name(routes, {"101"}) == set()
+    assert target.resolve_route_ids_by_short_name(routes, ["101"]) == set()
 
 
 # ---------------------------------------------------------------------------
@@ -338,7 +338,7 @@ def test_compute_summary_system_counts_and_percentages() -> None:
         ["SHELTER", "BENCH", "TRASHCAN", "PAD"],
         target.IMPROVEMENT_COLUMNS,
         whitelist_route_ids=set(),
-        whitelist_short_names=set(),
+        whitelist_short_names=[],
     )
     assert summary["system_total_stops"] == 4
     assert summary["per_improvement"]["Shelter"]["system_count"] == 2
@@ -352,7 +352,7 @@ def test_compute_summary_whitelist_coverage() -> None:
         ["SHELTER", "BENCH", "TRASHCAN", "PAD"],
         target.IMPROVEMENT_COLUMNS,
         whitelist_route_ids={"R1"},
-        whitelist_short_names={"101"},
+        whitelist_short_names=["101"],
     )
     assert summary["whitelist_total_stops"] == 2  # C1, C2
     assert summary["whitelist_pct_of_system"] == 50.0
@@ -367,7 +367,7 @@ def test_compute_summary_empty_universe_is_zero_safe() -> None:
         ["SHELTER"],
         {"Shelter": "SHELTER"},
         whitelist_route_ids=set(),
-        whitelist_short_names=set(),
+        whitelist_short_names=[],
     )
     assert summary["system_total_stops"] == 0
     assert summary["whitelist_pct_of_system"] == 0.0
@@ -381,7 +381,7 @@ def test_compute_summary_no_improvements_supplied_flag() -> None:
         [],
         target.IMPROVEMENT_COLUMNS,
         whitelist_route_ids=set(),
-        whitelist_short_names=set(),
+        whitelist_short_names=[],
     )
     assert summary["improvements_supplied"] is False
     assert summary["per_improvement"] == {}
@@ -398,10 +398,10 @@ def test_write_summary_txt_reports_counts(tmp_path: Path) -> None:
         ["SHELTER", "BENCH", "TRASHCAN", "PAD"],
         target.IMPROVEMENT_COLUMNS,
         whitelist_route_ids={"R1"},
-        whitelist_short_names={"101"},
+        whitelist_short_names=["101"],
     )
     out = tmp_path / "summary.txt"
-    target.write_summary_txt(summary, {"9999A"}, out)
+    target.write_summary_txt(summary, ["9999A"], out)
     content = out.read_text(encoding="utf-8")
     assert "Total logical stops (post-blacklist): 4" in content
     assert "Blacklist routes excluded: 9999A" in content
@@ -416,10 +416,10 @@ def test_write_summary_txt_without_improvements(tmp_path: Path) -> None:
         [],
         target.IMPROVEMENT_COLUMNS,
         whitelist_route_ids=set(),
-        whitelist_short_names=set(),
+        whitelist_short_names=[],
     )
     out = tmp_path / "summary.txt"
-    target.write_summary_txt(summary, set(), out)
+    target.write_summary_txt(summary, [], out)
     content = out.read_text(encoding="utf-8")
     assert "no improvements CSV supplied" in content
 
@@ -454,8 +454,8 @@ def test_main_runs_with_only_required_gtfs_files(
     monkeypatch.setattr(target, "USE_STOP_CODE", use_stop_code)
     monkeypatch.setattr(target, "IMPROVEMENTS_CSV", csv_path)
     monkeypatch.setattr(target, "IMPROVEMENTS_JOIN_FIELD", join_field)
-    monkeypatch.setattr(target, "ROUTE_WHITELIST", {"101"})
-    monkeypatch.setattr(target, "ROUTE_BLACKLIST", set())
+    monkeypatch.setattr(target, "ROUTE_WHITELIST", ["101"])
+    monkeypatch.setattr(target, "ROUTE_BLACKLIST", [])
     monkeypatch.setattr(target, "OUTPUT_DIR", out_dir)
 
     assert target.main() == 0

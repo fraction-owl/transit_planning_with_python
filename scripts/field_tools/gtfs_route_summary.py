@@ -44,7 +44,7 @@ BASE_OUTPUT_PATH = _DEFAULT_BASE_OUTPUT_PATH  # <<< EDIT HERE
 OUTPUT_FILENAME = "routes_summary.xlsx"
 DISTANCE_UNIT = "meters"  # meters | kilometers | feet | miles
 OUTPUT_UNITS = "imperial"  # imperial (mi/mph) or metric (km/kmh)
-EXCLUDED_ROUTE_SHORT_NAMES = ["9999A", "9999B", "9999C"]
+EXCLUDED_ROUTE_SHORT_NAMES = []  # e.g. ["9999A", "9999B", "9999C"]
 
 SERVICE_TYPES_PATH = ""
 CORRIDORS_PATH = ""

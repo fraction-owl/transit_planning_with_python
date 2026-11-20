@@ -112,18 +112,18 @@ TIGER_INPUT_GLOB: str = "tl_*_*_tabblock20.shp"
 #: 5-digit county FIPS codes. Applied in both Stage 1 and Stage 2.
 #: Leave empty ([]) to export everything.
 FIPS_TO_FILTER: List[str] = [
-    "11001",
-    "24031",
-    "24033",
-    "51683",
-    "51685",
-    "51059",
-    "51013",
-    "51510",
-    "51600",
-    "51610",
-    "51107",
-    "51153",
+    # "11001",
+    # "24031",
+    # "24033",
+    # "51683",
+    # "51685",
+    # "51059",
+    # "51013",
+    # "51510",
+    # "51600",
+    # "51610",
+    # "51107",
+    # "51153",
 ]
 
 #: Optional text file of county FIPS codes, one per line, used instead of

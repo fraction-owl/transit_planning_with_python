@@ -61,18 +61,18 @@ CSV_OUTPUT_PATH: str | None = (
 
 #: Optional county FIPS filter (5-digit codes, e.g. ["11001", "51059"])
 COUNTY_FIPS_FILTER: list[str] = [
-    "11001",
-    "24031",
-    "24033",
-    "51683",
-    "51685",
-    "51059",
-    "51013",
-    "51510",
-    "51600",
-    "51610",
-    "51107",
-    "51153",
+    # "11001",
+    # "24031",
+    # "24033",
+    # "51683",
+    # "51685",
+    # "51059",
+    # "51013",
+    # "51510",
+    # "51600",
+    # "51610",
+    # "51107",
+    # "51153",
 ]
 
 #: Optional text file of county FIPS codes, one per line, used instead of
