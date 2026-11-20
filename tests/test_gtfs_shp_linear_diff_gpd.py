@@ -7,6 +7,8 @@ Plane, US feet) around a DC origin, so distances in the fixtures read as feet.
 from __future__ import annotations
 
 import json
+import logging
+import random
 import re
 import zipfile
 from collections.abc import Mapping, Sequence
@@ -316,20 +318,65 @@ def test_combine_lines_drops_terminal_stubs_and_empty_input() -> None:
 def test_compare_alignments_splits_a_detour() -> None:
     gtfs = LineString([(0, 0), (3_000, 0)])
     ref = LineString([(0, 0), (1_000, 0), (1_000, 500), (2_000, 500), (2_000, 0), (3_000, 0)])
-    classes = mod.compare_alignments(gtfs, ref, buffer_dist=25.0, min_segment_dist=45.0)
-    lengths = {name: sum(line.length for line in lines) for name, lines in classes.items()}
+    classes = mod.compare_alignments([gtfs], [ref], buffer_dist=25.0, min_segment_dist=45.0)
+    lengths = _class_lengths(classes)
     assert lengths["matched"] == pytest.approx(2_000 + 50, rel=0.02)
     assert lengths["gtfs_only"] == pytest.approx(1_000 - 50, rel=0.02)
     assert lengths["shp_only"] == pytest.approx(1_000 + 2 * 475, rel=0.02)
 
 
+def _class_lengths(classes: Mapping[str, Sequence[LineString]]) -> dict[str, float]:
+    return {name: sum(line.length for line in lines) for name, lines in classes.items()}
+
+
+def _chop(line: LineString, step: float) -> list[LineString]:
+    """Cut a line into pieces of *step* length (the last one shorter)."""
+    marks = [*range(0, int(line.length), int(step)), line.length]
+    return [
+        LineString([line.interpolate(a), line.interpolate(b)]) for a, b in zip(marks, marks[1:])
+    ]
+
+
 def test_compare_alignments_identical_lines_match() -> None:
     line = LineString([(0, 0), (3_000, 0)])
     classes = mod.compare_alignments(
-        line, translate(line, 0, 10), buffer_dist=25.0, min_segment_dist=45.0
+        [line], [translate(line, 0, 10)], buffer_dist=25.0, min_segment_dist=45.0
     )
     assert classes["gtfs_only"] == [] and classes["shp_only"] == []
     assert sum(part.length for part in classes["matched"]) == pytest.approx(3_000.0)
+
+
+def test_compare_alignments_same_linework_never_differs() -> None:
+    # Identity regression: the same two direction shapes on both sides, the
+    # reference cut into 30 m pieces in shuffled order, report no difference.
+    out = LineString([(0, 0), (900, 0), (900, 600), (1_800, 600)])
+    back = LineString([(1_800, 9), (909, 9), (909, -150), (600, -150), (600, 90), (0, 90)])
+    pieces = _chop(out, 30.0) + _chop(back, 30.0)
+    random.Random(7).shuffle(pieces)
+    for reference in (pieces, [back, out]):
+        classes = mod.compare_alignments([out, back], reference, 25.0, 45.0)
+        assert classes["gtfs_only"] == [] and classes["shp_only"] == []
+
+
+def test_compare_alignments_keeps_lines_within_tolerance_of_any_line() -> None:
+    # Three parallel lines 21 m apart: GTFS has the inner two, the reference the
+    # outer two. Every line lies within the 25 m tolerance of a line on the
+    # other side, whichever order the features come in.
+    low, mid, high = (LineString([(0, y), (1_500, y)]) for y in (0, 21, 42))
+    for reference in ([mid, high], [high, mid]):
+        classes = mod.compare_alignments([low, mid], reference, 25.0, 45.0)
+        assert classes["gtfs_only"] == [] and classes["shp_only"] == []
+
+
+def test_compare_alignments_counts_a_shared_detour_once() -> None:
+    # Both GTFS directions leave the reference street together; the gtfs_only
+    # length is the detour street once, not twice.
+    out = LineString([(0, 0), (1_000, 0), (1_000, 300), (2_000, 300), (2_000, 0), (3_000, 0)])
+    back = LineString([(3_000, 8), (2_008, 8), (2_008, 308), (992, 308), (992, 8), (0, 8)])
+    ref = LineString([(0, 0), (3_000, 0)])
+    lengths = _class_lengths(mod.compare_alignments([out, back], [ref], 25.0, 45.0))
+    assert lengths["gtfs_only"] == pytest.approx(1_000 + 2 * 275, rel=0.03)
+    assert lengths["shp_only"] == pytest.approx(1_000 - 50, rel=0.03)
 
 
 # ---------------------------------------------------------------------------
@@ -559,3 +606,123 @@ def test_main_returns_1_for_missing_inputs(tmp_path: Path) -> None:
     (gtfs / "shapes.txt").unlink()
     args = ["--gtfs", str(gtfs), "--route-shapes", str(shp)]
     assert mod.main([*args, "--output-dir", str(tmp_path / "o")]) == 1
+
+
+# ---------------------------------------------------------------------------
+# Review regressions: identity runs, stale layers, run log, units, aliases
+# ---------------------------------------------------------------------------
+
+
+def _gtfs_as_reference(step: float = 300.0) -> list[tuple[str, list[tuple[float, float]]]]:
+    """The weekday GTFS shapes themselves, chopped into short pieces, as reference features."""
+    routes = {"10": ("S10_0", "S10_1"), "7": ("S7_E", "S7_W"), "40": ("S40",)}
+    return [
+        (name, list(piece.coords))
+        for name, shape_ids in routes.items()
+        for sid in shape_ids
+        for piece in _chop(LineString(SHAPES[sid]), step)
+    ]
+
+
+def test_rerun_with_identical_linework_reports_nothing_and_clears_old_layers(
+    tmp_path: Path,
+) -> None:
+    gtfs = write_feed(tmp_path / "gtfs")
+    out = tmp_path / "out"
+    first = write_reference(tmp_path / "ref1" / "routes.shp", DEFAULT_REFERENCE)
+    mod.run(make_config(gtfs, first, out))
+    for filename in (mod.SEGMENTS_GTFS_ONLY_FILENAME, mod.SEGMENTS_SHP_ONLY_FILENAME):
+        assert (out / filename).exists()
+
+    same = write_reference(tmp_path / "ref2" / "routes.shp", _gtfs_as_reference())
+    mod.run(make_config(gtfs, same, out))
+    table = route_table(out)
+    assert table["status"].to_dict() == {
+        "30": "no_gtfs_geometry",
+        "10": "match",
+        "7": "match",
+        "40": "match",
+    }
+    assert (table["gtfs_only_len_ft"] == 0).all() and (table["shp_only_len_ft"] == 0).all()
+    for filename in (mod.SEGMENTS_GTFS_ONLY_FILENAME, mod.SEGMENTS_SHP_ONLY_FILENAME):
+        stem = Path(filename).stem
+        assert not list(out.glob(f"{stem}.*")), f"stale {stem} files left behind"
+    assert (out / mod.SEGMENTS_MATCHED_FILENAME).exists()
+    log = (out / mod.RUN_LOG_FILENAME).read_text(encoding="utf-8")
+    assert (
+        "Layers with no features:  gtfs_shp_segments_gtfs_only.shp, gtfs_shp_segments_shp_only.shp"
+        in log
+    )
+
+
+def test_run_log_records_the_settings_used(tmp_path: Path) -> None:
+    gtfs = write_feed(tmp_path / "gtfs")
+    shp = write_reference(tmp_path / "ref" / "routes.shp", DEFAULT_REFERENCE)
+    out = tmp_path / "out"
+    args = ["--gtfs", str(gtfs), "--route-shapes", str(shp), "--output-dir", str(out)]
+    assert mod.main([*args, "--shp-route-field", "ROUTE", "--buffer-feet", "90"]) == 0
+    log = (out / mod.RUN_LOG_FILENAME).read_text(encoding="utf-8")
+    used = log.split("SETTINGS USED")[1].split("CONFIGURATION (verbatim")[0]
+    assert f'GTFS_PATH = r"{gtfs}"' in used
+    assert "SHP_ROUTE_FIELD = 'ROUTE'" in used
+    assert "BUFFER_TOLERANCE_FEET = 90.0" in used
+    assert 'SHP_ROUTE_FIELD: str = ""' in log  # the verbatim block is still there
+
+
+def test_km_output_names_columns_by_unit(tmp_path: Path) -> None:
+    gtfs = write_feed(tmp_path / "gtfs")
+    shp = write_reference(tmp_path / "ref" / "routes.shp", DEFAULT_REFERENCE)
+    out = tmp_path / "out"
+    summary = mod.run(make_config(gtfs, shp, out, distance_output_unit="km"))
+    table = route_table(out)
+    assert "gtfs_only_len_km" in table.columns
+    assert not [c for c in table.columns if c.endswith("_mi")]
+    assert table.loc["7", "gtfs_only_len_km"] == pytest.approx(
+        table.loc["7", "gtfs_only_len_ft"] * 0.0003048, abs=0.001
+    )
+    patterns = pd.read_csv(out / mod.PATTERNS_CSV_FILENAME)
+    assert "length_km" in patterns.columns and "length_mi" not in patterns.columns
+    layer = gpd.read_file(out / mod.SEGMENTS_GTFS_ONLY_FILENAME)
+    assert "len_km" in layer.columns and "len_mi" not in layer.columns
+    assert summary.length_unit == "km"
+    assert summary.gtfs_only_length == pytest.approx(
+        table.loc["7", "gtfs_only_len_ft"] * 0.0003048, abs=0.01
+    )
+
+
+def test_aliases_rename_and_combine_reference_routes(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    gtfs = write_feed(tmp_path / "gtfs")
+    features = [("10", REF_10_MAIN), ("10", REF_10_COUPLET), ("7 AM", S7_E), ("7 pm", S7_W)]
+    shp = write_reference(tmp_path / "ref" / "routes.shp", features)
+
+    mod.run(make_config(gtfs, shp, tmp_path / "plain"))
+    plain = route_table(tmp_path / "plain")
+    assert plain.loc["7", "status"] == "missing_from_shp"
+    assert plain.loc["7 AM", "status"] == "missing_from_gtfs"
+
+    aliases = {"7 am": "7", "7 PM": "07", "Nope": "1"}
+    with caplog.at_level(logging.INFO):
+        mod.run(make_config(gtfs, shp, tmp_path / "alias", shp_route_aliases=aliases))
+    table = route_table(tmp_path / "alias")
+    assert table.loc["7", "status"] == "match"
+    assert table.loc["7", "shp_route_names"] == "7 AM;7 pm"
+    assert "7 AM" not in table.index
+    assert "not found in the shapefile(s): NOPE" in caplog.text
+
+    out = tmp_path / "cli"
+    args = ["--gtfs", str(gtfs), "--route-shapes", str(shp), "--output-dir", str(out)]
+    args += ["--shp-route-field", "ROUTE"]
+    assert mod.main([*args, "--shp-route-alias", "7 AM=7", "--shp-route-alias", "7 PM=7"]) == 0
+    assert route_table(out).loc["7", "status"] == "match"
+    assert mod.main([*args, "--shp-route-alias", "7 AM"]) == 2
+
+
+def test_routes_without_trips_are_noted(tmp_path: Path) -> None:
+    gtfs = write_feed(tmp_path / "gtfs", routes=[*ROUTES, ("R80", "80")])
+    shp = write_reference(tmp_path / "ref" / "routes.shp", [*DEFAULT_REFERENCE, ("80", REF_30)])
+    mod.run(make_config(gtfs, shp, tmp_path / "out"))
+    row = route_table(tmp_path / "out").loc["80"]
+    assert row["status"] == "missing_from_gtfs"
+    assert row["note"] == "routes.txt lists this route, but no trip runs it"

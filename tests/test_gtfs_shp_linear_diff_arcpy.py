@@ -497,3 +497,95 @@ def test_main_returns_1_for_missing_inputs(mod: types.ModuleType, tmp_path: Path
     shp = write_reference(tmp_path / "ref" / "routes.shp", REFERENCE)
     out = tmp_path / "out"
     assert run_main(mod, tmp_path / "missing", shp, out, "--shp-route-field", "ROUTE") == 1
+
+
+# ---------------------------------------------------------------------------
+# Review regressions
+# ---------------------------------------------------------------------------
+
+
+def _chop(points: Sequence[tuple[float, float]], step: float) -> list[list[tuple[float, float]]]:
+    """Cut a line into pieces of *step* length (the last one shorter)."""
+    line = LineString(points)
+    marks = [*range(0, int(line.length), int(step)), line.length]
+    return [
+        [line.interpolate(a).coords[0], line.interpolate(b).coords[0]]
+        for a, b in zip(marks, marks[1:])
+    ]
+
+
+def test_compare_alignments_same_linework_never_differs(mod: types.ModuleType) -> None:
+    sr = mod.arcpy.SpatialReference(2248)
+    out = [(0, 0), (3_000, 0), (3_000, 2_000), (6_000, 2_000)]
+    back = [(6_000, 30), (3_030, 30), (3_030, -500), (2_000, -500), (2_000, 300), (0, 300)]
+    gtfs = [mod._polyline(out, sr), mod._polyline(back, sr)]
+    pieces = [mod._polyline(p, sr) for p in _chop(back, 100) + _chop(out, 100)]
+    classes = mod.compare_alignments(gtfs, pieces, 80.0, 150.0)
+    assert classes["gtfs_only"] == [] and classes["shp_only"] == []
+
+    low, mid, high = (mod._polyline([(0, y), (5_000, y)], sr) for y in (0, 70, 140))
+    for reference in ([mid, high], [high, mid]):
+        classes = mod.compare_alignments([low, mid], reference, 80.0, 150.0)
+        assert classes["gtfs_only"] == [] and classes["shp_only"] == []
+
+
+def test_rerun_clears_old_layers_and_logs_settings(mod: types.ModuleType, tmp_path: Path) -> None:
+    gtfs = write_feed(tmp_path / "gtfs")
+    out = tmp_path / "out"
+    first = write_reference(tmp_path / "ref1" / "routes.shp", REFERENCE)
+    assert run_main(mod, gtfs, first, out, "--shp-route-field", "ROUTE") == 0
+    features = mod.arcpy.FEATURES
+    gtfs_only = str(out / "gtfs_shp_segments_gtfs_only.shp")
+    shp_only = str(out / "gtfs_shp_segments_shp_only.shp")
+    assert gtfs_only in features and shp_only in features
+
+    same = [
+        (name, piece)
+        for name, shape_ids in (
+            ("10", ("S10_0", "S10_1")),
+            ("7", ("S7_E", "S7_W")),
+            ("40", ("S40",)),
+        )
+        for sid in shape_ids
+        for piece in _chop(SHAPES[sid], 300)
+    ]
+    second = write_reference(tmp_path / "ref2" / "routes.shp", same)
+    assert (
+        run_main(mod, gtfs, second, out, "--shp-route-field", "ROUTE", "--buffer-feet", "90") == 0
+    )
+    table = route_table(out)
+    assert table["status"].to_dict() == {
+        "30": "no_gtfs_geometry",
+        "10": "match",
+        "7": "match",
+        "40": "match",
+    }
+    assert (table["gtfs_only_len_ft"] == 0).all() and (table["shp_only_len_ft"] == 0).all()
+    assert gtfs_only not in features and shp_only not in features
+    log = (out / "gtfs_shp_linear_diff_runlog.txt").read_text(encoding="utf-8")
+    assert "BUFFER_TOLERANCE_FEET = 90.0" in log and "SHP_ROUTE_FIELD = 'ROUTE'" in log
+    assert "PROJECTED_CRS_WKID = 2248" in log
+
+
+def test_aliases_and_km_fields(
+    mod: types.ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gtfs = write_feed(tmp_path / "gtfs")
+    features = [REFERENCE[0], REFERENCE[1], ("7 AM", SHAPES["S7_E"]), ("7 PM", SHAPES["S7_W"])]
+    shp = write_reference(tmp_path / "ref" / "routes.shp", features)
+    out = tmp_path / "out"
+    monkeypatch.setattr(mod, "DISTANCE_OUTPUT_UNIT", "km")
+    args = [
+        "--shp-route-field",
+        "ROUTE",
+        "--shp-route-alias",
+        "7 AM=7",
+        "--shp-route-alias",
+        "7 PM=7",
+    ]
+    assert run_main(mod, gtfs, shp, out, *args) == 0
+    table = route_table(out)
+    assert table.loc["7", "status"] == "match" and table.loc["7", "shp_route_names"] == "7 AM;7 PM"
+    assert "matched_len_km" in table.columns
+    rows = mod.arcpy.FEATURES[str(out / "gtfs_shp_combined_routes.shp")]["rows"]
+    assert "len_km" in rows[0] and "len_mi" not in rows[0]

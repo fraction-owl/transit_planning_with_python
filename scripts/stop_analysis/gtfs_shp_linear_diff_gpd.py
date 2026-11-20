@@ -4,8 +4,7 @@ A sibling of ``gtfs_linear_diff_gpd.py`` that checks one GTFS feed against a
 reference route layer instead of a second feed: the recurring check that
 ``shapes.txt`` and the GIS team's route lines still agree. Route shapefiles
 usually hold one undirected line per route, so for each route the script picks
-one GTFS pattern per direction and combines the directions into a single route
-line before comparing.
+one GTFS pattern per direction and compares the directions together with it.
 
 Method
 ------
@@ -15,17 +14,18 @@ Method
   blank), ``PATTERN_RULE`` keeps the shape run by the most trips (ties go to
   the longer shape), the longest shape, or every shape. A route with no trips
   that day counts all of its trips.
-- Combining directions: the busiest pattern is the base and each further
-  pattern adds only what lies beyond ``BUFFER_TOLERANCE_FEET`` of it, so a
-  street served both ways counts once and one-way couplets keep both streets.
-  Reference features for a route are combined the same way.
-- Comparison: the buffered overlay of ``gtfs_linear_diff_gpd.py``. GTFS line
-  outside the buffered reference is ``gtfs_only``, reference line outside the
-  buffered GTFS line is ``shp_only``, and GTFS line inside it is ``matched``.
-  Pieces under ``MIN_SEGMENT_LENGTH_FEET`` are dropped, and a route is a
-  mismatch when ``gtfs_only`` plus ``shp_only`` reaches ``MISMATCH_MIN_FEET``.
+- Comparison: the buffered overlay of ``gtfs_linear_diff_gpd.py``, run on the
+  route's chosen GTFS shapes and reference features exactly as drawn. GTFS line
+  beyond ``BUFFER_TOLERANCE_FEET`` of every reference feature is ``gtfs_only``,
+  reference line beyond it of every chosen shape is ``shp_only``, and GTFS line
+  within it is ``matched``.
+- Lengths: only then is each class merged so a street drawn in both directions
+  counts once (one-way couplets keep both streets) and pieces under
+  ``MIN_SEGMENT_LENGTH_FEET`` dropped. A route is a mismatch when ``gtfs_only``
+  plus ``shp_only`` reaches ``MISMATCH_MIN_FEET``.
 - Routes match on ``GTFS_ROUTE_FIELD`` against ``SHP_ROUTE_FIELD``, or against
-  each file's name when that is blank, ignoring case and leading zeros.
+  each file's name when that is blank, ignoring case and leading zeros;
+  ``SHP_ROUTE_ALIASES`` renames shapefile routes that still differ.
 
 Inputs
 ------
@@ -37,7 +37,7 @@ Inputs
 Outputs
 -------
 - ``gtfs_shp_segments_gtfs_only.shp`` / ``_shp_only.shp`` / ``_matched.shp``.
-- ``gtfs_shp_combined_routes.shp``: the combined GTFS line compared per route.
+- ``gtfs_shp_combined_routes.shp``: each route's GTFS directions merged into one line.
 - ``gtfs_shp_selected_patterns.shp`` / ``.csv``: the shape picked per direction.
 - ``gtfs_shp_route_comparison.csv``: one row per route with its status
   (match, mismatch, missing from either side) and lengths.
@@ -107,6 +107,12 @@ SHP_ROUTE_FIELD: str = ""
 # turns "Route_10" into "10". Blank uses the whole value.
 SHP_ROUTE_PATTERN: str = r""
 
+# Shapefile route names to read as another route name, for names the rules
+# above do not reconcile, e.g. {"Blue 1": "B1", "7 AM": "7", "7 PM": "7"}.
+# Keys are compared after SHP_ROUTE_PATTERN, ignoring case. Features that end
+# up with the same route name are compared as one route.
+SHP_ROUTE_ALIASES: Mapping[str, str] = {}
+
 # routes.txt column matched against the shapefile's route names.
 GTFS_ROUTE_FIELD: Literal["route_short_name", "route_id"] = "route_short_name"
 
@@ -133,8 +139,8 @@ PATTERN_RULE: Literal["most_trips", "longest", "all"] = "most_trips"
 # differences without swallowing a move to a parallel street.
 BUFFER_TOLERANCE_FEET: float = 80.0
 
-# Overlay pieces shorter than this are dropped from every segment layer
-# (crossing artifacts and terminal stubs).
+# Pieces shorter than this are dropped from the segment layers and lengths
+# once the comparison is done (crossing artifacts and terminal stubs).
 MIN_SEGMENT_LENGTH_FEET: float = 150.0
 
 # A route present on both sides is flagged as a mismatch when its gtfs_only +
@@ -147,7 +153,8 @@ MISMATCH_MIN_FEET: float = 500.0
 # Output shapefiles are always written in WGS 84 (EPSG:4326).
 TARGET_CRS: str = ""
 
-# Unit for the *_mi length columns ("miles" or "km").
+# Unit of the converted length columns (named *_mi or *_km to match) and of
+# the summary lengths: "miles" or "km".
 DISTANCE_OUTPUT_UNIT: Literal["miles", "km"] = "miles"
 
 # Output filenames (all written inside OUTPUT_DIR).
@@ -178,6 +185,17 @@ _CALENDAR_FILES: tuple[str, ...] = ("calendar.txt", "calendar_dates.txt")
 _PATTERN_RULES: tuple[str, ...] = ("most_trips", "longest", "all")
 _GTFS_ROUTE_FIELDS: tuple[str, ...] = ("route_short_name", "route_id")
 _SHP_TEXT_MAX: int = 254
+_SHAPEFILE_PARTS: tuple[str, ...] = (
+    ".shp",
+    ".shx",
+    ".dbf",
+    ".prj",
+    ".cpg",
+    ".qix",
+    ".sbn",
+    ".sbx",
+    ".shp.xml",
+)
 
 # Route status values, in the order the route table lists them.
 STATUS_ORDER: tuple[str, ...] = (
@@ -206,6 +224,7 @@ class Config(NamedTuple):
     output_dir: Path
     shp_route_field: str = SHP_ROUTE_FIELD
     shp_route_pattern: str = SHP_ROUTE_PATTERN
+    shp_route_aliases: Mapping[str, str] = SHP_ROUTE_ALIASES
     gtfs_route_field: str = GTFS_ROUTE_FIELD
     ignore_leading_zeros: bool = IGNORE_LEADING_ZEROS
     service_day: str = SERVICE_DAY
@@ -240,7 +259,8 @@ class GtfsRoute(NamedTuple):
     route_label: str
     route_ids: tuple[str, ...]
     patterns: tuple[PatternChoice, ...]
-    geometry: Optional[BaseGeometry]  # combined line, projected CRS; None = no shapes
+    lines: tuple[BaseGeometry, ...]  # chosen shapes as drawn (compared), projected CRS
+    geometry: Optional[BaseGeometry]  # directions merged (lengths, display); None = no shapes
     note: str
 
 
@@ -251,7 +271,8 @@ class ReferenceRoute(NamedTuple):
     names: tuple[str, ...]  # route names as written in the shapefile(s)
     sources: tuple[str, ...]  # shapefile names the features came from
     feature_count: int
-    geometry: BaseGeometry  # combined line, projected CRS
+    lines: tuple[BaseGeometry, ...]  # features as drawn (compared), projected CRS
+    geometry: BaseGeometry  # features merged (lengths), projected CRS
 
 
 class SegmentRecord(NamedTuple):
@@ -299,9 +320,10 @@ class Summary(NamedTuple):
     no_gtfs_geometry_count: int
     service_date: str
     pattern_rule: str
-    matched_len_mi: float
-    gtfs_only_len_mi: float
-    shp_only_len_mi: float
+    length_unit: str
+    matched_length: float
+    gtfs_only_length: float
+    shp_only_length: float
     buffer_tolerance_feet: float
     min_segment_length_feet: float
     mismatch_min_feet: float
@@ -1369,6 +1391,16 @@ def total_length_ft(lines: Sequence[LineString], feet_per_unit: float) -> float:
     return float(sum(line.length for line in lines)) * feet_per_unit
 
 
+def union_lines(lines: Sequence[BaseGeometry]) -> BaseGeometry:
+    """Union line geometries into one (callers pass at least one line)."""
+    return unary_union(list(lines))
+
+
+def intersect_lines(geom: BaseGeometry, area: BaseGeometry) -> BaseGeometry:
+    """Return the part of a line geometry inside a polygon."""
+    return geom.intersection(area)
+
+
 def combine_lines(
     lines: Sequence[BaseGeometry], buffer_dist: float, min_segment_dist: float
 ) -> Optional[BaseGeometry]:
@@ -1395,49 +1427,76 @@ def combine_lines(
         if not kept:
             kept.extend(parts)
             continue
-        cover = unary_union(kept).buffer(buffer_dist)
+        cover = union_lines(kept).buffer(buffer_dist)
         for part in parts:
             extra = extract_lines(part.difference(cover))
             kept.extend(filter_short_lines(extra, min_segment_dist))
     if not kept:
         return None
-    return unary_union(kept)
+    return union_lines(kept)
+
+
+def consolidate_lines(
+    lines: Sequence[Any], buffer_dist: float, min_segment_dist: float
+) -> list[Any]:
+    """Merge one comparison class so a street drawn twice counts once, then drop short pieces.
+
+    Runs on pieces that are already classified, so it changes reported lengths
+    and the segment layers, never which class a piece is in.
+
+    Args:
+        lines: Classified pieces in a projected CRS.
+        buffer_dist: Distance within which two pieces count as the same street.
+        min_segment_dist: Shortest piece reported.
+
+    Returns:
+        The merged pieces, longest first.
+    """
+    ordered = sorted(lines, key=lambda line: -line.length)
+    merged = combine_lines(ordered, buffer_dist, 0.0)
+    if merged is None:
+        return []
+    kept = filter_short_lines(extract_lines(merged), min_segment_dist)
+    return sorted(kept, key=lambda line: -line.length)
 
 
 def compare_alignments(
-    gtfs_geom: BaseGeometry,
-    shp_geom: BaseGeometry,
+    gtfs_lines: Sequence[Any],
+    shp_lines: Sequence[Any],
     buffer_dist: float,
     min_segment_dist: float,
-) -> dict[str, list[LineString]]:
-    """Overlay a GTFS route line and a reference line (projected CRS).
+) -> dict[str, list[Any]]:
+    """Overlay a route's GTFS shapes and reference features (projected CRS).
 
-    GTFS line outside a *buffer_dist* buffer of the reference is ``gtfs_only``,
-    GTFS line inside it is ``matched``, and reference line outside a buffered
-    GTFS line is ``shp_only``. Pieces shorter than *min_segment_dist* are dropped
-    from every class.
+    Agreement is decided on the complete linework of both sides, as drawn:
+    GTFS line farther than *buffer_dist* from every reference feature is
+    ``gtfs_only``, GTFS line within it is ``matched``, and reference line
+    farther than *buffer_dist* from every GTFS shape is ``shp_only``. Only then
+    is each class merged with :func:`consolidate_lines`, which also drops
+    pieces shorter than *min_segment_dist*. The same linework on both sides
+    therefore reports no difference, however it is split or ordered.
 
     Args:
-        gtfs_geom: Combined GTFS route line.
-        shp_geom: Combined reference route line (same CRS).
+        gtfs_lines: The route's chosen GTFS shapes.
+        shp_lines: The route's reference features (same CRS).
         buffer_dist: Match tolerance in CRS units.
-        min_segment_dist: Minimum surviving segment length in CRS units.
+        min_segment_dist: Shortest piece reported, in CRS units.
 
     Returns:
         ``{"gtfs_only": [...], "matched": [...], "shp_only": [...]}``.
     """
+    gtfs_geom = union_lines(gtfs_lines)
+    shp_geom = union_lines(shp_lines)
     shp_buffer = shp_geom.buffer(buffer_dist)
     gtfs_buffer = gtfs_geom.buffer(buffer_dist)
+    raw = {
+        "gtfs_only": extract_lines(gtfs_geom.difference(shp_buffer)),
+        "matched": extract_lines(intersect_lines(gtfs_geom, shp_buffer)),
+        "shp_only": extract_lines(shp_geom.difference(gtfs_buffer)),
+    }
     return {
-        "gtfs_only": filter_short_lines(
-            extract_lines(gtfs_geom.difference(shp_buffer)), min_segment_dist
-        ),
-        "matched": filter_short_lines(
-            extract_lines(gtfs_geom.intersection(shp_buffer)), min_segment_dist
-        ),
-        "shp_only": filter_short_lines(
-            extract_lines(shp_geom.difference(gtfs_buffer)), min_segment_dist
-        ),
+        name: consolidate_lines(pieces, buffer_dist, min_segment_dist)
+        for name, pieces in raw.items()
     }
 
 
@@ -1508,53 +1567,26 @@ def _find_field(columns: Sequence[str], wanted: str) -> Optional[str]:
     return None
 
 
-def load_reference_routes(
-    path: Path,
-    route_field: str,
-    pattern: Optional[re.Pattern[str]],
-    ignore_leading_zeros: bool,
-    projected_crs: Any,
-    buffer_dist: float,
-    min_segment_dist: float,
-) -> dict[str, ReferenceRoute]:
-    """Load the reference route lines and combine them per route.
-
-    Every feature is assigned a route name from *route_field* (or its file's
-    name when *route_field* is blank), and all features sharing a name are
-    combined with :func:`combine_lines`, longest piece first, so a route drawn
-    once per direction is compared as one line.
+def read_reference_features(
+    path: Path, route_field: str, projected_crs: Any
+) -> tuple[list[tuple[str, str, BaseGeometry]], list[str]]:
+    """Read every reference line feature with its route name, projected.
 
     Args:
         path: ``ROUTE_SHAPES_PATH``.
-        route_field: ``SHP_ROUTE_FIELD``; blank names features by file.
-        pattern: Compiled ``SHP_ROUTE_PATTERN`` or ``None``.
-        ignore_leading_zeros: ``IGNORE_LEADING_ZEROS``.
+        route_field: ``SHP_ROUTE_FIELD``; blank names each feature by its file.
         projected_crs: CRS the comparison runs in.
-        buffer_dist: Combine tolerance in CRS units.
-        min_segment_dist: Shortest added piece kept when combining.
 
     Returns:
-        Mapping of route key to :class:`ReferenceRoute`.
+        Tuple of (``(layer name, raw route name, geometry)`` per line feature,
+        names of every layer read).
 
     Raises:
         OSError, ValueError: The path is unusable, or a layer has no CRS.
         ConfigError: *route_field* is missing from a layer.
     """
     layers = read_reference_layers(path)
-    if not route_field.strip() and len(layers) == 1:
-        logging.warning(
-            "SHP_ROUTE_FIELD is blank, so every feature in '%s' counts as route %r. "
-            "Set SHP_ROUTE_FIELD if this shapefile holds several routes.",
-            layers[0][0],
-            layers[0][0],
-        )
-
-    pieces: dict[str, list[BaseGeometry]] = {}
-    names: dict[str, set[str]] = {}
-    sources: dict[str, set[str]] = {}
-    counts: dict[str, int] = {}
-    unmatched: set[str] = set()
-    blank = 0
+    features: list[tuple[str, str, BaseGeometry]] = []
     for stem, layer in layers:
         if layer.crs is None:
             raise ValueError(
@@ -1576,18 +1608,82 @@ def load_reference_routes(
         else:
             raw_names = [stem] * len(lines)
         projected = lines.geometry.to_crs(projected_crs)
-        for raw, geom in zip(raw_names, projected):
-            name, matched = apply_route_pattern(raw, pattern)
-            if not matched:
-                unmatched.add(raw)
-            key = normalize_route_key(name, ignore_leading_zeros)
-            if not key:
-                blank += 1
-                continue
-            pieces.setdefault(key, []).append(geom)
-            names.setdefault(key, set()).add(raw)
-            sources.setdefault(key, set()).add(stem)
-            counts[key] = counts.get(key, 0) + 1
+        features.extend((stem, raw, geom) for raw, geom in zip(raw_names, projected))
+    return features, [stem for stem, _ in layers]
+
+
+def load_reference_routes(
+    path: Path,
+    route_field: str,
+    pattern: Optional[re.Pattern[str]],
+    ignore_leading_zeros: bool,
+    projected_crs: Any,
+    buffer_dist: float,
+    min_segment_dist: float,
+    aliases: Optional[Mapping[str, str]] = None,
+) -> dict[str, ReferenceRoute]:
+    """Load the reference route lines and group them by route.
+
+    Every feature is assigned a route name from *route_field* (or its file's
+    name when *route_field* is blank), renamed through *aliases*, and grouped
+    with the other features of that name. The features are kept as drawn for
+    the comparison; a merged copy (longest piece first, see
+    :func:`combine_lines`) gives the route's length.
+
+    Args:
+        path: ``ROUTE_SHAPES_PATH``.
+        route_field: ``SHP_ROUTE_FIELD``; blank names features by file.
+        pattern: Compiled ``SHP_ROUTE_PATTERN`` or ``None``.
+        ignore_leading_zeros: ``IGNORE_LEADING_ZEROS``.
+        projected_crs: CRS the comparison runs in.
+        buffer_dist: Merge tolerance in CRS units.
+        min_segment_dist: Shortest added piece kept when merging.
+        aliases: ``SHP_ROUTE_ALIASES``.
+
+    Returns:
+        Mapping of route key to :class:`ReferenceRoute`.
+
+    Raises:
+        OSError, ValueError: The path is unusable, or a layer has no CRS.
+        ConfigError: *route_field* is missing from a layer.
+    """
+    features, layer_names = read_reference_features(path, route_field, projected_crs)
+    if not route_field.strip() and len(layer_names) == 1:
+        logging.warning(
+            "SHP_ROUTE_FIELD is blank, so every feature in '%s' counts as route %r. "
+            "Set SHP_ROUTE_FIELD if this shapefile holds several routes.",
+            layer_names[0],
+            layer_names[0],
+        )
+    alias_keys = {
+        normalize_route_key(name, ignore_leading_zeros): normalize_route_key(
+            target, ignore_leading_zeros
+        )
+        for name, target in (aliases or {}).items()
+    }
+
+    pieces: dict[str, list[BaseGeometry]] = {}
+    names: dict[str, set[str]] = {}
+    sources: dict[str, set[str]] = {}
+    counts: dict[str, int] = {}
+    unmatched: set[str] = set()
+    used_aliases: set[str] = set()
+    blank = 0
+    for stem, raw, geom in features:
+        name, matched = apply_route_pattern(raw, pattern)
+        if not matched:
+            unmatched.add(raw)
+        key = normalize_route_key(name, ignore_leading_zeros)
+        if key in alias_keys:
+            used_aliases.add(key)
+            key = alias_keys[key]
+        if not key:
+            blank += 1
+            continue
+        pieces.setdefault(key, []).append(geom)
+        names.setdefault(key, set()).add(raw)
+        sources.setdefault(key, set()).add(stem)
+        counts[key] = counts.get(key, 0) + 1
     if unmatched:
         logging.warning(
             "SHP_ROUTE_PATTERN found no route name in %d value(s), used whole: %s",
@@ -1596,10 +1692,21 @@ def load_reference_routes(
         )
     if blank:
         logging.warning("Skipped %d reference feature(s) with a blank route name.", blank)
+    if used_aliases:
+        logging.info(
+            "Renamed shapefile route(s) through SHP_ROUTE_ALIASES: %s",
+            ", ".join(f"{k} -> {alias_keys[k]}" for k in sorted(used_aliases)),
+        )
+    unused = sorted(set(alias_keys) - used_aliases)
+    if unused:
+        logging.warning(
+            "SHP_ROUTE_ALIASES name(s) not found in the shapefile(s): %s", ", ".join(unused)
+        )
 
     out: dict[str, ReferenceRoute] = {}
     for key in sorted(pieces):
-        parts = sorted(extract_lines(unary_union(pieces[key])), key=lambda line: -line.length)
+        lines = tuple(pieces[key])
+        parts = sorted(extract_lines(union_lines(lines)), key=lambda line: -line.length)
         geometry = combine_lines(parts, buffer_dist, min_segment_dist)
         if geometry is None:
             continue
@@ -1608,9 +1715,10 @@ def load_reference_routes(
             names=tuple(sorted(names[key])),
             sources=tuple(sorted(sources[key])),
             feature_count=counts[key],
+            lines=lines,
             geometry=geometry,
         )
-    logging.info("Loaded %d reference route(s) from %d shapefile(s).", len(out), len(layers))
+    logging.info("Loaded %d reference route(s) from %d layer(s).", len(out), len(layer_names))
     return out
 
 
@@ -1636,7 +1744,7 @@ def build_gtfs_routes(
     buffer_dist: float,
     min_segment_dist: float,
 ) -> dict[str, GtfsRoute]:
-    """Combine each route key's chosen patterns into one GTFS route line.
+    """Group each route key's chosen patterns, keeping the shapes and a merged line.
 
     Args:
         choices: Output of :func:`select_patterns`.
@@ -1648,8 +1756,9 @@ def build_gtfs_routes(
         min_segment_dist: Shortest added piece kept when combining.
 
     Returns:
-        Mapping of route key to :class:`GtfsRoute`. Routes without a usable
-        shape carry ``geometry=None``.
+        Mapping of route key to :class:`GtfsRoute`: the chosen shapes as drawn
+        (compared) and a merged line (lengths and display). Routes without a
+        usable shape carry no lines and ``geometry=None``.
     """
     ids_by_key: dict[str, list[str]] = {}
     for rid in sorted(set(trip_route_ids)):
@@ -1669,15 +1778,15 @@ def build_gtfs_routes(
             remarks.insert(0, f"{len(route_ids)} GTFS routes share this name; combined")
         if not patterns:
             remarks.append("no trip has a usable shapes.txt shape")
-        geometry = combine_lines(
-            [shape_geoms[sid] for sid in unique_shape_ids(patterns)], buffer_dist, min_segment_dist
-        )
+        lines = tuple(shape_geoms[sid] for sid in unique_shape_ids(patterns))
+        geometry = combine_lines(lines, buffer_dist, min_segment_dist)
         label = route_keys.get(route_ids[0], (key, route_ids[0]))[1]
         out[key] = GtfsRoute(
             route_key=key,
             route_label=label,
             route_ids=tuple(route_ids),
             patterns=tuple(patterns),
+            lines=lines,
             geometry=geometry,
             note="; ".join(remarks),
         )
@@ -1702,11 +1811,14 @@ def compare_routes(
     min_segment_dist: float,
     mismatch_min_ft: float,
     feet_per_unit: float,
+    idle_route_keys: frozenset[str] = frozenset(),
 ) -> tuple[list[RouteComparison], list[SegmentRecord]]:
     """Compare every route key found on either side.
 
     Routes on both sides are overlaid with :func:`compare_alignments`. A route
-    on only one side contributes its whole line to that side's segment layer.
+    on only one side contributes its whole merged line to that side's segment
+    layer. *idle_route_keys* names routes listed in routes.txt that no trip
+    runs, so a shapefile route of that name is noted rather than unexplained.
 
     Returns:
         Tuple of (route rows, segment records in the projected CRS).
@@ -1730,8 +1842,8 @@ def compare_routes(
             status = "no_gtfs_geometry"
             if shp_geom is None:
                 notes.append("no reference line with this route name")
-        elif gtfs_geom is not None and shp_geom is not None:
-            classes = compare_alignments(gtfs_geom, shp_geom, buffer_dist, min_segment_dist)
+        elif g is not None and r is not None:
+            classes = compare_alignments(g.lines, r.lines, buffer_dist, min_segment_dist)
             lengths = {
                 name: total_length_ft(lines, feet_per_unit) for name, lines in classes.items()
             }
@@ -1747,7 +1859,10 @@ def compare_routes(
             if shp_geom is not None:
                 classes = {"shp_only": extract_lines(shp_geom)}
                 lengths["shp_only"] = shp_len
-            notes.append("no GTFS route with trips has this name")
+            if key in idle_route_keys:
+                notes.append("routes.txt lists this route, but no trip runs it")
+            else:
+                notes.append("no GTFS route with trips has this name")
 
         mismatch_len = lengths["gtfs_only"] + lengths["shp_only"]
         denom = max(gtfs_len, shp_len)
@@ -1783,6 +1898,21 @@ def compare_routes(
 # =============================================================================
 
 
+def unit_suffix(output_unit: DistanceUnit) -> str:
+    """Column-name suffix for converted lengths: ``"mi"`` or ``"km"``."""
+    return "km" if output_unit == "km" else "mi"
+
+
+def remove_layer(path: Path) -> bool:
+    """Delete a shapefile and its sidecar files; True when anything was removed."""
+    removed = False
+    for part in path.parent.glob(f"{path.stem}.*"):
+        if part.name[len(path.stem) :].lower() in _SHAPEFILE_PARTS:
+            part.unlink()
+            removed = True
+    return removed
+
+
 def _length_unit_value(feet: float, output_unit: DistanceUnit) -> Optional[float]:
     """Convert feet to *output_unit* rounded for an output column."""
     value = convert_distance(feet, "feet", output_unit)
@@ -1796,8 +1926,11 @@ def write_line_shapefile(
     projected_crs: Any,
     feet_per_unit: float,
     output_unit: DistanceUnit,
-) -> bool:
+) -> int:
     """Write line features to a shapefile in WGS 84, adding length fields.
+
+    With no features, a shapefile an earlier run left at *path* is deleted, so
+    every layer in the output folder belongs to this run.
 
     Args:
         records: One attribute mapping per feature (field names of 10
@@ -1806,23 +1939,28 @@ def write_line_shapefile(
         path: Destination ``.shp`` path.
         projected_crs: CRS the geometries are in.
         feet_per_unit: Feet per linear unit of *projected_crs*.
-        output_unit: Unit for the ``len_mi`` field (km when ``"km"``).
+        output_unit: Unit of the ``len_mi`` (or ``len_km``) field.
 
     Returns:
-        True when a file was written; False when there was nothing to write.
+        Number of features written (0 when there was nothing to write).
     """
     if not records:
-        logging.info("No features for %s; file not written.", path.name)
-        return False
+        if remove_layer(path):
+            logging.info("No features for %s; removed the copy from an earlier run.", path.name)
+        else:
+            logging.info("No features for %s; file not written.", path.name)
+        return 0
     frame = pd.DataFrame(
         [{k: _shp_text(v) if isinstance(v, str) else v for k, v in r.items()} for r in records]
     )
     frame["len_ft"] = [round(g.length * feet_per_unit, 1) for g in geometries]
-    frame["len_mi"] = [_length_unit_value(ft, output_unit) for ft in frame["len_ft"]]
+    frame[f"len_{unit_suffix(output_unit)}"] = [
+        _length_unit_value(ft, output_unit) for ft in frame["len_ft"]
+    ]
     gdf = gpd.GeoDataFrame(frame, geometry=list(geometries), crs=projected_crs)
     gdf.to_crs("EPSG:4326").to_file(path)
     logging.info("Wrote %d feature(s): %s", len(gdf), path)
-    return True
+    return len(gdf)
 
 
 def write_segment_layers(
@@ -1831,8 +1969,13 @@ def write_segment_layers(
     projected_crs: Any,
     feet_per_unit: float,
     output_unit: DistanceUnit,
-) -> None:
-    """Write the gtfs_only, shp_only and matched segment shapefiles."""
+) -> dict[str, int]:
+    """Write the gtfs_only, shp_only and matched segment shapefiles.
+
+    Returns:
+        Feature count per shapefile name.
+    """
+    written: dict[str, int] = {}
     for segment_class, filename in (
         ("gtfs_only", SEGMENTS_GTFS_ONLY_FILENAME),
         ("shp_only", SEGMENTS_SHP_ONLY_FILENAME),
@@ -1849,7 +1992,7 @@ def write_segment_layers(
             }
             for s in subset
         ]
-        write_line_shapefile(
+        written[filename] = write_line_shapefile(
             records,
             [s.geometry for s in subset],
             output_dir / filename,
@@ -1857,6 +2000,7 @@ def write_segment_layers(
             feet_per_unit,
             output_unit,
         )
+    return written
 
 
 def write_gtfs_route_layers(
@@ -1866,10 +2010,15 @@ def write_gtfs_route_layers(
     projected_crs: Any,
     feet_per_unit: float,
     output_unit: DistanceUnit,
-) -> None:
-    """Write the combined-route and selected-pattern shapefiles."""
+) -> dict[str, int]:
+    """Write the combined-route and selected-pattern shapefiles.
+
+    Returns:
+        Feature count per shapefile name.
+    """
+    written: dict[str, int] = {}
     drawn = [g for g in gtfs_routes.values() if g.geometry is not None]
-    write_line_shapefile(
+    written[COMBINED_ROUTES_FILENAME] = write_line_shapefile(
         [
             {
                 "rt_key": g.route_key,
@@ -1887,7 +2036,7 @@ def write_gtfs_route_layers(
         output_unit,
     )
     patterns = [p for g in gtfs_routes.values() for p in g.patterns]
-    write_line_shapefile(
+    written[PATTERNS_SHP_FILENAME] = write_line_shapefile(
         [
             {
                 "route_id": p.route_id,
@@ -1908,6 +2057,7 @@ def write_gtfs_route_layers(
         feet_per_unit,
         output_unit,
     )
+    return written
 
 
 def patterns_frame(gtfs_routes: Mapping[str, GtfsRoute], output_unit: DistanceUnit) -> pd.DataFrame:
@@ -1917,7 +2067,9 @@ def patterns_frame(gtfs_routes: Mapping[str, GtfsRoute], output_unit: DistanceUn
     df["trip_share"] = [
         round(t / d, 4) if d else 0.0 for t, d in zip(df["trips"], df["direction_trips"])
     ]
-    df["length_mi"] = [_length_unit_value(ft, output_unit) for ft in df["length_ft"]]
+    df[f"length_{unit_suffix(output_unit)}"] = [
+        _length_unit_value(ft, output_unit) for ft in df["length_ft"]
+    ]
     return df
 
 
@@ -1932,7 +2084,8 @@ def route_table_frame(rows: Sequence[RouteComparison], output_unit: DistanceUnit
         "shp_only_len_ft",
         "mismatch_len_ft",
     ):
-        df[col.replace("_ft", "_mi")] = [_length_unit_value(v, output_unit) for v in df[col]]
+        unit_col = col.replace("_ft", f"_{unit_suffix(output_unit)}")
+        df[unit_col] = [_length_unit_value(v, output_unit) for v in df[col]]
         df[col] = df[col].astype(float).round(1)
     df["mismatch_share"] = df["mismatch_share"].astype(float).round(4)
     df["_order"] = df["status"].map({s: i for i, s in enumerate(STATUS_ORDER)})
@@ -1953,8 +2106,20 @@ def resolve_source_file() -> Path | None:
         return None
 
 
-def write_run_log(output_dir: Path, summary_lines: List[str]) -> bool:
-    """Write the verbatim config block plus a run summary into *output_dir*.
+def setting_literal(value: Any) -> str:
+    """Write a setting the way the CONFIGURATION block spells it (paths as raw strings)."""
+    if isinstance(value, Path):
+        return f'r"{value.absolute()}"'
+    if isinstance(value, Mapping):
+        return repr(dict(value))
+    return repr(value)
+
+
+def write_run_log(output_dir: Path, summary_lines: List[str], settings: Mapping[str, Any]) -> bool:
+    """Write the run summary, the settings used, and the verbatim config block.
+
+    *settings* are the values the run actually used, after command-line flags
+    override the CONFIGURATION block, so a run made with flags can be repeated.
 
     Returns:
         ``True`` if the log was written successfully, ``False`` otherwise.
@@ -1985,6 +2150,11 @@ def write_run_log(output_dir: Path, summary_lines: List[str]) -> bool:
         "RUN SUMMARY",
         "-" * 72,
         *summary_lines,
+        "",
+        "-" * 72,
+        "SETTINGS USED (CONFIGURATION plus command-line flags)",
+        "-" * 72,
+        *(f"{name} = {setting_literal(value)}" for name, value in settings.items()),
         "",
         "-" * 72,
         "CONFIGURATION (verbatim from source)",
@@ -2033,6 +2203,9 @@ def validate_config(cfg: Config) -> None:
         if value < 0 or (name == "BUFFER_TOLERANCE_FEET" and value == 0):
             raise ConfigError(f"{name} must be positive; got {value!r}.")
     compile_route_pattern(cfg.shp_route_pattern)
+    for name, target in cfg.shp_route_aliases.items():
+        if not str(name).strip():
+            raise ConfigError(f"SHP_ROUTE_ALIASES has a blank route name (for {target!r}).")
     if cfg.target_crs.strip():
         crs_feet_per_unit(cfg.target_crs.strip())
 
@@ -2060,6 +2233,16 @@ def run(cfg: Config) -> Summary:
         feed.get("calendar"), feed.get("calendar_dates"), cfg.service_day, cfg.service_date
     )
     route_keys = gtfs_route_keys(feed["routes"], cfg.gtfs_route_field, cfg.ignore_leading_zeros)
+    trip_route_ids = set(feed["trips"]["route_id"])
+    active_keys = {key for rid, (key, _) in route_keys.items() if rid in trip_route_ids}
+    idle = {rid: key for rid, (key, _) in route_keys.items() if rid not in trip_route_ids}
+    idle_route_keys = frozenset(set(idle.values()) - active_keys)
+    if idle:
+        logging.info(
+            "%d route(s) in routes.txt have no trips and are left out: %s",
+            len(idle),
+            ", ".join(route_keys[rid][1] for rid in sorted(idle)),
+        )
 
     shapes_ll = build_shape_geometries(feed["shapes"])
     projected_crs = resolve_projected_crs(list(shapes_ll.values()), cfg.target_crs)
@@ -2096,9 +2279,16 @@ def run(cfg: Config) -> Summary:
         projected_crs,
         buffer_dist,
         min_segment_dist,
+        cfg.shp_route_aliases,
     )
     rows, segments = compare_routes(
-        gtfs_routes, ref_routes, buffer_dist, min_segment_dist, cfg.mismatch_min_feet, feet_per_unit
+        gtfs_routes,
+        ref_routes,
+        buffer_dist,
+        min_segment_dist,
+        cfg.mismatch_min_feet,
+        feet_per_unit,
+        idle_route_keys,
     )
 
     by_status = {s: [r for r in rows if r.status == s] for s in STATUS_ORDER}
@@ -2114,9 +2304,11 @@ def run(cfg: Config) -> Summary:
 
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
     unit = cfg.distance_output_unit
-    write_segment_layers(segments, cfg.output_dir, projected_crs, feet_per_unit, unit)
-    write_gtfs_route_layers(
-        gtfs_routes, shape_geoms, cfg.output_dir, projected_crs, feet_per_unit, unit
+    layers = write_segment_layers(segments, cfg.output_dir, projected_crs, feet_per_unit, unit)
+    layers.update(
+        write_gtfs_route_layers(
+            gtfs_routes, shape_geoms, cfg.output_dir, projected_crs, feet_per_unit, unit
+        )
     )
     for frame, filename in (
         (patterns_frame(gtfs_routes, unit), PATTERNS_CSV_FILENAME),
@@ -2126,6 +2318,11 @@ def run(cfg: Config) -> Summary:
         logging.info("Wrote: %s", cfg.output_dir / filename)
 
     compared = [r for r in rows if r.status in ("match", "mismatch")]
+
+    def total_in_unit(feet: float) -> float:
+        value = convert_distance(feet, "feet", unit)
+        return round(value or 0.0, 2)
+
     summary = Summary(
         gtfs_route_count=len(gtfs_routes),
         shp_route_count=len(ref_routes),
@@ -2137,9 +2334,10 @@ def run(cfg: Config) -> Summary:
         no_gtfs_geometry_count=len(by_status["no_gtfs_geometry"]),
         service_date=service_date.isoformat() if service_date else "all trips",
         pattern_rule=cfg.pattern_rule,
-        matched_len_mi=round(sum(r.matched_len_ft for r in compared) / 5280.0, 2),
-        gtfs_only_len_mi=round(sum(r.gtfs_only_len_ft for r in compared) / 5280.0, 2),
-        shp_only_len_mi=round(sum(r.shp_only_len_ft for r in compared) / 5280.0, 2),
+        length_unit=unit,
+        matched_length=total_in_unit(sum(r.matched_len_ft for r in compared)),
+        gtfs_only_length=total_in_unit(sum(r.gtfs_only_len_ft for r in compared)),
+        shp_only_length=total_in_unit(sum(r.shp_only_len_ft for r in compared)),
         buffer_tolerance_feet=cfg.buffer_tolerance_feet,
         min_segment_length_feet=cfg.min_segment_length_feet,
         mismatch_min_feet=cfg.mismatch_min_feet,
@@ -2157,10 +2355,15 @@ def run(cfg: Config) -> Summary:
         f"Missing from shapefile:   {summary.missing_from_shp_count}",
         f"Missing from GTFS:        {summary.missing_from_gtfs_count}",
         f"No GTFS geometry:         {summary.no_gtfs_geometry_count}",
-        f"GTFS-only / shp-only mi:  {summary.gtfs_only_len_mi} / {summary.shp_only_len_mi}",
+        f"GTFS-only / shp-only:     {summary.gtfs_only_length} / {summary.shp_only_length} {unit}",
         f"Projected CRS:            {summary.projected_crs}",
+        "Layers written:           "
+        + (", ".join(f"{name} ({n})" for name, n in layers.items() if n) or "none"),
+        "Layers with no features:  "
+        + (", ".join(name for name, n in layers.items() if not n) or "none"),
     ]
-    if not write_run_log(cfg.output_dir, summary_lines) and REQUIRE_RUN_LOG:
+    settings = {name.upper(): value for name, value in cfg._asdict().items()}
+    if not write_run_log(cfg.output_dir, summary_lines, settings) and REQUIRE_RUN_LOG:
         raise RuntimeError(
             "Run log could not be written. Set REQUIRE_RUN_LOG = False to suppress this "
             "error when a sidecar file is genuinely impossible."
@@ -2171,6 +2374,21 @@ def run(cfg: Config) -> Summary:
 # =============================================================================
 # CLI / MAIN
 # =============================================================================
+
+
+def parse_route_aliases(values: Sequence[str]) -> dict[str, str]:
+    """Parse ``--shp-route-alias NAME=ROUTE`` values into a mapping.
+
+    Raises:
+        ConfigError: A value has no ``=`` or a blank name.
+    """
+    aliases: dict[str, str] = {}
+    for value in values:
+        name, sep, target = value.partition("=")
+        if not sep or not name.strip():
+            raise ConfigError(f"--shp-route-alias expects NAME=ROUTE; got {value!r}.")
+        aliases[name.strip()] = target.strip()
+    return aliases
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -2195,6 +2413,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--shp-route-pattern",
         default=SHP_ROUTE_PATTERN,
         help="Regex whose first group pulls the route name from the field or file name.",
+    )
+    p.add_argument(
+        "--shp-route-alias",
+        action="append",
+        metavar="NAME=ROUTE",
+        help="Read shapefile route NAME as ROUTE; repeat for each alias. "
+        "Replaces SHP_ROUTE_ALIASES when given.",
     )
     p.add_argument(
         "--gtfs-route-field",
@@ -2277,6 +2502,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             ", ".join(placeholders),
         )
         return 2
+    try:
+        aliases = (
+            parse_route_aliases(args.shp_route_alias)
+            if args.shp_route_alias is not None
+            else dict(SHP_ROUTE_ALIASES)
+        )
+    except ConfigError as exc:
+        logging.error("%s", exc)
+        return 2
 
     cfg = Config(
         gtfs_path=Path(args.gtfs).expanduser(),
@@ -2284,6 +2518,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         output_dir=Path(args.output_dir).expanduser(),
         shp_route_field=args.shp_route_field,
         shp_route_pattern=args.shp_route_pattern,
+        shp_route_aliases=aliases,
         gtfs_route_field=args.gtfs_route_field,
         ignore_leading_zeros=args.ignore_leading_zeros,
         service_day=args.service_day,
