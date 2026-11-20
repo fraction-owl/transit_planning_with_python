@@ -174,7 +174,23 @@ def test_compute_headway_span_averages_across_directions() -> None:
     out = target.compute_headway_span(trips_dep)
     row = out.iloc[0]
     assert row["avg_headway_min"] == 40.0  # mean of 20 and 60
-    assert row["span_hrs"] == 1.0  # longest span across directions
+    assert row["span_hrs"] == 1.0  # first to last departure across directions
+    assert row["trip_count"] == 4
+
+
+def test_compute_headway_span_spans_first_to_last_departure_across_directions() -> None:
+    # AM-inbound / PM-outbound route: each direction alone spans one hour.
+    trips_dep = pd.DataFrame(
+        {
+            "route_id": ["R1"] * 4,
+            "direction_id": ["0", "0", "1", "1"],
+            "departure_min": [360, 420, 1020, 1080],  # 06:00, 07:00, 17:00, 18:00
+        }
+    )
+    out = target.compute_headway_span(trips_dep)
+    row = out.iloc[0]
+    assert row["span_hrs"] == 12.0  # 06:00 to 18:00
+    assert row["avg_headway_min"] == 60.0  # headway stays per direction
     assert row["trip_count"] == 4
 
 
@@ -226,6 +242,33 @@ def test_run_end_to_end_writes_csv(tmp_path: Path) -> None:
     assert row["trip_count"] == 3
     written = pd.read_csv(out_csv)
     assert len(written) == 1
+
+
+def test_run_stops_on_selected_frequency_based_trip(tmp_path: Path) -> None:
+    gtfs_dir = tmp_path / "gtfs"
+    gtfs_dir.mkdir()
+    _write_gtfs(gtfs_dir)
+    # T2 now repeats every 10 minutes from 07:00 to 09:00 (12 departures).
+    (gtfs_dir / "frequencies.txt").write_text(
+        "trip_id,start_time,end_time,headway_secs,exact_times\nT2,07:00:00,09:00:00,600,1\n"
+    )
+    with pytest.raises(ValueError, match=r"selected trip\(s\) \(T2\) are frequency-based"):
+        target.run(gtfs_folder=gtfs_dir, output_path=tmp_path / "out.csv", service_day="weekday")
+    assert not (tmp_path / "out.csv").exists()
+
+
+def test_run_ignores_frequency_trips_that_are_not_selected(tmp_path: Path) -> None:
+    gtfs_dir = tmp_path / "gtfs"
+    gtfs_dir.mkdir()
+    _write_gtfs(gtfs_dir)
+    # T4 is Saturday-only, so a weekday run never selects it.
+    (gtfs_dir / "frequencies.txt").write_text(
+        "trip_id,start_time,end_time,headway_secs,exact_times\nT4,09:00:00,11:00:00,600,1\n"
+    )
+    result = target.run(
+        gtfs_folder=gtfs_dir, output_path=tmp_path / "out.csv", service_day="weekday"
+    )
+    assert result.iloc[0]["trip_count"] == 3
 
 
 def test_run_route_filters_can_exclude_everything(tmp_path: Path) -> None:
@@ -337,15 +380,21 @@ def test_resolve_service_ids_rejects_malformed_service_date() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_main_end_to_end_on_gtfs_basic(tmp_path: Path) -> None:
+def test_main_end_to_end_on_gtfs_basic(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     out_csv = tmp_path / "headway_span_by_route.csv"
     argv = ["--gtfs-folder", str(GTFS_BASIC), "--output", str(out_csv), "--service-day", "weekday"]
-    assert target.main(argv) == 0
 
+    # R1's T2 is a frequency-based trip in frequencies.txt, so the run stops.
+    with caplog.at_level(logging.ERROR):
+        assert target.main(argv) == 1
+    assert "(T2) are frequency-based" in caplog.text
+    assert not out_csv.exists()
+
+    assert target.main([*argv, "--filter-out", "R1"]) == 0
     result = pd.read_csv(out_csv).set_index("route_id")
-    assert result.index.tolist() == ["R1", "R2", "R3"]
-    assert result["trip_count"].tolist() == [3, 3, 3]
-    # Every route's first and last trips start 10 hours apart. R3's uneven
+    assert result.index.tolist() == ["R2", "R3"]
+    assert result["trip_count"].tolist() == [3, 3]
+    # Each route's first and last trips start 10 hours apart. R3's uneven
     # 6 h and 4 h gaps (08:00, 14:00, 18:00) still average 300 minutes.
-    assert result["span_hrs"].tolist() == [10.0, 10.0, 10.0]
-    assert result["avg_headway_min"].tolist() == [300.0, 300.0, 300.0]
+    assert result["span_hrs"].tolist() == [10.0, 10.0]
+    assert result["avg_headway_min"].tolist() == [300.0, 300.0]
