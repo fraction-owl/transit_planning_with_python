@@ -764,24 +764,29 @@ def test_main_runs_feed_with_numeric_ids_and_blank_directions(
         {"7": [(0, 0), (3_000, 0)], "8": [(1_300, -500), (1_300, 500)]},
     )
     out = tmp_path / "out"
-    out.mkdir()
-    (out / "long_spacing_segments.csv").write_text("stale\n", encoding="utf-8")
+    gis = out / "current_gtfs_gis"
+    gis.mkdir(parents=True)
+    (gis / "long_spacing_segments.csv").write_text("stale\n", encoding="utf-8")
     for name, value in {
         "GTFS_PATH": str(gtfs),
         "OUTPUT_FOLDER": str(out),
         "INCLUDE_ROUTE_IDS": ["101"],
         "FILTER_OUT_LIST": [],
+        "STOP_KEY": "stop_id",
+        "REMOVAL_SCENARIOS": [],
+        "REVIEW_STOP_KEYS": [],
     }.items():
         monkeypatch.setattr(flagger, name, value)
 
     assert flagger.main() == 0
-    assert _pairs(out / "short_spacing_segments.txt") == [("01", "02", 300)]
-    flagged = pd.read_csv(out / "long_spacing_segments.csv", dtype=str)
+    assert _pairs(gis / "short_spacing_segments.txt") == [("01", "02", 300)]
+    flagged = pd.read_csv(gis / "long_spacing_segments.csv", dtype=str)
     assert flagged[["route_id", "direction_id", "flagged_stop_id"]].to_numpy().tolist() == [
         ["101", str(UNKNOWN_DIRECTION_ID), "99"]
     ]
-    exported = gpd.read_file(out / "stops.shp")
+    exported = gpd.read_file(gis / "stops.shp")
     assert sorted(exported["stop_id"]) == ["01", "02", "03"]
 
     monkeypatch.setattr(flagger, "INCLUDE_ROUTE_IDS", ["no-such-route"])
-    assert flagger.main() == 2
+    with pytest.raises(ValueError, match="No selected trips"):
+        flagger.main()

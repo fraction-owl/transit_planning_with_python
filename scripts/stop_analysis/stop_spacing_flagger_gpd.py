@@ -1,39 +1,44 @@
-"""Run a GTFS-to-GIS pipeline for stop-spacing QA and segment analysis.
+"""Review current GTFS stop spacing and proposed stop removals.
 
-This module converts a General Transit Feed Specification (GTFS) package
-(directory or .zip) into projected ESRI Shapefiles suitable for spatial
-analysis and provides quality assurance (QA) checks on stop spacing.
+EDIT HERE: GTFS_PATH and OUTPUT_FOLDER below. Add RemovalScenario entries to
+REMOVAL_SCENARIOS to compare proposed removals; leave it [] for a current-only
+report, and REVIEW_STOP_KEYS=[] for full selected routes. Inputs can be a GTFS
+folder or a zip (nested folder supported). Relative paths are resolved beside
+this script, or against the working directory when pasted into a notebook.
 
-The long-spacing check examines whether stops from other routes fall within
-a specified buffer distance of unusually long segments and may merit further
-review as possible missed service opportunities.
+Dependencies: pandas, numpy, geopandas, shapely, pyproj; openpyxl for Excel;
+matplotlib only when WRITE_REVIEW_MAPS=True. Python 3.9+ syntax.
 
-Spacing is measured along each distinct stopping pattern: the ordered stops
-of a trip in ``stop_times.txt``, on the shape that trip uses. Express and
-local trips sharing a shape are measured separately, and a stop visited twice
-(a loop) keeps both visits. Each stop is placed along the shape from
-``shape_dist_traveled`` when both files provide it; otherwise the stops are
-matched to the shape in trip order.
+Outputs under OUTPUT_FOLDER:
+  scenario_review/stop_spacing_review.xlsx: Changes, Spacing, Removed stops.
+  scenario_review/*.csv: the same three plain tables (optional).
+  scenario_review/maps/*.png: paired before/after map panels (optional).
+  current_gtfs_gis/: the original baseline GIS / nearby-stop QA outputs.
 
-Outputs:
-    • GeoDataFrames for served stops, route polylines, and stop-to-stop segments
-    • Shapefiles for use in GIS
-    • Logs flagging consecutive served stops that are spaced too closely
-    • CSVs identifying potential missed stops located between long stop-to-stop gaps
+Each scenario independently removes visits from the original GTFS. compare_to
+chooses a reporting baseline; it does not inherit removals. Inputs and GTFS
+are never edited. Identical results across patterns are combined; distinct
+shape distances and repeated stop visits stay separate. direction_id values
+are GTFS identifiers and do not imply north/south. Thresholds are review flags,
+not automatic closure decisions. Distances follow bus shapes, not sidewalks.
+Ridership joins are descriptive and are not summed across trips or patterns.
 
-Typical usage:
-    Update the paths in the CONFIGURATION section and run from a shell or a
-    Jupyter notebook.
+X,Y additions, relocations, terminal changes, new route alignments, inferred
+opposite-stop pairs and two-feed comparisons are outside this draft's scope.
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import math
+import re
 import sys
-import tempfile
 import zipfile
+from collections.abc import Hashable, Iterable, Iterator, Sequence
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Sequence, Set, Tuple
+from typing import Any, cast
 
 import geopandas as gpd
 import numpy as np
@@ -41,6 +46,22 @@ import pandas as pd
 from pyproj import CRS
 from shapely.geometry import LineString, Point
 from shapely.ops import substring
+
+
+@dataclass(frozen=True)
+class RemovalScenario:
+    """Independent removals from GTFS, with optional route/direction scope.
+
+    compare_to chooses the report baseline; it does NOT inherit removals.
+    Empty route_ids/direction_ids mean all selected routes/directions.
+    """
+
+    name: str
+    remove_stops: tuple[str, ...]
+    route_ids: tuple[str, ...] = ()
+    direction_ids: tuple[int, ...] = ()
+    compare_to: str = "Current GTFS"
+
 
 # =============================================================================
 # CONFIGURATION
@@ -51,7 +72,7 @@ GTFS_PATH: str = r"Path\To\Your\GTFS_Data_Folder"  # folder or .zip
 OUTPUT_FOLDER: str = r"Path\To\Your\Output_Folder"
 
 FILTER_OUT_LIST: list[str] = ["9999A", "9999B", "9999C"]
-INCLUDE_ROUTE_IDS: list[str] = ["101", "202"]
+INCLUDE_ROUTE_IDS: list[str] = []  # [] = all routes except FILTER_OUT_LIST
 
 # Union each route/direction's shapes in routes.shp only; spacing is always
 # measured along each stopping pattern's own shape.
@@ -77,6 +98,39 @@ LONG_SPACING_LOG_FILE: str = "long_spacing_segments.txt"
 LONG_SPACING_CSV_FILE: str = "long_spacing_segments.csv"
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
+
+# === BEFORE / AFTER REVIEW ===
+# IDs remain text. Choose stop_code OR stop_id; there is no silent fallback.
+STOP_KEY: str = "stop_code"
+REMOVAL_SCENARIOS: list[RemovalScenario] = []
+# Optional corridor focus. [] reports full selected routes. Context endpoints
+# outside this list remain in the analysis; this is NOT a stop-service filter.
+REVIEW_STOP_KEYS: list[str] = []
+WRITE_REVIEW_XLSX: bool = True
+WRITE_REVIEW_CSV: bool = True
+WRITE_REVIEW_MAPS: bool = False  # Optional matplotlib PNGs, no basemap download
+WRITE_LEGACY_GIS: bool = True  # Existing GTFS-only GIS and missed-stop outputs
+
+# Optional one-row-per-stop CSV/XLSX; leave blank to omit this join.
+# Attributes are reported, never used to automatically choose removals.
+STOP_ATTRIBUTES_PATH: str = ""
+STOP_ATTRIBUTES_SHEET: str | int = 0
+STOP_ATTRIBUTES_KEY: str = "Stop code"
+STOP_ATTRIBUTES_COLUMNS: list[str] = [
+    "Avg weekday boardings",
+    "Avg weekday alightings",
+    "Shelter",
+    "Bench",
+    "Trash can",
+    "Boarding pad",
+]
+# Optional supplied pair/candidate column, using STOP_KEY values. Blank = off.
+STOP_PAIR_COLUMN: str = "Opposite stop candidate"
+
+# Workbook sheets: Changes, Spacing, Removed stops (plain cells, one header row).
+# Maps show one scenario/pattern at a time on identical before/after extents.
+# Distances are along the unchanged bus shape, NOT pedestrian travel distances.
+# Scenario removals never modify the source GTFS. Terminal removals are rejected.
 
 # === END CONFIG ===
 
@@ -131,6 +185,8 @@ def _locate_stops(
         len(hint) == len(points)
         and np.isfinite(hint).all()
         and (np.diff(hint) >= 0).all()
+        and (hint >= 0).all()
+        and (hint <= line.length).all()
         and all(
             pt is not None and pt.distance(line.interpolate(d)) <= max_offset
             for pt, d in zip(points, hint)
@@ -146,11 +202,18 @@ def _locate_stops(
         xy = np.array([[pt.x, pt.y] for _, pt in usable])
         along, offset = _match_in_order(np.asarray(line.coords)[:, :2], xy)
         ok = offset <= max_offset
-        out[np.array([i for i, _ in usable])[ok]] = np.maximum.accumulate(along[ok])
+        positions = np.maximum.accumulate(along[ok])
+        indexes = np.array([i for i, _ in usable])[ok]
+        # Recheck offsets after enforcing monotonicity; moving a projection
+        # forward must not silently turn a bad location into a valid stop.
+        for index, position in zip(indexes, positions):
+            point = points[index]
+            if point is not None and point.distance(line.interpolate(position)) <= max_offset:
+                out[index] = position
     return out
 
 
-def _match_in_order(vertices: np.ndarray, xy: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+def _match_in_order(vertices: np.ndarray, xy: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Place points on a polyline in their given order.
 
     Each point goes to its nearest spot on one segment of the polyline. The
@@ -175,7 +238,7 @@ def _match_in_order(vertices: np.ndarray, xy: np.ndarray) -> Tuple[np.ndarray, n
     seg_from = np.concatenate(([0.0], np.cumsum(seg_len)[:-1]))
     len_sq = np.where(seg_len > 0, seg_len**2, 1.0)
 
-    def _on_segments(pt: np.ndarray, segs: np.ndarray | slice) -> Tuple[np.ndarray, np.ndarray]:
+    def _on_segments(pt: np.ndarray, segs: np.ndarray | slice) -> tuple[np.ndarray, np.ndarray]:
         rel = pt - start[segs]
         t = np.clip((rel * vec[segs]).sum(axis=-1) / len_sq[segs], 0.0, 1.0)
         gap = rel - t[..., None] * vec[segs]
@@ -209,7 +272,7 @@ def _match_in_order(vertices: np.ndarray, xy: np.ndarray) -> Tuple[np.ndarray, n
 
 def _pattern_stops(
     pattern: pd.Series,
-    stops_by_id: gpd.GeoDataFrame,
+    stops_by_id: pd.DataFrame,
     max_offset: float,
 ) -> pd.DataFrame:
     """Return a pattern's located stops in trip order.
@@ -229,7 +292,11 @@ def _pattern_stops(
         max_offset,
     )
     located = pd.DataFrame(
-        {"stop_id": stop_ids, "stop_name": stops["stop_name"].to_numpy(), "dist_along": dists}
+        {
+            "stop_id": stop_ids,
+            "stop_name": stops["stop_name"].to_numpy(),
+            "dist_along": dists,
+        }
     )
     return located.dropna(subset=["dist_along"]).reset_index(drop=True)
 
@@ -238,14 +305,14 @@ def _consecutive_stops(
     patterns_gdf: gpd.GeoDataFrame,
     stops_gdf: gpd.GeoDataFrame,
     max_offset: float,
-) -> Iterator[Tuple[pd.Series, pd.Series, pd.Series]]:
+) -> Iterator[tuple[pd.Series, pd.Series, pd.Series]]:
     """Yield ``(pattern, stop, next_stop)`` for consecutive stops of each pattern.
 
     A pair repeated by another pattern of the same route, direction and shape
     (e.g. a local and an express sharing a stretch) is yielded once.
     """
     stops_by_id = stops_gdf.drop_duplicates("stop_id").set_index("stop_id")
-    seen: Set[Tuple[Any, ...]] = set()
+    seen: set[tuple[Any, ...]] = set()
     for _, pattern in patterns_gdf.iterrows():
         located = _pattern_stops(pattern, stops_by_id, max_offset)
         for i in range(len(located) - 1):
@@ -336,7 +403,7 @@ def _flag_long_spacing_csv(
     max_offset_crs: float = max_offset_ft / ft_factor
     sindex = stops_gdf.sindex
 
-    records: List[Dict[str, Any]] = []
+    records: list[dict[str, Any]] = []
 
     for pattern, s0, s1 in _consecutive_stops(patterns_gdf, stops_gdf, max_offset_crs):
         seg_len_ft: float = (s1.dist_along - s0.dist_along) * ft_factor
@@ -383,11 +450,11 @@ def _flag_long_spacing_csv(
     if records:
         logging.info("Wrote long-spacing CSV → %s (%d rows)", csv_path.name, len(records))
     else:
-        logging.info("No long-spacing issues found; wrote empty %s.", csv_path.name)
+        logging.info("No nearby unserved-stop candidates; see scenario review for all gaps.")
 
     # —— optional one-line summary ————————————————————————————
     if summary:
-        flagged: Set[Tuple[str, int]] = {(rec["route_id"], rec["direction_id"]) for rec in records}
+        flagged: set[tuple[str, int]] = {(rec["route_id"], rec["direction_id"]) for rec in records}
         summ_path = csv_path.with_name(f"{csv_path.stem}_summary.txt")
         with summ_path.open("w", encoding="utf-8") as fh:
             fh.write("route_id\tdirection_id\n")
@@ -396,7 +463,7 @@ def _flag_long_spacing_csv(
         logging.info("Wrote summary → %s", summ_path.name)
 
 
-def _read_gtfs_tables(gtfs_path: Path) -> Dict[str, pd.DataFrame]:
+def _read_gtfs_tables(gtfs_path: Path) -> dict[str, pd.DataFrame]:
     """Load the five core GTFS tables into DataFrames.
 
     Parameters
@@ -415,7 +482,7 @@ def _read_gtfs_tables(gtfs_path: Path) -> Dict[str, pd.DataFrame]:
     leading zeros and values such as ``"NA"``; :func:`_prepare_tables`
     converts the numeric fields afterwards.
     """
-    filenames: Dict[str, str] = {
+    filenames: dict[str, str] = {
         "stops": "stops.txt",
         "routes": "routes.txt",
         "trips": "trips.txt",
@@ -430,19 +497,26 @@ def _read_gtfs_tables(gtfs_path: Path) -> Dict[str, pd.DataFrame]:
         return {k: _read(gtfs_path / v) for k, v in filenames.items()}
 
     if gtfs_path.is_file() and gtfs_path.suffix.lower() == ".zip":
-        logging.info("Detected GTFS zip – extracting to temporary directory …")
-        tmp = tempfile.TemporaryDirectory()
-        with zipfile.ZipFile(gtfs_path, "r") as zf:
-            zf.extractall(tmp.name)
-        root = Path(tmp.name)
-        return {k: _read(root / v) for k, v in filenames.items()}
+        tables: dict[str, pd.DataFrame] = {}
+        with zipfile.ZipFile(gtfs_path) as archive:
+            for key, filename in filenames.items():
+                matches = [
+                    name
+                    for name in archive.namelist()
+                    if Path(name).name.lower() == filename and "__MACOSX" not in name
+                ]
+                if len(matches) != 1:
+                    raise ValueError(f"Expected one {filename} in GTFS zip; found {len(matches)}.")
+                with archive.open(matches[0]) as stream:
+                    tables[key] = pd.read_csv(stream, dtype=str, keep_default_na=False)
+        return tables
 
     raise ValueError("GTFS_PATH must be a folder or a .zip file.")
 
 
-def _validate_columns(dfs: Dict[str, pd.DataFrame]) -> None:
+def _validate_columns(dfs: dict[str, pd.DataFrame]) -> None:
     """Raise ``ValueError`` if any required GTFS column is missing."""
-    required: Dict[str, set[str]] = {
+    required: dict[str, set[str]] = {
         "stops": {"stop_id", "stop_lat", "stop_lon", "stop_name"},
         "routes": {"route_id", "route_short_name"},
         "trips": {"trip_id", "route_id", "shape_id"},
@@ -468,7 +542,7 @@ def _validate_columns(dfs: Dict[str, pd.DataFrame]) -> None:
 
 
 def _prepare_tables(
-    dfs: Dict[str, pd.DataFrame],
+    dfs: dict[str, pd.DataFrame],
     unknown_direction: int = UNKNOWN_DIRECTION_ID,
 ) -> None:
     """Convert the numeric GTFS fields in place; IDs stay text.
@@ -477,10 +551,15 @@ def _prepare_tables(
     with *unknown_direction* for trips whose value is blank, invalid or
     absent (the field is optional in GTFS).
     """
-    numeric: Dict[str, list[str]] = {
+    numeric: dict[str, list[str]] = {
         "stops": ["stop_lat", "stop_lon"],
         "stop_times": ["stop_sequence", "shape_dist_traveled"],
-        "shapes": ["shape_pt_sequence", "shape_pt_lat", "shape_pt_lon", "shape_dist_traveled"],
+        "shapes": [
+            "shape_pt_sequence",
+            "shape_pt_lat",
+            "shape_pt_lon",
+            "shape_dist_traveled",
+        ],
     }
     for tbl, cols in numeric.items():
         for col in cols:
@@ -493,12 +572,20 @@ def _prepare_tables(
     unknown = ~direction.isin([0, 1])
     if unknown.any():
         logging.info(
-            "%d of %d trips have no valid direction_id; analyzing them as direction %d.",
+            "%d of %d trips lack direction_id; analyzing them as direction %d.",
             unknown.sum(),
             len(trips),
             unknown_direction,
         )
     trips["direction_id"] = direction.where(~unknown, unknown_direction).astype(int)
+    events = dfs["stop_times"]
+    for column in ("pickup_type", "drop_off_type"):
+        if column not in events:
+            events[column] = "0"
+    no_service = (events["pickup_type"] == "1") & (events["drop_off_type"] == "1")
+    if no_service.any():
+        logging.info("Excluded %d events forbidding both pickup and drop-off.", no_service.sum())
+    dfs["stop_times"] = events.loc[~no_service].copy()
 
 
 def _filter_routes(
@@ -506,7 +593,7 @@ def _filter_routes(
     trips: pd.DataFrame,
     include_ids: Sequence[str | int],
     exclude_ids: Sequence[str | int],
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Apply include/exclude lists and return filtered ``routes`` and ``trips``."""
     exclude = {str(rid) for rid in exclude_ids}
     include = {str(rid) for rid in include_ids}
@@ -562,7 +649,7 @@ def _build_stops_gdf(
     gdf = gdf.merge(agg, on="stop_id", how="left")
 
     logging.info("Stops GDF – kept %d served stops.", len(gdf))
-    return gdf
+    return gpd.GeoDataFrame(gdf, geometry="geometry", crs=crs)
 
 
 def _build_shape_lines(
@@ -637,7 +724,7 @@ def _build_routes_gdf(
         ).explode(ignore_index=True)
 
     logging.info("Routes GDF – built %d shapes.", len(gdf))
-    return gdf
+    return gpd.GeoDataFrame(gdf, geometry="geometry", crs=shape_lines.crs)
 
 
 def _dists_along_line(
@@ -656,10 +743,17 @@ def _dists_along_line(
         vertex_dists is None
         or len(vertex_dists) != len(coords)
         or not np.isfinite(stop_along).all()
+        or not np.isfinite(vertex_dists).all()
+        or (np.diff(vertex_dists) < 0).any()
+        or (np.diff(stop_along) < 0).any()
+        or (stop_along < vertex_dists[0]).any()
+        or (stop_along > vertex_dists[-1]).any()
     ):
         return tuple(np.full(len(stop_along), np.nan))
     steps = np.diff(coords[:, :2], axis=0)
     vertex_along = np.concatenate(([0.0], np.cumsum(np.hypot(steps[:, 0], steps[:, 1]))))
+    if (np.diff(vertex_along)[np.diff(vertex_dists) == 0] > 1e-6).any():
+        return tuple(np.full(len(stop_along), np.nan))
     return tuple(np.interp(stop_along, vertex_dists, vertex_along))
 
 
@@ -694,7 +788,10 @@ def _build_patterns_gdf(
             no_shape.sum(),
             len(per_trip),
         )
-    patterns = per_trip.drop_duplicates(["route_id", "direction_id", "shape_id", "stop_ids"])
+    # Different passes along a loop can share the same stop IDs.
+    patterns = per_trip.drop_duplicates(
+        ["route_id", "direction_id", "shape_id", "stop_ids", "stop_dists"]
+    )
 
     gdf = (
         shape_lines.merge(patterns.drop(columns="trip_id"), on="shape_id", how="inner")
@@ -709,9 +806,10 @@ def _build_patterns_gdf(
         )
     ]
     gdf = gdf.drop(columns="vertex_dists")
+    gdf["pattern_id"] = [f"P{i + 1:04d}" for i in range(len(gdf))]
 
     logging.info("Patterns GDF – %d stopping patterns from %d trips.", len(gdf), len(per_trip))
-    return gdf
+    return gpd.GeoDataFrame(gdf, geometry="geometry", crs=shape_lines.crs)
 
 
 def _split_into_segments(
@@ -730,7 +828,7 @@ def _split_into_segments(
     ft_factor = _feet_factor(crs)
     max_offset_crs = max_offset_ft / ft_factor
     stops_by_id = stops_gdf.drop_duplicates("stop_id").set_index("stop_id")
-    seen: Set[Tuple[Any, ...]] = set()
+    seen: set[tuple[Any, ...]] = set()
 
     for _, r in patterns_gdf.iterrows():
         line: LineString = r.geometry
@@ -792,10 +890,11 @@ def _export(gdf: gpd.GeoDataFrame, out_dir: Path, name: str) -> None:
 
 def _export_segments_by_route_dir(seg_gdf: gpd.GeoDataFrame, out_dir: Path) -> None:
     """Write one shapefile per ``(route_id, direction_id)``."""
-    for (rid, drn), grp in seg_gdf.groupby(["route_id", "direction_id"]):
+    for key, grp in seg_gdf.groupby(["route_id", "direction_id"]):
+        rid, drn = cast("tuple[str, int]", key)
         suffix = f"dir{drn}"
         fname = f"{rid}_{suffix}.shp"
-        grp_gdf: gpd.GeoDataFrame = grp  # type: ignore[assignment]  # ty: ignore[invalid-assignment]
+        grp_gdf = gpd.GeoDataFrame(grp, geometry="geometry", crs=seg_gdf.crs)
         grp_gdf.to_file(out_dir / fname)
         logging.info("Wrote %s", fname)
 
@@ -835,11 +934,11 @@ def _flag_short_spacing(
 
 
 def _build_stop_layers(
-    dfs: Dict[str, pd.DataFrame],
+    dfs: dict[str, pd.DataFrame],
     trips_selected: pd.DataFrame,
     routes_selected: pd.DataFrame,
     crs: str,
-) -> Tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
+) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
     """Return stop layers for *all* routes and for the filtered subset.
 
     Parameters
@@ -887,121 +986,687 @@ def _build_stop_layers(
     return all_stops_gdf, selected_stops_gdf
 
 
+@dataclass
+class LocatedPattern:
+    """One stopping pattern located once, before applying any removals."""
+
+    pattern_id: str
+    route_id: str
+    route_short: str
+    direction_id: int
+    shape_id: str
+    geometry: LineString
+    stops: pd.DataFrame
+
+
+def _scoped_removals(pattern: LocatedPattern, scenario: RemovalScenario) -> set[str]:
+    """Resolve a scenario's applicability without altering other routes."""
+    if scenario.route_ids and pattern.route_id not in scenario.route_ids:
+        return set()
+    if scenario.direction_ids and pattern.direction_id not in scenario.direction_ids:
+        return set()
+    return set(scenario.remove_stops)
+
+
+def _locate_review_patterns(
+    patterns: gpd.GeoDataFrame,
+    stops: gpd.GeoDataFrame,
+    stop_key: str,
+) -> list[LocatedPattern]:
+    """Locate full patterns; fail rather than bridge across an unlocated stop."""
+    by_id = stops.set_index("stop_id", drop=False)
+    factor = _feet_factor(stops.crs)
+    result: list[LocatedPattern] = []
+    for _, pattern in patterns.iterrows():
+        ids = list(pattern.stop_ids)
+        rows = by_id.reindex(ids)
+        points = [p if isinstance(p, Point) else None for p in rows.geometry]
+        distances = _locate_stops(
+            pattern.geometry,
+            points,
+            pattern.stop_dists,
+            SERVED_STOP_MAX_OFFSET_FT / factor,
+        )
+        bad = [ids[i] for i, distance in enumerate(distances) if not math.isfinite(distance)]
+        if bad:
+            raise ValueError(
+                f"Pattern {pattern.pattern_id} / shape {pattern.shape_id}: "
+                f"could not locate stop_id(s) {bad}. "
+                "Review aborted; these stops were not treated as removals."
+            )
+        located = pd.DataFrame(
+            {
+                "stop_id": ids,
+                "key": rows[stop_key].astype(str).to_numpy(),
+                "name": rows["stop_name"].to_numpy(),
+                "along_ft": distances * factor,
+                "x": rows.geometry.x.to_numpy(),
+                "y": rows.geometry.y.to_numpy(),
+            }
+        )
+        located["visit"] = located.groupby("stop_id", sort=False).cumcount() + 1
+        result.append(
+            LocatedPattern(
+                str(pattern.pattern_id),
+                str(pattern.route_id),
+                str(pattern.route_short_name),
+                int(pattern.direction_id),
+                str(pattern.shape_id),
+                pattern.geometry,
+                located,
+            )
+        )
+    return result
+
+
+def _validate_review(
+    dfs: dict[str, pd.DataFrame],
+    trips: pd.DataFrame,
+    shape_lines: gpd.GeoDataFrame,
+    stop_key: str,
+    scenarios: list[RemovalScenario],
+    focus: list[str],
+) -> None:
+    """Reject ambiguous IDs, unusable source events and misleading comparisons."""
+    if stop_key not in {"stop_id", "stop_code"}:
+        raise ValueError("STOP_KEY must be 'stop_code' or 'stop_id'.")
+    stops = dfs["stops"]
+    if stop_key not in stops:
+        raise ValueError(f"stops.txt has no {stop_key}; explicitly choose STOP_KEY='stop_id'.")
+    if stops["stop_id"].duplicated().any():
+        raise ValueError("Duplicate stop_id values in stops.txt.")
+    events = dfs["stop_times"].loc[dfs["stop_times"]["trip_id"].isin(trips["trip_id"])]
+    missing = set(events["stop_id"]) - set(stops["stop_id"])
+    if missing:
+        raise ValueError(f"Selected stop_times reference missing stop_id(s): {sorted(missing)}")
+    selected = stops.loc[stops["stop_id"].isin(events["stop_id"])]
+    if selected[stop_key].eq("").any() or selected[stop_key].duplicated().any():
+        raise ValueError(f"Blank or duplicate {stop_key} in selected stops; use a unique STOP_KEY.")
+    if (
+        events["stop_sequence"].isna().any()
+        or events.duplicated(["trip_id", "stop_sequence"]).any()
+    ):
+        raise ValueError("Selected stop_times contain invalid or duplicate stop_sequence values.")
+    if not set(trips["trip_id"]).issubset(set(events["trip_id"])):
+        raise ValueError("A selected trip has no boardable/alightable stop events.")
+    if not set(trips["shape_id"]).issubset(set(shape_lines["shape_id"])):
+        raise ValueError("A selected trip has no usable shape; review would be incomplete.")
+    if (
+        not selected["stop_lat"].between(-90, 90).all()
+        or not selected["stop_lon"].between(-180, 180).all()
+    ):
+        raise ValueError("Invalid coordinates in selected stops.")
+    names = [s.name for s in scenarios]
+    if len(set(names)) != len(names) or any(not name.strip() for name in names):
+        raise ValueError("Scenario names must be nonempty and unique.")
+    if "Current GTFS" in names:
+        raise ValueError("'Current GTFS' is reserved for the automatic baseline.")
+    known_names = {"Current GTFS", *names}
+    for scenario in scenarios:
+        if scenario.compare_to not in known_names or scenario.compare_to == scenario.name:
+            raise ValueError(f"Invalid compare_to for scenario {scenario.name!r}.")
+        if any(not isinstance(key, str) or not key.strip() for key in scenario.remove_stops):
+            raise ValueError("Removal IDs must be nonempty strings, e.g. '1001'.")
+        if len(scenario.remove_stops) != len(set(scenario.remove_stops)):
+            raise ValueError(f"Duplicate removal ID in {scenario.name!r}.")
+        if set(scenario.route_ids) - set(trips["route_id"]):
+            raise ValueError(f"Scenario {scenario.name!r} references an unselected route_id.")
+        scoped = trips
+        if scenario.route_ids:
+            scoped = scoped.loc[scoped["route_id"].isin(scenario.route_ids)]
+        if scenario.direction_ids:
+            scoped = scoped.loc[scoped["direction_id"].isin(scenario.direction_ids)]
+        scoped_ids = events.loc[events["trip_id"].isin(scoped["trip_id"]), "stop_id"]
+        keys = set(stops.loc[stops["stop_id"].isin(scoped_ids), stop_key])
+        unknown = set(scenario.remove_stops) - keys
+        if unknown:
+            raise ValueError(
+                f"Scenario {scenario.name!r}: IDs not served in its scope: {sorted(unknown)}"
+            )
+    unknown_focus = set(focus) - set(selected[stop_key])
+    if unknown_focus:
+        raise ValueError(f"Review focus IDs not served in selected routes: {sorted(unknown_focus)}")
+    if not 0 <= MIN_SPACING_FT < LONG_SPACING_FT:
+        raise ValueError("Require 0 <= MIN_SPACING_FT < LONG_SPACING_FT.")
+
+
+def _read_stop_attributes() -> dict[str, dict[str, Any]]:
+    """Read an optional one-to-one join; never silently aggregate ridership."""
+    if not STOP_ATTRIBUTES_PATH:
+        return {}
+    path = Path(STOP_ATTRIBUTES_PATH).expanduser()
+    if not path.is_absolute():
+        script = Path(globals().get("__file__", Path.cwd() / "gtfs_stop_spacing.py"))
+        path = script.resolve().parent / path
+    text_columns: dict[Hashable, Any] = {STOP_ATTRIBUTES_KEY: str}
+    if STOP_PAIR_COLUMN:
+        text_columns[STOP_PAIR_COLUMN] = str
+    if path.suffix.lower() == ".csv":
+        frame = pd.read_csv(path, dtype=text_columns, keep_default_na=False)
+    elif path.suffix.lower() == ".xlsx":
+        frame = pd.read_excel(
+            path,
+            sheet_name=STOP_ATTRIBUTES_SHEET,
+            dtype=text_columns,
+            keep_default_na=False,
+        )
+    else:
+        raise ValueError("STOP_ATTRIBUTES_PATH must be a CSV or XLSX.")
+    columns = list(dict.fromkeys([STOP_ATTRIBUTES_KEY, *STOP_ATTRIBUTES_COLUMNS]))
+    if STOP_PAIR_COLUMN:
+        columns = list(dict.fromkeys([*columns, STOP_PAIR_COLUMN]))
+    missing = set(columns) - set(frame.columns)
+    if missing:
+        raise ValueError(f"Stop attributes missing columns: {sorted(missing)}")
+    frame[STOP_ATTRIBUTES_KEY] = frame[STOP_ATTRIBUTES_KEY].str.strip()
+    if frame[STOP_ATTRIBUTES_KEY].eq("").any() or frame[STOP_ATTRIBUTES_KEY].duplicated().any():
+        raise ValueError("Stop attributes must contain exactly one row per nonblank stop key.")
+    return {
+        str(row[STOP_ATTRIBUTES_KEY]): {
+            key: row[key] for key in columns if key != STOP_ATTRIBUTES_KEY
+        }
+        for row in frame.to_dict("records")
+    }
+
+
+def _kept_indexes(pattern: LocatedPattern, scenario: RemovalScenario) -> list[int]:
+    """Remove visits on their original measures; never rematch the reduced sequence."""
+    removals = _scoped_removals(pattern, scenario)
+    keys = pattern.stops["key"].tolist()
+    if keys and (keys[0] in removals or keys[-1] in removals):
+        raise ValueError(
+            f"{scenario.name}: removal affects an endpoint of {pattern.pattern_id} "
+            f"({keys[0]} to {keys[-1]}). Terminal changes require a separate review."
+        )
+    return [i for i, key in enumerate(keys) if key not in removals]
+
+
+def _pattern_info(pattern: LocatedPattern) -> dict[str, Any]:
+    """Shared, public report identity fields."""
+    return {
+        "Route": pattern.route_short,
+        "Route ID": pattern.route_id,
+        "Direction ID": pattern.direction_id,
+        "Pattern IDs": pattern.pattern_id,
+        "Shape IDs": pattern.shape_id,
+    }
+
+
+def _focus_bounds(pattern: LocatedPattern, focus: list[str]) -> tuple[int, int] | None:
+    """Include a corridor and its immediately bounding retained stops."""
+    if not focus:
+        return 0, len(pattern.stops) - 1
+    indexes = [i for i, key in enumerate(pattern.stops["key"]) if key in set(focus)]
+    return (min(indexes), max(indexes)) if indexes else None
+
+
+def _gap_rows(
+    pattern: LocatedPattern,
+    scenario: RemovalScenario,
+    baseline: RemovalScenario,
+    focus: list[str],
+) -> list[dict[str, Any]]:
+    """Compare each after-gap to the original chain occupying the same interval."""
+    before = _kept_indexes(pattern, baseline)
+    after = _kept_indexes(pattern, scenario)
+    if not set(after).issubset(before):
+        raise ValueError(f"{scenario.name!r} would add service relative to {baseline.name!r}.")
+    bounds = _focus_bounds(pattern, focus)
+    if bounds is None:
+        return []
+    stops = pattern.stops
+    result: list[dict[str, Any]] = []
+    for start, end in zip(after[:-1], after[1:]):
+        if end < bounds[0] or start > bounds[1]:
+            continue
+        chain = [i for i in before if start <= i <= end]
+        old_gaps = [
+            float(stops.loc[j, "along_ft"] - stops.loc[i, "along_ft"])
+            for i, j in zip(chain[:-1], chain[1:])
+        ]
+        spacing = float(stops.loc[end, "along_ft"] - stops.loc[start, "along_ft"])
+        if not math.isclose(sum(old_gaps), spacing, abs_tol=1e-6):
+            raise ValueError("Before/after shape-distance reconciliation failed.")
+        removed = chain[1:-1]
+        long_status = ""
+        if spacing > LONG_SPACING_FT:
+            long_status = "Unchanged long gap"
+            if removed:
+                long_status = (
+                    "Lengthened existing long gap"
+                    if max(old_gaps) > LONG_SPACING_FT
+                    else "New long gap"
+                )
+            elif scenario.name == "Current GTFS":
+                long_status = "Existing long gap"
+        result.append(
+            {
+                "Scenario": scenario.name,
+                "Compared with": baseline.name,
+                **_pattern_info(pattern),
+                "From stop": stops.loc[start, "key"],
+                "To stop": stops.loc[end, "key"],
+                "From visit": int(stops.loc[start, "visit"]),
+                "To visit": int(stops.loc[end, "visit"]),
+                "Spacing (ft)": spacing,
+                "Spacing (mi)": spacing / 5280,
+                "Change": "Consolidated" if removed else "Unchanged",
+                "Stops removed vs baseline": ", ".join(stops.loc[i, "key"] for i in removed),
+                "Baseline stop chain": " > ".join(stops.loc[i, "key"] for i in chain),
+                "Baseline gaps (ft)": " + ".join(f"{gap:.1f}" for gap in old_gaps),
+                "Below short threshold": spacing < MIN_SPACING_FT,
+                "Above long threshold": spacing > LONG_SPACING_FT,
+                "Short threshold (ft)": MIN_SPACING_FT,
+                "Long threshold (ft)": LONG_SPACING_FT,
+                "Long gap status": long_status,
+                "From stop name": stops.loc[start, "name"],
+                "To stop name": stops.loc[end, "name"],
+                "_start": start,
+                "_end": end,
+            }
+        )
+    return result
+
+
+def _pair_status(
+    key: str,
+    patterns: list[LocatedPattern],
+    scenario: RemovalScenario,
+) -> str:
+    """Describe supplied pair service across the selected patterns."""
+    states: set[bool] = set()
+    for pattern in patterns:
+        if key in set(pattern.stops["key"]):
+            states.add(key not in _scoped_removals(pattern, scenario))
+    if not states:
+        return "Not identified in selected service"
+    if len(states) == 2:
+        return "Partly retained in selected service"
+    return "Retained in selected service" if True in states else "Removed from selected service"
+
+
+def _removed_rows(
+    pattern: LocatedPattern,
+    scenario: RemovalScenario,
+    baseline: RemovalScenario,
+    focus: list[str],
+    attributes: dict[str, dict[str, Any]],
+    all_patterns: list[LocatedPattern],
+) -> list[dict[str, Any]]:
+    """Report alternatives for each newly removed visit in its travel direction."""
+    before, after = _kept_indexes(pattern, baseline), _kept_indexes(pattern, scenario)
+    bounds = _focus_bounds(pattern, focus)
+    if bounds is None:
+        return []
+    stops = pattern.stops
+    result: list[dict[str, Any]] = []
+    for index in sorted(set(before) - set(after)):
+        if not bounds[0] <= index <= bounds[1]:
+            continue
+        previous = max(i for i in after if i < index)
+        following = min(i for i in after if i > index)
+        backward = float(stops.loc[index, "along_ft"] - stops.loc[previous, "along_ft"])
+        forward = float(stops.loc[following, "along_ft"] - stops.loc[index, "along_ft"])
+        nearest = previous if backward <= forward else following
+        key = str(stops.loc[index, "key"])
+        attrs = attributes.get(key, {})
+        row = {
+            "Scenario": scenario.name,
+            "Compared with": baseline.name,
+            **_pattern_info(pattern),
+            "Removed stop": key,
+            "Visit": int(stops.loc[index, "visit"]),
+            "Stop name": stops.loc[index, "name"],
+            "Previous retained stop": stops.loc[previous, "key"],
+            "Distance back (ft)": backward,
+            "Next retained stop": stops.loc[following, "key"],
+            "Distance forward (ft)": forward,
+            "Nearest retained stop": stops.loc[nearest, "key"],
+            "Nearest distance (ft)": min(backward, forward),
+        }
+        if attributes:
+            row["Attributes matched"] = key in attributes
+            row.update({column: attrs.get(column, "") for column in STOP_ATTRIBUTES_COLUMNS})
+            if STOP_PAIR_COLUMN:
+                pair = str(attrs.get(STOP_PAIR_COLUMN, "")).strip()
+                row[STOP_PAIR_COLUMN] = pair
+                row["Pair service after"] = (
+                    _pair_status(pair, all_patterns, scenario) if pair else ""
+                )
+        result.append(row)
+    return result
+
+
+def _collapse_report_rows(records: list[dict[str, Any]]) -> pd.DataFrame:
+    """Combine identical results across patterns, preserving distinct stop visits."""
+    groups: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for record in records:
+        public = {key: value for key, value in record.items() if not key.startswith("_")}
+        key = tuple(
+            (column, round(value, 6) if isinstance(value, float) else value)
+            for column, value in public.items()
+            if column not in {"Pattern IDs", "Shape IDs"}
+        )
+        if key not in groups:
+            groups[key] = {**public, "Pattern IDs": set(), "Shape IDs": set()}
+        groups[key]["Pattern IDs"].add(public["Pattern IDs"])
+        groups[key]["Shape IDs"].add(public["Shape IDs"])
+    rows = []
+    for record in groups.values():
+        rows.append(
+            {
+                **record,
+                "Pattern IDs": ", ".join(sorted(record["Pattern IDs"])),
+                "Shape IDs": ", ".join(sorted(record["Shape IDs"])),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _write_review_tables(
+    spacing: pd.DataFrame,
+    removed: pd.DataFrame,
+    output: Path,
+) -> None:
+    """Write ordinary cells only; no banners, colors, notes, styled tables or charts."""
+    changes = spacing.loc[spacing["Change"] == "Consolidated"]
+    if removed.empty and not len(removed.columns):
+        removed = pd.DataFrame(
+            columns=[
+                "Scenario",
+                "Removed stop",
+                "Nearest retained stop",
+                "Nearest distance (ft)",
+            ]
+        )
+    tables = {"Changes": changes, "Spacing": spacing, "Removed stops": removed}
+    if WRITE_REVIEW_CSV:
+        for name, frame in tables.items():
+            frame.to_csv(output / f"{name.lower().replace(' ', '_')}.csv", index=False)
+    if WRITE_REVIEW_XLSX:
+        # A native Python exporter keeps the downloaded script self-contained.
+        from openpyxl import Workbook
+        from openpyxl.cell.cell import Cell
+        from openpyxl.utils import get_column_letter
+
+        workbook = Workbook()
+        workbook.remove(workbook.active)
+        for name, frame in tables.items():
+            sheet = workbook.create_sheet(name)
+            sheet.append(frame.columns.tolist())
+            for values in frame.itertuples(index=False, name=None):
+                cells = []
+                for value in values:
+                    if pd.isna(value):
+                        value = None
+                    if isinstance(value, str):
+                        cell = Cell(sheet, value=value)
+                        cell.data_type = "s"  # IDs/names beginning '=' are literal text.
+                        cells.append(cell)
+                    else:
+                        cells.append(value)
+                sheet.append(cells)
+            sheet.freeze_panes = "A2"
+            for col_index, column in enumerate(frame.columns, start=1):
+                width = max(len(str(column)), *(len(str(v)) for v in frame[column].head(200)), 8)
+                sheet.column_dimensions[get_column_letter(col_index)].width = min(width + 2, 55)
+                number_format = (
+                    "0.0"
+                    if column.endswith("(ft)")
+                    else "0.000"
+                    if column.endswith("(mi)")
+                    else None
+                )
+                if number_format:
+                    for cell in list(sheet.columns)[col_index - 1][1:]:
+                        cell.number_format = number_format
+        workbook.save(output / "stop_spacing_review.xlsx")
+    logging.info(
+        "Review tables: %d gaps, %d changed gaps, %d removed-stop rows.",
+        len(spacing),
+        len(changes),
+        len(removed),
+    )
+
+
+def _plot_comparison(
+    pattern: LocatedPattern,
+    scenario: RemovalScenario,
+    baseline: RemovalScenario,
+    rows: list[dict[str, Any]],
+    output: Path,
+    factor: float,
+) -> None:
+    """Render matching before/after extents from the same records used by the tables."""
+    if not any(row["Change"] == "Consolidated" for row in rows):
+        return
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    first = min(row["_start"] for row in rows)
+    last = max(row["_end"] for row in rows)
+    stops = pattern.stops
+    begin, finish = (
+        float(stops.loc[first, "along_ft"]),
+        float(stops.loc[last, "along_ft"]),
+    )
+    line = substring(pattern.geometry, begin / factor, finish / factor)
+    if not isinstance(line, LineString):
+        return
+    minx, miny, maxx, maxy = line.bounds
+    # Include physical stop coordinates as well as their projected positions.
+    visible = stops.iloc[first : last + 1]
+    minx, maxx = min(minx, visible.x.min()), max(maxx, visible.x.max())
+    miny, maxy = min(miny, visible.y.min()), max(maxy, visible.y.max())
+    padding = max(maxx - minx, maxy - miny, 200 / factor) * 0.12
+    fig, axes = plt.subplots(1, 2, figsize=(12, 8), constrained_layout=True)
+    before, after = _kept_indexes(pattern, baseline), _kept_indexes(pattern, scenario)
+    removed = set(before) - set(after)
+    for axis, title, kept in zip(axes, [baseline.name, scenario.name], [before, after]):
+        x, y = line.xy
+        axis.plot(x, y, color="0.65", linewidth=2, zorder=1)
+        indexes = [i for i in kept if first <= i <= last]
+        selected = stops.iloc[indexes]
+        axis.scatter(selected.x, selected.y, color="#176087", s=30, label="Served stop", zorder=3)
+        for index in indexes:
+            row = stops.iloc[index]
+            axis.annotate(
+                str(row.key),
+                (row.x, row.y),
+                xytext=(7, 5),
+                textcoords="offset points",
+                fontsize=8,
+            )
+        if title == scenario.name:
+            deleted = stops.iloc[sorted(i for i in removed if first <= i <= last)]
+            axis.scatter(
+                deleted.x,
+                deleted.y,
+                marker="x",
+                color="#a33a2b",
+                s=45,
+                label="Removed stop",
+                zorder=4,
+            )
+            for row in deleted.itertuples():
+                axis.annotate(
+                    str(row.key),
+                    (row.x, row.y),
+                    xytext=(-7, 7),
+                    ha="right",
+                    textcoords="offset points",
+                    fontsize=8,
+                    color="#a33a2b",
+                )
+            for row in rows:
+                if row["Change"] != "Consolidated":
+                    continue
+                start = float(stops.loc[row["_start"], "along_ft"]) / factor
+                end = float(stops.loc[row["_end"], "along_ft"]) / factor
+                segment = substring(pattern.geometry, start, end)
+                if isinstance(segment, LineString):
+                    x, y = segment.xy
+                    axis.plot(x, y, color="#a33a2b", linewidth=2.5, zorder=2)
+                    midpoint = segment.interpolate(0.5, normalized=True)
+                    axis.annotate(
+                        f"{row['Spacing (ft)']:,.0f} ft",
+                        (midpoint.x, midpoint.y),
+                        xytext=(12, 0),
+                        textcoords="offset points",
+                        fontsize=8,
+                        color="#a33a2b",
+                        bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.8},
+                    )
+        axis.set_xlim(minx - padding, maxx + padding)
+        axis.set_ylim(miny - padding, maxy + padding)
+        axis.set_aspect("equal")
+        axis.set_title(title, fontsize=11)
+        axis.set_axis_off()
+        axis.legend(loc="lower left", fontsize=8)
+        axis.annotate(
+            "N",
+            xy=(0.95, 0.95),
+            xytext=(0.95, 0.86),
+            xycoords="axes fraction",
+            ha="center",
+            arrowprops={"arrowstyle": "->"},
+        )
+    fig.suptitle(
+        f"Route {pattern.route_short} | direction_id {pattern.direction_id} | {pattern.shape_id}",
+        fontsize=12,
+    )
+    fig.supxlabel(
+        "Distances follow the bus route; pedestrian access is not evaluated.",
+        fontsize=9,
+    )
+    slug = re.sub(r"[^A-Za-z0-9_-]+", "_", scenario.name).strip("_")[:60]
+    digest = hashlib.sha256(scenario.name.encode()).hexdigest()[:6]
+    filename = f"{slug}_{digest}_{pattern.pattern_id}.png"
+    fig.savefig(output / filename, dpi=160)
+    plt.close(fig)
+
+
+def _run_spacing_review(
+    patterns: gpd.GeoDataFrame,
+    stops: gpd.GeoDataFrame,
+    output: Path,
+) -> None:
+    """Apply independent removal scenarios to a common set of located patterns."""
+    located = _locate_review_patterns(patterns, stops, STOP_KEY)
+    current = RemovalScenario("Current GTFS", ())
+    scenarios = [current, *REMOVAL_SCENARIOS]
+    by_name = {scenario.name: scenario for scenario in scenarios}
+    attributes = _read_stop_attributes()
+    gaps: list[dict[str, Any]] = []
+    removed: list[dict[str, Any]] = []
+    plot_jobs: list[
+        tuple[LocatedPattern, RemovalScenario, RemovalScenario, list[dict[str, Any]]]
+    ] = []
+    for scenario in scenarios:
+        baseline = by_name[scenario.compare_to]
+        for pattern in located:
+            records = _gap_rows(pattern, scenario, baseline, REVIEW_STOP_KEYS)
+            gaps.extend(records)
+            removed.extend(
+                _removed_rows(pattern, scenario, baseline, REVIEW_STOP_KEYS, attributes, located)
+            )
+            if WRITE_REVIEW_MAPS:
+                plot_jobs.append((pattern, scenario, baseline, records))
+    if not gaps:
+        raise ValueError("No gaps found in the selected review scope.")
+    folder = _ensure_output_folder(output / "scenario_review")
+    _write_review_tables(_collapse_report_rows(gaps), _collapse_report_rows(removed), folder)
+    if plot_jobs:
+        map_folder = _ensure_output_folder(folder / "maps")
+        for pattern, scenario, baseline, records in plot_jobs:
+            _plot_comparison(
+                pattern,
+                scenario,
+                baseline,
+                records,
+                map_folder,
+                _feet_factor(stops.crs),
+            )
+        logging.info("Wrote before/after maps to %s", map_folder)
+
+
 # =============================================================================
 # MAIN
 # =============================================================================
 
 
-def main() -> int:  # noqa: D401
-    """Run the entire GTFS-to-GIS pipeline with both spacing QA checks.
-
-    Returns:
-        Process exit code: 0 on success, 1 on failure, 2 if required
-        CONFIGURATION values are still placeholders.
-    """
+def main() -> int:
+    """Run baseline QA plus optional removal comparisons; work from any folder."""
     logging.basicConfig(
         level=LOG_LEVEL,
         format="%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-    if (
-        GTFS_PATH == r"Path\To\Your\GTFS_Data_Folder"
-        or OUTPUT_FOLDER == r"Path\To\Your\Output_Folder"
-    ):
-        logging.warning(
-            "GTFS_PATH and/or OUTPUT_FOLDER are still set to placeholder values. "
-            "Please update them in the CONFIGURATION section before running."
-        )
+    if GTFS_PATH.startswith("Path\\To\\") or OUTPUT_FOLDER.startswith("Path\\To\\"):
+        logging.error("Edit GTFS_PATH and OUTPUT_FOLDER in the configuration section.")
         return 2
-    try:
-        feet_factor = _feet_factor(PROJECTED_CRS)
-    except ValueError as err:
-        logging.error("%s", err)
-        return 2
-    logging.info("Using CRS: %s (1 unit ≈ %.3f ft)", PROJECTED_CRS, feet_factor)
-    # -----------------------------------------------------------------
-    # STEP 0  Read GTFS tables and validate
-    # -----------------------------------------------------------------
-    logging.info("STEP 0  Reading GTFS tables …")
-    gtfs_path = Path(GTFS_PATH)
+    script_folder = (
+        Path(globals().get("__file__", Path.cwd() / "gtfs_stop_spacing.py")).resolve().parent
+    )
+    gtfs_path, output_path = (
+        Path(GTFS_PATH).expanduser(),
+        Path(OUTPUT_FOLDER).expanduser(),
+    )
+    if not gtfs_path.is_absolute():
+        gtfs_path = script_folder / gtfs_path
+    if not output_path.is_absolute():
+        output_path = script_folder / output_path
+    _feet_factor(PROJECTED_CRS)
+    logging.info("STEP 1: Reading GTFS tables.")
     dfs = _read_gtfs_tables(gtfs_path)
-
-    try:
-        _validate_columns(dfs)
-    except ValueError as err:
-        logging.error("\nERROR – invalid GTFS feed:\n%s", err)
-        return 1
+    _validate_columns(dfs)
     _prepare_tables(dfs)
-
-    # -----------------------------------------------------------------
-    # 0·1  Route / trip filtering
-    # -----------------------------------------------------------------
-    routes_df, trips_df = _filter_routes(
-        dfs["routes"], dfs["trips"], INCLUDE_ROUTE_IDS, FILTER_OUT_LIST
-    )
-    if trips_df.empty:
-        logging.error(
-            "No trips left after applying INCLUDE_ROUTE_IDS / FILTER_OUT_LIST; "
-            "check that the IDs match route_id values in routes.txt."
+    routes, trips = _filter_routes(dfs["routes"], dfs["trips"], INCLUDE_ROUTE_IDS, FILTER_OUT_LIST)
+    if trips.empty:
+        raise ValueError("No selected trips; check route_id include/exclude settings.")
+    logging.info("STEP 2: Building shapes and validating scenario inputs.")
+    lines = _build_shape_lines(dfs["shapes"], trips["shape_id"], PROJECTED_CRS)
+    _validate_review(dfs, trips, lines, STOP_KEY, REMOVAL_SCENARIOS, REVIEW_STOP_KEYS)
+    selected_stops = _build_stops_gdf(dfs["stops"], dfs["stop_times"], trips, routes, PROJECTED_CRS)
+    patterns = _build_patterns_gdf(dfs["stop_times"], trips, routes, lines)
+    output = _ensure_output_folder(output_path)
+    logging.info("STEP 3: Calculating current and proposed spacing.")
+    _run_spacing_review(patterns, selected_stops, output)
+    if WRITE_LEGACY_GIS:
+        logging.info("STEP 4: Writing existing GTFS GIS and nearby-stop QA outputs.")
+        legacy = _ensure_output_folder(output / "current_gtfs_gis")
+        all_stops = _build_stops_gdf(
+            dfs["stops"],
+            dfs["stop_times"],
+            dfs["trips"],
+            dfs["routes"],
+            PROJECTED_CRS,
         )
-        return 2
-
-    out_dir = _ensure_output_folder(OUTPUT_FOLDER)
-
-    # -----------------------------------------------------------------
-    # STEP 1  Build stop layers
-    # -----------------------------------------------------------------
-    logging.info("STEP 1  Building stop layers …")
-    all_stops_gdf, stops_gdf = _build_stop_layers(dfs, trips_df, routes_df, PROJECTED_CRS)
-    # export only the filtered set; route_dirs is an internal lookup
-    _export(stops_gdf.drop(columns="route_dirs"), out_dir, "stops")
-
-    # -----------------------------------------------------------------
-    # STEP 2  Build route polylines and stopping patterns
-    # -----------------------------------------------------------------
-    logging.info("STEP 2  Building routes shapefile and stopping patterns …")
-    shape_lines = _build_shape_lines(dfs["shapes"], trips_df["shape_id"], PROJECTED_CRS)
-    routes_gdf = _build_routes_gdf(shape_lines, trips_df, routes_df, ROUTE_UNION)
-    _export(routes_gdf, out_dir, "routes")
-    patterns_gdf = _build_patterns_gdf(dfs["stop_times"], trips_df, routes_df, shape_lines)
-
-    # -----------------------------------------------------------------
-    # STEP 3  Split polylines into stop-to-stop segments
-    # -----------------------------------------------------------------
-    logging.info("STEP 3  Splitting routes into stop-to-stop segments …")
-    segs_gdf = _split_into_segments(
-        patterns_gdf, stops_gdf, PROJECTED_CRS, max_offset_ft=SERVED_STOP_MAX_OFFSET_FT
-    )
-    _export(segs_gdf, out_dir, "segments")  # master file
-    _export_segments_by_route_dir(segs_gdf, out_dir)  # per-route files
-
-    # -----------------------------------------------------------------
-    # STEP 4  Short-spacing QA
-    # -----------------------------------------------------------------
-    logging.info("STEP 4  Flagging closely-spaced stops …")
-    _flag_short_spacing(
-        patterns_gdf,
-        stops_gdf,  # filtered layer
-        MIN_SPACING_FT,
-        out_dir / SPACING_LOG_FILE,
-        max_offset_ft=SERVED_STOP_MAX_OFFSET_FT,
-    )
-
-    # -----------------------------------------------------------------
-    # STEP 5  Long-spacing QA (needs *all* stops) – CSV export
-    # -----------------------------------------------------------------
-    logging.info("STEP 5  Flagging long-spacing segments …")
-    _flag_long_spacing_csv(
-        patterns_gdf,
-        all_stops_gdf,  # unfiltered layer
-        LONG_SPACING_FT,
-        NEAR_BUFFER_FT,
-        out_dir / LONG_SPACING_CSV_FILE,
-        max_offset_ft=SERVED_STOP_MAX_OFFSET_FT,
-    )
-
-    logging.info("\nAll done! Outputs in: %s", out_dir)
-    logging.info("Script completed successfully.")
+        _export(
+            gpd.GeoDataFrame(
+                selected_stops.drop(columns="route_dirs"),
+                geometry="geometry",
+                crs=selected_stops.crs,
+            ),
+            legacy,
+            "stops",
+        )
+        route_lines = _build_routes_gdf(lines, trips, routes, ROUTE_UNION)
+        _export(route_lines, legacy, "routes")
+        segments = _split_into_segments(patterns, selected_stops, PROJECTED_CRS)
+        _export(segments, legacy, "segments")
+        _export_segments_by_route_dir(segments, legacy)
+        _flag_short_spacing(patterns, selected_stops, MIN_SPACING_FT, legacy / SPACING_LOG_FILE)
+        _flag_long_spacing_csv(
+            patterns,
+            all_stops,
+            LONG_SPACING_FT,
+            NEAR_BUFFER_FT,
+            legacy / LONG_SPACING_CSV_FILE,
+        )
+    logging.info("Finished. Outputs: %s", output)
     return 0
 
 
