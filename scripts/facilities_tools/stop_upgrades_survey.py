@@ -84,11 +84,11 @@ IMPROVEMENT_ALIASES: Dict[str, str] = {
 # ---- Optional route filters (matched against route_short_name)
 # Whitelist: priority routes whose stops are also reported as a share of the
 # system total. Leave empty to skip the whitelist metric.
-ROUTE_WHITELIST: Set[str] = set()  # e.g. {"101", "202"}
+ROUTE_WHITELIST: List[str] = []  # e.g. ["101", "202"]
 
 # Blacklist: routes excluded from the system universe entirely (e.g., shuttle,
 # charter, or non-fixed-route services). Leave empty for no exclusions.
-ROUTE_BLACKLIST: Set[str] = set()  # e.g. {"9999A", "9999B"}
+ROUTE_BLACKLIST: List[str] = []  # e.g. ["9999A", "9999B"]
 
 # ---- Output
 OUTPUT_DIR: Path = Path(r"Path\To\Your\Output_Folder")
@@ -281,13 +281,13 @@ def _standardise_yn(series: pd.Series) -> pd.Series:
 
 def resolve_route_ids_by_short_name(
     routes_df: pd.DataFrame,
-    route_short_names: Set[str],
+    route_short_names: List[str],
 ) -> Set[str]:
-    """Resolve a set of route_short_name tokens to route_id values.
+    """Resolve a list of route_short_name tokens to route_id values.
 
     Args:
         routes_df: The routes.txt DataFrame.
-        route_short_names: A set of short-name tokens to match.
+        route_short_names: A list of short-name tokens to match.
 
     Returns:
         Set of matching route_id strings. Logs a warning for any token not found.
@@ -305,7 +305,7 @@ def resolve_route_ids_by_short_name(
 
     matched_ids = set(r.loc[r["route_short_name"].isin(route_short_names), "route_id"])
     found_tokens = set(r.loc[r["route_id"].isin(matched_ids), "route_short_name"])
-    missing = sorted(route_short_names - found_tokens)
+    missing = sorted(set(route_short_names) - found_tokens)
     if missing:
         logging.warning("Route filter tokens not found in routes.txt: %s", ", ".join(missing))
 
@@ -537,7 +537,7 @@ def compute_summary(
     canonical_cols: Sequence[str],
     column_map: Mapping[str, str],
     whitelist_route_ids: Set[str],
-    whitelist_short_names: Set[str],
+    whitelist_short_names: List[str],
 ) -> Dict[str, Any]:
     """Compute the headline metrics requested in the summary report.
 
@@ -547,7 +547,7 @@ def compute_summary(
         canonical_cols: Canonical improvement column names (may be empty).
         column_map: Improvement display label -> canonical column name.
         whitelist_route_ids: Set of route_ids treated as the whitelist universe.
-        whitelist_short_names: Set of route_short_names for human-readable logging.
+        whitelist_short_names: List of route_short_names for human-readable logging.
 
     Returns:
         Dictionary of metrics ready for serialisation/logging.
@@ -590,7 +590,7 @@ def compute_summary(
 
 def write_summary_txt(
     summary: Mapping[str, Any],
-    blacklist_short_names: Set[str],
+    blacklist_short_names: List[str],
     out_path: Path,
 ) -> None:
     """Write the human-readable text summary."""

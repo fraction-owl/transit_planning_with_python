@@ -58,7 +58,7 @@ import seaborn as sns
 INPUT_ROOT_DIR: Final[Path] = Path(r"Path\To\Your\Data_Folder_with_observed_trips")
 OUTPUT_ROOT_DIR: Final[Path] = Path(r"Path\To\Your\Output_Folder")
 
-ROUTES_TO_INCLUDE: Final[set[str]] = set()  # optional whitelist, e.g. {"101", "202"}; empty → all
+ROUTES_TO_INCLUDE: Final[list[str]] = []  # optional whitelist, e.g. ["101", "202"]; empty → all
 
 DATE_START: Final[pd.Timestamp] = pd.Timestamp("2024-06-30")
 DATE_END: Final[pd.Timestamp] = pd.Timestamp("2025-07-24")
