@@ -44,6 +44,7 @@ Outputs
 - ``gtfs_shp_route_comparison.csv``: one row per route with its status
   (match, mismatch, missing from either side) and lengths.
 - ``gtfs_shp_summary.json`` and a run-log sidecar with the CONFIGURATION block.
+- Optional ``comparison_pngs/route_*_comparison.png`` maps and ``plots_manifest.csv``.
 
 Typical usage
 -------------
@@ -62,9 +63,11 @@ import argparse
 import datetime as dt
 import json
 import logging
+import math
 import os
 import re
 import sys
+import textwrap
 import zipfile
 from collections.abc import Generator, Mapping
 from contextlib import contextmanager
@@ -72,8 +75,9 @@ from pathlib import Path
 from typing import IO, Any, List, Literal, NamedTuple, Optional, Sequence
 
 import geopandas as gpd
+import numpy as np
 import pandas as pd
-from pyproj import CRS
+from pyproj import CRS, Transformer
 from pyproj.exceptions import CRSError
 from shapely.geometry import GeometryCollection, LineString, MultiLineString
 from shapely.geometry.base import BaseGeometry
@@ -170,6 +174,18 @@ ROUTE_TABLE_FILENAME: str = r"gtfs_shp_route_comparison.csv"
 SUMMARY_FILENAME: str = r"gtfs_shp_summary.json"
 RUN_LOG_FILENAME: str = r"gtfs_shp_linear_diff_runlog.txt"
 
+# Optional comparison maps (PNG; needs matplotlib): per route, an overview and
+# up to PLOT_DETAIL_COUNT close-ups of its largest differences, with nearby stop
+# names for orientation, written to PLOT_SUBFOLDER with a plots_manifest.csv.
+# No map tiles are fetched.
+WRITE_COMPARISON_PNGS: bool = False
+# Route names to map, e.g. ("10", "50H"); empty maps every route that does not match.
+PLOT_ROUTES: tuple[str, ...] = ()
+PLOT_DETAIL_COUNT: int = 3  # close-ups per map, 0 through 3
+PLOT_DETAIL_WIDTH_FEET: float = 3000.0  # width of each close-up
+PLOT_DPI: int = 180
+PLOT_SUBFOLDER: str = r"comparison_pngs"
+
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
 
 # When True, a failed run-log write aborts the script so an output is never left
@@ -237,6 +253,11 @@ class Config(NamedTuple):
     mismatch_min_feet: float = MISMATCH_MIN_FEET
     target_crs: str = TARGET_CRS
     distance_output_unit: DistanceUnit = DISTANCE_OUTPUT_UNIT
+    write_comparison_pngs: bool = WRITE_COMPARISON_PNGS
+    plot_routes: tuple[str, ...] = PLOT_ROUTES
+    plot_detail_count: int = PLOT_DETAIL_COUNT
+    plot_detail_width_feet: float = PLOT_DETAIL_WIDTH_FEET
+    plot_dpi: int = PLOT_DPI
 
 
 class PatternChoice(NamedTuple):
@@ -1068,7 +1089,7 @@ def route_name_text(value: Any) -> str:
     if value is None:
         return ""
     if isinstance(value, float):
-        if value != value:  # NaN
+        if math.isnan(value):
             return ""
         if value.is_integer():
             return str(int(value))
@@ -1492,6 +1513,27 @@ def split_by_length(lines: Sequence[Any], min_length: float) -> tuple[list[Any],
 def intersect_lines(geom: BaseGeometry, area: BaseGeometry) -> BaseGeometry:
     """Return the part of a line geometry inside a polygon."""
     return geom.intersection(area)
+
+
+def line_coords(geom: BaseGeometry) -> list[list[tuple[float, float]]]:
+    """Return each part of a line geometry as a list of ``(x, y)`` vertices."""
+    return [[(float(x), float(y)) for x, y in part.coords] for part in extract_lines(geom)]
+
+
+def project_lonlat(
+    lons: Sequence[float], lats: Sequence[float], projected_crs: Any
+) -> tuple[list[float], list[float]]:
+    """Project WGS 84 longitude/latitude pairs into *projected_crs*."""
+    transformer = Transformer.from_crs("EPSG:4326", projected_crs, always_xy=True)
+    xs, ys = transformer.transform(list(lons), list(lats))
+    return [float(x) for x in xs], [float(y) for y in ys]
+
+
+def to_lonlat(x: float, y: float, projected_crs: Any) -> tuple[float, float]:
+    """Return the WGS 84 longitude/latitude of a projected point."""
+    transformer = Transformer.from_crs(projected_crs, "EPSG:4326", always_xy=True)
+    lon, lat = transformer.transform(x, y)
+    return float(lon), float(lat)
 
 
 def compare_alignments(
@@ -2131,7 +2173,7 @@ def write_gtfs_route_layers(
 def patterns_frame(gtfs_routes: Mapping[str, GtfsRoute], output_unit: DistanceUnit) -> pd.DataFrame:
     """Tabulate the chosen patterns, one row per route direction and shape."""
     rows = [p._asdict() for g in gtfs_routes.values() for p in g.patterns]
-    df = pd.DataFrame(rows, columns=list(PatternChoice._fields))
+    df = pd.DataFrame(rows, columns=pd.Index(PatternChoice._fields))
     df["trip_share"] = [
         round(t / d, 4) if d else 0.0 for t, d in zip(df["trips"], df["direction_trips"])
     ]
@@ -2143,7 +2185,7 @@ def patterns_frame(gtfs_routes: Mapping[str, GtfsRoute], output_unit: DistanceUn
 
 def route_table_frame(rows: Sequence[RouteComparison], output_unit: DistanceUnit) -> pd.DataFrame:
     """Assemble the per-route comparison table, mismatches first."""
-    df = pd.DataFrame([r._asdict() for r in rows], columns=list(RouteComparison._fields))
+    df = pd.DataFrame([r._asdict() for r in rows], columns=pd.Index(RouteComparison._fields))
     for col in (
         "gtfs_len_ft",
         "matched_len_ft",
@@ -2162,6 +2204,512 @@ def route_table_frame(rows: Sequence[RouteComparison], output_unit: DistanceUnit
     df["_order"] = df["status"].map({s: i for i, s in enumerate(STATUS_ORDER)})
     df = df.sort_values(["_order", "mismatch_len_ft", "route_key"], ascending=[True, False, True])
     return df.drop(columns="_order").reset_index(drop=True)
+
+
+# =============================================================================
+# COMPARISON MAPS (optional)
+# =============================================================================
+
+
+def load_plot_stops(gtfs_path: Path, projected_crs: Any) -> pd.DataFrame:
+    """Read stop names and projected positions, used only as map labels.
+
+    Returns:
+        Columns ``stop_name``, ``x`` and ``y`` (empty when stops.txt is absent
+        or lacks names or coordinates).
+    """
+    empty = pd.DataFrame({"stop_name": [], "x": [], "y": []})
+    try:
+        with open_gtfs_file(gtfs_path, "stops.txt") as handle:
+            stops = _read_csv(handle)
+    except (FileNotFoundError, pd.errors.EmptyDataError):
+        logging.info("No stops.txt labels available for comparison maps.")
+        return empty
+    required = {"stop_name", "stop_lat", "stop_lon"}
+    if not required.issubset(stops.columns):
+        logging.warning("stops.txt lacks name/coordinate columns; omitting map labels.")
+        return empty
+    stops["stop_lat"] = pd.to_numeric(stops["stop_lat"], errors="coerce")
+    stops["stop_lon"] = pd.to_numeric(stops["stop_lon"], errors="coerce")
+    stops = stops.dropna(subset=["stop_lat", "stop_lon"])
+    stops = stops[stops["stop_lat"].between(-90, 90) & stops["stop_lon"].between(-180, 180)]
+    if stops.empty:
+        return empty
+    xs, ys = project_lonlat(stops["stop_lon"].tolist(), stops["stop_lat"].tolist(), projected_crs)
+    return pd.DataFrame({"stop_name": stops["stop_name"].tolist(), "x": xs, "y": ys})
+
+
+def _sample_points(
+    coords_list: Sequence[Sequence[tuple[float, float]]], spacing: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """Cut lines into sub-segments of at most *spacing* and return their midpoints and lengths.
+
+    Returns:
+        Tuple of an (n, 2) array of midpoints and an (n,) array of lengths.
+    """
+    points: list[tuple[float, float]] = []
+    lengths: list[float] = []
+    for coords in coords_list:
+        for (x0, y0), (x1, y1) in zip(coords, coords[1:]):
+            seg = math.hypot(x1 - x0, y1 - y0)
+            if seg == 0:
+                continue
+            n = max(1, math.ceil(seg / spacing))
+            for k in range(n):
+                t = (k + 0.5) / n
+                points.append((x0 + t * (x1 - x0), y0 + t * (y1 - y0)))
+                lengths.append(seg / n)
+    if not points:
+        return np.empty((0, 2)), np.empty(0)
+    return np.asarray(points, dtype=float), np.asarray(lengths, dtype=float)
+
+
+def _near_mask(xs: np.ndarray, ys: np.ndarray, points: np.ndarray, radius: float) -> np.ndarray:
+    """Flag the (xs, ys) positions within *radius* of any of *points*."""
+    mask = np.zeros(len(xs), dtype=bool)
+    if len(xs) == 0 or len(points) == 0:
+        return mask
+    for start in range(0, len(points), 256):
+        block = points[start : start + 256]
+        dx = xs[:, None] - block[:, 0][None, :]
+        dy = ys[:, None] - block[:, 1][None, :]
+        mask |= ((dx * dx + dy * dy) <= radius * radius).any(axis=1)
+    return mask
+
+
+def _point_along(coords: Sequence[tuple[float, float]], fraction: float) -> tuple[float, float]:
+    """Return the point at *fraction* (0-1) of a vertex list's length."""
+    seg_lengths = [math.hypot(x1 - x0, y1 - y0) for (x0, y0), (x1, y1) in zip(coords, coords[1:])]
+    target = sum(seg_lengths) * fraction
+    for ((x0, y0), (x1, y1)), seg in zip(zip(coords, coords[1:]), seg_lengths):
+        if seg > 0 and target <= seg:
+            t = target / seg
+            return (x0 + t * (x1 - x0), y0 + t * (y1 - y0))
+        target -= seg
+    return coords[-1]
+
+
+def plot_detail_boxes(
+    lines: Sequence[Any], width: float, count: int
+) -> list[tuple[float, float, float, float]]:
+    """Choose separated close-ups where the most reported difference length lies.
+
+    Candidate centers sample the longest difference pieces. Ranking uses the
+    difference length inside each window, and windows overlapping a chosen one
+    are skipped. This picks places to look at, not a new comparison or a
+    severity measure.
+
+    Args:
+        lines: Reported difference lines (projected CRS).
+        width: Close-up width in CRS units.
+        count: Number of close-ups wanted.
+
+    Returns:
+        ``(xmin, ymin, xmax, ymax)`` per close-up, best first.
+    """
+    if count <= 0 or not lines:
+        return []
+    pieces = [
+        coords
+        for geom in sorted(lines, key=lambda g: -g.length)
+        for coords in line_coords(geom)
+        if len(coords) >= 2
+    ]
+    points, lengths = _sample_points(pieces, width / 20)
+    if len(points) == 0:
+        return []
+    half = width / 2
+    candidates: dict[tuple[int, int], tuple[float, float, float]] = {}
+    for coords in pieces[:80]:
+        piece_length = sum(
+            math.hypot(x1 - x0, y1 - y0) for (x0, y0), (x1, y1) in zip(coords, coords[1:])
+        )
+        fractions = (0.15, 0.5, 0.85) if piece_length > width else (0.5,)
+        for fraction in fractions:
+            x, y = _point_along(coords, fraction)
+            cell = (round(x / (width / 4)), round(y / (width / 4)))
+            if cell in candidates:
+                continue
+            inside = (np.abs(points[:, 0] - x) <= half) & (np.abs(points[:, 1] - y) <= half)
+            candidates[cell] = (float(lengths[inside].sum()), x, y)
+    chosen: list[tuple[float, float]] = []
+    for _, x, y in sorted(candidates.values(), key=lambda item: (-item[0], item[1], item[2])):
+        if any(abs(x - xx) < width * 1.1 and abs(y - yy) < width * 1.1 for xx, yy in chosen):
+            continue
+        chosen.append((x, y))
+        if len(chosen) == count:
+            break
+    return [(x - half, y - half, x + half, y + half) for x, y in chosen]
+
+
+def _plot_line_layer(
+    ax: Any,
+    lines: Sequence[Any],
+    color: str,
+    width: float,
+    style: str = "solid",
+    zorder: int = 3,
+) -> None:
+    """Draw the lines' actual vertices, including multipart and disconnected pieces."""
+    from matplotlib.collections import LineCollection
+
+    coordinates = [coords for geom in lines for coords in line_coords(geom) if len(coords) >= 2]
+    if coordinates:
+        ax.add_collection(
+            LineCollection(
+                coordinates,
+                colors=color,
+                linewidths=width,
+                linestyles=style,
+                zorder=zorder,
+                capstyle="round",
+            )
+        )
+
+
+def _plot_stop_labels(ax: Any, stops: pd.DataFrame, maximum: int = 3) -> None:
+    """Label a few separated nearby stops without implying service by this route."""
+    xmin, xmax = ax.get_xlim()
+    ymin, ymax = ax.get_ylim()
+    width, height = xmax - xmin, ymax - ymin
+    visible = stops[
+        stops["x"].between(xmin + width * 0.12, xmax - width * 0.12)
+        & stops["y"].between(ymin + height * 0.15, ymax - height * 0.15)
+    ]
+    if visible.empty:
+        return
+    chosen: list[tuple[float, float]] = []
+    used_names: set[str] = set()
+    visible = visible.copy()
+    visible["landmark"] = visible["stop_name"].str.contains(
+        r"METRO|TRANSIT|AIRPORT|PARK.*RIDE|STATION", case=False, regex=True
+    )
+    ordered = visible.sort_values(["landmark", "stop_name"], ascending=[False, True])
+    for stop_name, x, y in zip(
+        ordered["stop_name"], ordered["x"].to_numpy(dtype=float), ordered["y"].to_numpy(dtype=float)
+    ):
+        name = str(stop_name).strip()
+        if not name or name in used_names:
+            continue
+        if any(abs(x - cx) < width * 0.43 and abs(y - cy) < height * 0.32 for cx, cy in chosen):
+            continue
+        ax.plot(x, y, "o", color="#1f2937", markersize=2.5, zorder=8)
+        right = x > xmin + width * 0.55
+        high = y > ymin + height * 0.7
+        ax.annotate(
+            textwrap.fill(name, 24),
+            (x, y),
+            xytext=(-5 if right else 5, -5 if high else 5),
+            textcoords="offset points",
+            ha="right" if right else "left",
+            va="top" if high else "bottom",
+            fontsize=6.5,
+            color="#17212b",
+            zorder=9,
+            bbox={"facecolor": "white", "alpha": 0.88, "edgecolor": "none", "pad": 1.6},
+            clip_on=True,
+        )
+        chosen.append((x, y))
+        used_names.add(name)
+        if len(chosen) >= maximum:
+            break
+
+
+def _plot_scale(ax: Any, feet_per_unit: float) -> None:
+    """Add a projected-distance scale bar and a grid-north arrow."""
+    xmin, xmax = ax.get_xlim()
+    ymin, ymax = ax.get_ylim()
+    width, height = xmax - xmin, ymax - ymin
+    target_ft = width * feet_per_unit * 0.22
+    use_miles = target_ft >= 5280
+    target = target_ft / 5280 if use_miles else target_ft
+    exponent = 10 ** math.floor(math.log10(target))
+    scale_value = max(v * exponent for v in (0.1, 0.2, 0.5, 1, 2, 5) if v * exponent <= target)
+    length_ft = scale_value * 5280 if use_miles else scale_value
+    x, y = xmin + width * 0.06, ymin + height * 0.065
+    ax.plot([x, x + length_ft / feet_per_unit], [y, y], color="#111827", lw=2.5, zorder=10)
+    label = f"{scale_value:g} mi" if use_miles else f"{length_ft:,.0f} ft"
+    ax.text(
+        x,
+        y + height * 0.025,
+        label,
+        fontsize=7,
+        zorder=10,
+        bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.9, "pad": 1.5},
+    )
+    ax.annotate(
+        "N",
+        xy=(0.95, 0.94),
+        xytext=(0.95, 0.82),
+        xycoords="axes fraction",
+        ha="center",
+        fontsize=9,
+        fontweight="bold",
+        zorder=10,
+        arrowprops={"arrowstyle": "-|>", "color": "#111827"},
+    )
+
+
+def write_comparison_plots(
+    cfg: Config,
+    gtfs_routes: Mapping[str, GtfsRoute],
+    ref_routes: Mapping[str, ReferenceRoute],
+    rows: Sequence[RouteComparison],
+    segments: Sequence[SegmentRecord],
+    projected_crs: Any,
+    feet_per_unit: float,
+    service_date: str,
+) -> list[Path]:
+    """Write one PNG per selected route from the comparison already made.
+
+    Blue and gray show the chosen GTFS shapes and the reference lines as
+    drawn; orange and purple show the reported ``gtfs_only`` and ``shp_only``
+    pieces. An overview locates up to ``PLOT_DETAIL_COUNT`` close-ups of the
+    largest differences. Nearby stop names are geographic context, not a claim
+    that the route serves those stops, and no map tiles are fetched. PNGs a
+    previous run listed in ``plots_manifest.csv`` are deleted first, so the
+    folder holds only this run's maps.
+
+    Returns:
+        Paths of the PNGs written (empty when ``WRITE_COMPARISON_PNGS`` is off).
+    """
+    folder = cfg.output_dir / PLOT_SUBFOLDER
+    manifest_path = folder / "plots_manifest.csv"
+    if not cfg.write_comparison_pngs:
+        if manifest_path.exists():
+            logging.warning(
+                "%s holds comparison maps from an earlier run; WRITE_COMPARISON_PNGS is "
+                "off, so they were not updated.",
+                folder,
+            )
+        return []
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Rectangle
+
+    requested = {normalize_route_key(name, cfg.ignore_leading_zeros) for name in cfg.plot_routes}
+    row_map = {row.route_key: row for row in rows}
+    unknown = requested - row_map.keys()
+    if unknown:
+        logging.warning("PLOT_ROUTES not found in this comparison: %s", ", ".join(sorted(unknown)))
+    keys = [
+        row.route_key
+        for row in rows
+        if (row.route_key in requested if requested else row.status != "match")
+    ]
+    folder.mkdir(parents=True, exist_ok=True)
+    if manifest_path.exists():
+        prior = pd.read_csv(manifest_path, dtype=str, keep_default_na=False)
+        for filename in prior.get("png_file", []):
+            # Only PNGs this script recorded in its own folder; never follow paths.
+            if (
+                Path(filename).name == filename
+                and filename.startswith("route_")
+                and filename.endswith(".png")
+            ):
+                (folder / filename).unlink(missing_ok=True)
+    if keys:
+        stops = load_plot_stops(cfg.gtfs_path, projected_crs)
+    else:
+        stops = pd.DataFrame({"stop_name": [], "x": [], "y": []})
+    stop_x = stops["x"].to_numpy(dtype=float)
+    stop_y = stops["y"].to_numpy(dtype=float)
+    colors = {
+        "gtfs": "#1666A6",
+        "gis": "#64748B",
+        "gtfs_only": "#D14905",
+        "shp_only": "#A22685",
+    }
+    files: list[Path] = []
+    manifest: list[dict[str, Any]] = []
+    for key in keys:
+        row = row_map[key]
+        g, r = gtfs_routes.get(key), ref_routes.get(key)
+        gtfs_lines = list(g.lines) if g is not None else []
+        gis_lines = list(r.lines) if r is not None else []
+        if not gtfs_lines and not gis_lines:
+            logging.warning("Route %s has no drawable geometry; no comparison PNG.", key)
+            continue
+        differences = {
+            name: [s.geometry for s in segments if s.route_key == key and s.segment_class == name]
+            for name in ("gtfs_only", "shp_only")
+        }
+        detail_boxes = plot_detail_boxes(
+            differences["gtfs_only"] + differences["shp_only"],
+            cfg.plot_detail_width_feet / feet_per_unit,
+            cfg.plot_detail_count,
+        )
+        boxes = [geometry_bounds(line) for line in gtfs_lines + gis_lines]
+        x0, y0 = min(b[0] for b in boxes), min(b[1] for b in boxes)
+        x1, y1 = max(b[2] for b in boxes), max(b[3] for b in boxes)
+        route_points, _ = _sample_points(
+            [c for line in gtfs_lines + gis_lines for c in line_coords(line)], 300 / feet_per_unit
+        )
+        near = _near_mask(stop_x, stop_y, route_points, 600 / feet_per_unit)
+        nearby_stops = stops[near]
+        padding = max(x1 - x0, y1 - y0, 1000 / feet_per_unit) * 0.08
+        overview = (x0 - padding, y0 - padding, x1 + padding, y1 + padding)
+        with plt.rc_context({"font.family": "DejaVu Sans", "font.size": 9}):
+            fig, axes = plt.subplots(2, 2, figsize=(14, 11))
+            fig.subplots_adjust(
+                left=0.035, right=0.98, bottom=0.13, top=0.87, wspace=0.12, hspace=0.23
+            )
+            fig.suptitle(
+                f"Route {row.route_label}  |  GTFS / GIS comparison",
+                x=0.035,
+                y=0.975,
+                ha="left",
+                fontsize=22,
+                fontweight="bold",
+                color="#142b43",
+            )
+            fig.text(
+                0.035,
+                0.933,
+                f"{row.status.replace('_', ' ').upper()}  ·  Service date: {service_date}"
+                f"  ·  Pattern selection: {cfg.pattern_rule}",
+                fontsize=10,
+                color="#425466",
+            )
+            panel_boxes = [overview] + detail_boxes
+            centers: list[str] = []
+            for index, ax in enumerate(axes.flat):
+                if index >= len(panel_boxes):
+                    ax.axis("off")
+                    if index == 1:
+                        ax.text(
+                            0.5,
+                            0.5,
+                            "No reported unmatched segments to enlarge.",
+                            ha="center",
+                            va="center",
+                        )
+                    continue
+                bounds = panel_boxes[index]
+                ax.set_xlim(bounds[0], bounds[2])
+                ax.set_ylim(bounds[1], bounds[3])
+                ax.set_aspect("equal", adjustable="box")
+                ax.set_facecolor("#f3f5f7")
+                _plot_line_layer(ax, gis_lines, colors["gis"], 2.6, "dashed", 2)
+                _plot_line_layer(ax, gtfs_lines, colors["gtfs"], 1.1, "solid", 3)
+                for name, style in (("gtfs_only", "solid"), ("shp_only", "dashed")):
+                    _plot_line_layer(ax, differences[name], "white", 5, style, 4)
+                    _plot_line_layer(ax, differences[name], colors[name], 2.7, style, 5)
+                _plot_stop_labels(ax, nearby_stops, maximum=3)
+                _plot_scale(ax, feet_per_unit)
+                ax.set_xticks([])
+                ax.set_yticks([])
+                for spine in ax.spines.values():
+                    spine.set_edgecolor("#bdc7d0")
+                if index == 0:
+                    ax.set_title(
+                        "Overview · boxes locate the close-ups", loc="left", fontsize=11, pad=8
+                    )
+                    for letter, window in zip("ABC", detail_boxes):
+                        ax.add_patch(
+                            Rectangle(
+                                (window[0], window[1]),
+                                window[2] - window[0],
+                                window[3] - window[1],
+                                fill=False,
+                                edgecolor="#152d45",
+                                lw=1.1,
+                                zorder=11,
+                            )
+                        )
+                        ax.text(
+                            window[0],
+                            window[3],
+                            letter,
+                            fontsize=9,
+                            fontweight="bold",
+                            zorder=12,
+                            bbox={"facecolor": "white", "edgecolor": "#152d45", "pad": 1.6},
+                        )
+                else:
+                    lon, lat = to_lonlat(
+                        (bounds[0] + bounds[2]) / 2, (bounds[1] + bounds[3]) / 2, projected_crs
+                    )
+                    centers.append(f"{lat:.6f},{lon:.6f}")
+                    ax.set_title(
+                        f"{'ABC'[index - 1]} · {lat:.5f}, {lon:.5f}", loc="left", fontsize=11, pad=8
+                    )
+            legend = [
+                Line2D([0], [0], color=colors[name], lw=width, ls=style, label=label)
+                for name, width, style, label in (
+                    ("gtfs", 1.6, "solid", "GTFS selected patterns"),
+                    ("gis", 2.4, "dashed", "GIS source lines"),
+                    ("gtfs_only", 3, "solid", "GTFS-only discrepancy"),
+                    ("shp_only", 3, "dashed", "GIS-only discrepancy"),
+                )
+            ]
+            fig.legend(
+                handles=legend,
+                loc="lower center",
+                bbox_to_anchor=(0.5, 0.075),
+                ncol=4,
+                frameon=False,
+                fontsize=9,
+                handlelength=3,
+            )
+            fig.text(
+                0.035,
+                0.055,
+                f"Match tolerance: {cfg.buffer_tolerance_feet:g} ft. "
+                f"Reported pieces shorter than {cfg.min_segment_length_feet:g} ft are hidden. "
+                "Stop names are nearby geographic context. North arrow is grid north.",
+                fontsize=8,
+                color="#475569",
+            )
+            fig.text(
+                0.035,
+                0.031,
+                f"GTFS: {cfg.gtfs_path.name}    |    GIS: {cfg.route_shapes_path.name}",
+                fontsize=7.5,
+                color="#64748b",
+            )
+            safe_key = re.sub(r"[^A-Za-z0-9_-]+", "_", key).strip("_") or "route"
+            # Hex suffix avoids collisions for different keys such as A/B and A B.
+            suffix = "" if safe_key == key else f"_{key.encode('utf-8').hex()}"
+            filename = f"route_{safe_key}{suffix}_comparison.png"
+            path = folder / filename
+            try:
+                fig.savefig(path, dpi=cfg.plot_dpi, facecolor="white")
+            finally:
+                plt.close(fig)
+        files.append(path)
+        manifest.append(
+            {
+                "route_key": key,
+                "status": row.status,
+                "png_file": filename,
+                "service_date": service_date,
+                "pattern_rule": cfg.pattern_rule,
+                "buffer_ft": cfg.buffer_tolerance_feet,
+                "min_piece_ft": cfg.min_segment_length_feet,
+                "detail_centers_lat_lon": "; ".join(centers),
+            }
+        )
+        logging.info("Wrote comparison PNG (%d/%d): %s", len(files), len(keys), path)
+    pd.DataFrame(
+        manifest,
+        columns=pd.Index(
+            [
+                "route_key",
+                "status",
+                "png_file",
+                "service_date",
+                "pattern_rule",
+                "buffer_ft",
+                "min_piece_ft",
+                "detail_centers_lat_lon",
+            ]
+        ),
+    ).to_csv(manifest_path, index=False)
+    return files
 
 
 # =============================================================================
@@ -2274,6 +2822,19 @@ def validate_config(cfg: Config) -> None:
         if value < 0 or (name == "BUFFER_TOLERANCE_FEET" and value == 0):
             raise ConfigError(f"{name} must be positive; got {value!r}.")
     compile_route_pattern(cfg.shp_route_pattern)
+    if not 0 <= cfg.plot_detail_count <= 3:
+        raise ConfigError("PLOT_DETAIL_COUNT must be between 0 and 3.")
+    if cfg.plot_dpi < 72 or cfg.plot_dpi > 600:
+        raise ConfigError("PLOT_DPI must be between 72 and 600.")
+    if not math.isfinite(cfg.plot_detail_width_feet) or cfg.plot_detail_width_feet <= 0:
+        raise ConfigError("PLOT_DETAIL_WIDTH_FEET must be positive and finite.")
+    if cfg.write_comparison_pngs:
+        try:
+            import matplotlib  # noqa: F401
+        except ImportError as exc:
+            raise ConfigError(
+                "Comparison maps need matplotlib; install it or set WRITE_COMPARISON_PNGS = False."
+            ) from exc
     for name, target in cfg.shp_route_aliases.items():
         if not str(name).strip():
             raise ConfigError(f"SHP_ROUTE_ALIASES has a blank route name (for {target!r}).")
@@ -2414,6 +2975,17 @@ def run(cfg: Config) -> Summary:
     summary_path.write_text(json.dumps(summary._asdict(), indent=2), encoding="utf-8")
     logging.info("Wrote: %s", summary_path)
 
+    png_files = write_comparison_plots(
+        cfg,
+        gtfs_routes,
+        ref_routes,
+        rows,
+        segments,
+        projected_crs,
+        feet_per_unit,
+        summary.service_date,
+    )
+
     summary_lines = [
         f"GTFS / shapefile routes:  {summary.gtfs_route_count} / {summary.shp_route_count}",
         f"Service day counted:      {summary.service_date} ({cfg.service_day})",
@@ -2424,6 +2996,8 @@ def run(cfg: Config) -> Summary:
         f"No GTFS geometry:         {summary.no_gtfs_geometry_count}",
         f"GTFS-only / shp-only:     {summary.gtfs_only_length} / {summary.shp_only_length} {unit}",
         f"Projected CRS:            {summary.projected_crs}",
+        f"Comparison PNGs:          {len(png_files)}"
+        + (f" (see {PLOT_SUBFOLDER}/plots_manifest.csv)" if cfg.write_comparison_pngs else ""),
         "Layers written:           "
         + (", ".join(f"{name} ({n})" for name, n in layers.items() if n) or "none"),
         "Layers with no features:  "
@@ -2535,6 +3109,32 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=TARGET_CRS,
         help='Projected CRS for the overlay, e.g. "EPSG:2248"; empty auto-picks a UTM zone.',
     )
+    p.add_argument(
+        "--write-pngs",
+        action=argparse.BooleanOptionalAction,
+        default=WRITE_COMPARISON_PNGS,
+        help="Write optional route comparison maps (PNG).",
+    )
+    p.add_argument(
+        "--plot-routes",
+        nargs="*",
+        default=list(PLOT_ROUTES),
+        metavar="ROUTE",
+        help="Route names to map; no values maps every route that does not match.",
+    )
+    p.add_argument(
+        "--plot-detail-count",
+        type=int,
+        default=PLOT_DETAIL_COUNT,
+        help="Close-ups per map (0-3).",
+    )
+    p.add_argument(
+        "--plot-detail-width-feet",
+        type=float,
+        default=PLOT_DETAIL_WIDTH_FEET,
+        help="Width of each close-up, in feet.",
+    )
+    p.add_argument("--plot-dpi", type=int, default=PLOT_DPI, help="Map resolution (72-600).")
     return p
 
 
@@ -2596,6 +3196,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         mismatch_min_feet=args.mismatch_min_feet,
         target_crs=args.target_crs,
         distance_output_unit=DISTANCE_OUTPUT_UNIT,
+        write_comparison_pngs=args.write_pngs,
+        plot_routes=tuple(args.plot_routes),
+        plot_detail_count=args.plot_detail_count,
+        plot_detail_width_feet=args.plot_detail_width_feet,
+        plot_dpi=args.plot_dpi,
     )
     try:
         run(cfg)

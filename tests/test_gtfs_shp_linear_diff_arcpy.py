@@ -23,6 +23,7 @@ import pytest
 from pyproj import CRS, Transformer
 from shapely import ops
 from shapely.geometry import GeometryCollection, LineString, MultiLineString
+from shapely.geometry import Point as ShapelyPoint
 
 MODULE = "scripts.stop_analysis.gtfs_shp_linear_diff_arcpy"
 GPD_MODULE = "scripts.stop_analysis.gtfs_shp_linear_diff_gpd"
@@ -74,6 +75,19 @@ def _fake_arcpy() -> types.ModuleType:
     def _project(geom: Any, src: SpatialReference, dst: SpatialReference) -> Any:
         t = Transformer.from_crs(src._crs, dst._crs, always_xy=True)
         return ops.transform(t.transform, geom)
+
+    class PointGeometry:
+        def __init__(self, pt: Point, sr: SpatialReference) -> None:
+            self._g, self.spatialReference = ShapelyPoint(pt.X, pt.Y), sr
+
+        def projectAs(self, sr: SpatialReference) -> PointGeometry:
+            out = PointGeometry(Point(), sr)
+            out._g = _project(self._g, self.spatialReference, sr)
+            return out
+
+        @property
+        def firstPoint(self) -> Point:
+            return Point(self._g.x, self._g.y)
 
     class Polygon:
         def __init__(self, geom: Any, sr: SpatialReference) -> None:
@@ -205,6 +219,7 @@ def _fake_arcpy() -> types.ModuleType:
         "Point": Point,
         "Array": Array,
         "Polyline": Polyline,
+        "PointGeometry": PointGeometry,
         "Polygon": Polygon,
         "Describe": describe,
         "ListFields": list_fields,
@@ -620,3 +635,28 @@ def test_aliases_and_km_fields(
     assert "matched_len_km" in table.columns
     rows = mod.arcpy.FEATURES[str(out / "gtfs_shp_combined_routes.shp")]["rows"]
     assert "len_km" in rows[0] and "len_mi" not in rows[0]
+
+
+def test_maps_match_the_geopandas_twin(mod: types.ModuleType, tmp_path: Path) -> None:
+    gtfs = write_feed(tmp_path / "gtfs")
+    shp = write_reference(tmp_path / "ref" / "routes.shp", REFERENCE)
+    out, twin_out = tmp_path / "out", tmp_path / "twin"
+    args = ["--shp-route-field", "ROUTE", "--write-pngs", "--plot-dpi", "72"]
+    assert run_main(mod, gtfs, shp, out, *args) == 0
+    gpd_mod = importlib.import_module(GPD_MODULE)
+    assert run_main(gpd_mod, gtfs, shp, twin_out, *args, "--target-crs", "EPSG:2248") == 0
+    manifests = [
+        pd.read_csv(folder / "comparison_pngs" / "plots_manifest.csv", dtype=str)
+        for folder in (out, twin_out)
+    ]
+    assert manifests[0]["png_file"].tolist() == manifests[1]["png_file"].tolist()
+    assert manifests[0]["route_key"].tolist() == ["30", "40", "7", "99"]  # key order
+    for name in manifests[0]["png_file"]:
+        assert (out / "comparison_pngs" / name).read_bytes()[:4] == b"\x89PNG"
+    arc = manifests[0].set_index("route_key")["detail_centers_lat_lon"]
+    twin = manifests[1].set_index("route_key")["detail_centers_lat_lon"]
+    for key in arc.index:
+        a = [tuple(map(float, c.split(","))) for c in arc[key].split("; ")]
+        b = [tuple(map(float, c.split(","))) for c in twin[key].split("; ")]
+        assert len(a) == len(b)
+        assert all(abs(x[0] - y[0]) < 0.002 and abs(x[1] - y[1]) < 0.002 for x, y in zip(a, b))

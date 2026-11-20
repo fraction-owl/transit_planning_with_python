@@ -782,3 +782,78 @@ def test_route_table_lengths_add_up(tmp_path: Path) -> None:
         combined = gpd.read_file(out / mod.COMBINED_ROUTES_FILENAME).set_index("rt_key")
         for key, length in combined["len_ft"].items():
             assert length == pytest.approx(table.loc[key, "gtfs_len_ft"], abs=0.2)
+
+
+# ---------------------------------------------------------------------------
+# Optional comparison maps
+# ---------------------------------------------------------------------------
+
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+
+def test_plot_detail_boxes_pick_separated_differences() -> None:
+    long_far = LineString([(0, 0), (2_000, 0)])
+    short_far = LineString([(50_000, 0), (50_500, 0)])
+    boxes = mod.plot_detail_boxes([short_far, long_far], width=3_000.0, count=3)
+    assert len(boxes) == 2
+    centers = [((b[0] + b[2]) / 2, (b[1] + b[3]) / 2) for b in boxes]
+    assert centers[0][0] < 3_000 and centers[1][0] > 49_000  # most difference first
+    assert all(b[2] - b[0] == pytest.approx(3_000.0) for b in boxes)
+    assert len(mod.plot_detail_boxes([long_far, short_far], 3_000.0, 1)) == 1
+    assert mod.plot_detail_boxes([long_far], 3_000.0, 0) == []
+    assert mod.plot_detail_boxes([], 3_000.0, 3) == []
+
+
+def test_maps_are_off_by_default(tmp_path: Path) -> None:
+    gtfs = write_feed(tmp_path / "gtfs")
+    shp = write_reference(tmp_path / "ref" / "routes.shp", DEFAULT_REFERENCE)
+    mod.run(make_config(gtfs, shp, tmp_path / "out"))
+    assert not (tmp_path / "out" / mod.PLOT_SUBFOLDER).exists()
+    log = (tmp_path / "out" / mod.RUN_LOG_FILENAME).read_text(encoding="utf-8")
+    assert "Comparison PNGs:          0\n" in log
+
+
+def test_maps_for_routes_that_do_not_match_and_rerun_cleanup(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    gtfs = write_feed(tmp_path / "gtfs")
+    shp = write_reference(tmp_path / "ref" / "routes.shp", DEFAULT_REFERENCE)
+    out = tmp_path / "out"
+    folder = out / mod.PLOT_SUBFOLDER
+    mod.run(make_config(gtfs, shp, out, write_comparison_pngs=True, plot_dpi=72))
+    pngs = sorted(p.name for p in folder.glob("*.png"))
+    assert pngs == [f"route_{key}_comparison.png" for key in ("30", "40", "7", "99")]
+    assert all((folder / name).read_bytes()[:8] == PNG_SIGNATURE for name in pngs)
+    manifest = pd.read_csv(folder / "plots_manifest.csv", dtype=str, keep_default_na=False)
+    assert set(manifest["route_key"]) == {"7", "40", "99", "30"}
+    centers = manifest.set_index("route_key").loc["7", "detail_centers_lat_lon"].split("; ")
+    assert 1 <= len(centers) <= 3
+    lat, lon = (float(v) for v in centers[0].split(","))
+    assert 38.5 < lat < 39.5 and -77.5 < lon < -76.5  # close-ups sit in DC
+
+    with caplog.at_level(logging.WARNING):
+        mod.run(
+            make_config(
+                gtfs, shp, out, write_comparison_pngs=True, plot_dpi=72, plot_routes=("010", "nope")
+            )
+        )
+    assert sorted(p.name for p in folder.glob("*.png")) == ["route_10_comparison.png"]
+    assert "PLOT_ROUTES not found in this comparison: NOPE" in caplog.text
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        mod.run(make_config(gtfs, shp, out))
+    assert "holds comparison maps from an earlier run" in caplog.text
+    assert (folder / "route_10_comparison.png").exists()
+
+
+def test_map_settings_are_validated(tmp_path: Path) -> None:
+    gtfs = write_feed(tmp_path / "gtfs")
+    shp = write_reference(tmp_path / "ref" / "routes.shp", DEFAULT_REFERENCE)
+    base = ["--gtfs", str(gtfs), "--route-shapes", str(shp), "--output-dir", str(tmp_path / "o")]
+    base += ["--shp-route-field", "ROUTE", "--write-pngs"]
+    assert mod.main([*base, "--plot-detail-count", "4"]) == 2
+    assert mod.main([*base, "--plot-dpi", "50"]) == 2
+    assert mod.main([*base, "--plot-detail-width-feet", "0"]) == 2
+    assert mod.main([*base, "--plot-dpi", "72", "--plot-routes", "7"]) == 0
+    assert (tmp_path / "o" / mod.PLOT_SUBFOLDER / "route_7_comparison.png").exists()
