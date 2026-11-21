@@ -162,13 +162,18 @@ def _stops_gdf() -> pd.DataFrame:
     )
 
 
-def _events() -> pd.DataFrame:
+def _events(
+    can_alight: tuple[bool, bool, bool] = (True, True, True),
+    can_board: tuple[bool, bool, bool] = (True, True, True),
+) -> pd.DataFrame:
     return pd.DataFrame(
         {
             "stop_id": ["S1", "S2", "S3"],
             "route_id": ["A", "B", "C"],
             "arrival_sec": [28800.0, 29100.0, 29100.0],
             "departure_sec": [28800.0, 29100.0, 29100.0],
+            "can_alight": list(can_alight),
+            "can_board": list(can_board),
         }
     )
 
@@ -200,6 +205,94 @@ def test_compute_transfers_spatial_only_ignores_time(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(rtc, "ENABLE_TIME_CHECK", False)
     results = compute_transfers(_stops_gdf(), _events(), _routes_table(), radius_m=400.0)
     assert set(results["A"].keys()) == {"B"}
+
+
+@pytest.mark.parametrize("time_check", [True, False])
+@pytest.mark.parametrize(
+    ("can_alight", "can_board"),
+    [
+        ((False, True, True), (True, True, True)),  # no drop-off from A at S1
+        ((True, True, True), (True, False, True)),  # no pickup onto B at S2
+    ],
+)
+def test_compute_transfers_requires_drop_off_and_pickup(
+    monkeypatch: pytest.MonkeyPatch,
+    time_check: bool,
+    can_alight: tuple[bool, bool, bool],
+    can_board: tuple[bool, bool, bool],
+) -> None:
+    monkeypatch.setattr(rtc, "ENABLE_TIME_CHECK", time_check)
+    monkeypatch.setattr(rtc, "MAX_TRANSFER_WAIT_MINUTES", 30.0)
+    monkeypatch.setattr(rtc, "WALK_SPEED_MPH", 3.0)
+
+    events = _events(can_alight=can_alight, can_board=can_board)
+    results = compute_transfers(_stops_gdf(), events, _routes_table(), radius_m=400.0)
+    assert results == {}
+
+
+def test_build_stop_events_reads_pickup_and_drop_off_types() -> None:
+    stop_times = pd.DataFrame(
+        {
+            "trip_id": ["T1"] * 5,
+            "stop_id": ["S1", "S2", "S3", "S4", "S5"],
+            "arrival_time": ["08:00:00"] * 5,
+            "departure_time": ["08:00:00"] * 5,
+            # 1 = not available; blank, 0, 2 (phone) and 3 (ask driver) still allow it.
+            "pickup_type": ["0", "1", None, "2", "3"],
+            "drop_off_type": ["1", "0", "3", None, "2"],
+        }
+    )
+    trips = pd.DataFrame({"trip_id": ["T1"], "route_id": ["A"], "service_id": ["WK"]})
+
+    events = rtc._build_stop_events(stop_times, trips, keep_service_ids=None)
+    assert events["can_board"].tolist() == [True, False, True, True, True]
+    assert events["can_alight"].tolist() == [False, True, True, True, True]
+
+    # Both columns are optional in GTFS; without them every stop allows both.
+    bare = rtc._build_stop_events(
+        stop_times.drop(columns=["pickup_type", "drop_off_type"]), trips, keep_service_ids=None
+    )
+    assert bare["can_board"].all()
+    assert bare["can_alight"].all()
+
+
+@pytest.mark.parametrize("time_check", [True, False])
+def test_main_skips_connector_stop_with_no_pickup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, time_check: bool
+) -> None:
+    # Feeder A arrives at the hub at 08:00; connector B leaves it at 08:05 but
+    # with pickup_type=1, so no rider can board B there.
+    monkeypatch.setattr(rtc, "ENABLE_TIME_CHECK", time_check)
+    monkeypatch.setattr(rtc, "TARGET_ROUTE_TOKENS", {"A"})
+    feed = tmp_path / "feed"
+    feed.mkdir()
+    (feed / "stops.txt").write_text(
+        "stop_id,stop_lat,stop_lon\nHUB,38.90,-77.00\nA0,38.95,-77.00\nB9,38.85,-77.00\n"
+    )
+    (feed / "routes.txt").write_text("route_id,route_short_name\nA,A\nB,B\n")
+    (feed / "trips.txt").write_text("route_id,service_id,trip_id\nA,WK,TA\nB,WK,TB\n")
+    stop_times = (
+        "trip_id,arrival_time,departure_time,stop_id,stop_sequence,pickup_type,drop_off_type\n"
+        "TA,07:50:00,07:50:00,A0,1,0,1\n"
+        "TA,08:00:00,08:00:00,HUB,2,1,0\n"
+        "TB,08:05:00,08:05:00,HUB,1,{hub_pickup},1\n"
+        "TB,08:15:00,08:15:00,B9,2,1,0\n"
+    )
+    (feed / "calendar.txt").write_text(
+        "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday\nWK,1,1,1,1,1,0,0\n"
+    )
+    argv = ["--gtfs-dir", str(feed), "--output-dir", str(tmp_path / "out")]
+
+    (feed / "stop_times.txt").write_text(stop_times.format(hub_pickup="1"))
+    assert rtc.main(argv) == 0
+    summary = pd.read_csv(tmp_path / "out" / "route_transfers_summary.csv", keep_default_na=False)
+    assert summary["transfer_routes"].tolist() == [""]
+
+    # Control: the same feed with boarding allowed at the hub finds A -> B.
+    (feed / "stop_times.txt").write_text(stop_times.format(hub_pickup="0"))
+    assert rtc.main(argv) == 0
+    summary = pd.read_csv(tmp_path / "out" / "route_transfers_summary.csv", keep_default_na=False)
+    assert summary["transfer_routes"].tolist() == ["B"]
 
 
 def test_build_output_tables_includes_zero_transfer_targets() -> None:

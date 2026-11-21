@@ -18,7 +18,10 @@ one agency's routes, and connectors from another agency are labelled
 Transfers are directional: an A -> B transfer means a rider can ride route A,
 get off, and board route B. The time check uses A's arrival times at the
 alighting stop and B's departure times at the (possibly different) nearby
-boarding stop.
+boarding stop. Riders must be allowed off A at the alighting stop and onto B at
+the boarding stop: stop times with ``drop_off_type`` 1 never count as feeder
+arrivals, and stop times with ``pickup_type`` 1 never count as connector
+departures, whether or not the time check is enabled.
 
 By default only regular weekday service is considered: ``DAY_OF_WEEK`` is
 ``"weekday"``, which keeps trips whose calendar.txt service runs on at least one
@@ -105,7 +108,8 @@ PROJECTED_CRS = "EPSG:5070"
 # When True, a connector route only counts if at least one scheduled connection
 # is feasible: feeder arrival + walk time <= connector departure <= feeder
 # arrival + MAX_TRANSFER_WAIT_MINUTES. When False, any spatial co-location of the
-# two routes counts (a pure proximity transfer map).
+# two routes counts (a pure proximity transfer map). Either way, the feeder stop
+# must allow drop-off and the connector stop must allow pickup.
 ENABLE_TIME_CHECK = True
 
 # Assumed walking speed used to convert the stop-to-stop distance into a minimum
@@ -449,7 +453,8 @@ def _build_stop_events(
 
     Returns:
         A frame with ``stop_id``, ``route_id``, ``arrival_sec`` (feeder time),
-        and ``departure_sec`` (connector time).
+        ``departure_sec`` (connector time), ``can_alight`` (``drop_off_type``
+        is not 1) and ``can_board`` (``pickup_type`` is not 1).
     """
     trip_cols = trips[["trip_id", "route_id", "service_id"]].astype(str)
     events = stop_times.astype({"trip_id": str, "stop_id": str}).merge(
@@ -467,7 +472,16 @@ def _build_stop_events(
     # (fall back to arrival) so single-time rows still participate.
     events["arrival_sec"] = arrival.fillna(departure)
     events["departure_sec"] = departure.fillna(arrival)
-    return events[["stop_id", "route_id", "arrival_sec", "departure_sec"]]
+    # pickup_type / drop_off_type 1 means riders cannot board / get off here.
+    # Blank, 0, 2 (phone agency) and 3 (coordinate with driver) still allow it.
+    for flag, column in (("can_alight", "drop_off_type"), ("can_board", "pickup_type")):
+        if column in events.columns:
+            events[flag] = events[column].fillna("").astype(str).str.strip() != "1"
+        else:
+            events[flag] = True
+    return events[
+        ["stop_id", "route_id", "arrival_sec", "departure_sec", "can_alight", "can_board"]
+    ]
 
 
 _StopRouteArrays = dict[tuple[str, str], np.ndarray]
@@ -475,32 +489,42 @@ _StopRouteArrays = dict[tuple[str, str], np.ndarray]
 
 def _index_events(
     events: pd.DataFrame,
-) -> tuple[dict[str, set[str]], _StopRouteArrays, _StopRouteArrays]:
+) -> tuple[dict[str, set[str]], dict[str, set[str]], _StopRouteArrays, _StopRouteArrays]:
     """Build lookups of routes-per-stop and sorted time arrays per (stop, route).
+
+    Alighting lookups use only events where riders may get off
+    (``can_alight``); boarding lookups use only events where riders may get on
+    (``can_board``).
 
     Args:
         events: Output of :func:`_build_stop_events`.
 
     Returns:
-        A tuple ``(serves, arrivals, departures)`` where ``serves`` maps a
-        ``stop_id`` to the set of routes serving it, ``arrivals`` maps
-        ``(stop_id, route_id)`` to a sorted array of feeder arrival seconds, and
-        ``departures`` maps it to a sorted array of connector departure seconds.
+        A tuple ``(alight_routes, board_routes, arrivals, departures)`` where
+        ``alight_routes`` maps a ``stop_id`` to the set of routes riders can get
+        off at it, ``board_routes`` maps it to the set of routes riders can get
+        on at it, ``arrivals`` maps ``(stop_id, route_id)`` to a sorted array of
+        feeder arrival seconds, and ``departures`` maps it to a sorted array of
+        connector departure seconds.
     """
-    serves: dict[str, set[str]] = {}
-    for stop_id, route_id in zip(events["stop_id"], events["route_id"]):
-        serves.setdefault(stop_id, set()).add(route_id)
+    alight_routes: dict[str, set[str]] = {}
+    board_routes: dict[str, set[str]] = {}
+    for stop_id, route_id, can_alight, can_board in zip(
+        events["stop_id"], events["route_id"], events["can_alight"], events["can_board"]
+    ):
+        if can_alight:
+            alight_routes.setdefault(stop_id, set()).add(route_id)
+        if can_board:
+            board_routes.setdefault(stop_id, set()).add(route_id)
 
     arrivals: dict[tuple[str, str], np.ndarray] = {}
     departures: dict[tuple[str, str], np.ndarray] = {}
     for (stop_id, route_id), group in events.groupby(["stop_id", "route_id"], sort=False):
-        arr = group["arrival_sec"].dropna().to_numpy(dtype=float)
-        dep = group["departure_sec"].dropna().to_numpy(dtype=float)
-        arr.sort()
-        dep.sort()
-        arrivals[(stop_id, route_id)] = arr
-        departures[(stop_id, route_id)] = dep
-    return serves, arrivals, departures
+        alight = group.loc[group["can_alight"], "arrival_sec"].dropna()
+        board = group.loc[group["can_board"], "departure_sec"].dropna()
+        arrivals[(stop_id, route_id)] = np.sort(alight.to_numpy(dtype=float))
+        departures[(stop_id, route_id)] = np.sort(board.to_numpy(dtype=float))
+    return alight_routes, board_routes, arrivals, departures
 
 
 def compute_transfers(
@@ -510,6 +534,10 @@ def compute_transfers(
     radius_m: float,
 ) -> dict[str, dict[str, dict[str, float]]]:
     """Compute feasible transfers from each target route to connector routes.
+
+    A stop pair counts only where riders can get off the target route at the
+    alighting stop and get on the connector at the boarding stop, whether or
+    not the time check is enabled.
 
     Args:
         stops_gdf: Projected unique stops with ``x``/``y`` in meters.
@@ -522,7 +550,7 @@ def compute_transfers(
         where stats holds ``stop_pairs``, ``min_distance_m``, and
         ``min_wait_seconds`` (NaN when the time check is disabled).
     """
-    serves, arrivals, departures = _index_events(events)
+    alight_routes, board_routes, arrivals, departures = _index_events(events)
     target_ids = set(routes.index[routes["is_target"]])
 
     coords = np.column_stack([stops_gdf["x"].to_numpy(), stops_gdf["y"].to_numpy()])
@@ -538,12 +566,12 @@ def compute_transfers(
 
     for i, neigh in enumerate(neighbors):
         stop_a = stop_ids[i]
-        targets_here = [r for r in serves.get(stop_a, ()) if r in target_ids]
+        targets_here = [r for r in alight_routes.get(stop_a, ()) if r in target_ids]
         if not targets_here:
             continue
         for j in neigh:
             stop_b = stop_ids[j]
-            routes_b = serves.get(stop_b)
+            routes_b = board_routes.get(stop_b)
             if not routes_b:
                 continue
             distance = float(np.hypot(coords[i, 0] - coords[j, 0], coords[i, 1] - coords[j, 1]))
