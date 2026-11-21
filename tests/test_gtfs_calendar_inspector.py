@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import zipfile
 from pathlib import Path
 
 import pandas as pd
@@ -78,6 +79,39 @@ def test_run_works_without_trips(tmp_path: Path) -> None:
     service, day_types = target.run(gtfs_path=feed, output_dir=tmp_path / "out")
     assert _summary_row(service, "TWR")["trip_count"] == 0
     assert _day_type_row(day_types, "weekday")["service_ids"] == "TWR"
+
+
+_WEEK_CALENDAR = (
+    "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,start_date,end_date\n"
+    "WK,1,1,1,1,1,0,0,20260105,20260109\n"
+)
+_ONE_CANCELLATION = "service_id,date,exception_type\nWK,20260107,2\n"
+
+
+def test_run_stops_when_calendar_dates_is_damaged(tmp_path: Path) -> None:
+    feed = tmp_path / "feed"
+    feed.mkdir()
+    (feed / "calendar.txt").write_text(_WEEK_CALENDAR, encoding="utf-8")
+    (feed / "calendar_dates.txt").write_text(_ONE_CANCELLATION, encoding="utf-8")
+    service, _ = target.run(gtfs_path=feed, output_dir=tmp_path / "ok")
+    assert _summary_row(service, "WK")["active_days"] == 4
+
+    # One malformed record must not discard the valid cancellation above it.
+    with (feed / "calendar_dates.txt").open("a", encoding="utf-8") as handle:
+        handle.write("WK,20260108,2,extra,fields\n")
+    with pytest.raises(ValueError, match="Could not read calendar_dates.txt"):
+        target.run(gtfs_path=feed, output_dir=tmp_path / "damaged")
+    assert not (tmp_path / "damaged" / "calendar_service_summary.csv").exists()
+    rc = target.main(["--gtfs", str(feed), "--output-dir", str(tmp_path / "damaged")])
+    assert rc == 1
+
+
+def test_run_accepts_zipped_feed_without_calendar_dates(tmp_path: Path) -> None:
+    zip_path = tmp_path / "feed.zip"
+    with zipfile.ZipFile(zip_path, "w") as archive:
+        archive.writestr("wrapper/calendar.txt", _WEEK_CALENDAR)
+    service, _ = target.run(gtfs_path=zip_path, output_dir=tmp_path / "out")
+    assert _summary_row(service, "WK")["active_days"] == 5
 
 
 def test_main_placeholder_paths_return_2() -> None:

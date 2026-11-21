@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import shutil
 import zipfile
 from pathlib import Path
 
@@ -249,11 +250,53 @@ def test_segment_hausdorff_distance_handles_shared_stop_code() -> None:
     gdf = target.build_stops_gdf(_shared_code_stops(), "EPSG:4326", "stop_code")
     gdf_proj = gdf.to_crs("EPSG:26918")
     line = LineString([gdf_proj.loc["1", "geometry"], gdf_proj.loc["2", "geometry"]])
-    shapes = {("A", "0"): line, ("B", "0"): line}
-    distance = target.segment_hausdorff_distance(
-        ("A", "0"), ("B", "0"), "1", "2", shapes, gdf_proj, padding_m=50.0
-    )
+    m0, m1 = target.locate_stops_along_shape(["1", "2"], line, gdf_proj, tolerance=30.0)
+    assert m0 is not None and m1 is not None
+    distance = target.segment_hausdorff_distance(line, (m0, m1), line, (m0, m1), padding=50.0)
     assert distance == pytest.approx(0.0)
+
+
+# ---------------------------------------------------------------------------
+# locate_stops_along_shape
+# ---------------------------------------------------------------------------
+
+
+def test_locate_stops_along_shape_places_loop_ends_at_both_ends() -> None:
+    # A square loop that ends where it starts.
+    shape = LineString([(0, 0), (300, 0), (300, 300), (0, 300), (0, 0)])
+    stops = gpd.GeoDataFrame(
+        geometry=[Point(0, 0), Point(300, 0), Point(300, 300)],
+        index=pd.Index(["A", "B", "C"]),
+        crs=target.PROJECTED_CRS,
+    )
+    measures = target.locate_stops_along_shape(["A", "B", "C", "A"], shape, stops, 30.0)
+    assert measures == pytest.approx([0.0, 300.0, 600.0, 1200.0])
+
+
+def test_locate_stops_along_shape_keeps_visits_on_their_own_pass() -> None:
+    # Out along y=0 and back along y=8, with stops on each direction's curb.
+    # R and S (return curb) lie 12 m from the outbound pass but belong on the
+    # return pass. P is drawn 3 m from the return pass and 5 m from the
+    # outbound one, but its neighbours place it outbound.
+    shape = LineString([(0, 0), (400, 0), (400, 8), (0, 8)])
+    coords = {
+        "P1": (50, -4),
+        "P": (100, 5),
+        "P2": (150, -4),
+        "Q": (300, -4),
+        "R": (300, 12),
+        "S": (100, 12),
+    }
+    stops = gpd.GeoDataFrame(
+        geometry=[Point(xy) for xy in coords.values()],
+        index=pd.Index(list(coords)),
+        crs=target.PROJECTED_CRS,
+    )
+    seq = ["P1", "P", "P2", "Q", "MISSING", "R", "S"]
+    measures = target.locate_stops_along_shape(seq, shape, stops, 30.0)
+    assert measures[4] is None
+    located = [m for m in measures if m is not None]
+    assert located == pytest.approx([50.0, 100.0, 150.0, 300.0, 508.0, 708.0])
 
 
 # ---------------------------------------------------------------------------
@@ -391,6 +434,17 @@ def test_compare_segments_tests_proximity_against_the_segment(
     assert flags == expected
 
 
+@pytest.mark.parametrize("end_gap_m", [0, 1], ids=["closed-loop", "endpoint-1m-off"])
+def test_compare_segments_checks_the_closing_leg_of_a_loop(end_gap_m: float) -> None:
+    # Both routes run the same square loop; X lies on the closing leg C -> A.
+    # The flag must not depend on whether the shape ends exactly at its start.
+    coords = {"A": (0, 0), "B": (300, 0), "C": (300, 300), "X": (0, 150), "Z": (0, end_gap_m)}
+    end = "Z" if end_gap_m else "A"
+    loop = LineString([(0, 0), (300, 0), (300, 300), (0, 300), (0, end_gap_m)])
+    flags = _compare_pair(["A", "B", "C", end], ["A", "B", "C", "X", end], coords, loop)
+    assert flags == [("C", end, "X")]
+
+
 def test_compare_segments_ignores_reference_revisiting_a_boundary_stop() -> None:
     # The reference runs out to L and back through X before continuing to B.
     coords = {"A": (0, 0), "X": (100, 0), "L": (150, 10), "B": (300, 0)}
@@ -438,6 +492,14 @@ def test_sequences_are_reversed_false_for_same_direction() -> None:
 
 def test_sequences_are_reversed_false_with_fewer_than_two_shared() -> None:
     assert target.sequences_are_reversed(["A", "B"], ["B", "X"]) is False
+
+
+def test_sequences_are_reversed_counts_every_visit_of_a_loop() -> None:
+    # The loop's return to A must not outvote A, B, C served in the same order.
+    loop = ["A", "B", "C", "A"]
+    assert target.sequences_are_reversed(loop, ["A", "B", "X", "C"]) is False
+    assert target.sequences_are_reversed(loop, ["C", "X", "B", "A"]) is True
+    assert target.sequences_are_reversed(loop, ["A", "C", "B", "A"]) is True
 
 
 # ---------------------------------------------------------------------------
@@ -928,6 +990,89 @@ def test_run_segment_comparison_reversed_reference(
     ]
     expected = [(m, reference_route, keys) for m, _, keys in expected]
     assert _segment_flags(tmp_path, monkeypatch, trips, stops, shapes) == expected
+
+
+def test_run_segment_comparison_loop_is_not_mistaken_for_a_reversed_reference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 151 runs a square loop A -> B -> C -> A; 161 serves X between B and C.
+    # With the default COMPARE_REVERSED_REFERENCES = False, 161 must still be
+    # compared as a same-direction reference.
+    monkeypatch.setattr(target, "COMPARE_REVERSED_REFERENCES", False)
+    stops = {"A": ("A", 0, 0), "B": ("B", 300, 0), "X": ("X", 300, 150), "C": ("C", 300, 300)}
+    shapes = {
+        "LOOP": [(0, 0), (300, 0), (300, 300), (0, 300), (0, 0)],
+        "L": [(0, 0), (300, 0), (300, 300)],
+    }
+    trips = [
+        ("151", "0", "t151", "LOOP", ["A", "B", "C", "A"]),
+        ("161", "0", "t161", "L", ["A", "B", "X", "C"]),
+    ]
+    assert _segment_flags(tmp_path, monkeypatch, trips, stops, shapes) == [("151", "161", "X")]
+
+
+@pytest.mark.parametrize("projected_crs", ["EPSG:26918", "EPSG:2283"], ids=["metres", "us-feet"])
+@pytest.mark.parametrize(("offset_m", "expected"), [(20, [("161", "151", "X")]), (40, [])])
+def test_run_segment_comparison_thresholds_are_metres_in_any_crs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    projected_crs: str,
+    offset_m: float,
+    expected: list[tuple[str, str, str]],
+) -> None:
+    # X sits offset_m from the street; MAX_STOP_TO_SHAPE_M is 30 m whether
+    # distances are measured in metres or in Virginia State Plane US feet.
+    monkeypatch.setattr(target, "PROJECTED_CRS", projected_crs)
+    stops = {**CORRIDOR_STOPS, "X": ("X", 200, offset_m)}
+    trips = [
+        ("151", "0", "t151", "S", ["A", "B", "X", "C"]),
+        ("161", "0", "t161", "S", ["A", "B", "C"]),
+    ]
+    assert _segment_flags(tmp_path, monkeypatch, trips, stops) == expected
+
+
+def test_prepare_gtfs_context_rejects_a_geographic_projected_crs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(target, "PROJECTED_CRS", "EPSG:4326")
+    with pytest.raises(ValueError, match="not a projected CRS"):
+        target.prepare_gtfs_context()
+
+
+@pytest.mark.parametrize(
+    "drop_shape_id", [False, True], ids=["no-shapes-txt", "no-shape-id-either"]
+)
+def test_main_runs_within_route_check_without_shapes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    drop_shape_id: bool,
+) -> None:
+    gtfs_dir = tmp_path / "gtfs"
+    shutil.copytree(Path(__file__).parent / "fixtures" / "gtfs_basic", gtfs_dir)
+    (gtfs_dir / "shapes.txt").unlink()
+    if drop_shape_id:
+        trips = pd.read_csv(gtfs_dir / "trips.txt", dtype=str)
+        trips.drop(columns="shape_id").to_csv(gtfs_dir / "trips.txt", index=False)
+    # T3 skips S4 (stop_code 1004), which R1's other trips serve.
+    stop_times = pd.read_csv(gtfs_dir / "stop_times.txt", dtype=str)
+    stop_times = stop_times[~((stop_times["trip_id"] == "T3") & (stop_times["stop_id"] == "S4"))]
+    stop_times.to_csv(gtfs_dir / "stop_times.txt", index=False)
+
+    out_dir = tmp_path / "out"
+    monkeypatch.setattr(target, "GTFS_DIR", gtfs_dir)
+    monkeypatch.setattr(target, "OUTPUT_DIR", out_dir)
+    monkeypatch.setattr(target, "PLOT_DIR", out_dir / "segment_plots")
+    monkeypatch.setattr(target, "TARGET_ROUTE_IDS", set())
+    monkeypatch.setattr(target, "ROUTE_ID_WHITELIST", set())
+    with caplog.at_level(logging.WARNING):
+        assert target.main() == 0
+
+    intra = pd.read_csv(out_dir / target.INTRA_ROUTE_FILENAME, dtype=str)
+    assert list(zip(intra["trip_id"], intra["missing_stop_keys"], strict=True)) == [("T3", "1004")]
+    assert pd.read_csv(out_dir / target.OUTPUT_FILENAME).empty
+    assert "3 of 3 route/direction(s) have no usable shape" in caplog.text
+    assert "geometry-based checks did not run" in caplog.text
 
 
 # ---------------------------------------------------------------------------
