@@ -1,23 +1,34 @@
-"""Tests for the trip-level ridership intake in service_cut_impact_gpd.
+"""Tests for service_cut_impact_gpd.
 
-The fixtures mirror the shape of a real APC/ridecheck export: one row per trip
-per surveyed day, keyed by route number and scheduled start time rather than by
-GTFS trip_id.
+Covers the trip-level ridership intake, untimed stop visits, and trip_windows
+time bounds. The ridership fixtures mirror the shape of a real APC/ridecheck
+export: one row per trip per surveyed day, keyed by route number and scheduled
+start time rather than by GTFS trip_id.
 """
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 import pandas as pd
 import pytest
 
 from scripts.stop_analysis.service_cut_impact_gpd import (
+    Config,
     RidershipSpec,
+    bin_counts,
+    build_events,
     build_stop_id_lookup,
     load_ridership,
     match_trips_by_route_and_time,
+    resolve_drop_mask,
+    run,
+    summarize_stops,
+    validate_scenario,
 )
+
+GTFS_BASIC = Path(__file__).parent / "fixtures" / "gtfs_basic"
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -430,3 +441,163 @@ def test_blank_survey_date_column_makes_date_averaging_a_no_op(
     _, plain = load_ridership(vendor_xlsx, vendor_spec, events=route_232_events, routes=route_232)
     _, averaged = load_ridership(vendor_xlsx, dated, events=route_232_events, routes=route_232)
     assert plain.equals(averaged)
+
+
+def test_trips_with_no_timed_visit_are_skipped_not_fatal(events, routes, vendor_spec) -> None:
+    untimed_trip = pd.DataFrame(
+        {"trip_id": ["ghost"], "stop_id": ["s1"], "dep_min": [float("nan")], "route_id": ["r42"]}
+    )
+    frame = pd.DataFrame({"ROUTE_NUMBER": ["42"], "TRIP_START_TIME": ["7:23"]})
+    matched = match_trips_by_route_and_time(
+        frame, pd.concat([events, untimed_trip]), routes, vendor_spec
+    )
+    assert list(matched) == ["t1"]
+
+
+# ---------------------------------------------------------------------------
+# Untimed stop visits
+#
+# GTFS may leave arrival/departure blank at stops between timepoints. Those
+# visits are still service: they must reach the scenario mask, the rider
+# estimates, and the exported feed, and stay out of only the time metrics.
+# ---------------------------------------------------------------------------
+
+
+def _copy_feed(dest: Path, untimed_stop: str | None = None) -> Path:
+    """Copy gtfs_basic, optionally clearing the times at one stop."""
+    shutil.copytree(GTFS_BASIC, dest)
+    if untimed_stop:
+        st = pd.read_csv(dest / "stop_times.txt", dtype=str)
+        at_stop = st["stop_id"] == untimed_stop
+        st.loc[at_stop, ["arrival_time", "departure_time"]] = ""
+        st["timepoint"] = (~at_stop).astype(int).astype(str)
+        st.to_csv(dest / "stop_times.txt", index=False)
+    return dest
+
+
+def test_build_events_keeps_untimed_visits() -> None:
+    stop_times = pd.DataFrame(
+        {
+            "trip_id": ["t1", "t1", "t1"],
+            "stop_id": ["a", "b", "c"],
+            "arrival_time": ["07:00:00", None, "07:10:00"],
+            "departure_time": ["07:00:00", " ", None],
+        }
+    )
+    trips = pd.DataFrame({"trip_id": ["t1"], "route_id": ["r1"], "service_id": ["wk"]})
+    routes = pd.DataFrame({"route_id": ["r1"], "route_short_name": ["1"]})
+    events = build_events(stop_times, trips, routes, service_ids=None)
+    assert list(events["stop_id"]) == ["a", "b", "c"]
+    dep = events.set_index("stop_id")["dep_min"]
+    assert dep["a"] == 420
+    assert pd.isna(dep["b"])
+    assert dep["c"] == 430  # blank departure falls back to arrival
+
+
+def test_untimed_visits_count_as_service_but_not_in_time_metrics() -> None:
+    events = pd.DataFrame(
+        {
+            "trip_id": ["t1", "t2", "t3"],
+            "stop_id": ["b", "b", "b"],
+            "dep_min": [float("nan"), 485.0, 545.0],
+            "route_label": ["1", "1", "1"],
+        }
+    )
+    stats = summarize_stops(events).loc["b"]
+    assert stats["trips"] == 3
+    assert stats["first_dep_min"] == 485
+    assert stats["max_gap_min"] == 60
+    bins = bin_counts(events, 60)
+    assert bins.to_dict("records") == [
+        {"stop_id": "b", "bin_start_min": 480, "trips": 1},
+        {"stop_id": "b", "bin_start_min": 540, "trips": 1},
+    ]
+
+
+@pytest.mark.parametrize("untimed_stop", [None, "S2"], ids=["timed", "untimed"])
+def test_route_stop_cut_reaches_riders_and_export_whether_or_not_timed(
+    tmp_path: Path, untimed_stop: str | None
+) -> None:
+    feed = _copy_feed(tmp_path / "feed", untimed_stop)
+    usage = tmp_path / "stop_usage.csv"
+    pd.DataFrame({"ROUTE_NUMBER": ["R1"], "STOP_ID": ["S2"], "BOARD_ALL": [40]}).to_csv(
+        usage, index=False
+    )
+    trip_riders = tmp_path / "trip_riders.csv"
+    pd.DataFrame(
+        {"trip_id": ["T1", "T2", "T3"], "stop_id": ["S2"] * 3, "PASSENGERS_ON": [10, 20, 10]}
+    ).to_csv(trip_riders, index=False)
+    out = tmp_path / "out"
+    cfg = Config(
+        gtfs_dir=str(feed),
+        output_dir=out,
+        scenarios=({"name": "cut", "route_stops": {"R1": ["S2"]}},),
+        stop_ridership_csv=str(usage),
+        ridership_csv=str(trip_riders),
+        ridership_trip_mode="trip_id",
+        export_scenario_gtfs=True,
+        export_map_layers=False,
+    )
+    summary = run(cfg).iloc[0]
+    assert summary["events_removed"] == 3
+    assert summary["trips_truncated"] == 3
+    assert summary["stops_reduced"] == 1
+    assert summary["stop_boardings_lost_est"] == pytest.approx(40.0)
+    assert summary["riders_on_cut_service"] == pytest.approx(40.0)
+
+    exported = pd.read_csv(out / "cut_gtfs" / "stop_times.txt", dtype=str)
+    at_s2 = exported.loc[exported["stop_id"] == "S2", "trip_id"]
+    assert set(at_s2) == {"T7", "T8", "T9"}  # R3 still serves S2; R1 no longer does
+
+
+# ---------------------------------------------------------------------------
+# trip_windows time bounds
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def two_trip_events() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "trip_id": ["am", "am", "pm", "pm"],
+            "stop_id": ["s1", "s2", "s1", "s2"],
+            "dep_min": [420.0, 425.0, 1020.0, 1025.0],  # 07:00, 17:00
+            "route_id": ["r1"] * 4,
+            "direction_id": ["0"] * 4,
+        }
+    )
+
+
+def test_blank_window_bound_means_unbounded(two_trip_events) -> None:
+    routes = pd.DataFrame({"route_id": ["r1"], "route_short_name": ["1"]})
+    scenario = {
+        "name": "evening",
+        "trip_windows": [{"route": "1", "depart_after": "17:00", "depart_before": ""}],
+    }
+    mask = resolve_drop_mask(scenario, two_trip_events, routes)
+    assert set(two_trip_events.loc[mask, "trip_id"]) == {"pm"}
+
+
+@pytest.mark.parametrize("bound", ["depart_after", "depart_before"])
+@pytest.mark.parametrize("value", ["5:00 PM", "17h00", "1700", 1700])
+def test_unreadable_window_bound_is_rejected(bound: str, value: object) -> None:
+    scenario = {"name": "evening", "trip_windows": [{"route": "1", bound: value}]}
+    with pytest.raises(ValueError, match=f"{bound} = {value!r} is not a readable time"):
+        validate_scenario(scenario)
+
+
+def test_unreadable_window_bound_fails_before_any_output(tmp_path: Path) -> None:
+    # The bad bound is in the second scenario; the first must not be written either.
+    out = tmp_path / "out"
+    cfg = Config(
+        gtfs_dir=str(GTFS_BASIC),
+        output_dir=out,
+        scenarios=(
+            {"name": "cut_r2", "routes": ["R2"]},
+            {"name": "evening", "trip_windows": [{"route": "R1", "depart_after": "5:00 PM"}]},
+        ),
+        export_map_layers=False,
+    )
+    with pytest.raises(ValueError, match="'5:00 PM' is not a readable time"):
+        run(cfg)
+    assert not out.exists()

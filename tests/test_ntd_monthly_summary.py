@@ -1102,6 +1102,58 @@ def test_extract_replay_config_rejects_truncated_legacy_log() -> None:
 
 
 # ---------------------------------------------------------------------------
+# read_excel_data — zero-boardings rows
+# ---------------------------------------------------------------------------
+
+
+def _zero_board_workbook(path: Path) -> None:
+    """Two routes with identical service, one carrying no riders, plus a placeholder."""
+    service = {"MTH_REV_HOURS": 10.0, "ASCH_TRIPS": 10, "DAYS": 1, "REV_MILES": 50.0}
+    no_service = {"MTH_REV_HOURS": 0.0, "ASCH_TRIPS": 0, "DAYS": 0, "REV_MILES": 0.0}
+    rows = [
+        {"Route Name": 101, "Service Period": "Weekday", "MTH_BOARD": 100.0, **service},
+        {"Route Name": 202, "Service Period": "Weekday", "MTH_BOARD": 0.0, **service},
+        # A route/day type that did not run: nothing to keep.
+        {"Route Name": 202, "Service Period": "Sunday", "MTH_BOARD": 0.0, **no_service},
+    ]
+    frame = pd.DataFrame(rows)
+    frame["MTH_PASS_MILES"] = frame["MTH_BOARD"] * 2
+    frame.to_excel(path, sheet_name="Sheet1", index=False)
+
+
+def test_zero_boardings_row_with_service_is_kept_and_flagged(
+    tmp_path: Path, config: mod.AppConfig, caplog: pytest.LogCaptureFixture
+) -> None:
+    _zero_board_workbook(tmp_path / "Jul-2024.xlsx")
+    cfg = _with_periods(config, ["Jul-2024"], data_root=tmp_path)
+    with caplog.at_level(logging.WARNING):
+        df = mod.read_excel_data(cfg)["Jul-2024"]
+    rows = set(zip(df["ROUTE_NAME"], df["SERVICE_PERIOD"], strict=True))
+    assert rows == {("101", "Weekday"), ("202", "Weekday")}
+    assert "1 row(s) record service but zero boardings (202 Weekday)" in caplog.text
+
+
+def test_zero_boardings_service_counts_in_systemwide_ratios(
+    tmp_path: Path, config: mod.AppConfig
+) -> None:
+    _zero_board_workbook(tmp_path / "Jul-2024.xlsx")
+    cfg = _with_periods(config, ["Jul-2024"], data_root=tmp_path)
+    df = mod.calculate_derived_columns(mod.read_excel_data(cfg)["Jul-2024"])
+    df["service_type"] = "local"
+    df["period"] = "Jul-2024"
+
+    total = mod.aggregate_by_service_type(df).set_index("service_type").loc["TOTAL"]
+    assert total["MTH_REV_HOURS"] == pytest.approx(20.0)
+    assert total["TOTAL_TRIPS"] == pytest.approx(20.0)
+    assert total["MTH_REV_MILES"] == pytest.approx(100.0)
+    assert total["BOARDS_PER_HOUR"] == pytest.approx(5.0)
+
+    ts = mod.build_monthly_timeseries(df, cfg).set_index("route")
+    assert ts.loc["SYSTEMWIDE", "pph"] == pytest.approx(5.0)
+    assert ts.loc["202", "pph"] == pytest.approx(0.0)
+
+
+# ---------------------------------------------------------------------------
 # main / cli (end to end)
 # ---------------------------------------------------------------------------
 
