@@ -122,3 +122,70 @@ def test_month_backfill_rejects_unsupported_or_ambiguous_years(
     df = _months(Date=dates, Month=months)
     with pytest.raises(SystemExit, match=reason):
         otp_by_timepoint_from_avl.add_year_month_column(df)
+
+
+# ---------------------------------------------------------------------------
+# TIDES route, timepoint and direction handling
+# ---------------------------------------------------------------------------
+
+ON_TIME = "2026-03-02T08:00:00"
+LATE = "2026-03-02T08:20:00"
+
+
+def _run_tides(tmp_path: Path, rows: list, *extra: str) -> tuple:
+    """Write TIDES stop visits, run the script, and return (exit code, processed table)."""
+    base = {
+        "service_date": "2026-03-02",
+        "route_id": "461",
+        "direction_id": 0,
+        "pattern_id": "P1",
+        "scheduled_stop_sequence": 1,
+        "stop_id": "S1",
+        "timepoint": True,
+        "schedule_relationship": "Scheduled",
+        "schedule_departure_time": ON_TIME,
+        "actual_departure_time": ON_TIME,
+    }
+    input_path = tmp_path / "visits.csv"
+    pd.DataFrame([{**base, **row} for row in rows]).to_csv(input_path, index=False)
+    outdir = tmp_path / "out"
+    argv = ["-i", str(input_path), "-d", str(outdir), "--no-line-plots", *extra]
+    code = otp_by_timepoint_from_avl.main(argv)
+    processed = outdir / "visits_processed.csv"
+    return code, pd.read_csv(processed, dtype={"Short Route": str}) if code == 0 else None
+
+
+def test_tides_hyphenated_route_ids_stay_distinct(tmp_path: Path) -> None:
+    code, out = _run_tides(
+        tmp_path,
+        [{"route_id": "R-1"}, {"route_id": "R-2", "actual_departure_time": LATE}],
+    )
+    assert code == 0
+    by_route = out.set_index("Short Route")["% On Time"].to_dict()
+    assert by_route == {"R-1": 100.0, "R-2": 0.0}
+
+
+def test_tides_scores_only_timepoint_visits(tmp_path: Path) -> None:
+    code, out = _run_tides(
+        tmp_path,
+        [
+            {"timepoint": True},
+            {
+                "timepoint": False,
+                "scheduled_stop_sequence": 2,
+                "stop_id": "S2",
+                "actual_departure_time": LATE,
+            },
+        ],
+    )
+    assert code == 0
+    assert out["Timepoint Order"].tolist() == [1]
+    assert out["Total Counts"].sum() == 1
+    assert out["% On Time"].tolist() == [100.0]
+
+
+def test_tides_rdt_filter_matches_numeric_direction(tmp_path: Path) -> None:
+    code, out = _run_tides(tmp_path, [{}], "--rdt", "461,0,1")
+    assert code == 0
+    kept = out[["Short Route", "Direction", "Timepoint Order"]].to_numpy().tolist()
+    assert kept == [["461", 0, 1]]

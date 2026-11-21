@@ -114,6 +114,18 @@ LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
 
 # === END CONFIG ===
 
+# TIDES columns read as text, so route "007" keeps its zeros and direction 0 stays "0".
+TIDES_TEXT_COLUMNS: Tuple[str, ...] = (
+    "route_id",
+    "direction_id",
+    "pattern_id",
+    "stop_id",
+    "timepoint",
+)
+
+# Values of the TIDES timepoint column that mean TRUE (compared without regard to case).
+TRUE_TEXT: frozenset[str] = frozenset({"true", "t", "1", "yes", "y"})
+
 # =============================================================================
 # ARGUMENTS
 # =============================================================================
@@ -171,7 +183,7 @@ def build_argparser() -> argparse.ArgumentParser:
         nargs="*",
         default=SHORT_ROUTE_FILTER,
         metavar="SHORT_ROUTE",
-        help="Short Route codes to keep.",
+        help="Short Route codes to keep (the full route_id for TIDES input).",
     )
     p.add_argument(
         "-g",
@@ -249,7 +261,7 @@ def parse_rdt_arg(arg: str) -> List[Tuple[str, str, int]]:
 
 
 def make_short_route(route_str: str) -> str:
-    """Return the short route code (portion before the first dash, no spaces)."""
+    """Return the short code of a CLEVER route label (portion before the first dash, no spaces)."""
     return str(route_str).split("-", 1)[0].replace(" ", "").strip()
 
 
@@ -619,15 +631,28 @@ def preprocess_tides_data(df: pd.DataFrame) -> pd.DataFrame:
 
     Performs the following:
       1. Filters out 'Canceled' trips.
-      2. Calculates deviations from scheduled vs actual departure times.
-      3. Classifies each stop visit as On Time, Early, or Late based on OTP thresholds.
-      4. Maps TIDES columns to the script's expected internal column names.
+      2. Keeps only timepoint visits (``timepoint`` TRUE) when the column is present.
+      3. Calculates deviations from scheduled vs actual departure times.
+      4. Classifies each stop visit as On Time, Early, or Late based on OTP thresholds.
+      5. Maps TIDES columns to the script's expected internal column names.
     """
     logging.info("Detected TIDES input format. Preprocessing...")
 
     # Filter out canceled trips if column exists
     if "schedule_relationship" in df.columns:
         df = df[df["schedule_relationship"].fillna("Scheduled") != "Canceled"].copy()
+
+    # Score timepoints only; ordinary stops would otherwise enter the timepoint report.
+    if "timepoint" in df.columns:
+        is_timepoint = (
+            df["timepoint"].fillna("").astype(str).str.strip().str.casefold().isin(TRUE_TEXT)
+        )
+        dropped = int((~is_timepoint).sum())
+        df = df.loc[is_timepoint].copy()
+        if dropped:
+            logging.info("Dropped %d stop visits not marked as timepoints.", dropped)
+    else:
+        logging.warning("TIDES input has no 'timepoint' column; every stop visit is scored.")
 
     # Ensure required date/time columns are parsed
     for col in ["schedule_departure_time", "actual_departure_time"]:
@@ -666,7 +691,8 @@ def preprocess_tides_data(df: pd.DataFrame) -> pd.DataFrame:
         sys.exit("ERROR: TIDES input missing 'direction_id' column.")
 
     df["Route"] = df["route_id"]
-    df["Direction"] = df["direction_id"]
+    # Text, so a --rdt direction such as "0" matches however the IDs were read.
+    df["Direction"] = df["direction_id"].astype("string").str.strip()
     df["Variation"] = df.get("pattern_id", "UNKNOWN")
     df["Timepoint Order"] = df.get("scheduled_stop_sequence")
 
@@ -898,7 +924,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
-    df_raw = pd.read_csv(input_path)
+    df_raw = pd.read_csv(input_path, dtype=dict.fromkeys(TIDES_TEXT_COLUMNS, str))
 
     # Detect TIDES signature
     tides_signature = ["service_date", "schedule_departure_time", "actual_departure_time"]
@@ -923,7 +949,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 1
 
     # Normalize / enrich --------------------------------------------------------
-    df_raw["Short Route"] = df_raw["Route"].astype(str).apply(make_short_route)
+    # A TIDES route_id is the route itself ("R-1" and "R-2" stay distinct); only CLEVER
+    # labels such as "101-Downtown" are cut to their short code.
+    if is_tides:
+        df_raw["Short Route"] = df_raw["Route"].astype(str).str.strip()
+    else:
+        df_raw["Short Route"] = df_raw["Route"].astype(str).apply(make_short_route)
     df_raw = normalize_variation_column(df_raw)
 
     if not is_tides:
