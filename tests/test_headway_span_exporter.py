@@ -369,6 +369,35 @@ def test_run_falls_back_when_calendar_lacks_dates(
     assert result.iloc[0]["trip_count"] == 3
 
 
+@pytest.mark.parametrize("service_date", ["", "20260115"])
+def test_run_calendar_dates_only_feed(tmp_path: Path, service_date: str) -> None:
+    gtfs_dir = tmp_path / "gtfs"
+    gtfs_dir.mkdir()
+    _write_gtfs(gtfs_dir)
+    (gtfs_dir / "calendar.txt").unlink()
+    # Thursday 2026-01-15 is WK's only service date; SAT runs Saturday 2026-01-17.
+    (gtfs_dir / "calendar_dates.txt").write_text(
+        "service_id,date,exception_type\nWK,20260115,1\nSAT,20260117,1\n"
+    )
+    result = target.run(
+        gtfs_folder=gtfs_dir,
+        output_path=tmp_path / "out.csv",
+        service_day="weekday",
+        service_date=service_date,
+    )
+    assert list(result["route_id"]) == ["R1"]
+    assert result.iloc[0]["trip_count"] == 3
+
+
+def test_run_requires_calendar_or_calendar_dates(tmp_path: Path) -> None:
+    gtfs_dir = tmp_path / "gtfs"
+    gtfs_dir.mkdir()
+    _write_gtfs(gtfs_dir)
+    (gtfs_dir / "calendar.txt").unlink()
+    with pytest.raises(FileNotFoundError, match="neither calendar.txt nor calendar_dates.txt"):
+        target.run(gtfs_folder=gtfs_dir, output_path=tmp_path / "out.csv", service_day="weekday")
+
+
 def test_resolve_service_ids_rejects_malformed_service_date() -> None:
     calendar = _calendar_df()
     with pytest.raises(ValueError, match="SERVICE_DATE"):
