@@ -144,6 +144,8 @@ transit_planning_with_python/
 │   └── stop_analysis/
 │       ├── gtfs_linear_diff_gpd.py
 │       ├── gtfs_route_diff.py
+│       ├── gtfs_shp_linear_diff_arcpy.py
+│       ├── gtfs_shp_linear_diff_gpd.py
 │       ├── gtfs_stop_diff.py
 │       ├── gtfs_timepoint_interval_flagger.py
 │       ├── service_cut_impact_arcpy.py
@@ -298,6 +300,8 @@ transit_planning_with_python/
 │   ├── test_gtfs_service_change_dates.py
 │   ├── test_gtfs_service_demographics_arcpy.py
 │   ├── test_gtfs_service_demographics_gpd.py
+│   ├── test_gtfs_shp_linear_diff_arcpy.py
+│   ├── test_gtfs_shp_linear_diff_gpd.py
 │   ├── test_gtfs_skipped_stop_flagger_gpd.py
 │   ├── test_gtfs_stop_diff.py
 │   ├── test_gtfs_stop_proximity_qc.py
