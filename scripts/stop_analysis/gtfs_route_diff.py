@@ -9,10 +9,12 @@ the service-change buckets planners actually track:
 - major / minor alignment changes (how much the set of stops a route serves moved);
 - major / minor schedule changes (trips/day, span, headway, revenue-hours on a
   representative weekday). "none" means the weekday trips are *identical* (an exact
-  fingerprint check), so shifted individual trips read as a minor change;
+  fingerprint check of each trip's direction, terminals and times), so shifted
+  individual trips read as a minor change;
 - candidate route splits (1 -> 2+) and merges (2+ -> 1), inferred from stop-set
   containment and flagged for planner review;
-- reblocking (the set of routes a route interlines with via shared ``block_id`` changed);
+- reblocking (the set of routes a route interlines with changed: routes interline when
+  their trips share a ``block_id`` on at least one common service date);
 - route name changes and other route attribute changes (``route_type``/mode, colors, ...);
 - calendar-approach changes (a ``service_id`` redefined to a new day pattern or date
   range) and per-route day-type coverage changes (gained/lost Saturday or Sunday service);
@@ -94,10 +96,10 @@ ALIGN_MINOR_JACCARD: float = 0.80
 
 # --- Schedule thresholds (representative weekday) ---------------------------
 # "Schedule change" is a three-state classification:
-#   none  : the route's weekday trips are *identical* (same set of trip start/end
-#           times) -- literally nothing changed. This is an exact fingerprint check,
-#           not a tolerance, so two feeds that share trips/day, span and headway but
-#           differ trip-by-trip are NOT called unchanged.
+#   none  : the route's weekday trips are *identical* (same set of trips by direction,
+#           terminal pair and start/end time) -- literally nothing changed. This is an
+#           exact fingerprint check, not a tolerance, so two feeds that share trips/day,
+#           span and headway but differ trip-by-trip are NOT called unchanged.
 #   minor : the schedule changed but no metric reaches its *_MAJOR knob below.
 #   major : at least one metric change reaches its *_MAJOR knob.
 # Only the major boundary is a knob; "minor vs none" is decided by exact equality.
@@ -698,6 +700,7 @@ def pick_representative_weekday_services(
     calendar: Optional[pd.DataFrame],
     calendar_dates: Optional[pd.DataFrame],
     weekday: str,
+    active_dates: Optional[Mapping[str, set[dt.date]]] = None,
 ) -> tuple[Optional[dt.date], set[str]]:
     """Pick a typical date of ``weekday`` and the service_ids active on it.
 
@@ -707,13 +710,18 @@ def pick_representative_weekday_services(
     other one-off date (reduced service, an added event service) therefore cannot be
     picked for sitting near the middle of the feed or for carrying more service_ids
     than a regular day. Works from ``calendar.txt`` and/or a
-    ``calendar_dates.txt``-only feed.
+    ``calendar_dates.txt``-only feed. Pass ``active_dates`` when the caller has
+    already expanded the calendar, to skip expanding (and logging) it again.
 
     Returns:
         ``(date, active_service_ids)``; ``(None, set())`` if no date can be resolved.
     """
     target = _weekday_name_to_int(weekday)
-    active = expand_service_active_dates(calendar, calendar_dates)
+    active = (
+        expand_service_active_dates(calendar, calendar_dates)
+        if active_dates is None
+        else active_dates
+    )
     if not any(d.weekday() == target for dates in active.values() for d in dates):
         return None, set()
     return representative_service_date(active, weekday)
@@ -898,26 +906,54 @@ def route_schedule_metrics(trips: pd.DataFrame, endpoints: pd.DataFrame) -> pd.D
 
 
 def schedule_fingerprint(trips: pd.DataFrame, endpoints: pd.DataFrame) -> dict[str, tuple]:
-    """Per-route exact signature of weekday service: sorted (start_sec, end_sec) pairs.
+    """Per-route exact signature of weekday service, one entry per trip.
 
-    Two routes with equal fingerprints run the same trips at the same times -- the basis
-    for the "literally nothing changed" check. It is deliberately stricter than the
-    summary metrics: a feed can preserve trips/day, span and median headway while
+    Each trip contributes ``(direction_id, first_stop, last_stop, start_sec, end_sec)``,
+    and the route's fingerprint is the sorted tuple of those. Two routes with equal
+    fingerprints run the same trips at the same times in the same directions -- the
+    basis for the "literally nothing changed" check. It is deliberately stricter than
+    the summary metrics: a feed can preserve trips/day, span and median headway while
     shifting individual trips, and that should read as a (minor) change, not "none".
-    ``trips`` should already be filtered to the representative weekday's service_ids.
+    Direction and the ordered terminal pair are included so that departures swapped
+    between directions (eastbound 08:00 + westbound 17:00 becoming eastbound 17:00 +
+    westbound 08:00) do not cancel out; neither relies on trip_ids staying stable
+    between feeds. A trips frame without ``direction_id`` is fingerprinted by terminals
+    alone. ``trips`` should already be filtered to the representative weekday's
+    service_ids.
     """
     if trips.empty or endpoints.empty:
         return {}
-    te = trips[["route_id", "trip_id"]].merge(
-        endpoints[["trip_id", "start_sec", "end_sec"]], on="trip_id", how="inner"
+    cols = ["route_id", "trip_id"] + (["direction_id"] if "direction_id" in trips.columns else [])
+    te = trips[cols].merge(
+        endpoints[["trip_id", "first_stop", "last_stop", "start_sec", "end_sec"]],
+        on="trip_id",
+        how="inner",
     )
     if te.empty:
         return {}
+    if "direction_id" not in te.columns:
+        te["direction_id"] = ""
     out: dict[str, tuple] = {}
     for rid, sub in te.groupby("route_id"):
-        pairs = sub[["start_sec", "end_sec"]].fillna(-1.0).round(0).to_numpy()
-        out[str(rid)] = tuple(sorted(map(tuple, pairs.tolist())))
+        times = sub[["start_sec", "end_sec"]].fillna(-1.0).round(0)
+        trip_keys = zip(
+            normalize_text(sub["direction_id"]),
+            normalize_text(sub["first_stop"]),
+            normalize_text(sub["last_stop"]),
+            times["start_sec"].tolist(),
+            times["end_sec"].tolist(),
+        )
+        out[str(rid)] = tuple(sorted(trip_keys))
     return out
+
+
+def fingerprint_times(fingerprint: tuple) -> list[tuple[float, float]]:
+    """Return a :func:`schedule_fingerprint` value's sorted (start_sec, end_sec) pairs.
+
+    Lets a caller tell trips that moved in time apart from trips that kept their times
+    but changed direction or terminals.
+    """
+    return sorted((start, end) for *_, start, end in fingerprint)
 
 
 def classify_schedule(
@@ -925,6 +961,7 @@ def classify_schedule(
     after: Optional[pd.Series],
     identical: bool,
     knobs: dict[str, float],
+    same_times: bool = False,
 ) -> tuple[str, str]:
     """Classify a route's schedule change and describe the deltas.
 
@@ -939,6 +976,9 @@ def classify_schedule(
         after: The route's after-feed metric row (or None if it runs no weekday trips).
         identical: Whether the two weekday schedule fingerprints are exactly equal.
         knobs: The ``SCHED_*`` thresholds keyed by name.
+        same_times: Whether the two feeds' trips have the same start/end times, so a
+            fingerprint difference comes only from directions or terminal pairs. Picks
+            the description when no summary metric moved.
 
     Returns:
         ``(tier, description)`` where tier is ``"none"``/``"minor"``/``"major"``.
@@ -978,7 +1018,11 @@ def classify_schedule(
     if np.isfinite(hw_b) and np.isfinite(hw_a) and abs(hw_a - hw_b) >= 0.5:
         bits.append(f"headway {hw_b:.0f}->{hw_a:.0f} min")
     if not bits:
-        bits.append("trip times shifted")
+        bits.append(
+            "same trip times, moved between directions or terminals"
+            if same_times
+            else "trip times shifted"
+        )
     return tier, "; ".join(bits)
 
 
@@ -987,25 +1031,62 @@ def classify_schedule(
 # =============================================================================
 
 
-def route_interline_partners(trips: pd.DataFrame) -> Optional[dict[str, frozenset[str]]]:
-    """Map each route_id to the set of other routes it shares a ``block_id`` with.
+def route_interline_partners(
+    trips: pd.DataFrame,
+    active_dates: Optional[Mapping[str, set[dt.date]]] = None,
+) -> Optional[dict[str, frozenset[str]]]:
+    """Map each route_id to the set of other routes it shares a vehicle block with.
 
-    Returns None if the feed has no usable ``block_id`` column, so callers can skip
-    reblocking detection gracefully.
+    GTFS defines a block by its ``block_id`` *and* shared service days, and agencies
+    often reuse a block_id on weekday and weekend schedules whose trips never share a
+    vehicle. So when ``active_dates`` is given, two routes are partners only if their
+    trips carry the same ``block_id`` on at least one common active date: trips on the
+    same service_id always qualify, and trips on different service_ids qualify when
+    those service_ids share a date. Without ``active_dates`` (or a ``service_id``
+    column), any shared ``block_id`` makes two routes partners.
+
+    Args:
+        trips: Trips with ``route_id`` and ``block_id``, plus ``service_id`` for the
+            date check.
+        active_dates: Each service_id's active dates, from
+            :func:`expand_service_active_dates`.
+
+    Returns:
+        Mapping of route_id to its partner route_ids, or None if the feed has no usable
+        ``block_id`` column, so callers can skip reblocking detection gracefully.
     """
     if "block_id" not in trips.columns:
         return None
+    check_dates = active_dates is not None and "service_id" in trips.columns
     t = trips[["route_id", "block_id"]].copy()
     t["block_id"] = t["block_id"].astype(str).str.strip()
-    t = t[t["block_id"].str.len() > 0][["route_id", "block_id"]].drop_duplicates()
+    t["service_id"] = normalize_text(trips["service_id"]) if check_dates else ""
+    t = t[t["block_id"].str.len() > 0].drop_duplicates()
     if t.empty:
         return None
+
+    dates = active_dates if active_dates is not None else {}
+    overlaps: dict[tuple[str, str], bool] = {}
+
+    def _share_a_date(sid_a: str, sid_b: str) -> bool:
+        if sid_a == sid_b:
+            return True
+        key = (min(sid_a, sid_b), max(sid_a, sid_b))
+        if key not in overlaps:
+            overlaps[key] = not dates.get(sid_a, set()).isdisjoint(dates.get(sid_b, set()))
+        return overlaps[key]
 
     pairs = t.merge(t, on="block_id", suffixes=("_a", "_b"))
     pairs = pairs[pairs["route_id_a"] != pairs["route_id_b"]]
     out: dict[str, set[str]] = {rid: set() for rid in t["route_id"].astype(str).unique()}
-    for a, b in zip(pairs["route_id_a"].astype(str), pairs["route_id_b"].astype(str)):
-        out[a].add(b)
+    for a, b, sid_a, sid_b in zip(
+        pairs["route_id_a"].astype(str),
+        pairs["route_id_b"].astype(str),
+        pairs["service_id_a"],
+        pairs["service_id_b"],
+    ):
+        if b not in out[a] and _share_a_date(sid_a, sid_b):
+            out[a].add(b)
     return {rid: frozenset(parts) for rid, parts in out.items()}
 
 
@@ -1566,12 +1647,17 @@ def compare_routes(
         len(corr.added),
     )
 
+    # Each service_id's active dates: used to pick the representative weekday and to
+    # decide whether two routes sharing a block_id ever run on the same date.
+    active_b = expand_service_active_dates(before.get("calendar"), before.get("calendar_dates"))
+    active_a = expand_service_active_dates(after.get("calendar"), after.get("calendar_dates"))
+
     # Schedule metrics on each feed's representative weekday.
     date_b, sids_b = pick_representative_weekday_services(
-        before.get("calendar"), before.get("calendar_dates"), weekday
+        before.get("calendar"), before.get("calendar_dates"), weekday, active_b
     )
     date_a, sids_a = pick_representative_weekday_services(
-        after.get("calendar"), after.get("calendar_dates"), weekday
+        after.get("calendar"), after.get("calendar_dates"), weekday, active_a
     )
     logging.info("Representative %s: before=%s after=%s", weekday, date_b, date_a)
     for label, picked in (("before", date_b), ("after", date_a)):
@@ -1590,8 +1676,8 @@ def compare_routes(
     fp_a = schedule_fingerprint(wk_trips_a, ends_a)
 
     # Reblocking inputs.
-    partners_b = route_interline_partners(trips_b)
-    partners_a = route_interline_partners(trips_a)
+    partners_b = route_interline_partners(trips_b, active_b)
+    partners_a = route_interline_partners(trips_a, active_a)
     reblock_possible = partners_b is not None and partners_a is not None
     if not reblock_possible:
         logging.info("Reblocking detection skipped (no usable block_id in one or both feeds).")
@@ -1695,10 +1781,14 @@ def compare_routes(
         if status == "present":
             b_sched = sched_b.loc[before_id] if before_id in sched_b.index else None
             a_sched = sched_a.loc[after_id] if after_id in sched_a.index else None
-            sched_identical = (
-                before_id in fp_b and after_id in fp_a and fp_b[before_id] == fp_a[after_id]
+            both_fp = before_id in fp_b and after_id in fp_a
+            sched_identical = both_fp and fp_b[before_id] == fp_a[after_id]
+            same_times = both_fp and fingerprint_times(fp_b[before_id]) == fingerprint_times(
+                fp_a[after_id]
             )
-            sched_tier, sched_detail = classify_schedule(b_sched, a_sched, sched_identical, knobs)
+            sched_tier, sched_detail = classify_schedule(
+                b_sched, a_sched, sched_identical, knobs, same_times=same_times
+            )
 
         # Reblocking.
         reblocked = False
