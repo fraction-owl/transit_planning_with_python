@@ -32,8 +32,9 @@ Outputs
 
 Notes:
     Service selection is date-based: ``calendar.txt`` and ``calendar_dates.txt``
-    are expanded into each service_id's real set of active dates, and metrics
-    are computed for a single representative date of the requested day type
+    (either may be absent, but not both) are expanded into each service_id's
+    real set of active dates, and metrics are computed for a single
+    representative date of the requested day type
     (the median date of the most common service pattern, skipping observed
     federal holidays). This keeps holiday-only services out of weekday
     headways and avoids double-counting agencies that run distinct Monday /
@@ -100,8 +101,20 @@ REQ_FILES: Final[tuple[str, ...]] = (
     "trips.txt",
     "stop_times.txt",
     "routes.txt",
-    "calendar.txt",
 )
+# Columns of an empty calendar.txt stand-in for calendar_dates-only feeds.
+_CALENDAR_COLS: Final[list[str]] = [
+    "service_id",
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+    "start_date",
+    "end_date",
+]
 _DAY_COLS: Final[dict[str, list[str]]] = {
     "weekday": ["monday", "tuesday", "wednesday", "thursday", "friday"],
     "monday": ["monday"],
@@ -596,7 +609,8 @@ def resolve_service_ids(
     day-of-week columns via :func:`service_ids_for_day`, with a warning.
 
     Args:
-        calendar: Parsed ``calendar.txt``.
+        calendar: Parsed ``calendar.txt`` (an empty table when the feed has
+            only ``calendar_dates.txt``).
         calendar_dates: Parsed ``calendar_dates.txt`` or ``None``.
         service_day: ``"weekday"`` or one of the seven day names.
         service_date_text: Optional explicit ``YYYYMMDD`` analysis date.
@@ -719,6 +733,8 @@ def run(
     ``m.GTFS_FOLDER = ...; m.run()`` works after a plain import.
 
     Raises:
+        FileNotFoundError: If a required file is missing, or the feed has
+            neither ``calendar.txt`` nor ``calendar_dates.txt``.
         ValueError: If any selected trip is a frequency-based template in
             ``frequencies.txt``, which this script does not expand.
     """
@@ -739,12 +755,28 @@ def run(
 
     gtfs = load_gtfs(gtfs_folder)
 
+    calendar: Optional[pd.DataFrame] = None
+    try:
+        with open_gtfs_file(gtfs_folder, "calendar.txt") as handle:
+            calendar = pd.read_csv(handle, dtype=str, low_memory=False)
+    except FileNotFoundError:
+        pass  # optional when calendar_dates.txt is present
+
     calendar_dates: Optional[pd.DataFrame] = None
     try:
         with open_gtfs_file(gtfs_folder, "calendar_dates.txt") as handle:
             calendar_dates = pd.read_csv(handle, dtype=str, low_memory=False)
     except FileNotFoundError:
-        pass  # optional file
+        pass  # optional when calendar.txt is present
+
+    if calendar is None and calendar_dates is None:
+        raise FileNotFoundError(
+            f"'{gtfs_folder}' has neither calendar.txt nor calendar_dates.txt; "
+            "GTFS requires at least one."
+        )
+    if calendar is None:
+        # calendar_dates-only feed: every active date comes from exception_type 1 rows.
+        calendar = pd.DataFrame(columns=_CALENDAR_COLS, dtype=str)
 
     frequency_trip_ids: set[str] = set()
     try:
@@ -754,7 +786,7 @@ def run(
     except FileNotFoundError:
         pass  # optional file
 
-    svc_ids = resolve_service_ids(gtfs["calendar"], calendar_dates, service_day, service_date)
+    svc_ids = resolve_service_ids(calendar, calendar_dates, service_day, service_date)
     logging.info("%d service_id(s) matched for SERVICE_DAY=%r.", len(svc_ids), service_day)
 
     trips = gtfs["trips"].copy()
