@@ -237,8 +237,9 @@ def join_route_attributes(
     Canceled / non-in-service trips are dropped via the inner join, which is
     keyed on ``TRIP_KEY`` (``service_date`` + ``trip_id_performed``). A
     ``trip_key`` is added for per-trip outlier trimming: the scheduled trip id
-    when present, else a route/direction/start-label fallback so the same
-    recurring trip is trimmed as one group.
+    when present, else (per row, including rows whose id is blank) a
+    route/direction/start-label fallback so the same recurring trip is trimmed
+    as one group.
 
     Args:
         trip_runtimes: Output of :func:`compute_trip_runtimes`.
@@ -262,12 +263,17 @@ def join_route_attributes(
 
     merged = _parse_service_date(trip_runtimes).merge(trips_small, on=TRIP_KEY, how="inner")
 
+    start_label = merged["start_time"].dt.strftime("%H:%M")
+    direction = merged["direction_id"].astype(str) if "direction_id" in merged.columns else ""
+    fallback = merged["route_id"].astype(str) + "_" + direction + "_" + start_label
     if "trip_id_scheduled" in merged.columns:
-        merged["trip_key"] = merged["trip_id_scheduled"].astype(str)
+        # Rows with a missing or blank scheduled id fall back one by one, so
+        # unrelated trips never share a "nan" or "" key and get trimmed together.
+        scheduled = merged["trip_id_scheduled"]
+        blank = scheduled.isna() | (scheduled.astype(str).str.strip() == "")
+        merged["trip_key"] = scheduled.astype(str).where(~blank, fallback)
     else:
-        start_label = merged["start_time"].dt.strftime("%H:%M")
-        direction = merged["direction_id"].astype(str) if "direction_id" in merged.columns else ""
-        merged["trip_key"] = merged["route_id"].astype(str) + "_" + direction + "_" + start_label
+        merged["trip_key"] = fallback
     return merged
 
 

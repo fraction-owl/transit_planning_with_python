@@ -22,8 +22,8 @@ Outputs:
       ``service_cut_impact_gpd.py`` expects for its ``SERVICE_DAY``.
     - ``low_ridership_trips.csv``: trips whose ``LOW_RIDERSHIP_MEASURE`` (passengers per
       revenue hour by default; per revenue mile and raw boardings also available) falls
-      below ``LOW_RIDERSHIP_THRESHOLD``. Written only when trips are flagged; set the
-      threshold to 0 to disable.
+      below ``LOW_RIDERSHIP_THRESHOLD``. Rewritten on every run while flagging is on
+      (header only when no trip is flagged); set the threshold to 0 to disable.
     - ``charts/``: one bar chart PNG per route per day type, plus a system chart per
       day type (``EXPORT_CHARTS``).
     - ``charts/trips/``: per-trip bar charts per route (and direction) and day type on
@@ -608,7 +608,7 @@ def build_hourly_from_xlsx(
 
     grouped = trips_rows.groupby(["day_type", "route", "hour"], as_index=False).agg(
         boardings=("boardings", "sum"),
-        alightings=("alightings", "sum"),
+        alightings=("alightings", _sum_or_missing),
         trips=("boardings", "size"),
         days_observed=("days_observed", "mean"),
     )
@@ -649,6 +649,15 @@ def build_hourly_from_xlsx(
 # =============================================================================
 
 
+def _sum_or_missing(values: pd.Series) -> float:
+    """Sum *values*, or return NaN when none is present (e.g. no alighting data).
+
+    A plain sum turns a column of missing values into 0.0, which reads as an
+    observed zero; an explicitly recorded zero still sums to 0.0.
+    """
+    return values.sum(min_count=1)
+
+
 def finalize_tables(hourly: pd.DataFrame) -> "tuple[pd.DataFrame, pd.DataFrame]":
     """Sort, label, and round the route table; derive the system rollup.
 
@@ -668,7 +677,7 @@ def finalize_tables(hourly: pd.DataFrame) -> "tuple[pd.DataFrame, pd.DataFrame]"
 
     system = table.groupby(["day_type", "hour", "hour_label"], as_index=False).agg(
         boardings=("boardings", "sum"),
-        alightings=("alightings", "sum"),
+        alightings=("alightings", _sum_or_missing),
         routes=("route", "nunique"),
     )
     system["_day_order"] = system["day_type"].map(_day_sort_key)
@@ -705,7 +714,8 @@ def flag_low_ridership(
             revenue columns, missing trip times) are skipped with a warning.
         threshold: Trips with *measure* strictly below this are flagged.
             Values <= 0 disable the pass.
-        out_path: Destination CSV (only written when trips are flagged).
+        out_path: Destination CSV, rewritten on every enabled run so a stale
+            list never survives; header only when no trip is flagged.
 
     Returns:
         Number of trips flagged.
@@ -714,7 +724,7 @@ def flag_low_ridership(
         ValueError: On an unrecognised *measure*.
     """
     _validate_measure(measure)
-    if threshold <= 0 or trip_rows.empty:
+    if threshold <= 0:
         return 0
     values = trip_rows[measure]
     missing = int(values.isna().sum())
@@ -726,14 +736,6 @@ def flag_low_ridership(
             measure,
         )
     flagged = trip_rows[values < threshold].copy()
-    if flagged.empty:
-        logging.info(
-            "No trips below %.1f %s (%d trips checked).",
-            threshold,
-            measure,
-            len(trip_rows) - missing,
-        )
-        return 0
     flagged["hour"] = flagged["hour"].astype(int)
     flagged.insert(
         list(flagged.columns).index("hour") + 1,
@@ -747,6 +749,15 @@ def flag_low_ridership(
     round_cols = ["boardings", "pass_per_hour", "pass_per_mile", "days_observed"]
     flagged[round_cols] = flagged[round_cols].round(2)
     flagged.to_csv(out_path, index=False)
+    if flagged.empty:
+        logging.info(
+            "No trips below %.1f %s (%d trips checked); wrote header-only %s.",
+            threshold,
+            measure,
+            len(trip_rows) - missing,
+            out_path,
+        )
+        return 0
     for day_type in sorted(flagged["day_type"].unique(), key=_day_sort_key):
         sub = flagged[flagged["day_type"] == day_type]
         logging.warning(
