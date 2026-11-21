@@ -139,3 +139,63 @@ def test_trip_chart_filename_uses_the_route_name(tmp_path) -> None:
     out_dir = tmp_path / "charts"
     assert ridership_by_hour.export_trip_charts(rows, "pass_per_hour", 5.0, out_dir) == 1
     assert (out_dir / "route_RIBS5_LOOP_weekday.png").exists()
+
+
+def _one_trip_workbook(path: Path, boardings: float, alightings: object = 1.0) -> Path:
+    """One weekday trip at 06:15 with one revenue hour; alightings=None drops the column."""
+    header = [h for h in _HEADER if alightings is not None or h != "PASSENGERS_OFF"]
+    row = [3695, "RIBS5", "LOOP", 44, datetime.time(6, 15), boardings, alightings, 150, 1.0, 9.0]
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.append(header)
+    sheet.append([v for h, v in zip(_HEADER, row) if h in header])
+    workbook.save(path)
+    return path
+
+
+def test_rerun_replaces_the_low_ridership_list(tmp_path, monkeypatch) -> None:
+    """A clean rerun leaves a header-only CSV, not the previous run's flagged trips."""
+    import pandas as pd
+
+    monkeypatch.setattr(ridership_by_hour, "LOW_RIDERSHIP_MEASURE", "pass_per_hour")
+    monkeypatch.setattr(ridership_by_hour, "LOW_RIDERSHIP_THRESHOLD", 5.0)
+    out_dir = tmp_path / "out"
+    low_csv = out_dir / ridership_by_hour.LOW_RIDERSHIP_FILENAME
+
+    first = _one_trip_workbook(tmp_path / "first.xlsx", boardings=2.0)
+    ridership_by_hour.run(out_dir, {"weekday": str(first)}, export_charts_flag=False)
+    flagged = pd.read_csv(low_csv)
+    assert flagged["pass_per_hour"].tolist() == [2.0]
+
+    second = _one_trip_workbook(tmp_path / "second.xlsx", boardings=12.0)
+    ridership_by_hour.run(out_dir, {"weekday": str(second)}, export_charts_flag=False)
+    rerun = pd.read_csv(low_csv)
+    assert rerun.empty
+    assert list(rerun.columns) == list(flagged.columns)
+
+
+def test_missing_alighting_data_exports_blank_not_zero(tmp_path) -> None:
+    """No PASSENGERS_OFF column -> blank alightings; a recorded zero stays 0.0."""
+    import pandas as pd
+
+    missing = _one_trip_workbook(tmp_path / "missing.xlsx", boardings=4.0, alightings=None)
+    ridership_by_hour.run(tmp_path / "missing", {"weekday": str(missing)}, False)
+    for name in (ridership_by_hour.ROUTE_OUTPUT_FILENAME, ridership_by_hour.SYSTEM_OUTPUT_FILENAME):
+        table = pd.read_csv(tmp_path / "missing" / name)
+        assert table["alightings"].isna().all(), name
+        assert table["boardings"].tolist() == [4.0], name
+
+    zero = _one_trip_workbook(tmp_path / "zero.xlsx", boardings=4.0, alightings=0.0)
+    ridership_by_hour.run(tmp_path / "zero", {"weekday": str(zero)}, False)
+    for name in (ridership_by_hour.ROUTE_OUTPUT_FILENAME, ridership_by_hour.SYSTEM_OUTPUT_FILENAME):
+        table = pd.read_csv(tmp_path / "zero" / name)
+        assert table["alightings"].tolist() == [0.0], name
+
+
+def test_alighting_chart_draws_with_missing_alighting_data(tmp_path, monkeypatch) -> None:
+    """Charting alightings when the source has none writes empty bars instead of failing."""
+    monkeypatch.setattr(ridership_by_hour, "CHART_MEASURE", "alightings")
+    monkeypatch.setattr(ridership_by_hour, "EXPORT_TRIP_CHARTS", False)
+    missing = _one_trip_workbook(tmp_path / "missing.xlsx", boardings=4.0, alightings=None)
+    ridership_by_hour.run(tmp_path / "out", {"weekday": str(missing)}, export_charts_flag=True)
+    assert list((tmp_path / "out" / ridership_by_hour.CHARTS_SUBDIR).glob("*.png"))
