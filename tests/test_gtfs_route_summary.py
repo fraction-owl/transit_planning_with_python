@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from pathlib import Path
 
@@ -266,25 +267,36 @@ def test_trip_distances_meters_no_dist_returns_empty() -> None:
 
 
 def _shapes(lengths: dict[str, str]) -> pd.DataFrame:
+    """Two-point shapes from stop A (west) to stop B (east), with the given lengths."""
     rows = []
     for shape_id, length in lengths.items():
+        start = {"shape_pt_lat": "38.9", "shape_pt_lon": "-77.0"}
+        end = {"shape_pt_lat": "38.9", "shape_pt_lon": "-76.99"}
         rows.append({"shape_id": shape_id, "shape_pt_sequence": "1", "shape_dist_traveled": "0"})
+        rows[-1].update(start)
         rows.append({"shape_id": shape_id, "shape_pt_sequence": "2", "shape_dist_traveled": length})
+        rows[-1].update(end)
     return pd.DataFrame(rows)
 
 
+_SHAPE_END_STOPS = pd.DataFrame(
+    {"stop_id": ["A", "B"], "stop_lat": ["38.9", "38.9"], "stop_lon": ["-77.0", "-76.99"]}
+)
+
+
 def test_trip_distances_meters_shape_fallback_per_trip() -> None:
-    """A trip without stop_times distances still gets its shape's length."""
+    """A trip without stop_times distances is measured along its shape."""
     stop_times = pd.DataFrame(
         {
             "trip_id": ["T1", "T1", "T2", "T2"],
             "stop_sequence": ["1", "2", "1", "2"],
+            "stop_id": ["A", "B", "A", "B"],
             "shape_dist_traveled": ["0", "1000", "", ""],
         }
     )
     trips = pd.DataFrame({"trip_id": ["T1", "T2"], "shape_id": ["S1", "S2"]})
     result = trip_distances_meters(
-        stop_times, _shapes({"S1": "999", "S2": "2500"}), trips, "meters"
+        stop_times, _shapes({"S1": "999", "S2": "2500"}), trips, "meters", _SHAPE_END_STOPS
     )
     assert result.to_dict() == pytest.approx({"T1": 1000.0, "T2": 2500.0})
 
@@ -294,13 +306,97 @@ def test_trip_distances_meters_blank_last_stop_is_unknown_not_zero() -> None:
         {
             "trip_id": ["T1", "T1", "T1"],
             "stop_sequence": ["1", "2", "3"],
+            "stop_id": ["A", "MID", "B"],
             "shape_dist_traveled": ["0", "", ""],
         }
     )
     trips = pd.DataFrame({"trip_id": ["T1"], "shape_id": ["S1"]})
     assert trip_distances_meters(stop_times, None, trips, "meters").empty
-    with_shape = trip_distances_meters(stop_times, _shapes({"S1": "4000"}), trips, "meters")
+    with_shape = trip_distances_meters(
+        stop_times, _shapes({"S1": "4000"}), trips, "meters", _SHAPE_END_STOPS
+    )
     assert with_shape["T1"] == pytest.approx(4000.0)
+
+
+_LAT = 38.9
+_DEG_LON_PER_MILE = 1 / (69.172 * math.cos(math.radians(_LAT)))
+_METERS_PER_MILE = 1609.344
+
+
+def _lon(mile: float) -> str:
+    return str(-77.2 + mile * _DEG_LON_PER_MILE)
+
+
+def _line_shape(shape_id: str, miles: list[int]) -> pd.DataFrame:
+    """Shape through the given mile marks on an east-west line; distances in miles."""
+    traveled = [0]
+    for a, b in zip(miles, miles[1:]):
+        traveled.append(traveled[-1] + abs(b - a))
+    return pd.DataFrame(
+        {
+            "shape_id": shape_id,
+            "shape_pt_sequence": [str(i + 1) for i in range(len(miles))],
+            "shape_pt_lat": str(_LAT),
+            "shape_pt_lon": [_lon(m) for m in miles],
+            "shape_dist_traveled": [str(d) for d in traveled],
+        }
+    )
+
+
+def _mile_stops(**marks: float) -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "stop_id": list(marks),
+            "stop_lat": str(_LAT),
+            "stop_lon": [_lon(m) for m in marks.values()],
+        }
+    )
+
+
+def _trips_between(shape_id: str, ends: dict[str, tuple[str, str]]) -> tuple[pd.DataFrame, ...]:
+    trips = pd.DataFrame({"trip_id": list(ends), "shape_id": shape_id})
+    stop_times = pd.DataFrame(
+        [
+            {"trip_id": trip, "stop_sequence": str(seq), "stop_id": stop}
+            for trip, pair in ends.items()
+            for seq, stop in enumerate(pair, start=1)
+        ]
+    )
+    return trips, stop_times
+
+
+def _miles(result: pd.Series) -> dict[str, float]:
+    return (result / _METERS_PER_MILE).to_dict()
+
+
+def test_trip_distances_meters_short_turn_measured_between_its_stops() -> None:
+    trips, stop_times = _trips_between(
+        "S", {"FULL": ("A", "Z"), "SHORT": ("A", "M"), "LATER": ("M", "Z")}
+    )
+    stops = _mile_stops(A=0, M=5, Z=10)
+    result = trip_distances_meters(
+        stop_times, _line_shape("S", list(range(11))), trips, "miles", stops
+    )
+    assert _miles(result) == pytest.approx({"FULL": 10, "SHORT": 5, "LATER": 5})
+
+
+def test_trip_distances_meters_loop_whole_and_ambiguous_out_and_back_unknown() -> None:
+    # Out to mile 10 and back: A and M are passed twice, Z once.
+    shape = _line_shape("S", [*range(11), *range(9, -1, -1)])
+    trips, stop_times = _trips_between(
+        "S", {"LOOP": ("A", "A"), "OUT": ("A", "Z"), "BACK": ("Z", "A"), "SHORT": ("A", "M")}
+    )
+    result = trip_distances_meters(stop_times, shape, trips, "miles", _mile_stops(A=0, M=5, Z=10))
+    # A-to-M could be miles 0-5 or 0-15, so SHORT is left out rather than guessed.
+    assert _miles(result) == pytest.approx({"LOOP": 20, "OUT": 10, "BACK": 10})
+
+
+def test_trip_distances_meters_stop_off_shape_or_no_stops_is_unknown() -> None:
+    shape = _line_shape("S", list(range(11)))
+    trips, stop_times = _trips_between("S", {"T": ("A", "Z")})
+    off_shape = _mile_stops(A=0, Z=10).assign(stop_lat=["38.9", "38.91"])  # Z ~0.7 mi away
+    assert trip_distances_meters(stop_times, shape, trips, "miles", off_shape).empty
+    assert trip_distances_meters(stop_times, shape, trips, "miles").empty
 
 
 def test_trip_distances_meters_orders_by_stop_sequence() -> None:
@@ -621,6 +717,28 @@ def test_build_summary_skips_trips_with_no_active_dates(
     assert row["directions"] == 1
     assert row["avg_duration_min"] == pytest.approx(10.0)
     assert row["avg_speed_kmh"] == pytest.approx(60.0)
+
+
+def test_build_summary_short_turn_on_shared_shape(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A 10-mile, 30-minute trip and a 5-mile, 15-minute short turn on one shape."""
+    monkeypatch.setattr(mod, "OUTPUT_UNITS", "imperial")
+    trips, stop_times = _trips_between("S", {"FULL": ("A", "Z"), "SHORT": ("A", "M")})
+    trips = trips.assign(route_id="R1", service_id="WK")
+    stop_times["arrival_time"] = ["07:00:00", "07:30:00", "08:00:00", "08:15:00"]
+    stop_times["departure_time"] = stop_times["arrival_time"]
+    row = build_summary(
+        routes_df=pd.DataFrame({"route_id": ["R1"], "route_short_name": ["1"]}),
+        trips_df=trips,
+        stop_times_df=stop_times,
+        calendar_df=_make_calendar([_cal_row("WK", _DAYS[:5])]),
+        calendar_dates_df=None,
+        shapes_df=_line_shape("S", list(range(11))),
+        distance_unit="miles",
+        extras={},
+        stops_df=_mile_stops(A=0, M=5, Z=10),
+    ).iloc[0]
+    assert row["avg_distance_mi"] == pytest.approx(7.5)
+    assert row["avg_speed_mph"] == pytest.approx(20.0)
 
 
 def test_build_summary_route_with_only_inactive_service_omitted() -> None:
