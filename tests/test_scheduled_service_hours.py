@@ -185,6 +185,60 @@ def test_same_coordinates_count_as_one_place() -> None:
     assert not target.same_place("X", "Y", places)
 
 
+def test_same_place_compares_coordinates_as_numbers() -> None:
+    places = {
+        "B": ("38.8", "-77.2"),
+        "B_padded": ("38.800000", "-77.200000"),
+        "B_bay": ("38.8001", "-77.2"),  # A nearby bay, not the same place.
+        "X": ("", ""),
+        "X2": ("", ""),
+        "bad": ("n/a", "-77.2"),
+        "bad2": ("n/a", "-77.2"),
+    }
+    assert target.same_place("B", "B_padded", places)
+    assert not target.same_place("B", "B_bay", places)
+    # Missing or unreadable coordinates never make two stops one place.
+    assert not target.same_place("X", "X2", places)
+    assert not target.same_place("bad", "bad2", places)
+
+
+def test_layover_at_reformatted_coordinates_counts_as_revenue(tmp_path: Path) -> None:
+    # T1 ends at B at 06:30 and T2 leaves B2 at 07:00. B and B2 are the same
+    # point, written with different precision.
+    gtfs = write_feed(
+        tmp_path / "gtfs",
+        {
+            "trips.txt": [
+                {"route_id": "R", "service_id": "wk", "trip_id": t, "block_id": "B1"}
+                for t in ("T1", "T2")
+            ],
+            "stop_times.txt": [
+                stop_time("T1", 1, "A", "06:00:00"),
+                stop_time("T1", 2, "B", "06:30:00"),
+                stop_time("T2", 1, "B2", "07:00:00"),
+                stop_time("T2", 2, "A", "07:30:00"),
+            ],
+            "stops.txt": [
+                {"stop_id": "A", "stop_lat": "38.9", "stop_lon": "-77.2"},
+                {"stop_id": "B", "stop_lat": "38.8", "stop_lon": "-77.2"},
+                {"stop_id": "B2", "stop_lat": "38.800000", "stop_lon": "-77.200000"},
+            ],
+            "calendar.txt": [calendar_row("wk", DAYS[:5])],
+        },
+    )
+    cfg = target.Config(
+        gtfs_path=gtfs,
+        tods_path=None,
+        output_dir=tmp_path / "out",
+        periods=[("Nov", "20261101", "20261130")],
+        layover_in_revenue_hours=True,
+    )
+    (block,) = target.run(cfg)["block"].to_dict("records")
+    assert block["layover_hours"] == 0.5
+    assert block["unresolved_gap_hours"] == 0.0 and block["location_jumps"] == 0
+    assert block["vehicle_revenue_hours"] == 1.5
+
+
 def test_add_derived_follows_the_layover_setting() -> None:
     df = pd.DataFrame({c: [1.0] for c in target.COMPONENTS})
     counted = target.add_derived(df, layover_in_revenue=True, tods_supplied=True).iloc[0]
