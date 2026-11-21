@@ -155,6 +155,35 @@ def test_get_status_traveling() -> None:
     assert status == "TRAVELING BETWEEN STOPS"
 
 
+# A trip with a scheduled hold at every stop: A 07:55-08:00 (origin), B 08:10-08:13
+# (intermediate), C 08:20-08:22 (last).
+_HOLD_SEQUENCE = [
+    (475, 480, "A", "Origin", "T1", True, False, 1, 2),
+    (490, 493, "B", "Middle", "T1", False, False, 2, 0),
+    (500, 502, "C", "End", "T1", False, True, 3, 2),
+]
+
+
+@pytest.mark.parametrize(
+    ("minute", "expected"),
+    [(490, "ARRIVE"), (491, "DWELL"), (492, "DWELL"), (493, "DEPART")],
+)
+def test_get_status_intermediate_hold_keeps_stop(minute: int, expected: str) -> None:
+    status, stop_id, _name, _arr, _dep, trip_id, _seq, _tp = get_status_for_minute(
+        minute, _HOLD_SEQUENCE
+    )
+    assert (status, stop_id, trip_id) == (expected, "B", "T1")
+
+
+@pytest.mark.parametrize(
+    ("minute", "expected", "stop"),
+    [(475, "DWELL", "A"), (480, "DEPART", "A"), (500, "ARRIVE", "C"), (502, "DWELL", "C")],
+)
+def test_get_status_terminal_hold_boundaries(minute: int, expected: str, stop: str) -> None:
+    status, stop_id, *_ = get_status_for_minute(minute, _HOLD_SEQUENCE)
+    assert (status, stop_id) == (expected, stop)
+
+
 # ---------------------------------------------------------------------------
 # fill_stop_ids_for_dwell_layover_loading
 # ---------------------------------------------------------------------------
@@ -241,6 +270,49 @@ def test_process_block_row_count() -> None:
     assert len(df) == len(timeline)
 
 
+def _stops_df(rows: list[tuple[str, int, str, int, int]]) -> pd.DataFrame:
+    """Build process_block input from (trip_id, stop_sequence, stop_id, arr, dep) rows."""
+    df = pd.DataFrame(
+        rows, columns=["trip_id", "stop_sequence", "stop_id", "arrival_min", "departure_min"]
+    )
+    df = mark_first_and_last_stops(df)
+    return df.assign(stop_name=df["stop_id"], route_short_name="R1", direction_id="0", timepoint=2)
+
+
+def test_process_block_intermediate_hold_is_not_loading() -> None:
+    # Only the origin departure is preceded by LOADING; B's hold stays DWELL.
+    block = _stops_df(
+        [("T1", 1, "A", 480, 480), ("T1", 2, "B", 490, 493), ("T1", 3, "C", 500, 500)]
+    )
+    df = process_block(block, "B1", range(489, 495)).set_index("Timestamp")
+    statuses = df.loc[["08:10", "08:11", "08:12", "08:13"], "Status"].tolist()
+    assert statuses == ["ARRIVE", "DWELL", "DWELL", "DEPART"]
+    assert set(df.loc[["08:10", "08:11", "08:12", "08:13"], "Stop ID"]) == {"B"}
+
+
+def test_process_block_gap_between_different_stops_is_deadhead() -> None:
+    # T1 ends at C 08:20; T2 starts at D 08:30. The bus cannot be at C at 08:29.
+    block = _stops_df(
+        [("T1", 1, "A", 480, 480), ("T1", 2, "C", 500, 500), ("T2", 1, "D", 510, 510)]
+        + [("T2", 2, "E", 530, 530)]
+    )
+    df = process_block(block, "B1", range(500, 511)).set_index("Timestamp")
+    gap = df.loc["08:21":"08:29"]
+    assert set(gap["Status"]) == {"DEADHEAD"}
+    assert set(gap["Stop ID"]) == {""}
+    assert (df.loc["08:30", "Status"], df.loc["08:30", "Stop ID"]) == ("DEPART", "D")
+
+
+def test_process_block_gap_at_same_stop_is_layover_then_loading() -> None:
+    block = _stops_df(
+        [("T1", 1, "A", 480, 480), ("T1", 2, "C", 500, 500), ("T2", 1, "C", 510, 510)]
+        + [("T2", 2, "E", 530, 530)]
+    )
+    df = process_block(block, "B1", range(500, 511)).set_index("Timestamp")
+    assert (df.loc["08:25", "Status"], df.loc["08:25", "Stop ID"]) == ("LAYOVER", "C")
+    assert (df.loc["08:29", "Status"], df.loc["08:29", "Stop ID"]) == ("LOADING", "C")
+
+
 # ---------------------------------------------------------------------------
 # run — full pipeline against gtfs_basic, real xlsx output
 # ---------------------------------------------------------------------------
@@ -274,6 +346,23 @@ def test_run_writes_real_block_workbooks(tmp_path: Path, monkeypatch: pytest.Mon
     # list the other as interlined.
     assert ("R1", "R2") in pairs
     assert ("R2", "R1") in pairs
+
+
+def test_run_reads_only_the_four_tables_it_uses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import scripts.gtfs_exports.bus_block_exporter as mod
+
+    feed = tmp_path / "gtfs"
+    feed.mkdir()
+    for name in ("trips.txt", "routes.txt", "stops.txt", "stop_times.txt"):
+        shutil.copy(FIXTURES / "gtfs_basic" / name, feed / name)
+    monkeypatch.setattr(mod, "GTFS_FOLDER_PATH", str(feed))
+    monkeypatch.setattr(mod, "OUTPUT_FOLDER", str(tmp_path / "out"))
+    monkeypatch.setattr(mod, "CALENDAR_SERVICE_IDS", ["WKDY"])
+
+    assert mod.run() == 0
+    assert (tmp_path / "out" / "block_B1.xlsx").is_file()
 
 
 def test_run_walks_ten_stop_trip_in_sequence_order(
