@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import math
 import os
 from pathlib import Path
 from typing import Final
@@ -124,7 +125,9 @@ def load_data(input_file: str) -> pd.DataFrame:
     ValueError
         If the expected columns are missing.
     """
-    data_frame = pd.read_excel(input_file)
+    # Route names are IDs, not numbers: read them as text so a numeric cell (101)
+    # matches the configured "101" and text IDs keep any leading zeros.
+    data_frame = pd.read_excel(input_file, dtype={"ROUTE_NAME": str})
     selected_columns = [
         "SERIAL_NUMBER",
         "ROUTE_NAME",
@@ -165,6 +168,30 @@ def assign_service_period(ts: pd.Timestamp | dt.time) -> str:
         return "Other"
 
 
+def normalize_route_name(value: object) -> object:
+    """Return a route designator as trimmed text, so 101, 101.0 and "101" all match.
+
+    Text keeps its leading zeros (``"007"`` stays ``"007"``); only a number
+    holding a whole value loses its decimal part. Missing values pass through.
+
+    Args:
+        value: A route name from the source data or a configured route list.
+
+    Returns:
+        The route name as a string, or the missing value unchanged.
+    """
+    if value is None or value is pd.NA or (isinstance(value, float) and math.isnan(value)):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value).strip()
+
+
+def _normalized_routes(routes: list) -> set[object]:
+    """Normalize a configured route list with :func:`normalize_route_name`."""
+    return {normalize_route_name(route) for route in routes}
+
+
 def get_route_load_limit(route_name: str) -> float:
     """Return the applicable load-factor limit for *route_name*.
 
@@ -179,7 +206,7 @@ def get_route_load_limit(route_name: str) -> float:
         ``LOWER_LOAD_FACTOR_LIMIT`` if the route is in
         :data:`LOWER_LIMIT_ROUTES`, else ``HIGHER_LOAD_FACTOR_LIMIT``.
     """
-    if route_name in LOWER_LIMIT_ROUTES:
+    if normalize_route_name(route_name) in _normalized_routes(LOWER_LIMIT_ROUTES):
         return LOWER_LOAD_FACTOR_LIMIT
     return HIGHER_LOAD_FACTOR_LIMIT
 
@@ -215,7 +242,7 @@ def determine_limit_type(route_name: str) -> str:
     str
         ``"LOW"`` if the route uses the lower limit, else ``"HIGH"``.
     """
-    if route_name in LOWER_LIMIT_ROUTES:
+    if normalize_route_name(route_name) in _normalized_routes(LOWER_LIMIT_ROUTES):
         return "LOW"
     return "HIGH"
 
@@ -231,7 +258,8 @@ def process_data(
 
     The transformation pipeline:
 
-        1. Apply `filter_in_routes` and `filter_out_routes`.
+        1. Normalize ``ROUTE_NAME`` to text, then apply `filter_in_routes` and
+           `filter_out_routes`.
         2. Add column ``SERVICE_PERIOD``.
         3. Compute and round ``LOAD_FACTOR``.
         4. Add ``LOAD_FACTOR_VIOLATION`` and ``ROUTE_LIMIT_TYPE``.
@@ -254,11 +282,15 @@ def process_data(
         pandas.DataFrame:
             A fully processed and neatly sorted DataFrame.
     """
-    # 1) Apply filters
+    # 1) Normalize route names, then apply filters
+    data_frame = data_frame.copy()
+    data_frame["ROUTE_NAME"] = data_frame["ROUTE_NAME"].map(normalize_route_name)
     if filter_in_routes:
-        data_frame = data_frame[data_frame["ROUTE_NAME"].isin(filter_in_routes)]
+        data_frame = data_frame[data_frame["ROUTE_NAME"].isin(_normalized_routes(filter_in_routes))]
     if filter_out_routes:
-        data_frame = data_frame[~data_frame["ROUTE_NAME"].isin(filter_out_routes)]
+        data_frame = data_frame[
+            ~data_frame["ROUTE_NAME"].isin(_normalized_routes(filter_out_routes))
+        ]
 
     # 2) Assign service period and calculate load factor
     data_frame["SERVICE_PERIOD"] = data_frame["TRIP_START_TIME"].apply(assign_service_period)
