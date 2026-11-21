@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import geopandas as gpd
 import pytest
 
 import scripts.gbfs_tools.gbfs_stations_exporter as target
@@ -279,3 +280,25 @@ def test_export_shapefile_writes_file(tmp_path: Path) -> None:
     out = tmp_path / "gbfs_stations.shp"
     target.export_shapefile(gdf, out)
     assert out.exists()
+
+
+# ---------------------------------------------------------------------------
+# gbfs_stations_to_files / main
+# ---------------------------------------------------------------------------
+
+
+def test_empty_refresh_fails_and_keeps_previous_outputs(tmp_path: Path) -> None:
+    # A refresh that finds no stations must fail loudly, not return normally
+    # while the previous run's layers stay in place looking current.
+    source = tmp_path / "station_information.json"
+    source.write_text(json.dumps(_station_info(_valid_stations())), encoding="utf-8")
+    target.gbfs_stations_to_files(str(source), tmp_path, "both")
+
+    source.write_text(json.dumps(_station_info([])), encoding="utf-8")
+    with pytest.raises(ValueError, match="no usable stations"):
+        target.gbfs_stations_to_files(str(source), tmp_path, "both")
+    assert target.main(["--source", str(source), "--output-dir", str(tmp_path)]) == 1
+
+    geojson = json.loads((tmp_path / "gbfs_stations.geojson").read_text(encoding="utf-8"))
+    assert len(geojson["features"]) == 2
+    assert len(gpd.read_file(tmp_path / "gbfs_stations.shp")) == 2

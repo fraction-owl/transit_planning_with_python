@@ -123,8 +123,12 @@ def test_system_monthly_one_row_per_month(trips: pd.DataFrame) -> None:
 def test_system_monthly_totals_reconcile(trips: pd.DataFrame) -> None:
     system = mod.build_system_monthly(trips)
     assert system["total_trips"].sum() == len(trips)
-    assert (system["member_trips"] + system["casual_trips"]).equals(system["total_trips"])
-    assert (system["electric_trips"] + system["classic_trips"]).equals(system["total_trips"])
+    assert (system["member_trips"] + system["casual_trips"] + system["other_rider_trips"]).equals(
+        system["total_trips"]
+    )
+    assert (system["electric_trips"] + system["classic_trips"] + system["other_bike_trips"]).equals(
+        system["total_trips"]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -380,3 +384,58 @@ def test_station_name_is_first_nonblank(tmp_path: Path) -> None:
     daytype = mod.build_station_daytype_averages(loaded).set_index("station_id")
     assert station.loc["31200", "station_name"] == "Dupont"
     assert daytype.loc["31200", "station_name"] == "Dupont"
+
+
+def test_system_monthly_counts_each_category_directly(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A blank member_casual is not casual, and docked_bike is not classic:
+    # both are counted as other so the splits still reconcile to the total.
+    _write_extract(
+        tmp_path / "202601-capitalbikeshare-tripdata.csv",
+        [
+            "A,classic_bike,2026-01-05 10:00:00,2026-01-05 10:10:00,Dupont,31200,"
+            "Eastern,31201,38.9,-77.0,38.9,-77.0,member",
+            "B,docked_bike,2026-01-06 10:00:00,2026-01-06 10:10:00,Dupont,31200,"
+            "Eastern,31201,38.9,-77.0,38.9,-77.0,",
+        ],
+    )
+    with caplog.at_level("WARNING"):
+        system = mod.build_system_monthly(mod.load_trips(tmp_path))
+    row = system.iloc[0]
+    assert row["total_trips"] == 2
+    assert (row["member_trips"], row["casual_trips"], row["other_rider_trips"]) == (1, 0, 1)
+    assert (row["electric_trips"], row["classic_trips"], row["other_bike_trips"]) == (0, 1, 1)
+    assert "'docked_bike': 1" in caplog.text
+    assert "blank: 1" in caplog.text
+
+
+def test_station_charts_do_not_overwrite_each_other(tmp_path: Path) -> None:
+    # "A B" and "A/B" both slug to "A_B"; each must still get its own chart.
+    station_ids = ["A B", "A/B", "A-B"]
+    _write_extract(
+        tmp_path / "in" / "202601-capitalbikeshare-tripdata.csv",
+        [
+            f"R{n},classic_bike,2026-01-0{n} 10:00:00,2026-01-0{n} 10:10:00,"
+            f"Name,{sid},Name,{sid},38.9,-77.0,38.9,-77.0,member"
+            for n, sid in enumerate(station_ids, start=1)
+        ],
+    )
+    station = mod.build_station_monthly(mod.load_trips(tmp_path / "in"))
+    written = mod.plot_station_trends(station, tmp_path / "all", max_plots=0)
+    on_disk = {p.name for p in (tmp_path / "all").glob("*.png")}
+    assert len(on_disk) == len(station_ids)
+    assert {p.name for p in written} == on_disk
+    assert "station_A-B.png" in on_disk
+
+    # A capped run names the busiest station's chart the same way.
+    capped = mod.plot_station_trends(station, tmp_path / "capped", max_plots=1)
+    assert capped[0].name in on_disk
+
+
+def test_station_chart_filenames_disambiguate_case_insensitively() -> None:
+    # "ab" and "AB" are different stations but the same file on Windows/macOS.
+    names = mod._station_chart_filenames(["ab", "AB", "31000"])
+    assert names["31000"] == "station_31000.png"
+    assert len({name.casefold() for name in names.values()}) == 3
+    assert names == mod._station_chart_filenames(["31000", "AB", "ab"])
