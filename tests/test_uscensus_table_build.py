@@ -1017,6 +1017,72 @@ def test_build_joined_table_with_tract_commute(tmp_path: Path) -> None:
     assert df["commute_timed"].iloc[0] == pytest.approx(960.0)
 
 
+def _write_s0801(path: Path, *rows: tuple[str, str]) -> str:
+    """Write an S0801 file of (GEO_ID, mean travel time) rows; 1000 workers, 0% WFH."""
+    cols = (
+        "S0801_C01_001E,S0801_C01_003E,S0801_C01_004E,S0801_C01_009E,S0801_C01_013E,S0801_C01_046E"
+    )
+    _write_plain_csv(
+        path,
+        _census_csv(
+            f"GEO_ID,NAME,{cols}",
+            "Geo,Name," + ",".join(["l"] * 6),
+            *[f"{geo},Tract,1000,80.0,10.0,5.0,0.0,{mean}" for geo, mean in rows],
+        ),
+    )
+    return str(path)
+
+
+def test_build_joined_table_keeps_mean_travel_time_per_block(tmp_path: Path) -> None:
+    # A tract mean is not a count: blocks holding 25% and 75% of residents both
+    # report the tract's 40 minutes, matching their person-minutes / commuters.
+    blocks = [("1000000US110010001001001", 25), ("1000000US110010001001002", 75)]
+    pop_path = tmp_path / "P1-Data.csv"
+    _write_plain_csv(
+        pop_path,
+        _census_csv(
+            "GEO_ID,NAME,P1_001N", "Geo,Name,Total", *[f"{g},Block,{p}" for g, p in blocks]
+        ),
+    )
+    s0801 = _write_s0801(tmp_path / "ACSST5Y2024.S0801-Data.csv", (_TRACT_GEO_ID, "40.0"))
+    df = build_joined_table(
+        pop_files=[str(pop_path)], hh_files=[], jobs_files=[], commute_files=[s0801]
+    ).sort_values("total_pop")
+    assert df["mean_travel_time"].tolist() == pytest.approx([40.0, 40.0])
+    assert df["commute_person_min"].tolist() == pytest.approx([10_000.0, 30_000.0])
+    assert df["commute_timed"].tolist() == pytest.approx([250.0, 750.0])
+
+
+def test_build_joined_table_mean_travel_time_nan_without_timed_commuters(
+    tmp_path: Path,
+) -> None:
+    # An empty block and a block in a tract with a suppressed mean have no timed
+    # commuters, so their mean is unknown (NaN), not a 0-minute commute.
+    blocks = [
+        ("1000000US110010001001001", 100),
+        ("1000000US110010001001002", 0),
+        ("1000000US110010002001001", 50),
+    ]
+    pop_path = tmp_path / "P1-Data.csv"
+    _write_plain_csv(
+        pop_path,
+        _census_csv(
+            "GEO_ID,NAME,P1_001N", "Geo,Name,Total", *[f"{g},Block,{p}" for g, p in blocks]
+        ),
+    )
+    s0801 = _write_s0801(
+        tmp_path / "ACSST5Y2024.S0801-Data.csv",
+        (_TRACT_GEO_ID, "30.0"),
+        ("1400000US11001000200", "(X)"),
+    )
+    df = build_joined_table(
+        pop_files=[str(pop_path)], hh_files=[], jobs_files=[], commute_files=[s0801]
+    ).set_index("block_id_synth")
+    assert df.loc["110010001001001", "mean_travel_time"] == pytest.approx(30.0)
+    assert pd.isna(df.loc["110010001001002", "mean_travel_time"])
+    assert pd.isna(df.loc["110010002001001", "mean_travel_time"])
+
+
 # ---------------------------------------------------------------------------
 # discover_census_files  (integration using existing test fixtures)
 # ---------------------------------------------------------------------------

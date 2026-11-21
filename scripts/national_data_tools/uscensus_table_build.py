@@ -1098,12 +1098,16 @@ def _apply_fips_filter(
 
 
 def _tract_count_columns(tract_df: pd.DataFrame) -> list[str]:
-    """Return the additive count columns of a tract table (numeric, not ``perc_*`` or ids)."""
-    ids = {GEO_ID_COL, "tract_id_clean", "FIPS"}
+    """Return the additive count columns of a tract table (numeric, not ``perc_*`` or ids).
+
+    ``mean_travel_time`` is a mean, not a count, so it is left out too;
+    ``build_joined_table`` re-derives it per block after the split.
+    """
+    excluded = {GEO_ID_COL, "tract_id_clean", "FIPS", "mean_travel_time"}
     return [
         str(c)
         for c in tract_df.columns
-        if c not in ids
+        if c not in excluded
         and not str(c).startswith("perc_")
         and pd.api.types.is_numeric_dtype(tract_df[c])
     ]
@@ -1186,7 +1190,8 @@ def build_joined_table(
 
     Tract percentages (``perc_*``) ride along per block unchanged; tract counts are
     split across each tract's blocks by block population (P1) or households (H9), so
-    every count column sums over blocks to the tract total.
+    every count column sums over blocks to the tract total. ``mean_travel_time`` is
+    not split: each block reports ``commute_person_min / commute_timed``.
     """
     block_df = _build_block_df(_BlockInputs(pop_files, hh_files, jobs_files))
     tract_df = _build_tract_df(
@@ -1231,7 +1236,14 @@ def build_joined_table(
         )
     # Count allocation (as in uscensus_tiger_join_gpd): split every tract count across
     # the tract's blocks, so block rows can be summed without multiplying tract totals.
-    return allocate_tract_counts_to_blocks(combined, _tract_count_columns(tract_df))
+    combined = allocate_tract_counts_to_blocks(combined, _tract_count_columns(tract_df))
+    if {"mean_travel_time", "commute_person_min", "commute_timed"} <= set(combined.columns):
+        # Re-derive the mean from the split person-minutes and commuters so the row
+        # agrees with them. Blocks with no timed commuters (no residents, or a
+        # suppressed tract mean) get NaN rather than a 0-minute commute.
+        timed = combined["commute_timed"]
+        combined["mean_travel_time"] = (combined["commute_person_min"] / timed).where(timed > 0)
+    return combined
 
 
 __all__ = ["build_joined_table"]
