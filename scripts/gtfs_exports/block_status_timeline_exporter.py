@@ -472,7 +472,7 @@ def find_cluster(stop_id: str, clusters: list[dict[str, Any]]) -> Optional[str]:
 def status_for_same_trip(
     minute: int, stop_info: tuple, settings: dict[str, int]
 ) -> Optional[tuple]:
-    """Return a visit's occupancy, including both boundaries of a scheduled hold."""
+    """Return a visit's occupancy; a mid-trip hold is ARRIVE, then DWELL, then DEPART."""
     arr, dep, sid, name, tid, first, last, seq, timepoint = stop_info
     detail = (sid, name, minutes_to_hhmm(arr), minutes_to_hhmm(dep), tid, seq, timepoint)
     if first and minute == dep:
@@ -480,8 +480,13 @@ def status_for_same_trip(
     if last and minute == arr:
         return ("ARRIVE",) + detail
     if arr <= minute <= dep:
-        if not first and not last and arr == dep:
-            return ("ARRIVE/DEPART",) + detail
+        if not first and not last:
+            if arr == dep:
+                return ("ARRIVE/DEPART",) + detail
+            if minute == arr:
+                return ("ARRIVE",) + detail
+            if minute == dep:
+                return ("DEPART",) + detail
         if first and minute >= dep - settings["PRE_DEPARTURE_MINUTES"]:
             return ("LOADING",) + detail
         return ("DWELL",) + detail

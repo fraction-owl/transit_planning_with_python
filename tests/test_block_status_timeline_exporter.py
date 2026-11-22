@@ -216,8 +216,8 @@ def test_get_status_for_minute_hold_boundaries_are_occupied() -> None:
         (440, 440, "S3", "Elm St", "T1", False, True, 3, 0),
     ]
     assert [get_status_for_minute(m, seq)[:2] for m in (430, 431, 432)] == [
-        ("DWELL", "S2"),
-        ("DWELL", "S2"),
+        ("ARRIVE", "S2"),
+        ("DEPART", "S2"),
         ("TRAVELING BETWEEN STOPS", None),
     ]
 
