@@ -17,6 +17,7 @@ Start with the task you need. Read the selected script's opening comments for in
 | Compare route changes | [gtfs_route_diff.py](scripts/stop_analysis/gtfs_route_diff.py) | Before/after GTFS |
 | Summarize observed OTP and runtime | [otp_runtime_from_tides.py](scripts/operations_tools/otp_runtime_from_tides.py) | TIDES |
 | Calculate planned service hours | [scheduled_service_hours.py](scripts/gtfs_exports/scheduled_service_hours.py) | GTFS + optional TODS supplements |
+| Screen trip cuts for real savings | [trip_cut_savings.py](scripts/ridership_tools/trip_cut_savings.py) | GTFS with blocks + trip ridership, optional TODS |
 | Review bay assignments | [bay_assignment_optimizer.py](scripts/facilities_tools/bay_assignment_optimizer.py) | GTFS and facility settings |
 
 The sections below describe the wider collection. Scripts can also form workflows by passing their output files to another tool.
