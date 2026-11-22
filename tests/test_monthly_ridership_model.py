@@ -280,6 +280,68 @@ def test_select_predictors_raises_on_missing_column() -> None:
         mrm.select_predictors(_model_table(), ("nope",), "ntd_boardings", ("route_id",), ())
 
 
+def _warm_months_design() -> tuple[np.ndarray, np.ndarray, list[str]]:
+    """Eight warm-weather rows: service hours vary, snowfall is zero throughout."""
+    table = _model_table(8).assign(total_snow_in=0.0)
+    y, x_matrix, names, _, _ = mrm.build_design_matrix(
+        table,
+        "ntd_boardings",
+        ["scheduled_hours", "total_snow_in"],
+        (),
+        log_dependent=True,
+        log_predictors=("scheduled_hours", "total_snow_in"),
+        standardize=False,
+    )
+    return y, x_matrix, names
+
+
+def test_constant_predictor_is_reported_and_dropped_before_vif_and_fit(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    y, x_matrix, names = _warm_months_design()
+    assert mrm._variance_inflation_factors(x_matrix, names)["log_total_snow_in"] == np.inf
+    with pytest.raises(ValueError, match="log_total_snow_in"):
+        mrm.fit_ols(y, x_matrix, names, "HC1")
+
+    with caplog.at_level(logging.WARNING):
+        kept_x, kept_names, dropped = mrm.drop_constant_terms(x_matrix, names)
+    assert "zero variance" in caplog.text and "log_total_snow_in" in caplog.text
+    assert (kept_names, dropped) == (["intercept", "log_scheduled_hours"], ("log_total_snow_in",))
+    for result in (
+        mrm.fit_ols(y, kept_x, kept_names, "HC1"),
+        mrm.prune_collinear(y, kept_x, kept_names, 10.0, "HC1"),
+    ):
+        result = result._replace(constant_terms=dropped)
+        assert result.term_names == ["intercept", "log_scheduled_hours"]
+        summary = mrm.build_summary_frame(result, "ntd_boardings", True).set_index("metric")
+        assert summary.loc["dropped_zero_variance", "value"] == "log_total_snow_in"
+
+
+def test_shipped_predictor_settings_encode_month() -> None:
+    """The default explicit list omits 'month'; it is still kept and one-hot encoded."""
+    rng = np.random.default_rng(3)
+    n = 40
+    table = pd.DataFrame({col: rng.uniform(1.0, 10.0, n) for col in mrm.PREDICTORS})
+    table[mrm.DEPENDENT_VAR] = rng.uniform(100.0, 1000.0, n)
+    table["month"] = np.repeat(["Jan", "Feb", "Mar", "Apr"], n // 4)
+    assert "month" not in mrm.PREDICTORS and "month" in mrm.CATEGORICAL_PREDICTORS
+
+    predictors = mrm.select_predictors(
+        table, mrm.PREDICTORS, mrm.DEPENDENT_VAR, mrm.JOIN_KEYS, mrm.CATEGORICAL_PREDICTORS
+    )
+    assert predictors == [*mrm.PREDICTORS, "month"]
+    _, _, names, _, _ = mrm.build_design_matrix(
+        table,
+        mrm.DEPENDENT_VAR,
+        predictors,
+        mrm.CATEGORICAL_PREDICTORS,
+        mrm.LOG_DEPENDENT,
+        mrm.LOG_PREDICTORS,
+        mrm.STANDARDIZE_PREDICTORS,
+    )
+    assert [n for n in names if n.startswith("month_")] == ["month_Feb", "month_Jan", "month_Mar"]
+
+
 # ---------------------------------------------------------------------------
 # Export + run log
 # ---------------------------------------------------------------------------

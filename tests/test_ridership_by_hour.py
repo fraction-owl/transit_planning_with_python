@@ -38,6 +38,15 @@ _HEADER = [
         ("1900-01-01 05:13:00", 313),
         ("1/0/1900", 0),  # Excel's rendering of time serial zero (midnight)
         ("12/30/1899", 0),
+        ("1:30 PM", 810),  # afternoon: the suffix is read, not dropped
+        ("1:30:00 pm", 810),
+        ("1:30PM", 810),
+        ("12:00 PM", 720),  # noon
+        ("12:00 AM", 0),  # midnight
+        ("12:15 a.m.", 15),
+        ("9:05 AM", 545),
+        ("1899-12-30 1:30:00 PM", 810),
+        ("13:30 PM", None),  # not a 12-hour time
         ("", None),
         (None, None),
         ("not a time", None),
@@ -74,6 +83,53 @@ def test_load_route_trip_workbook_keeps_midnight_trips(tmp_path) -> None:
     assert by_trip.loc["48", "hour"] == 5
     assert by_trip.loc["48", "start_time"] == "05:13"
     assert (by_trip["direction"] == "LOOP").all()
+
+
+def test_pm_text_start_lands_in_the_afternoon_hour(tmp_path) -> None:
+    """A '1:30 PM' text start counts at 13:30 (hour 13), not overnight hour 25."""
+    import pandas as pd
+
+    path = tmp_path / "weekday.xlsx"
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.append(_HEADER)
+    sheet.append([3695, "RIBS5", "LOOP", 44, "1:30 PM", 30.0, 1.0, 150, 1.0, 9.0])
+    workbook.save(path)
+
+    rows = ridership_by_hour.load_route_trip_workbook(path, "weekday")
+    assert rows[["start_time", "hour"]].to_numpy().tolist() == [["13:30", 13]]
+    ridership_by_hour.run(tmp_path / "out", {"weekday": str(path)}, export_charts_flag=False)
+    table = pd.read_csv(tmp_path / "out" / ridership_by_hour.ROUTE_OUTPUT_FILENAME)
+    assert table[["hour", "boardings"]].to_numpy().tolist() == [[13, 30.0]]
+
+
+def test_blank_trip_numbers_stay_in_totals_but_not_the_trip_table(tmp_path, caplog) -> None:
+    """Blank TRIP_NUMBER cells never become a 'nan' trip; their boardings are reported."""
+    import pandas as pd
+
+    path = tmp_path / "weekday.xlsx"
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.append(_HEADER)
+    sheet.append([3695, "RIBS5", "LOOP", 44, datetime.time(6, 15), 5.0, 1.0, 150, 1.0, 9.0])
+    sheet.append([3695, "RIBS5", "LOOP", None, datetime.time(6, 45), 7.0, 1.0, 150, 1.0, 9.0])
+    sheet.append([3695, "RIBS5", "LOOP", "  ", datetime.time(7, 15), 12.0, 1.0, 150, 1.0, 9.0])
+    workbook.save(path)
+
+    rows = ridership_by_hour.load_route_trip_workbook(path, "weekday")
+    assert rows["trip_id"].isna().tolist() == [False, True, True]
+
+    out = tmp_path / "out"
+    with caplog.at_level("WARNING"):
+        ridership_by_hour.run(out, {"weekday": str(path)}, export_charts_flag=False)
+    trips = pd.read_csv(out / "ridership_by_trip_weekday.csv", dtype={"trip_id": str})
+    assert trips[["trip_id", "avg_daily_boardings"]].to_numpy().tolist() == [["44", 5.0]]
+    assert "2 row(s) with a blank trip_id (19 average daily boardings)" in caplog.text
+    routes = pd.read_csv(out / ridership_by_hour.ROUTE_OUTPUT_FILENAME)
+    system = pd.read_csv(out / ridership_by_hour.SYSTEM_OUTPUT_FILENAME)
+    assert routes["boardings"].sum() == system["boardings"].sum() == 24.0
+    log = next(out.glob("*_runlog.txt")).read_text("utf-8")
+    assert "Blank trip_id:     2 row(s), 19 avg daily boardings" in log
 
 
 @pytest.mark.parametrize(

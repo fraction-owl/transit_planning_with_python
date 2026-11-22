@@ -3275,6 +3275,45 @@ def build_max_load_by_trip_export(
 # =============================================================================
 
 
+# pandas 2 infers one format from the first value and turns values written
+# another way (e.g. without fractional seconds) into NaT unless ISO 8601 or mixed
+# formats are asked for; pandas 1 (older ArcGIS Pro) parses value by value and
+# has neither option.
+_PANDAS_MAJOR: int = int(pd.__version__.split(".", 1)[0])
+
+
+def parse_utc_timestamps(values: pd.Series) -> pd.Series:
+    """Parse timestamps to UTC, whichever ISO 8601 forms they mix.
+
+    Values with and without fractional seconds, a ``Z`` or a numeric UTC offset
+    all parse, whatever order they come in; values without an offset are taken
+    as UTC. Anything that is not ISO 8601 is handed to pandas' mixed-format
+    parser.
+
+    Args:
+        values: Timestamps as text.
+
+    Returns:
+        UTC datetimes, NaT where the value is blank or unreadable.
+    """
+    text = values.astype("string").str.strip()
+    text = text.mask(text == "", pd.NA)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        if _PANDAS_MAJOR < 2:
+            return pd.to_datetime(text.astype(object), errors="coerce", utc=True)
+        stamps = pd.to_datetime(text, errors="coerce", utc=True, format="ISO8601")
+        rest = stamps.isna() & text.notna()
+        if rest.any():
+            try:
+                others = pd.to_datetime(text[rest], errors="coerce", utc=True, format="mixed")
+            except (ValueError, TypeError):
+                others = None
+            if others is not None:
+                stamps.loc[rest] = others
+    return stamps
+
+
 def _trip_duration_hours(performed: pd.DataFrame) -> pd.Series:
     """Per-row trip duration in hours from trips_performed start/end times.
 
@@ -3289,10 +3328,8 @@ def _trip_duration_hours(performed: pd.DataFrame) -> pd.Series:
     ):
         if start_col not in performed.columns or end_col not in performed.columns:
             continue
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            start = pd.to_datetime(performed[start_col], errors="coerce", utc=True)
-            end = pd.to_datetime(performed[end_col], errors="coerce", utc=True)
+        start = parse_utc_timestamps(performed[start_col])
+        end = parse_utc_timestamps(performed[end_col])
         hours = (end - start).dt.total_seconds() / 3600.0
         duration = duration.fillna(hours.where(hours > 0))
     return duration

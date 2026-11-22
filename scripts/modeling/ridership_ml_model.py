@@ -386,12 +386,17 @@ class ModelScore(NamedTuple):
 # =============================================================================
 
 
-def load_table(path: Path, sheet: str | int = 0) -> pd.DataFrame:
+def load_table(
+    path: Path, sheet: str | int = 0, text_columns: tuple[str, ...] = ()
+) -> pd.DataFrame:
     """Read a CSV or Excel file into a DataFrame.
 
     Args:
         path: Path to a ``.csv``, ``.xlsx``, or ``.xls`` file.
         sheet: Worksheet name or index for Excel inputs (ignored for CSV).
+        text_columns: Columns to read as text rather than numbers (join keys,
+            so route ``"01"`` does not become ``1``). Names absent from the
+            file are ignored.
 
     Returns:
         The loaded DataFrame.
@@ -405,10 +410,20 @@ def load_table(path: Path, sheet: str | int = 0) -> pd.DataFrame:
 
     suffix = path.suffix.lower()
     if suffix == ".csv":
-        return pd.read_csv(path)
+        return pd.read_csv(path, dtype={col: str for col in text_columns})
     if suffix in {".xlsx", ".xls"}:
-        return pd.read_excel(path, sheet_name=sheet)
+        return pd.read_excel(path, sheet_name=sheet, dtype={col: str for col in text_columns})
     raise ValueError(f"Unsupported file type '{suffix}' for {path}. Use .csv, .xlsx, or .xls.")
+
+
+def _text_key(series: pd.Series) -> pd.Series:
+    """Return a join-key column as trimmed text, keeping leading zeros.
+
+    ``"01"`` and ``"1"`` stay distinct keys. A whole number that a float
+    round-trip wrote with a trailing ``.0`` (``"101.0"``) reads as ``"101"``.
+    """
+    text = series.astype("string").str.strip()
+    return text.str.replace(r"^(\d+)\.0+$", r"\1", regex=True)
 
 
 def assemble_model_table(
@@ -424,16 +439,20 @@ def assemble_model_table(
         feature_tables: Feature sources to merge in, each on its own join keys.
 
     Returns:
-        The merged modeling table, one row per anchor observation.
+        The merged modeling table, one row per anchor observation. Join keys
+        are compared as trimmed text on both sides.
 
     Raises:
         KeyError: If a feature table is missing one of its declared join keys.
+        ValueError: If a feature table repeats a key with differing values, or
+            carries a value column already on the anchor or an earlier table.
     """
-    merged = load_table(anchor_path, anchor_sheet)
+    all_keys = tuple(dict.fromkeys(k for ft in feature_tables for k in ft.join_keys))
+    merged = load_table(anchor_path, anchor_sheet, text_columns=all_keys)
     logging.info("Anchor table '%s' loaded: %d rows, %d cols.", anchor_path.name, *merged.shape)
 
     for ft in feature_tables:
-        df = load_table(ft.path, ft.sheet)
+        df = load_table(ft.path, ft.sheet, text_columns=ft.join_keys)
         missing = [k for k in ft.join_keys if k not in df.columns]
         if missing:
             raise KeyError(f"Feature table '{ft.label}' is missing join key(s): {missing}")
@@ -459,21 +478,34 @@ def assemble_model_table(
                 "side before joining."
             )
 
-        n_dup = int(df.duplicated(subset=list(ft.join_keys)).sum())
+        keys = list(ft.join_keys)
+        for key in keys:
+            merged[key] = _text_key(merged[key])
+            df[key] = _text_key(df[key])
+
+        subset = df[cols]
+        n_dup = int(subset.duplicated().sum())
+        subset = subset.drop_duplicates()
+        conflicting = subset.loc[subset.duplicated(subset=keys, keep=False), keys]
+        if not conflicting.empty:
+            examples = conflicting.drop_duplicates()
+            raise ValueError(
+                f"Feature table '{ft.label}' has {len(examples)} key(s) on {ft.join_keys} "
+                f"with conflicting values, e.g. {examples.head(5).to_dict('records')}. "
+                "Keep one row per key before joining."
+            )
         if n_dup:
             logging.warning(
-                "Feature table '%s' has %d duplicate row(s) on %s; keeping the first "
-                "occurrence of each key.",
+                "Feature table '%s' has %d exact duplicate row(s) on %s; dropped them.",
                 ft.label,
                 n_dup,
                 ft.join_keys,
             )
-        subset = df[cols].drop_duplicates(subset=list(ft.join_keys))
 
         before = len(merged)
         # The merge indicator counts matches exactly, unlike inferring them from a
         # value column that may itself contain legitimate NaNs.
-        merged = merged.merge(subset, on=list(ft.join_keys), how="left", indicator="_table_matched")
+        merged = merged.merge(subset, on=keys, how="left", indicator="_table_matched")
         matched = int((merged["_table_matched"] == "both").sum())
         merged = merged.drop(columns="_table_matched")
         logging.info(
@@ -514,16 +546,21 @@ def select_predictors(
         categoricals: Categorical predictors (kept even though non-numeric).
 
     Returns:
-        The ordered list of predictor column names.
+        The ordered list of predictor column names. Categoricals are always
+        included, after the explicit predictors when *explicit* leaves them out.
 
     Raises:
-        KeyError: If any explicitly named predictor is absent from ``df``.
+        KeyError: If any explicitly named or categorical predictor is absent
+            from ``df``.
     """
     if explicit:
-        missing = [c for c in explicit if c not in df.columns]
+        # Categoricals must reach the design matrix to be encoded, even when the
+        # explicit list leaves them out.
+        predictors = [*explicit, *(c for c in categoricals if c not in explicit)]
+        missing = [c for c in predictors if c not in df.columns]
         if missing:
             raise KeyError(f"Configured predictors not found in data: {missing}")
-        return list(explicit)
+        return predictors
 
     auto = [
         c
