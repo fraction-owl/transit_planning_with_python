@@ -61,6 +61,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import logging
+import math
 import os
 import sys
 import zipfile
@@ -853,12 +854,27 @@ def load_schedule(gtfs_path: Path, tods_path: Optional[Path]) -> Schedule:
 # =============================================================================
 
 
+def _coordinates(place: Optional[tuple[str, str]]) -> Optional[tuple[float, float]]:
+    """Parse a (stop_lat, stop_lon) text pair; None when missing or not numeric."""
+    if place is None:
+        return None
+    try:
+        lat, lon = float(place[0]), float(place[1])
+    except ValueError:
+        return None
+    return (lat, lon) if math.isfinite(lat) and math.isfinite(lon) else None
+
+
 def same_place(a: str, b: str, places: Mapping[str, tuple[str, str]]) -> bool:
-    """Return True if stops *a* and *b* are one place (same id or same coordinates)."""
+    """Return True if stops *a* and *b* are one place (same id or same coordinates).
+
+    Coordinates are compared as numbers, so ``38.8`` and ``38.800000`` match,
+    while stops at different coordinates (such as nearby bays) stay apart.
+    """
     if a == b:
         return True
-    pa, pb = places.get(a), places.get(b)
-    return pa is not None and pa == pb and all(pa)
+    pa = _coordinates(places.get(a))
+    return pa is not None and pa == _coordinates(places.get(b))
 
 
 def expand_by_service_set(movements: pd.DataFrame, sets: Sequence[tuple[str, ...]]) -> pd.DataFrame:

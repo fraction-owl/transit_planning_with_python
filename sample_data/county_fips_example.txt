@@ -1,0 +1,35 @@
+# Example county FIPS list for the Census scripts in scripts/national_data_tools/:
+# uscensus_table_build.py (COUNTY_FIPS_FILE), uscensus_tiger_join_gpd.py
+# (FIPS_FILE or --fips-file) and uscensus_tiger_join_arcpy.py (FIPS_FILE).
+#
+# Copy this file, edit the copy, and point the setting at it. The script then
+# keeps only the counties listed here, in place of its inline FIPS list.
+#
+# One 5-digit county FIPS code per line, leading zero included (01001, not
+# 1001). Anything after the code on the same line is ignored, so county lines
+# copied from the FCC's list work as they are:
+#
+#     https://transition.fcc.gov/oet/info/maps/census/fips/fips.txt
+#
+# Blank lines and anything after "#" are ignored. A file that lists no codes
+# stops the script with a message, and the Washington, DC area counties below
+# are commented out, so an unedited copy never filters to DC by mistake.
+# Remove the "# " in front of each county you want to keep.
+
+# District of Columbia
+# 11001  District of Columbia
+
+# Maryland
+# 24031  Montgomery County
+# 24033  Prince George's County
+
+# Virginia
+# 51013  Arlington County
+# 51059  Fairfax County
+# 51107  Loudoun County
+# 51153  Prince William County
+# 51510  Alexandria city
+# 51600  Fairfax city
+# 51610  Falls Church city
+# 51683  Manassas city
+# 51685  Manassas Park city

@@ -162,3 +162,72 @@ def test_integration_exports(input_df, tmp_path, monkeypatch) -> None:
     # Verify content of violation log
     content = log_out.read_text(encoding="utf-8")
     assert "20B" in content  # Should be listed as violation
+
+
+_COLUMNS = [
+    "SERIAL_NUMBER",
+    "ROUTE_NAME",
+    "DIRECTION_NAME",
+    "TRIP_START_TIME",
+    "BLOCK",
+    "MAX_LOAD",
+    "MAX_LOAD_P",
+    "ALL_RECORDS_MAX_LOAD",
+]
+
+
+def _write_workbook(path, rows) -> str:
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(_COLUMNS)
+    for row in rows:
+        ws.append(row)
+    wb.save(path)
+    return str(path)
+
+
+def test_numeric_excel_route_gets_its_configured_limit(tmp_path, monkeypatch) -> None:
+    """A numeric ROUTE_NAME cell (101) matches the configured text route "101"."""
+    monkeypatch.setattr(load_factor_monitor, "LOWER_LIMIT_ROUTES", ["101"])
+    path = _write_workbook(
+        tmp_path / "stats.xlsx",
+        [
+            [1, 101, "Inbound", "08:00", 1, 42, 42, 42],
+            [2, "007", "Inbound", "08:30", 2, 10, 10, 10],  # A text ID with a leading zero.
+        ],
+    )
+    data = load_factor_monitor.load_data(path)
+    data["TRIP_START_TIME"] = pd.to_datetime(data["TRIP_START_TIME"], format="%H:%M")
+    processed = load_factor_monitor.process_data(
+        data, bus_capacity=39, filter_in_routes=[], filter_out_routes=[], decimals=4
+    ).set_index("SERIAL_NUMBER")
+
+    assert processed.loc[1, "ROUTE_NAME"] == "101"
+    assert processed.loc[1, "LOAD_FACTOR"] == pytest.approx(1.0769)
+    assert processed.loc[1, "ROUTE_LIMIT_TYPE"] == "LOW"
+    assert processed.loc[1, "LOAD_FACTOR_VIOLATION"] == "TRUE"
+    assert processed.loc[2, "ROUTE_NAME"] == "007"
+
+
+def test_route_filters_and_limits_normalize_route_names(monkeypatch) -> None:
+    """Numeric route values, including floats from a column with blanks, match text config."""
+    monkeypatch.setattr(load_factor_monitor, "LOWER_LIMIT_ROUTES", [101])
+    data = pd.DataFrame(
+        {
+            "SERIAL_NUMBER": [1, 2, 3],
+            "ROUTE_NAME": [101.0, " 202 ", "007"],
+            "TRIP_START_TIME": pd.to_datetime(["08:00"] * 3, format="%H:%M"),
+            "MAX_LOAD": [42, 42, 42],
+        }
+    )
+    kept = load_factor_monitor.process_data(
+        data, bus_capacity=39, filter_in_routes=["101", 202], filter_out_routes=[], decimals=4
+    ).set_index("SERIAL_NUMBER")
+    assert sorted(kept.index) == [1, 2]
+    assert kept["ROUTE_NAME"].to_dict() == {1: "101", 2: "202"}
+    assert kept["ROUTE_LIMIT_TYPE"].to_dict() == {1: "LOW", 2: "HIGH"}
+    # "7" does not match the text ID "007": leading zeros are kept, not stripped.
+    dropped = load_factor_monitor.process_data(
+        data, bus_capacity=39, filter_in_routes=[], filter_out_routes=["7"], decimals=4
+    )
+    assert "007" in set(dropped["ROUTE_NAME"])

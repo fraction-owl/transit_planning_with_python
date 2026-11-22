@@ -17,7 +17,8 @@ Outputs
   measurement columns.
 - A CSV of monthly aggregates at ``MONTHLY_OUTPUT_PATH`` (``avg_temp_f``,
   ``max_daily_precip_in``, ``days_with_precip``, ``total_snow_in``,
-  ``max_daily_snow_in``), written only when that path is set.
+  ``max_daily_snow_in``), written only when that path is set. The input must then
+  hold a single station; a multi-station input stops the run before writing.
 - ``<output stem>_processing_log.txt`` (or ``LOG_PATH``): a .txt processing log
   written next to the output when ``WRITE_LOG`` is on (the default).
 
@@ -251,8 +252,26 @@ def aggregate_monthly(df: pd.DataFrame) -> pd.DataFrame:
         days_with_precip  — count of days with measurable precipitation (PRCP > 0)
         total_snow_in     — sum of daily snowfall
         max_daily_snow_in — peak single-day snowfall
+
+    A month with no readings for a measure gets NA for it, not 0. Long-name headers
+    from ``clean_weather(use_long_names=True)`` are mapped back to the NOAA codes.
+
+    Raises:
+        ValueError: If the frame holds more than one station (each station's
+            readings would count as separate days), or no recognised weather column.
     """
-    df = df.copy()
+    if "STATION" in df.columns:
+        stations = sorted(df["STATION"].dropna().astype(str).unique())
+        if len(stations) > 1:
+            shown = ", ".join(stations[:10]) + (" ..." if len(stations) > 10 else "")
+            raise ValueError(
+                f"Monthly aggregates need a single station, but the input has "
+                f"{len(stations)}: {shown}. Filter the input CSV to one STATION, or leave "
+                "MONTHLY_OUTPUT_PATH unset to write only the daily output."
+            )
+
+    # rename returns a copy, so the caller's frame is left untouched.
+    df = df.rename(columns={long: code for code, long in COLUMN_LONG_NAMES.items()})
     df["period"] = df["DATE"].dt.to_period("M").astype(str)
 
     agg: dict[str, Any] = {}
@@ -265,10 +284,15 @@ def aggregate_monthly(df: pd.DataFrame) -> pd.DataFrame:
 
     if "PRCP" in df.columns:
         agg["max_daily_precip_in"] = pd.NamedAgg(column="PRCP", aggfunc="max")
-        agg["days_with_precip"] = pd.NamedAgg(column="PRCP", aggfunc=lambda x: int((x > 0).sum()))
+        # A month with no PRCP readings is unobserved, not dry.
+        agg["days_with_precip"] = pd.NamedAgg(
+            column="PRCP",
+            aggfunc=lambda x: int((x > 0).sum()) if x.notna().any() else pd.NA,
+        )
 
     if "SNOW" in df.columns:
-        agg["total_snow_in"] = pd.NamedAgg(column="SNOW", aggfunc="sum")
+        # min_count=1 keeps a month with no SNOW readings NaN; a plain sum gives 0.
+        agg["total_snow_in"] = pd.NamedAgg(column="SNOW", aggfunc=lambda x: x.sum(min_count=1))
         agg["max_daily_snow_in"] = pd.NamedAgg(column="SNOW", aggfunc="max")
 
     if not agg:
@@ -277,6 +301,8 @@ def aggregate_monthly(df: pd.DataFrame) -> pd.DataFrame:
         )
 
     monthly = df.groupby("period").agg(**agg).reset_index()
+    if "days_with_precip" in monthly.columns:
+        monthly["days_with_precip"] = monthly["days_with_precip"].astype("Int64")
 
     rounding = {
         "avg_temp_f": 1,
@@ -338,6 +364,9 @@ def run(
         # the bare-read inference path.
         raw = pd.read_csv(input_path, dtype={"STATION": "string"})
         clean = clean_weather(raw, use_long_names=use_long_names)
+        # Aggregate before writing anything, so an input the monthly step rejects
+        # leaves no half-finished run behind.
+        monthly = aggregate_monthly(clean) if monthly_output_path is not None else None
 
         if output_path.suffix == ".parquet":
             clean.to_parquet(output_path, index=False)
@@ -346,8 +375,7 @@ def run(
 
         logger.info("%d rows x %d cols -> %s", len(clean), clean.shape[1], output_path)
 
-        if monthly_output_path is not None:
-            monthly = aggregate_monthly(clean)
+        if monthly is not None and monthly_output_path is not None:
             monthly.to_csv(monthly_output_path, index=False)
             logger.info("%d monthly rows -> %s", len(monthly), monthly_output_path)
     finally:

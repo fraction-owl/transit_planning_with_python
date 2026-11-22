@@ -18,6 +18,11 @@ no command‑line flags are required.  Adjust paths, time‑window parameters, o
 filters (e.g. selected `service_id`s, maximum trips per block, or specific
 `route_short_name`s) to match the target feed.
 
+Inputs
+------
+- A GTFS feed folder with ``trips.txt`` (including ``block_id``), ``routes.txt``,
+  ``stops.txt`` and ``stop_times.txt``. Other GTFS files are not read.
+
 Outputs
 -------
 - One Excel workbook per vehicle block (`block_<block_id>.xlsx`) in
@@ -301,51 +306,29 @@ def mark_first_and_last_stops(df_in: pd.DataFrame) -> pd.DataFrame:
 
 
 def _status_for_same_trip(minute: int, stop_info: tuple[Any, ...]) -> Optional[tuple[Any, ...]]:
+    """Return the status tuple for *minute* at one stop visit, or None if not there.
+
+    The trip's last stop is ARRIVE at its arrival minute and the first stop is DEPART
+    at its departure minute. An intermediate stop is ARRIVE/DEPART when both times fall
+    in the same minute; when they differ (a scheduled hold), it is ARRIVE at the
+    arrival minute and DEPART at the departure minute. Every other minute from arrival
+    through departure is DWELL.
+    """
     (arr, dep, s_id, s_name, t_id, is_first, is_last, s_seq, t_val) = stop_info
+    detail = (s_id, s_name, minutes_to_hhmm(arr), minutes_to_hhmm(dep), t_id, s_seq, t_val)
     if minute == arr and is_last:
-        return (
-            "ARRIVE",
-            s_id,
-            s_name,
-            minutes_to_hhmm(arr),
-            minutes_to_hhmm(dep),
-            t_id,
-            s_seq,
-            t_val,
-        )
+        return ("ARRIVE",) + detail
     if minute == dep and is_first:
-        return (
-            "DEPART",
-            s_id,
-            s_name,
-            minutes_to_hhmm(arr),
-            minutes_to_hhmm(dep),
-            t_id,
-            s_seq,
-            t_val,
-        )
-    if arr == dep and minute == arr:
-        return (
-            "ARRIVE/DEPART",
-            s_id,
-            s_name,
-            minutes_to_hhmm(arr),
-            minutes_to_hhmm(dep),
-            t_id,
-            s_seq,
-            t_val,
-        )
-    if arr < minute < dep:
-        return (
-            "DWELL",
-            s_id,
-            s_name,
-            minutes_to_hhmm(arr),
-            minutes_to_hhmm(dep),
-            t_id,
-            s_seq,
-            t_val,
-        )
+        return ("DEPART",) + detail
+    if not is_first and not is_last:
+        if minute == arr == dep:
+            return ("ARRIVE/DEPART",) + detail
+        if minute == arr:
+            return ("ARRIVE",) + detail
+        if minute == dep:
+            return ("DEPART",) + detail
+    if arr <= minute <= dep:
+        return ("DWELL",) + detail
     return None
 
 
@@ -538,6 +521,13 @@ def _status_for_active_trips(
 
 
 def _row_for_inactive(minute: int, block_id: str, trips: list[dict[str, Any]]) -> dict[str, Any]:
+    """Build the row for a minute between (or outside) a block's trips.
+
+    Between two trips that meet at the same stop, the gap length picks DWELL,
+    LAYOVER or LONG BREAK. When the previous trip ends at a different stop from
+    where the next one starts, the whole gap is DEADHEAD: the bus has to move, and
+    GTFS does not say when it leaves one stop or reaches the other.
+    """
     prev_trip = next_trip = None
     for trip in trips:
         if trip["end"] < minute:
@@ -548,13 +538,14 @@ def _row_for_inactive(minute: int, block_id: str, trips: list[dict[str, Any]]) -
                 next_trip = trip
 
     if prev_trip and next_trip:
-        gap = next_trip["start"] - prev_trip["end"]
-        if gap <= DWELL_THRESHOLD:
-            status = "DWELL"
-        elif gap <= LAYOVER_THRESHOLD:
-            status = "LAYOVER"
-        else:
-            status = "LONG BREAK"
+        last_stop = prev_trip["stop_times_sequence"][-1]
+        status, _, _ = _status_for_different_trip(
+            prev_trip["end"],
+            next_trip["start"],
+            last_stop[2],
+            last_stop[3],
+            next_trip["stop_times_sequence"][0][2],
+        )
     else:
         status = "INACTIVE"
 
@@ -669,14 +660,15 @@ def _build_schedule_rows(  # type: ignore[override]
                 if status == "EMPTY":
                     status = "TRAVELING BETWEEN STOPS"
 
-                # Promote DWELL/LAYOVER → LOADING when a departure is imminent
+                # Promote DWELL/LAYOVER → LOADING when the trip's departure from its
+                # first stop is imminent. A hold at an intermediate stop also ends in
+                # a DEPART, but stays DWELL.
                 if status in {"DWELL", "LAYOVER"}:
                     nxt_min = minute + TIME_INTERVAL_MIN
                     if nxt_min <= chosen_trip["end"]:
-                        if (
-                            get_status_for_minute(nxt_min, chosen_trip["stop_times_sequence"])[0]
-                            == "DEPART"
-                        ):
+                        sequence = chosen_trip["stop_times_sequence"]
+                        nxt_stat = get_status_for_minute(nxt_min, sequence)
+                        if nxt_stat[0] == "DEPART" and nxt_stat[6] == sequence[0][7]:
                             status = "LOADING"
 
                 row: dict[str, Any] = {
@@ -892,7 +884,9 @@ def run() -> int:
     validate_folders(gtfs_path, out_path)
 
     logging.info("Loading GTFS …")
-    gtfs = load_gtfs_data(str(gtfs_path))
+    gtfs = load_gtfs_data(
+        str(gtfs_path), files=("trips.txt", "routes.txt", "stops.txt", "stop_times.txt")
+    )
 
     # ── Merge, mark, filter ────────────────────────────────────────────────────
     trips = gtfs["trips"]
