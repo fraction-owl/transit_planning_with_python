@@ -2,7 +2,7 @@
 
 Official route maps usually show one version of a route. This script finds every
 distinct way a route's trips actually run — a pattern is a unique combination of
-route, direction, path (shape geometry) and ordered stop list, optionally
+route (within its agency), direction, path (shape geometry) and ordered stop list, optionally
 including pickup/drop-off restrictions — and draws each one in its own map
 panel: the pattern's line with arrows for the direction of travel, its stops,
 and the route's other patterns in light gray for context. Each panel lists the
@@ -26,6 +26,8 @@ Outputs
 -------
 - ``pattern_maps/route_<name>_dir<id>.png``: one figure per route and
   direction, one panel per pattern (long lists continue in ``_p2``, ``_p3`` …).
+  When agencies share a route name, the stem adds the agency_id
+  (``route_<name>_<agency_id>_dir<id>``).
 - ``pattern_summary.csv``: one row per pattern — trips, day-type counts and
   first/last departures, terminals, length, and differences from P1.
 - ``pattern_stops.csv``: the ordered stop list of every pattern.
@@ -1099,8 +1101,9 @@ def build_trip_table(
         shape_canon: Output of :func:`group_identical_shapes`.
 
     Returns:
-        DataFrame with ``trip_id``, ``route_id``, ``route_label``,
-        ``route_long_name``, ``service_id``, ``direction_id``, ``shape_id``,
+        DataFrame with ``trip_id``, ``route_id``, ``agency_id`` (blank when
+        routes.txt has none), ``route_label``, ``route_long_name``,
+        ``service_id``, ``direction_id``, ``shape_id``,
         ``path_key`` (canonical shape_id, blank when the trip has no usable
         shape), ``trip_headsign``, ``stop_ids`` and ``boarding`` (tuples in
         stop order) and ``start_min`` (first departure, minutes past midnight).
@@ -1125,14 +1128,21 @@ def build_trip_table(
         if "route_long_name" in routes.columns
         else pd.Series("", index=routes.index)
     )
+    agency = (
+        routes["agency_id"].fillna("").astype(str).str.strip()
+        if "agency_id" in routes.columns
+        else pd.Series("", index=routes.index)
+    )
     route_info = pd.DataFrame(
         {
             "route_id": routes["route_id"].astype(str).str.strip(),
+            "agency_id": agency,
             "route_label": [route_label(s, r) for s, r in zip(short, routes["route_id"])],
             "route_long_name": long_name,
         }
     ).drop_duplicates("route_id")
     table = table.merge(route_info, on="route_id", how="left")
+    table["agency_id"] = table["agency_id"].fillna("")
     table["route_label"] = table["route_label"].fillna(table["route_id"])
     table["route_long_name"] = table["route_long_name"].fillna("")
 
@@ -1192,12 +1202,13 @@ def find_patterns(
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Group trips into unique patterns and rank them within each route/direction.
 
-    A pattern is a unique (route label, direction_id, path key, stop list)
-    combination, plus the per-stop boarding restrictions when
-    *split_on_boarding* is True. Patterns are grouped by route *label* (the
-    public route number), so per-calendar route_ids that share a short name
-    map together. Within each route and direction, patterns are ranked by trip
-    count (then by stop count); ``P1`` is the main pattern.
+    A pattern is a unique (agency_id, route label, direction_id, path key,
+    stop list) combination, plus the per-stop boarding restrictions when
+    *split_on_boarding* is True. Patterns are grouped by agency and route
+    *label* (the public route number), so per-calendar route_ids that share a
+    short name map together, while another agency's route with the same
+    number stays separate. Within each route and direction, patterns are
+    ranked by trip count (then by stop count); ``P1`` is the main pattern.
 
     Args:
         trip_table: Output of :func:`build_trip_table`.
@@ -1212,6 +1223,7 @@ def find_patterns(
     restrictions = trip_table["boarding"] if split_on_boarding else [()] * len(trip_table)
     keys = list(
         zip(
+            trip_table["agency_id"],
             trip_table["route_label"],
             trip_table["direction_id"],
             trip_table["path_key"],
@@ -1226,12 +1238,13 @@ def find_patterns(
     records: list[dict[str, Any]] = []
     for key, pos_list in positions.items():
         grp = trip_table.iloc[pos_list]
-        label, direction, path_key, stop_ids, _ = key
+        agency_id, label, direction, path_key, stop_ids, _ = key
         headsigns = grp.loc[grp["trip_headsign"] != "", "trip_headsign"]
         starts = grp["start_min"].dropna()
         first_trip = grp.sort_values(["start_min", "trip_id"], kind="mergesort").iloc[0]
         records.append(
             {
+                "agency_id": agency_id,
                 "route_label": label,
                 "route_ids": ", ".join(sorted(set(grp["route_id"]))),
                 "route_long_name": grp["route_long_name"].iloc[0],
@@ -1258,20 +1271,21 @@ def find_patterns(
         [
             "_route_sort",
             "route_label",
+            "agency_id",
             "direction_id",
             "n_trips",
             "n_stops",
             "path_key",
             "_stop_key",
         ],
-        ascending=[True, True, True, False, False, True, True],
+        ascending=[True, True, True, True, False, False, True, True],
         kind="mergesort",
     ).reset_index(drop=True)
-    patterns["pattern_rank"] = patterns.groupby(["route_label", "direction_id"]).cumcount() + 1
+    direction_keys = ["agency_id", "route_label", "direction_id"]
+    patterns["pattern_rank"] = patterns.groupby(direction_keys).cumcount() + 1
     patterns["pattern_id"] = "P" + patterns["pattern_rank"].astype(str)
     patterns["share_of_direction_trips"] = (
-        patterns["n_trips"]
-        / patterns.groupby(["route_label", "direction_id"])["n_trips"].transform("sum")
+        patterns["n_trips"] / patterns.groupby(direction_keys)["n_trips"].transform("sum")
     ).round(3)
 
     pattern_index = np.empty(len(trip_table), dtype=int)
@@ -1512,12 +1526,12 @@ def compare_with_main(
         "differs_from_main": [],
     }
     mains = {
-        (row["route_label"], row["direction_id"]): row
+        (row["agency_id"], row["route_label"], row["direction_id"]): row
         for row in patterns[patterns["pattern_rank"] == 1].to_dict("records")
     }
-    buffers: dict[tuple[str, str], Any] = {}
+    buffers: dict[tuple[str, str, str], Any] = {}
     for row in patterns.to_dict("records"):
-        group = (row["route_label"], row["direction_id"])
+        group = (row["agency_id"], row["route_label"], row["direction_id"])
         main = mains[group]
         columns["main_pattern_id"].append(main["pattern_id"])
         if row["pattern_rank"] == 1:
@@ -1637,6 +1651,7 @@ def build_pattern_stops_table(patterns: pd.DataFrame, stops: pd.DataFrame) -> pd
             rows.append(
                 {
                     "route": row.route_label,
+                    "agency_id": row.agency_id,
                     "direction_id": row.direction_id,
                     "pattern_id": row.pattern_id,
                     "stop_order": order,
@@ -1968,6 +1983,7 @@ def plot_route_direction(
     n_columns: int,
     dpi: int,
     arrows_across: int,
+    show_agency: bool = False,
 ) -> list[tuple[Path, list[int]]]:
     """Write the figure(s) for one route and direction, one panel per pattern.
 
@@ -1984,6 +2000,8 @@ def plot_route_direction(
         n_columns: Panels per row.
         dpi: PNG resolution.
         arrows_across: Arrows across the panel diagonal.
+        show_agency: Name the agency_id in the title, for a route number that
+            more than one agency uses.
 
     Returns:
         List of (PNG path, pattern_index values drawn in it).
@@ -1995,6 +2013,8 @@ def plot_route_direction(
     first = rows.iloc[0]
     direction = first["direction_id"] or "(none)"
     title = f"Route {first['route_label']}"
+    if show_agency and first["agency_id"]:
+        title += f" (agency {first['agency_id']})"
     if first["route_long_name"]:
         title += f" — {first['route_long_name']}"
     title += f"\nDirection {direction} · {len(rows)} pattern(s)"
@@ -2115,21 +2135,26 @@ def clip_backdrop(
     return gpd.clip(subset, window)
 
 
-def unique_base_names(groups: Sequence[tuple[str, str]]) -> dict[tuple[str, str], str]:
-    """Map each (route_label, direction_id) to a unique, filesystem-safe file stem.
+def unique_base_names(
+    groups: Sequence[tuple[str, str, str]], shared_labels: Optional[set[str]] = None
+) -> dict[tuple[str, str, str], str]:
+    """Map each (agency_id, route_label, direction_id) to a unique, filesystem-safe file stem.
 
-    Stems are deduplicated case-insensitively so they stay unique on Windows.
+    A label in *shared_labels* (used by more than one agency) gets its
+    agency_id in the stem. Stems are deduplicated case-insensitively so they
+    stay unique on Windows.
     """
     used: set[str] = set()
-    names: dict[tuple[str, str], str] = {}
-    for label, direction in groups:
-        stem = f"route_{sanitize_filename_component(label)}_dir"
+    names: dict[tuple[str, str, str], str] = {}
+    for agency, label, direction in groups:
+        name = f"{label}_{agency}" if label in (shared_labels or set()) and agency else label
+        stem = f"route_{sanitize_filename_component(name)}_dir"
         stem += sanitize_filename_component(direction) if direction else "none"
         candidate, n = stem, 2
         while candidate.lower() in used:
             candidate, n = f"{stem}_{n}", n + 1
         used.add(candidate.lower())
-        names[(label, direction)] = candidate
+        names[(agency, label, direction)] = candidate
     return names
 
 
@@ -2142,6 +2167,7 @@ def build_summary_table(
     out = pd.DataFrame(
         {
             "route": patterns["route_label"],
+            "agency_id": patterns["agency_id"],
             "route_ids": patterns["route_ids"],
             "route_long_name": patterns["route_long_name"],
             "direction_id": patterns["direction_id"],
@@ -2463,14 +2489,21 @@ def run(
 
     maps_dir = output_dir / MAPS_SUBDIR
     maps_dir.mkdir(parents=True, exist_ok=True)
-    groups = list(dict.fromkeys(zip(patterns["route_label"], patterns["direction_id"])))
-    base_names = unique_base_names(groups)
+    groups = list(
+        dict.fromkeys(zip(patterns["agency_id"], patterns["route_label"], patterns["direction_id"]))
+    )
+    agencies_per_label = patterns.groupby("route_label")["agency_id"].nunique()
+    shared_labels = set(agencies_per_label[agencies_per_label > 1].index)
+    base_names = unique_base_names(groups, shared_labels)
+    n_routes = len(patterns[["agency_id", "route_label"]].drop_duplicates())
     map_files: dict[int, str] = {}
     n_figures = 0
-    for label, route_rows in patterns.groupby("route_label", sort=False):
+    for (agency, label), route_rows in patterns.groupby(["agency_id", "route_label"], sort=False):
+        show_agency = label in shared_labels and bool(agency)
+        route_name = f"{label} (agency {agency})" if show_agency else label
         points = [stop_xy[s] for ids in route_rows["stop_ids"] for s in ids if s in stop_xy]
         if not points and route_rows["geometry"].isna().all():
-            logging.warning("Route %s has no mappable geometry or stops; skipped.", label)
+            logging.warning("Route %s has no mappable geometry or stops; skipped.", route_name)
             continue
         extent = route_extent(list(route_rows["geometry"]), points)
         route_backdrop = clip_backdrop(backdrop, extent)
@@ -2483,11 +2516,12 @@ def run(
                 route_backdrop,
                 day_selection,
                 maps_dir,
-                base_names[(str(label), str(direction))],
+                base_names[(str(agency), str(label), str(direction))],
                 max_panels,
                 panel_columns,
                 dpi,
                 arrows_across,
+                show_agency,
             )
             for path, indexes in written:
                 for idx in indexes:
@@ -2495,7 +2529,7 @@ def run(
             n_figures += len(written)
             logging.info(
                 "Route %s direction %s: %d pattern(s) — %s",
-                label,
+                route_name,
                 direction or "(none)",
                 len(rows),
                 ", ".join(f"{p} {n} trips" for p, n in zip(rows["pattern_id"], rows["n_trips"])),
@@ -2524,7 +2558,7 @@ def run(
         f"Projected CRS:        {crs.to_string()} ({crs.name})",
         f"Backdrop:             {backdrop_path or '-'}"
         + (f" ({backdrop_zip_member})" if backdrop_zip_member else ""),
-        f"Routes mapped:        {patterns['route_label'].nunique()}",
+        f"Routes mapped:        {n_routes}",
         f"Patterns found:       {len(patterns)}",
         f"Figures written:      {n_figures} in {maps_dir}",
         f"Summary CSV:          {summary_path}",
@@ -2540,7 +2574,7 @@ def run(
     logging.info(
         "Pattern map export complete — %d pattern(s) across %d route(s), %d figure(s).",
         len(patterns),
-        patterns["route_label"].nunique(),
+        n_routes,
         n_figures,
     )
     return summary

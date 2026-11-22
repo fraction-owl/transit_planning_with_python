@@ -14,6 +14,10 @@ Key Features
   observed U.S. federal holidays or the dates in EXTRA_HOLIDAY_DATES.
 * Computes per-route variants, directions, average trip distance, duration,
   and speed from the trips whose service has at least one active date.
+  A trip's distance comes from ``shape_dist_traveled`` in stop_times.txt,
+  else from the part of its shape between its first and last stops (placed
+  with stops.txt coordinates). A trip whose end stops cannot be placed on
+  its shape unambiguously is left out of distance and speed.
 * Optionally joins service-type, corridor, last-changed, and ridership
   lookups keyed on route_id.
 * Exports a formatted, print-ready XLSX wall chart suitable for field use.
@@ -23,11 +27,13 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import math
 import os
 import zipfile
 from collections.abc import Mapping, Sequence
 from typing import Any, Optional, Union
 
+import numpy as np
 import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
@@ -45,6 +51,13 @@ OUTPUT_FILENAME = "routes_summary.xlsx"
 DISTANCE_UNIT = "meters"  # meters | kilometers | feet | miles
 OUTPUT_UNITS = "imperial"  # imperial (mi/mph) or metric (km/kmh)
 EXCLUDED_ROUTE_SHORT_NAMES = []  # e.g. ["9999A", "9999B", "9999C"]
+
+# A trip with no shape_dist_traveled in stop_times.txt is measured along its
+# shape between its first and last stops. A stop farther than this from the
+# shape cannot be placed on it, and the trip's distance is left blank; so is
+# a trip whose end stops fit the shape more than one way (e.g. a short trip
+# on an out-and-back shape). 330 ft is about 100 m.
+SHAPE_STOP_TOLERANCE_FT: float = 330.0
 
 SERVICE_TYPES_PATH = ""
 CORRIDORS_PATH = ""
@@ -598,23 +611,191 @@ def first_to_last_distance(df: pd.DataFrame, id_col: str, seq_col: str) -> pd.Se
     return span[span > 0]
 
 
+def shape_passes_near(
+    shape: pd.DataFrame, lat: float, lon: float, tolerance_m: float
+) -> list[float]:
+    """Return where *shape* passes within *tolerance_m* of a point.
+
+    Each run of consecutive shape segments within the tolerance is one pass,
+    placed at the run's closest point to the point, so a shape that comes
+    back past a stop (a loop's terminal, an out-and-back street) yields one
+    pass per visit. Lengths use a local flat-earth approximation.
+
+    Args:
+        shape: One shape's points in order, with numeric ``lat``, ``lon`` and
+            ``dist`` (``shape_dist_traveled``) columns.
+        lat: Latitude of the point, e.g. a stop.
+        lon: Longitude of the point.
+        tolerance_m: Farthest the shape may be from the point, in metres.
+
+    Returns:
+        The ``shape_dist_traveled`` of each pass, in shape order (NaN where a
+        nearby shape point has no distance); empty if the shape never comes
+        within *tolerance_m*.
+    """
+    earth_radius_m = 6_371_008.8
+    x_scale = earth_radius_m * math.cos(math.radians(lat))
+    xs = np.radians(shape["lon"].to_numpy(dtype=float)) * x_scale
+    ys = np.radians(shape["lat"].to_numpy(dtype=float)) * earth_radius_m
+    px, py = math.radians(lon) * x_scale, math.radians(lat) * earth_radius_m
+    dists = shape["dist"].to_numpy(dtype=float)
+
+    # Closest point of each segment to the stop, as a 0-1 fraction along it.
+    dx, dy = np.diff(xs), np.diff(ys)
+    length_sq = dx * dx + dy * dy
+    along = (px - xs[:-1]) * dx + (py - ys[:-1]) * dy
+    frac = np.divide(along, length_sq, out=np.zeros_like(along), where=length_sq > 0)
+    frac = np.clip(frac, 0.0, 1.0)
+    gap = np.hypot(xs[:-1] + frac * dx - px, ys[:-1] + frac * dy - py)
+
+    passes: list[float] = []
+    near = gap <= tolerance_m
+    start = 0
+    while start < len(near):
+        if not near[start]:
+            start += 1
+            continue
+        end = start
+        while end + 1 < len(near) and near[end + 1]:
+            end += 1
+        k = start + int(np.argmin(gap[start : end + 1]))
+        passes.append(float(dists[k] + frac[k] * (dists[k + 1] - dists[k])))
+        start = end + 1
+    return passes
+
+
+def shape_lengths_between_stops(
+    trips_df: pd.DataFrame,
+    stop_times_df: pd.DataFrame,
+    shapes_df: pd.DataFrame,
+    stops_df: Optional[pd.DataFrame],
+    tolerance_m: float,
+) -> pd.Series:
+    """Measure each trip along its shape from its first stop to its last.
+
+    Both end stops are placed on the trip's shape with
+    :func:`shape_passes_near`. A trip gets a distance only when exactly one
+    pairing of a first-stop pass with a later last-stop pass exists. A loop
+    that starts and ends at one stop pairs one way, from the shape's start
+    to its end. A stop off the shape, or end stops that pair more than one
+    way (e.g. a short trip on an out-and-back shape), leaves the trip out
+    rather than guessing.
+
+    Args:
+        trips_df: Trips to measure, with ``trip_id`` and ``shape_id``.
+        stop_times_df: Parsed ``stop_times.txt``.
+        shapes_df: Parsed ``shapes.txt``.
+        stops_df: Parsed ``stops.txt``, or ``None``.
+        tolerance_m: Farthest a stop may be from its shape, in metres.
+
+    Returns:
+        Series indexed by ``trip_id`` with distances in the feed's units.
+    """
+    lengths: dict[str, float] = {}
+    if trips_df.empty:
+        return pd.Series(lengths, dtype=float).rename_axis("trip_id")
+    if (
+        stops_df is None
+        or not {"stop_id", "stop_lat", "stop_lon"} <= set(stops_df.columns)
+        or not {"shape_pt_lat", "shape_pt_lon"} <= set(shapes_df.columns)
+        or "stop_id" not in stop_times_df.columns
+    ):
+        logging.warning(
+            "%d trip(s) have no stop_times distance, and stop or shape coordinates are "
+            "unavailable to measure them along their shape; their distance is left blank.",
+            len(trips_df),
+        )
+        return pd.Series(lengths, dtype=float).rename_axis("trip_id")
+
+    coords = pd.DataFrame(
+        {
+            "stop_id": stops_df["stop_id"],
+            "lat": pd.to_numeric(stops_df["stop_lat"], errors="coerce"),
+            "lon": pd.to_numeric(stops_df["stop_lon"], errors="coerce"),
+        }
+    )
+    coords = coords.dropna().drop_duplicates("stop_id").set_index("stop_id")
+
+    calls = stop_times_df[stop_times_df["trip_id"].isin(trips_df["trip_id"])]
+    calls = calls.assign(_seq=pd.to_numeric(calls["stop_sequence"], errors="coerce"))
+    calls = calls.dropna(subset=["_seq"]).sort_values(["trip_id", "_seq"], kind="stable")
+    ends = calls.groupby("trip_id")["stop_id"].agg(["first", "last"])
+
+    points = pd.DataFrame(
+        {
+            "shape_id": shapes_df["shape_id"],
+            "seq": pd.to_numeric(shapes_df["shape_pt_sequence"], errors="coerce"),
+            "lat": pd.to_numeric(shapes_df["shape_pt_lat"], errors="coerce"),
+            "lon": pd.to_numeric(shapes_df["shape_pt_lon"], errors="coerce"),
+            "dist": pd.to_numeric(shapes_df["shape_dist_traveled"], errors="coerce"),
+        }
+    )
+    points = points[points["shape_id"].isin(trips_df["shape_id"])]
+    points = points.dropna(subset=["seq", "lat", "lon"]).sort_values(
+        ["shape_id", "seq"], kind="stable"
+    )
+    shapes = {shape_id: grp for shape_id, grp in points.groupby("shape_id")}
+
+    passes_cache: dict[tuple[str, str], list[float]] = {}
+
+    def passes(shape_id: str, stop_id: str) -> list[float]:
+        key = (shape_id, stop_id)
+        if key not in passes_cache:
+            shape = shapes.get(shape_id)
+            if shape is None or stop_id not in coords.index:
+                passes_cache[key] = []
+            else:
+                lat, lon = coords.loc[stop_id, ["lat", "lon"]]
+                passes_cache[key] = shape_passes_near(shape, lat, lon, tolerance_m)
+        return passes_cache[key]
+
+    for trip_id, shape_id in zip(trips_df["trip_id"], trips_df["shape_id"]):
+        if trip_id not in ends.index:
+            continue
+        origin = passes(shape_id, ends.loc[trip_id, "first"])
+        dest = passes(shape_id, ends.loc[trip_id, "last"])
+        if any(math.isnan(d) for d in origin + dest):
+            continue
+        spans = [b - a for a in origin for b in dest if b > a]
+        if len(spans) == 1:
+            lengths[trip_id] = spans[0]
+
+    unplaced = len(trips_df) - len(lengths)
+    if unplaced:
+        logging.warning(
+            "%d trip(s) have no stop_times distance, and their first and last stops could "
+            "not be placed unambiguously on their shape (within %.0f m); their distance is "
+            "left blank.",
+            unplaced,
+            tolerance_m,
+        )
+    return pd.Series(lengths, dtype=float).rename_axis("trip_id")
+
+
 def trip_distances_meters(
     stop_times_df: pd.DataFrame,
     shapes_df: Optional[pd.DataFrame],
     trips_df: pd.DataFrame,
     distance_unit: str,
+    stops_df: Optional[pd.DataFrame] = None,
+    tolerance_ft: float = SHAPE_STOP_TOLERANCE_FT,
 ) -> pd.Series:
     """Return a ``trip_id`` -> meters Series for all trips with a known length.
 
     Each trip uses ``stop_times.txt`` distances when its first and last stops
-    both have them, and otherwise falls back to the full length of its shape
-    in ``shapes.txt``. Trips with neither are left out.
+    both have them. Otherwise it is measured along its shape in
+    ``shapes.txt`` between its first and last stops (see
+    :func:`shape_lengths_between_stops`), so a short trip on a longer shape
+    is not given the whole shape's length. Trips with neither are left out.
 
     Args:
         stop_times_df: Parsed ``stop_times.txt``.
         shapes_df: Parsed ``shapes.txt`` or ``None``.
         trips_df: Parsed ``trips.txt``.
         distance_unit: Unit of ``shape_dist_traveled`` in the feed.
+        stops_df: Parsed ``stops.txt``, used to place stops on shapes. Without
+            it, trips lacking ``stop_times.txt`` distances are left out.
+        tolerance_ft: Farthest a stop may be from its shape, in feet.
 
     Returns:
         Series indexed by ``trip_id`` with distances in metres.
@@ -637,10 +818,11 @@ def trip_distances_meters(
         and {"shape_id", "shape_pt_sequence", "shape_dist_traveled"} <= set(shapes_df.columns)
         and "shape_id" in trips_df.columns
     ):
-        per_shape = first_to_last_distance(shapes_df, "shape_id", "shape_pt_sequence") * factor
-        from_shapes = trips_df.set_index("trip_id")["shape_id"].map(per_shape).dropna()
-        from_shapes = from_shapes[~from_shapes.index.isin(per_trip.index)]
-        per_trip = pd.concat([per_trip, from_shapes.astype(float)])
+        pending = trips_df[~trips_df["trip_id"].isin(per_trip.index) & trips_df["shape_id"].notna()]
+        from_shapes = shape_lengths_between_stops(
+            pending, stop_times_df, shapes_df, stops_df, tolerance_ft * 0.3048
+        )
+        per_trip = pd.concat([per_trip, from_shapes * factor])
 
     return per_trip
 
@@ -711,6 +893,7 @@ def build_summary(
     weekday_dow_share: float = WEEKDAY_DOW_SHARE,
     min_recurring_dates: int = MIN_RECURRING_DATES,
     extra_holiday_dates: Sequence[str] = EXTRA_HOLIDAY_DATES,
+    stops_df: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """Assemble the per-route summary DataFrame.
 
@@ -727,6 +910,8 @@ def build_summary(
         min_recurring_dates: Forwarded to :func:`classify_services`.
         extra_holiday_dates: Agency holidays added to the observed federal
             holidays; see :func:`holiday_dates_for`.
+        stops_df: Parsed ``stops.txt`` or ``None``; forwarded to
+            :func:`trip_distances_meters`.
 
     Returns:
         One-row-per-route :class:`pandas.DataFrame` ready for export. Trips
@@ -739,7 +924,7 @@ def build_summary(
         weekday_dow_share=weekday_dow_share,
         min_recurring_dates=min_recurring_dates,
     )
-    dist_m = trip_distances_meters(stop_times_df, shapes_df, trips_df, distance_unit)
+    dist_m = trip_distances_meters(stop_times_df, shapes_df, trips_df, distance_unit, stops_df)
     dur_s = trip_durations_seconds(stop_times_df)
 
     t = trips_df.copy()
@@ -991,6 +1176,12 @@ def main() -> int:
         except OSError as exc:
             logging.warning("shapes.txt unavailable: %s", exc)
 
+        stops_df: Optional[pd.DataFrame] = None
+        try:
+            stops_df = load_gtfs_data(GTFS_FOLDER_PATH, files=("stops.txt",)).get("stops")
+        except OSError as exc:
+            logging.warning("stops.txt unavailable (needed to measure trips on shapes): %s", exc)
+
         extras: dict[str, dict[str, str]] = {
             "service_types": load_optional_lookup(SERVICE_TYPES_PATH, "service_type"),
             "corridors": load_optional_lookup(CORRIDORS_PATH, "corridor"),
@@ -1010,6 +1201,7 @@ def main() -> int:
             weekday_dow_share=WEEKDAY_DOW_SHARE,
             min_recurring_dates=MIN_RECURRING_DATES,
             extra_holiday_dates=EXTRA_HOLIDAY_DATES,
+            stops_df=stops_df,
         )
 
         if summary.empty:
