@@ -128,9 +128,16 @@ def test_find_cluster() -> None:
 
 
 def test_status_for_same_trip_hold_occupies_both_boundaries() -> None:
-    hold = _stop(430, 431, "S2", first=False, last=False, seq=2)
-    statuses = [status_for_same_trip(m, hold, SETTINGS) for m in (429, 430, 431, 432)]
-    assert [s[0] if s else None for s in statuses] == [None, "DWELL", "DWELL", None]
+    hold = _stop(430, 433, "S2", first=False, last=False, seq=2)
+    statuses = [status_for_same_trip(m, hold, SETTINGS) for m in range(429, 435)]
+    assert [s[0] if s else None for s in statuses] == [
+        None,
+        "ARRIVE",
+        "DWELL",
+        "DWELL",
+        "DEPART",
+        None,
+    ]
 
 
 def test_status_for_same_trip_first_stop_and_through_stop() -> None:
@@ -182,9 +189,9 @@ def test_build_schedule_rows_through_dwell_stops_at_next_arrival() -> None:
     assert [(r["Status"], r["Stop ID"]) for r in rows] == [
         ("TRAVELING BETWEEN STOPS", ""),
         ("ARRIVE/DEPART", "S2"),
-        ("DWELL", "S3"),  # S2's two-minute dwell ends when the bus reaches S3
+        ("ARRIVE", "S3"),  # S2's two-minute dwell ends when the bus reaches S3
         ("DWELL", "S3"),
-        ("DWELL", "S3"),
+        ("DEPART", "S3"),
         ("TRAVELING BETWEEN STOPS", ""),
     ]
 
