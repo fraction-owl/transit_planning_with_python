@@ -670,13 +670,49 @@ def notebook_safe_argv(argv: Optional[Sequence[str]]) -> Optional[List[str]]:
 # ---- SCRIPT-SPECIFIC LOGIC --------------------------------------------------
 
 
+def _feed_has_file(gtfs_path: Path, file_name: str) -> bool:
+    """Return False only if the feed folder or ``.zip`` exists and lacks *file_name*.
+
+    A missing path, a path that is neither a folder nor a ``.zip``, or an
+    unreadable zip returns True, so ``load_gtfs_data`` reports the problem.
+    """
+    path = str(gtfs_path)
+    if os.path.isdir(path):
+        return os.path.exists(os.path.join(path, file_name))
+    if os.path.isfile(path) and path.lower().endswith(".zip"):
+        try:
+            with zipfile.ZipFile(path) as archive:
+                return any(os.path.basename(name) == file_name for name in archive.namelist())
+        except zipfile.BadZipFile:
+            return True
+    return True
+
+
 def _load_optional(gtfs_path: Path, file_name: str) -> Optional[pd.DataFrame]:
-    """Load one GTFS file via ``load_gtfs_data``, returning ``None`` if absent."""
+    """Load one GTFS file via ``load_gtfs_data``, returning ``None`` if absent.
+
+    A file that is present but cannot be read stops the run instead of being
+    skipped: dropping a damaged ``calendar_dates.txt`` would silently restore
+    every service its valid rows cancel.
+
+    Raises:
+        OSError: If the feed path is missing or the file cannot be read.
+        ValueError: If the feed path is not a folder or valid ``.zip``, or the
+            file is present but empty or not valid CSV.
+    """
+    if not _feed_has_file(gtfs_path, file_name):
+        logging.info("%s not in the feed — continuing without it.", file_name)
+        return None
     try:
         return load_gtfs_data(str(gtfs_path), files=(file_name,))[file_name[:-4]]
     except (OSError, ValueError) as exc:
-        logging.info("%s not usable (%s) — continuing without it.", file_name, exc)
-        return None
+        msg = (
+            f"Could not read {file_name} from '{gtfs_path}' ({exc}). The run stops "
+            "rather than continue without a file the feed includes; fix or remove it."
+        )
+        if isinstance(exc, OSError):
+            raise OSError(msg) from exc
+        raise ValueError(msg) from exc
 
 
 def _holidays_for(active_dates: Mapping[str, set[dt.date]]) -> set[dt.date]:
@@ -831,8 +867,10 @@ def run(
 
     Raises:
         ValueError: If the feed contains neither ``calendar.txt`` nor
-            ``calendar_dates.txt``.
-        OSError: If the run log is required but cannot be written.
+            ``calendar_dates.txt``, or one of them or ``trips.txt`` is present
+            but empty or not valid CSV.
+        OSError: If the feed path is missing, a present file cannot be read,
+            or the run log is required but cannot be written.
     """
     gtfs_path = GTFS_PATH if gtfs_path is None else Path(gtfs_path)
     output_dir = OUTPUT_DIR if output_dir is None else Path(output_dir)

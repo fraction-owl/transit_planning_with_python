@@ -145,3 +145,48 @@ def test_run_writes_panel_rollup_and_runlog(tmp_path: Path) -> None:
     rollup = pd.read_csv(tmp_path / target.ROLLUP_FILENAME)
     assert "runtime_mean_min" in rollup.columns
     assert not rollup.empty
+
+
+def _write_runtime_inputs(folder: Path, scheduled_ids: dict[str, str]) -> tuple[Path, Path]:
+    """One observed trip per route on 2026-01-05: 101 runs 10 min, 202 60 min, 303 30 min."""
+    minutes = {"101": 10, "202": 60, "303": 30}
+    visits = [
+        "service_date,trip_id_performed,trip_stop_sequence,actual_arrival_time,"
+        "actual_departure_time"
+    ]
+    trips = ["service_date,trip_id_performed,trip_id_scheduled,route_id,direction_id"]
+    for route, runtime in minutes.items():
+        end = f"2026-01-05T08:{runtime:02d}:00" if runtime < 60 else "2026-01-05T09:00:00"
+        visits.append(f"2026-01-05,P{route},1,2026-01-05T08:00:00,2026-01-05T08:00:00")
+        visits.append(f"2026-01-05,P{route},2,{end},{end}")
+        trips.append(f"2026-01-05,P{route},{scheduled_ids[route]},{route},0")
+    folder.mkdir()
+    (folder / "stop_visits.csv").write_text("\n".join(visits) + "\n")
+    (folder / "trips_performed.csv").write_text("\n".join(trips) + "\n")
+    return folder / "stop_visits.csv", folder / "trips_performed.csv"
+
+
+def test_blank_scheduled_trip_ids_fall_back_row_by_row(tmp_path: Path) -> None:
+    """Blank scheduled ids get their own route/direction/start keys, not one shared key."""
+    sv_path, tp_path = _write_runtime_inputs(tmp_path / "in", {"101": "", "202": " ", "303": "S3"})
+    joined = target.join_route_attributes(
+        target.compute_trip_runtimes(target.load_stop_visits(sv_path)),
+        target.load_trips_performed(tp_path),
+    ).set_index("route_id")
+    assert joined["trip_key"].to_dict() == {"101": "101_0_08:00", "202": "202_0_08:00", "303": "S3"}
+
+
+def test_run_keeps_routes_whose_scheduled_trip_ids_are_blank(tmp_path: Path) -> None:
+    """Two unrelated blank-id trips are not trimmed together out of the panel."""
+    sv_path, tp_path = _write_runtime_inputs(tmp_path / "in", {"101": "", "202": "", "303": "S3"})
+    cfg = target.Config(
+        stop_visits_path=sv_path,
+        trips_performed_path=tp_path,
+        output_dir=tmp_path / "out",
+        window_months=0,
+        min_obs_per_month=1,
+    )
+    panel = target.run(cfg)["panel"].set_index("route_id")
+    assert sorted(panel.index) == ["101", "202", "303"]
+    assert panel.loc["101", "runtime_mean_min"] == pytest.approx(10.0)
+    assert panel.loc["202", "runtime_mean_min"] == pytest.approx(60.0)

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import datetime as dt
+import logging
 import zipfile
 from pathlib import Path
 
@@ -12,6 +14,7 @@ from scripts.gtfs_exports.route_transfer_calculator import (
     build_output_tables,
     compute_transfers,
     distance_to_meters,
+    eligible_service_dates,
     has_timed_connection,
     parse_gtfs_time,
     service_ids_active_on_day,
@@ -162,13 +165,18 @@ def _stops_gdf() -> pd.DataFrame:
     )
 
 
-def _events() -> pd.DataFrame:
+def _events(
+    can_alight: tuple[bool, bool, bool] = (True, True, True),
+    can_board: tuple[bool, bool, bool] = (True, True, True),
+) -> pd.DataFrame:
     return pd.DataFrame(
         {
             "stop_id": ["S1", "S2", "S3"],
             "route_id": ["A", "B", "C"],
             "arrival_sec": [28800.0, 29100.0, 29100.0],
             "departure_sec": [28800.0, 29100.0, 29100.0],
+            "can_alight": list(can_alight),
+            "can_board": list(can_board),
         }
     )
 
@@ -200,6 +208,283 @@ def test_compute_transfers_spatial_only_ignores_time(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(rtc, "ENABLE_TIME_CHECK", False)
     results = compute_transfers(_stops_gdf(), _events(), _routes_table(), radius_m=400.0)
     assert set(results["A"].keys()) == {"B"}
+
+
+@pytest.mark.parametrize("time_check", [True, False])
+@pytest.mark.parametrize(
+    ("can_alight", "can_board"),
+    [
+        ((False, True, True), (True, True, True)),  # no drop-off from A at S1
+        ((True, True, True), (True, False, True)),  # no pickup onto B at S2
+    ],
+)
+def test_compute_transfers_requires_drop_off_and_pickup(
+    monkeypatch: pytest.MonkeyPatch,
+    time_check: bool,
+    can_alight: tuple[bool, bool, bool],
+    can_board: tuple[bool, bool, bool],
+) -> None:
+    monkeypatch.setattr(rtc, "ENABLE_TIME_CHECK", time_check)
+    monkeypatch.setattr(rtc, "MAX_TRANSFER_WAIT_MINUTES", 30.0)
+    monkeypatch.setattr(rtc, "WALK_SPEED_MPH", 3.0)
+
+    events = _events(can_alight=can_alight, can_board=can_board)
+    results = compute_transfers(_stops_gdf(), events, _routes_table(), radius_m=400.0)
+    assert results == {}
+
+
+def test_build_stop_events_reads_pickup_and_drop_off_types() -> None:
+    stop_times = pd.DataFrame(
+        {
+            "trip_id": ["T1"] * 5,
+            "stop_id": ["S1", "S2", "S3", "S4", "S5"],
+            "arrival_time": ["08:00:00"] * 5,
+            "departure_time": ["08:00:00"] * 5,
+            # 1 = not available; blank, 0, 2 (phone) and 3 (ask driver) still allow it.
+            "pickup_type": ["0", "1", None, "2", "3"],
+            "drop_off_type": ["1", "0", "3", None, "2"],
+        }
+    )
+    trips = pd.DataFrame({"trip_id": ["T1"], "route_id": ["A"], "service_id": ["WK"]})
+
+    events = rtc._build_stop_events(stop_times, trips, keep_service_ids=None)
+    assert events["can_board"].tolist() == [True, False, True, True, True]
+    assert events["can_alight"].tolist() == [False, True, True, True, True]
+
+    # Both columns are optional in GTFS; without them every stop allows both.
+    bare = rtc._build_stop_events(
+        stop_times.drop(columns=["pickup_type", "drop_off_type"]), trips, keep_service_ids=None
+    )
+    assert bare["can_board"].all()
+    assert bare["can_alight"].all()
+
+
+@pytest.mark.parametrize("time_check", [True, False])
+def test_main_skips_connector_stop_with_no_pickup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, time_check: bool
+) -> None:
+    # Feeder A arrives at the hub at 08:00; connector B leaves it at 08:05 but
+    # with pickup_type=1, so no rider can board B there.
+    monkeypatch.setattr(rtc, "ENABLE_TIME_CHECK", time_check)
+    monkeypatch.setattr(rtc, "TARGET_ROUTE_TOKENS", {"A"})
+    feed = tmp_path / "feed"
+    feed.mkdir()
+    (feed / "stops.txt").write_text(
+        "stop_id,stop_lat,stop_lon\nHUB,38.90,-77.00\nA0,38.95,-77.00\nB9,38.85,-77.00\n"
+    )
+    (feed / "routes.txt").write_text("route_id,route_short_name\nA,A\nB,B\n")
+    (feed / "trips.txt").write_text("route_id,service_id,trip_id\nA,WK,TA\nB,WK,TB\n")
+    stop_times = (
+        "trip_id,arrival_time,departure_time,stop_id,stop_sequence,pickup_type,drop_off_type\n"
+        "TA,07:50:00,07:50:00,A0,1,0,1\n"
+        "TA,08:00:00,08:00:00,HUB,2,1,0\n"
+        "TB,08:05:00,08:05:00,HUB,1,{hub_pickup},1\n"
+        "TB,08:15:00,08:15:00,B9,2,1,0\n"
+    )
+    (feed / "calendar.txt").write_text(
+        "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday\nWK,1,1,1,1,1,0,0\n"
+    )
+    argv = ["--gtfs-dir", str(feed), "--output-dir", str(tmp_path / "out")]
+
+    (feed / "stop_times.txt").write_text(stop_times.format(hub_pickup="1"))
+    assert rtc.main(argv) == 0
+    summary = pd.read_csv(tmp_path / "out" / "route_transfers_summary.csv", keep_default_na=False)
+    assert summary["transfer_routes"].tolist() == [""]
+
+    # Control: the same feed with boarding allowed at the hub finds A -> B.
+    (feed / "stop_times.txt").write_text(stop_times.format(hub_pickup="0"))
+    assert rtc.main(argv) == 0
+    summary = pd.read_csv(tmp_path / "out" / "route_transfers_summary.csv", keep_default_na=False)
+    assert summary["transfer_routes"].tolist() == ["B"]
+
+
+def test_build_stop_events_uses_stop_sequence_per_visit(caplog: pytest.LogCaptureFixture) -> None:
+    stop_times = pd.DataFrame(
+        {
+            "trip_id": ["L", "L", "L", "N", "N", "N"],
+            # L loops HUB -> X -> HUB. N's sequences sort numerically (2 < 10),
+            # and its "x" cannot be placed in the trip at all.
+            "stop_id": ["HUB", "X", "HUB", "P", "Q", "R"],
+            "stop_sequence": ["1", "2", "3", "2", "10", "x"],
+            "arrival_time": ["08:00:00"] * 6,
+            "departure_time": ["08:00:00"] * 6,
+        }
+    )
+    trips = pd.DataFrame({"trip_id": ["L", "N"], "route_id": ["A", "B"], "service_id": ["WK"] * 2})
+
+    with caplog.at_level(logging.WARNING):
+        events = rtc._build_stop_events(stop_times, trips, keep_service_ids=None)
+    # Nobody gets off at a trip's first visit or on at its last.
+    assert events["can_alight"].tolist() == [False, True, True, False, True, False]
+    assert events["can_board"].tolist() == [True, True, False, True, False, False]
+    assert events["service_id"].tolist() == ["WK"] * 6
+    assert "1 stop time(s) have a missing or non-numeric stop_sequence" in caplog.text
+
+
+def test_eligible_service_dates_limits_dates_to_filter_days() -> None:
+    monday = dt.date(2026, 11, 16)
+    calendar = pd.DataFrame(
+        {
+            "service_id": ["WK", "DAILY"],
+            "monday": ["1", "1"],
+            "tuesday": ["1", "1"],
+            "wednesday": ["1", "1"],
+            "thursday": ["1", "1"],
+            "friday": ["1", "1"],
+            "saturday": ["0", "1"],
+            "sunday": ["0", "1"],
+            "start_date": ["20261116"] * 2,
+            "end_date": ["20261122"] * 2,
+        }
+    )
+    weekdays = {monday + dt.timedelta(days=i) for i in range(5)}
+    assert eligible_service_dates(calendar, "weekday", {"WK", "DAILY"}) == {
+        "WK": weekdays,
+        "DAILY": weekdays,
+    }
+    assert eligible_service_dates(calendar, "saturday", {"DAILY"}) == {
+        "DAILY": {dt.date(2026, 11, 21)}
+    }
+    assert eligible_service_dates(None, "weekday", set()) is None
+
+
+def test_compute_transfers_only_pairs_services_sharing_a_date(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(rtc, "ENABLE_TIME_CHECK", True)
+    monkeypatch.setattr(rtc, "MAX_TRANSFER_WAIT_MINUTES", 30.0)
+    monkeypatch.setattr(rtc, "WALK_SPEED_MPH", 3.0)
+    # A arrives at S1 at 08:00 on Mondays. B leaves S2 (100 m away) at 08:05
+    # on Tuesdays and at 08:20 on Mondays.
+    events = pd.DataFrame(
+        {
+            "stop_id": ["S1", "S2", "S2"],
+            "route_id": ["A", "B", "B"],
+            "service_id": ["MON", "TUE", "MON"],
+            "arrival_sec": [28800.0, 29100.0, 30000.0],
+            "departure_sec": [28800.0, 29100.0, 30000.0],
+            "can_alight": [True] * 3,
+            "can_board": [True] * 3,
+        }
+    )
+    service_dates = {"MON": {dt.date(2026, 11, 16)}, "TUE": {dt.date(2026, 11, 17)}}
+
+    matched = compute_transfers(
+        _stops_gdf(), events, _routes_table(), radius_m=400.0, service_dates=service_dates
+    )
+    assert matched["A"]["B"]["min_wait_seconds"] == pytest.approx(1200.0)  # the Monday 08:20
+
+    # Without service matching, the Tuesday 08:05 departure is (wrongly) caught.
+    pooled = compute_transfers(_stops_gdf(), events, _routes_table(), radius_m=400.0)
+    assert pooled["A"]["B"]["min_wait_seconds"] == pytest.approx(300.0)
+
+
+_CALENDAR_HEADER = "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday"
+_YEAR = "20260101,20261231"
+# A ends at HUB at 08:00; B starts at HUB at 08:05 (the other stops are ~5 km away).
+_A_ENDS_B_STARTS = (
+    "TA,07:50:00,07:50:00,A0,1\n"
+    "TA,08:00:00,08:00:00,HUB,2\n"
+    "TB,08:05:00,08:05:00,HUB,1\n"
+    "TB,08:15:00,08:15:00,B9,2\n"
+)
+
+
+def _transfers_from_main(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    calendar: str,
+    stop_times: str,
+    time_check: bool = True,
+) -> list[str]:
+    monkeypatch.setattr(rtc, "ENABLE_TIME_CHECK", time_check)
+    monkeypatch.setattr(rtc, "TARGET_ROUTE_TOKENS", {"A"})
+    feed = tmp_path / "feed"
+    feed.mkdir()
+    (feed / "stops.txt").write_text(
+        "stop_id,stop_lat,stop_lon\nHUB,38.90,-77.00\nA0,38.95,-77.00\nB9,38.85,-77.00\n"
+    )
+    (feed / "routes.txt").write_text("route_id,route_short_name\nA,A\nB,B\n")
+    (feed / "trips.txt").write_text("route_id,service_id,trip_id\nA,SA,TA\nB,SB,TB\n")
+    (feed / "calendar.txt").write_text(calendar)
+    (feed / "stop_times.txt").write_text(
+        "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n" + stop_times
+    )
+    out = tmp_path / "out"
+    assert rtc.main(["--gtfs-dir", str(feed), "--output-dir", str(out)]) == 0
+    summary = pd.read_csv(out / "route_transfers_summary.csv", keep_default_na=False)
+    return summary["transfer_routes"].tolist()
+
+
+@pytest.mark.parametrize("time_check", [True, False])
+@pytest.mark.parametrize(
+    ("services", "expected"),
+    [
+        # Monday-only feeder, Tuesday-only connector: never on the same day.
+        (f"SA,1,0,0,0,0,0,0,{_YEAR}\nSB,0,1,0,0,0,0,0,{_YEAR}\n", [""]),
+        # Different service_ids that both run Mondays still connect.
+        (f"SA,1,0,1,0,1,0,0,{_YEAR}\nSB,1,1,1,1,1,0,0,{_YEAR}\n", ["B"]),
+        # The same weekdays, but in date ranges that never overlap.
+        ("SA,1,1,1,1,1,0,0,20260101,20260630\nSB,1,1,1,1,1,0,0,20260701,20261231\n", [""]),
+        # Both Monday-only; the ranges overlap only on Tuesday, June 30.
+        ("SA,1,0,0,0,0,0,0,20260101,20260630\nSB,1,0,0,0,0,0,0,20260630,20261231\n", [""]),
+    ],
+)
+def test_main_pairs_only_services_sharing_a_weekday_date(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    time_check: bool,
+    services: str,
+    expected: list[str],
+) -> None:
+    calendar = f"{_CALENDAR_HEADER},start_date,end_date\n{services}"
+    assert (
+        _transfers_from_main(tmp_path, monkeypatch, calendar, _A_ENDS_B_STARTS, time_check)
+        == expected
+    )
+
+
+@pytest.mark.parametrize(("b_days", "expected"), [("0,1", [""]), ("1,0", ["B"])])
+def test_main_matches_weekdays_when_calendar_has_no_date_range(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, b_days: str, expected: list[str]
+) -> None:
+    calendar = f"{_CALENDAR_HEADER}\nSA,1,0,0,0,0,0,0\nSB,{b_days},0,0,0,0,0\n"
+    assert _transfers_from_main(tmp_path, monkeypatch, calendar, _A_ENDS_B_STARTS) == expected
+
+
+@pytest.mark.parametrize("time_check", [True, False])
+def test_main_ignores_feeder_origin_and_connector_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, time_check: bool
+) -> None:
+    # A starts at HUB at 08:00 and leaves; B ends at HUB at 08:05. Nobody
+    # arrives at HUB aboard A or continues aboard B.
+    calendar = f"{_CALENDAR_HEADER},start_date,end_date\nSA,1,0,0,0,0,0,0,{_YEAR}\n"
+    calendar += f"SB,1,0,0,0,0,0,0,{_YEAR}\n"
+    stop_times = (
+        "TA,08:00:00,08:00:00,HUB,1\n"
+        "TA,08:10:00,08:10:00,A0,2\n"
+        "TB,07:55:00,07:55:00,B9,1\n"
+        "TB,08:05:00,08:05:00,HUB,2\n"
+    )
+    assert _transfers_from_main(tmp_path, monkeypatch, calendar, stop_times, time_check) == [""]
+
+
+@pytest.mark.parametrize(("b_leaves", "expected"), [("08:05:00", ["B"]), ("07:35:00", [""])])
+def test_main_loop_lets_riders_off_only_on_final_visit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, b_leaves: str, expected: list[str]
+) -> None:
+    # A loops HUB -> A0 -> HUB, leaving at 07:30 and returning at 08:00. A
+    # 07:35 departure of B follows only A's origin visit, which drops no one.
+    calendar = f"{_CALENDAR_HEADER},start_date,end_date\nSA,1,0,0,0,0,0,0,{_YEAR}\n"
+    calendar += f"SB,1,0,0,0,0,0,0,{_YEAR}\n"
+    stop_times = (
+        "TA,07:30:00,07:30:00,HUB,1\n"
+        "TA,07:45:00,07:45:00,A0,2\n"
+        "TA,08:00:00,08:00:00,HUB,3\n"
+        f"TB,{b_leaves},{b_leaves},HUB,1\n"
+        "TB,09:00:00,09:00:00,B9,2\n"
+    )
+    assert _transfers_from_main(tmp_path, monkeypatch, calendar, stop_times) == expected
 
 
 def test_build_output_tables_includes_zero_transfer_targets() -> None:

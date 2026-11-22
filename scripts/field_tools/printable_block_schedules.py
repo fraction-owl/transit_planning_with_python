@@ -77,7 +77,9 @@ REQUIRED_GTFS_FILES = [
     "calendar.txt",
 ]
 
-# If you only want certain service IDs or route short names, specify them here:
+# If you only want certain service IDs or route short names, specify them here.
+# A route filter keeps each block (per service ID) that serves one of the routes
+# on the selected service IDs, including its interlined trips on other routes.
 FILTER_SERVICE_IDS: list[str] = []  # e.g. ["WKD", "SAT"]
 FILTER_ROUTE_SHORT_NAMES: list[str] = []  # e.g. ["101", "202"]
 
@@ -357,6 +359,12 @@ def filter_data(
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Apply route and service filters, propagating them to stop times.
 
+    Service IDs are filtered first. The route filter then keeps every trip of
+    each ``(block_id, service_id)`` schedule with at least one trip on a
+    selected route, so interlined trips stay on the sheet. Blocks are matched
+    per service ID because each is exported separately, and a ``block_id``
+    reused on another service may not serve the route there.
+
     Args:
         trips_df: Parsed **trips.txt** table.
         stop_times_df: Parsed **stop_times.txt** table.
@@ -377,22 +385,29 @@ def filter_data(
     routes_subset = routes_df[["route_id", "route_short_name"]]
     trips_df = trips_df.merge(routes_subset, on="route_id", how="left")
 
-    # Apply Route Filtering
-    if FILTER_ROUTE_SHORT_NAMES:
-        blocks_for_selected_routes = (
-            trips_df[trips_df["route_short_name"].isin(FILTER_ROUTE_SHORT_NAMES)]["block_id"]
-            .dropna()
-            .unique()
-        )
-        if len(blocks_for_selected_routes) == 0:
-            logging.info("No blocks found with the specified route short names.")
-            return pd.DataFrame(), pd.DataFrame()
-
-        trips_df = trips_df[trips_df["block_id"].isin(blocks_for_selected_routes)]
-
     # Apply Service ID Filtering
     if FILTER_SERVICE_IDS:
         trips_df = trips_df[trips_df["service_id"].isin(FILTER_SERVICE_IDS)]
+
+    # Apply Route Filtering to whole block/service schedules
+    if FILTER_ROUTE_SHORT_NAMES:
+        keys = ["block_id", "service_id"]
+        serving = (
+            trips_df.loc[trips_df["route_short_name"].isin(FILTER_ROUTE_SHORT_NAMES), keys]
+            .dropna()
+            .drop_duplicates()
+        )
+        if serving.empty:
+            logging.info(
+                "No blocks found with the specified route short names%s.",
+                " on the specified service IDs" if FILTER_SERVICE_IDS else "",
+            )
+            return pd.DataFrame(), pd.DataFrame()
+
+        on_serving_block = pd.MultiIndex.from_frame(trips_df[keys]).isin(
+            pd.MultiIndex.from_frame(serving)
+        )
+        trips_df = trips_df[on_serving_block]
 
     # Filter stop_times to only include relevant trips
     stop_times_df = stop_times_df[stop_times_df["trip_id"].isin(trips_df["trip_id"])]
@@ -409,6 +424,7 @@ def prepare_stop_times(
     -----
     1. Ensure a numeric ``timepoint`` column (create if absent).
     2. Attach ``block_id``, ``route_short_name``, ``direction_id`` and ``service_id``.
+       ``direction_id`` is optional in GTFS; without it, Direction prints blank.
     3. Convert arrival/departure times → seconds → ``HH:MM`` format.
     4. Map ``stop_id`` → human-readable stop names and the ``stop_label``
        printed as Stop ID (per ``STOP_ID_FIELD``).
@@ -438,6 +454,8 @@ def prepare_stop_times(
         )
 
     # Merge essential trip columns into stop_times
+    if "direction_id" not in trips_df.columns:
+        trips_df = trips_df.assign(direction_id="")
     needed_trip_cols = ["trip_id", "block_id", "route_short_name", "direction_id", "service_id"]
     stop_times_df = stop_times_df.merge(trips_df[needed_trip_cols], on="trip_id", how="left")
 
@@ -571,7 +589,8 @@ def load_tods_movements(
     Returns:
         Per block and service, the movements sorted by start: ``trip_id``,
         ``label`` (Event Type), ``start``/``end`` seconds and the ``from_*`` /
-        ``to_*`` stop IDs and names. Only rows with a ``TODS_trip_type`` count.
+        ``to_*`` stop IDs, Stop ID labels (``from_label`` / ``to_label``, per
+        ``STOP_ID_FIELD``) and names. Only rows with a ``TODS_trip_type`` count.
 
     Raises:
         OSError: If the TODS files are missing.
@@ -586,9 +605,19 @@ def load_tods_movements(
     except OSError:
         tods_stops = pd.DataFrame(columns=["stop_id", "stop_name"])
     names: dict[str, str] = {}
+    codes: dict[str, str] = {}
     for frame in (stops_df, tods_stops):
         if frame is not None and {"stop_id", "stop_name"} <= set(frame.columns):
             names.update(zip(frame["stop_id"].astype(str), frame["stop_name"].fillna("")))
+        if frame is not None and {"stop_id", "stop_code"} <= set(frame.columns):
+            codes.update(zip(frame["stop_id"].astype(str), frame["stop_code"].fillna("")))
+    # Stop ID labels follow prepare_stop_times: stop_code if stops.txt has that column.
+    use_codes = (
+        STOP_ID_FIELD == "stop_code" and stops_df is not None and "stop_code" in stops_df.columns
+    )
+
+    def stop_label(stop_id: str) -> str:
+        return codes.get(stop_id, "") if use_codes else stop_id
 
     trips = tods["trips_supplement"].fillna("")
     if "TODS_trip_type" not in trips.columns:
@@ -623,6 +652,8 @@ def load_tods_movements(
                 "end": end,
                 "from_stop": first["stop_id"],
                 "to_stop": last["stop_id"],
+                "from_label": stop_label(first["stop_id"]),
+                "to_label": stop_label(last["stop_id"]),
                 "from_name": names.get(first["stop_id"], first["stop_id"]),
                 "to_name": names.get(last["stop_id"], last["stop_id"]),
             }
@@ -664,7 +695,10 @@ def add_layover_rows(
         include repositioning as well as waiting. A TODS movement row
         (``Pull-out``, ``Deadhead``, ``Pull-in`` ...) gives its scheduled
         departure from the first stop and arrival at the last; a gap it covers
-        becomes the movement plus a layover before or after it.
+        becomes its movements plus the waits before, between and after them.
+        Each wait is placed where the preceding trip or movement left the
+        vehicle, and is a ``Layover`` only if the next trip or movement starts
+        at that stop; otherwise it is ``Between trips``.
 
     Notes:
         Gap limits are the preceding trip's last arrival and the following
@@ -749,6 +783,42 @@ def add_layover_rows(
             f"Scheduled gap: {_duration_text(finish - begin)}",
         )
 
+    def between_row(trip: tuple, begin: float, finish: float, origin: str, dest: str) -> dict:
+        trip_id, first, last = trip
+        return observation_row(
+            {
+                "Event Type": "Between trips",
+                "Route": last["route_short_name"],
+                "Direction": last["direction_id"],
+                "Trip ID": trip_id,
+                "Trip Start Time": format_hhmm(first["trip_start_seconds"]),
+                "Stop Name": f"From: {origin}\nTo: {dest}",
+                "Scheduled Arrival Time": format_hhmm(begin),
+                "Scheduled Departure Time": format_hhmm(finish),
+            },
+            f"Scheduled gap: {_duration_text(finish - begin)} (may include travel)",
+        )
+
+    def gap_row(trip: tuple, begin: float, finish: float, here: Any, there: Any) -> dict:
+        # here/there: stop_id, stop_label, stop_name where the vehicle is / goes next.
+        same_stop = (
+            pd.notna(here["stop_id"])
+            and pd.notna(there["stop_id"])
+            and str(here["stop_id"]).strip() != ""
+            and str(here["stop_id"]).strip() == str(there["stop_id"]).strip()
+        )
+        if same_stop:
+            return wait_row(trip, begin, finish, here)
+        return between_row(trip, begin, finish, here["stop_name"], there["stop_name"])
+
+    def move_stop(move: Mapping[str, Any], end: str) -> dict[str, Any]:
+        # end is "from" or "to"; same keys as a prepared stop row.
+        return {
+            "stop_id": move[f"{end}_stop"],
+            "stop_label": move[f"{end}_label"],
+            "stop_name": move[f"{end}_name"],
+        }
+
     def trip_end(last: Any) -> float:
         end = last["arrival_seconds"]
         return last["departure_seconds"] if pd.isna(end) else end
@@ -802,44 +872,23 @@ def add_layover_rows(
             and m["end"] <= start_seconds
         ]
         if inside:
-            # TODS explains the gap: wait at the origin, move, wait at the destination.
-            cursor = end_seconds
+            # TODS explains the gap. Follow the vehicle: each wait is where the
+            # previous trip or movement left it, checked against the next origin.
+            cursor, here = end_seconds, last
             for move in inside:
                 if include_gaps and move["start"] > cursor:
-                    rows.append(wait_row(trips[pos], cursor, move["start"], last))
+                    rows.append(
+                        gap_row(trips[pos], cursor, move["start"], here, move_stop(move, "from"))
+                    )
                 rows.append(movement_row(move))
                 placed.add(move["trip_id"])
-                cursor = move["end"]
+                cursor, here = move["end"], move_stop(move, "to")
             if include_gaps and start_seconds > cursor:
-                rows.append(wait_row(trips[pos], cursor, start_seconds, next_first))
+                rows.append(gap_row(trips[pos], cursor, start_seconds, here, next_first))
             continue
         if gap_seconds == 0 or not include_gaps:
             continue
-
-        same_stop = (
-            pd.notna(last["stop_id"])
-            and pd.notna(next_first["stop_id"])
-            and str(last["stop_id"]).strip() != ""
-            and last["stop_id"] == next_first["stop_id"]
-        )
-        if same_stop:
-            rows.append(wait_row(trips[pos], end_seconds, start_seconds, last))
-            continue
-        rows.append(
-            observation_row(
-                {
-                    "Event Type": "Between trips",
-                    "Route": last["route_short_name"],
-                    "Direction": last["direction_id"],
-                    "Trip ID": trip_id,
-                    "Trip Start Time": format_hhmm(first["trip_start_seconds"]),
-                    "Stop Name": f"From: {last['stop_name']}\nTo: {next_first['stop_name']}",
-                    "Scheduled Arrival Time": format_hhmm(end_seconds),
-                    "Scheduled Departure Time": format_hhmm(start_seconds),
-                },
-                f"Scheduled gap: {_duration_text(gap_seconds)} (may include travel)",
-            )
-        )
+        rows.append(gap_row(trips[pos], end_seconds, start_seconds, last, next_first))
 
     unplaced = [m["trip_id"] for m in movements if m["trip_id"] not in placed]
     if unplaced:

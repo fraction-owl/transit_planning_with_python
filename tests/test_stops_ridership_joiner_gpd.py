@@ -1177,3 +1177,89 @@ def test_negative_values_are_kept_and_reported(tmp_path: Path) -> None:
         -5.0,
     )
     assert recon.set_index("category").loc["grand_total", "TOTAL"] == pytest.approx(6.0)
+
+
+# ---------------------------------------------------------------------------
+# Multi-period comparison
+# ---------------------------------------------------------------------------
+
+_TWO_PERIODS = [("sep", Path("a"), Path("a")), ("oct", Path("b"), Path("b"))]
+
+
+def _period_counts(rows: dict[str, tuple[float, float]]) -> pd.DataFrame:
+    df = pd.DataFrame.from_dict(rows, orient="index", columns=["boardings", "alightings"])
+    df.index.name = "stop_key"
+    return df.assign(total=df["boardings"] + df["alightings"])
+
+
+def _period_inventory(keys: list[str]) -> pd.DataFrame:
+    return pd.DataFrame(
+        {"stop_name": keys, "longitude": -77.0, "latitude": 38.9},
+        index=pd.Index(keys, name="stop_key"),
+    )
+
+
+def test_comparison_table_percent_change() -> None:
+    counts = [
+        _period_counts({"1": (20.0, 0.0), "2": (8.0, 2.0), "3": (5.0, 5.0), "4": (-2.0, 1.0)}),
+        _period_counts({"1": (15.0, 10.0), "2": (8.0, 2.0), "4": (3.0, 1.0)}),
+    ]
+    inventories = [_period_inventory(["1", "2", "3", "4"]), _period_inventory(["1", "2", "4"])]
+    with patch("stops_ridership_joiner_gpd.PERIOD_INPUTS", _TWO_PERIODS):
+        table = target.comparison_table(counts, inventories, by_route=False).set_index("stop_key")
+    assert table.loc["1", "boardings_pct_change"] == pytest.approx(-25.0)
+    assert table.loc["1", "total_pct_change"] == pytest.approx(25.0)
+    assert table.loc["2", "boardings_pct_change"] == pytest.approx(0.0)
+    # A zero or negative base keeps its change but has no percent change.
+    assert table.loc["1", "alightings_change"] == pytest.approx(10.0)
+    assert pd.isna(table.loc["1", "alightings_pct_change"])
+    assert table.loc["4", "boardings_change"] == pytest.approx(5.0)
+    assert pd.isna(table.loc["4", "boardings_pct_change"])
+    # Missing from the last period: neither change nor percent change.
+    assert pd.isna(table.loc["3", "boardings_change"])
+    assert pd.isna(table.loc["3", "boardings_pct_change"])
+
+
+@pytest.mark.parametrize("label", ["change", "PCT_CHANGE"])
+def test_validate_periods_rejects_reserved_labels(tmp_path: Path, label: str) -> None:
+    periods = [(label, tmp_path, tmp_path), ("oct", tmp_path, tmp_path)]
+    with (
+        patch("stops_ridership_joiner_gpd.PERIOD_INPUTS", periods),
+        pytest.raises(ValueError, match="period label"),
+    ):
+        target.validate_periods()
+
+
+@pytest.mark.parametrize("split", [False, True])
+def test_main_period_comparison_writes_changes(tmp_path: Path, split: bool) -> None:
+    gtfs_dir = tmp_path / "gtfs"
+    _write_min_gtfs(gtfs_dir)
+    columns = ["STOP_ID", "ROUTE_NAME", "XBOARDINGS", "XALIGHTINGS"]
+    sep, oct_ = tmp_path / "sep.xlsx", tmp_path / "oct.xlsx"
+    pd.DataFrame([["1001", "10A", 20.0, 4.0], ["2002", "20", 10.0, 0.0]], columns=columns).to_excel(
+        sep, index=False
+    )
+    pd.DataFrame([["1001", "10A", 30.0, 6.0], ["2002", "20", 5.0, 0.0]], columns=columns).to_excel(
+        oct_, index=False
+    )
+    out = tmp_path / "out"
+    with (
+        patch(
+            "stops_ridership_joiner_gpd.PERIOD_INPUTS",
+            [("sep", gtfs_dir, sep), ("oct", gtfs_dir, oct_)],
+        ),
+        patch("stops_ridership_joiner_gpd.OUTPUT_FOLDER", out),
+        patch("stops_ridership_joiner_gpd.SPLIT_BY_ROUTE", split),
+    ):
+        assert target.main() == 0
+    (run_dir,) = out.glob("stops_ridership_*")
+    for label in ("sep", "oct"):
+        assert (run_dir / "periods" / label / "ridership_reconciliation.csv").exists()
+    stems = ["stop_ridership_by_period"] + (["route_stop_ridership_by_period"] if split else [])
+    for stem in stems:
+        assert (run_dir / f"{stem}.gpkg").exists()
+        table = pd.read_csv(run_dir / f"{stem}.csv", dtype={"stop_key": str})
+        table = table.set_index("stop_key")
+        assert table.loc["1001", "boardings_pct_change"] == pytest.approx(50.0)
+        assert table.loc["2002", "boardings_pct_change"] == pytest.approx(-50.0)
+        assert pd.isna(table.loc["2002", "alightings_pct_change"])

@@ -198,11 +198,43 @@ def normalize_directions_column(df: pd.DataFrame, allowed: List[str]) -> pd.Data
     return df
 
 
+def normalize_legacy_directions(df: pd.DataFrame, allowed: List[str]) -> pd.DataFrame:
+    """Normalize 'Direction' on legacy rows only; TIDES rows keep their 0/1 IDs.
+
+    Rows are told apart by the ``_is_tides`` flag that :func:`load_trip_files`
+    sets per file, so a mixed CLEVER/TIDES batch normalizes just its CLEVER rows.
+    A frame without the flag is treated as all legacy.
+    """
+    if "_is_tides" in df.columns:
+        legacy = ~df["_is_tides"].astype(bool)
+    else:
+        legacy = pd.Series(True, index=df.index)
+    if not legacy.any():
+        return df
+    df = df.copy()
+    df.loc[legacy, "Direction"] = normalize_directions_column(df.loc[legacy], allowed)["Direction"]
+    return df
+
+
 # -----------------------------------------------------------------------------
 # ROUTE DISCOVERY HELPERS
 # -----------------------------------------------------------------------------
 
 _route_token_re = re.compile(r"([0-9]{1,4})")
+
+# A TIDES trips_performed file is recognised by this column; route discovery
+# and the loader share the test so they never disagree about a file's schema.
+_TIDES_MARKER_COL: Final[str] = "schedule_trip_start"
+
+# Internal column holding each trip's operating date (normalized datetime).
+# TIDES rows take it from ``service_date``; legacy rows from the scheduled
+# start's clock date. Dropped before any output is written.
+_SERVICE_DATE_COL: Final[str] = "_service_date"
+
+
+def _is_tides_columns(columns: Iterable[str]) -> bool:
+    """Return True when *columns* belong to a TIDES trips_performed file."""
+    return _TIDES_MARKER_COL in set(columns)
 
 
 def _clean_route_id(raw: str | float | int) -> str:
@@ -225,6 +257,9 @@ def _discover_route_csvs(
     ``RouteID``). Mixed files get processed by each relevant route run.
 
     The selected route column may be “Route”, “routeName”, “Route_ID”, etc.
+    TIDES trips_performed files always use ``route_id``: their other route-like
+    columns (``route_type``, ``route_type_agency``) describe the mode, and
+    ``convert_to_tides_trips_performed.py`` leaves them blank.
     Honors *wanted* whitelist (1-to-4 digit IDs with leading zeros stripped).
     """
     buckets: dict[str, list[Path]] = defaultdict(list)
@@ -235,11 +270,15 @@ def _discover_route_csvs(
             # Read just the header to find a Route-like column.
             header = pd.read_csv(p, sep=_detect_sep(p), nrows=0).columns.tolist()
             route_like = [c for c in header if route_hdr_re.fullmatch(c)]
-            if not route_like:
-                raise KeyError("no route-like column")
 
+            if _is_tides_columns(header):
+                if "route_id" not in header:
+                    raise KeyError("TIDES file has no route_id column")
+                route_col = "route_id"
+            elif not route_like:
+                raise KeyError("no route-like column")
             # Prefer the human-readable 'Route' column when present.
-            if "Route" in route_like:
+            elif "Route" in route_like:
                 route_col = "Route"
             else:
                 # Otherwise prefer a non-ID route-like column (e.g., routeName) over RouteID.
@@ -281,25 +320,37 @@ def _discover_route_csvs(
 def load_trip_files(files: Iterable[Path]) -> pd.DataFrame:
     """Load and concatenate observed trip CSV files.
 
+    Each file is mapped onto the internal schema before concatenation, so a
+    batch may mix legacy CLEVER exports and TIDES trips_performed files.
+
     Args:
         files: List of file paths to read.
 
     Returns:
         Combined DataFrame with parsed time columns and unified schema.
     """
-    frames = [pd.read_csv(p, sep=_detect_sep(p), dtype=str, low_memory=False) for p in files]
-    df = pd.concat(frames, ignore_index=True)
+    frames = [
+        _normalize_trip_frame(pd.read_csv(p, sep=_detect_sep(p), dtype=str, low_memory=False))
+        for p in files
+    ]
+    return pd.concat(frames, ignore_index=True)
 
+
+def _normalize_trip_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """Map one file's rows onto the internal (legacy CLEVER) schema.
+
+    Adds ``_is_tides`` (which rows skip legacy direction normalization) and
+    ``_SERVICE_DATE_COL`` (each trip's operating date, used by the date-range,
+    holiday, and day-type filters).
+    """
     # Detect TIDES format
-    if "schedule_trip_start" in df.columns:
+    if _is_tides_columns(df.columns):
         # Filter for 'In service' and remove 'Canceled'
         if "trip_type" in df.columns:
             # Normalize to lower/title case if needed, but assuming standard TIDES casing
             # TIDES typically uses "In service", "Deadhead", etc.
-            # Use fillna to avoid dropping legacy rows in mixed batches
             df = df.loc[df["trip_type"].fillna("In service") == "In service"].copy()
         if "schedule_relationship" in df.columns:
-            # Use fillna to avoid dropping legacy rows
             df = df.loc[df["schedule_relationship"].fillna("Scheduled") != "Canceled"].copy()
 
         # Rename columns to legacy internal names
@@ -331,6 +382,15 @@ def load_trip_files(files: Iterable[Path]) -> pd.DataFrame:
         if "Direction" in df.columns:
             df["Direction"] = df["Direction"].astype(str)
 
+        # TIDES service_date is the operating day: a Friday owl trip that
+        # starts at 00:30 Saturday still has Friday's service_date.
+        sched_date = df["Scheduled Start Time"].dt.normalize()
+        if "service_date" in df.columns:
+            supplied = pd.to_datetime(df["service_date"], errors="coerce").dt.normalize()
+            df[_SERVICE_DATE_COL] = supplied.fillna(sched_date)
+        else:
+            df[_SERVICE_DATE_COL] = sched_date
+
         # Flag as TIDES so we can skip legacy normalization steps
         df["_is_tides"] = True
 
@@ -343,27 +403,48 @@ def load_trip_files(files: Iterable[Path]) -> pd.DataFrame:
             "Actual Finish Time",
         ):
             df[col] = pd.to_datetime(df[col], errors="coerce")
+        df[_SERVICE_DATE_COL] = df["Scheduled Start Time"].dt.normalize()
         df["_is_tides"] = False
 
     return df
 
 
+def _service_dates(df: pd.DataFrame) -> pd.Series:
+    """Return each trip's operating date as a normalized datetime Series.
+
+    Uses ``_SERVICE_DATE_COL`` when :func:`load_trip_files` added it, otherwise
+    the scheduled start's clock date.
+    """
+    if _SERVICE_DATE_COL in df.columns:
+        return df[_SERVICE_DATE_COL]
+    return df["Scheduled Start Time"].dt.normalize()
+
+
 def extract_trip_start_time(df: pd.DataFrame, trip_col: str = "Trip") -> pd.DataFrame:
     """Extract trip start time (HH:MM) from a Trip column.
+
+    Rows that already have a start time (e.g. TIDES rows, which derive it from
+    the scheduled start) keep it; only missing values are extracted, so legacy
+    rows in a mixed CLEVER/TIDES batch still get one.
 
     Args:
         df: Trip data with a string-based Trip column.
         trip_col: Name of the Trip column to extract time from.
 
     Returns:
-        Copy of input DataFrame with a new 'trip_start_time' column.
+        Copy of input DataFrame with a populated 'trip_start_time' column.
     """
-    # If the time column is already populated (e.g. TIDES data), skip extraction
+    pattern = r"^\s*([0-2]?\d:[0-5]\d)"
     if TIME_COL_NAME in df.columns:
+        missing = df[TIME_COL_NAME].isna()
+        if not missing.any() or trip_col not in df.columns:
+            return df
+        df = df.copy()
+        df.loc[missing, TIME_COL_NAME] = df.loc[missing, trip_col].str.extract(pattern)[0]
         return df
 
     df = df.copy()
-    df[TIME_COL_NAME] = df[trip_col].str.extract(r"^\s*([0-2]?\d:[0-5]\d)")[0]
+    df[TIME_COL_NAME] = df[trip_col].str.extract(pattern)[0]
     return df
 
 
@@ -371,14 +452,15 @@ def filter_date_range(df: pd.DataFrame) -> pd.DataFrame:
     """Filter trips to only those within the configured date range.
 
     Args:
-        df: Trip records with 'Scheduled Start Time' as datetime.
+        df: Trip records with 'Scheduled Start Time' as datetime (and, from
+            :func:`load_trip_files`, each trip's service date).
 
     Returns:
-        Filtered DataFrame with rows whose scheduled start falls on a date from
-        DATE_START through DATE_END, inclusive (all of DATE_END's trips are kept,
-        not just those at midnight).
+        Filtered DataFrame with rows whose service date falls from DATE_START
+        through DATE_END, inclusive (all of DATE_END's trips are kept, not just
+        those at midnight).
     """
-    start_date = df["Scheduled Start Time"].dt.normalize()
+    start_date = _service_dates(df)
     return df.loc[start_date.between(DATE_START.normalize(), DATE_END.normalize())].copy()
 
 
@@ -401,21 +483,24 @@ def filter_holidays(df: pd.DataFrame, dates: Iterable[str]) -> pd.DataFrame:
     """Remove trips that occur on excluded holiday dates.
 
     Args:
-        df: Trip data with 'Scheduled Start Time' as datetime.
-        dates: Iterable of holiday dates as YYYY-MM-DD strings.
+        df: Trip data with 'Scheduled Start Time' as datetime (and, from
+            :func:`load_trip_files`, each trip's service date).
+        dates: Iterable of holiday service dates as YYYY-MM-DD strings.
 
     Returns:
         DataFrame excluding rows on the given dates.
     """
     bad = {pd.to_datetime(d).date() for d in dates}
-    return df.loc[~df["Scheduled Start Time"].dt.date.isin(bad)].copy()
+    return df.loc[~_service_dates(df).dt.date.isin(bad)].copy()
 
 
 def filter_service_day(df: pd.DataFrame, which: str | None) -> pd.DataFrame:
     """Filter trips by service day: WEEKDAY, SATURDAY, or SUNDAY.
 
     Args:
-        df: Trip data with 'Scheduled Start Time' as datetime.
+        df: Trip data with 'Scheduled Start Time' as datetime (and, from
+            :func:`load_trip_files`, each trip's service date, whose weekday
+            is used).
         which: Day type to keep. Must be 'WEEKDAY', 'SATURDAY', 'SUNDAY', or None.
 
     Returns:
@@ -425,7 +510,7 @@ def filter_service_day(df: pd.DataFrame, which: str | None) -> pd.DataFrame:
         raise ValueError("SERVICE_DAY_FILTER must be WEEKDAY, SATURDAY, SUNDAY or None")
     if not which:
         return df
-    dow = df["Scheduled Start Time"].dt.dayofweek
+    dow = _service_dates(df).dt.dayofweek
     keep = (dow <= 4) if which == "WEEKDAY" else (dow == 5 if which == "SATURDAY" else dow == 6)
     return df.loc[keep].copy()
 
@@ -461,11 +546,15 @@ def add_otp_flag(df: pd.DataFrame) -> pd.DataFrame:
 
     The columns are identical for one release cycle so downstream code
     can migrate from *on_time* to *within_window* at leisure.
+
+    A trip whose start deviation is unknown (no actual or scheduled start)
+    gets ``<NA>`` rather than ``False``, so it never counts against OTP.
     """
-    flag = df["start_dev_min"].between(
-        OTP_EARLY_MIN,
-        OTP_LATE_MIN,
-        inclusive="both",
+    dev = df["start_dev_min"]
+    flag = (
+        dev.between(OTP_EARLY_MIN, OTP_LATE_MIN, inclusive="both")
+        .astype("boolean")
+        .mask(dev.isna())
     )
     return df.assign(on_time=flag, within_window=flag)
 
@@ -606,13 +695,18 @@ def _sched_mode_with_warning(s: pd.Series, trip_id: str | int) -> float:
 
 
 def write_summary_table(df: pd.DataFrame) -> pd.DataFrame:
-    """Summarise each start-time token and save an XLSX sheet."""
+    """Summarise each start-time token and save an XLSX sheet.
+
+    ``n_events`` and ``otp_pct`` both count only trips whose start deviation
+    is known (non-null ``on_time``); a start time with none has blank OTP and
+    a blank ``under_target``.
+    """
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     trip_grp = df.groupby(TIME_COL_NAME, sort=False)
     summary = trip_grp.agg(
-        n_events=("Actual Start Time", lambda s: s.notna().sum()),
-        otp_pct=("on_time", lambda s: s.mean() * 100.0),
+        n_events=("on_time", "count"),
+        otp_pct=("on_time", lambda s: s.dropna().astype(float).mean() * 100.0),
     )
 
     summary["scheduled_runtime_mode"] = trip_grp["scheduled_runtime_min"].apply(
@@ -638,7 +732,9 @@ def write_summary_table(df: pd.DataFrame) -> pd.DataFrame:
 
     # New, clearer columns kept in parallel for one cycle
     summary["pct_within_window"] = summary["otp_pct"]
-    summary["under_target"] = summary["otp_pct"] < OTP_TARGET_PCT
+    summary["under_target"] = (
+        (summary["otp_pct"] < OTP_TARGET_PCT).astype("boolean").mask(summary["otp_pct"].isna())
+    )
     summary["below_target_pct"] = summary["under_target"]
 
     # Chronological order improves readability
@@ -838,7 +934,8 @@ def log_low_sample_start_times(
 
     * `trip_start_time – HH:MM string extracted earlier
     * `n_obs            – observations for that token after filtering
-    * `dates_run        – comma‑separated YYYY‑MM‑DD values
+    * `dates_run        – comma‑separated YYYY‑MM‑DD service dates (the
+      dates ``EXCLUDE_DATES`` is compared against)
 
     Parameters
     ----------
@@ -867,18 +964,20 @@ def log_low_sample_start_times(
     # ------------------------------------------------------------------ #
     # 2.  Assemble diagnostic rows, including the dates run.             #
     # ------------------------------------------------------------------ #
-    warned_df = (
-        df[df[TIME_COL_NAME].isin(sparse_tokens.index)]
-        .loc[:, [TIME_COL_NAME, "Scheduled Start Time"]]
-        .assign(n_obs=lambda x: x.groupby(TIME_COL_NAME)["Scheduled Start Time"].transform("size"))
-    )
+    sparse = df[TIME_COL_NAME].isin(sparse_tokens.index)
+    warned_df = pd.DataFrame(
+        {
+            TIME_COL_NAME: df.loc[sparse, TIME_COL_NAME],
+            "_run_date": _service_dates(df).loc[sparse],
+        }
+    ).assign(n_obs=lambda x: x.groupby(TIME_COL_NAME)["_run_date"].transform("size"))
 
     out = (
         warned_df.groupby(TIME_COL_NAME, sort=False)
         .agg(
             n_obs=("n_obs", "first"),
             dates_run=(
-                "Scheduled Start Time",
+                "_run_date",
                 lambda s: ", ".join(sorted({d.strftime("%Y-%m-%d") for d in s.dt.date})),
             ),
         )
@@ -1150,14 +1249,9 @@ def main() -> int:  # pragma: no cover
             .pipe(add_otp_flag)  # adds both on_time & within_window
         )
 
-        # Conditionally normalize directions (legacy only)
+        # Normalize directions on legacy rows only.
         # For TIDES, we preserve the 0/1 IDs as-is.
-        if not base_df.get("_is_tides", pd.Series([False] * len(base_df))).any():
-            base_df = normalize_directions_column(base_df, ALLOWED_DIRECTIONS)
-
-        # Drop the helper column if present
-        if "_is_tides" in base_df.columns:
-            base_df = base_df.drop(columns=["_is_tides"])
+        base_df = normalize_legacy_directions(base_df, ALLOWED_DIRECTIONS)
 
         if base_df.empty:
             logging.warning("   ⚠  No rows left after filtering; skipping route.")
@@ -1172,6 +1266,11 @@ def main() -> int:  # pragma: no cover
             base_df,
             thresh_frac=LOW_SAMPLE_FRAC,
             exclude_dates=EXCLUDE_DATES,
+        )
+
+        # Drop helper columns before any per-direction export
+        base_df = base_df.drop(
+            columns=[c for c in ("_is_tides", _SERVICE_DATE_COL) if c in base_df.columns]
         )
 
         # ------------------------------------------------------------------

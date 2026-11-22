@@ -169,3 +169,23 @@ def test_consumes_real_otp_runtime_from_tides_output(tmp_path: Path) -> None:
     source = pd.read_csv(table, dtype={"route_id": str})
     expected = source.groupby("route_id")["evaluated"].sum()
     assert rollup.set_index("route_id")["evaluated"].to_dict() == expected.to_dict()
+
+
+def test_load_otp_table_keeps_literal_na_route_ids_distinct(tmp_path: Path) -> None:
+    """Route IDs NA and NULL are routes, not missing values; a blank ID gets its own label."""
+    p = tmp_path / "p.csv"
+    pd.DataFrame(
+        {
+            "day_type": ["Weekday"] * 3,
+            "route_id": ["NA", "NULL", ""],
+            "month": ["2025-01"] * 3,
+            "on_time": [10, 0, 4],
+            "evaluated": [10, 10, 5],
+        }
+    ).to_csv(p, index=False)
+    rollup = target.reduce_to_route(target.load_otp_table(p), ["2025-01"], normalize_by_month=False)
+    assert rollup.set_index("route_id")["on_time"].to_dict() == {
+        "(blank)": 4,
+        "NA": 10,
+        "NULL": 0,
+    }

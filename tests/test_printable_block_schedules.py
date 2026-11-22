@@ -235,6 +235,38 @@ def test_filter_data_no_matching_route_returns_empty_dataframes() -> None:
     assert fst.empty
 
 
+def _make_reused_block_trips() -> pd.DataFrame:
+    # Block 100 runs routes 10 and 20 on weekdays (interlined), only route 20 on Saturdays.
+    return pd.DataFrame(
+        {
+            "trip_id": ["W1", "W2", "S1"],
+            "route_id": ["R1", "R2", "R2"],
+            "block_id": ["100", "100", "100"],
+            "service_id": ["WKDY", "WKDY", "SAT"],
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    ("service_ids", "kept"),
+    [(["SAT"], set()), ([], {"W1", "W2"}), (["WKDY", "SAT"], {"W1", "W2"})],
+    ids=["route-not-on-service", "route-only", "both-services"],
+)
+def test_filter_data_route_filter_matches_block_per_service_id(
+    service_ids: list[str], kept: set[str]
+) -> None:
+    with (
+        patch(f"{_MODULE}.FILTER_ROUTE_SHORT_NAMES", ["10"]),
+        patch(f"{_MODULE}.FILTER_SERVICE_IDS", service_ids),
+    ):
+        ft, fst = filter_data(
+            _make_reused_block_trips(), _make_stop_times(["W1", "W2", "S1"]), _make_routes()
+        )
+    # The Saturday block never serves route 10; the weekday block keeps its route 20 trip.
+    assert set(ft.get("trip_id", [])) == kept
+    assert set(fst.get("trip_id", [])) == kept
+
+
 def test_filter_data_stop_times_restricted_to_filtered_trips() -> None:
     with (
         patch(f"{_MODULE}.FILTER_ROUTE_SHORT_NAMES", ["20"]),
@@ -350,6 +382,42 @@ def test_prepare_stop_times_sorted_by_block_trip_sequence() -> None:
     # Re-sorting should not change the row order if already sorted correctly
     re_sorted = result.sort_values(["block_id", "trip_id", "stop_sequence"])
     assert re_sorted.index.tolist() == list(range(len(result)))
+
+
+def test_prepare_stop_times_without_direction_id_prints_blank_direction() -> None:
+    trips = _make_prep_trips().drop(columns="direction_id")
+    result = prepare_stop_times(trips, _make_prep_stop_times(), _make_stops())
+    assert len(result) == len(_make_prep_stop_times())
+    assert (result["direction_id"] == "").all()
+
+
+def test_main_runs_without_direction_id(tmp_path: Path) -> None:
+    feed = tmp_path / "feed"
+    feed.mkdir()
+    (feed / "trips.txt").write_text("route_id,service_id,trip_id,block_id\nR1,WKDY,T1,100\n")
+    (feed / "routes.txt").write_text("route_id,route_short_name\nR1,10\n")
+    (feed / "calendar.txt").write_text(
+        "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,"
+        "start_date,end_date\nWKDY,1,1,1,1,1,0,0,20260101,20261231\n"
+    )
+    (feed / "stops.txt").write_text("stop_id,stop_name\nS1,Oak St\nS2,Elm Ave\n")
+    (feed / "stop_times.txt").write_text(
+        "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+        "T1,07:00:00,07:00:00,S1,1\nT1,07:10:00,07:10:00,S2,2\n"
+    )
+    out = tmp_path / "out"
+    with (
+        patch(f"{_MODULE}.GTFS_FOLDER_PATH", str(feed)),
+        patch(f"{_MODULE}.BASE_OUTPUT_PATH", str(out)),
+        patch(f"{_MODULE}.FILTER_ROUTE_SHORT_NAMES", []),
+        patch(f"{_MODULE}.FILTER_SERVICE_IDS", []),
+        patch(f"{_MODULE}.TODS_PATH", ""),
+    ):
+        assert main() == 0
+    (path,) = out.glob("*.xlsx")
+    sheet = pd.read_excel(path, dtype=str, keep_default_na=False)
+    assert sheet["Direction"].tolist() == ["", ""]
+    assert sheet["Scheduled Departure Time"].tolist() == ["07:00", "07:10"]
 
 
 def test_prepare_stop_times_drops_rows_with_missing_block_id() -> None:
@@ -943,6 +1011,8 @@ def _move(trip_id: str, label: str, start: str, end: str, origin: str, dest: str
         "end": time_to_seconds(end),
         "from_stop": origin,
         "to_stop": dest,
+        "from_label": origin,
+        "to_label": dest,
         "from_name": origin,
         "to_name": dest,
     }
@@ -1026,6 +1096,40 @@ def test_tods_movements_fill_the_block_day() -> None:
     assert "Between trips" not in result["Event Type"].tolist()
 
 
+def test_tods_wait_between_deadheads_is_at_the_first_deadheads_destination() -> None:
+    # T1 ends at S2 07:20; deadhead S2 -> D, wait at D, deadhead D -> S1 for T2 at 08:00.
+    movements = [
+        _move("DH1", "Deadhead", "07:20:00", "07:28:00", "S2", "D"),
+        _move("DH2", "Deadhead", "07:38:00", "08:00:00", "D", "S1"),
+    ]
+    result = _rows_with_movements(movements)
+    assert result["Event Type"].tolist() == [
+        "Stop",
+        "Stop",
+        "Deadhead",
+        "Layover",
+        "Deadhead",
+        "Stop",
+    ]
+    wait = result.iloc[3]
+    assert wait[
+        ["Stop ID", "Stop Name", "Scheduled Arrival Time", "Scheduled Departure Time"]
+    ].tolist() == ["D", "D", "07:28", "07:38"]
+
+
+def test_tods_wait_where_movements_do_not_connect_is_between_trips() -> None:
+    # DH2 starts at E, not D where DH1 left the bus, so the wait may include travel.
+    movements = [
+        _move("DH1", "Deadhead", "07:20:00", "07:28:00", "S2", "D"),
+        _move("DH2", "Deadhead", "07:38:00", "08:00:00", "E", "S1"),
+    ]
+    result = _rows_with_movements(movements)
+    wait = result.iloc[3]
+    assert wait["Event Type"] == "Between trips"
+    assert wait["Stop Name"] == "From: D\nTo: E"
+    assert wait["Comments"].startswith("Scheduled gap: 10 min (may include travel)\n")
+
+
 def test_tods_movements_without_gap_rows() -> None:
     movements = [_move("DH", "Deadhead", "07:25:00", "07:45:00", "S2", "S1")]
     result = _rows_with_movements(movements, include_gaps=False)
@@ -1047,6 +1151,10 @@ def test_load_tods_movements_reads_the_mock_supplements() -> None:
     legs = movements["DC_R20_weekday_BLK001", "weekday"]
     assert [m["label"] for m in legs] == ["Pull-out", "Deadhead", "Pull-in"]
     assert legs[0]["from_name"] == "Mock DC North Garage"  # Named from stops_supplement.
+    # Stop ID labels use stop_code, as for GTFS rows; the garage has none.
+    assert legs[0]["from_label"] == ""
+    codes = dict(zip(stops["stop_id"], stops["stop_code"]))
+    assert legs[0]["to_label"] == codes[legs[0]["to_stop"]]
     assert legs[0]["end"] <= legs[1]["start"] <= legs[1]["end"] <= legs[2]["start"]
 
 

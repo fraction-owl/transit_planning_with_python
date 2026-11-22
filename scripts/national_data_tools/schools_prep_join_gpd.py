@@ -540,6 +540,8 @@ def _load_ipeds_wide(path: Path, school_type: SchoolType) -> pd.DataFrame:
     raw = raw[[IPEDS_ID_COL, IPEDS_LEVEL_COL, IPEDS_TOTAL_COL]]
     raw = raw[raw[IPEDS_LEVEL_COL].isin(IPEDS_LEVEL_MAP)].copy()
     raw["count"] = pd.to_numeric(raw[IPEDS_TOTAL_COL], errors="coerce")
+    # Drop unknown counts first so a blank level pivots to NaN, not a summed 0.
+    raw = raw[raw["count"].notna()]
     wide = (
         raw.pivot_table(index=IPEDS_ID_COL, columns=IPEDS_LEVEL_COL, values="count", aggfunc="sum")
         .rename(columns=IPEDS_LEVEL_MAP)

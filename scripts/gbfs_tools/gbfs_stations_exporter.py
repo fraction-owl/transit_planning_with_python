@@ -20,6 +20,11 @@ Outputs:
     - `gbfs_stations.shp`: Shapefile of static station points
     - `gbfs_stations.geojson`: GeoJSON of static station points
 
+A feed with no usable stations (an empty list, or none with valid
+coordinates) is an error: the run exits with status 1 and writes nothing, so
+any outputs from an earlier run are left as they were rather than silently
+presented as the current feed.
+
 Typical usage:
     Update the paths in the CONFIGURATION section (or pass the matching CLI
     flags, e.g. ``--source``, ``--output-dir``, ``--format``) and run from a
@@ -420,8 +425,12 @@ def gbfs_stations_to_files(
     stations_gdf = build_stations_gdf(station_info)
 
     if stations_gdf.empty:
-        logging.warning("No stations to export; nothing written.")
-        return
+        # Fail rather than return: a refresh that writes nothing would leave the
+        # previous run's layers in place looking current.
+        raise ValueError(
+            f"GBFS source '{resolved_source}' has no usable stations; nothing was "
+            f"written and any existing outputs in {resolved_output_dir} are unchanged."
+        )
 
     if kind in ("shapefile", "both"):
         export_shapefile(stations_gdf, resolved_output_dir / "gbfs_stations.shp")

@@ -157,7 +157,8 @@ def test_small_feed_splits_the_block_day(small_feed: tuple[Path, Path]) -> None:
     gtfs, tods = small_feed
     schedule = target.load_schedule(gtfs, tods)
     assert "T3" not in set(schedule.movements["trip_id"])  # Deleted by TODS.
-    (row,) = target.block_hours(schedule.movements, schedule.stop_places).to_dict("records")
+    movements = target.expand_by_service_set(schedule.movements, [("wk",)])
+    (row,) = target.block_hours(movements, schedule.stop_places).to_dict("records")
     assert row["revenue_trip_hours"] == 2.0  # T1 + T2
     assert row["pull_out_hours"] == 0.5 and row["pull_in_hours"] == 0.75
     assert row["deadhead_hours"] == 0.5
@@ -170,7 +171,8 @@ def test_moving_without_a_scheduled_movement_is_unresolved(small_feed: tuple[Pat
     gtfs, _ = small_feed
     # Without TODS, T1 ends at B and T2 starts at A an hour later: an unresolved gap.
     schedule = target.load_schedule(gtfs, None)
-    (row,) = target.block_hours(schedule.movements, schedule.stop_places).to_dict("records")
+    movements = target.expand_by_service_set(schedule.movements, [("wk",)])
+    (row,) = target.block_hours(movements, schedule.stop_places).to_dict("records")
     assert row["unresolved_gap_hours"] == 2.0  # T1->T2 and T2->T3 both change place.
     assert row["layover_hours"] == 0.0
     assert row["location_jumps"] == 2
@@ -181,6 +183,60 @@ def test_same_coordinates_count_as_one_place() -> None:
     places = {"A": ("38.9", "-77.0"), "A2": ("38.9", "-77.0"), "X": ("", "")}
     assert target.same_place("A", "A2", places)
     assert not target.same_place("X", "Y", places)
+
+
+def test_same_place_compares_coordinates_as_numbers() -> None:
+    places = {
+        "B": ("38.8", "-77.2"),
+        "B_padded": ("38.800000", "-77.200000"),
+        "B_bay": ("38.8001", "-77.2"),  # A nearby bay, not the same place.
+        "X": ("", ""),
+        "X2": ("", ""),
+        "bad": ("n/a", "-77.2"),
+        "bad2": ("n/a", "-77.2"),
+    }
+    assert target.same_place("B", "B_padded", places)
+    assert not target.same_place("B", "B_bay", places)
+    # Missing or unreadable coordinates never make two stops one place.
+    assert not target.same_place("X", "X2", places)
+    assert not target.same_place("bad", "bad2", places)
+
+
+def test_layover_at_reformatted_coordinates_counts_as_revenue(tmp_path: Path) -> None:
+    # T1 ends at B at 06:30 and T2 leaves B2 at 07:00. B and B2 are the same
+    # point, written with different precision.
+    gtfs = write_feed(
+        tmp_path / "gtfs",
+        {
+            "trips.txt": [
+                {"route_id": "R", "service_id": "wk", "trip_id": t, "block_id": "B1"}
+                for t in ("T1", "T2")
+            ],
+            "stop_times.txt": [
+                stop_time("T1", 1, "A", "06:00:00"),
+                stop_time("T1", 2, "B", "06:30:00"),
+                stop_time("T2", 1, "B2", "07:00:00"),
+                stop_time("T2", 2, "A", "07:30:00"),
+            ],
+            "stops.txt": [
+                {"stop_id": "A", "stop_lat": "38.9", "stop_lon": "-77.2"},
+                {"stop_id": "B", "stop_lat": "38.8", "stop_lon": "-77.2"},
+                {"stop_id": "B2", "stop_lat": "38.800000", "stop_lon": "-77.200000"},
+            ],
+            "calendar.txt": [calendar_row("wk", DAYS[:5])],
+        },
+    )
+    cfg = target.Config(
+        gtfs_path=gtfs,
+        tods_path=None,
+        output_dir=tmp_path / "out",
+        periods=[("Nov", "20261101", "20261130")],
+        layover_in_revenue_hours=True,
+    )
+    (block,) = target.run(cfg)["block"].to_dict("records")
+    assert block["layover_hours"] == 0.5
+    assert block["unresolved_gap_hours"] == 0.0 and block["location_jumps"] == 0
+    assert block["vehicle_revenue_hours"] == 1.5
 
 
 def test_add_derived_follows_the_layover_setting() -> None:
@@ -199,6 +255,145 @@ def test_service_day_types_explicit_mapping() -> None:
     assert types == {"wk": {"Weekday"}, "end": {"Saturday", "Sunday"}}
     with pytest.raises(ValueError, match="unknown day type"):
         target.service_day_types({}, {"x": "Fiesta"})
+
+
+# =============================================================================
+# SERVICE SETS (services that run together on a date)
+# =============================================================================
+
+DAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+
+
+def calendar_row(service_id: str, days: tuple[str, ...]) -> dict[str, str]:
+    return {
+        "service_id": service_id,
+        **{d: "1" if d in days else "0" for d in DAYS},
+        "start_date": "20261101",
+        "end_date": "20261130",
+    }
+
+
+def run_feed(
+    folder: Path,
+    trips: list[tuple[str, str, str]],
+    times: dict[str, tuple[str, str, str, str]],
+    calendar: list[dict[str, str]],
+) -> dict[str, pd.DataFrame]:
+    """Run November 2026 on trips (trip_id, service_id, block_id) with (from, to, start, end)."""
+    gtfs = write_feed(
+        folder / "gtfs",
+        {
+            "trips.txt": [
+                {"route_id": "R", "service_id": s, "trip_id": t, "block_id": b} for t, s, b in trips
+            ],
+            "stop_times.txt": [
+                row
+                for t, (a, b, start, end) in times.items()
+                for row in (stop_time(t, 1, a, start), stop_time(t, 2, b, end))
+            ],
+            "stops.txt": [
+                {"stop_id": s, "stop_lat": lat, "stop_lon": "-77.0"}
+                for s, lat in (("A", "38.90"), ("B", "38.95"))
+            ],
+            "calendar.txt": calendar,
+        },
+    )
+    cfg = target.Config(
+        gtfs_path=gtfs,
+        tods_path=None,
+        output_dir=folder / "out",
+        periods=[("Nov", "20261101", "20261130")],
+    )
+    return target.run(cfg)
+
+
+TWO_HOUR_BLOCK = {
+    "T1": ("A", "B", "06:00:00", "07:00:00"),
+    "T2": ("B", "A", "08:00:00", "09:00:00"),  # One hour of layover at B before it.
+}
+
+
+@pytest.mark.parametrize("services", [("wk", "wk"), ("wkA", "wkB")])
+def test_block_across_services_with_the_same_days_keeps_its_layover(
+    tmp_path: Path, services: tuple[str, str]
+) -> None:
+    # GTFS defines a block by block_id and shared service days, not by service_id.
+    weekdays = DAYS[:5]
+    tables = run_feed(
+        tmp_path,
+        [("T1", services[0], "B1"), ("T2", services[1], "B1")],
+        TWO_HOUR_BLOCK,
+        [calendar_row(s, weekdays) for s in sorted(set(services))],
+    )
+    (block,) = tables["block"].to_dict("records")
+    assert block["service_ids"] == "|".join(sorted(set(services)))
+    assert block["layover_hours"] == 1.0 and block["location_jumps"] == 0
+    nov = tables["period"].iloc[0]
+    # 21 weekdays x (2 revenue trip hours + 1 layover hour).
+    assert nov["layover_hours"] == 21.0
+    assert nov["vehicle_revenue_hours"] == 63.0
+
+
+def everyday_plus_weekday_trip(tmp_path: Path) -> dict[str, pd.DataFrame]:
+    """Block B1: T1 and T3 run every day; T2, between them, runs on weekdays only."""
+    return run_feed(
+        tmp_path,
+        [("T1", "all", "B1"), ("T2", "wk", "B1"), ("T3", "all", "B1")],
+        {**TWO_HOUR_BLOCK, "T3": ("A", "B", "10:00:00", "11:00:00")},
+        [calendar_row("all", DAYS), calendar_row("wk", DAYS[:5])],
+    )
+
+
+def test_block_is_rebuilt_for_each_set_of_services_that_runs(tmp_path: Path) -> None:
+    tables = everyday_plus_weekday_trip(tmp_path)
+    blocks = tables["block"].set_index("service_ids")
+    # Weekdays: T1, T2, T3 with an hour of layover before T2 and before T3.
+    assert blocks.loc["all|wk", "revenue_trip_hours"] == 3.0
+    assert blocks.loc["all|wk", "layover_hours"] == 2.0
+    # Weekends: T1 ends at B and T3 starts at A three hours later.
+    assert blocks.loc["all", "revenue_trip_hours"] == 2.0
+    assert blocks.loc["all", "unresolved_gap_hours"] == 3.0
+    nov = tables["period"].iloc[0]
+    assert (nov["weekdays"], nov["saturdays"] + nov["sundays"]) == (21, 9)
+    assert nov["revenue_trip_hours"] == 21 * 3.0 + 9 * 2.0
+    assert nov["layover_hours"] == 21 * 2.0
+    assert nov["unresolved_gap_hours"] == 9 * 3.0
+    day_types = tables["day_type"].set_index("day_type")
+    assert day_types.loc["Weekday", "service_ids"] == "all|wk"
+    assert day_types.loc["Saturday", "service_ids"] == "all"
+
+
+def test_typical_weekday_is_the_most_common_operating_day(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # One service_id per weekday: Monday-Thursday one hour, Friday two hours.
+    times = {f"T{d}": ("A", "B", "06:00:00", "07:00:00") for d in DAYS[:4]}
+    times["Tfriday"] = ("A", "B", "06:00:00", "08:00:00")
+    with caplog.at_level("WARNING"):
+        tables = run_feed(
+            tmp_path / "split",
+            [(f"T{d}", d, f"B{d}") for d in DAYS[:5]],
+            times,
+            [calendar_row(d, (d,)) for d in DAYS[:5]],
+        )
+    weekday = tables["day_type"].set_index("day_type").loc["Weekday"]
+    # November 2026 has five Mondays and four of each other weekday.
+    assert weekday["service_ids"] == "monday"
+    assert (weekday["days"], weekday["typical_days"]) == (21, 5)
+    assert weekday["revenue_trip_hours"] == 1.0  # Not 6.0, the five services summed.
+    assert "5 service sets run on Weekday dates" in caplog.text
+    # Period totals count each weekday's own service.
+    assert tables["period"].iloc[0]["revenue_trip_hours"] == 17 * 1.0 + 4 * 2.0
+
+    single = run_feed(
+        tmp_path / "single",
+        [("T", "wk", "B")],
+        {"T": ("A", "B", "06:00:00", "07:00:00")},
+        [calendar_row("wk", DAYS[:5])],
+    )
+    weekday = single["day_type"].set_index("day_type").loc["Weekday"]
+    assert (weekday["days"], weekday["typical_days"]) == (21, 21)
+    assert weekday["revenue_trip_hours"] == 1.0
 
 
 # =============================================================================
@@ -288,7 +483,7 @@ def test_mock_hours_match_the_feeds(mock_tables: dict[str, pd.DataFrame]) -> Non
         trip_hours(gtfs["stop_times.txt"]),
         trip_hours(tods["stop_times_supplement.txt"]),
     )
-    services = mock_tables["service"].set_index("service_id")
+    services = mock_tables["service"].set_index("service_ids")
     for sid in services.index:
         rev = sum(revenue[t["trip_id"]] for t in gtfs["trips.txt"] if t["service_id"] == sid)
         non = sum(
@@ -314,7 +509,7 @@ def test_day_types_are_classified_from_the_calendar(mock_tables: dict[str, pd.Da
 
 
 def test_gtfs_calendar_periods_follow_the_feed(mock_tables: dict[str, pd.DataFrame]) -> None:
-    services = mock_tables["service"].set_index("service_id")
+    services = mock_tables["service"].set_index("service_ids")
     periods = mock_tables["period"].set_index("period")
     nov = periods.loc["Nov"]
     # calendar_dates swaps Veterans Day (Wed 11/11) and Thanksgiving (Thu 11/26)
@@ -342,7 +537,7 @@ def test_config_calendar_uses_federal_holidays(tmp_path: Path) -> None:
         holiday_service_day_type="Sunday",
     )
     tables = target.run(cfg)
-    services = tables["service"].set_index("service_id")
+    services = tables["service"].set_index("service_ids")
     nov = tables["period"].iloc[0]
     # Veterans Day (Wed 11/11) and Thanksgiving (Thu 11/26) run the Sunday schedule.
     assert (nov["weekdays"], nov["holidays"]) == (19, 2)
@@ -434,7 +629,9 @@ def sheet_rows(ws: Any) -> list[dict[str, Any]]:
 
 
 def period_totals(wb: Any) -> dict[str, dict[str, Any]]:
-    return {r["Period"]: r for r in sheet_rows(wb["Periods"]) if r["Service"] == "All services"}
+    return {
+        r["Period"]: r for r in sheet_rows(wb["Periods"]) if r["Services"] == "All service sets"
+    }
 
 
 def test_workbook_formulas_trace_back_to_trip_times(mock_run: tuple) -> None:
@@ -452,7 +649,7 @@ def test_workbook_formulas_trace_back_to_trip_times(mock_run: tuple) -> None:
     assert wb.calculation.fullCalcOnLoad
     assert wb["Settings"]["B2"].value is True  # LAYOVER_IN_REVENUE_HOURS default.
     periods = sheet_rows(wb["Periods"])
-    service_row = next(r for r in periods if r["Service"] == "weekday")
+    service_row = next(r for r in periods if r["Services"] == "weekday")
     assert service_row["Service days"].startswith("=SUMIFS(Calendar!")
     assert (
         service_row["Revenue trip h"].startswith("=$E")
@@ -508,7 +705,7 @@ def test_workbook_layover_switch_and_calendar_edits_recalculate(
     wb.save(edited)
 
     totals = period_totals(recalculate(edited, tmp_path))["November 2026"]
-    weekday = tables["service"].set_index("service_id").loc["weekday"]
+    weekday = tables["service"].set_index("service_ids").loc["weekday"]
     nov = tables["period"].set_index("period").loc["November 2026"]
     assert totals["Revenue trip h"] == pytest.approx(
         nov["revenue_trip_hours"] - weekday["revenue_trip_hours"], abs=0.01
@@ -517,6 +714,22 @@ def test_workbook_layover_switch_and_calendar_edits_recalculate(
     assert totals["Vehicle revenue h"] == pytest.approx(totals["Revenue trip h"], abs=1e-6)
     moves = sum(totals[target.COMPONENT_LABELS[c]] for c in target.TODS_COMPONENTS)
     assert totals["Nonrevenue h"] == pytest.approx(moves + totals["Layover h"], abs=1e-6)
+
+
+@needs_libreoffice
+def test_workbook_matches_the_csv_for_blocks_across_services(tmp_path: Path) -> None:
+    tables = everyday_plus_weekday_trip(tmp_path)
+    out = tmp_path / "out"
+    wb = recalculate(out / target.WORKBOOK_FILENAME, tmp_path)
+    blocks = {r["Services"]: r for r in sheet_rows(wb["Blocks"])}
+    assert blocks["all|wk"]["Layover h"] == pytest.approx(2.0)
+    assert blocks["all"]["Unresolved gap h"] == pytest.approx(3.0)
+    total = period_totals(wb)["Nov"]
+    nov = tables["period"].iloc[0]
+    for column in ("revenue_trip_hours", "layover_hours", "unresolved_gap_hours"):
+        label = target.COMPONENT_LABELS[column]
+        assert total[label] == pytest.approx(nov[column], abs=0.01), label
+    assert total["Vehicle revenue h"] == pytest.approx(nov["vehicle_revenue_hours"], abs=0.01)
 
 
 def test_workbook_without_tods_marks_unknowns(tmp_path: Path) -> None:
