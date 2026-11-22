@@ -69,6 +69,8 @@ REQUIRED_NUMERIC_COLS: Final[list[str]] = [
     "DAYS",
     "REV_MILES",
 ]
+# Any positive value here means the row records operated service.
+SERVICE_COLS: Final[tuple[str, ...]] = ("MTH_REV_HOURS", "ASCH_TRIPS", "REV_MILES")
 SERVICE_PERIODS: Final[list[str]] = ["Weekday", "Saturday", "Sunday"]
 MONTH_NAMES: Final[tuple[str, ...]] = (
     "Jan",
@@ -610,7 +612,11 @@ def read_excel_data(config: AppConfig) -> dict[str, pd.DataFrame]:
 
         # --- cleansing ----------------------------------------------------- #
         df = df.dropna(subset=["ROUTE_NAME", "MTH_BOARD"])
-        df = df[df["MTH_BOARD"] != 0]
+        # A zero-boardings row is a placeholder only when it records no service
+        # either. With service, its hours, trips, and miles belong in every total
+        # and ratio; dropping it would overstate boardings per hour/trip/mile.
+        has_service = df[list(SERVICE_COLS)].apply(pd.to_numeric, errors="coerce").gt(0).any(axis=1)
+        df = df[(df["MTH_BOARD"] != 0) | has_service]
         df = df[df["SERVICE_PERIOD"].isin(SERVICE_PERIODS)].copy()
         df["ROUTE_NAME"] = (
             df["ROUTE_NAME"]
@@ -620,6 +626,24 @@ def read_excel_data(config: AppConfig) -> dict[str, pd.DataFrame]:
             .str.replace(" ", "", regex=False)
             .apply(lambda x: re.sub(r"\.0$", "", x))
         )
+        zero_board = df[df["MTH_BOARD"] == 0]
+        if not zero_board.empty:
+            listed = [
+                f"{route} {service_period}"
+                for route, service_period in zip(
+                    zero_board["ROUTE_NAME"], zero_board["SERVICE_PERIOD"]
+                )
+            ]
+            logging.warning(
+                "%s: %d row(s) record service but zero boardings (%s%s). They are kept and "
+                "count as zero riders. If your agency enters 0 where ridership is unavailable, "
+                "boardings per hour, trip, and mile are understated for these routes and "
+                "systemwide.",
+                period,
+                len(listed),
+                ", ".join(listed[:10]),
+                ", …" if len(listed) > 10 else "",
+            )
 
         data[period] = df
         logging.info("%d rows", len(df))

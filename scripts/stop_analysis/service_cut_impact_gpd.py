@@ -1027,8 +1027,11 @@ def build_events(
     """Build the baseline stop-event table every metric derives from.
 
     One row per (trip, stop visit) on the analysis day, with a parsed departure
-    minute. Rows whose departure and arrival times both fail to parse are dropped
-    with a warning — they cannot participate in time-based metrics.
+    minute. Every visit is kept, including untimed ones: GTFS leaves times blank
+    at stops between timepoints, and those stops are still served. Their
+    ``dep_min`` is NaN, so they count toward stop service, coverage, ridership,
+    scenario masks, and the scenario GTFS, but not toward time bins, spans, or
+    gaps.
 
     Args:
         stop_times: Parsed ``stop_times.txt``.
@@ -1038,8 +1041,8 @@ def build_events(
             all trips).
 
     Returns:
-        DataFrame with columns ``trip_id``, ``stop_id``, ``dep_min``, ``route_id``,
-        ``route_label``, ``direction_id``.
+        DataFrame with columns ``trip_id``, ``stop_id``, ``dep_min`` (float minutes,
+        NaN when untimed), ``route_id``, ``route_label``, ``direction_id``.
 
     Raises:
         ValueError: If no trips remain after the service-day filter.
@@ -1070,17 +1073,32 @@ def build_events(
         events["direction_id"] = ""
     events["direction_id"] = events["direction_id"].fillna("").astype(str)
 
-    time_source = events["departure_time"].where(
-        events["departure_time"].notna(), events["arrival_time"]
-    )
-    events["dep_min"] = time_source.map(parse_time_to_minutes)
-    bad = int(events["dep_min"].isna().sum())
-    if bad:
+    def _blank_to_na(values: pd.Series) -> pd.Series:
+        return values.where(values.fillna("").astype(str).str.strip() != "")
+
+    departure = _blank_to_na(events["departure_time"])
+    time_source = departure.where(departure.notna(), _blank_to_na(events["arrival_time"]))
+    events["dep_min"] = pd.to_numeric(
+        time_source.map(parse_time_to_minutes), errors="coerce"
+    ).astype(float)
+    untimed = events["dep_min"].isna()
+    malformed = untimed & time_source.notna()
+    if malformed.any():
         logging.warning(
-            "Dropped %d stop_times row(s) with unparseable departure/arrival times.", bad
+            "%d stop_times row(s) carry a time that is not HH:MM[:SS] (e.g. %r). They are "
+            "kept as untimed stop visits: they count toward stop service, coverage, ridership, "
+            "and the scenario GTFS, but not toward time bins, spans, or gaps.",
+            int(malformed.sum()),
+            time_source[malformed].iloc[0],
         )
-        events = events[events["dep_min"].notna()].copy()
-    events["dep_min"] = events["dep_min"].astype(int)
+    blank = int((untimed & ~malformed).sum())
+    if blank:
+        logging.info(
+            "%d stop visit(s) have no arrival/departure time (untimed stops, which GTFS allows "
+            "between timepoints). They count toward stop service, coverage, ridership, and the "
+            "scenario GTFS, but not toward time bins, spans, or gaps.",
+            blank,
+        )
 
     labels = _route_label_series(routes)
     events["route_label"] = events["route_id"].map(labels).fillna(events["route_id"])
@@ -1153,6 +1171,61 @@ def _resolve_route_ids(routes: pd.DataFrame, tokens: Sequence[str]) -> set[str]:
     return found_ids
 
 
+def _window_bound(window: Mapping[str, Any], key: str) -> Optional[int]:
+    """Parse a trip_windows time bound, rejecting one that is set but unreadable.
+
+    :func:`parse_time_to_minutes` returns ``None`` both for an omitted bound and
+    for one it cannot read. Treating the second like the first would silently
+    drop the bound and widen the cut, e.g. an evening cut entered as
+    ``"5:00 PM"`` becoming an all-day one.
+
+    Returns:
+        Minutes past midnight, or ``None`` only when the bound is omitted/blank.
+
+    Raises:
+        ValueError: If the bound is set but is not ``HH:MM[:SS]``.
+    """
+    raw = window.get(key)
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return None
+    minutes = parse_time_to_minutes(raw)
+    if minutes is None:
+        raise ValueError(
+            f"trip_windows entry {dict(window)!r}: {key} = {raw!r} is not a readable time. "
+            "Use 24-hour HH:MM or HH:MM:SS, e.g. '17:00' for 5 PM, or '25:30' for 1:30 AM "
+            "at the end of the service day."
+        )
+    return minutes
+
+
+def validate_scenario(scenario: Mapping[str, Any]) -> None:
+    """Reject a scenario definition that cannot be evaluated as written.
+
+    :func:`run` calls this for every scenario before loading the feed, so a typo
+    in one scenario cannot leave other scenarios' files behind with no summary.
+
+    Raises:
+        ValueError: On unknown scenario keys, a trip_windows time bound that is
+            set but unreadable, or a trip_windows entry with no usable criteria.
+    """
+    unknown = set(scenario) - _SCENARIO_KEYS
+    if unknown:
+        raise ValueError(
+            f"Scenario {scenario.get('name', '?')!r} has unknown key(s): {sorted(unknown)}. "
+            f"Allowed keys: {sorted(_SCENARIO_KEYS)}."
+        )
+    for window in scenario.get("trip_windows") or ():
+        after = _window_bound(window, "depart_after")
+        before = _window_bound(window, "depart_before")
+        route_token = str(window.get("route", "")).strip()
+        direction = str(window.get("direction_id", "")).strip()
+        if after is None and before is None and not route_token and not direction:
+            raise ValueError(
+                f"trip_windows entry {window!r} has no usable criteria — set at least "
+                "one of route, direction_id, depart_after, depart_before."
+            )
+
+
 def resolve_drop_mask(
     scenario: Mapping[str, Any], events: pd.DataFrame, routes: pd.DataFrame
 ) -> pd.Series:
@@ -1168,15 +1241,9 @@ def resolve_drop_mask(
         scenario removes.
 
     Raises:
-        ValueError: On unknown scenario keys or a trip_windows entry with no
-            usable criteria.
+        ValueError: If :func:`validate_scenario` rejects the scenario.
     """
-    unknown = set(scenario) - _SCENARIO_KEYS
-    if unknown:
-        raise ValueError(
-            f"Scenario {scenario.get('name', '?')!r} has unknown key(s): {sorted(unknown)}. "
-            f"Allowed keys: {sorted(_SCENARIO_KEYS)}."
-        )
+    validate_scenario(scenario)
 
     mask = pd.Series(False, index=events.index)
 
@@ -1208,13 +1275,8 @@ def resolve_drop_mask(
                 selected &= (
                     trip_route["direction_id"].reindex(first_dep.index).astype(str) == direction
                 )
-            after = parse_time_to_minutes(window.get("depart_after"))
-            before = parse_time_to_minutes(window.get("depart_before"))
-            if after is None and before is None and not route_token and not direction:
-                raise ValueError(
-                    f"trip_windows entry {window!r} has no usable criteria — set at least "
-                    "one of route, direction_id, depart_after, depart_before."
-                )
+            after = _window_bound(window, "depart_after")
+            before = _window_bound(window, "depart_before")
             if after is not None:
                 selected &= first_dep >= after
             if before is not None:
@@ -1299,13 +1361,14 @@ def summarize_stops(events: pd.DataFrame) -> pd.DataFrame:
         events: Event table (baseline or scenario-surviving rows).
 
     Returns:
-        DataFrame indexed by ``stop_id`` with ``trips``, ``first_dep_min``,
-        ``last_dep_min``, ``max_gap_min`` (largest gap between consecutive
-        departures; NaN with fewer than two), and ``routes`` (label CSV).
+        DataFrame indexed by ``stop_id`` with ``trips`` (every visit, timed or
+        not), ``first_dep_min``, ``last_dep_min``, ``max_gap_min`` (largest gap
+        between consecutive timed departures; NaN with fewer than two), and
+        ``routes`` (label CSV).
     """
 
     def _max_gap(dep_minutes: pd.Series) -> float:
-        uniq = sorted(set(dep_minutes.tolist()))
+        uniq = sorted(set(dep_minutes.dropna().tolist()))
         if len(uniq) < 2:
             return float("nan")
         return float(max(b - a for a, b in zip(uniq, uniq[1:])))
@@ -1326,6 +1389,8 @@ def summarize_stops(events: pd.DataFrame) -> pd.DataFrame:
 def bin_counts(events: pd.DataFrame, bin_minutes: int) -> pd.DataFrame:
     """Count distinct trips serving each stop in each time-of-day bin.
 
+    Untimed visits have no bin and are left out.
+
     Args:
         events: Event table (baseline or scenario-surviving rows).
         bin_minutes: Bin width in minutes (e.g. 60).
@@ -1333,8 +1398,8 @@ def bin_counts(events: pd.DataFrame, bin_minutes: int) -> pd.DataFrame:
     Returns:
         DataFrame with columns ``stop_id``, ``bin_start_min``, ``trips``.
     """
-    binned = events.copy()
-    binned["bin_start_min"] = (binned["dep_min"] // bin_minutes) * bin_minutes
+    binned = events[events["dep_min"].notna()].copy()
+    binned["bin_start_min"] = ((binned["dep_min"] // bin_minutes) * bin_minutes).astype(int)
     counts = (
         binned.groupby(["stop_id", "bin_start_min"])["trip_id"].nunique().reset_index(name="trips")
     )
@@ -1735,7 +1800,7 @@ def match_trips_by_route_and_time(
     token_to_id = dict(zip(r["route_id"], r["route_id"]))
     token_to_id.update({s: rid for s, rid in zip(short, r["route_id"]) if s})
 
-    first_dep = events.groupby("trip_id")["dep_min"].min()
+    first_dep = events.groupby("trip_id")["dep_min"].min().dropna()
     trip_route = events.drop_duplicates("trip_id").set_index("trip_id")["route_id"].astype(str)
     by_route: dict[str, list[tuple[int, str]]] = {}
     for trip_id, departure in first_dep.items():
@@ -2467,8 +2532,8 @@ def operational_savings(
 ) -> dict[str, Any]:
     """Estimate revenue service removed by the scenario, from GTFS alone.
 
-    Revenue hours are the change in summed per-trip spans (first to last stop
-    event), so truncations that shorten a trip's ends count. Revenue miles are
+    Revenue hours are the change in summed per-trip spans (first to last timed
+    stop event), so truncations that shorten a trip's ends count. Revenue miles are
     summed shape lengths of wholly-cut trips only — truncation mileage changes
     are not estimated. Deadhead, pull-ins/outs, and layover are invisible to
     GTFS; scheduled-operations data (TODS) would be needed for true operating
@@ -2841,6 +2906,10 @@ def run(cfg: Config) -> pd.DataFrame:
     Returns:
         The cross-scenario summary table (also written to disk).
     """
+    if not isinstance(cfg.scenarios, str):
+        for scenario in cfg.scenarios:
+            validate_scenario(scenario)
+
     feed = load_feed(cfg.gtfs_dir)
     stops = feed["stops"]
     routes = feed["routes"]
