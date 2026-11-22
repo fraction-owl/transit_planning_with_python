@@ -826,7 +826,9 @@ def load_schedule(cfg: Settings) -> dict[str, pd.DataFrame]:
     if trips.trip_id.duplicated().any():
         raise ValueError("Duplicate active GTFS trip IDs.")
     routes = tables["routes"].copy()
-    routes["label"] = routes.route_short_name.where(routes.route_short_name.ne(""), routes.route_id)
+    # route_short_name is optional in GTFS: fall back to route_id when it is absent or blank.
+    short_name = routes.get("route_short_name", pd.Series("", index=routes.index))
+    routes["label"] = short_name.where(short_name.ne(""), routes.route_id)
     routes["label"] = routes.label.map(route_label)
     # Accept either an agency route_id or its public route_short_name.
     requested = {route_label(r) for r in cfg.routes}
