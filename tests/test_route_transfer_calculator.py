@@ -487,6 +487,143 @@ def test_main_loop_lets_riders_off_only_on_final_visit(
     assert _transfers_from_main(tmp_path, monkeypatch, calendar, stop_times) == expected
 
 
+def _two_route_feed(
+    tmp_path: Path, stops: str, stop_times: str, extra_files: dict[str, str]
+) -> list[str]:
+    """Run main on a weekday A/B feed and return A's transfer_routes."""
+    feed = tmp_path / "feed"
+    feed.mkdir(parents=True)
+    (feed / "stops.txt").write_text(stops)
+    (feed / "routes.txt").write_text("route_id,route_short_name\nA,A\nB,B\n")
+    (feed / "trips.txt").write_text("route_id,service_id,trip_id\nA,WK,TA\nB,WK,TB\n")
+    (feed / "calendar.txt").write_text(
+        f"{_CALENDAR_HEADER},start_date,end_date\nWK,1,1,1,1,1,0,0,{_YEAR}\n"
+    )
+    (feed / "stop_times.txt").write_text(
+        "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n" + stop_times
+    )
+    for name, text in extra_files.items():
+        (feed / name).write_text(text)
+    out = tmp_path / "out"
+    assert rtc.main(["--gtfs-dir", str(feed), "--output-dir", str(out)]) == 0
+    summary = pd.read_csv(out / "route_transfers_summary.csv", keep_default_na=False)
+    return summary["transfer_routes"].tolist()
+
+
+# A alights at HA at 08:00; B boards at HB, about 11 m north, at 08:05.
+_NEAR_STOPS = (
+    "stop_id,stop_lat,stop_lon,parent_station\n"
+    "HA,38.90000,-77.00000,HUB\nHB,38.90010,-77.00000,HUB\n"
+    "HUB,38.90005,-77.00000,\nA0,38.95,-77.00,\nB9,38.85,-77.00,\n"
+)
+_A_AT_HA_B_AT_HB = (
+    "TA,07:50:00,07:50:00,A0,1\n"
+    "TA,08:00:00,08:00:00,HA,2\n"
+    "TB,08:05:00,08:05:00,HB,1\n"
+    "TB,08:15:00,08:15:00,B9,2\n"
+)
+
+
+@pytest.mark.parametrize("time_check", [True, False])
+@pytest.mark.parametrize(
+    ("transfers", "expected"),
+    [
+        (None, ["B"]),  # control: no transfers.txt
+        ("from_stop_id,to_stop_id,transfer_type\nHA,HB,3\n", [""]),
+        ("from_stop_id,to_stop_id,transfer_type\nHUB,HUB,3\n", [""]),  # station covers children
+        ("from_stop_id,to_stop_id,transfer_type\nHB,HA,3\n", ["B"]),  # other direction only
+        ("from_stop_id,to_stop_id,transfer_type\nHA,HB,2\n", ["B"]),  # not a prohibition
+    ],
+)
+def test_main_skips_transfers_marked_not_possible(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    time_check: bool,
+    transfers: str | None,
+    expected: list[str],
+) -> None:
+    monkeypatch.setattr(rtc, "ENABLE_TIME_CHECK", time_check)
+    monkeypatch.setattr(rtc, "TARGET_ROUTE_TOKENS", {"A"})
+    extra = {"transfers.txt": transfers} if transfers else {}
+    assert _two_route_feed(tmp_path, _NEAR_STOPS, _A_AT_HA_B_AT_HB, extra) == expected
+
+
+def test_transfer_rules_follow_routes_stations_and_specificity(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    stops = pd.DataFrame({"stop_id": ["HA", "HB", "HUB"], "parent_station": ["HUB", "HUB", None]})
+    transfers = pd.DataFrame(
+        {
+            "from_stop_id": ["HUB", "HA", "HA", "HA"],
+            "to_stop_id": ["HUB", "HB", "HB", "HB"],
+            "from_route_id": ["", "A", "", ""],
+            "to_route_id": ["", "B", "C", ""],
+            "from_trip_id": ["", "", "", "T1"],
+            "transfer_type": ["3", "0", "3", "0"],
+        }
+    )
+    with caplog.at_level(logging.WARNING):
+        rules = rtc.build_transfer_rules(transfers, stops)
+    assert "1 row(s) name a from_trip_id or to_trip_id" in caplog.text
+    pair = rules[("HA", "HB")]
+    # The station-wide ban applies to every route pair the A -> B override does not name.
+    assert rtc.transfer_prohibited(pair, "A", "C")
+    assert rtc.transfer_prohibited(pair, "D", "B")
+    assert not rtc.transfer_prohibited(pair, "A", "B")
+    assert rtc.transfer_prohibited(rules[("HB", "HA")], "A", "B")
+    assert rtc.build_transfer_rules(None, stops) == {}
+
+
+def test_main_counts_exact_frequency_departures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # B's template leaves HUB at 07:05 and runs every 10 minutes; A arrives at 08:00.
+    monkeypatch.setattr(rtc, "ENABLE_TIME_CHECK", True)
+    monkeypatch.setattr(rtc, "TARGET_ROUTE_TOKENS", {"A"})
+    stops = "stop_id,stop_lat,stop_lon\nHUB,38.90,-77.00\nA0,38.95,-77.00\nB9,38.85,-77.00\n"
+    stop_times = (
+        "TA,07:50:00,07:50:00,A0,1\n"
+        "TA,08:00:00,08:00:00,HUB,2\n"
+        "TB,07:05:00,07:05:00,HUB,1\n"
+        "TB,07:15:00,07:15:00,B9,2\n"
+    )
+    header = "trip_id,start_time,end_time,headway_secs,exact_times\n"
+    exact = {"frequencies.txt": header + "TB,07:05:00,09:00:00,600,1\n"}
+    assert _two_route_feed(tmp_path / "exact", stops, stop_times, exact) == ["B"]
+    # The window must reach the departure: runs stop before end_time.
+    early = {"frequencies.txt": header + "TB,07:05:00,08:05:00,600,1\n"}
+    assert _two_route_feed(tmp_path / "early", stops, stop_times, early) == [""]
+
+
+def test_expand_exact_frequencies_shifts_every_stop() -> None:
+    events = pd.DataFrame(
+        {
+            "trip_id": ["TB", "TB", "TX"],
+            "arrival_sec": [300.0, 900.0, 100.0],
+            "departure_sec": [300.0, 900.0, 100.0],
+        }
+    )
+    frequencies = pd.DataFrame(
+        {
+            "trip_id": ["TB"],
+            "start_time": ["07:05:00"],
+            "end_time": ["07:35:00"],  # exclusive: runs at 07:05, 07:15, 07:25
+            "headway_secs": ["600"],
+            "exact_times": ["1"],
+        }
+    )
+    out = rtc._expand_exact_frequencies(events, frequencies)
+    tb = out[out["trip_id"] == "TB"].sort_values("departure_sec")
+    start = 7 * 3600 + 5 * 60
+    first_stop = [start, start + 600, start + 1200]
+    assert sorted(tb["departure_sec"].tolist()) == sorted(
+        first_stop + [t + 600 for t in first_stop]
+    )
+    assert out.loc[out["trip_id"] == "TX", "departure_sec"].tolist() == [100.0]
+    headway_only = frequencies.assign(exact_times="0")
+    pd.testing.assert_frame_equal(rtc._expand_exact_frequencies(events, headway_only), events)
+
+
 def test_build_output_tables_includes_zero_transfer_targets() -> None:
     routes = _routes_table()
     results = {"A": {"B": {"stop_pairs": 1.0, "min_distance_m": 100.0, "min_wait_seconds": 300.0}}}

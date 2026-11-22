@@ -15,16 +15,16 @@ this script on the merged feed. ``TARGET_AGENCY_IDS`` can restrict targets to
 one agency's routes, and connectors from another agency are labelled
 ``"<agency_id>:<route>"``.
 
-Transfers are directional: an A -> B transfer means a rider can ride route A,
-get off, and board route B. The time check uses A's arrival times at the
-alighting stop and B's departure times at the (possibly different) nearby
-boarding stop. Riders must be allowed off A at the alighting stop and onto B at
-the boarding stop: stop times with ``drop_off_type`` 1 never count as feeder
-arrivals, and stop times with ``pickup_type`` 1 never count as connector
-departures, whether or not the time check is enabled. A stop time counts as a
-feeder arrival only if its trip has an earlier ``stop_sequence`` and as a
-connector departure only if it has a later one, judged per visit (so a loop
-still lets riders off when it returns to its origin).
+Transfers are directional: an A -> B transfer means a rider can ride route A, get off, and
+board route B. The time check uses A's arrival times at the alighting stop and B's departure
+times at the (possibly different) nearby boarding stop. Riders must be allowed off A at the
+alighting stop and onto B at the boarding stop: stop times with ``drop_off_type`` 1 never
+count as feeder arrivals, and stop times with ``pickup_type`` 1 never count as connector
+departures, whether or not the time check is enabled. A stop time counts as a feeder arrival
+only if its trip has an earlier ``stop_sequence`` and as a connector departure only if it
+has a later one, judged per visit (so a loop still lets riders off when it returns to its
+origin). Stop pairs that transfers.txt marks not possible (``transfer_type`` 3) never count,
+and trips with ``exact_times=1`` in frequencies.txt count at every scheduled run.
 
 By default only regular weekday service is considered: ``DAY_OF_WEEK`` is
 ``"weekday"``, which keeps trips whose calendar.txt service runs on at least one
@@ -510,7 +510,8 @@ def _read_feed(folder: str) -> tuple[dict[str, pd.DataFrame], Optional[pd.DataFr
 
     Returns:
         A tuple ``(tables, calendar)``: ``stops``, ``routes``, ``trips`` and
-        ``stop_times`` frames, and calendar.txt (None when the feed has none).
+        ``stop_times`` frames, plus ``transfers`` and ``frequencies`` when the
+        feed has them, and calendar.txt (None when the feed has none).
 
     Raises:
         FileNotFoundError: If a required GTFS file is missing.
@@ -545,6 +546,13 @@ def _read_feed(folder: str) -> tuple[dict[str, pd.DataFrame], Optional[pd.DataFr
         len(stop_times),
     )
     tables = {"stops": stops, "routes": routes, "trips": trips, "stop_times": stop_times}
+    for name in ("transfers", "frequencies"):
+        try:
+            tables[name] = _read(f"{name}.txt")
+        except FileNotFoundError:
+            pass  # optional
+        except (OSError, ValueError, pd.errors.ParserError) as exc:
+            logging.warning("Could not read %s.txt (%s); it is ignored.", name, exc)
     return tables, calendar
 
 
@@ -611,8 +619,91 @@ def _project_stops(stops: pd.DataFrame) -> gpd.GeoDataFrame:
     return gdf
 
 
+def _expand_exact_frequencies(
+    events: pd.DataFrame, frequencies: Optional[pd.DataFrame]
+) -> pd.DataFrame:
+    """Replace each exact-times frequency trip's template with its scheduled runs.
+
+    A frequencies.txt row with ``exact_times=1`` schedules a run at
+    ``start_time`` and every ``headway_secs`` after it, up to but not including
+    ``end_time``. The trip's stop_times give each stop's time relative to its
+    first stop, so every run is the template shifted to leave its first stop at
+    that start. Headway-based rows (``exact_times`` blank or 0) have no exact
+    departures; those trips keep their template times, with a warning.
+
+    Args:
+        events: Stop events with ``trip_id``, ``arrival_sec`` and ``departure_sec``.
+        frequencies: Parsed frequencies.txt, or None when the feed has none.
+
+    Returns:
+        *events* with every exact-times trip's rows repeated once per run.
+    """
+    if frequencies is None or frequencies.empty or events.empty:
+        return events
+    required = ("trip_id", "start_time", "end_time", "headway_secs")
+    missing = [col for col in required if col not in frequencies.columns]
+    if missing:
+        logging.warning("frequencies.txt has no %s column(s); it is ignored.", ", ".join(missing))
+        return events
+
+    freq = frequencies.assign(trip_id=frequencies["trip_id"].astype(str).str.strip())
+    freq = freq[freq["trip_id"].isin(set(events["trip_id"]))]
+    exact_col = freq["exact_times"] if "exact_times" in freq.columns else pd.Series("", freq.index)
+    exact = exact_col.fillna("").astype(str).str.strip() == "1"
+    headway_only = freq.loc[~exact, "trip_id"].nunique()
+    if headway_only:
+        logging.warning(
+            "%d trip(s) in frequencies.txt run on a headway without exact times "
+            "(exact_times 0); only their stop_times template times are used.",
+            headway_only,
+        )
+
+    runs: list[tuple[str, float]] = []
+    invalid = 0
+    for trip_id, start_text, end_text, headway_text in zip(
+        freq.loc[exact, "trip_id"],
+        freq.loc[exact, "start_time"],
+        freq.loc[exact, "end_time"],
+        freq.loc[exact, "headway_secs"],
+    ):
+        start, end = parse_gtfs_time(start_text), parse_gtfs_time(end_text)
+        headway = pd.to_numeric(headway_text, errors="coerce")
+        if start is None or end is None or not headway > 0 or start >= end:
+            invalid += 1
+            continue
+        runs.extend((trip_id, float(run)) for run in np.arange(start, end, float(headway)))
+    if invalid:
+        logging.warning(
+            "%d exact_times row(s) in frequencies.txt have an unreadable time window or "
+            "headway; their trips keep only their stop_times template times.",
+            invalid,
+        )
+    if not runs:
+        return events
+
+    starts = pd.DataFrame(runs, columns=["trip_id", "_run_start"])
+    expanded_ids = set(starts["trip_id"])
+    template = events[events["trip_id"].isin(expanded_ids)]
+    first = template.groupby("trip_id")["departure_sec"].min().rename("_template_start")
+    expanded = template.merge(starts, on="trip_id").join(first, on="trip_id")
+    offset = expanded["_run_start"] - expanded["_template_start"]
+    expanded["arrival_sec"] = expanded["arrival_sec"] + offset
+    expanded["departure_sec"] = expanded["departure_sec"] + offset
+    logging.info(
+        "frequencies.txt: %d exact-times trip(s) expanded to %d scheduled run(s).",
+        len(expanded_ids),
+        len(starts),
+    )
+    rest = events[~events["trip_id"].isin(expanded_ids)]
+    expanded = expanded.drop(columns=["_run_start", "_template_start"])
+    return pd.concat([rest, expanded], ignore_index=True)
+
+
 def _build_stop_events(
-    stop_times: pd.DataFrame, trips: pd.DataFrame, keep_service_ids: Optional[set[str]]
+    stop_times: pd.DataFrame,
+    trips: pd.DataFrame,
+    keep_service_ids: Optional[set[str]],
+    frequencies: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """Join stop_times to trips and resolve feeder/connector event times.
 
@@ -621,6 +712,9 @@ def _build_stop_events(
         trips: Parsed trips.txt.
         keep_service_ids: service_ids to keep (day filter), or None to keep
             every trip.
+        frequencies: Parsed frequencies.txt, or None. Trips with
+            ``exact_times=1`` rows get one set of events per scheduled run
+            (see :func:`_expand_exact_frequencies`).
 
     Returns:
         A frame with ``stop_id``, ``route_id``, ``service_id``,
@@ -672,6 +766,7 @@ def _build_stop_events(
             "stop_times.txt has no stop_sequence column, so trip origins cannot be told "
             "from destinations; every stop counts for both boarding and alighting."
         )
+    events = _expand_exact_frequencies(events, frequencies)
     return events[
         [
             "stop_id",
@@ -783,18 +878,130 @@ def _best_connection(
     return best_wait is not None, best_wait
 
 
+# One transfers.txt row as it applies to a stop pair: (from_route_id or None,
+# to_route_id or None, stop rank, prohibited). Stop rank counts the row's stop
+# IDs that name the stop itself rather than its parent station (0-2).
+TransferRule = tuple[Optional[str], Optional[str], int, bool]
+
+
+def build_transfer_rules(
+    transfers: Optional[pd.DataFrame], stops: pd.DataFrame
+) -> dict[tuple[str, str], list[TransferRule]]:
+    """Index transfers.txt rows by the (from stop, to stop) pairs they govern.
+
+    A ``from_stop_id`` or ``to_stop_id`` naming a station governs each stop
+    whose ``parent_station`` is that station. Rows naming a trip
+    (``from_trip_id``/``to_trip_id``) are skipped with a warning, because this
+    script counts transfers between routes rather than individual trips. Rows
+    without both stop IDs, and in-seat rows (``transfer_type`` 4 or 5), say
+    nothing about walking between stops and are skipped too.
+
+    Args:
+        transfers: Parsed transfers.txt, or None when the feed has none.
+        stops: Parsed stops.txt (``parent_station`` is optional).
+
+    Returns:
+        Mapping of ``(from_stop_id, to_stop_id)`` to the rules that apply there;
+        :func:`transfer_prohibited` decides between them.
+    """
+    if transfers is None or transfers.empty:
+        return {}
+
+    def column(name: str) -> pd.Series:
+        if name not in transfers.columns:
+            return pd.Series("", index=transfers.index)
+        return transfers[name].fillna("").astype(str).str.strip()
+
+    children: dict[str, set[str]] = {}
+    if "parent_station" in stops.columns:
+        parents = stops["parent_station"].fillna("").astype(str).str.strip()
+        for stop_id, parent in zip(stops["stop_id"].astype(str), parents):
+            if parent:
+                children.setdefault(parent, set()).add(stop_id)
+
+    def governed(stop_id: str) -> list[tuple[str, int]]:
+        return [(stop_id, 1), *((child, 0) for child in sorted(children.get(stop_id, ())))]
+
+    rules: dict[tuple[str, str], list[TransferRule]] = {}
+    trip_rows = 0
+    prohibiting = 0
+    kinds = column("transfer_type").replace("", "0")
+    for from_stop, to_stop, from_route, to_route, from_trip, to_trip, kind in zip(
+        column("from_stop_id"),
+        column("to_stop_id"),
+        column("from_route_id"),
+        column("to_route_id"),
+        column("from_trip_id"),
+        column("to_trip_id"),
+        kinds,
+    ):
+        if from_trip or to_trip:
+            trip_rows += 1
+            continue
+        if not from_stop or not to_stop or kind not in {"0", "1", "2", "3"}:
+            continue
+        prohibited = kind == "3"
+        prohibiting += prohibited
+        for stop_a, rank_a in governed(from_stop):
+            for stop_b, rank_b in governed(to_stop):
+                rules.setdefault((stop_a, stop_b), []).append(
+                    (from_route or None, to_route or None, rank_a + rank_b, prohibited)
+                )
+    if trip_rows:
+        logging.warning(
+            "transfers.txt: %d row(s) name a from_trip_id or to_trip_id and are not "
+            "applied; this script compares routes, not individual trips.",
+            trip_rows,
+        )
+    if prohibiting:
+        logging.info("transfers.txt: %d row(s) mark a transfer as not possible.", prohibiting)
+    return rules
+
+
+def transfer_prohibited(rules: Sequence[TransferRule], from_route: str, to_route: str) -> bool:
+    """Return True when the most specific matching rule says the transfer is not possible.
+
+    A rule matches when each route it names equals the feeder (*from_route*)
+    or connector (*to_route*). Rules naming more of the two routes are more
+    specific; among those naming as many, rules naming the stops themselves
+    beat rules naming their parent stations. Equally specific rules that
+    disagree resolve to not possible.
+
+    Args:
+        rules: The rules for one stop pair, from :func:`build_transfer_rules`.
+        from_route: The feeder route_id.
+        to_route: The connector route_id.
+
+    Returns:
+        True when the transfer is not possible (``transfer_type`` 3).
+    """
+    best: Optional[tuple[int, int]] = None
+    prohibited = False
+    for rule_from, rule_to, stop_rank, rule_prohibited in rules:
+        if (rule_from and rule_from != from_route) or (rule_to and rule_to != to_route):
+            continue
+        rank = (int(rule_from is not None) + int(rule_to is not None), stop_rank)
+        if best is None or rank > best:
+            best, prohibited = rank, rule_prohibited
+        elif rank == best:
+            prohibited = prohibited or rule_prohibited
+    return prohibited
+
+
 def compute_transfers(
     stops_gdf: gpd.GeoDataFrame,
     events: pd.DataFrame,
     routes: pd.DataFrame,
     radius_m: float,
     service_dates: Optional[Mapping[str, set[dt.date]]] = None,
+    transfer_rules: Optional[Mapping[tuple[str, str], Sequence[TransferRule]]] = None,
 ) -> dict[str, dict[str, dict[str, float]]]:
     """Compute feasible transfers from each target route to connector routes.
 
     A stop pair counts only where riders can get off the target route at the
-    alighting stop and get on the connector at the boarding stop, whether or
-    not the time check is enabled. When ``service_dates`` is given, the feeder
+    alighting stop and get on the connector at the boarding stop, and where
+    transfers.txt does not mark the transfer as not possible, whether or not
+    the time check is enabled. When ``service_dates`` is given, the feeder
     and connector trips must also belong to services that share an operating
     date.
 
@@ -806,6 +1013,8 @@ def compute_transfers(
         service_dates: Each service_id's eligible operating dates, from
             :func:`eligible_service_dates`. A service missing from it pairs
             with nothing. None pools every trip regardless of service.
+        transfer_rules: transfers.txt rules by stop pair, from
+            :func:`build_transfer_rules`. None applies no rules.
 
     Returns:
         A nested mapping ``target_route_id -> connector_route_id -> stats``,
@@ -851,11 +1060,14 @@ def compute_transfers(
                 continue
             distance = float(np.hypot(coords[i, 0] - coords[j, 0], coords[i, 1] - coords[j, 1]))
             min_wait_sec = distance / walk_mps + buffer_sec if walk_mps > 0 else buffer_sec
+            pair_rules = transfer_rules.get((stop_a, stop_b)) if transfer_rules else None
 
             for route_a in targets_here:
                 arr = arrivals.get((stop_a, route_a), {})
                 for route_b in routes_b:
                     if route_b == route_a:
+                        continue
+                    if pair_rules and transfer_prohibited(pair_rules, route_a, route_b):
                         continue
                     dep = departures.get((stop_b, route_b), {})
                     feasible, wait = _best_connection(
@@ -1088,7 +1300,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         logging.info("No service-day filter: pooling all trips regardless of service day.")
 
     stops_gdf = _project_stops(feed["stops"])
-    events = _build_stop_events(feed["stop_times"], feed["trips"], keep_service_ids)
+    events = _build_stop_events(
+        feed["stop_times"], feed["trips"], keep_service_ids, feed.get("frequencies")
+    )
+    transfer_rules = build_transfer_rules(feed.get("transfers"), feed["stops"])
 
     radius_m = distance_to_meters(MAX_TRANSFER_DISTANCE, MAX_TRANSFER_DISTANCE_UNIT)
     logging.info(
@@ -1097,7 +1312,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "on" if ENABLE_TIME_CHECK else "off",
     )
 
-    results = compute_transfers(stops_gdf, events, routes, radius_m, service_dates)
+    results = compute_transfers(stops_gdf, events, routes, radius_m, service_dates, transfer_rules)
     summary, detail = build_output_tables(results, routes)
 
     os.makedirs(output_dir, exist_ok=True)
