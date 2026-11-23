@@ -19,7 +19,9 @@ Outputs
 All outputs are written to ``OUTPUT_DIR`` (created if it does not exist):
 
 - ``<input stem>_processed.csv`` -- combined trip-level table with load factors
-  and violation flags (machine-readable).
+  and violation flags (machine-readable). ``LOAD_FACTOR_VIOLATION`` is
+  ``TRUE``, ``FALSE``, or ``UNKNOWN`` for a trip with a blank ``MAX_LOAD``; it
+  compares the unrounded load factor, so ``DECIMAL_PLACES`` affects display only.
 - ``<input stem>_processed.xlsx`` (``OUTPUT_FILE``) -- the same table as a
   single-sheet workbook for quick inspection.
 - ``<ROUTE_NAME>.xlsx`` -- one workbook per route, with one sheet per
@@ -84,7 +86,8 @@ HIGHER_LOAD_FACTOR_LIMIT: Final[float] = 1.25
 FILTER_IN_ROUTES: list[str] = []  # e.g. ["101", "202"]
 FILTER_OUT_ROUTES: list[str] = []  # e.g. ["105", "106"]
 
-# Specify how many decimals to round the LOAD_FACTOR to
+# Specify how many decimals to round the LOAD_FACTOR to. Display only:
+# violations are judged on the unrounded load factor.
 DECIMAL_PLACES: Final[int] = 4
 
 WRITE_VIOLATION_LOG: Final[bool] = True
@@ -223,10 +226,15 @@ def check_load_factor_violation(row: pd.Series) -> str:
     Returns:
     -------
     str
-        ``"TRUE"`` if the row exceeds its route limit, otherwise ``"FALSE"``.
+        ``"TRUE"`` if the row exceeds its route limit, ``"FALSE"`` if it does
+        not, and ``"UNKNOWN"`` if the load factor is missing (blank
+        ``MAX_LOAD``), so an unobserved trip is never reported as compliant.
     """
+    load_factor = row["LOAD_FACTOR"]
+    if pd.isna(load_factor):
+        return "UNKNOWN"
     limit = get_route_load_limit(row["ROUTE_NAME"])
-    return "TRUE" if row["LOAD_FACTOR"] > limit else "FALSE"
+    return "TRUE" if load_factor > limit else "FALSE"
 
 
 def determine_limit_type(route_name: str) -> str:
@@ -261,8 +269,10 @@ def process_data(
         1. Normalize ``ROUTE_NAME`` to text, then apply `filter_in_routes` and
            `filter_out_routes`.
         2. Add column ``SERVICE_PERIOD``.
-        3. Compute and round ``LOAD_FACTOR``.
-        4. Add ``LOAD_FACTOR_VIOLATION`` and ``ROUTE_LIMIT_TYPE``.
+        3. Compute ``LOAD_FACTOR`` and flag ``LOAD_FACTOR_VIOLATION`` from the
+           unrounded ratio (``UNKNOWN`` where ``MAX_LOAD`` is blank), then
+           round ``LOAD_FACTOR`` for display.
+        4. Add ``ROUTE_LIMIT_TYPE``.
         5. Sort rows by descending ``LOAD_FACTOR``.
 
     Args:
@@ -296,11 +306,17 @@ def process_data(
     data_frame["SERVICE_PERIOD"] = data_frame["TRIP_START_TIME"].apply(assign_service_period)
     data_frame["LOAD_FACTOR"] = data_frame["MAX_LOAD"] / bus_capacity
 
-    # 5) Round load factor to specified decimals
-    data_frame["LOAD_FACTOR"] = data_frame["LOAD_FACTOR"].round(decimals)
-
-    # 3) Mark whether load factor is violated
+    # 3) Mark whether load factor is violated. The unrounded ratio is compared,
+    #    so the display precision below never changes a trip's compliance.
     data_frame["LOAD_FACTOR_VIOLATION"] = data_frame.apply(check_load_factor_violation, axis=1)
+    unknown = int((data_frame["LOAD_FACTOR_VIOLATION"] == "UNKNOWN").sum())
+    if unknown:
+        logging.warning(
+            "%d trip(s) have no MAX_LOAD; their LOAD_FACTOR_VIOLATION is UNKNOWN.", unknown
+        )
+
+    # Round load factor to specified decimals for display
+    data_frame["LOAD_FACTOR"] = data_frame["LOAD_FACTOR"].round(decimals)
 
     # 4) Add column for route limit type
     data_frame["ROUTE_LIMIT_TYPE"] = data_frame["ROUTE_NAME"].apply(determine_limit_type)
@@ -446,10 +462,18 @@ def write_violation_log(data_frame: pd.DataFrame, log_file_path: str) -> None:
     """
     # Filter rows where load‐factor is violated
     violations_df = data_frame[data_frame["LOAD_FACTOR_VIOLATION"] == "TRUE"]
+    unknown = int((data_frame["LOAD_FACTOR_VIOLATION"] == "UNKNOWN").sum())
+    unknown_note = (
+        f"{unknown} trip(s) have no MAX_LOAD and could not be checked "
+        "(LOAD_FACTOR_VIOLATION = UNKNOWN).\n"
+    )
 
     # Open (or create) the log file and overwrite any existing content
     with open(log_file_path, "w", encoding="utf-8") as log_file:
-        if violations_df.empty:
+        if violations_df.empty and unknown:
+            log_file.write("No load‐factor violations found among trips with a MAX_LOAD.\n")
+            log_file.write(unknown_note)
+        elif violations_df.empty:
             log_file.write(
                 "No load‐factor violations found (all trips within permissible limits).\n"
             )
@@ -482,6 +506,8 @@ def write_violation_log(data_frame: pd.DataFrame, log_file_path: str) -> None:
                     f"{row.get('ROUTE_LIMIT_TYPE', '')}\n"
                 )
                 log_file.write(line)
+            if unknown:
+                log_file.write("\n" + unknown_note)
     logging.info("Exported load‐factor violation log: %s", log_file_path)
 
 
