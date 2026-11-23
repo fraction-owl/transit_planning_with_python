@@ -12,6 +12,7 @@ import importlib
 import os
 import sys
 import types
+import zipfile
 from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -273,6 +274,25 @@ def _long_rows(out: Path) -> list[list[str]]:
 # ---------------------------------------------------------------------------
 # Reading, filtering and spatial reference
 # ---------------------------------------------------------------------------
+
+
+def test_read_gtfs_tables_from_zip_with_wrapper_folder(
+    mod: types.ModuleType, tmp_path: Path
+) -> None:
+    # WMATA publishes its tables one folder inside the zip.
+    gtfs = _write_feed(
+        tmp_path / "gtfs",
+        {"S1": (0, 30), "S2": (500, 30)},
+        [("1", "101", "0", "10", ["S1", "S2"])],
+        {"10": [(0, 0), (2_000, 0)]},
+    )
+    zip_path = tmp_path / "feed.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        for f in gtfs.iterdir():
+            zf.write(f, f"wmata_gtfs/{f.name}")
+    dfs = mod._read_gtfs_tables(zip_path)
+    assert dfs["stops"]["stop_id"].tolist() == ["S1", "S2"]
+    assert set(dfs) == {"stops", "routes", "trips", "stop_times", "shapes"}
 
 
 def test_numeric_ids_keep_their_text_and_shape_geometry(
