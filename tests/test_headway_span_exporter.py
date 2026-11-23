@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime as dt
 import logging
 import math
 import zipfile
@@ -53,30 +54,29 @@ def _write_gtfs(gtfs_dir: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# parse_time_to_minutes
+# parse_time_to_seconds
 # ---------------------------------------------------------------------------
 
 
-def test_parse_time_to_minutes_basic_conversion() -> None:
-    assert target.parse_time_to_minutes("06:30:00") == 390
-    assert target.parse_time_to_minutes("06:30") == 390
+def test_parse_time_to_seconds_basic_conversion() -> None:
+    assert target.parse_time_to_seconds("06:30:00") == 23400
+    assert target.parse_time_to_seconds("06:30") == 23400
 
 
-def test_parse_time_to_minutes_preserves_times_past_midnight() -> None:
-    assert target.parse_time_to_minutes("25:30:00") == 1530
+def test_parse_time_to_seconds_preserves_times_past_midnight() -> None:
+    assert target.parse_time_to_seconds("25:30:00") == 91800
 
 
-def test_parse_time_to_minutes_rounds_seconds() -> None:
-    assert target.parse_time_to_minutes("06:00:31") == 361
-    assert target.parse_time_to_minutes("06:00:29") == 360
-    # Python banker's rounding: exactly 30 s rounds to the even value (0).
-    assert target.parse_time_to_minutes("06:00:30") == 360
+def test_parse_time_to_seconds_keeps_seconds() -> None:
+    assert target.parse_time_to_seconds("06:00:31") == 21631
+    assert target.parse_time_to_seconds("06:00:30") == 21630
 
 
-def test_parse_time_to_minutes_invalid_values_return_none() -> None:
-    assert target.parse_time_to_minutes("not a time") is None
-    assert target.parse_time_to_minutes(None) is None
-    assert target.parse_time_to_minutes(360) is None
+def test_parse_time_to_seconds_invalid_values_return_none() -> None:
+    assert target.parse_time_to_seconds("not a time") is None
+    assert target.parse_time_to_seconds("06:60:00") is None
+    assert target.parse_time_to_seconds(None) is None
+    assert target.parse_time_to_seconds(360) is None
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +141,24 @@ def test_first_departures_filters_to_requested_trips() -> None:
     )
     out = target.first_departures(stop_times, {"T1"})
     assert set(out["trip_id"]) == {"T1"}
+
+
+def test_first_departures_keeps_seconds() -> None:
+    stop_times = pd.DataFrame(
+        {
+            "trip_id": ["T1"],
+            "stop_sequence": ["1"],
+            "departure_time": ["06:16:20"],
+        }
+    )
+    out = target.first_departures(stop_times, {"T1"})
+    assert out.iloc[0]["departure_min"] == pytest.approx(376 + 1 / 3)
+
+
+def test_stop_time_counts_reports_zero_for_trips_without_rows() -> None:
+    stop_times = pd.DataFrame({"trip_id": ["T1", "T1", "T2", "T9"]})
+    counts = target.stop_time_counts(stop_times, {"T1", "T2", "T3"})
+    assert counts.to_dict() == {"T1": 2, "T2": 1, "T3": 0}
 
 
 # ---------------------------------------------------------------------------
@@ -254,8 +272,72 @@ def test_run_end_to_end_writes_csv(tmp_path: Path) -> None:
     assert row["avg_headway_min"] == 30.0
     assert row["span_hrs"] == 1.0
     assert row["trip_count"] == 3
+    assert row["excluded_trip_count"] == 0
     written = pd.read_csv(out_csv)
     assert len(written) == 1
+    assert list(written.columns) == target.OUTPUT_COLUMNS
+
+
+def test_run_excludes_trips_with_fewer_than_two_stop_times(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    gtfs_dir = tmp_path / "gtfs"
+    gtfs_dir.mkdir()
+    _write_gtfs(gtfs_dir)
+    # Single-stop records at 06:15 and 06:45 sit between R1's 30-minute
+    # departures; X3 has no stop_times rows at all.
+    with (gtfs_dir / "trips.txt").open("a") as handle:
+        handle.write("R1,WK,X1,0\nR1,WK,X2,0\nR1,WK,X3,0\n")
+    with (gtfs_dir / "stop_times.txt").open("a") as handle:
+        handle.write("X1,S1,1,06:15:00\nX2,S1,1,06:45:00\n")
+
+    with caplog.at_level(logging.WARNING):
+        result = target.run(
+            gtfs_folder=gtfs_dir, output_path=tmp_path / "out.csv", service_day="weekday"
+        )
+
+    row = result.iloc[0]
+    # Counting X1/X2 as departures would report 5 trips and a 15-minute headway.
+    assert row["avg_headway_min"] == 30.0
+    assert row["trip_count"] == 3
+    assert row["excluded_trip_count"] == 3
+    assert "3 selected trip(s) have fewer than 2 stop_times rows" in caplog.text
+    assert "X1, X2, X3" in caplog.text
+
+
+def test_run_keeps_route_whose_trips_are_all_excluded(tmp_path: Path) -> None:
+    gtfs_dir = tmp_path / "gtfs"
+    gtfs_dir.mkdir()
+    _write_gtfs(gtfs_dir)
+    # R2's only trip (T4, one stop) now also runs on weekdays.
+    (gtfs_dir / "trips.txt").write_text(
+        "route_id,service_id,trip_id,direction_id\nR1,WK,T1,0\nR1,WK,T2,0\nR1,WK,T3,0\nR2,WK,T4,0\n"
+    )
+    result = target.run(
+        gtfs_folder=gtfs_dir, output_path=tmp_path / "out.csv", service_day="weekday"
+    ).set_index("route_id")
+    assert result.loc["R1", "trip_count"] == 3
+    assert result.loc["R2", "trip_count"] == 0
+    assert result.loc["R2", "excluded_trip_count"] == 1
+    assert math.isnan(result.loc["R2", "avg_headway_min"])
+
+
+def test_run_headway_keeps_departure_seconds(tmp_path: Path) -> None:
+    gtfs_dir = tmp_path / "gtfs"
+    gtfs_dir.mkdir()
+    _write_gtfs(gtfs_dir)
+    # Departures 16 min 20 s apart. Rounding each to the minute first
+    # (360, 376, 393) would report 16.5.
+    (gtfs_dir / "stop_times.txt").write_text(
+        "trip_id,stop_id,stop_sequence,departure_time\n"
+        "T1,S1,1,06:00:00\nT1,S2,2,06:10:00\n"
+        "T2,S1,1,06:16:20\nT2,S2,2,06:26:20\n"
+        "T3,S1,1,06:32:40\nT3,S2,2,06:42:40\n"
+    )
+    result = target.run(
+        gtfs_folder=gtfs_dir, output_path=tmp_path / "out.csv", service_day="weekday"
+    )
+    assert result.iloc[0]["avg_headway_min"] == 16.3
 
 
 def test_run_stops_on_selected_frequency_based_trip(tmp_path: Path) -> None:
@@ -289,13 +371,14 @@ def test_run_route_filters_can_exclude_everything(tmp_path: Path) -> None:
     gtfs_dir = tmp_path / "gtfs"
     gtfs_dir.mkdir()
     _write_gtfs(gtfs_dir)
-    with pytest.raises(SystemExit):
+    with pytest.raises(ValueError, match="No trips remain after filtering"):
         target.run(
             gtfs_folder=gtfs_dir,
             output_path=tmp_path / "out.csv",
             service_day="weekday",
             filter_out_route_short_names=["101"],
         )
+    assert not (tmp_path / "out.csv").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -401,6 +484,63 @@ def test_run_calendar_dates_only_feed(tmp_path: Path, service_date: str) -> None
     )
     assert list(result["route_id"]) == ["R1"]
     assert result.iloc[0]["trip_count"] == 3
+
+
+def _write_november_feed(gtfs_dir: Path) -> None:
+    """Weekday service through November 2026, none on Thanksgiving (Nov 26)."""
+    _write_gtfs(gtfs_dir)
+    (gtfs_dir / "calendar.txt").write_text(
+        "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,start_date,end_date\n"
+        "WK,1,1,1,1,1,0,0,20261101,20261130\nSAT,0,0,0,0,0,1,0,20261101,20261130\n"
+    )
+    (gtfs_dir / "calendar_dates.txt").write_text("service_id,date,exception_type\nWK,20261126,2\n")
+
+
+def test_main_no_service_date_inside_feed_writes_header_only_csv(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    gtfs_dir = tmp_path / "gtfs"
+    gtfs_dir.mkdir()
+    _write_november_feed(gtfs_dir)
+    out_csv = tmp_path / "thanksgiving.csv"
+    argv = ["--gtfs-folder", str(gtfs_dir), "--output", str(out_csv)]
+
+    with caplog.at_level(logging.WARNING):
+        assert target.main([*argv, "--service-date", "20261126"]) == 0
+    assert "No trips are scheduled on SERVICE_DATE 20261126" in caplog.text
+    written = pd.read_csv(out_csv)
+    assert written.empty
+    assert list(written.columns) == target.OUTPUT_COLUMNS
+
+    # Route filters never turn a no-service day into an error either.
+    assert target.main([*argv, "--service-date", "20261126", "--filter-in", "101"]) == 0
+
+
+def test_main_service_date_outside_feed_calendar_fails(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    gtfs_dir = tmp_path / "gtfs"
+    gtfs_dir.mkdir()
+    _write_november_feed(gtfs_dir)
+    out_csv = tmp_path / "out.csv"
+    with caplog.at_level(logging.ERROR):
+        rc = target.main(
+            ["--gtfs-folder", str(gtfs_dir), "--output", str(out_csv), "--service-date", "20261201"]
+        )
+    assert rc == 1
+    assert "outside the period the feed's calendar covers" in caplog.text
+    assert "20261101 to 20261130" in caplog.text
+    assert not out_csv.exists()
+
+
+def test_calendar_period_spans_calendar_and_calendar_dates() -> None:
+    calendar = pd.DataFrame({"start_date": ["20261101"], "end_date": ["20261130"]})
+    calendar_dates = pd.DataFrame({"date": ["20261215", "bad"]})
+    assert target.calendar_period(calendar, calendar_dates) == (
+        dt.date(2026, 11, 1),
+        dt.date(2026, 12, 15),
+    )
+    assert target.calendar_period(pd.DataFrame(columns=["start_date"]), None) is None
 
 
 def test_run_requires_calendar_or_calendar_dates(tmp_path: Path) -> None:

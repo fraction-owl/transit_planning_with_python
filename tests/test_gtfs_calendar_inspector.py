@@ -106,6 +106,31 @@ def test_run_stops_when_calendar_dates_is_damaged(tmp_path: Path) -> None:
     assert rc == 1
 
 
+def test_run_labels_rare_non_holiday_service_infrequent(tmp_path: Path) -> None:
+    feed = tmp_path / "feed"
+    feed.mkdir()
+    (feed / "calendar.txt").write_text(
+        "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,start_date,end_date\n"
+        "WK,1,1,1,1,1,0,0,20261101,20261130\n"
+        "NOV2,1,0,0,0,0,0,0,20261102,20261102\n",
+        encoding="utf-8",
+    )
+    (feed / "calendar_dates.txt").write_text(
+        "service_id,date,exception_type\nWK,20261126,2\nTHX,20261126,1\n", encoding="utf-8"
+    )
+    service, _ = target.run(gtfs_path=feed, output_dir=tmp_path / "out")
+
+    # One ordinary Monday: rare, but nothing in the feed makes it a holiday.
+    nov2 = _summary_row(service, "NOV2")
+    assert nov2["labels"] == "Infrequent"
+    assert nov2["holiday_days"] == 0
+    # Runs only on Thanksgiving: the Holiday label is backed by holiday_days.
+    thx = _summary_row(service, "THX")
+    assert thx["labels"] == "Holiday"
+    assert thx["holiday_days"] == 1
+    assert _summary_row(service, "WK")["labels"] == "Weekday"
+
+
 def test_run_accepts_zipped_feed_without_calendar_dates(tmp_path: Path) -> None:
     zip_path = tmp_path / "feed.zip"
     with zipfile.ZipFile(zip_path, "w") as archive:
