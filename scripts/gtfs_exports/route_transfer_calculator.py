@@ -26,21 +26,21 @@ has a later one, judged per visit (so a loop still lets riders off when it retur
 origin). Stop pairs that transfers.txt marks not possible (``transfer_type`` 3) never count,
 and trips with ``exact_times=1`` in frequencies.txt count at every scheduled run.
 
-By default only regular weekday service is considered: ``DAY_OF_WEEK`` is
-``"weekday"``, which keeps trips whose calendar.txt service runs on at least one
-of Monday–Friday. Weekend-only service is excluded, and because
-``calendar_dates.txt`` exceptions are never consulted, holiday-exception service
-never enters the pool either. Under a day filter, feeder and connector trips
-pair only if their services share a calendar.txt operating date on one of the
-filter's days (a Monday-only trip never feeds a Tuesday-only one). Set a single
-day name to filter to that day, or ``None`` / ``--day all`` to pool every trip
-regardless of service day (which can pair trips that never run on the same day
-— inflating counts).
+By default (``DAY_OF_WEEK = "weekday"``) one representative weekday is analysed,
+the date ``gtfs_calendar_inspector.py`` reports: from calendar.txt and
+calendar_dates.txt, the median Monday–Friday date (federal holidays skipped)
+running the most common set of services. Only that date's trips are kept, so
+feeder and connector trips always run on the same day. A day name picks a
+representative date of that day; ``SERVICE_DATE`` analyses one explicit date
+(e.g. the day after Thanksgiving); ``None`` / ``--day all`` pools every trip
+(which can pair trips that never run on the same day, inflating counts). A
+calendar without usable dates falls back to calendar.txt's weekday columns.
 
 Inputs:
     - A GTFS feed folder or ``.zip`` with stops.txt, routes.txt, trips.txt, and
       stop_times.txt (a single agency's feed, or a merged multi-agency feed
-      from gtfs_feed_merger.py). calendar.txt is used when a day filter is set.
+      from gtfs_feed_merger.py). calendar.txt and calendar_dates.txt are used
+      when a day filter or SERVICE_DATE is set.
 
 Outputs:
     - A summary CSV keyed on ``route_id``: one row per target route with a
@@ -50,7 +50,7 @@ Outputs:
       shortest feasible wait observed.
 
 Defaults come from the CONFIGURATION block; ``--gtfs-dir`` / ``--output-dir`` /
-``--day`` / ``--log-level`` override them, so the script can run standalone or
+``--day`` / ``--service-date`` / ``--log-level`` override them, so the script can run standalone or
 under the prep_features_public.py orchestrator.
 
 Typical usage:
@@ -131,15 +131,18 @@ MIN_TRANSFER_BUFFER_MINUTES: float = 0.0
 # Longest a rider will wait at the connector stop, in minutes.
 MAX_TRANSFER_WAIT_MINUTES: float = 30.0
 
-# Service-day filter. "weekday" (the default) keeps trips whose calendar.txt
-# service runs on at least one of Monday-Friday — regular weekday service, with
-# weekend-only service excluded and holiday exceptions naturally absent because
-# calendar_dates.txt is never consulted. A single day name (e.g., "monday")
-# keeps only that day's service. Either way, a feeder and a connector trip pair
-# only if their services run on a common date within the filter's days.
-# None keeps all trips regardless of service day.
-# Feeds without calendar.txt fall back to all trips with a warning.
+# Service-day filter. "weekday" (the default) keeps the trips that run on a
+# representative weekday: the date, picked from calendar.txt and
+# calendar_dates.txt, that runs the most common Monday-Friday set of services
+# (observed federal holidays skipped). A single day name (e.g., "friday") picks
+# a representative date of that day. None keeps all trips regardless of
+# service day. Feeds with no calendar at all keep all trips, with a warning.
 DAY_OF_WEEK: Optional[str] = "weekday"
+
+# Explicit service date (YYYYMMDD or YYYY-MM-DD), e.g. "20261127" for the day
+# after Thanksgiving. When set, it replaces DAY_OF_WEEK: only the trips of the
+# services running on that date are kept. "" = use DAY_OF_WEEK.
+SERVICE_DATE: str = ""
 
 # --- Output ---------------------------------------------------------------
 SUMMARY_FILENAME = "route_transfers_summary.csv"
@@ -215,7 +218,8 @@ def distance_to_meters(distance: float, unit: str) -> float:
 def service_ids_active_on_day(calendar_df: Optional[pd.DataFrame], day: str) -> Optional[set[str]]:
     """Return the set of service_ids whose regular service runs on the given day.
 
-    Only ``calendar.txt`` weekly flags are consulted; date-specific exceptions in
+    The fallback of :func:`select_services` when the calendar has no usable
+    dates. Only ``calendar.txt`` weekly flags are consulted; date-specific exceptions in
     ``calendar_dates.txt`` are not mapped to weekdays, so holiday-exception
     service never qualifies. When the calendar is unavailable, None is returned
     to signal "do not filter".
@@ -408,6 +412,294 @@ def eligible_service_dates(
     }
 
 
+def service_ids_active_on(
+    active_dates: Mapping[str, set[dt.date]],
+    target_date: dt.date,
+) -> set[str]:
+    """Return the service_ids operating on *target_date*.
+
+    Args:
+        active_dates: Output of :func:`expand_service_active_dates`.
+        target_date: The calendar date to query.
+
+    Returns:
+        Set of service_id strings active on that date (possibly empty).
+    """
+    return {sid for sid, dates in active_dates.items() if target_date in dates}
+
+
+def representative_service_date(
+    active_dates: Mapping[str, set[dt.date]],
+    service_day: str,
+    override_date: Optional[dt.date] = None,
+    exclude_dates: Optional[set[dt.date]] = None,
+) -> tuple[dt.date, set[str]]:
+    """Pick a typical date for *service_day* and the service_ids active on it.
+
+    Rather than trusting any single date or unioning every service whose
+    columns mention a weekday (which double-counts agencies running distinct
+    Monday / midweek / Friday schedules), this scans every candidate date of
+    the requested day type, groups them by their exact set of active
+    service_ids, and returns the median date of the **modal** (most common)
+    set. A few miscoded dates therefore cannot steer the result, and per-day
+    math (headways, spans, trip counts) reflects one real operating day.
+
+    Warnings are logged when the choice is ambiguous: when the modal set
+    covers under half the candidate dates, and — for ``"weekday"`` — when
+    Monday-through-Friday do not all share one service pattern, so the user
+    knows a single representative day cannot speak for the whole week.
+
+    Args:
+        active_dates: Output of :func:`expand_service_active_dates`.
+        service_day: ``"weekday"`` or one of ``"monday"`` … ``"sunday"``.
+        override_date: Skip selection entirely and use this date (the
+            explicit user override). Logged, and a warning is emitted if no
+            service is active on it.
+        exclude_dates: Dates to skip as candidates — typically observed
+            holidays, so a holiday cannot masquerade as a typical day.
+
+    Returns:
+        Tuple of (chosen date, set of service_id strings active on it).
+
+    Raises:
+        ValueError: If *service_day* is not recognised, or no candidate
+            dates exist for it.
+    """
+    day_names = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+    key = service_day.strip().lower()
+    if key == "weekday":
+        allowed = {0, 1, 2, 3, 4}
+    elif key in day_names:
+        allowed = {day_names.index(key)}
+    else:
+        raise ValueError(
+            f"service_day must be 'weekday' or one of {', '.join(day_names)}; got {service_day!r}"
+        )
+
+    if override_date is not None:
+        ids = service_ids_active_on(active_dates, override_date)
+        if not ids:
+            logging.warning("No service is active on override date %s.", override_date)
+        else:
+            logging.info(
+                "Using override date %s (%s): %d service_id(s).",
+                override_date,
+                day_names[override_date.weekday()],
+                len(ids),
+            )
+        return override_date, ids
+
+    skip = exclude_dates or set()
+    candidates = sorted(
+        {d for dates in active_dates.values() for d in dates if d.weekday() in allowed} - skip
+    )
+    if not candidates:
+        raise ValueError(f"No active dates found for service_day={service_day!r}.")
+
+    by_set: dict[frozenset[str], list[dt.date]] = {}
+    for d in candidates:
+        by_set.setdefault(frozenset(service_ids_active_on(active_dates, d)), []).append(d)
+
+    modal_ids = max(by_set, key=lambda ids: (len(by_set[ids]), -min(by_set[ids]).toordinal()))
+    modal_dates = by_set[modal_ids]
+    chosen = modal_dates[len(modal_dates) // 2]
+    share = len(modal_dates) / len(candidates)
+
+    if key == "weekday":
+        per_day: dict[str, frozenset[str]] = {}
+        for dow in sorted({d.weekday() for d in candidates}):
+            day_candidates = [d for d in candidates if d.weekday() == dow]
+            day_sets: dict[frozenset[str], int] = {}
+            for d in day_candidates:
+                s = frozenset(service_ids_active_on(active_dates, d))
+                day_sets[s] = day_sets.get(s, 0) + 1
+            per_day[day_names[dow]] = max(day_sets, key=lambda s: day_sets[s])
+        if len(set(per_day.values())) > 1:
+            detail = "; ".join(
+                f"{day}={sorted(ids) if ids else '{}'}" for day, ids in per_day.items()
+            )
+            logging.warning(
+                "Weekday service varies by day of week (%s). Using %s (%s) as the "
+                "representative weekday; pass an explicit service date to analyse "
+                "a different day.",
+                detail,
+                chosen,
+                day_names[chosen.weekday()],
+            )
+    if share < 0.5:
+        logging.warning(
+            "The chosen service pattern covers only %.0f%% of candidate %s dates — "
+            "this feed's %s service is irregular; consider an explicit service date.",
+            share * 100,
+            service_day,
+            service_day,
+        )
+
+    logging.info(
+        "Representative %s: %s (%s) with %d service_id(s), matching %.0f%% of candidate dates.",
+        service_day,
+        chosen,
+        day_names[chosen.weekday()],
+        len(modal_ids),
+        share * 100,
+    )
+    return chosen, set(modal_ids)
+
+
+def federal_holidays_observed(year: int) -> set[dt.date]:
+    """Return the observed dates of the U.S. federal holidays of *year*.
+
+    Covers the eleven holidays of 5 U.S.C. 6103: New Year's Day, Birthday of
+    Martin Luther King Jr. (3rd Monday of January), Washington's Birthday
+    (3rd Monday of February), Memorial Day (last Monday of May), Juneteenth
+    (June 19, from its 2021 establishment onward), Independence Day, Labor
+    Day (1st Monday of September), Columbus Day (2nd Monday of October),
+    Veterans Day, Thanksgiving (4th Thursday of November), and Christmas.
+
+    Fixed-date holidays falling on a Saturday are observed on the preceding
+    Friday and those falling on a Sunday on the following Monday, so an
+    observed date can land in the *previous* calendar year (e.g. New Year's
+    Day 2022 was observed on 2021-12-31). Callers classifying a span of dates
+    should therefore union this set over ``range(first_year, last_year + 2)``.
+
+    Args:
+        year: Calendar year whose holidays are computed.
+
+    Returns:
+        The observed dates of *year*'s federal holidays.
+    """
+
+    def nth_weekday(month: int, weekday: int, n: int) -> dt.date:
+        first = dt.date(year, month, 1)
+        offset = (weekday - first.weekday()) % 7
+        return first + dt.timedelta(days=offset + 7 * (n - 1))
+
+    def last_monday(month: int) -> dt.date:
+        next_month = dt.date(year + (month == 12), month % 12 + 1, 1)
+        last = next_month - dt.timedelta(days=1)
+        return last - dt.timedelta(days=last.weekday())
+
+    def observed(day: dt.date) -> dt.date:
+        if day.weekday() == 5:  # Saturday -> preceding Friday
+            return day - dt.timedelta(days=1)
+        if day.weekday() == 6:  # Sunday -> following Monday
+            return day + dt.timedelta(days=1)
+        return day
+
+    fixed = [
+        dt.date(year, 1, 1),  # New Year's Day
+        dt.date(year, 7, 4),  # Independence Day
+        dt.date(year, 11, 11),  # Veterans Day
+        dt.date(year, 12, 25),  # Christmas Day
+    ]
+    if year >= 2021:
+        fixed.append(dt.date(year, 6, 19))  # Juneteenth
+    floating = [
+        nth_weekday(1, 0, 3),  # Birthday of Martin Luther King Jr.
+        nth_weekday(2, 0, 3),  # Washington's Birthday
+        last_monday(5),  # Memorial Day
+        nth_weekday(9, 0, 1),  # Labor Day
+        nth_weekday(10, 0, 2),  # Columbus Day
+        nth_weekday(11, 3, 4),  # Thanksgiving Day
+    ]
+    return {observed(day) for day in fixed} | set(floating)
+
+
+def parse_service_date(text: str) -> Optional[dt.date]:
+    """Parse SERVICE_DATE (``YYYYMMDD`` or ``YYYY-MM-DD``); ``""`` gives ``None``.
+
+    Raises:
+        ValueError: If *text* is not blank and not a date in either format.
+    """
+    value = str(text).strip()
+    if not value:
+        return None
+    for fmt in ("%Y%m%d", "%Y-%m-%d"):
+        try:
+            return dt.datetime.strptime(value, fmt).date()
+        except ValueError:
+            continue
+    raise ValueError(f"SERVICE_DATE {value!r} is not a date; use YYYYMMDD or YYYY-MM-DD.")
+
+
+def select_services(
+    calendar_df: Optional[pd.DataFrame],
+    calendar_dates_df: Optional[pd.DataFrame],
+    day: Optional[str],
+    service_date: Optional[dt.date] = None,
+) -> tuple[Optional[set[str]], Optional[dict[str, set[dt.date]]]]:
+    """Choose the services to analyse: one date's services, or every trip.
+
+    With *service_date*, the services running on that date. Otherwise, with a
+    day filter, the services running on a representative date of *day* (see
+    :func:`representative_service_date`), with calendar_dates.txt exceptions
+    applied and observed federal holidays skipped. Either way every kept trip
+    runs on the same date, so feeder and connector trips need no date matching.
+
+    If the calendar has no usable dates (no calendar files, or calendar.txt
+    without ``start_date``/``end_date``), the day filter falls back to
+    calendar.txt's weekday columns via :func:`service_ids_active_on_day`, and
+    services pair only on shared dates from :func:`eligible_service_dates`.
+
+    Args:
+        calendar_df: Parsed calendar.txt, or None if the feed has none.
+        calendar_dates_df: Parsed calendar_dates.txt, or None if the feed has none.
+        day: ``"weekday"``, a day name, or None for no day filter.
+        service_date: Explicit date that replaces *day*, or None.
+
+    Returns:
+        ``(service_ids, service_dates)``: the service_ids to keep (None keeps every
+        trip) and, in the weekday-column fallback only, each service's eligible
+        dates for :func:`compute_transfers` (otherwise None).
+
+    Raises:
+        ValueError: If *day* is not recognised, or no service runs on *service_date*.
+    """
+    if day is not None and day.lower() != "weekday" and day.lower() not in _DAY_COLUMNS:
+        raise ValueError(f"DAY_OF_WEEK must be 'weekday' or one of {_DAY_COLUMNS}, got '{day}'.")
+    if service_date is None and day is None:
+        return None, None
+    try:
+        active = expand_service_active_dates(calendar_df, calendar_dates_df)
+        if service_date is not None:
+            ids = service_ids_active_on(active, service_date)
+            if not ids:
+                raise ValueError(f"No service runs on SERVICE_DATE {service_date.isoformat()}.")
+            logging.info(
+                "Using SERVICE_DATE %s (%s): service_id(s) %s.",
+                service_date.isoformat(),
+                service_date.strftime("%A"),
+                ", ".join(sorted(ids)),
+            )
+            return ids, None
+        years = {d.year for dates in active.values() for d in dates}
+        holidays: set[dt.date] = set()
+        for year in range(min(years, default=0), max(years, default=-1) + 2):
+            holidays |= federal_holidays_observed(year)
+        chosen, ids = representative_service_date(active, str(day), exclude_dates=holidays)
+        logging.info(
+            "Analysing %s (%s): service_id(s) %s.",
+            chosen.isoformat(),
+            chosen.strftime("%A"),
+            ", ".join(sorted(ids)),
+        )
+        return ids, None
+    except ValueError as exc:
+        if service_date is not None:
+            raise
+        logging.warning(
+            "Could not pick a representative %s from the calendar dates (%s); "
+            "falling back to calendar.txt weekday columns.",
+            day,
+            exc,
+        )
+    keep = service_ids_active_on_day(calendar_df, str(day))
+    if keep is None:
+        logging.warning("No usable calendar.txt for the day filter; keeping all trips.")
+        return None, None
+    return keep, eligible_service_dates(calendar_df, str(day), keep)
+
+
 def has_timed_connection(
     arrivals: np.ndarray,
     departures: np.ndarray,
@@ -510,8 +802,9 @@ def _read_feed(folder: str) -> tuple[dict[str, pd.DataFrame], Optional[pd.DataFr
 
     Returns:
         A tuple ``(tables, calendar)``: ``stops``, ``routes``, ``trips`` and
-        ``stop_times`` frames, plus ``transfers`` and ``frequencies`` when the
-        feed has them, and calendar.txt (None when the feed has none).
+        ``stop_times`` frames, plus ``transfers``, ``frequencies`` and
+        ``calendar_dates`` when the feed has them, and calendar.txt (None when
+        the feed has none).
 
     Raises:
         FileNotFoundError: If a required GTFS file is missing.
@@ -546,7 +839,7 @@ def _read_feed(folder: str) -> tuple[dict[str, pd.DataFrame], Optional[pd.DataFr
         len(stop_times),
     )
     tables = {"stops": stops, "routes": routes, "trips": trips, "stop_times": stop_times}
-    for name in ("transfers", "frequencies"):
+    for name in ("transfers", "frequencies", "calendar_dates"):
         try:
             tables[name] = _read(f"{name}.txt")
         except FileNotFoundError:
@@ -1235,9 +1528,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--day",
         default=DAY_OF_WEEK if DAY_OF_WEEK is not None else "all",
         help=(
-            "Service-day filter: 'weekday' (any Mon-Fri service), a single "
-            "day name (monday..sunday), or 'all' to keep every trip."
+            "Service-day filter: 'weekday' (a representative Mon-Fri date), a single "
+            "day name (monday..sunday) for a representative date of that day, or "
+            "'all' to keep every trip."
         ),
+    )
+    parser.add_argument(
+        "--service-date",
+        default=SERVICE_DATE,
+        help="Explicit service date (YYYYMMDD or YYYY-MM-DD); replaces --day when set.",
     )
     parser.add_argument(
         "--log-level",
@@ -1273,6 +1572,16 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     day_token = str(args.day).strip().lower()
     day_filter: Optional[str] = None if day_token in ("", "all", "none") else day_token
+    try:
+        service_date = parse_service_date(args.service_date)
+    except ValueError as exc:
+        logging.error("%s", exc)
+        return 2
+    if day_filter is not None and day_filter != "weekday" and day_filter not in _DAY_COLUMNS:
+        logging.error(
+            "--day must be 'weekday', 'all' or one of %s; got %r.", _DAY_COLUMNS, day_token
+        )
+        return 2
 
     try:
         feed, calendar = _read_feed(gtfs_dir)
@@ -1287,17 +1596,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
     logging.info("Identified %d target route(s).", n_targets)
 
-    keep_service_ids: Optional[set[str]] = None
-    service_dates: Optional[dict[str, set[dt.date]]] = None
-    if day_filter is not None:
+    if service_date is None and day_filter is not None:
         logging.info("Service-day filter: %s.", day_filter)
-        keep_service_ids = service_ids_active_on_day(calendar, day_filter)
-        if keep_service_ids is None:
-            logging.warning("No usable calendar.txt for the day filter; keeping all trips.")
-        else:
-            service_dates = eligible_service_dates(calendar, day_filter, keep_service_ids)
-    else:
+    elif service_date is None:
         logging.info("No service-day filter: pooling all trips regardless of service day.")
+    try:
+        keep_service_ids, service_dates = select_services(
+            calendar, feed.get("calendar_dates"), day_filter, service_date
+        )
+    except ValueError as exc:
+        logging.error("%s", exc)
+        return 1
 
     stops_gdf = _project_stops(feed["stops"])
     events = _build_stop_events(

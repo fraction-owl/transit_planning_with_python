@@ -178,6 +178,20 @@ def test_compute_headway_span_averages_across_directions() -> None:
     assert row["trip_count"] == 4
 
 
+def test_compute_headway_span_rounds_once_after_averaging_directions() -> None:
+    trips_dep = pd.DataFrame(
+        {
+            "route_id": ["R1"] * 6,
+            "direction_id": ["0", "0", "1", "1", "1", "1"],
+            # 30.0-min and 30.666...-min headways: the mean is 30.333...
+            "departure_min": [360, 390, 360, 390, 420, 452],
+        }
+    )
+    row = target.compute_headway_span(trips_dep).iloc[0]
+    # Rounding each direction first (30.0 and 30.7) would give 30.4.
+    assert row["avg_headway_min"] == 30.3
+
+
 def test_compute_headway_span_spans_first_to_last_departure_across_directions() -> None:
     # AM-inbound / PM-outbound route: each direction alone spans one hour.
     trips_dep = pd.DataFrame(

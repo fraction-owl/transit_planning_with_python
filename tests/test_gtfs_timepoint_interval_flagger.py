@@ -125,13 +125,38 @@ def test_compute_intervals_pairs_and_math(tmp_path: Path) -> None:
     t1 = intervals.loc[intervals["trip_id"] == "T1"].iloc[0]
     assert (t1["from_stop_id"], t1["to_stop_id"]) == ("S1", "S3")  # skips non-timepoint S2
     assert t1["interval_minutes"] == 12
-    assert (t1["from_departure"], t1["to_arrival"]) == ("07:00", "07:12")
+    assert (t1["from_departure"], t1["to_arrival"]) == ("07:00:00", "07:12:00")
 
     t3 = intervals.loc[intervals["trip_id"] == "T3"].iloc[0]
     assert t3["interval_minutes"] == 12  # 23:55 -> 24:07 crosses midnight
-    assert t3["to_arrival"] == "24:07"
+    assert t3["to_arrival"] == "24:07:00"
     assert t3["route_short_name"] == "20"
     assert t3["from_stop_name"] == "Elm & Oak"
+
+
+def test_interval_seconds_count_against_a_strict_limit(tmp_path: Path) -> None:
+    feed = _write_feed(tmp_path / "gtfs")
+    st = pd.read_csv(feed / "stop_times.txt", dtype=str)
+    # T2 runs S1 08:00:00 -> S2 08:10:20: 10.33 minutes, over a 10-minute limit
+    # even though both times round to whole minutes 10 apart.
+    st.loc[
+        (st["trip_id"] == "T2") & (st["stop_id"] == "S2"), ["arrival_time", "departure_time"]
+    ] = "08:10:20"
+    st.to_csv(feed / "stop_times.txt", index=False)
+    flags = target.run(str(feed), tmp_path / "out", max_interval_minutes=10.0)
+    t2 = flags.loc[flags["trip_id"] == "T2"].iloc[0]
+    assert t2["interval_minutes"] == pytest.approx(620 / 60)
+    assert (t2["from_departure"], t2["to_arrival"]) == ("08:00:00", "08:10:20")
+    detail = pd.read_csv(tmp_path / "out" / target.DETAIL_FILENAME)
+    assert detail.loc[detail["trip_id"] == "T2", "interval_minutes"].item() == 10.33
+
+
+def test_parse_time_to_seconds_keeps_seconds() -> None:
+    assert target.parse_time_to_seconds("08:10:20") == 29420
+    assert target.parse_time_to_seconds("25:00") == 90000
+    assert target.parse_time_to_seconds("8:61:00") is None
+    assert target.parse_time_to_seconds(None) is None
+    assert target.seconds_to_hhmmss(95400) == "26:30:00"
 
 
 def test_flag_long_intervals_boundary_and_negatives(caplog: pytest.LogCaptureFixture) -> None:
