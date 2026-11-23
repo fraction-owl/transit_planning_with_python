@@ -822,3 +822,75 @@ def test_main_rejects_bad_extra_holiday_date(
     monkeypatch.setattr(mod, "BASE_OUTPUT_PATH", str(tmp_path / "out"))
     monkeypatch.setattr(mod, "EXTRA_HOLIDAY_DATES", ["Dec 24"])
     assert mod.main() == 2
+
+
+# ---------------------------------------------------------------------------
+# Frequency-weighted averages and stop-pattern variants
+# ---------------------------------------------------------------------------
+
+# FULL serves A-B-C in 30 min once. FREQ serves A-B in 10 min, as a template
+# for runs every 10 minutes from 06:00 until (not including) 07:30: 9 runs.
+_FREQ_FEED = {
+    "routes.txt": "route_id,route_short_name,route_long_name\nR1,1,One\n",
+    "trips.txt": (
+        "route_id,service_id,trip_id,direction_id,shape_id\nR1,WK,FULL,0,S\nR1,WK,FREQ,0,S\n"
+    ),
+    "stop_times.txt": (
+        "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+        "FULL,07:00:00,07:00:00,A,1\nFULL,07:10:00,07:10:00,B,2\nFULL,07:30:00,07:30:00,C,3\n"
+        "FREQ,06:00:00,06:00:00,A,1\nFREQ,06:10:00,06:10:00,B,2\n"
+    ),
+    "frequencies.txt": (
+        "trip_id,start_time,end_time,headway_secs,exact_times\nFREQ,06:00:00,07:30:00,600,1\n"
+    ),
+    "calendar_dates.txt": "service_id,date,exception_type\nWK,20260105,1\n",
+}
+
+
+def test_main_weights_frequency_trips_and_counts_short_turn_variant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    feed_dir = tmp_path / "feed"
+    feed_dir.mkdir()
+    for name, text in _FREQ_FEED.items():
+        (feed_dir / name).write_text(text, encoding="utf-8")
+    monkeypatch.setattr(mod, "GTFS_FOLDER_PATH", str(feed_dir))
+    monkeypatch.setattr(mod, "BASE_OUTPUT_PATH", str(tmp_path / "out"))
+    assert mod.main() == 0
+    row = pd.read_excel(tmp_path / "out" / mod.OUTPUT_FILENAME).iloc[0]
+    # (30 + 9 x 10) / 10 departures, not (30 + 10) / 2 trip_ids.
+    assert row["avg_duration_min"] == pytest.approx(12.0)
+    # A-B-C and the A-B short turn share shape S but are two stop patterns.
+    assert row["variants"] == 2
+
+
+def test_scheduled_runs_per_trip_sums_windows_and_skips_bad_rows() -> None:
+    freq = pd.DataFrame(
+        {
+            "trip_id": ["T", "T", "U", "V"],
+            "start_time": ["06:00:00", "16:00:00", "06:00:00", "bad"],
+            "end_time": ["07:00:00", "16:25:00", "06:00:00", "07:00:00"],
+            "headway_secs": ["600", "600", "600", "600"],
+        }
+    )
+    # 06:00-07:00 every 10 min = 6 runs; 16:00-16:25 = 16:00, :10, :20 = 3 runs.
+    assert mod.scheduled_runs_per_trip(freq).to_dict() == {"T": 9.0}
+    assert mod.scheduled_runs_per_trip(None).empty
+
+
+def test_trip_stop_patterns_split_on_restrictions_riders_can_use() -> None:
+    stop_times = pd.DataFrame(
+        {
+            "trip_id": ["T1"] * 3 + ["T2"] * 3 + ["T3"] * 3,
+            "stop_id": ["A", "B", "C"] * 3,
+            "stop_sequence": ["1", "2", "3"] * 3,
+            # T2 forbids alighting at its origin and boarding at its terminus
+            # (unusable either way); T3 is drop-off only at B.
+            "pickup_type": ["", "", "", "0", "", "1", "", "1", ""],
+            "drop_off_type": ["", "", "", "1", "", "0", "", "", ""],
+        }
+    )
+    patterns = mod.trip_stop_patterns(stop_times)
+    assert patterns["T1"] == patterns["T2"]
+    assert patterns["T1"] != patterns["T3"]
+    assert mod.trip_stop_patterns(stop_times.drop(columns="stop_id")).empty
