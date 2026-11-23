@@ -23,17 +23,18 @@ count as feeder arrivals, and stop times with ``pickup_type`` 1 never count as c
 departures, whether or not the time check is enabled. A stop time counts as a feeder arrival
 only if its trip has an earlier ``stop_sequence`` and as a connector departure only if it
 has a later one, judged per visit (so a loop still lets riders off when it returns to its
-origin). Stop pairs that transfers.txt marks not possible (``transfer_type`` 3) never count,
-and trips with ``exact_times=1`` in frequencies.txt count at every scheduled run.
+origin). transfers.txt is honored: ``transfer_type`` 3 pairs never count, and a longer
+``transfer_type`` 2 ``min_transfer_time`` replaces walk time plus buffer. Trips with
+``exact_times=1`` in frequencies.txt count at every scheduled run.
 
-By default ``DAY_OF_WEEK`` is ``"weekday"``: the script analyzes the representative
-weekday ``gtfs_calendar_inspector.py`` reports (calendar_dates.txt exceptions
-applied, federal holidays skipped) and keeps only trips of the service_ids running
-that date, so feeder and connector trips always run on the same day and a service
-confined to a few special dates stays out. Set a single day name for a
-representative date of that day, ``SERVICE_DATE`` / ``--service-date`` for one
-explicit date, or ``None`` / ``--day all`` to pool every trip regardless of service
-day (which can pair trips that never run on the same day — inflating counts).
+By default ``DAY_OF_WEEK`` is ``"weekday"``: feeder trips run on the representative weekday
+``gtfs_calendar_inspector.py`` reports (calendar_dates.txt exceptions applied, federal
+holidays skipped), so a service confined to a few special dates stays out. Connectors run
+that date, or the day before or after when a wait crosses midnight and that day is one of
+the filter's days (a 24:05 arrival catches the next weekday's 00:10 trip). Set a day name
+for a representative date of that day, ``SERVICE_DATE`` / ``--service-date`` for one
+explicit date, or ``None`` / ``--day all`` to pool every trip regardless of service day
+(which can pair trips that never run on the same day — inflating counts).
 
 Inputs:
     - A GTFS feed folder or ``.zip`` with stops.txt, routes.txt, trips.txt, and
@@ -62,10 +63,11 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import logging
+import math
 import os
 import sys
 import zipfile
-from collections.abc import Generator, Mapping
+from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import IO, List, Optional, Sequence
@@ -113,10 +115,12 @@ PROJECTED_CRS = "EPSG:5070"
 # --- Time buffer ----------------------------------------------------------
 # When True, a connector route only counts if at least one scheduled connection
 # is feasible: feeder arrival + walk time <= connector departure <= feeder
-# arrival + MAX_TRANSFER_WAIT_MINUTES. When False, any spatial co-location of the
-# two routes counts (a pure proximity transfer map). Either way, the feeder stop
-# must allow drop-off and the connector stop must allow pickup, and under a day
-# filter or service date only trips running on the chosen date count.
+# arrival + MAX_TRANSFER_WAIT_MINUTES. Where transfers.txt sets a longer
+# min_transfer_time (transfer_type 2), it replaces walk time + buffer. When
+# False, any spatial co-location of the two routes counts (a pure proximity
+# transfer map). Either way, the feeder stop must allow drop-off and the
+# connector stop must allow pickup, and under a day filter or service date the
+# feeder trip runs on the chosen date (see DAY_OF_WEEK).
 ENABLE_TIME_CHECK = True
 
 # Assumed walking speed used to convert the stop-to-stop distance into a minimum
@@ -134,15 +138,18 @@ MAX_TRANSFER_WAIT_MINUTES: float = 30.0
 # weekday: the median date of the most common set of active service_ids across
 # Monday-Friday, with calendar_dates.txt exceptions applied and federal holidays
 # skipped (gtfs_calendar_inspector.py reports the same date). A single day name
-# (e.g., "monday") picks a representative date for that day instead. Either way,
-# only trips of the service_ids active on the chosen date count, so a feeder and
-# a connector trip always run on the same day. None keeps all trips regardless
-# of service day. Feeds with neither calendar.txt nor calendar_dates.txt fall
-# back to all trips with a warning.
+# (e.g., "monday") picks a representative date for that day instead. Feeder
+# trips run on the chosen date. A connector runs on it too, or on the day before
+# or after when the wait crosses midnight, if that day is one of the filter's
+# days (Friday night onto Saturday's first trip does not count under "weekday").
+# None keeps all trips regardless of service day. Feeds with neither calendar.txt
+# nor calendar_dates.txt fall back to all trips with a warning.
 DAY_OF_WEEK: Optional[str] = "weekday"
 
-# Analyze this one date instead of DAY_OF_WEEK, as "YYYY-MM-DD" or "YYYYMMDD"
-# (e.g., the day after Thanksgiving). Leave "" to use DAY_OF_WEEK.
+# Analyze this one date instead of a representative DAY_OF_WEEK date, as
+# "YYYY-MM-DD" or "YYYYMMDD" (e.g., the day after Thanksgiving). DAY_OF_WEEK still
+# limits which neighboring days a connection across midnight may reach; set it
+# to None to allow any. Leave "" to use DAY_OF_WEEK.
 SERVICE_DATE: str = ""
 
 # --- Output ---------------------------------------------------------------
@@ -545,28 +552,40 @@ def parse_service_date(value: str) -> Optional[dt.date]:
     )
 
 
+def _filter_weekdays(day: Optional[str]) -> set[int]:
+    """Return the weekday numbers (Monday = 0) a day filter covers; all seven for None."""
+    if day is None:
+        return set(range(7))
+    key = day.lower()
+    return set(range(5)) if key == "weekday" else {_DAY_COLUMNS.index(key)}
+
+
 def resolve_service_day(
     calendar_df: Optional[pd.DataFrame],
     calendar_dates_df: Optional[pd.DataFrame],
     day: Optional[str],
     service_date: Optional[dt.date] = None,
-) -> Optional[tuple[dt.date, set[str]]]:
-    """Pick the date to analyze and the service_ids that run on it.
+) -> Optional[tuple[dt.date, dict[str, set[dt.date]]]]:
+    """Pick the date to analyze and the services running on it or beside it.
 
     calendar.txt and calendar_dates.txt are expanded into each service's real
     operating dates. An explicit *service_date* is used as given; otherwise
     :func:`representative_service_date` picks a typical *day*, skipping
-    observed federal holidays.
+    observed federal holidays. The days before and after the chosen date are
+    kept when they are among *day*'s days (any day when *day* is None), so a
+    connection across midnight can reach their trips.
 
     Args:
         calendar_df: Parsed calendar.txt, or None if the feed has none.
         calendar_dates_df: Parsed calendar_dates.txt, or None.
-        day: ``"weekday"`` or a day name; ignored when *service_date* is set.
+        day: ``"weekday"`` or a day name. With *service_date* set it only
+            limits the neighboring days.
         service_date: An explicit date to analyze, or None.
 
     Returns:
-        ``(date, service_ids)``, or None when the feed has neither calendar
-        file to resolve dates from.
+        ``(date, service_dates)``: the chosen date, and each service_id that
+        runs on it or on a kept neighboring day, mapped to the dates among
+        those it runs. None when the feed has neither calendar file.
 
     Raises:
         ValueError: If neither *day* nor *service_date* is set, *day* is not
@@ -580,27 +599,38 @@ def resolve_service_day(
     active = expand_service_active_dates(calendar_df, calendar_dates_df)
 
     if service_date is not None:
-        ids = service_ids_active_on(active, service_date)
+        chosen = service_date
+        ids = service_ids_active_on(active, chosen)
         if not ids:
-            raise ValueError(f"No service_id is active on SERVICE_DATE {service_date}.")
+            raise ValueError(f"No service_id is active on SERVICE_DATE {chosen}.")
         logging.info(
             "Using SERVICE_DATE %s (%s): service_ids %s.",
-            service_date,
-            _DAY_COLUMNS[service_date.weekday()],
+            chosen,
+            _DAY_COLUMNS[chosen.weekday()],
             ", ".join(sorted(ids)),
         )
-        return service_date, ids
+    else:
+        if day is None:
+            raise ValueError("Set DAY_OF_WEEK or SERVICE_DATE to pick a service day.")
+        years = {d.year for dates in active.values() for d in dates}
+        holidays: set[dt.date] = set()
+        if years:
+            for year in range(min(years), max(years) + 2):
+                holidays |= federal_holidays_observed(year)
+        chosen, ids = representative_service_date(active, day, exclude_dates=holidays)
+        logging.info("Service_ids running on %s: %s.", chosen, ", ".join(sorted(ids)))
 
-    if day is None:
-        raise ValueError("Set DAY_OF_WEEK or SERVICE_DATE to pick a service day.")
-    years = {d.year for dates in active.values() for d in dates}
-    holidays: set[dt.date] = set()
-    if years:
-        for year in range(min(years), max(years) + 2):
-            holidays |= federal_holidays_observed(year)
-    chosen, ids = representative_service_date(active, day, exclude_dates=holidays)
-    logging.info("Service_ids running on %s: %s.", chosen, ", ".join(sorted(ids)))
-    return chosen, ids
+    allowed = _filter_weekdays(day)
+    neighbors = {chosen + dt.timedelta(days=k) for k in (-1, 1)}
+    neighbors = {d for d in neighbors if d.weekday() in allowed}
+    if neighbors:
+        logging.info(
+            "Connections across midnight may reach trips on %s.",
+            " and ".join(str(d) for d in sorted(neighbors)),
+        )
+    window = {chosen} | neighbors
+    service_dates = {sid: dates & window for sid, dates in active.items() if dates & window}
+    return chosen, service_dates
 
 
 def has_timed_connection(
@@ -907,7 +937,7 @@ def _build_stop_events(
         stop_times: Parsed stop_times.txt.
         trips: Parsed trips.txt.
         keep_service_ids: service_ids to keep (those running on the chosen
-            service date), or None to keep every trip.
+            service date or a kept neighboring day), or None to keep every trip.
         frequencies: Parsed frequencies.txt, or None. Trips with
             ``exact_times=1`` rows get one set of events per scheduled run
             (see :func:`_expand_exact_frequencies`).
@@ -976,16 +1006,18 @@ def _build_stop_events(
     ]
 
 
-_StopRouteArrays = dict[tuple[str, str], np.ndarray]
+# Service key used for every event when trips are not matched by service.
+_ANY_SERVICE = ""
 
-# Stands in for a (stop, route) with no usable times.
-_NO_TIMES = np.empty(0, dtype=float)
+_StopRouteServiceArrays = dict[tuple[str, str], dict[str, np.ndarray]]
 
 
 def _index_events(
-    events: pd.DataFrame,
-) -> tuple[dict[str, set[str]], dict[str, set[str]], _StopRouteArrays, _StopRouteArrays]:
-    """Build lookups of routes-per-stop and sorted time arrays per (stop, route).
+    events: pd.DataFrame, by_service: bool
+) -> tuple[
+    dict[str, set[str]], dict[str, set[str]], _StopRouteServiceArrays, _StopRouteServiceArrays
+]:
+    """Build lookups of routes-per-stop and sorted time arrays per (stop, route, service).
 
     Alighting lookups use only events where riders may get off
     (``can_alight``); boarding lookups use only events where riders may get on
@@ -993,14 +1025,18 @@ def _index_events(
 
     Args:
         events: Output of :func:`_build_stop_events`.
+        by_service: Keep each ``service_id``'s times apart so trips can be
+            matched by operating date. When False, every event falls under one
+            shared service key.
 
     Returns:
         A tuple ``(alight_routes, board_routes, arrivals, departures)`` where
         ``alight_routes`` maps a ``stop_id`` to the set of routes riders can get
         off at it, ``board_routes`` maps it to the set of routes riders can get
-        on at it, ``arrivals`` maps ``(stop_id, route_id)`` to sorted feeder
-        arrival seconds, and ``departures`` maps it to sorted connector
-        departure seconds.
+        on at it, ``arrivals`` maps ``(stop_id, route_id)`` to
+        ``{service_id: sorted feeder arrival seconds}``, and ``departures`` maps
+        it to ``{service_id: sorted connector departure seconds}``. A service
+        appears only if riders can get off (or on) one of its trips there.
     """
     alight_routes: dict[str, set[str]] = {}
     board_routes: dict[str, set[str]] = {}
@@ -1012,23 +1048,88 @@ def _index_events(
         if can_board:
             board_routes.setdefault(stop_id, set()).add(route_id)
 
-    arrivals: _StopRouteArrays = {}
-    departures: _StopRouteArrays = {}
-    for (stop_id, route_id), group in events.groupby(["stop_id", "route_id"], sort=False):
+    service = events["service_id"] if by_service else pd.Series(_ANY_SERVICE, index=events.index)
+    arrivals: _StopRouteServiceArrays = {}
+    departures: _StopRouteServiceArrays = {}
+    for (stop_id, route_id, service_id), group in events.groupby(
+        [events["stop_id"], events["route_id"], service], sort=False
+    ):
         key = (str(stop_id), str(route_id))
         if group["can_alight"].any():
             alight = group.loc[group["can_alight"], "arrival_sec"].dropna()
-            arrivals[key] = np.sort(alight.to_numpy(dtype=float))
+            arrivals.setdefault(key, {})[str(service_id)] = np.sort(alight.to_numpy(dtype=float))
         if group["can_board"].any():
             board = group.loc[group["can_board"], "departure_sec"].dropna()
-            departures[key] = np.sort(board.to_numpy(dtype=float))
+            departures.setdefault(key, {})[str(service_id)] = np.sort(board.to_numpy(dtype=float))
     return alight_routes, board_routes, arrivals, departures
 
 
+_SECONDS_PER_DAY = 86400.0
+
+
+def _best_connection(
+    arrivals_by_service: Mapping[str, np.ndarray],
+    departures_by_service: Mapping[str, np.ndarray],
+    runs_days_apart: Callable[[str, str, int], bool],
+    min_wait_seconds: float,
+    max_wait_seconds: float,
+) -> tuple[bool, Optional[float]]:
+    """Check whether any feeder trip can reach any connector trip on a real date.
+
+    GTFS times count from each trip's own service date, so a connector run
+    *k* service days after the feeder's leaves ``k * 86400`` seconds later on
+    the feeder's clock: a Monday trip arriving at 24:05 can catch a Tuesday
+    trip leaving at 00:10. Each offset whose times could fall inside the wait
+    window is tried, but only for (feeder service, connector service) pairs
+    that ``runs_days_apart`` accepts at that offset. With the time check off,
+    any pair accepted at offset 0 is enough.
+
+    Args:
+        arrivals_by_service: Feeder arrival seconds at the alighting stop,
+            keyed by service_id.
+        departures_by_service: Connector departure seconds at the boarding
+            stop, keyed by service_id.
+        runs_days_apart: ``runs_days_apart(a, b, k)`` is True when service
+            *b* operates *k* days after some operating date of service *a*.
+        min_wait_seconds: Earliest the rider can board after arriving.
+        max_wait_seconds: Longest the rider will wait.
+
+    Returns:
+        A tuple ``(feasible, shortest_wait_seconds)``. ``shortest_wait_seconds``
+        is None when infeasible or when the time check is disabled.
+    """
+    best_wait: Optional[float] = None
+    for service_a, arrivals in arrivals_by_service.items():
+        for service_b, departures in departures_by_service.items():
+            if not ENABLE_TIME_CHECK:
+                if runs_days_apart(service_a, service_b, 0):
+                    return True, None
+                continue
+            if arrivals.size == 0 or departures.size == 0:
+                continue
+            # Day offsets that can put some departure inside some arrival's window.
+            first = math.ceil((arrivals[0] + min_wait_seconds - departures[-1]) / _SECONDS_PER_DAY)
+            last = math.floor((arrivals[-1] + max_wait_seconds - departures[0]) / _SECONDS_PER_DAY)
+            for offset in range(first, last + 1):
+                if not runs_days_apart(service_a, service_b, offset):
+                    continue
+                feasible, wait = has_timed_connection(
+                    arrivals,
+                    departures + offset * _SECONDS_PER_DAY,
+                    min_wait_seconds,
+                    max_wait_seconds,
+                )
+                if feasible and wait is not None and (best_wait is None or wait < best_wait):
+                    best_wait = wait
+    return best_wait is not None, best_wait
+
+
 # One transfers.txt row as it applies to a stop pair: (from_route_id or None,
-# to_route_id or None, stop rank, prohibited). Stop rank counts the row's stop
-# IDs that name the stop itself rather than its parent station (0-2).
-TransferRule = tuple[Optional[str], Optional[str], int, bool]
+# to_route_id or None, stop rank, prohibited, minimum transfer seconds). Stop
+# rank counts the row's stop IDs that name the stop itself rather than its
+# parent station (0-2). The minimum is a transfer_type 2 row's
+# min_transfer_time, else 0.
+TransferRule = tuple[Optional[str], Optional[str], int, bool, float]
 
 
 def build_transfer_rules(
@@ -1049,7 +1150,9 @@ def build_transfer_rules(
 
     Returns:
         Mapping of ``(from_stop_id, to_stop_id)`` to the rules that apply there;
-        :func:`transfer_prohibited` decides between them.
+        :func:`governing_transfer_rule` decides between them. A ``transfer_type``
+        2 row carries its ``min_transfer_time`` (seconds); one without a
+        readable value is applied with no minimum, with a warning.
     """
     if transfers is None or transfers.empty:
         return {}
@@ -1072,8 +1175,10 @@ def build_transfer_rules(
     rules: dict[tuple[str, str], list[TransferRule]] = {}
     trip_rows = 0
     prohibiting = 0
+    no_minimum = 0
     kinds = column("transfer_type").replace("", "0")
-    for from_stop, to_stop, from_route, to_route, from_trip, to_trip, kind in zip(
+    minimums = pd.to_numeric(column("min_transfer_time"), errors="coerce")
+    for from_stop, to_stop, from_route, to_route, from_trip, to_trip, kind, minimum in zip(
         column("from_stop_id"),
         column("to_stop_id"),
         column("from_route_id"),
@@ -1081,6 +1186,7 @@ def build_transfer_rules(
         column("from_trip_id"),
         column("to_trip_id"),
         kinds,
+        minimums,
     ):
         if from_trip or to_trip:
             trip_rows += 1
@@ -1089,11 +1195,29 @@ def build_transfer_rules(
             continue
         prohibited = kind == "3"
         prohibiting += prohibited
+        min_seconds = 0.0
+        if kind == "2":
+            if pd.notna(minimum) and minimum >= 0:
+                min_seconds = float(minimum)
+            else:
+                no_minimum += 1
         for stop_a, rank_a in governed(from_stop):
             for stop_b, rank_b in governed(to_stop):
                 rules.setdefault((stop_a, stop_b), []).append(
-                    (from_route or None, to_route or None, rank_a + rank_b, prohibited)
+                    (
+                        from_route or None,
+                        to_route or None,
+                        rank_a + rank_b,
+                        prohibited,
+                        min_seconds,
+                    )
                 )
+    if no_minimum:
+        logging.warning(
+            "transfers.txt: %d transfer_type 2 row(s) have no readable min_transfer_time; "
+            "they add no minimum to the walk time.",
+            no_minimum,
+        )
     if trip_rows:
         logging.warning(
             "transfers.txt: %d row(s) name a from_trip_id or to_trip_id and are not "
@@ -1105,14 +1229,47 @@ def build_transfer_rules(
     return rules
 
 
-def transfer_prohibited(rules: Sequence[TransferRule], from_route: str, to_route: str) -> bool:
-    """Return True when the most specific matching rule says the transfer is not possible.
+def governing_transfer_rule(
+    rules: Sequence[TransferRule], from_route: str, to_route: str
+) -> tuple[bool, float]:
+    """Return what the most specific matching rule says about a transfer.
 
     A rule matches when each route it names equals the feeder (*from_route*)
     or connector (*to_route*). Rules naming more of the two routes are more
     specific; among those naming as many, rules naming the stops themselves
     beat rules naming their parent stations. Equally specific rules that
-    disagree resolve to not possible.
+    disagree resolve to the stricter: not possible, or the longer minimum.
+
+    Args:
+        rules: The rules for one stop pair, from :func:`build_transfer_rules`.
+        from_route: The feeder route_id.
+        to_route: The connector route_id.
+
+    Returns:
+        A tuple ``(prohibited, min_transfer_seconds)``: whether the transfer
+        is not possible (``transfer_type`` 3), and the ``min_transfer_time``
+        a ``transfer_type`` 2 rule requires (0 when none applies).
+    """
+    best: Optional[tuple[int, int]] = None
+    prohibited = False
+    min_seconds = 0.0
+    for rule_from, rule_to, stop_rank, rule_prohibited, rule_min in rules:
+        if (rule_from and rule_from != from_route) or (rule_to and rule_to != to_route):
+            continue
+        rank = (int(rule_from is not None) + int(rule_to is not None), stop_rank)
+        if best is None or rank > best:
+            best, prohibited, min_seconds = rank, rule_prohibited, rule_min
+        elif rank == best:
+            prohibited = prohibited or rule_prohibited
+            min_seconds = max(min_seconds, rule_min)
+    return prohibited, min_seconds
+
+
+def transfer_prohibited(rules: Sequence[TransferRule], from_route: str, to_route: str) -> bool:
+    """Return True when the most specific matching rule says the transfer is not possible.
+
+    See :func:`governing_transfer_rule`, which also returns the rule's minimum
+    transfer time.
 
     Args:
         rules: The rules for one stop pair, from :func:`build_transfer_rules`.
@@ -1122,17 +1279,7 @@ def transfer_prohibited(rules: Sequence[TransferRule], from_route: str, to_route
     Returns:
         True when the transfer is not possible (``transfer_type`` 3).
     """
-    best: Optional[tuple[int, int]] = None
-    prohibited = False
-    for rule_from, rule_to, stop_rank, rule_prohibited in rules:
-        if (rule_from and rule_from != from_route) or (rule_to and rule_to != to_route):
-            continue
-        rank = (int(rule_from is not None) + int(rule_to is not None), stop_rank)
-        if best is None or rank > best:
-            best, prohibited = rank, rule_prohibited
-        elif rank == best:
-            prohibited = prohibited or rule_prohibited
-    return prohibited
+    return governing_transfer_rule(rules, from_route, to_route)[0]
 
 
 def compute_transfers(
@@ -1140,32 +1287,61 @@ def compute_transfers(
     events: pd.DataFrame,
     routes: pd.DataFrame,
     radius_m: float,
+    service_dates: Optional[Mapping[str, set[dt.date]]] = None,
     transfer_rules: Optional[Mapping[tuple[str, str], Sequence[TransferRule]]] = None,
+    feeder_date: Optional[dt.date] = None,
 ) -> dict[str, dict[str, dict[str, float]]]:
     """Compute feasible transfers from each target route to connector routes.
 
     A stop pair counts only where riders can get off the target route at the
     alighting stop and get on the connector at the boarding stop, and where
     transfers.txt does not mark the transfer as not possible, whether or not
-    the time check is enabled. Every trip in *events* is treated as running
-    on the same day, so filter them to one service date first (see
-    :func:`resolve_service_day`).
+    the time check is enabled. A ``transfer_type`` 2 rule's minimum transfer
+    time replaces the walk time plus buffer when it is longer. When
+    ``service_dates`` is given, the connector trip must run on the feeder
+    trip's operating date, or on the date before or after it when the
+    connection crosses midnight (see :func:`_best_connection`). With
+    ``feeder_date`` also given, only the feeder's run on that date counts.
 
     Args:
         stops_gdf: Projected unique stops with ``x``/``y`` in meters.
         events: Stop events from :func:`_build_stop_events`.
         routes: Route table indexed by ``route_id`` with ``is_target``.
         radius_m: Space buffer in meters.
+        service_dates: Each service_id's eligible operating dates, from
+            :func:`resolve_service_day`. A service missing from it pairs with
+            nothing. None pools every trip regardless of service.
         transfer_rules: transfers.txt rules by stop pair, from
             :func:`build_transfer_rules`. None applies no rules.
+        feeder_date: The analysis date. Feeder trips count only on it, while
+            connectors may run on any of their ``service_dates``. None lets
+            feeders run on any of theirs.
 
     Returns:
         A nested mapping ``target_route_id -> connector_route_id -> stats``,
         where stats holds ``stop_pairs``, ``min_distance_m``, and
         ``min_wait_seconds`` (NaN when the time check is disabled).
     """
-    alight_routes, board_routes, arrivals, departures = _index_events(events)
+    alight_routes, board_routes, arrivals, departures = _index_events(
+        events, by_service=service_dates is not None
+    )
     target_ids = set(routes.index[routes["is_target"]])
+
+    shares_date: dict[tuple[str, str, int], bool] = {}
+
+    def runs_days_apart(service_a: str, service_b: str, offset: int) -> bool:
+        if service_dates is None:
+            return True
+        key = (service_a, service_b, offset)
+        if key not in shares_date:
+            dates_a = service_dates.get(service_a, set())
+            if feeder_date is not None:
+                dates_a = dates_a & {feeder_date}
+            if offset:
+                shift = dt.timedelta(days=offset)
+                dates_a = {d + shift for d in dates_a}
+            shares_date[key] = not dates_a.isdisjoint(service_dates.get(service_b, set()))
+        return shares_date[key]
 
     coords = np.column_stack([stops_gdf["x"].to_numpy(), stops_gdf["y"].to_numpy()])
     stop_ids = stops_gdf["stop_id"].to_numpy()
@@ -1193,18 +1369,24 @@ def compute_transfers(
             pair_rules = transfer_rules.get((stop_a, stop_b)) if transfer_rules else None
 
             for route_a in targets_here:
-                arr = arrivals.get((stop_a, route_a), _NO_TIMES)
+                arr = arrivals.get((stop_a, route_a), {})
                 for route_b in routes_b:
                     if route_b == route_a:
                         continue
-                    if pair_rules and transfer_prohibited(pair_rules, route_a, route_b):
-                        continue
-                    wait: Optional[float] = None
-                    if ENABLE_TIME_CHECK:
-                        dep = departures.get((stop_b, route_b), _NO_TIMES)
-                        feasible, wait = has_timed_connection(arr, dep, min_wait_sec, max_wait_sec)
-                        if not feasible:
+                    rule_min_sec = 0.0
+                    if pair_rules:
+                        prohibited, rule_min_sec = governing_transfer_rule(
+                            pair_rules, route_a, route_b
+                        )
+                        if prohibited:
                             continue
+                    dep = departures.get((stop_b, route_b), {})
+                    # A transfers.txt minimum replaces walk time + buffer when longer.
+                    feasible, wait = _best_connection(
+                        arr, dep, runs_days_apart, max(min_wait_sec, rule_min_sec), max_wait_sec
+                    )
+                    if not feasible:
+                        continue
 
                     conn = results.setdefault(route_a, {}).setdefault(
                         route_b,
@@ -1435,6 +1617,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     logging.info("Identified %d target route(s).", n_targets)
 
     keep_service_ids: Optional[set[str]] = None
+    service_dates: Optional[dict[str, set[dt.date]]] = None
+    feeder_date: Optional[dt.date] = None
     if day_filter is not None or service_date is not None:
         try:
             selection = resolve_service_day(
@@ -1448,7 +1632,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "The feed has no usable calendar.txt or calendar_dates.txt; keeping all trips."
             )
         else:
-            keep_service_ids = selection[1]
+            feeder_date, service_dates = selection
+            keep_service_ids = set(service_dates)
     else:
         logging.info("No service-day filter: pooling all trips regardless of service day.")
 
@@ -1465,7 +1650,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "on" if ENABLE_TIME_CHECK else "off",
     )
 
-    results = compute_transfers(stops_gdf, events, routes, radius_m, transfer_rules)
+    results = compute_transfers(
+        stops_gdf, events, routes, radius_m, service_dates, transfer_rules, feeder_date
+    )
     summary, detail = build_output_tables(results, routes)
 
     os.makedirs(output_dir, exist_ok=True)

@@ -14,9 +14,10 @@ Key Features
   observed U.S. federal holidays or the dates in EXTRA_HOLIDAY_DATES.
 * Computes per-route variants, directions, average trip distance, duration,
   and speed from the trips whose service has at least one active date.
-  Variants are distinct stopping patterns: trips serving the same stops in
-  the same order (by ``stop_sequence``) count once, whatever their shape_id
-  or headsign.
+  Variants are the distinct ordered stop patterns (including where riders may
+  not board or alight) within each direction, so a short turn on its parent
+  trip's shape counts separately. The averages count each trip once per
+  scheduled run, so a frequencies.txt trip weighs as much as its departures.
   A trip's distance comes from ``shape_dist_traveled`` in stop_times.txt,
   else from the part of its shape between its first and last stops (placed
   with stops.txt coordinates). A trip whose end stops cannot be placed on
@@ -848,22 +849,89 @@ def trip_durations_seconds(stop_times_df: pd.DataFrame) -> pd.Series:
     return (last_arr - first_dep).dropna()
 
 
-def trip_stop_patterns(stop_times_df: pd.DataFrame) -> pd.Series:
-    """Return a ``trip_id`` -> ordered tuple of ``stop_id`` Series.
+def scheduled_runs_per_trip(frequencies_df: Optional[pd.DataFrame]) -> pd.Series:
+    """Return a ``trip_id`` -> number-of-scheduled-runs Series from ``frequencies.txt``.
 
-    Two trips share a stopping pattern when they serve the same stops in the
-    same order. Stops are ordered by numeric ``stop_sequence``.
+    A frequencies.txt row runs its trip every ``headway_secs`` from
+    ``start_time`` up to but not including ``end_time``, so it schedules
+    ``ceil((end_time - start_time) / headway_secs)`` runs; a trip's rows are
+    summed. That count is exact for ``exact_times=1`` and the planned count
+    for headway-based rows. A trip's stop_times are then a template for those
+    runs, not a run of their own. Trips not in frequencies.txt, or whose rows
+    are all unreadable, are absent (they run once).
+
+    Args:
+        frequencies_df: Parsed ``frequencies.txt`` or ``None``.
+
+    Returns:
+        Series indexed by ``trip_id`` with the number of scheduled runs.
+    """
+    required = {"trip_id", "start_time", "end_time", "headway_secs"}
+    if frequencies_df is None or frequencies_df.empty:
+        return pd.Series(dtype=float)
+    if not required <= set(frequencies_df.columns):
+        logging.warning(
+            "frequencies.txt lacks %s; frequency trips count once.",
+            ", ".join(sorted(required - set(frequencies_df.columns))),
+        )
+        return pd.Series(dtype=float)
+    start = frequencies_df["start_time"].map(hms_to_seconds)
+    end = frequencies_df["end_time"].map(hms_to_seconds)
+    headway = pd.to_numeric(frequencies_df["headway_secs"], errors="coerce")
+    valid = start.notna() & end.notna() & (headway > 0) & (end > start)
+    if not valid.all():
+        logging.warning(
+            "frequencies.txt: ignoring %d row(s) with an unreadable time window or headway.",
+            int((~valid).sum()),
+        )
+    runs = ((end[valid] - start[valid]) / headway[valid]).map(math.ceil).astype(float)
+    return runs.groupby(frequencies_df.loc[valid, "trip_id"]).sum().rename_axis("trip_id")
+
+
+def trip_stop_patterns(stop_times_df: pd.DataFrame) -> pd.Series:
+    """Return a ``trip_id`` -> ordered stop pattern Series.
+
+    A pattern lists the trip's stops in ``stop_sequence`` order, each with
+    whether riders may board (``pickup_type`` is not 1) and alight
+    (``drop_off_type`` is not 1) there. Boarding at the last stop and alighting
+    at the first are left out, since no rider can use them, so feeds that mark
+    those differently from trip to trip do not split one pattern in two.
 
     Args:
         stop_times_df: Parsed ``stop_times.txt``.
 
     Returns:
-        Series indexed by ``trip_id`` whose values are tuples of stop IDs.
+        Series indexed by ``trip_id`` holding one tuple per trip; empty when
+        ``stop_times.txt`` has no ``stop_id`` column.
     """
-    df = stop_times_df[["trip_id", "stop_id", "stop_sequence"]].copy()
+    if "stop_id" not in stop_times_df.columns:
+        return pd.Series(dtype=object)
+    df = stop_times_df.copy()
     df["_seq"] = pd.to_numeric(df["stop_sequence"], errors="coerce")
-    df = df.sort_values(["trip_id", "_seq"], kind="stable")
-    return df.groupby("trip_id", sort=False)["stop_id"].agg(tuple)
+    df = df.sort_values(["trip_id", "_seq"], kind="mergesort")
+    grp = df.groupby("trip_id", sort=False)
+    flags = {}
+    for flag, column in (("board", "pickup_type"), ("alight", "drop_off_type")):
+        if column in df.columns:
+            flags[flag] = df[column].fillna("").astype(str).str.strip() != "1"
+        else:
+            flags[flag] = pd.Series(True, index=df.index)
+    board = flags["board"] & (grp.cumcount(ascending=False) > 0)
+    alight = flags["alight"] & (grp.cumcount() > 0)
+    token = (
+        df["stop_id"].astype(str)
+        + "|"
+        + board.map({True: "P", False: "-"})
+        + alight.map({True: "D", False: "-"})
+    )
+    return token.groupby(df["trip_id"], sort=False).agg(tuple).rename_axis("trip_id")
+
+
+def _weighted_mean(values: pd.Series, weights: pd.Series) -> float:
+    """Return the *weights*-weighted mean of *values*, ignoring missing values."""
+    known = values.notna()
+    total = weights[known].sum()
+    return float((values[known] * weights[known]).sum() / total) if total > 0 else float("nan")
 
 
 def load_optional_lookup(path: str, value_col: str) -> dict[str, str]:
@@ -915,8 +983,15 @@ def build_summary(
     min_recurring_dates: int = MIN_RECURRING_DATES,
     extra_holiday_dates: Sequence[str] = EXTRA_HOLIDAY_DATES,
     stops_df: Optional[pd.DataFrame] = None,
+    frequencies_df: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """Assemble the per-route summary DataFrame.
+
+    ``variants`` counts the distinct ordered stop patterns (see
+    :func:`trip_stop_patterns`) within each direction, falling back to
+    distinct ``shape_id`` or ``trip_headsign`` values when ``stop_times.txt``
+    has no ``stop_id``. Average distance, duration and speed weight each trip
+    by its scheduled runs (see :func:`scheduled_runs_per_trip`).
 
     Args:
         routes_df: Parsed ``routes.txt``.
@@ -933,6 +1008,7 @@ def build_summary(
             holidays; see :func:`holiday_dates_for`.
         stops_df: Parsed ``stops.txt`` or ``None``; forwarded to
             :func:`trip_distances_meters`.
+        frequencies_df: Parsed ``frequencies.txt`` or ``None``.
 
     Returns:
         One-row-per-route :class:`pandas.DataFrame` ready for export. Trips
@@ -947,7 +1023,6 @@ def build_summary(
     )
     dist_m = trip_distances_meters(stop_times_df, shapes_df, trips_df, distance_unit, stops_df)
     dur_s = trip_durations_seconds(stop_times_df)
-    patterns = trip_stop_patterns(stop_times_df)
 
     t = trips_df.copy()
     t["_sid"] = t["service_id"].map(lambda v: v.strip() if isinstance(v, str) else None)
@@ -959,7 +1034,8 @@ def build_summary(
     t = t[running].copy()
     t["_dist_m"] = t["trip_id"].map(dist_m)
     t["_dur_s"] = t["trip_id"].map(dur_s)
-    t["_pattern"] = t["trip_id"].map(patterns)
+    t["_runs"] = t["trip_id"].map(scheduled_runs_per_trip(frequencies_df)).fillna(1.0)
+    t["_pattern"] = t["trip_id"].map(trip_stop_patterns(stop_times_df))
 
     excluded = {str(x) for x in (EXCLUDED_ROUTE_SHORT_NAMES or [])}
     imperial = str(OUTPUT_UNITS).lower() == "imperial"
@@ -976,8 +1052,21 @@ def build_summary(
         if rt.empty:
             continue
 
-        # Distinct stopping patterns; a trip with no stop times adds none.
-        variants = int(rt["_pattern"].nunique())
+        patterned = rt[rt["_pattern"].notna()]
+        if not patterned.empty:
+            direction = (
+                patterned["direction_id"].fillna("")
+                if "direction_id" in patterned.columns
+                else pd.Series("", index=patterned.index)
+            )
+            variants = len(set(zip(direction, patterned["_pattern"])))
+        elif "shape_id" in rt.columns and rt["shape_id"].notna().any():
+            variants = int(rt["shape_id"].nunique())
+        elif "trip_headsign" in rt.columns and rt["trip_headsign"].notna().any():
+            variants = int(rt["trip_headsign"].nunique())
+        else:
+            variants = 1
+        variants = max(variants, 1)
 
         directions = int(rt["direction_id"].nunique()) if "direction_id" in rt.columns else 1
         directions = max(directions, 1)
@@ -986,8 +1075,10 @@ def build_summary(
         for sid in rt["_sid"].unique():
             day_cats |= service_labels.get(sid, set())
 
-        avg_dist_m = rt["_dist_m"].dropna().mean()
-        avg_dur_s = rt["_dur_s"].dropna().mean()
+        # Each trip counts once per scheduled run, so a frequencies.txt template
+        # weighs as much as the departures it stands for.
+        avg_dist_m = _weighted_mean(rt["_dist_m"], rt["_runs"])
+        avg_dur_s = _weighted_mean(rt["_dur_s"], rt["_runs"])
         # Speed uses only trips with both a distance and a positive duration,
         # so one trip's distance is never divided by another trip's time.
         timed = rt[rt["_dist_m"].notna() & (rt["_dur_s"] > 0)]
@@ -1001,7 +1092,9 @@ def build_summary(
             round(avg_dur_s / 60.0, 1) if pd.notna(avg_dur_s) else None
         )
         if not timed.empty:
-            mps = timed["_dist_m"].sum() / timed["_dur_s"].sum()
+            mps = (timed["_dist_m"] * timed["_runs"]).sum() / (
+                timed["_dur_s"] * timed["_runs"]
+            ).sum()
             avg_speed: Optional[float] = round(mps * (2.23694 if imperial else 3.6), 1)
         else:
             avg_speed = None
@@ -1200,6 +1293,14 @@ def main() -> int:
         except OSError as exc:
             logging.warning("stops.txt unavailable (needed to measure trips on shapes): %s", exc)
 
+        frequencies_df: Optional[pd.DataFrame] = None
+        try:
+            frequencies_df = load_gtfs_data(GTFS_FOLDER_PATH, files=("frequencies.txt",)).get(
+                "frequencies"
+            )
+        except OSError as exc:
+            logging.info("frequencies.txt unavailable: %s", exc)
+
         extras: dict[str, dict[str, str]] = {
             "service_types": load_optional_lookup(SERVICE_TYPES_PATH, "service_type"),
             "corridors": load_optional_lookup(CORRIDORS_PATH, "corridor"),
@@ -1220,6 +1321,7 @@ def main() -> int:
             min_recurring_dates=MIN_RECURRING_DATES,
             extra_holiday_dates=EXTRA_HOLIDAY_DATES,
             stops_df=stops_df,
+            frequencies_df=frequencies_df,
         )
 
         if summary.empty:

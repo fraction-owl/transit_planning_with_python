@@ -17,16 +17,20 @@ Outputs
   measurement columns.
 - A CSV of monthly aggregates at ``MONTHLY_OUTPUT_PATH`` (``avg_temp_f``,
   ``max_daily_precip_in``, ``days_with_precip``, ``total_snow_in``,
-  ``max_daily_snow_in``), written only when that path is set. The input must then
-  hold a single station; a multi-station input stops the run before writing.
+  ``max_daily_snow_in``), written only when that path is set. ``INPUT_UNITS``
+  must then say whether the export is in standard or metric units, so metric
+  readings are converted to deg F and inches. The input must hold a single
+  station; a multi-station input, or a date repeated with different readings,
+  stops the run before writing. Exact repeats of a date are counted once.
 - ``<output stem>_processing_log.txt`` (or ``LOG_PATH``): a .txt processing log
   written next to the output when ``WRITE_LOG`` is on (the default).
 
 Typical usage
 -------------
 Set ``INPUT_PATH`` and ``OUTPUT_PATH`` in the config block (or pass ``--input``
-/ ``--output``; ``--long-names`` and ``--log`` are also available) and run from
-a shell or a Jupyter notebook. Paths left unset are prompted for interactively.
+/ ``--output``; ``--long-names``, ``--log`` and ``--input-units`` are also
+available) and run from a shell or a Jupyter notebook. Paths left unset are
+prompted for interactively.
 """
 
 from __future__ import annotations
@@ -50,6 +54,11 @@ OUTPUT_PATH: Path | None = None
 MONTHLY_OUTPUT_PATH: Path | None = (
     None  # set to write the monthly aggregates alongside the daily output
 )
+# Units the NOAA CDO export was ordered in: "standard" (deg F, inches) or
+# "metric" (deg C, millimeters). Required when MONTHLY_OUTPUT_PATH is set; the
+# monthly columns are always deg F and inches. The daily output keeps the
+# export's own units.
+INPUT_UNITS: str | None = None
 DATE_FORMAT: str | None = None  # None = infer (handles ISO 2021-01-01 and 1/1/2021)
 USE_LONG_NAMES = False  # rename code headers (TMAX) to long names; logged either way
 WRITE_LOG = True  # also write a .txt processing log next to the output
@@ -84,6 +93,25 @@ COLUMN_LONG_NAMES = {
     "WT09": "Blowing or drifting snow",
     "WT18": "Snow, snow pellets, snow grains, or ice crystals",
 }
+
+# NOAA CDO export unit systems accepted by INPUT_UNITS.
+UNIT_SYSTEMS = ("standard", "metric")
+
+
+def resolve_input_units(units: str | None) -> str:
+    """Return *units* as ``"standard"`` or ``"metric"``, or raise an actionable error.
+
+    Raises:
+        ValueError: If *units* is unset or not one of :data:`UNIT_SYSTEMS`.
+    """
+    key = "" if units is None else str(units).strip().lower()
+    if key not in UNIT_SYSTEMS:
+        raise ValueError(
+            f"INPUT_UNITS must be 'standard' (deg F, inches) or 'metric' (deg C, millimeters) "
+            f"to match the units the NOAA CDO export was ordered in; got {units!r}. Set "
+            "INPUT_UNITS (or pass --input-units) before writing monthly aggregates."
+        )
+    return key
 
 
 def _add_file_log(path: Path) -> logging.FileHandler:
@@ -237,7 +265,7 @@ def clean_weather(df: pd.DataFrame, *, use_long_names: bool = USE_LONG_NAMES) ->
     return df
 
 
-def aggregate_monthly(df: pd.DataFrame) -> pd.DataFrame:
+def aggregate_monthly(df: pd.DataFrame, *, units: str | None) -> pd.DataFrame:
     """Collapse a cleaned daily NOAA frame into monthly ridership-model inputs.
 
     Returns one row per calendar month with a ``period`` key (``"YYYY-MM"``),
@@ -255,11 +283,20 @@ def aggregate_monthly(df: pd.DataFrame) -> pd.DataFrame:
 
     A month with no readings for a measure gets NA for it, not 0. Long-name headers
     from ``clean_weather(use_long_names=True)`` are mapped back to the NOAA codes.
+    Metric readings (deg C, millimeters) are converted to deg F and inches first.
+    Rows repeating a station-date with identical values count once.
+
+    Args:
+        df: Output of :func:`clean_weather`.
+        units: ``"standard"`` or ``"metric"``, the units the export was ordered in.
 
     Raises:
-        ValueError: If the frame holds more than one station (each station's
-            readings would count as separate days), or no recognised weather column.
+        ValueError: If *units* is not ``"standard"`` or ``"metric"``, the frame
+            holds more than one station (each station's readings would count as
+            separate days), a station-date repeats with different readings, or
+            no recognised weather column is present.
     """
+    units = resolve_input_units(units)
     if "STATION" in df.columns:
         stations = sorted(df["STATION"].dropna().astype(str).unique())
         if len(stations) > 1:
@@ -272,6 +309,34 @@ def aggregate_monthly(df: pd.DataFrame) -> pd.DataFrame:
 
     # rename returns a copy, so the caller's frame is left untouched.
     df = df.rename(columns={long: code for code, long in COLUMN_LONG_NAMES.items()})
+
+    # A repeated station-date would count its precipitation day and snowfall
+    # twice. Exact repeats collapse to one row; differing readings are rejected.
+    repeats = df.duplicated(keep="first")
+    if repeats.any():
+        logger.warning("dropping %d exact duplicate row(s)", int(repeats.sum()))
+        df = df.loc[~repeats].copy()
+    key = [df["STATION"]] if "STATION" in df.columns else []
+    day = df["DATE"].dt.normalize()
+    conflicting = day[day.groupby(key + [day], dropna=False).transform("size") > 1]
+    if not conflicting.empty:
+        dates = sorted({d.date().isoformat() for d in conflicting})
+        shown = ", ".join(dates[:10]) + (" ..." if len(dates) > 10 else "")
+        raise ValueError(
+            f"{len(dates)} date(s) appear more than once with different readings: {shown}. "
+            "Remove or reconcile the duplicate rows in the input CSV before writing "
+            "monthly aggregates."
+        )
+
+    if units == "metric":
+        for col in ("TAVG", "TMAX", "TMIN"):
+            if col in df.columns:
+                df[col] = df[col] * 9.0 / 5.0 + 32.0
+        for col in ("PRCP", "SNOW"):
+            if col in df.columns:
+                df[col] = df[col] / 25.4
+        logger.info("converted metric readings to deg F and inches")
+
     df["period"] = df["DATE"].dt.to_period("M").astype(str)
 
     agg: dict[str, Any] = {}
@@ -326,6 +391,7 @@ def run(
     *,
     use_long_names: bool | None = None,
     write_log: bool | None = None,
+    input_units: str | None = None,
 ) -> pd.DataFrame:
     """Notebook entry point: clean ``input_path`` and write ``output_path``.
 
@@ -333,7 +399,9 @@ def run(
     set, a second CSV of monthly aggregates is written alongside the daily
     output.  Those monthly columns (``avg_temp_f``, ``max_daily_precip_in``,
     ``days_with_precip``, ``total_snow_in``, ``max_daily_snow_in``) are what the
-    ridership models expect in the exogenous feature table.
+    ridership models expect in the exogenous feature table. They need
+    ``input_units`` (or ``INPUT_UNITS``); the run stops before reading the
+    input when it is unset.
 
     Unset args fall back to the config block, resolved at call time -- so
     ``m.INPUT_PATH = ...; m.run()`` works as expected after a plain import.
@@ -346,6 +414,9 @@ def run(
     )
     use_long_names = USE_LONG_NAMES if use_long_names is None else use_long_names
     write_log = WRITE_LOG if write_log is None else write_log
+    input_units = INPUT_UNITS if input_units is None else input_units
+    if monthly_output_path is not None:
+        input_units = resolve_input_units(input_units)
 
     # Anything still unset after arg + config block falls to an interactive prompt.
     if input_path is None:
@@ -366,7 +437,9 @@ def run(
         clean = clean_weather(raw, use_long_names=use_long_names)
         # Aggregate before writing anything, so an input the monthly step rejects
         # leaves no half-finished run behind.
-        monthly = aggregate_monthly(clean) if monthly_output_path is not None else None
+        monthly = (
+            aggregate_monthly(clean, units=input_units) if monthly_output_path is not None else None
+        )
 
         if output_path.suffix == ".parquet":
             clean.to_parquet(output_path, index=False)
@@ -419,8 +492,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=WRITE_LOG,
         help="write a .txt processing log next to the output",
     )
+    parser.add_argument(
+        "--input-units",
+        choices=UNIT_SYSTEMS,
+        default=INPUT_UNITS,
+        help="units the NOAA export was ordered in (required for monthly aggregates)",
+    )
     args = parser.parse_args(notebook_safe_argv(argv))
-    run(args.input, args.output, use_long_names=args.long_names, write_log=args.log)
+    run(
+        args.input,
+        args.output,
+        use_long_names=args.long_names,
+        write_log=args.log,
+        input_units=args.input_units,
+    )
     logger.info("Script completed successfully.")
     return 0
 

@@ -101,30 +101,47 @@ def _special_day_calendar() -> tuple[pd.DataFrame, pd.DataFrame]:
     return calendar, calendar_dates
 
 
+def _running_on(service_dates: dict[str, set[dt.date]], day: dt.date) -> set[str]:
+    return {sid for sid, dates in service_dates.items() if day in dates}
+
+
 def test_resolve_service_day_applies_calendar_dates_exceptions() -> None:
     calendar, calendar_dates = _special_day_calendar()
-    chosen, ids = resolve_service_day(calendar, calendar_dates, "weekday")
+    chosen, service_dates = resolve_service_day(calendar, calendar_dates, "weekday")
     assert chosen.weekday() < 5 and chosen != _DAY_AFTER_THANKSGIVING
-    assert ids == {"1"}  # service 4 never runs on a regular weekday
+    assert _running_on(service_dates, chosen) == {"1"}
+    assert "4" not in service_dates  # service 4 never runs on or beside a regular weekday
 
 
-def test_resolve_service_day_explicit_date_uses_that_dates_services() -> None:
+def test_resolve_service_day_explicit_date_keeps_weekday_neighbors() -> None:
     calendar, calendar_dates = _special_day_calendar()
+    thanksgiving = _DAY_AFTER_THANKSGIVING - dt.timedelta(days=1)
+    # Saturday the 28th is outside the weekday filter; Thursday the 26th is kept.
     assert resolve_service_day(calendar, calendar_dates, "weekday", _DAY_AFTER_THANKSGIVING) == (
         _DAY_AFTER_THANKSGIVING,
-        {"1", "4"},
-    )
-    assert resolve_service_day(calendar, calendar_dates, None, _DAY_AFTER_THANKSGIVING) == (
-        _DAY_AFTER_THANKSGIVING,
-        {"1", "4"},
+        {"1": {thanksgiving, _DAY_AFTER_THANKSGIVING}, "4": {_DAY_AFTER_THANKSGIVING}},
     )
 
 
-def test_resolve_service_day_single_day_name() -> None:
-    calendar, calendar_dates = _special_day_calendar()
-    chosen, ids = resolve_service_day(calendar, calendar_dates, "tuesday")
-    assert chosen.weekday() == 1
-    assert ids == {"1"}
+def test_resolve_service_day_neighbors_follow_the_day_filter() -> None:
+    calendar = pd.DataFrame(
+        {
+            "service_id": ["WK", "SAT"],
+            **{day: ["1", "0"] for day in _DAY_COLS[:5]},
+            "saturday": ["0", "1"],
+            "sunday": ["0", "0"],
+            "start_date": ["20261102", "20261102"],
+            "end_date": ["20261204", "20261204"],
+        }
+    )
+    friday, saturday = dt.date(2026, 11, 20), dt.date(2026, 11, 21)
+    _, weekday_only = resolve_service_day(calendar, None, "weekday", friday)
+    assert weekday_only == {"WK": {friday - dt.timedelta(days=1), friday}}
+    _, any_day = resolve_service_day(calendar, None, None, friday)
+    assert any_day == {"WK": {friday - dt.timedelta(days=1), friday}, "SAT": {saturday}}
+    # A single day name keeps no neighbors.
+    chosen, friday_only = resolve_service_day(calendar, None, "friday")
+    assert friday_only == {"WK": {chosen}}
 
 
 def test_resolve_service_day_reads_calendar_dates_only_feed() -> None:
@@ -136,9 +153,9 @@ def test_resolve_service_day_reads_calendar_dates_only_feed() -> None:
             "exception_type": "1",
         }
     )
-    chosen, ids = resolve_service_day(None, calendar_dates, "weekday")
+    chosen, service_dates = resolve_service_day(None, calendar_dates, "weekday")
     assert chosen in mondays
-    assert ids == {"MON"}
+    assert service_dates == {"MON": {chosen}}
 
 
 def test_resolve_service_day_without_calendar_returns_none() -> None:
@@ -383,6 +400,37 @@ def test_build_stop_events_uses_stop_sequence_per_visit(caplog: pytest.LogCaptur
     assert events["can_board"].tolist() == [True, True, False, True, False, False]
     assert events["service_id"].tolist() == ["WK"] * 6
     assert "1 stop time(s) have a missing or non-numeric stop_sequence" in caplog.text
+
+
+def test_compute_transfers_only_pairs_services_sharing_a_date(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(rtc, "ENABLE_TIME_CHECK", True)
+    monkeypatch.setattr(rtc, "MAX_TRANSFER_WAIT_MINUTES", 30.0)
+    monkeypatch.setattr(rtc, "WALK_SPEED_MPH", 3.0)
+    # A arrives at S1 at 08:00 on Mondays. B leaves S2 (100 m away) at 08:05
+    # on Tuesdays and at 08:20 on Mondays.
+    events = pd.DataFrame(
+        {
+            "stop_id": ["S1", "S2", "S2"],
+            "route_id": ["A", "B", "B"],
+            "service_id": ["MON", "TUE", "MON"],
+            "arrival_sec": [28800.0, 29100.0, 30000.0],
+            "departure_sec": [28800.0, 29100.0, 30000.0],
+            "can_alight": [True] * 3,
+            "can_board": [True] * 3,
+        }
+    )
+    service_dates = {"MON": {dt.date(2026, 11, 16)}, "TUE": {dt.date(2026, 11, 17)}}
+
+    matched = compute_transfers(
+        _stops_gdf(), events, _routes_table(), radius_m=400.0, service_dates=service_dates
+    )
+    assert matched["A"]["B"]["min_wait_seconds"] == pytest.approx(1200.0)  # the Monday 08:20
+
+    # Without service matching, the Tuesday 08:05 departure is (wrongly) caught.
+    pooled = compute_transfers(_stops_gdf(), events, _routes_table(), radius_m=400.0)
+    assert pooled["A"]["B"]["min_wait_seconds"] == pytest.approx(300.0)
 
 
 _CALENDAR_HEADER = "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday"
@@ -821,3 +869,152 @@ def test_read_feed_missing_required_file_raises(tmp_path: Path) -> None:
         zf.writestr("stops.txt", "stop_id\n1\n")
     with pytest.raises(FileNotFoundError, match="routes.txt"):
         rtc._read_feed(str(zipped))
+
+
+# ---------------------------------------------------------------------------
+# transfers.txt minimum transfer times
+# ---------------------------------------------------------------------------
+
+_HUB_STOPS = "stop_id,stop_lat,stop_lon\nHUB,38.90,-77.00\nA0,38.95,-77.00\nB9,38.85,-77.00\n"
+
+
+@pytest.mark.parametrize(
+    ("b_leaves", "transfers", "expected"),
+    [
+        ("08:02:00", None, ["B"]),  # control: a 2-minute transfer at a shared stop
+        ("08:02:00", "HUB,HUB,2,300", [""]),  # transfers.txt requires 5 minutes
+        ("08:05:00", "HUB,HUB,2,300", ["B"]),
+        ("08:02:00", "HUB,HUB,2,60", ["B"]),
+        ("08:02:00", "HUB,HUB,0,300", ["B"]),  # min_transfer_time applies to type 2 only
+    ],
+)
+def test_main_applies_min_transfer_time(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    b_leaves: str,
+    transfers: str | None,
+    expected: list[str],
+) -> None:
+    monkeypatch.setattr(rtc, "ENABLE_TIME_CHECK", True)
+    monkeypatch.setattr(rtc, "TARGET_ROUTE_TOKENS", {"A"})
+    stop_times = (
+        "TA,07:50:00,07:50:00,A0,1\n"
+        "TA,08:00:00,08:00:00,HUB,2\n"
+        f"TB,{b_leaves},{b_leaves},HUB,1\n"
+        "TB,08:20:00,08:20:00,B9,2\n"
+    )
+    header = "from_stop_id,to_stop_id,transfer_type,min_transfer_time\n"
+    extra = {"transfers.txt": header + transfers + "\n"} if transfers else {}
+    assert _two_route_feed(tmp_path, _HUB_STOPS, stop_times, extra) == expected
+
+
+def test_governing_transfer_rule_returns_most_specific_minimum() -> None:
+    stops = pd.DataFrame({"stop_id": ["HA", "HB"]})
+    transfers = pd.DataFrame(
+        {
+            "from_stop_id": ["HA", "HA", "HA", "HA"],
+            "to_stop_id": ["HB", "HB", "HB", "HB"],
+            "from_route_id": ["", "A", "C", "C"],
+            "to_route_id": ["", "B", "", ""],
+            "transfer_type": ["2", "0", "2", "2"],
+            "min_transfer_time": ["300", "", "120", "240"],
+        }
+    )
+    pair = rtc.build_transfer_rules(transfers, stops)[("HA", "HB")]
+    assert rtc.governing_transfer_rule(pair, "D", "B") == (False, 300.0)  # stop-wide rule
+    assert rtc.governing_transfer_rule(pair, "A", "B") == (False, 0.0)  # route-pair override
+    assert rtc.governing_transfer_rule(pair, "C", "B") == (False, 240.0)  # tie: longer minimum
+
+
+# ---------------------------------------------------------------------------
+# Connections across a service-day boundary
+# ---------------------------------------------------------------------------
+
+# A arrives at HUB at 24:05 on its service date; B leaves HUB at 00:10 on its own.
+_A_AFTER_MIDNIGHT = (
+    "TA,23:55:00,23:55:00,A0,1\n"
+    "TA,24:05:00,24:05:00,HUB,2\n"
+    "TB,00:10:00,00:10:00,HUB,1\n"
+    "TB,00:20:00,00:20:00,B9,2\n"
+)
+# A arrives at 00:05 on its service date; B leaves at 24:10 on the date before.
+_B_BEFORE_MIDNIGHT = (
+    "TA,23:55:00,23:55:00,A0,1\n"
+    "TA,00:05:00,00:05:00,HUB,2\n"
+    "TB,24:10:00,24:10:00,HUB,1\n"
+    "TB,24:20:00,24:20:00,B9,2\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("services", "stop_times", "expected"),
+    [
+        # Monday-only A, Tuesday-only B: the representative weekday is a Tuesday
+        # (Monday holidays are skipped), when A does not run. See the explicit
+        # Monday below.
+        ("SA,1,0,0,0,0,0,0\nSB,0,1,0,0,0,0,0", _A_AFTER_MIDNIGHT, [""]),
+        # One weekday service: Monday's 24:05 arrival catches Tuesday's 00:10.
+        ("SA,1,1,1,1,1,0,0\nSB,1,1,1,1,1,0,0", _A_AFTER_MIDNIGHT, ["B"]),
+        # Monday at 24:05 does not reach a Wednesday-only 00:10.
+        ("SA,1,0,0,0,0,0,0\nSB,0,0,1,0,0,0,0", _A_AFTER_MIDNIGHT, [""]),
+        # Saturday service is outside the weekday filter.
+        ("SA,0,0,0,0,1,0,0\nSB,0,0,0,0,0,1,0", _A_AFTER_MIDNIGHT, [""]),
+        # Tuesday 00:05 arrival catches Monday's 24:10 (also Tuesday 00:10).
+        ("SA,0,1,0,0,0,0,0\nSB,1,0,0,0,0,0,0", _B_BEFORE_MIDNIGHT, ["B"]),
+    ],
+)
+def test_main_connects_across_service_day_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    services: str,
+    stop_times: str,
+    expected: list[str],
+) -> None:
+    rows = "".join(f"{line},{_YEAR}\n" for line in services.splitlines())
+    calendar = f"{_CALENDAR_HEADER},start_date,end_date\n{rows}"
+    assert _transfers_from_main(tmp_path, monkeypatch, calendar, stop_times) == expected
+
+
+@pytest.mark.parametrize(
+    ("services", "extra_args", "expected"),
+    [
+        # Monday trip at 24:05 (Tuesday 00:05) catches the Tuesday 00:10 trip.
+        ("SA,1,0,0,0,0,0,0\nSB,0,1,0,0,0,0,0", ("--service-date", "2026-11-16"), ["B"]),
+        # On the Tuesday, A does not run, so nothing feeds B.
+        ("SA,1,0,0,0,0,0,0\nSB,0,1,0,0,0,0,0", ("--service-date", "2026-11-17"), [""]),
+        # Friday night onto Saturday is outside the weekday filter...
+        ("SA,0,0,0,0,1,0,0\nSB,0,0,0,0,0,1,0", ("--service-date", "2026-11-20"), [""]),
+        # ...and counts once no day filter limits the neighboring days.
+        (
+            "SA,0,0,0,0,1,0,0\nSB,0,0,0,0,0,1,0",
+            ("--service-date", "2026-11-20", "--day", "all"),
+            ["B"],
+        ),
+    ],
+)
+def test_main_connects_across_midnight_from_a_service_date(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    services: str,
+    extra_args: tuple[str, ...],
+    expected: list[str],
+) -> None:
+    rows = "".join(f"{line},{_YEAR}\n" for line in services.splitlines())
+    calendar = f"{_CALENDAR_HEADER},start_date,end_date\n{rows}"
+    transfers = _transfers_from_main(
+        tmp_path, monkeypatch, calendar, _A_AFTER_MIDNIGHT, extra_args=extra_args
+    )
+    assert transfers == expected
+
+
+def test_best_connection_reports_wait_across_midnight(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(rtc, "ENABLE_TIME_CHECK", True)
+    feasible, wait = rtc._best_connection(
+        {"MON": np.array([24 * 3600.0 + 300.0])},  # 24:05
+        {"TUE": np.array([600.0])},  # 00:10
+        lambda a, b, offset: offset == 1,
+        0.0,
+        1800.0,
+    )
+    assert feasible
+    assert wait == pytest.approx(300.0)
