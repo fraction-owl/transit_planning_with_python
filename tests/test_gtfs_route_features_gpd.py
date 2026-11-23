@@ -96,12 +96,19 @@ def test_coverage_departures_in_same_bin_dedupe() -> None:
     assert cov["A"] == pytest.approx(100.0 * 1 / 24)
 
 
-def test_coverage_keeps_extended_clock_no_wrap() -> None:
-    # 01:00 -> hour 1 and 25:00 -> hour 25 stay distinct; wrapping 25:00 to 01:00 would
-    # wrongly collapse them into a single bin.
+def test_coverage_wraps_extended_clock() -> None:
+    # 01:00 and 25:00 are the same clock hour, so they fill one bin, not two.
     trips = pd.DataFrame({"route_id": ["A", "A"], "start_sec": [3600.0, 90000.0]})
     cov = _service_day_coverage(trips).set_index("route_id")["pct_day_with_service"]
-    assert cov["A"] == pytest.approx(100.0 * 2 / 24)
+    assert cov["A"] == pytest.approx(100.0 * 1 / 24)
+
+
+def test_coverage_never_exceeds_100_percent() -> None:
+    # WMATA C11 departs in GTFS hours 0 through 25: 26 extended hours, but only 24 clock
+    # hours, so the route covers 100% of the day, not 108.33%.
+    trips = pd.DataFrame({"route_id": ["C11"] * 26, "start_sec": [h * 3600.0 for h in range(26)]})
+    cov = _service_day_coverage(trips).set_index("route_id")["pct_day_with_service"]
+    assert cov["C11"] == pytest.approx(100.0)
 
 
 def test_coverage_drops_missing_start() -> None:

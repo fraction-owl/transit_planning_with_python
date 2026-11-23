@@ -388,6 +388,45 @@ def test_merge_rejects_mixed_timezones(tmp_path: Path) -> None:
         merge_feeds(_feeds(tmp_path, b_files), MergeSettings())
 
 
+def test_merge_accepts_timezone_aliases(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Fairfax Connector's archived feed says US/Eastern and WMATA's says America/New_York;
+    # the tz database links the first to the second, so they are one timezone.
+    monkeypatch.setattr(gfm, "load_timezone_links", lambda: {"US/Eastern": "America/New_York"})
+    b_files = dict(FEED_B)
+    b_files["agency"] = [FEED_B["agency"][0], "Agency B,https://b.example,US/Eastern"]
+    result = merge_feeds(_feeds(tmp_path, b_files), MergeSettings())
+    assert set(result.tables["agency"]["agency_timezone"]) == {"America/New_York"}
+
+
+def test_merge_rejects_mixed_timezones_without_link_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(gfm, "load_timezone_links", dict)
+    b_files = dict(FEED_B)
+    b_files["agency"] = [FEED_B["agency"][0], "Agency B,https://b.example,US/Eastern"]
+    with pytest.raises(MergeError, match="tzdata.zi"):
+        merge_feeds(_feeds(tmp_path, b_files), MergeSettings())
+
+
+def test_load_timezone_links_reads_tzdata_zi(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "tzdata.zi").write_text(
+        "# version test\nZ Test/Zone -5 - EST\nL Test/Zone Test/Alias\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(gfm.zoneinfo, "TZPATH", (str(tmp_path),))
+    links = gfm.load_timezone_links()
+    assert links["Test/Alias"] == "Test/Zone"
+    assert "Test/Zone" not in links
+
+
+def test_canonical_timezone_follows_link_chains() -> None:
+    links = {"A/Old": "A/Mid", "A/Mid": "A/Zone", "Loop/1": "Loop/2", "Loop/2": "Loop/1"}
+    assert gfm.canonical_timezone("A/Old", links) == "A/Zone"
+    assert gfm.canonical_timezone("A/Zone", links) == "A/Zone"
+    assert gfm.canonical_timezone("Loop/1", links) == "Loop/2"
+
+
 def test_merge_dedupes_transfers_on_merged_stops(tmp_path: Path) -> None:
     result = merge_feeds(_feeds(tmp_path), MergeSettings())
     transfers = result.tables["transfers"]
