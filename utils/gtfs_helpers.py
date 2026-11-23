@@ -326,6 +326,30 @@ def load_express_route_ids(
     return load_id_set(inline_ids, txt_path, kind="express route")
 
 
+def load_non_revenue_route_ids(
+    inline_ids: Optional[Sequence[str]] = None,
+    txt_path: Optional[str] = None,
+) -> set[str]:
+    """Resolve the set of non-revenue route ids (see ``load_id_set``).
+
+    Non-revenue routes are test, training and other routes that carry no
+    passengers. Example file: ``sample_data/non_revenue_routes_example.txt``.
+    """
+    return load_id_set(inline_ids, txt_path, kind="non-revenue route")
+
+
+def load_event_route_ids(
+    inline_ids: Optional[Sequence[str]] = None,
+    txt_path: Optional[str] = None,
+) -> set[str]:
+    """Resolve the set of event-route ids (see ``load_id_set``).
+
+    Event routes carry passengers to and from special events, such as a stadium
+    shuttle on game days. Example file: ``sample_data/event_routes_example.txt``.
+    """
+    return load_id_set(inline_ids, txt_path, kind="event route")
+
+
 def stop_pattern_id(stop_ids: Iterable[object]) -> str:
     """Return a short text ID for an ordered stop pattern that is stable across runs.
 
