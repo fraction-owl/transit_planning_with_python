@@ -231,3 +231,50 @@ def test_route_filters_and_limits_normalize_route_names(monkeypatch) -> None:
         data, bus_capacity=39, filter_in_routes=[], filter_out_routes=["7"], decimals=4
     )
     assert "007" in set(dropped["ROUTE_NAME"])
+
+
+def _one_trip(max_load: float) -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "SERIAL_NUMBER": [1],
+            "ROUTE_NAME": ["101"],
+            "DIRECTION_NAME": ["Inbound"],
+            "TRIP_START_TIME": pd.to_datetime(["08:00"], format="%H:%M"),
+            "MAX_LOAD": [max_load],
+        }
+    )
+
+
+def test_blank_max_load_is_unknown_not_compliant(tmp_path, monkeypatch) -> None:
+    """A trip with no observed load is flagged UNKNOWN, and the log does not call it compliant."""
+    processed = load_factor_monitor.process_data(
+        _one_trip(float("nan")),
+        bus_capacity=39,
+        filter_in_routes=[],
+        filter_out_routes=[],
+        decimals=4,
+    )
+    assert pd.isna(processed.iloc[0]["LOAD_FACTOR"])
+    assert processed.iloc[0]["LOAD_FACTOR_VIOLATION"] == "UNKNOWN"
+
+    log_out = tmp_path / "violations.txt"
+    load_factor_monitor.write_violation_log(processed, str(log_out))
+    content = log_out.read_text(encoding="utf-8")
+    assert "all trips within permissible limits" not in content
+    assert "1 trip(s) have no MAX_LOAD" in content
+
+
+@pytest.mark.parametrize("decimals", [0, 1, 4])
+def test_display_precision_does_not_change_compliance(monkeypatch, decimals: int) -> None:
+    """40 riders on a 39-seat bus (1.026) exceed a 1.0 limit at any display precision."""
+    monkeypatch.setattr(load_factor_monitor, "LOWER_LIMIT_ROUTES", ["101"])
+    processed = load_factor_monitor.process_data(
+        _one_trip(40),
+        bus_capacity=39,
+        filter_in_routes=[],
+        filter_out_routes=[],
+        decimals=decimals,
+    )
+    row = processed.iloc[0]
+    assert row["LOAD_FACTOR"] == round(40 / 39, decimals)
+    assert row["LOAD_FACTOR_VIOLATION"] == "TRUE"
