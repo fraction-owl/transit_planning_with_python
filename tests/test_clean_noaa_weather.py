@@ -143,7 +143,7 @@ def test_aggregate_monthly_rejects_multiple_stations() -> None:
         ]
     )
     with pytest.raises(ValueError, match="single station.*2: A, B"):
-        mod.aggregate_monthly(mod.clean_weather(raw))
+        mod.aggregate_monthly(mod.clean_weather(raw), units="standard")
 
 
 def test_aggregate_monthly_unobserved_month_is_na_not_dry() -> None:
@@ -154,7 +154,7 @@ def test_aggregate_monthly_unobserved_month_is_na_not_dry() -> None:
             _daily("2021-03-01", "2021-03-31", prcp=0.0, snow=0.0),
         ]
     )
-    monthly = mod.aggregate_monthly(mod.clean_weather(raw)).set_index("period")
+    monthly = mod.aggregate_monthly(mod.clean_weather(raw), units="standard").set_index("period")
     assert monthly.loc["2021-01", "days_with_precip"] == 31
     assert monthly.loc["2021-01", "total_snow_in"] == pytest.approx(15.5)
     # February has no PRCP/SNOW readings at all: unknown, not 0 wet days / 0 in.
@@ -166,8 +166,8 @@ def test_aggregate_monthly_unobserved_month_is_na_not_dry() -> None:
 
 
 def test_aggregate_monthly_accepts_long_name_headers(raw_df: pd.DataFrame) -> None:
-    short = mod.aggregate_monthly(mod.clean_weather(raw_df))
-    long = mod.aggregate_monthly(mod.clean_weather(raw_df, use_long_names=True))
+    short = mod.aggregate_monthly(mod.clean_weather(raw_df), units="standard")
+    long = mod.aggregate_monthly(mod.clean_weather(raw_df, use_long_names=True), units="standard")
     pd.testing.assert_frame_equal(short, long)
 
 
@@ -179,7 +179,14 @@ def test_aggregate_monthly_accepts_long_name_headers(raw_df: pd.DataFrame) -> No
 def test_run_long_names_with_monthly_output(tmp_path: Path) -> None:
     out_path = tmp_path / "weather_clean.csv"
     monthly_path = tmp_path / "weather_monthly.csv"
-    mod.run(FIXTURE_CSV, out_path, monthly_path, use_long_names=True, write_log=False)
+    mod.run(
+        FIXTURE_CSV,
+        out_path,
+        monthly_path,
+        use_long_names=True,
+        write_log=False,
+        input_units="standard",
+    )
 
     assert "Precipitation" in pd.read_csv(out_path).columns
     monthly = pd.read_csv(monthly_path)
@@ -197,7 +204,7 @@ def test_run_multi_station_monthly_writes_nothing(tmp_path: Path) -> None:
     out_path = tmp_path / "weather_clean.csv"
     monthly_path = tmp_path / "weather_monthly.csv"
     with pytest.raises(ValueError, match="single station"):
-        mod.run(src, out_path, monthly_path, write_log=False)
+        mod.run(src, out_path, monthly_path, write_log=False, input_units="standard")
     assert not out_path.exists()
     assert not monthly_path.exists()
 
@@ -213,3 +220,58 @@ def test_run_writes_csv_and_returns_clean_frame(tmp_path: Path) -> None:
     reloaded = pd.read_csv(out_path)
     assert len(reloaded) == len(result)
     assert "DAY_OF_WEEK" in reloaded.columns
+
+
+# ---------------------------------------------------------------------------
+# Input units and repeated station-dates
+# ---------------------------------------------------------------------------
+
+
+def _frame(csv: str) -> pd.DataFrame:
+    import io
+
+    return mod.clean_weather(pd.read_csv(io.StringIO(csv), dtype={"STATION": "string"}))
+
+
+def test_aggregate_monthly_converts_metric_to_fahrenheit_and_inches() -> None:
+    clean = _frame("STATION,NAME,DATE,TAVG,PRCP,SNOW\nX,N,2026-01-01,20,25.4,50.8\n")
+    metric = mod.aggregate_monthly(clean, units="metric").iloc[0]
+    assert metric["avg_temp_f"] == pytest.approx(68.0)
+    assert metric["max_daily_precip_in"] == pytest.approx(1.0)
+    assert metric["total_snow_in"] == pytest.approx(2.0)
+    standard = mod.aggregate_monthly(clean, units="Standard").iloc[0]
+    assert standard["avg_temp_f"] == pytest.approx(20.0)
+    assert standard["max_daily_precip_in"] == pytest.approx(25.4)
+
+
+@pytest.mark.parametrize("units", [None, "", "imperial"])
+def test_aggregate_monthly_requires_input_units(units: str | None) -> None:
+    clean = _frame("STATION,NAME,DATE,TAVG\nX,N,2026-01-01,20\n")
+    with pytest.raises(ValueError, match="INPUT_UNITS"):
+        mod.aggregate_monthly(clean, units=units)
+
+
+def test_run_monthly_without_units_stops_before_writing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(mod, "INPUT_UNITS", None)
+    out_path = tmp_path / "weather_clean.csv"
+    with pytest.raises(ValueError, match="INPUT_UNITS"):
+        mod.run(FIXTURE_CSV, out_path, tmp_path / "monthly.csv", write_log=False)
+    assert not out_path.exists()
+
+
+def test_aggregate_monthly_counts_an_exact_repeat_once() -> None:
+    clean = _frame(
+        "STATION,NAME,DATE,PRCP,SNOW\nX,N,2026-01-01,0.5,2\nX,N,2026-01-01,0.5,2\n"
+        "X,N,2026-01-02,0,0\n"
+    )
+    row = mod.aggregate_monthly(clean, units="standard").iloc[0]
+    assert row["days_with_precip"] == 1
+    assert row["total_snow_in"] == pytest.approx(2.0)
+
+
+def test_aggregate_monthly_rejects_conflicting_repeat() -> None:
+    clean = _frame("STATION,NAME,DATE,PRCP,SNOW\nX,N,2026-01-01,0.5,2\nX,N,2026-01-01,0.5,3\n")
+    with pytest.raises(ValueError, match="1 date\\(s\\) appear more than once.*2026-01-01"):
+        mod.aggregate_monthly(clean, units="standard")
