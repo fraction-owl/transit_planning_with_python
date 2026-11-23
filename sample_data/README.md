@@ -17,7 +17,7 @@ The GTFS, TODS and TIDES files are copies of fixtures in [`tests/fixtures/`](../
 
 ## Route lists
 
-These optional examples use invented Mock DC Transit route IDs that `gtfs_current.zip` does not contain. In `trip_cut_savings.py`, point `NON_REVENUE_ROUTES` at `non_revenue_routes_example.txt` to remove test routes from baseline totals and cut screening. Point `OTHER_EXCLUDED_ROUTES` at `event_routes_example.txt` when event shuttles should remain in passenger-service totals and be excluded from cut proposals. Both settings accept absolute paths or paths relative to the script. Scripts can read either file with `load_non_revenue_route_ids` or `load_event_route_ids` from `utils/gtfs_helpers.py`, the counterparts of `load_express_route_ids`.
+These optional examples are lists of Mock DC Transit routes. `express_routes_example.txt` lists route 20 by its `gtfs_current.zip` route ID, `DC_R20`. In `gtfs_service_demographics_gpd.py`, point `EXPRESS_ROUTES_FILE` (or `--express-routes-file`) at it to label route 20 "express" in route mode; a relative path is read from the folder you run the script in. The non-revenue and event examples use invented route IDs that `gtfs_current.zip` does not contain. In `trip_cut_savings.py`, point `NON_REVENUE_ROUTES` at `non_revenue_routes_example.txt` to remove test routes from baseline totals and cut screening. Point `OTHER_EXCLUDED_ROUTES` at `event_routes_example.txt` when event shuttles should remain in passenger-service totals and be excluded from cut proposals. Both settings accept absolute paths or paths relative to the script. Scripts can read these files with `load_express_route_ids`, `load_non_revenue_route_ids` or `load_event_route_ids` from `utils/gtfs_helpers.py`.
 
 ## Archive editions
 

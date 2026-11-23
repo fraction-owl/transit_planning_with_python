@@ -1,0 +1,11 @@
+# Example express-route list: Mock DC Transit express service. Route 20, the
+# East-West Express in gtfs_current.zip, runs on weekday peaks only, one
+# direction per peak. In gtfs_service_demographics_gpd.py, point
+# EXPRESS_ROUTES_FILE (or --express-routes-file) at a copy of this file to label
+# the route "express" in route mode. Its park-and-ride origin stops, which get
+# the drive-access buffer, go in a separate list (EXPRESS_ORIGIN_STOPS_FILE).
+#
+# One GTFS route_id per line. The script matches route_id, not route_short_name,
+# so route 20 is listed as DC_R20. Blank lines are ignored, and "#" starts a
+# comment, on its own line or after a route.
+DC_R20
