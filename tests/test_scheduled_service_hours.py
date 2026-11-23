@@ -241,12 +241,12 @@ def test_layover_at_reformatted_coordinates_counts_as_revenue(tmp_path: Path) ->
 
 def test_add_derived_follows_the_layover_setting() -> None:
     df = pd.DataFrame({c: [1.0] for c in target.COMPONENTS})
-    counted = target.add_derived(df, layover_in_revenue=True, tods_supplied=True).iloc[0]
+    counted = target.add_derived(df, layover_in_revenue=True, movements_known=True).iloc[0]
     assert counted["vehicle_revenue_hours"] == 2.0 and counted["nonrevenue_hours"] == 4.0
-    separate = target.add_derived(df, layover_in_revenue=False, tods_supplied=True).iloc[0]
+    separate = target.add_derived(df, layover_in_revenue=False, movements_known=True).iloc[0]
     assert separate["vehicle_revenue_hours"] == 1.0 and separate["nonrevenue_hours"] == 5.0
     assert counted["vehicle_hours"] == separate["vehicle_hours"] == 7.0
-    blank = target.add_derived(df, layover_in_revenue=True, tods_supplied=False).iloc[0]
+    blank = target.add_derived(df, layover_in_revenue=True, movements_known=False).iloc[0]
     assert math.isnan(blank["deadhead_hours"]) and math.isnan(blank["vehicle_hours"])
 
 
@@ -396,6 +396,84 @@ def test_typical_weekday_is_the_most_common_operating_day(
     assert weekday["revenue_trip_hours"] == 1.0
 
 
+def christmas_on_sunday_service(folder: Path) -> dict[str, pd.DataFrame]:
+    """Weekday, Saturday and Sunday service; Friday 2026-12-25 runs Sunday service."""
+    weekday, saturday, sunday = DAYS[:5], ("saturday",), ("sunday",)
+    calendar = [
+        {**calendar_row(sid, days), "end_date": "20261231"}
+        for sid, days in (("wk", weekday), ("sat", saturday), ("sun", sunday))
+    ]
+    gtfs = write_feed(
+        folder / "gtfs",
+        {
+            "trips.txt": [
+                {"route_id": "R", "service_id": sid, "trip_id": f"T{sid}", "block_id": f"B{sid}"}
+                for sid in ("wk", "sat", "sun")
+            ],
+            "stop_times.txt": [
+                row
+                for sid, end in (("wk", "08:00:00"), ("sat", "07:30:00"), ("sun", "07:00:00"))
+                for row in (
+                    stop_time(f"T{sid}", 1, "A", "06:00:00"),
+                    stop_time(f"T{sid}", 2, "B", end),
+                )
+            ],
+            "stops.txt": [
+                {"stop_id": "A", "stop_lat": "38.90", "stop_lon": "-77.0"},
+                {"stop_id": "B", "stop_lat": "38.95", "stop_lon": "-77.0"},
+            ],
+            "calendar.txt": calendar,
+            "calendar_dates.txt": [
+                {"service_id": "wk", "date": "20261225", "exception_type": "2"},
+                {"service_id": "sun", "date": "20261225", "exception_type": "1"},
+            ],
+        },
+    )
+    cfg = target.Config(
+        gtfs_path=gtfs,
+        tods_path=None,
+        output_dir=folder / "out",
+        periods=[("Dec", "20261201", "20261231")],
+    )
+    return target.run(cfg)
+
+
+def test_period_counts_days_by_the_schedule_they_run(tmp_path: Path) -> None:
+    dec = christmas_on_sunday_service(tmp_path)["period"].iloc[0]
+    # Calendar days: Christmas is a Friday.
+    assert (dec["weekdays"], dec["saturdays"], dec["sundays"], dec["holidays"]) == (23, 4, 4, 0)
+    # Operating schedules: Christmas runs the Sunday schedule.
+    schedules = ("weekday", "saturday", "sunday", "holiday")
+    assert tuple(dec[f"{d}_schedule_days"] for d in schedules) == (22, 4, 5, 0)
+    assert dec["revenue_trip_hours"] == 22 * 2.0 + 4 * 1.5 + 5 * 1.0
+
+
+def test_schedule_day_types_follow_the_typical_sets() -> None:
+    reference = pd.DataFrame(
+        {
+            "day_type": ["Weekday"] * 5 + ["Saturday", "Sunday"] * 3 + ["Weekday"],
+            "service_set": ["wk"] * 4 + ["wk|school"] + ["end"] * 6 + [""],
+        }
+    )
+    calendar = pd.DataFrame(
+        {
+            "day_type": ["Weekday", "Weekday", "Saturday", "Sunday", "Weekday", "Weekday"],
+            "service_set": ["wk", "wk|school", "end", "end", "end", ""],
+        }
+    )
+    # "end" is typical of both weekend days: a weekend date keeps its own type,
+    # a weekday running it takes the first (Saturday). A set typical of nothing
+    # (wk|school) keeps the date's day type; no service is blank.
+    assert target.schedule_day_types(calendar, reference) == [
+        "Weekday",
+        "Weekday",
+        "Saturday",
+        "Sunday",
+        "Saturday",
+        "",
+    ]
+
+
 # =============================================================================
 # FREQUENCY-BASED TRIPS
 # =============================================================================
@@ -473,6 +551,7 @@ def mock_tables(tmp_path_factory: pytest.TempPathFactory) -> dict[str, pd.DataFr
         tods_path=TODS_ZIP,
         output_dir=tmp_path_factory.mktemp("hours"),
         periods=[("Nov", "20261101", "20261130"), ("Jan", "20260101", "20260131")],
+        tods_movements_complete=True,
     )
     return target.run(cfg)
 
@@ -515,6 +594,8 @@ def test_gtfs_calendar_periods_follow_the_feed(mock_tables: dict[str, pd.DataFra
     # calendar_dates swaps Veterans Day (Wed 11/11) and Thanksgiving (Thu 11/26)
     # from weekday to holiday service.
     assert (nov["weekdays"], nov["saturdays"], nov["sundays"], nov["holidays"]) == (19, 4, 5, 2)
+    schedules = ("weekday", "saturday", "sunday", "holiday")
+    assert tuple(nov[f"{d}_schedule_days"] for d in schedules) == (19, 4, 5, 2)
     expected = (
         19 * services.loc["weekday", "vehicle_hours"]
         + 4 * services.loc["saturday", "vehicle_hours"]
@@ -541,6 +622,8 @@ def test_config_calendar_uses_federal_holidays(tmp_path: Path) -> None:
     nov = tables["period"].iloc[0]
     # Veterans Day (Wed 11/11) and Thanksgiving (Thu 11/26) run the Sunday schedule.
     assert (nov["weekdays"], nov["holidays"]) == (19, 2)
+    assert (nov["weekday_schedule_days"], nov["sunday_schedule_days"]) == (19, 7)
+    assert nov["holiday_schedule_days"] == 0
     expected = (
         19 * services.loc["weekday", "revenue_trip_hours"]
         + 7 * services.loc["sunday", "revenue_trip_hours"]
@@ -580,6 +663,89 @@ def test_main_without_tods_leaves_nonrevenue_blank(tmp_path: Path) -> None:
     assert pd.isna(period["deadhead_hours"]) and pd.isna(period["vehicle_hours"])
 
 
+def stops_only_tods(folder: Path) -> Path:
+    """A TODS folder that only edits one stop's description: no movements."""
+    with zipfile.ZipFile(GTFS_ZIP) as archive:
+        name = next(n for n in archive.namelist() if n.endswith("stops.txt"))
+        stop_id = next(csv.DictReader(io.TextIOWrapper(archive.open(name), encoding="utf-8")))
+    return write_feed(
+        folder, {"stops_supplement.txt": [{"stop_id": stop_id["stop_id"], "stop_desc": "Edited"}]}
+    )
+
+
+@pytest.mark.parametrize("confirmed", [False, True])
+def test_tods_without_movements_leaves_vehicle_hours_blank(
+    tmp_path: Path, confirmed: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    cfg = target.Config(
+        gtfs_path=GTFS_ZIP,
+        tods_path=stops_only_tods(tmp_path / "tods"),
+        output_dir=tmp_path / "out",
+        periods=[("Nov", "20261101", "20261130")],
+        tods_movements_complete=confirmed,
+    )
+    with caplog.at_level("WARNING"):
+        nov = target.run(cfg)["period"].iloc[0]
+    assert nov["revenue_trip_hours"] > 0 and nov["unresolved_gap_hours"] > 0
+    # Not 0.00 nonrevenue hours and a complete-looking vehicle-hours total.
+    assert pd.isna(nov["nonrevenue_hours"]) and pd.isna(nov["vehicle_hours"])
+    assert pd.isna(nov["pull_out_hours"])
+    assert ("no nonrevenue trips" if confirmed else "0 of") in caplog.text
+    total = period_totals(load_workbook(tmp_path / "out" / target.WORKBOOK_FILENAME))["Nov"]
+    assert total["Vehicle h"] == total["Nonrevenue h"] == "n/a"
+
+
+def test_tods_movements_need_confirmation(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    argv = [
+        "--gtfs",
+        str(GTFS_ZIP),
+        "--tods",
+        str(TODS_ZIP),
+        "--period",
+        "Nov",
+        "20261101",
+        "20261130",
+    ]
+    with caplog.at_level("WARNING"):
+        assert target.main([*argv, "--output-dir", str(tmp_path / "unconfirmed")]) == 0
+    assert "TODS_MOVEMENTS_COMPLETE is False" in caplog.text
+    unconfirmed = pd.read_csv(tmp_path / "unconfirmed" / target.PERIOD_FILENAME).iloc[0]
+    assert pd.isna(unconfirmed["deadhead_hours"]) and pd.isna(unconfirmed["vehicle_hours"])
+
+    confirmed_dir = tmp_path / "confirmed"
+    assert (
+        target.main([*argv, "--tods-movements-complete", "--output-dir", str(confirmed_dir)]) == 0
+    )
+    confirmed = pd.read_csv(confirmed_dir / target.PERIOD_FILENAME).iloc[0]
+    assert confirmed["deadhead_hours"] > 0 and confirmed["vehicle_hours"] > 0
+    # TODS deletes and adds apply to revenue hours either way.
+    assert confirmed["revenue_trip_hours"] == unconfirmed["revenue_trip_hours"]
+    log = (confirmed_dir / target.RUN_LOG_FILENAME).read_text(encoding="utf-8")
+    assert "TODS movements:    confirmed complete" in log
+
+
+def test_confirmed_partial_tods_warns_about_blocks_without_movements(
+    small_feed: tuple[Path, Path], tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    gtfs, tods = small_feed
+    # A second block with no TODS movements.
+    with (gtfs / "trips.txt").open("a", encoding="utf-8") as fh:
+        fh.write("R,wk,T9,B2\n")
+    with (gtfs / "stop_times.txt").open("a", encoding="utf-8") as fh:
+        fh.write("T9,1,A,12:00:00,12:00:00\nT9,2,B,13:00:00,13:00:00\n")
+    cfg = target.Config(
+        gtfs_path=gtfs,
+        tods_path=tods,
+        output_dir=tmp_path / "out",
+        periods=[("Nov", "20261101", "20261130")],
+        tods_movements_complete=True,
+    )
+    with caplog.at_level("WARNING"):
+        nov = target.run(cfg)["period"].iloc[0]
+    assert "1 of 2 block(s) have TODS nonrevenue trips" in caplog.text
+    assert nov["vehicle_hours"] > 0
+
+
 # =============================================================================
 # FORMULA WORKBOOK
 # =============================================================================
@@ -596,6 +762,7 @@ def mock_run(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, dict[str, 
         tods_path=TODS_ZIP,
         output_dir=out,
         periods=[("November 2026", "20261101", "20261130"), ("Jan 2026", "20260101", "20260131")],
+        tods_movements_complete=True,
     )
     return out, target.run(cfg)
 
@@ -682,6 +849,22 @@ def test_workbook_totals_match_the_csv(mock_run: tuple, tmp_path: Path) -> None:
         if isinstance(c.value, str) and c.value.startswith("#")
     ]
     assert not errors
+
+
+@needs_libreoffice
+def test_workbook_schedule_day_counts_match_the_csv(tmp_path: Path) -> None:
+    tables = christmas_on_sunday_service(tmp_path)
+    wb = recalculate(tmp_path / "out" / target.WORKBOOK_FILENAME, tmp_path)
+    christmas = next(r for r in sheet_rows(wb["Calendar"]) if r["Date"] and r["Date"].day == 25)
+    assert (christmas["Day type"], christmas["Schedule day type"]) == ("Weekday", "Sunday")
+    (days,) = sheet_rows(wb["Period days"])
+    dec = tables["period"].iloc[0]
+    for label in target.DAY_TYPES:
+        column = f"{label.lower()}_schedule_days"
+        assert days[f"{label} schedule days"] == dec[column], label
+    assert days["Weekdays"] == 23 and days["Days without service"] == 0
+    total = period_totals(wb)["Dec"]
+    assert total["Revenue trip h"] == pytest.approx(dec["revenue_trip_hours"], abs=0.01)
 
 
 @needs_libreoffice

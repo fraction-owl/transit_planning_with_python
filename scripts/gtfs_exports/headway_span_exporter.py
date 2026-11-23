@@ -692,7 +692,8 @@ def compute_headway_span(trips_dep: pd.DataFrame) -> pd.DataFrame:
             {
                 "route_id": route_id,
                 "direction_id": direction_id,
-                "avg_headway_min": round(headway, 1),
+                # Rounded once, after averaging the directions below.
+                "avg_headway_min": headway,
                 "span_min": span_min,
                 "trip_count": n,
             }

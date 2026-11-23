@@ -452,6 +452,109 @@ def test_main_matches_weekdays_when_calendar_has_no_date_range(
     assert _transfers_from_main(tmp_path, monkeypatch, calendar, _A_ENDS_B_STARTS) == expected
 
 
+def _exception_service_feed(tmp_path: Path) -> Path:
+    """Weekday service SA plus SB, whose Mon/Thu/Fri flags survive only on 2026-11-27.
+
+    calendar_dates.txt removes SB on Nov 23 and 26 and removes SA on Nov 27, so
+    the two services never run on the same date. TA (route A, SA) and TA2
+    (route A, SB) arrive at HUB at 08:00; TB (route B, SB) leaves HUB at 08:05.
+    """
+    feed = tmp_path / "feed"
+    feed.mkdir()
+    (feed / "stops.txt").write_text(
+        "stop_id,stop_lat,stop_lon\nHUB,38.90,-77.00\nA0,38.95,-77.00\nB9,38.85,-77.00\n"
+    )
+    (feed / "routes.txt").write_text("route_id,route_short_name\nA,A\nB,B\n")
+    (feed / "trips.txt").write_text("route_id,service_id,trip_id\nA,SA,TA\nA,SB,TA2\nB,SB,TB\n")
+    (feed / "calendar.txt").write_text(
+        f"{_CALENDAR_HEADER},start_date,end_date\n"
+        f"SA,1,1,1,1,1,0,0,{_YEAR}\n"
+        "SB,1,0,0,1,1,0,0,20261123,20261127\n"
+    )
+    (feed / "calendar_dates.txt").write_text(
+        "service_id,date,exception_type\nSB,20261123,2\nSB,20261126,2\nSA,20261127,2\n"
+    )
+    (feed / "stop_times.txt").write_text(
+        "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+        + _A_ENDS_B_STARTS
+        + "TA2,07:50:00,07:50:00,A0,1\nTA2,08:00:00,08:00:00,HUB,2\n"
+    )
+    return feed
+
+
+@pytest.mark.parametrize(
+    ("extra_args", "expected"),
+    [
+        # Representative weekday: SA only. SB's calendar.txt flags overlap SA's
+        # weekdays, but after calendar_dates.txt the two never run together.
+        ([], [""]),
+        # The day after Thanksgiving, run deliberately: SB only.
+        (["--service-date", "2026-11-27"], ["B"]),
+    ],
+)
+def test_main_applies_calendar_date_exceptions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, extra_args: list[str], expected: list[str]
+) -> None:
+    monkeypatch.setattr(rtc, "TARGET_ROUTE_TOKENS", {"A"})
+    feed = _exception_service_feed(tmp_path)
+    out = tmp_path / "out"
+    assert rtc.main(["--gtfs-dir", str(feed), "--output-dir", str(out), *extra_args]) == 0
+    summary = pd.read_csv(out / "route_transfers_summary.csv", keep_default_na=False)
+    assert summary["transfer_routes"].tolist() == expected
+
+
+@pytest.mark.parametrize(
+    ("service_date", "expected"),
+    [
+        # Tuesday: MON's trips are kept for Monday-night connections into
+        # Tuesday, but their 08:00 -> 08:05 Monday transfer is not Tuesday's.
+        ("20261124", [""]),
+        ("20261123", ["B"]),  # Monday itself.
+    ],
+)
+def test_main_counts_only_connections_touching_the_analysed_date(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, service_date: str, expected: list[str]
+) -> None:
+    monkeypatch.setattr(rtc, "TARGET_ROUTE_TOKENS", {"A"})
+    feed = tmp_path / "feed"
+    feed.mkdir()
+    (feed / "stops.txt").write_text(
+        "stop_id,stop_lat,stop_lon\nHUB,38.90,-77.00\nA0,38.95,-77.00\nB9,38.85,-77.00\n"
+    )
+    (feed / "routes.txt").write_text("route_id,route_short_name\nA,A\nB,B\nC,C\n")
+    (feed / "trips.txt").write_text("route_id,service_id,trip_id\nA,MON,TA\nB,MON,TB\nC,WK,TC\n")
+    (feed / "calendar.txt").write_text(
+        f"{_CALENDAR_HEADER},start_date,end_date\n"
+        f"MON,1,0,0,0,0,0,0,{_YEAR}\nWK,1,1,1,1,1,0,0,{_YEAR}\n"
+    )
+    (feed / "stop_times.txt").write_text(
+        "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+        + _A_ENDS_B_STARTS
+        + "TC,09:00:00,09:00:00,A0,1\nTC,09:10:00,09:10:00,B9,2\n"
+    )
+    out = tmp_path / "out"
+    argv = ["--gtfs-dir", str(feed), "--output-dir", str(out), "--service-date", service_date]
+    assert rtc.main(argv) == 0
+    summary = pd.read_csv(out / "route_transfers_summary.csv", keep_default_na=False)
+    assert summary["transfer_routes"].tolist() == expected
+
+
+def test_main_rejects_a_service_date_with_no_service(tmp_path: Path) -> None:
+    feed = _exception_service_feed(tmp_path)
+    argv = ["--gtfs-dir", str(feed), "--output-dir", str(tmp_path / "out")]
+    assert rtc.main([*argv, "--service-date", "20251225"]) == 1
+    assert rtc.main([*argv, "--service-date", "Nov 27"]) == 2
+
+
+def test_select_services_falls_back_to_weekday_columns_without_dates() -> None:
+    calendar = pd.DataFrame(
+        {"service_id": ["WK", "SAT"], **{d: ["1", "0"] for d in rtc._DAY_COLUMNS[:5]}}
+    ).assign(saturday=["0", "1"], sunday=["0", "0"])
+    keep, dates, anchor = rtc.select_services(calendar, None, "weekday")
+    assert keep == {"WK"} and dates is not None and set(dates) == {"WK"} and anchor is None
+    assert rtc.select_services(None, None, None) == (None, None, None)
+
+
 @pytest.mark.parametrize("time_check", [True, False])
 def test_main_ignores_feeder_origin_and_connector_destination(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, time_check: bool
