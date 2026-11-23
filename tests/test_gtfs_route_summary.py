@@ -19,6 +19,7 @@ from scripts.field_tools.gtfs_route_summary import (
     parse_holiday_dates,
     trip_distances_meters,
     trip_durations_seconds,
+    trip_stop_patterns,
 )
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "gtfs_basic"
@@ -444,6 +445,23 @@ def test_trip_durations_seconds_past_midnight() -> None:
 
 
 # ---------------------------------------------------------------------------
+# trip_stop_patterns
+# ---------------------------------------------------------------------------
+
+
+def test_trip_stop_patterns_orders_by_numeric_stop_sequence() -> None:
+    stop_times = pd.DataFrame(
+        {
+            "trip_id": ["T1", "T1", "T1", "T2", "T2"],
+            "stop_id": ["C", "A", "B", "A", "B"],
+            "stop_sequence": ["10", "1", "2", "1", "2"],
+        }
+    )
+    result = trip_stop_patterns(stop_times)
+    assert result.to_dict() == {"T1": ("A", "B", "C"), "T2": ("A", "B")}
+
+
+# ---------------------------------------------------------------------------
 # load_optional_lookup
 # ---------------------------------------------------------------------------
 
@@ -665,6 +683,7 @@ def _two_trip_feed(service_ids: tuple[str, str]) -> dict[str, pd.DataFrame]:
         "stop_times": pd.DataFrame(
             {
                 "trip_id": ["A", "A", "B", "B"],
+                "stop_id": ["S1", "S2", "S2", "S1"],
                 "stop_sequence": ["1", "2", "1", "2"],
                 "arrival_time": ["07:00:00", "07:10:00", "08:00:00", "09:40:00"],
                 "departure_time": ["07:00:00", "07:10:00", "08:00:00", "09:40:00"],
@@ -717,6 +736,45 @@ def test_build_summary_skips_trips_with_no_active_dates(
     assert row["directions"] == 1
     assert row["avg_duration_min"] == pytest.approx(10.0)
     assert row["avg_speed_kmh"] == pytest.approx(60.0)
+
+
+def test_build_summary_variants_count_stopping_patterns_not_shapes() -> None:
+    # Route 1: two shapes, one stopping pattern. Route 2: one shape, and a
+    # short turn on it that stops at fewer places.
+    trips = pd.DataFrame(
+        {
+            "route_id": ["R1", "R1", "R2", "R2"],
+            "service_id": "WK",
+            "trip_id": ["T1", "T2", "T3", "T4"],
+            "shape_id": ["S1", "S2", "S3", "S3"],
+            "trip_headsign": ["Downtown", "Downtown via Main", "Mall", "Mall"],
+        }
+    )
+    stops = {"T1": "ABC", "T2": "ABC", "T3": "ABC", "T4": "AB"}
+    stop_times = pd.DataFrame(
+        [
+            {
+                "trip_id": trip,
+                "stop_id": stop,
+                "stop_sequence": str(seq),
+                "arrival_time": f"07:{seq:02d}:00",
+                "departure_time": f"07:{seq:02d}:00",
+            }
+            for trip, pattern in stops.items()
+            for seq, stop in enumerate(pattern, start=1)
+        ]
+    )
+    summary = build_summary(
+        routes_df=pd.DataFrame({"route_id": ["R1", "R2"], "route_short_name": ["1", "2"]}),
+        trips_df=trips,
+        stop_times_df=stop_times,
+        calendar_df=_make_calendar([_cal_row("WK", _DAYS[:5])]),
+        calendar_dates_df=None,
+        shapes_df=None,
+        distance_unit="meters",
+        extras={},
+    )
+    assert summary.set_index("route_short_name")["variants"].to_dict() == {"1": 1, "2": 2}
 
 
 def test_build_summary_short_turn_on_shared_shape(monkeypatch: pytest.MonkeyPatch) -> None:
