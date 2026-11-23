@@ -20,7 +20,7 @@
     "target/connector pair). It is deliberately not described: it has no route_id column, so",
     "inference finds no join key and skips it. Only the route_id-keyed summary ships, and only",
     "transfer_route_count (the transfer_routes column is a comma-separated string, not a",
-    "predictor). The script defaults to weekday (non-holiday) service via its --day filter.",
+    "predictor). The script defaults to a representative weekday via its --day filter.",
     "NOTE: private_shuttle_coverage_by_route_gpd.py cleans the agency's private-shuttle operator",
     "registry ({input}/shuttles/private_shuttles.csv) and rolls shuttle presence up per route so",
     "the models can test whether private shuttles move ridership. When the registry carries",

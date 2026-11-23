@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import zipfile
+from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
@@ -14,10 +15,10 @@ from scripts.gtfs_exports.route_transfer_calculator import (
     build_output_tables,
     compute_transfers,
     distance_to_meters,
-    eligible_service_dates,
     has_timed_connection,
     parse_gtfs_time,
-    service_ids_active_on_day,
+    parse_service_date,
+    resolve_service_day,
 )
 
 GTFS_BASIC = Path(__file__).parent / "fixtures" / "gtfs_basic"
@@ -58,47 +59,110 @@ def test_distance_to_meters_rejects_unknown_unit() -> None:
 
 
 # ---------------------------------------------------------------------------
-# service_ids_active_on_day
+# resolve_service_day / parse_service_date
 # ---------------------------------------------------------------------------
 
+_DAY_COLS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+_DAY_AFTER_THANKSGIVING = dt.date(2026, 11, 27)
 
-def test_service_ids_active_on_day_reads_calendar_flags() -> None:
+
+def _special_day_calendar() -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Weekday service "1", and service "4" whose exceptions leave it only Nov 27.
+
+    Service 4 carries Monday, Thursday and Friday flags, so calendar.txt alone
+    says it runs alongside service 1. calendar_dates.txt removes every one of
+    those dates except the day after Thanksgiving.
+    """
     calendar = pd.DataFrame(
         {
-            "service_id": ["weekday", "weekend"],
-            "monday": ["1", "0"],
-            "saturday": ["0", "1"],
+            "service_id": ["1", "4"],
+            **{
+                day: ["1", "1" if day in ("monday", "thursday", "friday") else "0"]
+                for day in _DAY_COLS[:5]
+            },
+            "saturday": ["0", "0"],
+            "sunday": ["0", "0"],
+            "start_date": ["20261102", "20261102"],
+            "end_date": ["20261204", "20261204"],
         }
     )
-    assert service_ids_active_on_day(calendar, "monday") == {"weekday"}
-    assert service_ids_active_on_day(calendar, "saturday") == {"weekend"}
-
-
-def test_service_ids_active_on_day_weekday_keeps_any_monday_to_friday_service() -> None:
-    calendar = pd.DataFrame(
+    removed = [
+        day
+        for day in (dt.date(2026, 11, 2) + dt.timedelta(days=i) for i in range(33))
+        if day.weekday() in (0, 3, 4) and day != _DAY_AFTER_THANKSGIVING
+    ]
+    calendar_dates = pd.DataFrame(
         {
-            "service_id": ["weekday", "friday_only", "weekend", "daily"],
-            "monday": ["1", "0", "0", "1"],
-            "tuesday": ["1", "0", "0", "1"],
-            "wednesday": ["1", "0", "0", "1"],
-            "thursday": ["1", "0", "0", "1"],
-            "friday": ["1", "1", "0", "1"],
-            "saturday": ["0", "0", "1", "1"],
-            "sunday": ["0", "0", "1", "1"],
+            "service_id": "4",
+            "date": [day.strftime("%Y%m%d") for day in removed],
+            "exception_type": "2",
         }
     )
-    # Daily service runs on weekdays too; weekend-only service is excluded.
-    assert service_ids_active_on_day(calendar, "weekday") == {"weekday", "friday_only", "daily"}
+    return calendar, calendar_dates
 
 
-def test_service_ids_active_on_day_none_calendar_returns_none() -> None:
-    assert service_ids_active_on_day(None, "monday") is None
-    assert service_ids_active_on_day(None, "weekday") is None
+def test_resolve_service_day_applies_calendar_dates_exceptions() -> None:
+    calendar, calendar_dates = _special_day_calendar()
+    chosen, ids = resolve_service_day(calendar, calendar_dates, "weekday")
+    assert chosen.weekday() < 5 and chosen != _DAY_AFTER_THANKSGIVING
+    assert ids == {"1"}  # service 4 never runs on a regular weekday
 
 
-def test_service_ids_active_on_day_invalid_day_raises() -> None:
-    with pytest.raises(ValueError):
-        service_ids_active_on_day(None, "someday")
+def test_resolve_service_day_explicit_date_uses_that_dates_services() -> None:
+    calendar, calendar_dates = _special_day_calendar()
+    assert resolve_service_day(calendar, calendar_dates, "weekday", _DAY_AFTER_THANKSGIVING) == (
+        _DAY_AFTER_THANKSGIVING,
+        {"1", "4"},
+    )
+    assert resolve_service_day(calendar, calendar_dates, None, _DAY_AFTER_THANKSGIVING) == (
+        _DAY_AFTER_THANKSGIVING,
+        {"1", "4"},
+    )
+
+
+def test_resolve_service_day_single_day_name() -> None:
+    calendar, calendar_dates = _special_day_calendar()
+    chosen, ids = resolve_service_day(calendar, calendar_dates, "tuesday")
+    assert chosen.weekday() == 1
+    assert ids == {"1"}
+
+
+def test_resolve_service_day_reads_calendar_dates_only_feed() -> None:
+    mondays = [dt.date(2026, 11, 2) + dt.timedelta(weeks=i) for i in range(5)]
+    calendar_dates = pd.DataFrame(
+        {
+            "service_id": "MON",
+            "date": [day.strftime("%Y%m%d") for day in mondays],
+            "exception_type": "1",
+        }
+    )
+    chosen, ids = resolve_service_day(None, calendar_dates, "weekday")
+    assert chosen in mondays
+    assert ids == {"MON"}
+
+
+def test_resolve_service_day_without_calendar_returns_none() -> None:
+    assert resolve_service_day(None, None, "weekday") is None
+    assert resolve_service_day(pd.DataFrame(), None, "weekday") is None
+
+
+def test_resolve_service_day_raises_when_nothing_runs() -> None:
+    calendar, calendar_dates = _special_day_calendar()
+    with pytest.raises(ValueError, match="No service_id is active"):
+        resolve_service_day(calendar, calendar_dates, "weekday", dt.date(2026, 11, 28))
+    with pytest.raises(ValueError, match="No active dates"):
+        resolve_service_day(calendar, calendar_dates, "saturday")
+
+
+@pytest.mark.parametrize("text", ["2026-11-27", "20261127", " 2026-11-27 "])
+def test_parse_service_date_accepts_both_formats(text: str) -> None:
+    assert parse_service_date(text) == _DAY_AFTER_THANKSGIVING
+
+
+def test_parse_service_date_blank_and_invalid() -> None:
+    assert parse_service_date("") is None
+    with pytest.raises(ValueError, match="not a date"):
+        parse_service_date("11/27/2026")
 
 
 # ---------------------------------------------------------------------------
@@ -282,7 +346,7 @@ def test_main_skips_connector_stop_with_no_pickup(
         "TB,08:15:00,08:15:00,B9,2,1,0\n"
     )
     (feed / "calendar.txt").write_text(
-        "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday\nWK,1,1,1,1,1,0,0\n"
+        f"{_CALENDAR_HEADER},start_date,end_date\nWK,1,1,1,1,1,0,0,{_YEAR}\n"
     )
     argv = ["--gtfs-dir", str(feed), "--output-dir", str(tmp_path / "out")]
 
@@ -321,64 +385,6 @@ def test_build_stop_events_uses_stop_sequence_per_visit(caplog: pytest.LogCaptur
     assert "1 stop time(s) have a missing or non-numeric stop_sequence" in caplog.text
 
 
-def test_eligible_service_dates_limits_dates_to_filter_days() -> None:
-    monday = dt.date(2026, 11, 16)
-    calendar = pd.DataFrame(
-        {
-            "service_id": ["WK", "DAILY"],
-            "monday": ["1", "1"],
-            "tuesday": ["1", "1"],
-            "wednesday": ["1", "1"],
-            "thursday": ["1", "1"],
-            "friday": ["1", "1"],
-            "saturday": ["0", "1"],
-            "sunday": ["0", "1"],
-            "start_date": ["20261116"] * 2,
-            "end_date": ["20261122"] * 2,
-        }
-    )
-    weekdays = {monday + dt.timedelta(days=i) for i in range(5)}
-    assert eligible_service_dates(calendar, "weekday", {"WK", "DAILY"}) == {
-        "WK": weekdays,
-        "DAILY": weekdays,
-    }
-    assert eligible_service_dates(calendar, "saturday", {"DAILY"}) == {
-        "DAILY": {dt.date(2026, 11, 21)}
-    }
-    assert eligible_service_dates(None, "weekday", set()) is None
-
-
-def test_compute_transfers_only_pairs_services_sharing_a_date(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(rtc, "ENABLE_TIME_CHECK", True)
-    monkeypatch.setattr(rtc, "MAX_TRANSFER_WAIT_MINUTES", 30.0)
-    monkeypatch.setattr(rtc, "WALK_SPEED_MPH", 3.0)
-    # A arrives at S1 at 08:00 on Mondays. B leaves S2 (100 m away) at 08:05
-    # on Tuesdays and at 08:20 on Mondays.
-    events = pd.DataFrame(
-        {
-            "stop_id": ["S1", "S2", "S2"],
-            "route_id": ["A", "B", "B"],
-            "service_id": ["MON", "TUE", "MON"],
-            "arrival_sec": [28800.0, 29100.0, 30000.0],
-            "departure_sec": [28800.0, 29100.0, 30000.0],
-            "can_alight": [True] * 3,
-            "can_board": [True] * 3,
-        }
-    )
-    service_dates = {"MON": {dt.date(2026, 11, 16)}, "TUE": {dt.date(2026, 11, 17)}}
-
-    matched = compute_transfers(
-        _stops_gdf(), events, _routes_table(), radius_m=400.0, service_dates=service_dates
-    )
-    assert matched["A"]["B"]["min_wait_seconds"] == pytest.approx(1200.0)  # the Monday 08:20
-
-    # Without service matching, the Tuesday 08:05 departure is (wrongly) caught.
-    pooled = compute_transfers(_stops_gdf(), events, _routes_table(), radius_m=400.0)
-    assert pooled["A"]["B"]["min_wait_seconds"] == pytest.approx(300.0)
-
-
 _CALENDAR_HEADER = "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday"
 _YEAR = "20260101,20261231"
 # A ends at HUB at 08:00; B starts at HUB at 08:05 (the other stops are ~5 km away).
@@ -390,15 +396,10 @@ _A_ENDS_B_STARTS = (
 )
 
 
-def _transfers_from_main(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    calendar: str,
-    stop_times: str,
-    time_check: bool = True,
-) -> list[str]:
-    monkeypatch.setattr(rtc, "ENABLE_TIME_CHECK", time_check)
-    monkeypatch.setattr(rtc, "TARGET_ROUTE_TOKENS", {"A"})
+def _write_ab_feed(
+    tmp_path: Path, calendar: str, stop_times: str, calendar_dates: str | None = None
+) -> Path:
+    """Write a feed where route A runs on service SA and route B on service SB."""
     feed = tmp_path / "feed"
     feed.mkdir()
     (feed / "stops.txt").write_text(
@@ -407,11 +408,28 @@ def _transfers_from_main(
     (feed / "routes.txt").write_text("route_id,route_short_name\nA,A\nB,B\n")
     (feed / "trips.txt").write_text("route_id,service_id,trip_id\nA,SA,TA\nB,SB,TB\n")
     (feed / "calendar.txt").write_text(calendar)
+    if calendar_dates is not None:
+        (feed / "calendar_dates.txt").write_text(calendar_dates)
     (feed / "stop_times.txt").write_text(
         "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n" + stop_times
     )
+    return feed
+
+
+def _transfers_from_main(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    calendar: str,
+    stop_times: str,
+    time_check: bool = True,
+    calendar_dates: str | None = None,
+    extra_args: Sequence[str] = (),
+) -> list[str]:
+    monkeypatch.setattr(rtc, "ENABLE_TIME_CHECK", time_check)
+    monkeypatch.setattr(rtc, "TARGET_ROUTE_TOKENS", {"A"})
+    feed = _write_ab_feed(tmp_path, calendar, stop_times, calendar_dates)
     out = tmp_path / "out"
-    assert rtc.main(["--gtfs-dir", str(feed), "--output-dir", str(out)]) == 0
+    assert rtc.main(["--gtfs-dir", str(feed), "--output-dir", str(out), *extra_args]) == 0
     summary = pd.read_csv(out / "route_transfers_summary.csv", keep_default_na=False)
     return summary["transfer_routes"].tolist()
 
@@ -430,7 +448,7 @@ def _transfers_from_main(
         ("SA,1,0,0,0,0,0,0,20260101,20260630\nSB,1,0,0,0,0,0,0,20260630,20261231\n", [""]),
     ],
 )
-def test_main_pairs_only_services_sharing_a_weekday_date(
+def test_main_pairs_only_services_running_on_the_weekday_date(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     time_check: bool,
@@ -444,12 +462,82 @@ def test_main_pairs_only_services_sharing_a_weekday_date(
     )
 
 
-@pytest.mark.parametrize(("b_days", "expected"), [("0,1", [""]), ("1,0", ["B"])])
-def test_main_matches_weekdays_when_calendar_has_no_date_range(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, b_days: str, expected: list[str]
+def _special_day_feed_files() -> tuple[str, str]:
+    """Return calendar.txt and calendar_dates.txt for a special-day service SA.
+
+    SA's Monday/Thursday/Friday flags overlap SB's weekdays, but exceptions
+    leave SA only Friday, Nov 27 (the day after Thanksgiving).
+    """
+    calendar = (
+        f"{_CALENDAR_HEADER},start_date,end_date\n"
+        "SA,1,0,0,1,1,0,0,20261102,20261204\n"
+        "SB,1,1,1,1,1,0,0,20261102,20261204\n"
+    )
+    removed = [
+        day
+        for day in (dt.date(2026, 11, 2) + dt.timedelta(days=i) for i in range(33))
+        if day.weekday() in (0, 3, 4) and day != _DAY_AFTER_THANKSGIVING
+    ]
+    calendar_dates = "service_id,date,exception_type\n" + "".join(
+        f"SA,{day:%Y%m%d},2\n" for day in removed
+    )
+    return calendar, calendar_dates
+
+
+@pytest.mark.parametrize("time_check", [True, False])
+@pytest.mark.parametrize(
+    ("extra_args", "expected"),
+    [
+        # The representative weekday has only SB, so A never feeds B.
+        ((), [""]),
+        # On the day after Thanksgiving both services run, and A feeds B.
+        (("--service-date", "2026-11-27"), ["B"]),
+    ],
+)
+def test_main_applies_calendar_dates_exceptions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    time_check: bool,
+    extra_args: tuple[str, ...],
+    expected: list[str],
 ) -> None:
-    calendar = f"{_CALENDAR_HEADER}\nSA,1,0,0,0,0,0,0\nSB,{b_days},0,0,0,0,0\n"
-    assert _transfers_from_main(tmp_path, monkeypatch, calendar, _A_ENDS_B_STARTS) == expected
+    calendar, calendar_dates = _special_day_feed_files()
+    transfers = _transfers_from_main(
+        tmp_path,
+        monkeypatch,
+        calendar,
+        _A_ENDS_B_STARTS,
+        time_check,
+        calendar_dates=calendar_dates,
+        extra_args=extra_args,
+    )
+    assert transfers == expected
+
+
+def test_main_reports_calendar_without_date_range(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    calendar = f"{_CALENDAR_HEADER}\nSA,1,0,0,0,0,0,0\nSB,1,0,0,0,0,0,0\n"
+    feed = _write_ab_feed(tmp_path, calendar, _A_ENDS_B_STARTS)
+    with caplog.at_level(logging.ERROR):
+        assert rtc.main(["--gtfs-dir", str(feed), "--output-dir", str(tmp_path / "out")]) == 1
+    assert "start_date" in caplog.text
+    assert not (tmp_path / "out").exists()
+
+
+@pytest.mark.parametrize("extra_args", [("--day", "someday"), ("--service-date", "11/27/2026")])
+def test_main_rejects_unusable_day_settings(tmp_path: Path, extra_args: tuple[str, ...]) -> None:
+    calendar, calendar_dates = _special_day_feed_files()
+    feed = _write_ab_feed(tmp_path, calendar, _A_ENDS_B_STARTS, calendar_dates)
+    argv = ["--gtfs-dir", str(feed), "--output-dir", str(tmp_path / "out"), *extra_args]
+    assert rtc.main(argv) == 2
+
+
+def test_main_errors_when_no_service_runs_on_the_service_date(tmp_path: Path) -> None:
+    calendar, calendar_dates = _special_day_feed_files()
+    feed = _write_ab_feed(tmp_path, calendar, _A_ENDS_B_STARTS, calendar_dates)
+    argv = ["--gtfs-dir", str(feed), "--output-dir", str(tmp_path / "out")]
+    assert rtc.main([*argv, "--service-date", "20261128"]) == 1  # a Saturday
 
 
 @pytest.mark.parametrize("time_check", [True, False])
@@ -669,6 +757,7 @@ def test_build_route_table_filters_targets_by_agency(monkeypatch: pytest.MonkeyP
 def test_parse_args_defaults_to_weekday_filter() -> None:
     args = rtc.parse_args([])
     assert args.day == "weekday"
+    assert args.service_date == ""
 
 
 def test_parse_args_overrides() -> None:
