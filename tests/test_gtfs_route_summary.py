@@ -741,6 +741,50 @@ def test_build_summary_short_turn_on_shared_shape(monkeypatch: pytest.MonkeyPatc
     assert row["avg_speed_mph"] == pytest.approx(20.0)
 
 
+def test_build_summary_counts_stop_sequences_as_variants() -> None:
+    # FULL and FULL_ALT serve A-M-Z on different shapes: one variant. SHORT
+    # (A-M) and the reverse trip (Z-M-A) stop differently: two more.
+    pairs = {
+        "FULL": ("S1", ["A", "M", "Z"]),
+        "FULL_ALT": ("S2", ["A", "M", "Z"]),
+        "SHORT": ("S4", ["A", "M"]),
+        "BACK": ("S3", ["Z", "M", "A"]),
+    }
+    trips = pd.DataFrame(
+        {
+            "route_id": "R1",
+            "service_id": "WK",
+            "trip_id": list(pairs),
+            "shape_id": [shape for shape, _stops in pairs.values()],
+        }
+    )
+    stop_times = pd.DataFrame(
+        [
+            {
+                "trip_id": trip,
+                # Out of order on purpose: patterns follow stop_sequence.
+                "stop_sequence": str(10 * seq),
+                "stop_id": stop,
+                "arrival_time": f"07:{seq:02d}:00",
+                "departure_time": f"07:{seq:02d}:00",
+            }
+            for trip, (_shape, stops) in pairs.items()
+            for seq, stop in reversed(list(enumerate(stops, start=1)))
+        ]
+    )
+    row = build_summary(
+        routes_df=pd.DataFrame({"route_id": ["R1"], "route_short_name": ["1"]}),
+        trips_df=trips,
+        stop_times_df=stop_times,
+        calendar_df=_make_calendar([_cal_row("WK", _DAYS[:5])]),
+        calendar_dates_df=None,
+        shapes_df=None,
+        distance_unit="meters",
+        extras={},
+    ).iloc[0]
+    assert row["variants"] == 3  # Not 4, the number of shapes.
+
+
 def test_build_summary_route_with_only_inactive_service_omitted() -> None:
     feed = _two_trip_feed(("GONE", "GONE"))
     assert _summary(feed, calendar_df=_make_calendar([])).empty

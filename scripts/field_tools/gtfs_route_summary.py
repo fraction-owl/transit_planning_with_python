@@ -12,8 +12,10 @@ Key Features
   and/or calendar_dates.txt). A day of the week counts when the service
   recurs on it; Holiday marks a service with no recurring day that runs on
   observed U.S. federal holidays or the dates in EXTRA_HOLIDAY_DATES.
-* Computes per-route variants, directions, average trip distance, duration,
-  and speed from the trips whose service has at least one active date.
+* Computes per-route variants (distinct ordered stop sequences, so a trip
+  pattern that stops differently counts and a second shape over the same
+  stops does not), directions, average trip distance, duration, and speed
+  from the trips whose service has at least one active date.
   A trip's distance comes from ``shape_dist_traveled`` in stop_times.txt,
   else from the part of its shape between its first and last stops (placed
   with stops.txt coordinates). A trip whose end stops cannot be placed on
@@ -845,6 +847,26 @@ def trip_durations_seconds(stop_times_df: pd.DataFrame) -> pd.Series:
     return (last_arr - first_dep).dropna()
 
 
+def trip_stop_patterns(stop_times_df: pd.DataFrame) -> pd.Series:
+    """Return a ``trip_id`` -> ordered tuple of ``stop_id`` Series.
+
+    Two trips with the same tuple serve the same stops in the same order, so
+    the number of distinct tuples on a route is its number of stopping patterns.
+
+    Args:
+        stop_times_df: Parsed ``stop_times.txt``.
+
+    Returns:
+        Series indexed by ``trip_id``; empty if stop_times has no ``stop_id``.
+    """
+    if "stop_id" not in stop_times_df.columns:
+        return pd.Series(dtype=object)
+    df = stop_times_df.copy()
+    df["_seq"] = pd.to_numeric(df["stop_sequence"], errors="coerce")
+    df = df.sort_values(["trip_id", "_seq"], kind="stable")
+    return df.groupby("trip_id")["stop_id"].agg(tuple)
+
+
 def load_optional_lookup(path: str, value_col: str) -> dict[str, str]:
     """Load an optional route_id -> value lookup from CSV or TSV.
 
@@ -926,6 +948,7 @@ def build_summary(
     )
     dist_m = trip_distances_meters(stop_times_df, shapes_df, trips_df, distance_unit, stops_df)
     dur_s = trip_durations_seconds(stop_times_df)
+    patterns = trip_stop_patterns(stop_times_df)
 
     t = trips_df.copy()
     t["_sid"] = t["service_id"].map(lambda v: v.strip() if isinstance(v, str) else None)
@@ -937,6 +960,7 @@ def build_summary(
     t = t[running].copy()
     t["_dist_m"] = t["trip_id"].map(dist_m)
     t["_dur_s"] = t["trip_id"].map(dur_s)
+    t["_pattern"] = t["trip_id"].map(patterns)
 
     excluded = {str(x) for x in (EXCLUDED_ROUTE_SHORT_NAMES or [])}
     imperial = str(OUTPUT_UNITS).lower() == "imperial"
@@ -953,13 +977,9 @@ def build_summary(
         if rt.empty:
             continue
 
-        if "shape_id" in rt.columns and rt["shape_id"].notna().any():
-            variants = int(rt["shape_id"].nunique())
-        elif "trip_headsign" in rt.columns and rt["trip_headsign"].notna().any():
-            variants = int(rt["trip_headsign"].nunique())
-        else:
-            variants = 1
-        variants = max(variants, 1)
+        # Distinct ordered stop sequences, not shapes: two shapes over the same
+        # stops are one variant for a rider or a field checker.
+        variants = max(int(rt["_pattern"].nunique()), 1)
 
         directions = int(rt["direction_id"].nunique()) if "direction_id" in rt.columns else 1
         directions = max(directions, 1)
