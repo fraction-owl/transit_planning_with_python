@@ -343,7 +343,7 @@ def test_main_reads_identifiers_as_text(tmp_path, monkeypatch) -> None:
     df["Trip"] = ["04:02 00123", "04:02 00123"]
     df["Timepoint ID"] = ["0042", "0043"]
     df.to_csv(input_csv, index=False)
-    monkeypatch.setattr(target, "INPUT_CSV", input_csv)
+    monkeypatch.setattr(target, "INPUT_PATH", input_csv)
     monkeypatch.setattr(target, "OUTPUT_DIR", tmp_path)
     monkeypatch.setattr(target, "OUTPUT_CSV", tmp_path / "stop_visits.csv")
 
@@ -351,3 +351,167 @@ def test_main_reads_identifiers_as_text(tmp_path, monkeypatch) -> None:
     out = pd.read_csv(tmp_path / "stop_visits.csv", dtype=str)
     assert list(out["trip_id_performed"]) == ["00123", "00123"]
     assert list(out["stop_id"]) == ["0042", "0043"]
+
+
+# ---------------------------------------------------------------------------
+# Folder input (read_input_folder / main)
+# ---------------------------------------------------------------------------
+
+
+def _run_main_on_folder(
+    monkeypatch, folder, out_dir, **config: object
+) -> tuple[int, pd.DataFrame | None]:
+    """Point main() at *folder*; return its exit code and stop_visits output (None if absent)."""
+    monkeypatch.setattr(target, "INPUT_PATH", folder)
+    monkeypatch.setattr(target, "OUTPUT_DIR", out_dir)
+    monkeypatch.setattr(target, "OUTPUT_CSV", out_dir / "stop_visits.csv")
+    for name, value in config.items():
+        monkeypatch.setattr(target, name, value)
+    code = target.main()
+    path = out_dir / "stop_visits.csv"
+    return code, pd.read_csv(path, dtype=str) if path.exists() else None
+
+
+def test_folder_input_matches_converting_the_concatenation(tmp_path, monkeypatch) -> None:
+    """A trip split across two exports converts as one trip."""
+    df = _input_df()
+    df.iloc[[0]].to_csv(tmp_path / "a.csv", index=False)
+    df.iloc[[1]].to_csv(tmp_path / "b.csv", index=False)
+
+    code, out = _run_main_on_folder(monkeypatch, tmp_path, tmp_path)
+    assert code == 0
+    expected = target.convert_to_tides(df).astype("string").fillna("")
+    assert out.fillna("").to_numpy().tolist() == expected.to_numpy().tolist()
+
+
+def test_folder_input_hashes_trip_split_between_vehicles_across_files(tmp_path) -> None:
+    """Multi-vehicle detection sees both files, so both halves get hashed IDs."""
+    df = _input_df()
+    df["Vehicle"] = ["7906", "7907"]
+    df.iloc[[0]].to_csv(tmp_path / "a.csv", index=False)
+    df.iloc[[1]].to_csv(tmp_path / "b.csv", index=False)
+
+    combined = target.read_input_folder(tmp_path)
+    ids = target.convert_to_tides(combined.drop(columns=target.SOURCE_FILE_COL))
+    assert ids["trip_id_performed"].nunique() == 2
+    assert not (ids["trip_id_performed"] == "1550064").any()
+
+
+def test_read_input_folder_reads_files_in_sorted_order(tmp_path) -> None:
+    df = _input_df()
+    df.iloc[[1]].to_csv(tmp_path / "2025-02.csv", index=False)
+    df.iloc[[0]].to_csv(tmp_path / "2025-01.csv", index=False)
+
+    combined = target.read_input_folder(tmp_path)
+    assert list(combined[target.SOURCE_FILE_COL]) == ["2025-01.csv", "2025-02.csv"]
+    assert list(combined["Timepoint ID"]) == ["TP1", "TP2"]
+
+
+def test_read_input_folder_drops_rows_repeated_across_files(tmp_path, caplog) -> None:
+    df = _input_df()
+    df.to_csv(tmp_path / "a.csv", index=False)
+    df.iloc[[1]].to_csv(tmp_path / "b.csv", index=False)  # overlaps a.csv
+
+    with caplog.at_level("WARNING"):
+        combined = target.read_input_folder(tmp_path)
+    assert len(combined) == 2
+    assert set(combined[target.SOURCE_FILE_COL]) == {"a.csv"}
+    assert "Dropped 1 rows" in caplog.text
+
+
+def test_read_input_folder_keeps_later_file_repeats_when_dedupe_off(tmp_path) -> None:
+    df = _input_df()
+    df.to_csv(tmp_path / "a.csv", index=False)
+    df.iloc[[1]].to_csv(tmp_path / "b.csv", index=False)
+
+    assert len(target.read_input_folder(tmp_path, drop_duplicates=False)) == 3
+
+
+def test_read_input_folder_keeps_repeats_within_one_file(tmp_path) -> None:
+    df = _input_df()
+    pd.concat([df, df.iloc[[1]]]).to_csv(tmp_path / "a.csv", index=False)
+    df.iloc[[0]].to_csv(tmp_path / "b.csv", index=False)
+
+    combined = target.read_input_folder(tmp_path)
+    assert list(combined[target.SOURCE_FILE_COL]) == ["a.csv"] * 3
+
+
+def test_read_input_folder_drops_every_later_copy_of_a_row(tmp_path) -> None:
+    """A row in a.csv once and b.csv twice keeps only a.csv's copy."""
+    df = _input_df()
+    df.to_csv(tmp_path / "a.csv", index=False)
+    pd.concat([df.iloc[[1]], df.iloc[[1]]]).to_csv(tmp_path / "b.csv", index=False)
+
+    assert len(target.read_input_folder(tmp_path)) == 2
+
+
+def test_read_input_folder_skips_files_missing_required_columns(tmp_path, caplog) -> None:
+    _input_df().to_csv(tmp_path / "a.csv", index=False)
+    pd.DataFrame({"route_id": ["101"]}).to_csv(tmp_path / "other.csv", index=False)
+    (tmp_path / "empty.csv").write_text("")
+
+    with caplog.at_level("WARNING"):
+        combined = target.read_input_folder(tmp_path)
+    assert set(combined[target.SOURCE_FILE_COL]) == {"a.csv"}
+    assert "Skipped other.csv: missing required columns" in caplog.text
+    assert "Skipped empty.csv: could not read it" in caplog.text
+
+
+def test_read_input_folder_warns_on_differing_columns(tmp_path, caplog) -> None:
+    df = _input_df()
+    df.iloc[[0]].to_csv(tmp_path / "a.csv", index=False)
+    df.iloc[[1]].drop(columns=["Arrival Time"]).to_csv(tmp_path / "b.csv", index=False)
+
+    with caplog.at_level("WARNING"):
+        combined = target.read_input_folder(tmp_path)
+    assert len(combined) == 2
+    assert pd.isna(combined["Arrival Time"].iloc[1])
+    assert "b.csv columns differ" in caplog.text
+
+
+def test_read_input_folder_pattern_and_recursion(tmp_path) -> None:
+    df = _input_df()
+    (tmp_path / "sub").mkdir()
+    df.iloc[[0]].to_csv(tmp_path / "Stop Visit Events 1.csv", index=False)
+    df.iloc[[1]].to_csv(tmp_path / "sub" / "Stop Visit Events 2.csv", index=False)
+    df.to_csv(tmp_path / "unrelated.csv", index=False)
+
+    flat = target.read_input_folder(tmp_path, pattern="Stop Visit Events*.csv")
+    deep = target.read_input_folder(tmp_path, pattern="Stop Visit Events*.csv", recursive=True)
+    assert list(flat[target.SOURCE_FILE_COL]) == ["Stop Visit Events 1.csv"]
+    assert list(deep[target.SOURCE_FILE_COL]) == [
+        "Stop Visit Events 1.csv",
+        "sub/Stop Visit Events 2.csv",
+    ]
+
+
+def test_main_folder_rerun_ignores_own_outputs(tmp_path, monkeypatch) -> None:
+    """Outputs written into the input folder are not read back on the next run."""
+    _input_df().to_csv(tmp_path / "a.csv", index=False)
+    config = {"COMBINED_INPUT_FILENAME": "combined.csv"}
+
+    _, first = _run_main_on_folder(monkeypatch, tmp_path, tmp_path, **config)
+    code, second = _run_main_on_folder(monkeypatch, tmp_path, tmp_path, **config)
+    assert code == 0
+    assert len(first) == len(second) == 2
+
+
+def test_main_folder_writes_combined_input_with_source_column(tmp_path, monkeypatch) -> None:
+    in_dir, out_dir = tmp_path / "in", tmp_path / "out"
+    in_dir.mkdir()
+    df = _input_df()
+    df.iloc[[0]].to_csv(in_dir / "a.csv", index=False)
+    df.iloc[[1]].to_csv(in_dir / "b.csv", index=False)
+
+    _run_main_on_folder(monkeypatch, in_dir, out_dir, COMBINED_INPUT_FILENAME="combined.csv")
+    combined = pd.read_csv(out_dir / "combined.csv", dtype=str)
+    assert list(combined[target.SOURCE_FILE_COL]) == ["a.csv", "b.csv"]
+    assert list(combined.columns) == [*df.columns, target.SOURCE_FILE_COL]
+
+
+def test_main_folder_without_usable_files_returns_1(tmp_path, monkeypatch) -> None:
+    in_dir = tmp_path / "in"
+    in_dir.mkdir()
+    code, out = _run_main_on_folder(monkeypatch, in_dir, tmp_path / "out")
+    assert code == 1
+    assert out is None
