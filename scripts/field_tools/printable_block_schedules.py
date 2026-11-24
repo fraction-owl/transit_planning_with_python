@@ -779,7 +779,7 @@ def movements_on_date(
     """Regroup TODS movements for a ``SERVICE_DATE`` export, keyed by ``(block_id, date)``.
 
     Args:
-        movements: Output of :pyfunc:`load_tods_movements`.
+        movements: Output of :pyfunc:`build_tods_movements`.
         service_ids: The service_ids active on *service_date*; movements on
             other services are dropped.
         service_date: The date (``YYYYMMDD``) used as each key's second part.
@@ -845,7 +845,7 @@ def add_layover_rows(
         block_df: All prepared stop events for this block and service ID,
             including ``trip_start_seconds`` before the timepoint filter.
         movements: This block's TODS nonrevenue trips (see
-            :pyfunc:`load_tods_movements`), placed before the first trip,
+            :pyfunc:`build_tods_movements`), placed before the first trip,
             between trips or after the last trip by their scheduled times.
         include_gaps: Add rows for waiting time (``INCLUDE_LAYOVER_ROWS``).
         service_date: The date (``YYYYMMDD``) every trip in *block_df* runs
@@ -1105,7 +1105,7 @@ def export_blocks(
         service_labels: ``service_id`` → calendar label for file names (see
             :pyfunc:`build_service_labels`). ``None`` shows raw service_ids.
         tods_movements: TODS nonrevenue trips by ``(block_id, service_id)``
-            (see :pyfunc:`load_tods_movements`), or by ``(block_id,
+            (see :pyfunc:`build_tods_movements`), or by ``(block_id,
             SERVICE_DATE)`` when that is set (see :pyfunc:`movements_on_date`);
             ``None`` lists GTFS trips only.
 
@@ -1157,7 +1157,8 @@ def export_blocks(
         block_subset = block_subset.merge(first_departures, on="trip_id", how="left")
 
         block_subset["Trip Start Time"] = block_subset["trip_start_hhmm"]
-        filename = build_block_filename(block_subset, service_labels or {})
+        movements = (tods_movements or {}).get((str(block_id), str(service_id)), [])
+        filename = build_block_filename(block_subset, service_labels or {}, movements)
         if service_date:
             safe_date = re.sub(r'[\\/:*?"<>|\s]+', "-", service_date)
             filename = f"{os.path.splitext(filename)[0]}_{safe_date}.xlsx"
@@ -1810,6 +1811,26 @@ def main() -> int:
                 raise ValueError(f"No service_id is active on {SERVICE_DATE.strip()} in this feed.")
             logging.info("Service IDs active on that date: %s", date_service_ids)
 
+        tods_movements = None
+        if TODS_PATH.strip():
+            logging.info("TODS supplement files: %s", TODS_PATH)
+            tods = apply_tods_supplements(gtfs_data, load_tods_supplements(TODS_PATH))
+            stop_times_df, stops_df, routes_df = tods["stop_times"], tods["stops"], tods["routes"]
+            tods_movements = build_tods_movements(tods["trips"], stop_times_df, stops_df)
+            if date_service_ids is not None:
+                tods_movements = movements_on_date(
+                    tods_movements, date_service_ids, SERVICE_DATE.strip()
+                )
+            # Pull-outs, pull-ins and deadheads print as movement rows, not stop rows.
+            trip_types = tods["trips"]["TODS_trip_type"].fillna("").astype(str).str.strip()
+            trips_df = tods["trips"].loc[trip_types == ""]
+            if trips_df.empty:
+                logging.warning(
+                    "No public trips remain after applying the TODS supplements (every trip "
+                    "was deleted or is on a deleted route) – no files generated."
+                )
+                return 1
+
         trips_df, stop_times_df = filter_data(trips_df, stop_times_df, routes_df, date_service_ids)
         if trips_df.empty or stop_times_df.empty:
             logging.warning("No data remains after filtering – no files generated.")
@@ -1827,14 +1848,6 @@ def main() -> int:
             )
             return 1
 
-        tods_movements = None
-        if TODS_PATH.strip():
-            logging.info("TODS supplement files: %s", TODS_PATH)
-            tods_movements = load_tods_movements(TODS_PATH, stops_df)
-            if date_service_ids is not None:
-                tods_movements = movements_on_date(
-                    tods_movements, date_service_ids, SERVICE_DATE.strip()
-                )
         export_blocks(prepared, service_labels, tods_movements)
         logging.info("Script finished successfully.")
         logging.info("Script completed successfully.")
