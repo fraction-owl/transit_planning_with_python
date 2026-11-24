@@ -159,6 +159,30 @@ def test_classify_empty_service() -> None:
     assert classify_service_ids({"GHOST": set()}) == {"GHOST": set()}
 
 
+def test_classify_low_rate_service_needs_a_holiday_date_when_holidays_given() -> None:
+    thanksgiving = dt.date(2026, 11, 26)
+    active = {
+        "ONE_MONDAY": {dt.date(2026, 11, 2)},  # a single ordinary Monday
+        "HOL": {thanksgiving, dt.date(2026, 11, 27)},  # Thanksgiving + day after
+    }
+    # Without holidays, the annual rate alone decides: both look like Holiday.
+    assert classify_service_ids(active) == {"ONE_MONDAY": {"Holiday"}, "HOL": {"Holiday"}}
+    # With holidays, only the service that runs on one keeps the label.
+    labels = classify_service_ids(active, holidays={thanksgiving})
+    assert labels == {"ONE_MONDAY": {"Special"}, "HOL": {"Holiday"}}
+
+
+def test_classify_holidays_do_not_change_high_rate_services() -> None:
+    calendar, calendar_dates = _load_fixture("gtfs_holiday_negation")
+    active = expand_service_active_dates(calendar, calendar_dates)
+    # The holiday set only affects low-rate services: regular services keep
+    # their labels, and HOL (none of its dates in the set) turns Special.
+    labels = classify_service_ids(active, holidays=set())
+    assert labels["WKD"] == {"Weekday"}
+    assert labels["SUN"] == {"Sunday"}
+    assert labels["HOL"] == {"Special"}
+
+
 # ---------------------------------------------------------------------------
 # representative_service_date
 # ---------------------------------------------------------------------------

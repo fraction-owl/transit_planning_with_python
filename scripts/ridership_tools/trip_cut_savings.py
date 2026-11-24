@@ -2210,6 +2210,13 @@ class DeadheadModel:
         root = Path(folder).expanduser()
         if not root.is_dir():
             raise ValueError(f"TODS_PATH must be an extracted directory: {root}")
+        found_v1 = [n for n in ("deadheads.txt", "deadhead_times.txt") if (root / n).is_file()]
+        if found_v1:
+            raise ValueError(
+                f"'{root}' contains TODS v1 deadhead tables ({', '.join(found_v1)}). This "
+                "script expects TODS 2.1 supplements (trips_supplement.txt, "
+                "stop_times_supplement.txt); convert the files to TODS 2.1 first."
+            )
         public_trips = _required(feed, "trips").set_index("trip_id")
         stops = _required(feed, "stops")
         stop_ids = set(stops.stop_id)
@@ -2310,9 +2317,11 @@ class DeadheadModel:
         if "TODS_delete" in times and times.TODS_delete.eq("1").any():
             raise ValueError("Apply TODS stop-time deletions upstream before using this profile.")
         # TODS adds non-revenue routes in routes_supplement.txt.
-        routes = set(_required(feed, "routes").route_id) | set(
-            _tods_table(root, "routes_supplement.txt", ["route_id"]).route_id
-        )
+        route_supplement = _tods_table(root, "routes_supplement.txt", ["route_id"])
+        if "TODS_delete" in route_supplement and route_supplement.TODS_delete.eq("1").any():
+            # A deleted route's public trips would otherwise still be priced.
+            raise ValueError("Apply TODS route deletions upstream before using this profile.")
+        routes = set(_required(feed, "routes").route_id) | set(route_supplement.route_id)
         timed = {str(t): g for t, g in times.groupby("trip_id")}
         all_block_groups = {str(b): g for b, g in trips.groupby("block_id")}
         active_groups = {

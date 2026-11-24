@@ -1350,11 +1350,20 @@ def test_tods_movement_overlapping_a_trip_is_not_listed(caplog: pytest.LogCaptur
     assert "overlap revenue trips" in caplog.text
 
 
-def test_load_tods_movements_reads_the_mock_supplements() -> None:
-    from scripts.field_tools.printable_block_schedules import load_gtfs_data, load_tods_movements
+def test_build_tods_movements_reads_the_mock_supplements() -> None:
+    from scripts.field_tools.printable_block_schedules import (
+        apply_tods_supplements,
+        build_tods_movements,
+        load_gtfs_data,
+        load_tods_supplements,
+    )
 
-    stops = load_gtfs_data(str(MOCK_GTFS), files=["stops.txt"], dtype=str)["stops"]
-    movements = load_tods_movements(str(MOCK_TODS), stops)
+    gtfs = load_gtfs_data(
+        str(MOCK_GTFS), files=["trips.txt", "stop_times.txt", "stops.txt", "routes.txt"], dtype=str
+    )
+    stops = gtfs["stops"]
+    tods = apply_tods_supplements(gtfs, load_tods_supplements(str(MOCK_TODS)))
+    movements = build_tods_movements(tods["trips"], tods["stop_times"], tods["stops"])
     legs = movements["DC_R20_weekday_BLK001", "weekday"]
     assert [m["label"] for m in legs] == ["Pull-out", "Deadhead", "Pull-in"]
     assert legs[0]["from_name"] == "Mock DC North Garage"  # Named from stops_supplement.

@@ -1,0 +1,2 @@
+stop_id,stop_name,stop_lat,stop_lon
+G,Example Garage,38.8800,-77.0100
