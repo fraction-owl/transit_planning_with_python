@@ -169,18 +169,18 @@ def test_classify_low_rate_service_needs_a_holiday_date_when_holidays_given() ->
     assert classify_service_ids(active) == {"ONE_MONDAY": {"Holiday"}, "HOL": {"Holiday"}}
     # With holidays, only the service that runs on one keeps the label.
     labels = classify_service_ids(active, holidays={thanksgiving})
-    assert labels == {"ONE_MONDAY": {"Infrequent"}, "HOL": {"Holiday"}}
+    assert labels == {"ONE_MONDAY": {"Special"}, "HOL": {"Holiday"}}
 
 
 def test_classify_holidays_do_not_change_high_rate_services() -> None:
     calendar, calendar_dates = _load_fixture("gtfs_holiday_negation")
     active = expand_service_active_dates(calendar, calendar_dates)
     # The holiday set only affects low-rate services: regular services keep
-    # their labels, and HOL (none of its dates in the set) turns Infrequent.
+    # their labels, and HOL (none of its dates in the set) turns Special.
     labels = classify_service_ids(active, holidays=set())
     assert labels["WKD"] == {"Weekday"}
     assert labels["SUN"] == {"Sunday"}
-    assert labels["HOL"] == {"Infrequent"}
+    assert labels["HOL"] == {"Special"}
 
 
 # ---------------------------------------------------------------------------

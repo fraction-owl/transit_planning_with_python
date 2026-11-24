@@ -134,6 +134,25 @@ def test_read_gtfs_tables_from_zip(tmp_path: Path) -> None:
     assert "shapes" in dfs
 
 
+def test_read_gtfs_tables_from_zip_with_wrapper_folder(tmp_path: Path) -> None:
+    # WMATA publishes its tables one folder inside the zip.
+    gtfs = _make_gtfs_dir(tmp_path)
+    zip_path = tmp_path / "feed.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        for f in gtfs.iterdir():
+            zf.write(f, f"wmata_gtfs/{f.name}")
+    dfs = _read_gtfs_tables(zip_path)
+    assert len(dfs["stops"]) == 2
+    assert set(dfs) == {"stops", "routes", "trips", "stop_times", "shapes"}
+
+
+def test_read_gtfs_tables_names_a_missing_table(tmp_path: Path) -> None:
+    gtfs = _make_gtfs_dir(tmp_path)
+    (gtfs / "shapes.txt").unlink()
+    with pytest.raises(FileNotFoundError, match="shapes.txt"):
+        _read_gtfs_tables(gtfs)
+
+
 def test_read_gtfs_tables_raises_on_unsupported_path(tmp_path: Path) -> None:
     bad = tmp_path / "data.json"
     bad.write_text("{}", encoding="utf-8")

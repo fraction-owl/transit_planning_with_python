@@ -187,24 +187,24 @@ def classify_service_ids(
     The annual rate alone cannot tell a holiday service from any other rarely
     used one (a one-day special event, a single-date exception). Pass
     *holidays* to check: a low-rate service with none of its active dates in
-    that set is labelled ``Infrequent`` instead of ``Holiday``.
+    that set is labelled ``Special`` instead of ``Holiday``.
 
     Args:
         active_dates: Output of :func:`expand_service_active_dates`.
         holiday_max_days_per_year: Services active at or below this annual
-            rate are labelled ``Holiday`` (or ``Infrequent``; see *holidays*).
+            rate are labelled ``Holiday`` (or ``Special``; see *holidays*).
         dow_share: Minimum fraction of active dates on a day-of-week bucket
             (Mon–Fri, Saturday, Sunday) to earn that bucket's label.
         holidays: Optional set of holiday dates, e.g. from
             ``federal_holidays_observed``. When given, a low-rate service
             earns ``Holiday`` only if at least one of its active dates is in
-            this set, and ``Infrequent`` otherwise. When ``None`` (the
+            this set, and ``Special`` otherwise. When ``None`` (the
             default), every low-rate service is labelled ``Holiday``.
 
     Returns:
         Mapping of ``service_id`` to a set of labels drawn from
-        ``{"Weekday", "Saturday", "Sunday", "Holiday", "Infrequent"}``
-        (``Infrequent`` only when *holidays* is given). A service with no
+        ``{"Weekday", "Saturday", "Sunday", "Holiday", "Special"}``
+        (``Special`` only when *holidays* is given). A service with no
         active dates maps to an empty set.
     """
     result: dict[str, set[str]] = {}
@@ -220,7 +220,7 @@ def classify_service_ids(
             if holidays is None or not dates.isdisjoint(holidays):
                 labels.add("Holiday")
             else:
-                labels.add("Infrequent")
+                labels.add("Special")
         else:
             n = len(dates)
             wd = sum(1 for d in dates if d.weekday() < 5)

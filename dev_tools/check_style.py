@@ -27,6 +27,10 @@ Checks performed (per-file):
         behind by a rename).
     14. docstring_length – Module docstring runs at most DOCSTRING_MAX_LINES
         lines (CONTRIBUTING.md asks for ~50).
+    15. exit_code_contract – `main()` is annotated `-> int`, never bare-`return`s,
+        and the `__main__` guard propagates its value into `SystemExit`
+        (CONTRIBUTING.md: `0` success, `1` runtime failure, `2` config error).
+        Complements `notebook_guard`, which accepts a legacy bare `main()` call.
 
 Exit status:
     0 – all enabled checks passed for all files
@@ -87,6 +91,7 @@ CHECKS_ENABLED: dict[str, bool] = {
     "docstring_sections": True,
     "docstring_script_refs": True,
     "docstring_length": True,
+    "exit_code_contract": True,
 }
 
 # Module docstrings longer than this many lines, counted from the opening quotes
@@ -552,6 +557,118 @@ def check_main_function(src: str, path: Path) -> list[Violation]:
     ]
 
 
+def _returns_in_own_scope(func: ast.FunctionDef) -> list[ast.Return]:
+    """Return the `return` statements belonging to *func* itself.
+
+    `ast.walk` descends into nested `def`s and lambdas, whose returns belong to
+    those inner scopes — a closure inside `main()` is free to `return` nothing.
+    """
+    found: list[ast.Return] = []
+    stack: list[ast.AST] = list(ast.iter_child_nodes(func))
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            continue
+        if isinstance(node, ast.Return):
+            found.append(node)
+        stack.extend(ast.iter_child_nodes(node))
+    return found
+
+
+def _guard_propagates_exit_code(guard: ast.If) -> bool:
+    """Return True if *guard* hands a value to `SystemExit` / `sys.exit`.
+
+    Only the presence of an argument matters, not where it came from: scripts
+    that stage the code in a local first (`code = main()` … `raise
+    SystemExit(code)`), so a notebook kernel never sees a `SystemExit`
+    traceback, satisfy the contract just as `raise SystemExit(main())` does.
+    A bare `main()` call does not — the shell always sees status 0 unless
+    main() happens to raise.
+    """
+    for node in ast.walk(guard):
+        if isinstance(node, ast.Raise) and isinstance(node.exc, ast.Call):
+            func = node.exc.func
+            if isinstance(func, ast.Name) and func.id == "SystemExit" and node.exc.args:
+                return True
+        if isinstance(node, ast.Call) and node.args:
+            if ast.unparse(node.func) in {"sys.exit", "exit"}:
+                return True
+    return False
+
+
+def check_exit_code_contract(src: str, path: Path) -> list[Violation]:
+    """Flag `main()` entry points that cannot carry an exit code to the shell.
+
+    CONTRIBUTING.md pins `0` success / `1` runtime failure / `2` configuration
+    error, returned rather than raised so `main()` stays traceback-free in a
+    notebook cell.  Three ways that breaks, all decidable from the source:
+
+    * `main()` annotated anything but `-> int` (so it yields no code at all),
+    * a bare `return` / `return None` inside `main()` (no code on that path),
+    * a `__main__` guard that discards main()'s value.
+
+    The absence of `main()` or of the guard is left to `main_function` and
+    `notebook_guard`; this check only grades the ones that are present.
+    """
+    try:
+        tree = ast.parse(src, filename=str(path))
+    except SyntaxError:
+        return []
+
+    violations: list[Violation] = []
+
+    main = next(
+        (n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "main"),
+        None,
+    )
+    if main is not None:
+        annotation = ast.unparse(main.returns) if main.returns else None
+        if annotation != "int":
+            violations.append(
+                Violation(
+                    check="exit_code_contract",
+                    line=main.lineno,
+                    message=(
+                        f"`main()` is annotated `-> {annotation}` — the exit-code contract "
+                        "requires `-> int` (0 success, 1 runtime failure, 2 config error)"
+                    ),
+                )
+            )
+        for node in _returns_in_own_scope(main):
+            if node.value is None or (
+                isinstance(node.value, ast.Constant) and node.value.value is None
+            ):
+                violations.append(
+                    Violation(
+                        check="exit_code_contract",
+                        line=node.lineno,
+                        message=(
+                            "bare `return` in `main()` yields None rather than an exit "
+                            "code — return 0, 1, or 2 explicitly"
+                        ),
+                    )
+                )
+
+    guard = next(
+        (n for n in tree.body if isinstance(n, ast.If) and _is_main_guard_test(n.test)),
+        None,
+    )
+    if guard is not None and not _guard_propagates_exit_code(guard):
+        violations.append(
+            Violation(
+                check="exit_code_contract",
+                line=guard.lineno,
+                message=(
+                    "`__main__` guard discards main()'s return value, so shell callers, "
+                    "cron jobs, and Makefiles see status 0 — use "
+                    "`raise SystemExit(main())`"
+                ),
+            )
+        )
+
+    return violations
+
+
 def check_logging_present(src: str) -> list[Violation]:
     """Flag scripts that don't import and use the logging module."""
     violations: list[Violation] = []
@@ -860,6 +977,8 @@ def audit_file(path: Path) -> FileResult:
         violations.extend(check_docstring_script_refs(src, path))
     if enabled.get("docstring_length", True):
         violations.extend(check_docstring_length(src, path))
+    if enabled.get("exit_code_contract", True):
+        violations.extend(check_exit_code_contract(src, path))
 
     return FileResult(path=path, violations=violations)
 

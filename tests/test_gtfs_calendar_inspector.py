@@ -62,6 +62,30 @@ def test_run_split_weekday_day_type_summary(tmp_path: Path) -> None:
     assert _day_type_row(day_types, "sunday")["service_ids"] == "SUN"
 
 
+def test_run_labels_rare_non_holiday_service_special(tmp_path: Path) -> None:
+    # WMATA service_id 3 runs on five Fridays, none a federal holiday: the feed shows
+    # they are exception dates but not why, so the label is Special, not Holiday.
+    feed = tmp_path / "feed"
+    feed.mkdir()
+    (feed / "calendar.txt").write_text(
+        "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,"
+        "start_date,end_date\n"
+        "WKD,1,1,1,1,1,0,0,20260105,20260630\n",
+        encoding="utf-8",
+    )
+    fridays = ["20260109", "20260206", "20260306", "20260403", "20260501"]
+    (feed / "calendar_dates.txt").write_text(
+        "service_id,date,exception_type\n" + "".join(f"3,{d},1\n" for d in fridays),
+        encoding="utf-8",
+    )
+    service, _ = target.run(gtfs_path=feed, output_dir=tmp_path / "out")
+    special = _summary_row(service, "3")
+    assert special["labels"] == "Special"
+    assert special["active_days"] == 5
+    assert special["holiday_days"] == 0
+    assert _summary_row(service, "WKD")["labels"] == "Weekday"
+
+
 def test_run_rejects_feed_without_any_calendar(tmp_path: Path) -> None:
     feed = tmp_path / "feed"
     feed.mkdir()
@@ -106,7 +130,7 @@ def test_run_stops_when_calendar_dates_is_damaged(tmp_path: Path) -> None:
     assert rc == 1
 
 
-def test_run_labels_rare_non_holiday_service_infrequent(tmp_path: Path) -> None:
+def test_run_keeps_holiday_label_only_for_a_service_on_a_holiday(tmp_path: Path) -> None:
     feed = tmp_path / "feed"
     feed.mkdir()
     (feed / "calendar.txt").write_text(
@@ -122,7 +146,7 @@ def test_run_labels_rare_non_holiday_service_infrequent(tmp_path: Path) -> None:
 
     # One ordinary Monday: rare, but nothing in the feed makes it a holiday.
     nov2 = _summary_row(service, "NOV2")
-    assert nov2["labels"] == "Infrequent"
+    assert nov2["labels"] == "Special"
     assert nov2["holiday_days"] == 0
     # Runs only on Thanksgiving: the Holiday label is backed by holiday_days.
     thx = _summary_row(service, "THX")
