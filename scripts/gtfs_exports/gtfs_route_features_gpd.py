@@ -479,9 +479,10 @@ def _service_day_coverage(trip_times: pd.DataFrame, bins_per_day: int = 24) -> p
     departures -- rather than whole operating intervals -- mirrors the service a rider
     waiting at a stop actually experiences: what matters is how often a boardable vehicle
     shows up, not that some bus is mid-route elsewhere. A long trip therefore credits only
-    the bin it starts in. Late-night trips keep the GTFS extended clock (e.g. a 25:30
-    departure falls in bin 25, not wrapped back to 01:30), matching how span_hours and
-    runtimes treat after-midnight times here.
+    the bin it starts in. After-midnight departures wrap onto the clock (a 25:30
+    departure falls in bin 1, with any 01:30 departure), so this is the share of the 24
+    clock hours with a departure and never exceeds 100. span_hours and runtimes keep the
+    GTFS extended clock, where a value above 24 hours is meaningful.
 
     Bins are one hour wide on purpose: a route running at least hourly then fills every
     hour it operates, so this stays a span / availability measure. Finer frequency (e.g.
@@ -501,6 +502,7 @@ def _service_day_coverage(trip_times: pd.DataFrame, bins_per_day: int = 24) -> p
 
     bin_sec = 86_400.0 / bins_per_day
     bin_idx = np.floor(df["start_sec"].to_numpy(dtype=float) / bin_sec).astype(np.int64)
+    bin_idx %= bins_per_day
 
     served: dict[str, set[int]] = {}
     for route_id, b in zip(df["route_id"].to_numpy(), bin_idx):

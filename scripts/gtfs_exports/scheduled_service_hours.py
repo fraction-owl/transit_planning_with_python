@@ -20,15 +20,15 @@ ends one movement somewhere other than where the next begins with no scheduled
 movement in between. Vehicle revenue hours add layover to revenue trip hours
 when LAYOVER_IN_REVENUE_HOURS is True; vehicle hours run from pull-out to pull-in.
 
-Day types come from SERVICE_DAY_TYPES or, when that is empty, from each
-service's GTFS active dates. Period totals count each date's services from the
-GTFS calendar (calendar.txt, calendar_dates.txt and their TODS supplements) or,
-with PERIOD_CALENDAR = "config", from each date's day type, treating
-HOLIDAY_DATES (and optionally U.S. federal holidays) as holidays. A typical day
-of each day type is the service set that runs on the most dates of that type
-across the feed's whole calendar; any other sets of that type are logged. Period
-days are also counted by the typical day whose service they run: a Christmas on
-Sunday service is a weekday and a Sunday schedule day.
+A date's day type is Weekday, Saturday or Sunday, or Holiday for HOLIDAY_DATES (and optionally
+U.S. federal holidays) and, with the GTFS calendar, dates running a service SERVICE_DAY_TYPES
+calls Holiday. Period totals count each date's services from the GTFS calendar (calendar.txt,
+calendar_dates.txt and their TODS supplements) or, with PERIOD_CALENDAR = "config", the
+services of the date's day type: those SERVICE_DAY_TYPES lists (they must run together on some
+date), or else the day type's typical set: the service set that runs on the most dates of that
+type in the feed's calendar (for Holiday, only sets run mostly on holidays); other sets are
+logged. Period days are also counted by the typical day whose service they run: a Christmas
+on Sunday service is a holiday and a Sunday schedule day.
 
 Inputs
 ------
@@ -42,7 +42,7 @@ Outputs
 - ``service_hours_by_block.csv``: hours per block and service set, with QA counts.
 - ``service_hours_by_service.csv``: hours for one day of each service set.
 - ``service_hours_by_day_type.csv``: hours on a typical day of each day type.
-- ``service_hours_by_period.csv``: total hours and day counts per period.
+- ``service_hours_by_period.csv``: total hours, day counts and service sets per period.
 - ``service_hours.xlsx``: the same period totals as Excel formulas, traceable
   through Calendar, Services and Blocks sheets to each trip's start and end time,
   with a layover-as-revenue switch, so totals can be checked and adjusted by hand.
@@ -69,7 +69,7 @@ import sys
 import zipfile
 from collections import Counter
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, List, Optional
@@ -110,17 +110,22 @@ PERIODS: List[tuple[str, str, str]] = [("November 2026", "20261101", "20261130")
 # Which services run on each date of a period:
 #   "gtfs"   - the GTFS calendar (with TODS calendar supplements), date by date.
 #   "config" - each date's day type: Weekday / Saturday / Sunday, or Holiday for
-#              the dates below; the services of that day type run.
+#              the dates below; the services of that day type run (from
+#              SERVICE_DAY_TYPES, or else the set that runs on the most dates of
+#              that day type in the GTFS calendar).
 PERIOD_CALENDAR: str = "gtfs"
 
 # service_id -> day type(s): "Weekday", "Saturday", "Sunday", "Holiday", or a
-# comma-separated list such as "Saturday, Sunday". Empty: classify each service
-# from its GTFS active dates.
+# comma-separated list such as "Saturday, Sunday". The services listed under one
+# day type must run together on some date of the GTFS calendar. With the GTFS
+# calendar, a date running a Holiday service counts as a holiday. Empty: config
+# mode runs each day type's typical service set.
 SERVICE_DAY_TYPES: dict[str, str] = {}
 
-# PERIOD_CALENDAR = "config" only: holiday dates (YYYYMMDD), whether to add the
-# observed U.S. federal holidays, and whose services run on a holiday (for
-# example "Sunday" if holidays run the Sunday schedule).
+# Holiday dates (YYYYMMDD) and whether to add the observed U.S. federal
+# holidays; these dates count as holidays in both calendar modes.
+# PERIOD_CALENDAR = "config" only: whose services run on a holiday (for example
+# "Sunday" if holidays run the Sunday schedule).
 HOLIDAY_DATES: List[str] = []
 USE_FEDERAL_HOLIDAYS: bool = True
 HOLIDAY_SERVICE_DAY_TYPE: str = "Holiday"
@@ -449,71 +454,6 @@ def service_ids_active_on(
         Set of service_id strings active on that date (possibly empty).
     """
     return {sid for sid, dates in active_dates.items() if target_date in dates}
-
-
-def classify_service_ids(
-    active_dates: Mapping[str, set[dt.date]],
-    holiday_max_days_per_year: float = 25.0,
-    dow_share: float = 0.80,
-) -> dict[str, set[str]]:
-    """Classify each service_id by its real active-date pattern.
-
-    A service operating at or below *holiday_max_days_per_year* is labelled
-    ``Holiday`` — this catches holiday-only services regardless of what
-    their day-of-week columns claim (scheduling-software exports often stamp
-    a weekday pattern on a service that really runs five days a year).
-    Otherwise, day-of-week shares of the active dates determine the labels.
-
-    Args:
-        active_dates: Output of :func:`expand_service_active_dates`.
-        holiday_max_days_per_year: Services active at or below this annual
-            rate are labelled ``Holiday``.
-        dow_share: Minimum fraction of active dates on a day-of-week bucket
-            (Mon–Fri, Saturday, Sunday) to earn that bucket's label.
-
-    Returns:
-        Mapping of ``service_id`` to a set of labels drawn from
-        ``{"Weekday", "Saturday", "Sunday", "Holiday"}``. A service with no
-        active dates maps to an empty set.
-    """
-    result: dict[str, set[str]] = {}
-    for sid, dates in active_dates.items():
-        if not dates:
-            result[sid] = set()
-            logging.info("Service %s: empty (0 active dates).", sid)
-            continue
-        span_days = (max(dates) - min(dates)).days + 1
-        per_year = len(dates) / max(span_days / 365.25, 0.1)
-        labels: set[str] = set()
-        if per_year <= holiday_max_days_per_year:
-            labels.add("Holiday")
-        else:
-            n = len(dates)
-            wd = sum(1 for d in dates if d.weekday() < 5)
-            sat = sum(1 for d in dates if d.weekday() == 5)
-            sun = sum(1 for d in dates if d.weekday() == 6)
-            if wd / n >= dow_share:
-                labels.add("Weekday")
-            if sat / n >= dow_share:
-                labels.add("Saturday")
-            if sun / n >= dow_share:
-                labels.add("Sunday")
-            if not labels:
-                if wd > 0:
-                    labels.add("Weekday")
-                if sat > 0:
-                    labels.add("Saturday")
-                if sun > 0:
-                    labels.add("Sunday")
-        result[sid] = labels
-        logging.info(
-            "Service %s -> %s (%d dates, %.1f/yr).",
-            sid,
-            sorted(labels),
-            len(dates),
-            per_year,
-        )
-    return result
 
 
 def federal_holidays_observed(year: int) -> set[dt.date]:
@@ -1045,13 +985,13 @@ def service_hours(blocks: pd.DataFrame) -> pd.DataFrame:
 def service_day_types(
     active: Mapping[str, set[dt.date]], explicit: Mapping[str, str]
 ) -> dict[str, set[str]]:
-    """Return service_id -> day types, from *explicit* or from GTFS active dates.
+    """Return service_id -> day types from *explicit* (SERVICE_DAY_TYPES); empty if it is.
 
     Raises:
         ValueError: If *explicit* names a day type outside DAY_TYPES.
     """
     if not explicit:
-        return classify_service_ids(active)
+        return {}
     result: dict[str, set[str]] = {}
     for sid, value in explicit.items():
         labels = {v.strip().title() for v in str(value).split(",") if v.strip()}
@@ -1072,13 +1012,90 @@ def ranked_service_sets(calendar: pd.DataFrame, label: str) -> list[tuple[str, i
     return sets.most_common()
 
 
+def typical_service_sets(calendar: pd.DataFrame) -> dict[str, list[tuple[str, int]]]:
+    """Return each day type's candidate service sets, the typical one (most dates) first.
+
+    Holiday ranks only sets that run on holidays on most of their dates: a holiday
+    that runs the weekday or Sunday schedule does not make it a holiday schedule.
+    Day types with no candidate set are left out.
+    """
+    ranked = {label: ranked_service_sets(calendar, label) for label in DAY_TYPES}
+    total = Counter(s for s in calendar["service_set"] if s)
+    ranked["Holiday"] = [(s, n) for s, n in ranked["Holiday"] if 2 * n > total[s]]
+    return {label: sets for label, sets in ranked.items() if sets}
+
+
+def config_day_types(
+    explicit: Mapping[str, set[str]], gtfs_days: pd.DataFrame, holiday_service_day_type: str
+) -> dict[str, set[str]]:
+    """Return service_id -> day types for PERIOD_CALENDAR = "config".
+
+    Config mode runs every service of a date's day type together, so the services
+    of one day type must be ones that run together. Services that never share a
+    date (a Monday-Thursday and a Friday schedule, or the schedules before and
+    after a service change) would otherwise add several days' trips to each date.
+
+    Args:
+        explicit: Output of :func:`service_day_types` (SERVICE_DAY_TYPES).
+        gtfs_days: Output of :func:`build_calendar` in GTFS calendar mode over the
+            feed's dates.
+        holiday_service_day_type: HOLIDAY_SERVICE_DAY_TYPE.
+
+    Returns:
+        *explicit*, once checked; when it is empty, each day type's typical
+        service set from :func:`typical_service_sets`.
+
+    Raises:
+        ValueError: If *explicit* lists services under one day type that never
+            all run on one date of the GTFS calendar.
+    """
+    observed = [set(running) for running in gtfs_days["running"] if running]
+    if explicit:
+        dated = set().union(*observed)
+        for label in DAY_TYPES:
+            members = {s for s, labels in explicit.items() if label in labels and s in dated}
+            if len(members) > 1 and not any(members <= running for running in observed):
+                combos = Counter("|".join(sorted(r & members)) for r in observed if r & members)
+                runs = "; ".join(f"{s} ({n} dates)" for s, n in combos.most_common(5))
+                raise ValueError(
+                    f"SERVICE_DAY_TYPES lists {', '.join(sorted(members))} as {label}, but they "
+                    "never all run on the same date of the GTFS calendar, so config mode would "
+                    "add their trips together. List only the services that run together on one "
+                    f"{label}. The GTFS calendar runs: {runs}."
+                )
+        return dict(explicit)
+    result: dict[str, set[str]] = {}
+    for label, ranked in typical_service_sets(gtfs_days).items():
+        typical, n = ranked[0]
+        logging.info(
+            "Config calendar: %s dates run %s, the set on %d of %d %s dates in the GTFS calendar.",
+            label,
+            typical,
+            n,
+            sum(count for _set, count in ranked_service_sets(gtfs_days, label)),
+            label,
+        )
+        for sid in typical.split("|"):
+            result.setdefault(sid, set()).add(label)
+    if holiday_service_day_type.title() == "Holiday" and not any(
+        "Holiday" in labels for labels in result.values()
+    ):
+        logging.warning(
+            "No service set in the GTFS calendar runs mostly on holidays, so config-mode "
+            "holidays get no service. Set HOLIDAY_SERVICE_DAY_TYPE to the day type whose "
+            "schedule runs on holidays, or list the holiday services in SERVICE_DAY_TYPES."
+        )
+    return result
+
+
 def day_type_hours(services: pd.DataFrame, calendar: pd.DataFrame) -> pd.DataFrame:
     """Report the hours of a typical day of each day type in *calendar*.
 
     A day type can have more than one version, i.e. more than one service set
     running on its dates (a Friday-only service, school-day trips, one service_id
     per weekday). The typical day is the set that runs on the most dates of that
-    type (ties go to the earliest); the other sets are logged.
+    type (ties go to the earliest; see :func:`typical_service_sets`); the other
+    sets are logged.
 
     Args:
         services: Output of :func:`service_hours`, indexed by service set.
@@ -1090,13 +1107,17 @@ def day_type_hours(services: pd.DataFrame, calendar: pd.DataFrame) -> pd.DataFra
         its ``blocks`` and ``revenue_trips`` and the COMPONENTS (hours).
     """
     rows = []
+    typical_sets = typical_service_sets(calendar)
     for label in DAY_TYPES:
         ranked = ranked_service_sets(calendar, label)
-        if not ranked:
+        if label not in typical_sets:
+            if ranked:
+                logging.info("%s dates run only other day types' schedules.", label)
             continue
-        typical, typical_days = ranked[0]
+        typical, typical_days = typical_sets[label][0]
+        others = [(s, n) for s, n in ranked if s != typical]
         days = sum(n for _set, n in ranked)
-        if len(ranked) > 1:
+        if others:
             logging.warning(
                 "%s: %d service sets run on %s dates; the typical %s is %s (%d of %d days). "
                 "Others: %s.",
@@ -1107,7 +1128,7 @@ def day_type_hours(services: pd.DataFrame, calendar: pd.DataFrame) -> pd.DataFra
                 typical,
                 typical_days,
                 days,
-                ", ".join(f"{s} ({n} days)" for s, n in ranked[1:]),
+                ", ".join(f"{s} ({n} days)" for s, n in others),
             )
         sub = services.loc[typical]
         row: dict[str, Any] = {
@@ -1148,7 +1169,9 @@ def build_calendar(
     Args:
         known: service_ids that have trips; other services are ignored.
         active: service_id -> active dates.
-        types: service_id -> day types.
+        types: service_id -> day types: SERVICE_DAY_TYPES with the GTFS calendar
+            (a date running a Holiday service is a holiday), the services of each
+            day type in config mode (:func:`config_day_types`).
         cfg: Resolved configuration (calendar mode and holidays).
         periods: (name, first date, last date) of each period, dates as YYYYMMDD.
 
@@ -1183,7 +1206,7 @@ def build_calendar(
         while day <= end:
             if cfg.period_calendar == "gtfs":
                 running = service_ids_active_on(active, day) & known
-                holiday = any("Holiday" in types.get(s, set()) for s in running)
+                holiday = day in holidays or any("Holiday" in types.get(s, ()) for s in running)
                 lookup = "Holiday" if holiday else WEEKDAY_LABELS[day.weekday()]
             else:
                 holiday = day in holidays
@@ -1208,12 +1231,14 @@ def build_calendar(
 def schedule_day_types(calendar: pd.DataFrame, reference: pd.DataFrame) -> list[str]:
     """Return the day type whose schedule runs on each date of *calendar* (GTFS calendar).
 
-    A date runs day type X's schedule when its service set is X's typical set,
-    the set that runs on the most dates of type X in *reference* (as in
-    :func:`day_type_hours`): a Christmas that runs the typical Sunday set is a
-    Sunday schedule day. A set that is the typical set of no day type keeps the
-    date's own day type; one typical of several (a single weekend service) keeps
-    the date's own day type if it is one of them, else takes the first in DAY_TYPES.
+    A date runs day type X's schedule when its service set is X's typical set
+    in *reference* (:func:`typical_service_sets`): a Christmas that runs the
+    typical Sunday set is a Sunday schedule day. A set that is the typical set of
+    no day type takes the day type of most of its dates in *reference* (a set
+    run only on a few Fridays, or a weekday set run on a holiday, is a weekday
+    schedule), or the date's own day type if it has none there. A set typical of
+    several (a single weekend service) keeps the date's own day type if it is one
+    of them, else takes the first in DAY_TYPES.
 
     Args:
         calendar: Output of :func:`build_calendar` (GTFS calendar mode).
@@ -1223,15 +1248,18 @@ def schedule_day_types(calendar: pd.DataFrame, reference: pd.DataFrame) -> list[
         One day type per row of *calendar*; blank where no service runs.
     """
     typical_of: dict[str, list[str]] = {}
-    for label in DAY_TYPES:
-        ranked = ranked_service_sets(reference, label)
-        if ranked:
-            typical_of.setdefault(ranked[0][0], []).append(label)
+    for label, ranked in typical_service_sets(reference).items():
+        typical_of.setdefault(ranked[0][0], []).append(label)
+    usual: dict[str, Counter[str]] = {}
+    for service_set, day_type in zip(reference["service_set"], reference["day_type"]):
+        usual.setdefault(service_set, Counter())[day_type] += 1
     out = []
     for service_set, day_type in zip(calendar["service_set"], calendar["day_type"]):
         labels = typical_of.get(service_set, [])
         if not service_set:
             out.append("")
+        elif not labels and service_set in usual:
+            out.append(usual[service_set].most_common(1)[0][0])
         elif not labels or day_type in labels:
             out.append(day_type)
         else:
@@ -1240,7 +1268,11 @@ def schedule_day_types(calendar: pd.DataFrame, reference: pd.DataFrame) -> list[
 
 
 def period_hours(services: pd.DataFrame, calendar: pd.DataFrame, cfg: Config) -> pd.DataFrame:
-    """Total each period as days x hours per day of each service set, summed over sets."""
+    """Total each period as days x hours per day of each service set, summed over sets.
+
+    ``service_sets`` lists each set run in the period with its number of days, so a
+    date running an unusual set (a Friday-only schedule) stays visible.
+    """
     rows = []
     for name, first, last in cfg.periods:
         sub = calendar.loc[calendar["period"] == name]
@@ -1266,6 +1298,9 @@ def period_hours(services: pd.DataFrame, calendar: pd.DataFrame, cfg: Config) ->
             "sunday_schedule_days": schedules["Sunday"],
             "holiday_schedule_days": schedules["Holiday"],
             "days_without_service": no_service,
+            "service_sets": "; ".join(
+                f"{s} ({n} day{'s' if n != 1 else ''})" for s, n in set_days.most_common()
+            ),
         }
         row.update(totals.to_dict())
         rows.append(row)
@@ -1824,9 +1859,18 @@ def run(cfg: Config) -> dict[str, pd.DataFrame]:
     schedule = load_schedule(cfg.gtfs_path, cfg.tods_path)
     known = set(schedule.movements["service_id"])
     types = service_day_types(schedule.active_dates, cfg.service_day_types)
-    calendar = build_calendar(known, schedule.active_dates, types, cfg, cfg.periods)
     # Typical days come from every date of the feed; the periods if it has no dates.
     span = feed_span(schedule.active_dates, known)
+    if cfg.period_calendar == "config":
+        gtfs_days = build_calendar(
+            known,
+            schedule.active_dates,
+            types,
+            replace(cfg, period_calendar="gtfs"),
+            [("feed", *span)] if span is not None else cfg.periods,
+        )
+        types = config_day_types(types, gtfs_days, cfg.holiday_service_day_type)
+    calendar = build_calendar(known, schedule.active_dates, types, cfg, cfg.periods)
     feed_calendar = (
         build_calendar(known, schedule.active_dates, types, cfg, [("feed", *span)])
         if span is not None

@@ -354,7 +354,8 @@ def test_block_is_rebuilt_for_each_set_of_services_that_runs(tmp_path: Path) -> 
     assert blocks.loc["all", "revenue_trip_hours"] == 2.0
     assert blocks.loc["all", "unresolved_gap_hours"] == 3.0
     nov = tables["period"].iloc[0]
-    assert (nov["weekdays"], nov["saturdays"] + nov["sundays"]) == (21, 9)
+    # Veterans Day (11/11) and Thanksgiving (11/26) are holidays by date.
+    assert (nov["weekdays"], nov["saturdays"] + nov["sundays"]) == (19, 9)
     assert nov["revenue_trip_hours"] == 21 * 3.0 + 9 * 2.0
     assert nov["layover_hours"] == 21 * 2.0
     assert nov["unresolved_gap_hours"] == 9 * 3.0
@@ -377,9 +378,10 @@ def test_typical_weekday_is_the_most_common_operating_day(
             [calendar_row(d, (d,)) for d in DAYS[:5]],
         )
     weekday = tables["day_type"].set_index("day_type").loc["Weekday"]
-    # November 2026 has five Mondays and four of each other weekday.
+    # November 2026 has five Mondays and four of each other weekday; Veterans Day
+    # (Wednesday) and Thanksgiving (Thursday) are holidays, not weekdays.
     assert weekday["service_ids"] == "monday"
-    assert (weekday["days"], weekday["typical_days"]) == (21, 5)
+    assert (weekday["days"], weekday["typical_days"]) == (19, 5)
     assert weekday["revenue_trip_hours"] == 1.0  # Not 6.0, the five services summed.
     assert "5 service sets run on Weekday dates" in caplog.text
     # Period totals count each weekday's own service.
@@ -392,7 +394,7 @@ def test_typical_weekday_is_the_most_common_operating_day(
         [calendar_row("wk", DAYS[:5])],
     )
     weekday = single["day_type"].set_index("day_type").loc["Weekday"]
-    assert (weekday["days"], weekday["typical_days"]) == (21, 21)
+    assert (weekday["days"], weekday["typical_days"]) == (19, 19)
     assert weekday["revenue_trip_hours"] == 1.0
 
 
@@ -440,8 +442,8 @@ def christmas_on_sunday_service(folder: Path) -> dict[str, pd.DataFrame]:
 
 def test_period_counts_days_by_the_schedule_they_run(tmp_path: Path) -> None:
     dec = christmas_on_sunday_service(tmp_path)["period"].iloc[0]
-    # Calendar days: Christmas is a Friday.
-    assert (dec["weekdays"], dec["saturdays"], dec["sundays"], dec["holidays"]) == (23, 4, 4, 0)
+    # Calendar days: Christmas is a holiday (on a Friday).
+    assert (dec["weekdays"], dec["saturdays"], dec["sundays"], dec["holidays"]) == (22, 4, 4, 1)
     # Operating schedules: Christmas runs the Sunday schedule.
     schedules = ("weekday", "saturday", "sunday", "holiday")
     assert tuple(dec[f"{d}_schedule_days"] for d in schedules) == (22, 4, 5, 0)
@@ -472,6 +474,116 @@ def test_schedule_day_types_follow_the_typical_sets() -> None:
         "Saturday",
         "",
     ]
+
+
+def split_weekday_feed(folder: Path) -> Path:
+    """WMATA-shaped feed: four weekday service_ids that never run on the same date.
+
+    Each runs its own date range and reuses blocks B1 and B2 (two one-hour trips
+    each), as successive schedules do. Service 3 replaces the weekday service on
+    Friday 2026-02-13 only, by calendar_dates exceptions: the feed says which trips
+    run that Friday, not that it is a holiday.
+    """
+    weekday = DAYS[:5]
+    ranges = (("1", "20251215", "20260109"), ("10", "20260112", "20260206"))
+    ranges += (("9", "20260209", "20260403"), ("6", "20260406", "20260612"))
+    calendar = [
+        {**calendar_row(sid, weekday), "start_date": start, "end_date": end}
+        for sid, start, end in ranges
+    ]
+    calendar += [
+        {**calendar_row(sid, (day,)), "start_date": "20251214", "end_date": "20260613"}
+        for sid, day in (("S", "saturday"), ("U", "sunday"))
+    ]
+    trips, stop_times = [], []
+    for sid in ("1", "10", "9", "6", "3", "S", "U"):
+        for block in ("B1", "B2"):
+            for k, (start, end) in enumerate((("06:00:00", "07:00:00"), ("08:00:00", "09:00:00"))):
+                trip = f"{sid}_{block}_{k}"
+                trips.append(
+                    {"route_id": "R", "service_id": sid, "trip_id": trip, "block_id": block}
+                )
+                stop_times += [stop_time(trip, 1, "A", start), stop_time(trip, 2, "B", end)]
+    return write_feed(
+        folder,
+        {
+            "trips.txt": trips,
+            "stop_times.txt": stop_times,
+            "stops.txt": [
+                {"stop_id": "A", "stop_lat": "38.90", "stop_lon": "-77.0"},
+                {"stop_id": "B", "stop_lat": "38.95", "stop_lon": "-77.0"},
+            ],
+            "calendar.txt": calendar,
+            "calendar_dates.txt": [
+                {"service_id": "9", "date": "20260213", "exception_type": "2"},
+                {"service_id": "3", "date": "20260213", "exception_type": "1"},
+            ],
+        },
+    )
+
+
+def split_weekday_run(tmp_path: Path, **settings: Any) -> dict[str, pd.DataFrame]:
+    cfg = target.Config(
+        gtfs_path=split_weekday_feed(tmp_path / "gtfs"),
+        tods_path=None,
+        output_dir=tmp_path / "out",
+        periods=[("Mon", "20260209", "20260209"), ("Week", "20260209", "20260215")],
+        **settings,
+    )
+    return target.run(cfg)
+
+
+def test_config_calendar_runs_one_observed_weekday_set(tmp_path: Path) -> None:
+    # Adding up services 1, 10, 9 and 6 counted four weekdays' trips on every date,
+    # with every block overlapping itself.
+    tables = split_weekday_run(tmp_path, period_calendar="config")
+    periods = tables["period"].set_index("period")
+    assert periods.loc["Mon", "revenue_trip_hours"] == 4.0
+    assert periods.loc["Week", "revenue_trip_hours"] == 7 * 4.0
+    assert tables["block"]["overlaps"].sum() == 0
+    assert "|" not in tables["day_type"].set_index("day_type").loc["Weekday", "service_ids"]
+
+
+def test_config_calendar_rejects_services_that_never_run_together(tmp_path: Path) -> None:
+    types = {"1": "Weekday", "9": "Weekday", "S": "Saturday", "U": "Sunday"}
+    with pytest.raises(ValueError, match=r"lists 1, 9 as Weekday, but they never all run"):
+        split_weekday_run(tmp_path, period_calendar="config", service_day_types=types)
+    types = {"9": "Weekday", "S": "Saturday", "U": "Sunday"}
+    tables = split_weekday_run(tmp_path, period_calendar="config", service_day_types=types)
+    assert tables["period"].set_index("period").loc["Mon", "revenue_trip_hours"] == 4.0
+
+
+def test_exception_only_friday_is_a_weekday_not_a_holiday(tmp_path: Path) -> None:
+    week = split_weekday_run(tmp_path)["period"].set_index("period").loc["Week"]
+    assert (week["weekdays"], week["holidays"], week["saturdays"], week["sundays"]) == (5, 0, 1, 1)
+    assert week["holiday_schedule_days"] == 0
+    # The Friday's own schedule stays visible in the period's service sets.
+    assert week["service_sets"] == "9 (4 days); 3 (1 day); S (1 day); U (1 day)"
+    assert week["revenue_trip_hours"] == 7 * 4.0
+
+
+def test_listed_holiday_dates_are_holidays_in_the_gtfs_calendar(tmp_path: Path) -> None:
+    # Wednesday 2026-02-11 runs the regular weekday service, but is listed as a holiday.
+    tables = split_weekday_run(tmp_path, holiday_dates=["20260211"])
+    week = tables["period"].set_index("period").loc["Week"]
+    assert (week["weekdays"], week["holidays"]) == (4, 1)
+    assert (week["weekday_schedule_days"], week["holiday_schedule_days"]) == (5, 0)
+
+
+def test_typical_holiday_set_runs_mostly_on_holidays() -> None:
+    calendar = pd.DataFrame(
+        {
+            "day_type": ["Weekday"] * 6 + ["Holiday"] * 3 + ["Sunday"] * 2,
+            "service_set": ["wk"] * 6 + ["wk", "hol", "sun"] + ["sun"] * 2,
+        }
+    )
+    # A holiday running the weekday or Sunday schedule does not make it a holiday
+    # schedule; "hol" runs only on holidays.
+    typical = target.typical_service_sets(calendar)
+    assert typical["Holiday"] == [("hol", 1)]
+    assert typical["Weekday"][0] == ("wk", 6)
+    no_holiday_schedule = calendar.assign(service_set=["wk"] * 7 + ["sun"] * 4)
+    assert "Holiday" not in target.typical_service_sets(no_holiday_schedule)
 
 
 # =============================================================================
@@ -604,8 +716,10 @@ def test_gtfs_calendar_periods_follow_the_feed(mock_tables: dict[str, pd.DataFra
     )
     assert nov["vehicle_hours"] == pytest.approx(expected, abs=0.1)
     # 2026-01-01 runs holiday service only (calendar_dates removes weekday service).
+    # MLK Day (1/19) is a holiday by date but runs the weekday schedule.
     jan = periods.loc["Jan"]
-    assert (jan["weekdays"], jan["holidays"]) == (21, 1)
+    assert (jan["weekdays"], jan["holidays"]) == (20, 2)
+    assert (jan["weekday_schedule_days"], jan["holiday_schedule_days"]) == (21, 1)
 
 
 def test_config_calendar_uses_federal_holidays(tmp_path: Path) -> None:
@@ -840,7 +954,7 @@ def test_workbook_totals_match_the_csv(mock_run: tuple, tmp_path: Path) -> None:
         for column, label in labels.items():
             assert row[label] == pytest.approx(csv_periods.loc[name, column], abs=0.01), label
     days = {r["Period"]: r for r in sheet_rows(wb["Period days"])}
-    assert (days["Jan 2026"]["Weekdays"], days["Jan 2026"]["Holidays"]) == (21, 1)
+    assert (days["Jan 2026"]["Weekdays"], days["Jan 2026"]["Holidays"]) == (20, 2)
     errors = [
         (ws.title, c.coordinate)
         for ws in wb
@@ -856,13 +970,13 @@ def test_workbook_schedule_day_counts_match_the_csv(tmp_path: Path) -> None:
     tables = christmas_on_sunday_service(tmp_path)
     wb = recalculate(tmp_path / "out" / target.WORKBOOK_FILENAME, tmp_path)
     christmas = next(r for r in sheet_rows(wb["Calendar"]) if r["Date"] and r["Date"].day == 25)
-    assert (christmas["Day type"], christmas["Schedule day type"]) == ("Weekday", "Sunday")
+    assert (christmas["Day type"], christmas["Schedule day type"]) == ("Holiday", "Sunday")
     (days,) = sheet_rows(wb["Period days"])
     dec = tables["period"].iloc[0]
     for label in target.DAY_TYPES:
         column = f"{label.lower()}_schedule_days"
         assert days[f"{label} schedule days"] == dec[column], label
-    assert days["Weekdays"] == 23 and days["Days without service"] == 0
+    assert days["Weekdays"] == 22 and days["Days without service"] == 0
     total = period_totals(wb)["Dec"]
     assert total["Revenue trip h"] == pytest.approx(dec["revenue_trip_hours"], abs=0.01)
 

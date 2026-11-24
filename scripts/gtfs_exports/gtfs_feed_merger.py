@@ -68,7 +68,9 @@ import os
 import re
 import sys
 import zipfile
+import zoneinfo
 from datetime import datetime
+from importlib import resources
 from pathlib import Path
 from typing import IO, Any, List, Mapping, NamedTuple, Optional, Sequence, Union
 
@@ -723,25 +725,96 @@ def normalize_agency_ids(feed: Feed) -> None:
         routes.loc[blank_routes, "agency_id"] = agency["agency_id"].iloc[0]
 
 
-def check_timezones(feeds: Sequence[Feed]) -> None:
-    """Require one agency_timezone across all feeds, as GTFS requires.
+def load_timezone_links() -> dict[str, str]:
+    """Map each alias in the installed tz database to the zone it names.
+
+    Reads the ``L <zone> <alias>`` lines of ``tzdata.zi``, which ships in the
+    system zoneinfo folders and in the ``tzdata`` package (installed with pandas
+    on Windows), e.g. ``US/Eastern`` -> ``America/New_York``.
+
+    Returns:
+        Mapping of alias to zone name; empty when no ``tzdata.zi`` is installed.
+    """
+    texts: list[str] = []
+    for folder in zoneinfo.TZPATH:
+        try:
+            texts.append((Path(folder) / "tzdata.zi").read_text(encoding="utf-8"))
+        except OSError:
+            continue
+    try:
+        package = resources.files("tzdata")
+        texts.append(package.joinpath("zoneinfo/tzdata.zi").read_text(encoding="utf-8"))
+    except (ImportError, OSError):
+        pass
+    links: dict[str, str] = {}
+    for text in texts:
+        for line in text.splitlines():
+            parts = line.split()
+            if len(parts) == 3 and parts[0] == "L":
+                links.setdefault(parts[2], parts[1])
+    return links
+
+
+def canonical_timezone(name: str, links: Mapping[str, str]) -> str:
+    """Follow tz database links from *name* to the zone it names.
 
     Args:
-        feeds: The feeds to merge.
+        name: A timezone name, e.g. ``US/Eastern``.
+        links: Output of :func:`load_timezone_links`.
+
+    Returns:
+        The zone name, e.g. ``America/New_York``; *name* itself when it is not an alias.
+    """
+    seen = {name}
+    while name in links and links[name] not in seen:
+        name = links[name]
+        seen.add(name)
+    return name
+
+
+def check_timezones(feeds: Sequence[Feed], links: Optional[Mapping[str, str]] = None) -> None:
+    """Require one agency_timezone across all feeds, as GTFS requires.
+
+    Names the installed tz database links to the same zone (``US/Eastern`` and
+    ``America/New_York``) count as one timezone. When the feeds spell it
+    differently, every agency is given the zone's canonical name.
+
+    Args:
+        feeds: The feeds to merge. Their agency tables may be updated in place.
+        links: Alias-to-zone mapping; defaults to :func:`load_timezone_links`.
 
     Raises:
         MergeError: The feeds' agencies use different timezones.
     """
-    found: dict[str, list[str]] = {}
+    if links is None:
+        links = load_timezone_links()
+    found: dict[str, dict[str, list[str]]] = {}
     for feed in feeds:
         for tz in feed.tables["agency"]["agency_timezone"].str.strip().unique():
-            found.setdefault(tz, []).append(feed.label)
+            zone = canonical_timezone(tz, links)
+            found.setdefault(zone, {}).setdefault(tz, []).append(feed.label)
+    spellings = {tz: labels for names in found.values() for tz, labels in names.items()}
+    detail = "; ".join(f"{tz}: {', '.join(labels)}" for tz, labels in sorted(spellings.items()))
     if len(found) > 1:
-        detail = "; ".join(f"{tz}: {', '.join(labels)}" for tz, labels in sorted(found.items()))
+        hint = (
+            ""
+            if links
+            else " No tz database link table (tzdata.zi) was found, so aliases such as "
+            "US/Eastern could not be matched to their zones."
+        )
         raise MergeError(
             "GTFS allows one agency_timezone per feed, but these feeds use several "
-            f"({detail}). Merge only feeds in the same timezone."
+            f"({detail}). Merge only feeds in the same timezone.{hint}"
         )
+    if len(found) == 1 and len(spellings) > 1:
+        zone = next(iter(found))
+        logging.info(
+            "Feeds name the same timezone differently (%s); the merged feed uses '%s'.",
+            detail,
+            zone,
+        )
+        for feed in feeds:
+            feed.tables["agency"]["agency_timezone"] = zone
 
 
 def feed_service_dates(tables: Mapping[str, pd.DataFrame]) -> dict[str, set[dt.date]]:

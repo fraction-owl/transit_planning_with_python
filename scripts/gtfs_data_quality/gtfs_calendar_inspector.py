@@ -22,7 +22,7 @@ Inputs
 Outputs
 -------
 - ``calendar_service_summary.csv``: one row per service_id — inferred labels
-  (Weekday / Saturday / Sunday / Holiday), active-date count and range,
+  (Weekday / Saturday / Sunday / Holiday / Special), active-date count and range,
   per-year rate, day-of-week breakdown, holiday overlap, trip count, and
   sample dates.
 - ``calendar_day_type_summary.csv``: one row per day type — the
@@ -63,7 +63,9 @@ SERVICE_SUMMARY_FILENAME: str = r"calendar_service_summary.csv"
 DAY_TYPE_SUMMARY_FILENAME: str = r"calendar_day_type_summary.csv"
 
 # Classification thresholds — see utils/calendar_helpers.py for guidance on
-# when to raise or lower them.
+# when to raise or lower them. A service running at or below
+# HOLIDAY_MAX_DAYS_PER_YEAR is labelled Holiday when at least one of its dates
+# is an observed U.S. federal holiday, and Special otherwise.
 HOLIDAY_MAX_DAYS_PER_YEAR: float = 25.0
 WEEKDAY_DOW_SHARE: float = 0.80
 
@@ -725,6 +727,37 @@ def _holidays_for(active_dates: Mapping[str, set[dt.date]]) -> set[dt.date]:
     return holidays
 
 
+def _label_special_services(
+    labels: Mapping[str, set[str]],
+    active_dates: Mapping[str, set[dt.date]],
+    holidays: set[dt.date],
+) -> dict[str, set[str]]:
+    """Relabel infrequent services that run on no holiday from Holiday to Special.
+
+    :func:`classify_service_ids` labels a service Holiday from its rarity alone.
+    A feed's exception dates do not say why a service runs, so the Holiday label
+    is kept only when one of the service's dates is an observed holiday.
+
+    Args:
+        labels: Output of :func:`classify_service_ids`.
+        active_dates: Output of :func:`expand_service_active_dates`.
+        holidays: Observed federal holidays overlapping the feed.
+
+    Returns:
+        A copy of *labels* with unsupported Holiday labels replaced by Special.
+    """
+    result: dict[str, set[str]] = {}
+    for sid, sid_labels in labels.items():
+        result[sid] = set(sid_labels)
+        if "Holiday" in sid_labels and not active_dates.get(sid, set()) & holidays:
+            result[sid] = (result[sid] - {"Holiday"}) | {"Special"}
+            logging.info(
+                "Service %s: infrequent but runs on no observed federal holiday -> Special.",
+                sid,
+            )
+    return result
+
+
 def build_service_summary(
     active_dates: Mapping[str, set[dt.date]],
     labels: Mapping[str, set[str]],
@@ -736,7 +769,7 @@ def build_service_summary(
 
     Args:
         active_dates: Output of :func:`expand_service_active_dates`.
-        labels: Output of :func:`classify_service_ids`.
+        labels: Output of :func:`_label_special_services`.
         trip_counts: Trips per service_id (empty mapping when trips.txt is
             unavailable).
         holidays: Observed federal holidays overlapping the feed.
@@ -891,6 +924,7 @@ def run(
         dow_share=WEEKDAY_DOW_SHARE,
     )
     holidays = _holidays_for(active)
+    labels = _label_special_services(labels, active, holidays)
     trip_counts: dict[str, int] = {}
     if trips is not None and "service_id" in trips.columns:
         trip_counts = trips["service_id"].astype(str).str.strip().value_counts().to_dict()
