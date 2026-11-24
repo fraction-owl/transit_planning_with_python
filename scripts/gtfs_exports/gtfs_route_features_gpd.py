@@ -89,7 +89,8 @@ INPUT_DIR: Final[Path] = Path(r"Path\To\Your\Input_Folder")  # <<< EDIT ME
 GTFS_DIR: Final[Path] = INPUT_DIR / "your_gtfs_name"  # <<< EDIT ME
 
 # Weekday to characterize (monday..friday). The script picks the date with the
-# most active weekday service_ids so a holiday-skewed date isn't used.
+# most active weekday service_ids so a holiday-skewed date isn't used, then
+# keeps every service running on that date, including daily service.
 ANALYSIS_WEEKDAY: Final[str] = "tuesday"  # <<< EDIT ME
 
 # Optional central business district (CBD) layer: a polygon shapefile (.shp) or a .zip
@@ -267,9 +268,8 @@ def _active_service_ids_for_date(
     calendar: pd.DataFrame,
     calendar_dates: Optional[pd.DataFrame],
     analysis_date: dt.date,
-    weekday_service_ids: set[str],
 ) -> set[str]:
-    """Resolve the service_ids active on a date, applying calendar_dates exceptions."""
+    """Resolve every service_id active on a date, applying calendar_dates exceptions."""
     ds = analysis_date.strftime("%Y%m%d")
     col = _WEEKDAY_COLS[analysis_date.weekday()]
 
@@ -293,7 +293,7 @@ def _active_service_ids_for_date(
             active |= set(cd[cd["exception_type"] == "1"]["service_id"].dropna().astype(str))
             active -= set(cd[cd["exception_type"] == "2"]["service_id"].dropna().astype(str))
 
-    return active & weekday_service_ids
+    return active
 
 
 def choose_analysis_date_and_services(
@@ -304,9 +304,12 @@ def choose_analysis_date_and_services(
 ) -> tuple[dt.date, set[str]]:
     """Pick the in-range date of the preferred weekday with the most active service.
 
-    Scans outward from today (clamped to the feed's date range) and returns the
-    first date whose active weekday service_ids equal the full weekday set, or the
-    best date found otherwise.
+    Scans outward from today (clamped to the feed's date range) and picks the
+    first date whose active weekday-only service_ids equal the full weekday-only
+    set, or the date with the most of them otherwise. Weekday-only service just
+    scores the dates (a holiday drops it); the returned set holds every
+    service_id active on the chosen date, including service that also runs on
+    weekends.
     """
     pref_int = _weekday_name_to_int(preferred_weekday)
 
@@ -323,6 +326,7 @@ def choose_analysis_date_and_services(
 
     best_date: Optional[dt.date] = None
     best_active: set[str] = set()
+    best_score = 0
     for step in range(0, max_search_days + 1):
         for sign in (1, -1):
             if step == 0 and sign == -1:
@@ -330,10 +334,11 @@ def choose_analysis_date_and_services(
             cand = anchor + dt.timedelta(days=step * sign)
             if cand < min_start or cand > max_end or cand.weekday() != pref_int:
                 continue
-            active = _active_service_ids_for_date(cal, calendar_dates, cand, weekday_sids)
-            if len(active) > len(best_active):
-                best_date, best_active = cand, active
-            if active and len(active) == len(weekday_sids):
+            active = _active_service_ids_for_date(cal, calendar_dates, cand)
+            score = len(active & weekday_sids)
+            if score > best_score:
+                best_date, best_active, best_score = cand, active, score
+            if score == len(weekday_sids):
                 return cand, active
 
     if best_date is None or not best_active:
@@ -474,9 +479,10 @@ def _service_day_coverage(trip_times: pd.DataFrame, bins_per_day: int = 24) -> p
     departures -- rather than whole operating intervals -- mirrors the service a rider
     waiting at a stop actually experiences: what matters is how often a boardable vehicle
     shows up, not that some bus is mid-route elsewhere. A long trip therefore credits only
-    the bin it starts in. Late-night trips keep the GTFS extended clock (e.g. a 25:30
-    departure falls in bin 25, not wrapped back to 01:30), matching how span_hours and
-    runtimes treat after-midnight times here.
+    the bin it starts in. After-midnight departures wrap onto the clock (a 25:30
+    departure falls in bin 1, with any 01:30 departure), so this is the share of the 24
+    clock hours with a departure and never exceeds 100. span_hours and runtimes keep the
+    GTFS extended clock, where a value above 24 hours is meaningful.
 
     Bins are one hour wide on purpose: a route running at least hourly then fills every
     hour it operates, so this stays a span / availability measure. Finer frequency (e.g.
@@ -496,6 +502,7 @@ def _service_day_coverage(trip_times: pd.DataFrame, bins_per_day: int = 24) -> p
 
     bin_sec = 86_400.0 / bins_per_day
     bin_idx = np.floor(df["start_sec"].to_numpy(dtype=float) / bin_sec).astype(np.int64)
+    bin_idx %= bins_per_day
 
     served: dict[str, set[int]] = {}
     for route_id, b in zip(df["route_id"].to_numpy(), bin_idx):
@@ -1121,6 +1128,23 @@ def run(
         raise ValueError("No trips after the weekday service filter.")
 
     trip_ids = set(trips["trip_id"])
+    try:
+        frequencies = _read_feed_csv(gtfs_dir, "frequencies.txt")
+        frequency_trip_ids = set(frequencies.get("trip_id", pd.Series(dtype=str)).dropna())
+    except FileNotFoundError:
+        frequency_trip_ids = set()  # optional file
+    templates = sorted(trip_ids & frequency_trip_ids)
+    if templates:
+        # Each frequencies.txt row repeats a template trip; counting the template
+        # once would understate trips, revenue hours and miles, so stop rather
+        # than write misleading model inputs.
+        listed = ", ".join(templates[:5]) + (", ..." if len(templates) > 5 else "")
+        raise ValueError(
+            f"{len(templates)} selected trip(s) ({listed}) are frequency-based trips in "
+            "frequencies.txt, which this script does not expand: each would count as a single "
+            "departure. Expand them into individually scheduled trips in trips.txt and "
+            "stop_times.txt, then rerun."
+        )
     shape_ids = set(trips["shape_id"]) - {""}
 
     with open_gtfs_file(gtfs_dir, "stop_times.txt") as handle:

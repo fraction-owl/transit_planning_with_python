@@ -27,8 +27,10 @@ In OUTPUT_DIR:
     into one table, with an added ``month`` column (``YYYY-MM``) and a
     ``source_file`` column recording which extract each row came from.
   * ``monthly_system_ridership.csv`` -- one row per month: total trips plus
-    member/casual and electric/classic splits and the dockless (blank-station)
-    start count.
+    member/casual/other and electric/classic/other splits and the dockless
+    (blank-station) start count. ``other_rider_trips`` / ``other_bike_trips``
+    hold trips whose ``member_casual`` / ``rideable_type`` is blank or not a
+    recognized value (e.g. ``docked_bike``), so each split sums to the total.
   * ``monthly_station_ridership.csv`` -- one row per (month, station): trips
     departing, arriving, and total activity. Dockless trips with a blank
     station are excluded from the per-station table but still counted in the
@@ -37,7 +39,9 @@ In OUTPUT_DIR:
     ridership (departures + arrivals) on weekdays, Saturdays, and Sundays,
     plus the day counts used as denominators.
   * ``plots/system_ridership_trend.png`` -- system-wide trips per month.
-  * ``plots/stations/station_<id>.png`` -- one trend chart per station.
+  * ``plots/stations/station_<id>.png`` -- one trend chart per station. Ids
+    are made filesystem-safe; distinct ids that would share a file name
+    (e.g. ``A B`` and ``A/B``) get a short hash of the id appended.
 
 Typical usage
 -------------
@@ -55,6 +59,7 @@ from __future__ import annotations
 import argparse
 import calendar
 import datetime as dt
+import hashlib
 import io
 import logging
 import re
@@ -62,7 +67,7 @@ import sys
 import zipfile
 from collections import Counter
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import Iterable, List, Optional, Sequence
 
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
@@ -308,31 +313,66 @@ def load_trips(input_path: Path) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 
+#: Recognized category values, counted directly by :func:`build_system_monthly`.
+#: Any other value, including a blank, goes to the ``other_*`` column so each
+#: split still sums to ``total_trips``.
+RIDER_TYPES: tuple[str, ...] = ("member", "casual")
+BIKE_TYPES: tuple[str, ...] = ("electric_bike", "classic_bike")
+
+
+def _warn_other_values(values: pd.Series, known: Sequence[str], column: str) -> pd.Series:
+    """Return a mask of *values* outside *known*, logging what those values are."""
+    other = ~values.isin(known)
+    if other.any():
+        found = values[other].fillna("").value_counts()
+        listing = ", ".join(
+            f"{value!r}: {n}" if value else f"blank: {n}" for value, n in found.items()
+        )
+        logger.warning(
+            "%d trip(s) have a %s outside %s and are counted as other: %s",
+            int(other.sum()),
+            column,
+            list(known),
+            listing,
+        )
+    return other
+
+
 def build_system_monthly(trips: pd.DataFrame) -> pd.DataFrame:
     """Aggregate trips to one row per month with split-out counts.
+
+    Each category in :data:`RIDER_TYPES` and :data:`BIKE_TYPES` is counted
+    directly. Trips with any other or blank value are counted in
+    ``other_rider_trips`` / ``other_bike_trips`` (and logged), so they are not
+    folded into casual or classic.
 
     Args:
         trips: Concatenated trips, as returned by :func:`load_trips`.
 
     Returns:
-        One row per month (sorted) with ``total_trips``, member/casual and
-        electric/classic splits, and the dockless (blank start station) count.
+        One row per month (sorted) with ``total_trips``, member/casual/other and
+        electric/classic/other splits, and the dockless (blank start station)
+        count.
     """
     flags = pd.DataFrame(
         {
             "month": trips["month"],
             "member_trips": trips["member_casual"] == "member",
+            "casual_trips": trips["member_casual"] == "casual",
+            "other_rider_trips": _warn_other_values(
+                trips["member_casual"], RIDER_TYPES, "member_casual"
+            ),
             "electric_trips": trips["rideable_type"] == "electric_bike",
+            "classic_trips": trips["rideable_type"] == "classic_bike",
+            "other_bike_trips": _warn_other_values(
+                trips["rideable_type"], BIKE_TYPES, "rideable_type"
+            ),
             "dockless_start_trips": trips["start_station_id"].str.len() == 0,
         }
     )
     counts = flags.groupby("month", sort=True).sum().astype(int)
     summary = pd.DataFrame({"total_trips": flags.groupby("month", sort=True).size()})
-    summary["member_trips"] = counts["member_trips"]
-    summary["casual_trips"] = summary["total_trips"] - summary["member_trips"]
-    summary["electric_trips"] = counts["electric_trips"]
-    summary["classic_trips"] = summary["total_trips"] - summary["electric_trips"]
-    summary["dockless_start_trips"] = counts["dockless_start_trips"]
+    summary = summary.join(counts)
     summary.index.name = "month"
     return summary.reset_index()
 
@@ -616,6 +656,9 @@ def plot_station_trends(
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     totals = station_monthly.groupby("station_id")["total"].sum().sort_values(ascending=False)
+    # Name files from every station, not just the plotted ones, so a station's
+    # chart name does not change with max_plots.
+    file_names = _station_chart_filenames(totals.index)
     if max_plots and max_plots > 0:
         totals = totals.head(max_plots)
 
@@ -636,7 +679,7 @@ def plot_station_trends(
         ax.legend()
         _format_month_axis(fig, ax, len(rows))
         fig.tight_layout()
-        path = out_dir / f"station_{_safe_name(station_id)}.png"
+        path = out_dir / file_names[station_id]
         fig.savefig(path, dpi=120)
         plt.close(fig)
         written.append(path)
@@ -654,6 +697,37 @@ def _format_month_axis(fig: plt.Figure, ax: plt.Axes, n_months: int) -> None:
 def _safe_name(value: str) -> str:
     """Reduce a value to a filesystem-safe slug for use in a file name."""
     return re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("_") or "unknown"
+
+
+def _station_chart_filenames(station_ids: Iterable[str]) -> dict[str, str]:
+    """Map each station id to its own ``station_<slug>.png`` file name.
+
+    Slugs come from :func:`_safe_name`, which can map distinct ids to one
+    slug (``"A B"`` and ``"A/B"`` both become ``A_B``). Slugs are compared
+    case-insensitively, as Windows and macOS file systems do, and every id
+    whose slug collides gets the first 8 hex digits of the SHA-256 of the raw
+    id appended, so no chart overwrites another.
+
+    Args:
+        station_ids: Distinct station ids.
+
+    Returns:
+        File names keyed by station id.
+
+    Raises:
+        ValueError: If names still collide after the hash is appended.
+    """
+    slugs = {station_id: _safe_name(str(station_id)) for station_id in station_ids}
+    slug_counts = Counter(slug.casefold() for slug in slugs.values())
+    names: dict[str, str] = {}
+    for station_id, slug in slugs.items():
+        if slug_counts[slug.casefold()] > 1:
+            digest = hashlib.sha256(str(station_id).encode("utf-8")).hexdigest()[:8]
+            slug = f"{slug}_{digest}"
+        names[station_id] = f"station_{slug}.png"
+    if len({name.casefold() for name in names.values()}) < len(names):
+        raise ValueError("Station chart file names collide even after appending id hashes.")
+    return names
 
 
 # ---------------------------------------------------------------------------

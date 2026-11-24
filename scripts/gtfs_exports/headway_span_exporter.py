@@ -9,14 +9,17 @@ avg_headway_min
     Mean gap (minutes) between consecutive trip departures from the first
     stop of each trip.  Computed per direction then averaged across
     directions, so a two-way route is not credited with half its true
-    headway.
+    headway.  Departure seconds are kept until the final rounding.
 span_hrs
-    Hours from the first departure to the last departure.  GTFS times
-    beyond 24:00 (e.g. ``"25:30:00"``) are handled correctly — they are
-    preserved as integers ≥ 1440 minutes before the span is calculated.
+    Hours from the first departure to the last departure, across all
+    directions.  GTFS times beyond 24:00 (e.g. ``"25:30:00"``) count past
+    midnight before the span is calculated.
 trip_count
-    Total one-way trips across all directions (diagnostic; not used by
-    the model directly).
+    One-way trips whose departures went into the metrics above.
+excluded_trip_count
+    Selected trips with fewer than two ``stop_times.txt`` rows, left out of
+    all metrics and listed in a warning (``gtfs_schedule_exporter.py``
+    rejects the same trips).
 
 Weekday service is the default because the ridership model uses weekday
 NTD data.  A single day (e.g. ``"friday"``) can be selected via
@@ -26,19 +29,26 @@ differ, and ``SERVICE_DATE`` pins the analysis to one explicit date.
 Outputs
 -------
 - ``headway_span_by_route.csv`` (``OUTPUT_FILENAME``) in ``OUTPUT_DIR``: one
-  row per ``route_id`` with ``avg_headway_min``, ``span_hrs``, and
-  ``trip_count``.
+  row per ``route_id`` with ``avg_headway_min``, ``span_hrs``,
+  ``trip_count``, and ``excluded_trip_count``. A ``SERVICE_DATE`` inside the
+  feed's calendar with no trips (e.g. a holiday shutdown) gives a header-only
+  CSV and a successful run.
 
 Notes:
     Service selection is date-based: ``calendar.txt`` and ``calendar_dates.txt``
-    are expanded into each service_id's real set of active dates, and metrics
-    are computed for a single representative date of the requested day type
+    (either may be absent, but not both) are expanded into each service_id's
+    real set of active dates, and metrics are computed for a single
+    representative date of the requested day type
     (the median date of the most common service pattern, skipping observed
     federal holidays). This keeps holiday-only services out of weekday
     headways and avoids double-counting agencies that run distinct Monday /
     midweek / Friday schedules — the script warns when it detects that split.
     Feeds whose calendar lacks usable dates fall back to the day-of-week
     columns with a warning; ``SERVICE_DATE`` overrides selection entirely.
+    A ``SERVICE_DATE`` outside the dates the calendar files cover is an error.
+    Frequency-based trips are not expanded: if any selected trip appears in
+    ``frequencies.txt``, the run stops with an error rather than counting the
+    template trip as a single departure.
 
 Typical usage
 -------------
@@ -96,8 +106,20 @@ REQ_FILES: Final[tuple[str, ...]] = (
     "trips.txt",
     "stop_times.txt",
     "routes.txt",
-    "calendar.txt",
 )
+# Columns of an empty calendar.txt stand-in for calendar_dates-only feeds.
+_CALENDAR_COLS: Final[list[str]] = [
+    "service_id",
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+    "start_date",
+    "end_date",
+]
 _DAY_COLS: Final[dict[str, list[str]]] = {
     "weekday": ["monday", "tuesday", "wednesday", "thursday", "friday"],
     "monday": ["monday"],
@@ -108,6 +130,16 @@ _DAY_COLS: Final[dict[str, list[str]]] = {
     "saturday": ["saturday"],
     "sunday": ["sunday"],
 }
+# A trip needs at least this many stop_times rows to count as a departure
+# (the same rule gtfs_schedule_exporter.py applies when it rejects trips).
+MIN_STOP_TIMES_PER_TRIP: Final[int] = 2
+OUTPUT_COLUMNS: Final[list[str]] = [
+    "route_id",
+    "avg_headway_min",
+    "span_hrs",
+    "trip_count",
+    "excluded_trip_count",
+]
 _SERVICE_DAY_CHOICES: Final[tuple[str, ...]] = (
     "weekday",
     "monday",
@@ -124,13 +156,14 @@ _SERVICE_DAY_CHOICES: Final[tuple[str, ...]] = (
 # =============================================================================
 
 
-def parse_time_to_minutes(time_value: Optional[str]) -> Optional[int]:
-    """Convert an ``HH:MM[:SS]`` time string to integer minutes past midnight.
+def parse_time_to_seconds(time_value: Optional[str]) -> Optional[int]:
+    """Convert an ``HH:MM[:SS]`` time string to integer seconds past midnight.
 
     GTFS times may exceed 24:00 (e.g. ``"25:30:00"`` for a 1:30 AM trip on
     the following calendar day); those values are preserved as integers
-    greater than or equal to 1440. Seconds, when present, are rounded to the
-    nearest minute.
+    greater than or equal to 86400. Seconds are kept rather than rounded to
+    the minute, so headways between departures a few seconds off the minute
+    are not distorted.
 
     Args:
         time_value: Time string such as ``"7:05"``, ``"07:05:00"``, or
@@ -138,7 +171,7 @@ def parse_time_to_minutes(time_value: Optional[str]) -> Optional[int]:
             Non-string or malformed values yield ``None``.
 
     Returns:
-        Minutes since midnight, or ``None`` if the value cannot be parsed.
+        Seconds since midnight, or ``None`` if the value cannot be parsed.
     """
     if not isinstance(time_value, str):
         return None
@@ -153,7 +186,7 @@ def parse_time_to_minutes(time_value: Optional[str]) -> Optional[int]:
         return None
     if hours < 0 or not 0 <= minutes < 60 or not 0 <= seconds < 60:
         return None
-    return hours * 60 + minutes + round(seconds / 60)
+    return hours * 3600 + minutes * 60 + seconds
 
 
 @contextmanager
@@ -577,6 +610,37 @@ def federal_holidays_observed(year: int) -> set[dt.date]:
     return {observed(day) for day in fixed} | set(floating)
 
 
+def calendar_period(
+    calendar: Optional[pd.DataFrame], calendar_dates: Optional[pd.DataFrame]
+) -> Optional[tuple[dt.date, dt.date]]:
+    """Return the first and last dates the feed's calendar files cover.
+
+    The period runs from the earliest ``start_date`` or ``calendar_dates``
+    date to the latest ``end_date`` or ``calendar_dates`` date, so a date
+    inside it with no active service is a scheduled no-service day rather
+    than a day the feed says nothing about.
+
+    Args:
+        calendar: Parsed ``calendar.txt`` or ``None``.
+        calendar_dates: Parsed ``calendar_dates.txt`` or ``None``.
+
+    Returns:
+        ``(first, last)`` dates, or ``None`` when no date parses.
+    """
+    values: list[pd.Series] = []
+    if calendar is not None:
+        values += [calendar[c] for c in ("start_date", "end_date") if c in calendar.columns]
+    if calendar_dates is not None and "date" in calendar_dates.columns:
+        values.append(calendar_dates["date"])
+    if not values:
+        return None
+    text = pd.concat(values).dropna().astype(str).str.strip()
+    parsed = pd.to_datetime(text, format="%Y%m%d", errors="coerce").dropna()
+    if parsed.empty:
+        return None
+    return parsed.min().date(), parsed.max().date()
+
+
 def resolve_service_ids(
     calendar: pd.DataFrame,
     calendar_dates: Optional[pd.DataFrame],
@@ -591,8 +655,12 @@ def resolve_service_ids(
     override. Feeds whose calendar rows lack usable dates fall back to the
     day-of-week columns via :func:`service_ids_for_day`, with a warning.
 
+    An override date inside :func:`calendar_period` with no active service
+    returns an empty set: the feed schedules no service that day.
+
     Args:
-        calendar: Parsed ``calendar.txt``.
+        calendar: Parsed ``calendar.txt`` (an empty table when the feed has
+            only ``calendar_dates.txt``).
         calendar_dates: Parsed ``calendar_dates.txt`` or ``None``.
         service_day: ``"weekday"`` or one of the seven day names.
         service_date_text: Optional explicit ``YYYYMMDD`` analysis date.
@@ -602,7 +670,9 @@ def resolve_service_ids(
 
     Raises:
         ValueError: If *service_date_text* is set but not a valid YYYYMMDD
-            date, or the override date cannot be resolved against the feed.
+            date, the override date cannot be resolved against the feed, or
+            it has no active service and falls outside the period the feed's
+            calendar covers.
     """
     override: Optional[dt.date] = None
     if service_date_text.strip():
@@ -617,6 +687,20 @@ def resolve_service_ids(
         active = expand_service_active_dates(calendar, calendar_dates)
         if override is not None:
             _, ids = representative_service_date(active, service_day, override_date=override)
+            if not ids:
+                period = calendar_period(calendar, calendar_dates)
+                if period is None or not period[0] <= override <= period[1]:
+                    covered = (
+                        f"it covers {period[0]:%Y%m%d} to {period[1]:%Y%m%d}"
+                        if period
+                        else "it has no parseable dates"
+                    )
+                    raise ValueError(
+                        f"SERVICE_DATE {override:%Y%m%d} is outside the period the feed's "
+                        f"calendar covers ({covered}), so the feed cannot say whether service "
+                        "runs that day. Pick a date inside that period or use a feed that "
+                        "covers it."
+                    )
             return ids
         years = {d.year for dates in active.values() for d in dates}
         holidays: set[dt.date] = set()
@@ -635,6 +719,21 @@ def resolve_service_ids(
         return service_ids_for_day(calendar, service_day)
 
 
+def stop_time_counts(stop_times: pd.DataFrame, trip_ids: set[str]) -> pd.Series:
+    """Count the ``stop_times.txt`` rows of each trip in *trip_ids*.
+
+    Args:
+        stop_times: Full ``stop_times.txt`` DataFrame.
+        trip_ids: Set of trip_id strings to count.
+
+    Returns:
+        Row count per trip_id, indexed by trip_id; a trip with no rows
+        counts 0.
+    """
+    counts = stop_times.loc[stop_times["trip_id"].isin(trip_ids), "trip_id"].value_counts()
+    return counts.reindex(sorted(trip_ids), fill_value=0)
+
+
 def first_departures(stop_times: pd.DataFrame, trip_ids: set[str]) -> pd.DataFrame:
     """Return one row per trip with the departure time of its first stop.
 
@@ -643,11 +742,13 @@ def first_departures(stop_times: pd.DataFrame, trip_ids: set[str]) -> pd.DataFra
         trip_ids: Set of trip_id strings to process.
 
     Returns:
-        DataFrame with columns ``trip_id`` and ``departure_min``.
+        DataFrame with columns ``trip_id`` and ``departure_min`` (minutes
+        past midnight as a float, so seconds are kept).
     """
     st = stop_times[stop_times["trip_id"].isin(trip_ids)].copy()
     st["stop_sequence"] = pd.to_numeric(st["stop_sequence"], errors="coerce")
-    st["departure_min"] = st["departure_time"].map(parse_time_to_minutes)
+    seconds = pd.to_numeric(st["departure_time"].map(parse_time_to_seconds), errors="coerce")
+    st["departure_min"] = seconds / 60
     st = st.dropna(subset=["stop_sequence", "departure_min"])
     first = st.sort_values("stop_sequence").groupby("trip_id", sort=False).first().reset_index()
     return first[["trip_id", "departure_min"]]
@@ -674,7 +775,8 @@ def compute_headway_span(trips_dep: pd.DataFrame) -> pd.DataFrame:
             {
                 "route_id": route_id,
                 "direction_id": direction_id,
-                "avg_headway_min": round(headway, 1),
+                # Rounded once, after averaging the directions below.
+                "avg_headway_min": headway,
                 "span_min": span_min,
                 "trip_count": n,
             }
@@ -688,11 +790,14 @@ def compute_headway_span(trips_dep: pd.DataFrame) -> pd.DataFrame:
         df.groupby("route_id")
         .agg(
             avg_headway_min=("avg_headway_min", "mean"),
-            span_min=("span_min", "max"),  # longest span across directions
             trip_count=("trip_count", "sum"),
         )
         .reset_index()
     )
+    # Span runs from the route's first departure to its last in any direction,
+    # so an AM-only direction and a PM-only direction still span the whole day.
+    route_deps = trips_dep.groupby("route_id")["departure_min"]
+    out["span_min"] = out["route_id"].map(route_deps.max() - route_deps.min()).astype(float)
     out["avg_headway_min"] = out["avg_headway_min"].round(1)
     out["span_hrs"] = (out["span_min"] / 60).round(2)
     return out[["route_id", "avg_headway_min", "span_hrs", "trip_count"]]
@@ -710,6 +815,17 @@ def run(
 
     Unset args fall back to the config block at the top of this file, so
     ``m.GTFS_FOLDER = ...; m.run()`` works after a plain import.
+
+    A *service_date* inside the feed's calendar period with no scheduled
+    trips writes a header-only CSV and returns an empty frame.
+
+    Raises:
+        FileNotFoundError: If a required file is missing, or the feed has
+            neither ``calendar.txt`` nor ``calendar_dates.txt``.
+        ValueError: If any selected trip is a frequency-based template in
+            ``frequencies.txt``, which this script does not expand; if
+            *service_date* falls outside the feed's calendar period; or if
+            no trips remain after the service and route filters.
     """
     gtfs_folder = GTFS_FOLDER if gtfs_folder is None else Path(gtfs_folder)
     output_path = (OUTPUT_DIR / OUTPUT_FILENAME) if output_path is None else Path(output_path)
@@ -728,18 +844,55 @@ def run(
 
     gtfs = load_gtfs(gtfs_folder)
 
+    calendar: Optional[pd.DataFrame] = None
+    try:
+        with open_gtfs_file(gtfs_folder, "calendar.txt") as handle:
+            calendar = pd.read_csv(handle, dtype=str, low_memory=False)
+    except FileNotFoundError:
+        pass  # optional when calendar_dates.txt is present
+
     calendar_dates: Optional[pd.DataFrame] = None
     try:
         with open_gtfs_file(gtfs_folder, "calendar_dates.txt") as handle:
             calendar_dates = pd.read_csv(handle, dtype=str, low_memory=False)
     except FileNotFoundError:
+        pass  # optional when calendar.txt is present
+
+    if calendar is None and calendar_dates is None:
+        raise FileNotFoundError(
+            f"'{gtfs_folder}' has neither calendar.txt nor calendar_dates.txt; "
+            "GTFS requires at least one."
+        )
+    if calendar is None:
+        # calendar_dates-only feed: every active date comes from exception_type 1 rows.
+        calendar = pd.DataFrame(columns=_CALENDAR_COLS, dtype=str)
+
+    frequency_trip_ids: set[str] = set()
+    try:
+        with open_gtfs_file(gtfs_folder, "frequencies.txt") as handle:
+            frequencies = pd.read_csv(handle, dtype=str, low_memory=False)
+        frequency_trip_ids = set(frequencies.get("trip_id", pd.Series(dtype=str)).dropna())
+    except FileNotFoundError:
         pass  # optional file
 
-    svc_ids = resolve_service_ids(gtfs["calendar"], calendar_dates, service_day, service_date)
+    svc_ids = resolve_service_ids(calendar, calendar_dates, service_day, service_date)
     logging.info("%d service_id(s) matched for SERVICE_DAY=%r.", len(svc_ids), service_day)
 
     trips = gtfs["trips"].copy()
     trips = trips[trips["service_id"].isin(svc_ids)]
+    trips["trip_id"] = trips["trip_id"].astype(str)
+
+    if trips.empty and service_date.strip():
+        # resolve_service_ids has already rejected dates outside the feed's
+        # calendar, so this is a day the feed schedules no service (e.g. a
+        # holiday shutdown): a valid result, not a failure.
+        logging.warning(
+            "No trips are scheduled on SERVICE_DATE %s. Writing a header-only CSV.",
+            service_date.strip(),
+        )
+        result = pd.DataFrame(columns=OUTPUT_COLUMNS)
+        _write_csv(result, output_path)
+        return result
 
     routes = gtfs["routes"][["route_id", "route_short_name"]]
     trips = trips.merge(routes, on="route_id", how="left")
@@ -750,8 +903,9 @@ def run(
         trips = trips[~trips["route_short_name"].isin(filter_out)]
 
     if trips.empty:
-        logging.error("No trips remain after filtering. Check SERVICE_DAY and route filter lists.")
-        sys.exit(1)
+        raise ValueError(
+            "No trips remain after filtering. Check SERVICE_DAY and route filter lists."
+        )
 
     logging.info("%d trips after filtering.", len(trips))
 
@@ -762,17 +916,67 @@ def run(
         trips["direction_id"] = trips["direction_id"].fillna("0")
 
     trip_ids = set(trips["trip_id"].astype(str))
-    dep = first_departures(gtfs["stop_times"], trip_ids)
-    trips["trip_id"] = trips["trip_id"].astype(str)
+    templates = sorted(trip_ids & frequency_trip_ids)
+    if templates:
+        # Each frequencies.txt row repeats a template trip; counting the template
+        # once would undercount trips and misstate headway and span, so stop
+        # rather than guess.
+        listed = ", ".join(templates[:5]) + (", ..." if len(templates) > 5 else "")
+        raise ValueError(
+            f"{len(templates)} selected trip(s) ({listed}) are frequency-based trips in "
+            "frequencies.txt, which this script does not expand: each would count as a single "
+            "departure. Expand them into individually scheduled trips in trips.txt and "
+            "stop_times.txt, or filter out their routes, then rerun."
+        )
+    # A trip with fewer than two stop_times rows is not a departure between
+    # two stops; counting it would shorten headways and inflate trip_count.
+    counts = stop_time_counts(gtfs["stop_times"], trip_ids)
+    short_ids = set(counts.index[counts < MIN_STOP_TIMES_PER_TRIP])
+    if short_ids:
+        listed = sorted(short_ids)
+        logging.warning(
+            "%d selected trip(s) have fewer than %d stop_times rows and are left out of "
+            "avg_headway_min, span_hrs, and trip_count (see excluded_trip_count): %s",
+            len(listed),
+            MIN_STOP_TIMES_PER_TRIP,
+            ", ".join(listed[:10]) + (", ..." if len(listed) > 10 else ""),
+        )
+    counted = trips[~trips["trip_id"].isin(short_ids)]
+    dep = first_departures(gtfs["stop_times"], set(counted["trip_id"]))
 
-    trips_dep = trips[["trip_id", "route_id", "direction_id"]].merge(dep, on="trip_id", how="inner")
+    trips_dep = counted[["trip_id", "route_id", "direction_id"]].merge(
+        dep, on="trip_id", how="inner"
+    )
     result = compute_headway_span(trips_dep)
-    logging.info("Computed metrics for %d route(s).", len(result))
+    excluded = (
+        trips.loc[trips["trip_id"].isin(short_ids)]
+        .groupby("route_id")
+        .size()
+        .rename("excluded_trip_count")
+        .reset_index()
+    )
+    # Outer merge keeps a route whose every trip was excluded, so it is
+    # reported with trip_count 0 instead of vanishing from the output.
+    result = result.merge(excluded, on="route_id", how="outer")
+    result["trip_count"] = result["trip_count"].fillna(0).astype(int)
+    result["excluded_trip_count"] = result["excluded_trip_count"].fillna(0).astype(int)
+    result = result[OUTPUT_COLUMNS].sort_values("route_id", ignore_index=True)
+    logging.info(
+        "Computed metrics for %d route(s) from %d trip(s); %d trip(s) excluded.",
+        len(result),
+        int(result["trip_count"].sum()),
+        len(short_ids),
+    )
 
+    _write_csv(result, output_path)
+    return result
+
+
+def _write_csv(result: pd.DataFrame, output_path: Path) -> None:
+    """Write *result* to *output_path*, creating the folder if needed."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     result.to_csv(output_path, index=False)
     logging.info("Written → %s", output_path)
-    return result
 
 
 def notebook_safe_argv(argv: Optional[Sequence[str]]) -> Optional[List[str]]:

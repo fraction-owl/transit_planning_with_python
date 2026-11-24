@@ -382,6 +382,10 @@ def extract_modifiers(
 def normalize_street_name(name: str, modifiers_set: Set[str]) -> str:
     """Normalize a street name by removing known modifiers, punctuation, and extra spaces.
 
+    Only one modifier is removed: the last one that is not the first word. The
+    street type follows the name ("Johns Rd", "Park St SE"), so "St Johns Rd"
+    becomes "st johns" rather than "johns", which would equal "Johns Rd".
+
     Args:
         name (str): The street name to normalize.
         modifiers_set (set): A set of known modifiers to remove from the name.
@@ -393,7 +397,13 @@ def normalize_street_name(name: str, modifiers_set: Set[str]) -> str:
         return ""
     if modifiers_set:
         pattern = r"\b(" + "|".join(re.escape(m) for m in modifiers_set) + r")\b"
-        name = re.sub(pattern, "", name, flags=re.IGNORECASE)
+        matches = [
+            m
+            for m in re.finditer(pattern, name, flags=re.IGNORECASE)
+            if re.search(r"\w", name[: m.start()])
+        ]
+        if matches:
+            name = name[: matches[-1].start()] + " " + name[matches[-1].end() :]
     name = re.sub(r"[^\w\s]", "", name)
     return re.sub(r"\s+", " ", name).strip().lower()
 
@@ -435,6 +445,8 @@ def spatial_join_stops_roadways(
 def extract_street_names(stop_name: str, modifiers: Set[str]) -> List[str]:
     """Extract potential street names from a stop name using common separators.
 
+    Splits on '@', '&', '/', '+', 'and', 'at', and 'intersection of'.
+
     Args:
         stop_name (str): The name of the stop.
         modifiers (set): A set of known modifiers to assist in normalization.
@@ -444,8 +456,10 @@ def extract_street_names(stop_name: str, modifiers: Set[str]) -> List[str]:
     """
     if pd.isna(stop_name) or not isinstance(stop_name, str):
         return []
-    # Symbol separators split with or without surrounding spaces ("A&B", "A @ B").
-    pattern = r"\s*[@&/+]\s*| and | intersection of "
+    # Symbol separators split with or without surrounding spaces ("A&B", "A @ B");
+    # word separators ("and", "at") need them. "Intersection of" also splits at
+    # the start of the name, so it is not left attached to the first street.
+    pattern = r"\s*[@&/+]\s*| and | at |(?:^|\s)intersection of "
     streets = re.split(pattern, stop_name, flags=re.IGNORECASE)
     return [normalize_street_name(street, modifiers) for street in streets if street]
 
@@ -512,7 +526,8 @@ def process_typos(
     buffer (the per-stop local set), as determined by ``join_gdf``. A stop is
     therefore never compared against a similarly-named road elsewhere in the
     region, and reported original road names come only from the road
-    features that actually intersect the buffer.
+    features that actually intersect the buffer. Stops with no named road in
+    their buffer are skipped, and their number is logged.
 
     Args:
         stops_gdf (gpd.GeoDataFrame): The GeoDataFrame of stops.
@@ -528,12 +543,16 @@ def process_typos(
     """
     # Build per-stop {normalized name -> original names} from the spatial join,
     # so both the comparison set and the reported names are buffer-local.
+    # A blank cleaned name can never match a street, so it does not make a
+    # stop assessable.
     local = join_gdf.dropna(subset=["FULLNAME_clean", "FULLNAME"])
+    local = local.loc[local["FULLNAME_clean"] != ""]
     nearby_by_stop: Dict[str, Dict[str, Set[str]]] = {}
     for s_id, clean, original in zip(local["stop_id"], local["FULLNAME_clean"], local["FULLNAME"]):
         nearby_by_stop.setdefault(s_id, {}).setdefault(clean, set()).add(original)
 
     potential_typos: List[Dict[str, Any]] = []
+    unassessed = 0
     for _, stop in stops_gdf.iterrows():
         s_id = stop["stop_id"]
         s_name = stop["stop_name"]
@@ -542,10 +561,18 @@ def process_typos(
         local_road_names = nearby_by_stop.get(s_id, {})
         if not local_road_names:
             # No roads within this stop's buffer -- nothing to compare against.
+            unassessed += 1
             continue
 
         typos = compare_stop_to_roads(s_id, s_name, s_streets, local_road_names, threshold)
         potential_typos.extend(typos)
+
+    if unassessed:
+        logging.info(
+            "%d of %d stop(s) had no named road within the buffer and were not assessed.",
+            unassessed,
+            len(stops_gdf),
+        )
 
     logging.info("Total potential typos found before deduplication: %d", len(potential_typos))
     if not potential_typos:
@@ -783,7 +810,15 @@ def main() -> int:
     # 9. Buffer stops, spatial-join with roadways
     stops_buffered = create_buffered_stops(stops_gdf, buffer_distance)
     join_gdf = spatial_join_stops_roadways(stops_buffered, roadways_gdf)
-    logging.info("Spatial join produced %d candidate matches", join_gdf.shape[0])
+    # The left join keeps one row, with no road, for each stop that matched
+    # nothing, so count only rows that carry a road.
+    matched = join_gdf["index_right"].notna()
+    logging.info(
+        "Spatial join found %d stop-road intersection(s) across %d of %d stop(s).",
+        int(matched.sum()),
+        join_gdf.index[matched].nunique(),
+        len(stops_buffered),
+    )
 
     # ------------------------------------------------------------------
     # 10. Fuzzy-match street names to find potential typos

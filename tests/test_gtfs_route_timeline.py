@@ -155,7 +155,7 @@ def test_resolve_periods_infers_starts_from_feed_bounds() -> None:
     periods = resolve_periods(["d1", "d2"], ["f1", "f2"], summaries, None, None, 90)
     assert periods[0].start == dt.date(2024, 1, 1)
     assert periods[0].end == dt.date(2024, 7, 1)
-    assert periods[1].end == dt.date(2024, 12, 31)  # last feed's own declared end
+    assert periods[1].end == dt.date(2025, 1, 1)  # day after the last feed's declared end
     assert periods[0].start_source == "calendar"
     assert periods[1].start_source == "feed_info"
 
@@ -179,6 +179,20 @@ def test_resolve_periods_final_end_falls_back_to_fixed_days() -> None:
     ]
     periods = resolve_periods(["d1", "d2"], ["f1", "f2"], summaries, None, None, 90)
     assert periods[1].end == dt.date(2024, 7, 1) + dt.timedelta(days=90)
+
+
+def test_resolve_periods_keeps_a_one_day_final_feed() -> None:
+    """A final feed declaring one service day ends the next day, not 90 days later."""
+    summaries = [
+        _summary([("R1", "1")], bounds=("20260101", "20260331", "calendar")),
+        _summary([("R1", "1")], bounds=("20260401", "20260401", "feed_info")),
+    ]
+    periods = resolve_periods(["d1", "d2"], ["f1", "f2"], summaries, None, None, 90)
+    assert (periods[1].start, periods[1].end) == (dt.date(2026, 4, 1), dt.date(2026, 4, 2))
+    # An end before the final feed's start is unusable and still falls back.
+    summaries[1] = _summary([("R1", "1")], bounds=("20260401", "20260331", "calendar"))
+    periods = resolve_periods(["d1", "d2"], ["f1", "f2"], summaries, None, None, 90)
+    assert periods[1].end == dt.date(2026, 4, 1) + dt.timedelta(days=90)
 
 
 def test_resolve_periods_rejects_single_feed() -> None:
@@ -289,6 +303,40 @@ def test_build_lineages_gap_rejoins_same_route_id() -> None:
     assert len(lineages) == 2
     r2 = next(ln for ln in lineages if ln.display_name() == "2")
     assert r2.ids == {0: "R2", 2: "R2"}
+
+
+def test_build_lineages_two_ids_returning_to_one_row_both_survive(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A rekeyed to B, both vanish, then A and B return together: both stay listed."""
+    stops = frozenset({"x", "y", "z"})
+    summaries = [
+        _summary([("A", "5")], {"A": stops}),
+        _summary([("B", "5")], {"B": stops}),
+        _summary([("Z", "9")], {"Z": frozenset({"q"})}),
+        _summary([("A", "5"), ("B", "5")], {"A": stops, "B": stops}),
+    ]
+    with caplog.at_level("WARNING"):
+        lineages = build_lineages(summaries, 0.5)
+    final_ids = sorted(ln.ids[3] for ln in lineages if 3 in ln.ids)
+    assert final_ids == ["A", "B"]
+    original = next(ln for ln in lineages if ln.first_index() == 0)
+    assert original.ids == {0: "A", 1: "B", 3: "B"}  # the row keeps the id it last carried
+    reused = next(ln for ln in lineages if ln.ids == {3: "A"})
+    assert "ambiguous reuse: route_id A" in reused.notes[3]
+    assert "ambiguous reuse" in caplog.text
+
+    periods = _periods(
+        [
+            ("2024-01-01", "2024-04-01"),
+            ("2024-04-01", "2024-07-01"),
+            ("2024-07-01", "2024-10-01"),
+            ("2024-10-01", "2025-01-01"),
+        ]
+    )
+    events = build_events_table(lineages, periods)
+    added_a = events[(events["event"] == "added") & (events["route_id_after"] == "A")]
+    assert added_a["detail"].str.contains("ambiguous reuse").tolist() == [True]
 
 
 def test_build_lineages_sorted_by_first_appearance_then_name() -> None:
@@ -417,7 +465,7 @@ def test_run_timeline_end_to_end(tmp_path: Path) -> None:
 
     periods = pd.read_csv(out_dir / "feed_periods.csv")
     assert periods["start"].tolist() == ["2024-01-01", "2024-07-01", "2025-01-01"]
-    assert periods["end"].tolist() == ["2024-07-01", "2025-01-01", "2025-06-30"]
+    assert periods["end"].tolist() == ["2024-07-01", "2025-01-01", "2025-07-01"]
 
     for name in (
         "route_timeline.csv",

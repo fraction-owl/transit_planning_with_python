@@ -2,10 +2,15 @@
 
 Reads a GTFS feed and, optionally, its TODS supplement files, rebuilds each
 vehicle block's day (pull-out, revenue trips, layovers, deadheads, pull-in) and
-totals the hours by GTFS service, by day type (Weekday / Saturday / Sunday /
-Holiday) and by reporting period, such as a month. TODS supplements are applied
-to the GTFS tables by the TODS 2.1 rules (delete, update, add) before anything
-is counted. Without TODS the run reports revenue trip hours and layover only.
+totals the hours by service set (the GTFS services that run together on a date),
+by day type (Weekday / Saturday / Sunday / Holiday) and by reporting period, such
+as a month. TODS supplements are applied by the TODS 2.1 rules (delete, update, add; trips on
+a deleted route are ignored) before anything is counted. Until TODS_MOVEMENTS_COMPLETE confirms
+the TODS holds every block's movements, only revenue trip hours and layover are reported.
+
+Blocks are rebuilt once for each service set that runs on some date, from the
+trips of every service in that set: GTFS defines a block by its block_id and
+the days its trips share, so one block can join trips of different service_ids.
 
 Each block's time is split into revenue trip hours (first departure to last
 arrival of each revenue trip), layover (the vehicle waits at one place between
@@ -15,24 +20,29 @@ ends one movement somewhere other than where the next begins with no scheduled
 movement in between. Vehicle revenue hours add layover to revenue trip hours
 when LAYOVER_IN_REVENUE_HOURS is True; vehicle hours run from pull-out to pull-in.
 
-Day types come from SERVICE_DAY_TYPES or, when that is empty, from each
-service's GTFS active dates. Period totals count each date's services from the
-GTFS calendar (calendar.txt, calendar_dates.txt and their TODS supplements) or,
-with PERIOD_CALENDAR = "config", from each date's day type, treating
-HOLIDAY_DATES (and optionally U.S. federal holidays) as holidays.
+A date's day type is Weekday, Saturday or Sunday, or Holiday for HOLIDAY_DATES (and optionally
+U.S. federal holidays) and, with the GTFS calendar, dates running a service SERVICE_DAY_TYPES
+calls Holiday. Period totals count each date's services from the GTFS calendar (calendar.txt,
+calendar_dates.txt and their TODS supplements) or, with PERIOD_CALENDAR = "config", the
+services of the date's day type: those SERVICE_DAY_TYPES lists (they must run together on some
+date), or else the day type's typical set: the service set that runs on the most dates of that
+type in the feed's calendar (for Holiday, only sets run mostly on holidays); other sets are
+logged. Period days are also counted by the typical day whose service they run: a Christmas
+on Sunday service is a holiday and a Sunday schedule day.
 
 Inputs
 ------
-- GTFS_PATH: GTFS feed, as a folder or ``.zip``.
-- TODS_PATH (optional): TODS supplement files for that feed, as a folder or
-  ``.zip`` (for example from ``tsde_to_tods.py``).
+- GTFS_PATH: GTFS feed, as a folder or ``.zip``. A feed with frequency-based
+  trips (rows in frequencies.txt) stops the run: their repetitions are not expanded.
+- TODS_PATH (optional): TODS 2.1 supplement files for that feed, as a folder or ``.zip``
+  (for example from ``tsde_to_tods.py``); TODS v1 deadhead tables stop the run.
 
 Outputs
 -------
-- ``service_hours_by_block.csv``: hours per block and service, with QA counts.
-- ``service_hours_by_service.csv``: hours per service day of each service_id.
+- ``service_hours_by_block.csv``: hours per block and service set, with QA counts.
+- ``service_hours_by_service.csv``: hours for one day of each service set.
 - ``service_hours_by_day_type.csv``: hours on a typical day of each day type.
-- ``service_hours_by_period.csv``: total hours and day counts per period.
+- ``service_hours_by_period.csv``: total hours, day counts and service sets per period.
 - ``service_hours.xlsx``: the same period totals as Excel formulas, traceable
   through Calendar, Services and Blocks sheets to each trip's start and end time,
   with a layover-as-revenue switch, so totals can be checked and adjusted by hand.
@@ -53,12 +63,13 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import logging
+import math
 import os
 import sys
 import zipfile
 from collections import Counter
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, List, Optional
@@ -80,6 +91,12 @@ GTFS_PATH: str = r"Path\To\Your\GTFS_Folder_or.zip"
 TODS_PATH: Optional[str] = r"Path\To\Your\TODS_Folder_or.zip"
 OUTPUT_DIR: str = r"Path\To\Your\Output_Folder"
 
+# Set True only once the TODS files hold every block's pull-out, pull-in and
+# deadhead trips. Until then, pull-out, pull-in, deadhead, nonrevenue and vehicle
+# hours are left blank, because a movement missing from TODS would count as zero.
+# The log reports how many blocks have TODS movements, to check before confirming.
+TODS_MOVEMENTS_COMPLETE: bool = False
+
 BLOCK_FILENAME: str = "service_hours_by_block.csv"
 SERVICE_FILENAME: str = "service_hours_by_service.csv"
 DAY_TYPE_FILENAME: str = "service_hours_by_day_type.csv"
@@ -93,17 +110,22 @@ PERIODS: List[tuple[str, str, str]] = [("November 2026", "20261101", "20261130")
 # Which services run on each date of a period:
 #   "gtfs"   - the GTFS calendar (with TODS calendar supplements), date by date.
 #   "config" - each date's day type: Weekday / Saturday / Sunday, or Holiday for
-#              the dates below; the services of that day type run.
+#              the dates below; the services of that day type run (from
+#              SERVICE_DAY_TYPES, or else the set that runs on the most dates of
+#              that day type in the GTFS calendar).
 PERIOD_CALENDAR: str = "gtfs"
 
 # service_id -> day type(s): "Weekday", "Saturday", "Sunday", "Holiday", or a
-# comma-separated list such as "Saturday, Sunday". Empty: classify each service
-# from its GTFS active dates.
+# comma-separated list such as "Saturday, Sunday". The services listed under one
+# day type must run together on some date of the GTFS calendar. With the GTFS
+# calendar, a date running a Holiday service counts as a holiday. Empty: config
+# mode runs each day type's typical service set.
 SERVICE_DAY_TYPES: dict[str, str] = {}
 
-# PERIOD_CALENDAR = "config" only: holiday dates (YYYYMMDD), whether to add the
-# observed U.S. federal holidays, and whose services run on a holiday (for
-# example "Sunday" if holidays run the Sunday schedule).
+# Holiday dates (YYYYMMDD) and whether to add the observed U.S. federal
+# holidays; these dates count as holidays in both calendar modes.
+# PERIOD_CALENDAR = "config" only: whose services run on a holiday (for example
+# "Sunday" if holidays run the Sunday schedule).
 HOLIDAY_DATES: List[str] = []
 USE_FEDERAL_HOLIDAYS: bool = True
 HOLIDAY_SERVICE_DAY_TYPE: str = "Holiday"
@@ -169,6 +191,7 @@ class Config:
     use_federal_holidays: bool = USE_FEDERAL_HOLIDAYS
     holiday_service_day_type: str = HOLIDAY_SERVICE_DAY_TYPE
     layover_in_revenue_hours: bool = LAYOVER_IN_REVENUE_HOURS
+    tods_movements_complete: bool = TODS_MOVEMENTS_COMPLETE
 
 
 # =============================================================================
@@ -433,71 +456,6 @@ def service_ids_active_on(
     return {sid for sid, dates in active_dates.items() if target_date in dates}
 
 
-def classify_service_ids(
-    active_dates: Mapping[str, set[dt.date]],
-    holiday_max_days_per_year: float = 25.0,
-    dow_share: float = 0.80,
-) -> dict[str, set[str]]:
-    """Classify each service_id by its real active-date pattern.
-
-    A service operating at or below *holiday_max_days_per_year* is labelled
-    ``Holiday`` — this catches holiday-only services regardless of what
-    their day-of-week columns claim (scheduling-software exports often stamp
-    a weekday pattern on a service that really runs five days a year).
-    Otherwise, day-of-week shares of the active dates determine the labels.
-
-    Args:
-        active_dates: Output of :func:`expand_service_active_dates`.
-        holiday_max_days_per_year: Services active at or below this annual
-            rate are labelled ``Holiday``.
-        dow_share: Minimum fraction of active dates on a day-of-week bucket
-            (Mon–Fri, Saturday, Sunday) to earn that bucket's label.
-
-    Returns:
-        Mapping of ``service_id`` to a set of labels drawn from
-        ``{"Weekday", "Saturday", "Sunday", "Holiday"}``. A service with no
-        active dates maps to an empty set.
-    """
-    result: dict[str, set[str]] = {}
-    for sid, dates in active_dates.items():
-        if not dates:
-            result[sid] = set()
-            logging.info("Service %s: empty (0 active dates).", sid)
-            continue
-        span_days = (max(dates) - min(dates)).days + 1
-        per_year = len(dates) / max(span_days / 365.25, 0.1)
-        labels: set[str] = set()
-        if per_year <= holiday_max_days_per_year:
-            labels.add("Holiday")
-        else:
-            n = len(dates)
-            wd = sum(1 for d in dates if d.weekday() < 5)
-            sat = sum(1 for d in dates if d.weekday() == 5)
-            sun = sum(1 for d in dates if d.weekday() == 6)
-            if wd / n >= dow_share:
-                labels.add("Weekday")
-            if sat / n >= dow_share:
-                labels.add("Saturday")
-            if sun / n >= dow_share:
-                labels.add("Sunday")
-            if not labels:
-                if wd > 0:
-                    labels.add("Weekday")
-                if sat > 0:
-                    labels.add("Saturday")
-                if sun > 0:
-                    labels.add("Sunday")
-        result[sid] = labels
-        logging.info(
-            "Service %s -> %s (%d dates, %.1f/yr).",
-            sid,
-            sorted(labels),
-            len(dates),
-            per_year,
-        )
-    return result
-
-
 def federal_holidays_observed(year: int) -> set[dt.date]:
     """Return the observed dates of the U.S. federal holidays of *year*.
 
@@ -641,6 +599,28 @@ def feed_members(path: Path) -> set[str]:
         return {Path(name).name for name in archive.namelist() if not name.endswith("/")}
 
 
+TODS_V1_TABLES = ("deadheads.txt", "deadhead_times.txt")
+
+
+def reject_tods_v1(path: Path) -> None:
+    """Stop when a TODS input holds TODS v1 deadhead tables.
+
+    This script reads TODS 2.1 supplements (pull-outs, pull-ins and deadheads
+    as ``trips_supplement.txt`` rows). A v1 folder would otherwise load without
+    its deadheads and report plausible but incomplete vehicle hours.
+
+    Raises:
+        ValueError: If *path* contains ``deadheads.txt`` or ``deadhead_times.txt``.
+    """
+    found = sorted(set(TODS_V1_TABLES) & feed_members(path))
+    if found:
+        raise ValueError(
+            f"'{path}' contains TODS v1 deadhead tables ({', '.join(found)}). This script "
+            "expects TODS 2.1 supplements (trips_supplement.txt, stop_times_supplement.txt); "
+            "convert the files to TODS 2.1 first."
+        )
+
+
 def load_tables(path: Path, wanted: Sequence[str]) -> dict[str, pd.DataFrame]:
     """Load the files of *wanted* that exist in the feed, as all-text DataFrames.
 
@@ -711,6 +691,40 @@ def apply_supplement(
     return out.reindex(columns=list(dict.fromkeys([*base.columns, *out.columns]))).fillna("")
 
 
+def drop_trips_on_deleted_routes(
+    trips: pd.DataFrame, routes_before: pd.DataFrame, routes_after: pd.DataFrame
+) -> pd.DataFrame:
+    """Drop trips whose route a TODS ``routes_supplement.txt`` deletes.
+
+    TODS ignores trips that reference a deleted route unless they are
+    reassigned, so pass *trips* after ``trips_supplement.txt`` has been
+    applied: a trip moved to a surviving route keeps its new ``route_id`` and
+    stays. Each dropped trip is counted in a warning.
+
+    Args:
+        trips: Trips table with a ``route_id`` column, already supplemented.
+        routes_before: ``routes.txt`` before ``routes_supplement.txt``.
+        routes_after: The same table after :func:`apply_supplement`.
+
+    Returns:
+        *trips* without the rows on deleted routes.
+    """
+    deleted = set(routes_before.get("route_id", pd.Series(dtype=str)).astype(str)) - set(
+        routes_after.get("route_id", pd.Series(dtype=str)).astype(str)
+    )
+    if not deleted:
+        return trips
+    on_deleted = trips["route_id"].astype(str).isin(deleted)
+    if on_deleted.any():
+        logging.warning(
+            "Ignoring %d trip(s) on route(s) deleted in routes_supplement.txt (%s); "
+            "reassign them to another route in trips_supplement.txt to keep them.",
+            int(on_deleted.sum()),
+            ", ".join(sorted(deleted)),
+        )
+    return trips.loc[~on_deleted]
+
+
 @dataclass
 class Schedule:
     """Supplemented trips with their timing, plus calendar and stop locations."""
@@ -776,15 +790,36 @@ def load_schedule(gtfs_path: Path, tods_path: Optional[Path]) -> Schedule:
 
     Raises:
         OSError: If an input path is missing.
-        ValueError: If required GTFS tables are missing or inconsistent.
+        ValueError: If required GTFS tables are missing or inconsistent, the
+            feed has frequency-based trips, the TODS input holds TODS v1
+            deadhead tables, or the supplements leave no trips.
     """
     gtfs = load_tables(
         gtfs_path,
-        ("trips.txt", "stop_times.txt", "stops.txt", "calendar.txt", "calendar_dates.txt"),
+        (
+            "trips.txt",
+            "stop_times.txt",
+            "stops.txt",
+            "routes.txt",
+            "calendar.txt",
+            "calendar_dates.txt",
+            "frequencies.txt",
+        ),
     )
     for name in ("trips", "stop_times"):
         if name not in gtfs:
             raise ValueError(f"GTFS feed '{gtfs_path}' has no {name}.txt.")
+    frequencies = gtfs.get("frequencies")
+    if frequencies is not None and not frequencies.empty:
+        # Each frequencies.txt row repeats a template trip; counting the template
+        # once would undercount trips and hours, so stop rather than guess.
+        ids = sorted(set(frequencies.get("trip_id", pd.Series(dtype=str))))
+        listed = ", ".join(ids[:5]) + (", ..." if len(ids) > 5 else "")
+        raise ValueError(
+            f"GTFS feed '{gtfs_path}' has frequency-based trips ({listed}) in frequencies.txt, "
+            "which this script does not expand: each would count as a single trip. Expand them "
+            "into individually scheduled trips in trips.txt and stop_times.txt, then rerun."
+        )
     tods: dict[str, pd.DataFrame] = {}
     if tods_path is not None:
         tods = load_tables(
@@ -793,13 +828,24 @@ def load_schedule(gtfs_path: Path, tods_path: Optional[Path]) -> Schedule:
                 "trips_supplement.txt",
                 "stop_times_supplement.txt",
                 "stops_supplement.txt",
+                "routes_supplement.txt",
                 "calendar_supplement.txt",
                 "calendar_dates_supplement.txt",
             ),
         )
+        reject_tods_v1(tods_path)
         if not tods:
             raise ValueError(f"No TODS supplement files found in '{tods_path}'.")
     trips = apply_supplement(gtfs["trips"], tods.get("trips_supplement"), ["trip_id"])
+    routes = apply_supplement(gtfs.get("routes"), tods.get("routes_supplement"), ["route_id"])
+    trips = drop_trips_on_deleted_routes(
+        trips, gtfs.get("routes", pd.DataFrame(columns=["route_id"])), routes
+    )
+    if trips.empty:
+        raise ValueError(
+            f"No trips remain after applying the TODS supplements in '{tods_path}': every trip "
+            "was deleted or is on a route deleted in routes_supplement.txt."
+        )
     stop_times = apply_supplement(
         gtfs["stop_times"], tods.get("stop_times_supplement"), ["trip_id", "stop_sequence"]
     )
@@ -826,25 +872,65 @@ def load_schedule(gtfs_path: Path, tods_path: Optional[Path]) -> Schedule:
 # =============================================================================
 
 
+def _coordinates(place: Optional[tuple[str, str]]) -> Optional[tuple[float, float]]:
+    """Parse a (stop_lat, stop_lon) text pair; None when missing or not numeric."""
+    if place is None:
+        return None
+    try:
+        lat, lon = float(place[0]), float(place[1])
+    except ValueError:
+        return None
+    return (lat, lon) if math.isfinite(lat) and math.isfinite(lon) else None
+
+
 def same_place(a: str, b: str, places: Mapping[str, tuple[str, str]]) -> bool:
-    """Return True if stops *a* and *b* are one place (same id or same coordinates)."""
+    """Return True if stops *a* and *b* are one place (same id or same coordinates).
+
+    Coordinates are compared as numbers, so ``38.8`` and ``38.800000`` match,
+    while stops at different coordinates (such as nearby bays) stay apart.
+    """
     if a == b:
         return True
-    pa, pb = places.get(a), places.get(b)
-    return pa is not None and pa == pb and all(pa)
+    pa = _coordinates(places.get(a))
+    return pa is not None and pa == _coordinates(places.get(b))
+
+
+def expand_by_service_set(movements: pd.DataFrame, sets: Sequence[tuple[str, ...]]) -> pd.DataFrame:
+    """Return the movements of each service set, labelled in a ``service_set`` column.
+
+    A trip appears once for every set that includes its service_id, so each set's
+    blocks can be rebuilt from all the trips that run together on its dates.
+
+    Args:
+        movements: Output of :func:`build_movements`.
+        sets: Service sets, each a sorted tuple of the service_ids running on a date.
+    """
+    parts = [
+        movements.loc[movements["service_id"].isin(members)].assign(service_set="|".join(members))
+        for members in sets
+    ]
+    if not parts:
+        return movements.iloc[0:0].assign(service_set="")
+    return pd.concat(parts, ignore_index=True)
 
 
 def block_hours(movements: pd.DataFrame, places: Mapping[str, tuple[str, str]]) -> pd.DataFrame:
     """Split each block's service day into the hour components.
 
-    Trips with a blank block_id each form their own block. Gaps where the vehicle
-    stays put are layover; gaps where it changes place with no movement are
-    unresolved. Overlapping movements are counted, not summed as gaps.
+    Trips are grouped by service set and block_id, so a block's trips of different
+    service_ids that run on the same dates form one vehicle day. Trips with a blank
+    block_id each form their own block. Gaps where the vehicle stays put are
+    layover; gaps where it changes place with no movement are unresolved.
+    Overlapping movements are counted, not summed as gaps.
+
+    Args:
+        movements: Output of :func:`expand_by_service_set`.
+        places: stop_id -> (stop_lat, stop_lon).
 
     Returns:
-        One row per (service_id, block_id) with the COMPONENTS (hours) and
-        ``revenue_trips``, ``nonrevenue_trips``, ``routes``, ``start``, ``end``,
-        ``has_tods``, ``overlaps`` and ``location_jumps``.
+        One row per (service set, block_id), the set in ``service_ids``, with the
+        COMPONENTS (hours) and ``revenue_trips``, ``nonrevenue_trips``, ``routes``,
+        ``start``, ``end``, ``has_tods``, ``overlaps`` and ``location_jumps``.
     """
     keyed = movements.assign(
         _block=movements["block_id"].where(
@@ -852,7 +938,7 @@ def block_hours(movements: pd.DataFrame, places: Mapping[str, tuple[str, str]]) 
         )
     )
     rows = []
-    for (service_id, block), group in keyed.groupby(["service_id", "_block"], sort=True):
+    for (service_set, block), group in keyed.groupby(["service_set", "_block"], sort=True):
         legs = group.sort_values(["start", "end"]).to_dict("records")
         seconds = Counter()
         overlaps = jumps = 0
@@ -868,7 +954,7 @@ def block_hours(movements: pd.DataFrame, places: Mapping[str, tuple[str, str]]) 
                 seconds["unresolved_gap" if moved else "layover"] += gap
         revenue = [leg for leg in legs if leg["category"] == "revenue"]
         row = {
-            "service_id": service_id,
+            "service_ids": service_set,
             "block_id": "" if block.startswith("trip:") else block,
             "routes": "|".join(sorted({leg["route_id"] for leg in revenue})),
             "revenue_trips": len(revenue),
@@ -891,8 +977,12 @@ def _clock(seconds: float) -> str:
     return f"{total // 60:02d}:{total % 60:02d}"
 
 
-def add_derived(df: pd.DataFrame, layover_in_revenue: bool, tods_supplied: bool) -> pd.DataFrame:
-    """Add vehicle revenue, nonrevenue and vehicle hours; blank TODS columns without TODS."""
+def add_derived(df: pd.DataFrame, layover_in_revenue: bool, movements_known: bool) -> pd.DataFrame:
+    """Add vehicle revenue, nonrevenue and vehicle hours.
+
+    When *movements_known* is False (no TODS, or TODS not confirmed complete),
+    the TODS columns, nonrevenue hours and vehicle hours are blank (NaN).
+    """
     out = df.copy()
     layover = out["layover_hours"]
     out["vehicle_revenue_hours"] = out["revenue_trip_hours"] + (
@@ -902,15 +992,55 @@ def add_derived(df: pd.DataFrame, layover_in_revenue: bool, tods_supplied: bool)
         0 if layover_in_revenue else layover
     )
     out["vehicle_hours"] = out[list(COMPONENTS)].sum(axis=1)
-    if not tods_supplied:
-        # Without TODS the pull-outs, pull-ins and deadheads are unknown, not zero.
+    if not movements_known:
+        # Without complete TODS the pull-outs, pull-ins and deadheads are unknown, not zero.
         out[[*TODS_COMPONENTS, "nonrevenue_hours", "vehicle_hours"]] = float("nan")
     return out
 
 
+def movement_coverage_confirmed(blocks: pd.DataFrame, tods_supplied: bool, confirmed: bool) -> bool:
+    """Return True if nonrevenue and vehicle hours can be reported; log why not.
+
+    They need TODS, the user's confirmation (TODS_MOVEMENTS_COMPLETE) that the TODS
+    files hold every block's movements, and at least one nonrevenue trip in them.
+
+    Args:
+        blocks: Output of :func:`block_hours`.
+        tods_supplied: Whether TODS supplement files were applied.
+        confirmed: TODS_MOVEMENTS_COMPLETE.
+    """
+    if not tods_supplied:
+        return False
+    with_tods = int(blocks["has_tods"].sum()) if not blocks.empty else 0
+    coverage = f"{with_tods} of {len(blocks)} block(s) have TODS nonrevenue trips"
+    if not confirmed:
+        logging.warning(
+            "Pull-out, pull-in, deadhead, nonrevenue and vehicle hours are left blank: "
+            "TODS_MOVEMENTS_COMPLETE is False. %s. Set it to True (or pass "
+            "--tods-movements-complete) once the TODS files hold every block's pull-out, "
+            "pull-in and deadhead trips.",
+            coverage,
+        )
+        return False
+    if with_tods == 0:
+        logging.warning(
+            "TODS_MOVEMENTS_COMPLETE is True, but the TODS files hold no nonrevenue trips "
+            "(no trip has a TODS_trip_type); nonrevenue and vehicle hours are left blank."
+        )
+        return False
+    if with_tods < len(blocks):
+        logging.warning(
+            "%s; the others' pull-out and pull-in time is missing from vehicle hours "
+            "(see has_tods in %s).",
+            coverage,
+            BLOCK_FILENAME,
+        )
+    return True
+
+
 def service_hours(blocks: pd.DataFrame) -> pd.DataFrame:
-    """Total the block hours per service_id (one service day of each service)."""
-    grouped = blocks.groupby("service_id")
+    """Total the block hours per service set (one day on which that set runs)."""
+    grouped = blocks.groupby("service_ids")
     out = grouped[list(COMPONENTS)].sum()
     out.insert(0, "blocks", grouped.size())
     out.insert(1, "blocks_without_tods", grouped["has_tods"].apply(lambda s: int((~s).sum())))
@@ -924,13 +1054,13 @@ def service_hours(blocks: pd.DataFrame) -> pd.DataFrame:
 def service_day_types(
     active: Mapping[str, set[dt.date]], explicit: Mapping[str, str]
 ) -> dict[str, set[str]]:
-    """Return service_id -> day types, from *explicit* or from GTFS active dates.
+    """Return service_id -> day types from *explicit* (SERVICE_DAY_TYPES); empty if it is.
 
     Raises:
         ValueError: If *explicit* names a day type outside DAY_TYPES.
     """
     if not explicit:
-        return classify_service_ids(active)
+        return {}
     result: dict[str, set[str]] = {}
     for sid, value in explicit.items():
         labels = {v.strip().title() for v in str(value).split(",") if v.strip()}
@@ -943,21 +1073,142 @@ def service_day_types(
     return result
 
 
-def day_type_hours(services: pd.DataFrame, types: Mapping[str, set[str]]) -> pd.DataFrame:
-    """Sum the services of each day type into one typical day of that type."""
+def ranked_service_sets(calendar: pd.DataFrame, label: str) -> list[tuple[str, int]]:
+    """Return the service sets running on *label* dates, most dates first (ties: earliest)."""
+    sets = Counter(
+        s for s, d in zip(calendar["service_set"], calendar["day_type"]) if d == label and s
+    )
+    return sets.most_common()
+
+
+def typical_service_sets(calendar: pd.DataFrame) -> dict[str, list[tuple[str, int]]]:
+    """Return each day type's candidate service sets, the typical one (most dates) first.
+
+    Holiday ranks only sets that run on holidays on most of their dates: a holiday
+    that runs the weekday or Sunday schedule does not make it a holiday schedule.
+    Day types with no candidate set are left out.
+    """
+    ranked = {label: ranked_service_sets(calendar, label) for label in DAY_TYPES}
+    total = Counter(s for s in calendar["service_set"] if s)
+    ranked["Holiday"] = [(s, n) for s, n in ranked["Holiday"] if 2 * n > total[s]]
+    return {label: sets for label, sets in ranked.items() if sets}
+
+
+def config_day_types(
+    explicit: Mapping[str, set[str]], gtfs_days: pd.DataFrame, holiday_service_day_type: str
+) -> dict[str, set[str]]:
+    """Return service_id -> day types for PERIOD_CALENDAR = "config".
+
+    Config mode runs every service of a date's day type together, so the services
+    of one day type must be ones that run together. Services that never share a
+    date (a Monday-Thursday and a Friday schedule, or the schedules before and
+    after a service change) would otherwise add several days' trips to each date.
+
+    Args:
+        explicit: Output of :func:`service_day_types` (SERVICE_DAY_TYPES).
+        gtfs_days: Output of :func:`build_calendar` in GTFS calendar mode over the
+            feed's dates.
+        holiday_service_day_type: HOLIDAY_SERVICE_DAY_TYPE.
+
+    Returns:
+        *explicit*, once checked; when it is empty, each day type's typical
+        service set from :func:`typical_service_sets`.
+
+    Raises:
+        ValueError: If *explicit* lists services under one day type that never
+            all run on one date of the GTFS calendar.
+    """
+    observed = [set(running) for running in gtfs_days["running"] if running]
+    if explicit:
+        dated = set().union(*observed)
+        for label in DAY_TYPES:
+            members = {s for s, labels in explicit.items() if label in labels and s in dated}
+            if len(members) > 1 and not any(members <= running for running in observed):
+                combos = Counter("|".join(sorted(r & members)) for r in observed if r & members)
+                runs = "; ".join(f"{s} ({n} dates)" for s, n in combos.most_common(5))
+                raise ValueError(
+                    f"SERVICE_DAY_TYPES lists {', '.join(sorted(members))} as {label}, but they "
+                    "never all run on the same date of the GTFS calendar, so config mode would "
+                    "add their trips together. List only the services that run together on one "
+                    f"{label}. The GTFS calendar runs: {runs}."
+                )
+        return dict(explicit)
+    result: dict[str, set[str]] = {}
+    for label, ranked in typical_service_sets(gtfs_days).items():
+        typical, n = ranked[0]
+        logging.info(
+            "Config calendar: %s dates run %s, the set on %d of %d %s dates in the GTFS calendar.",
+            label,
+            typical,
+            n,
+            sum(count for _set, count in ranked_service_sets(gtfs_days, label)),
+            label,
+        )
+        for sid in typical.split("|"):
+            result.setdefault(sid, set()).add(label)
+    if holiday_service_day_type.title() == "Holiday" and not any(
+        "Holiday" in labels for labels in result.values()
+    ):
+        logging.warning(
+            "No service set in the GTFS calendar runs mostly on holidays, so config-mode "
+            "holidays get no service. Set HOLIDAY_SERVICE_DAY_TYPE to the day type whose "
+            "schedule runs on holidays, or list the holiday services in SERVICE_DAY_TYPES."
+        )
+    return result
+
+
+def day_type_hours(services: pd.DataFrame, calendar: pd.DataFrame) -> pd.DataFrame:
+    """Report the hours of a typical day of each day type in *calendar*.
+
+    A day type can have more than one version, i.e. more than one service set
+    running on its dates (a Friday-only service, school-day trips, one service_id
+    per weekday). The typical day is the set that runs on the most dates of that
+    type (ties go to the earliest; see :func:`typical_service_sets`); the other
+    sets are logged.
+
+    Args:
+        services: Output of :func:`service_hours`, indexed by service set.
+        calendar: Output of :func:`build_calendar`.
+
+    Returns:
+        One row per day type with service: the set (``service_ids``), the dates
+        of that type with service (``days``) and running the set (``typical_days``),
+        its ``blocks`` and ``revenue_trips`` and the COMPONENTS (hours).
+    """
     rows = []
+    typical_sets = typical_service_sets(calendar)
     for label in DAY_TYPES:
-        members = sorted(s for s in services.index if label in types.get(s, set()))
-        if not members:
+        ranked = ranked_service_sets(calendar, label)
+        if label not in typical_sets:
+            if ranked:
+                logging.info("%s dates run only other day types' schedules.", label)
             continue
-        sub = services.loc[members]
+        typical, typical_days = typical_sets[label][0]
+        others = [(s, n) for s, n in ranked if s != typical]
+        days = sum(n for _set, n in ranked)
+        if others:
+            logging.warning(
+                "%s: %d service sets run on %s dates; the typical %s is %s (%d of %d days). "
+                "Others: %s.",
+                label,
+                len(ranked),
+                label,
+                label,
+                typical,
+                typical_days,
+                days,
+                ", ".join(f"{s} ({n} days)" for s, n in others),
+            )
+        sub = services.loc[typical]
         row: dict[str, Any] = {
             "day_type": label,
-            "service_ids": "|".join(members),
-            "blocks": int(sub["blocks"].sum()),
-            "revenue_trips": int(sub["revenue_trips"].sum()),
+            "service_ids": typical,
+            "days": days,
+            "typical_days": typical_days,
+            "blocks": int(sub["blocks"]),
+            "revenue_trips": int(sub["revenue_trips"]),
         }
-        row.update(sub[list(COMPONENTS)].sum().to_dict())
+        row.update(sub[list(COMPONENTS)].astype(float).to_dict())
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -967,13 +1218,38 @@ def _parse_date(value: str) -> dt.date:
     return datetime.strptime(str(value).strip(), "%Y%m%d").date()
 
 
+def feed_span(active: Mapping[str, set[dt.date]], known: set[str]) -> Optional[tuple[str, str]]:
+    """Return the first and last active dates (YYYYMMDD) of the *known* services, or None."""
+    dates = [d for sid in known for d in active.get(sid, ())]
+    if not dates:
+        return None
+    return min(dates).strftime("%Y%m%d"), max(dates).strftime("%Y%m%d")
+
+
 def build_calendar(
-    services: pd.DataFrame,
+    known: set[str],
     active: Mapping[str, set[dt.date]],
     types: Mapping[str, set[str]],
     cfg: Config,
+    periods: Sequence[tuple[str, str, str]],
 ) -> pd.DataFrame:
     """Return one row per (period, date) with its day type and the services running.
+
+    Args:
+        known: service_ids that have trips; other services are ignored.
+        active: service_id -> active dates.
+        types: service_id -> day types: SERVICE_DAY_TYPES with the GTFS calendar
+            (a date running a Holiday service is a holiday), the services of each
+            day type in config mode (:func:`config_day_types`).
+        cfg: Resolved configuration (calendar mode and holidays).
+        periods: (name, first date, last date) of each period, dates as YYYYMMDD.
+
+    Returns:
+        Columns ``period``, ``date``, ``weekday``, ``day_type``, ``schedule_day_type``
+        (the day type whose services run; blank on a date without service. With
+        PERIOD_CALENDAR = "gtfs" it starts as ``day_type``; see
+        :func:`schedule_day_types`), ``running`` (sorted tuple of service_ids) and
+        ``service_set`` (``running`` joined by ``|``).
 
     Raises:
         ValueError: If a period's dates are invalid, period names repeat, or
@@ -983,12 +1259,11 @@ def build_calendar(
         raise ValueError(
             f"PERIOD_CALENDAR must be 'gtfs' or 'config', not {cfg.period_calendar!r}."
         )
-    names = [name for name, _first, _last in cfg.periods]
+    names = [name for name, _first, _last in periods]
     if len(names) != len(set(names)):
         raise ValueError(f"Period names must be unique: {names}")
-    known = set(services.index)
     rows = []
-    for name, first, last in cfg.periods:
+    for name, first, last in periods:
         start, end = _parse_date(first), _parse_date(last)
         if end < start:
             raise ValueError(f"Period {name!r} ends before it starts.")
@@ -1000,7 +1275,8 @@ def build_calendar(
         while day <= end:
             if cfg.period_calendar == "gtfs":
                 running = service_ids_active_on(active, day) & known
-                holiday = any("Holiday" in types.get(s, set()) for s in running)
+                holiday = day in holidays or any("Holiday" in types.get(s, ()) for s in running)
+                lookup = "Holiday" if holiday else WEEKDAY_LABELS[day.weekday()]
             else:
                 holiday = day in holidays
                 lookup = cfg.holiday_service_day_type if holiday else WEEKDAY_LABELS[day.weekday()]
@@ -1011,24 +1287,71 @@ def build_calendar(
                     "date": day,
                     "weekday": day.strftime("%A"),
                     "day_type": "Holiday" if holiday else WEEKDAY_LABELS[day.weekday()],
+                    "schedule_day_type": lookup.title() if running else "",
                     "running": tuple(sorted(running)),
+                    "service_set": "|".join(sorted(running)),
                 }
             )
             day += dt.timedelta(days=1)
-    return pd.DataFrame(rows, columns=["period", "date", "weekday", "day_type", "running"])
+    columns = ["period", "date", "weekday", "day_type", "schedule_day_type", "running"]
+    return pd.DataFrame(rows, columns=[*columns, "service_set"])
+
+
+def schedule_day_types(calendar: pd.DataFrame, reference: pd.DataFrame) -> list[str]:
+    """Return the day type whose schedule runs on each date of *calendar* (GTFS calendar).
+
+    A date runs day type X's schedule when its service set is X's typical set
+    in *reference* (:func:`typical_service_sets`): a Christmas that runs the
+    typical Sunday set is a Sunday schedule day. A set that is the typical set of
+    no day type takes the day type of most of its dates in *reference* (a set
+    run only on a few Fridays, or a weekday set run on a holiday, is a weekday
+    schedule), or the date's own day type if it has none there. A set typical of
+    several (a single weekend service) keeps the date's own day type if it is one
+    of them, else takes the first in DAY_TYPES.
+
+    Args:
+        calendar: Output of :func:`build_calendar` (GTFS calendar mode).
+        reference: The calendar the typical sets come from (the feed's whole span).
+
+    Returns:
+        One day type per row of *calendar*; blank where no service runs.
+    """
+    typical_of: dict[str, list[str]] = {}
+    for label, ranked in typical_service_sets(reference).items():
+        typical_of.setdefault(ranked[0][0], []).append(label)
+    usual: dict[str, Counter[str]] = {}
+    for service_set, day_type in zip(reference["service_set"], reference["day_type"]):
+        usual.setdefault(service_set, Counter())[day_type] += 1
+    out = []
+    for service_set, day_type in zip(calendar["service_set"], calendar["day_type"]):
+        labels = typical_of.get(service_set, [])
+        if not service_set:
+            out.append("")
+        elif not labels and service_set in usual:
+            out.append(usual[service_set].most_common(1)[0][0])
+        elif not labels or day_type in labels:
+            out.append(day_type)
+        else:
+            out.append(labels[0])
+    return out
 
 
 def period_hours(services: pd.DataFrame, calendar: pd.DataFrame, cfg: Config) -> pd.DataFrame:
-    """Total each period as service days x hours per service day, summed over services."""
+    """Total each period as days x hours per day of each service set, summed over sets.
+
+    ``service_sets`` lists each set run in the period with its number of days, so a
+    date running an unusual set (a Friday-only schedule) stays visible.
+    """
     rows = []
     for name, first, last in cfg.periods:
         sub = calendar.loc[calendar["period"] == name]
         days = Counter(sub["day_type"])
-        service_days = Counter(sid for running in sub["running"] for sid in running)
+        schedules = Counter(sub["schedule_day_type"])
+        set_days = Counter(s for s in sub["service_set"] if s)
         totals = pd.Series(0.0, index=list(COMPONENTS))
-        for sid, n_days in service_days.items():
-            totals += n_days * services.loc[sid, list(COMPONENTS)].astype(float)
-        no_service = int(sum(1 for running in sub["running"] if not running))
+        for service_set, n_days in set_days.items():
+            totals += n_days * services.loc[service_set, list(COMPONENTS)].astype(float)
+        no_service = int((sub["service_set"] == "").sum())
         row: dict[str, Any] = {
             "period": name,
             "start_date": _parse_date(first).isoformat(),
@@ -1039,7 +1362,14 @@ def period_hours(services: pd.DataFrame, calendar: pd.DataFrame, cfg: Config) ->
             "saturdays": days["Saturday"],
             "sundays": days["Sunday"],
             "holidays": days["Holiday"],
+            "weekday_schedule_days": schedules["Weekday"],
+            "saturday_schedule_days": schedules["Saturday"],
+            "sunday_schedule_days": schedules["Sunday"],
+            "holiday_schedule_days": schedules["Holiday"],
             "days_without_service": no_service,
+            "service_sets": "; ".join(
+                f"{s} ({n} day{'s' if n != 1 else ''})" for s, n in set_days.most_common()
+            ),
         }
         row.update(totals.to_dict())
         rows.append(row)
@@ -1081,15 +1411,17 @@ CLOCK_FORMAT = "[h]:mm:ss"
 def movement_table(movements: pd.DataFrame, places: Mapping[str, tuple[str, str]]) -> pd.DataFrame:
     """Return every trip in block order, flagging when the vehicle stayed put since the last.
 
-    Trips with a blank block_id each form their own block, labelled
-    ``(none: <trip_id>)``. ``stays_put`` is True when the trip starts where the
-    previous trip of the same block ended (same stop ID or same coordinates).
+    *movements* is the output of :func:`expand_by_service_set`, so a trip appears
+    once per service set it runs in. Trips with a blank block_id each form their
+    own block, labelled ``(none: <trip_id>)``. ``stays_put`` is True when the trip
+    starts where the previous trip of the same block ended (same stop ID or same
+    coordinates).
     """
     df = movements.copy()
     df["block_key"] = df["block_id"].where(df["block_id"] != "", "(none: " + df["trip_id"] + ")")
-    df = df.sort_values(["service_id", "block_key", "start", "end"], kind="stable")
+    df = df.sort_values(["service_set", "block_key", "start", "end"], kind="stable")
     df = df.reset_index(drop=True)
-    same_block = df["service_id"].eq(df["service_id"].shift()) & df["block_key"].eq(
+    same_block = df["service_set"].eq(df["service_set"].shift()) & df["block_key"].eq(
         df["block_key"].shift()
     )
     previous_end = df["last_stop"].shift()
@@ -1136,40 +1468,41 @@ def write_workbook(
     calendar: pd.DataFrame,
     types: Mapping[str, set[str]],
     cfg: Config,
-    tods_supplied: bool,
+    movements_known: bool,
 ) -> Path:
     """Write a workbook whose period totals are Excel formulas back to trip times.
 
-    Sheets: Periods (service days x hours per service day), Settings (the
-    layover toggle and inputs), Period days and Calendar (which services run on
-    each date; editable), Services and Blocks (sums of the rows below them) and
+    Sheets: Periods (days x hours per day of each service set), Settings (the
+    layover toggle and inputs), Period days and Calendar (which service set runs
+    on each date; editable), Services and Blocks (sums of the rows below them) and
     Trips (start/end times; durations, gaps and layover as formulas).
 
     Args:
         path: Output ``.xlsx`` path.
         trips: Output of :func:`movement_table`.
-        calendar: Output of :func:`build_calendar`.
-        types: service_id -> day types.
+        calendar: Output of :func:`build_calendar` for the periods.
+        types: service set -> day types of the dates it runs on.
         cfg: Resolved configuration.
-        tods_supplied: False leaves the TODS columns as "n/a".
+        movements_known: False leaves the TODS columns, nonrevenue and vehicle
+            hours as "n/a".
 
     Returns:
         *path*.
     """
     wb = Workbook()
     wb.remove(wb.active)
-    services = sorted(set(trips["service_id"]))
+    services = sorted(set(trips["service_set"]))
     component_cols = list(COMPONENTS)
 
     def n_a(column: str) -> bool:
-        return not tods_supplied and column in TODS_COMPONENTS
+        return not movements_known and column in TODS_COMPONENTS
 
     # --- Trips -----------------------------------------------------------------
     ws_t = _sheet(
         wb,
         "Trips",
         [
-            "Service",
+            "Services",
             "Block",
             "Trip ID",
             "Type",
@@ -1185,6 +1518,7 @@ def write_workbook(
             "Stays at the same place",
             "Layover h",
             "Unresolved gap h",
+            "Trip service",
         ],
         {2: 26, 3: 30, 5: 16, 7: 18, 8: 18},
     )
@@ -1193,7 +1527,7 @@ def write_workbook(
         r = i + 2
         ws_t.append(
             [
-                t["service_id"],
+                t["service_set"],
                 t["block_key"],
                 t["trip_id"],
                 t["trip_type"],
@@ -1209,17 +1543,18 @@ def write_workbook(
                 bool(t["stays_put"]),
                 f"=IF(AND(M{r}>0,N{r}),M{r},0)",
                 f"=IF(AND(M{r}>0,NOT(N{r})),M{r},0)",
+                t["service_id"],
             ]
         )
         for col in ("I", "J"):
             ws_t[f"{col}{r}"].number_format = CLOCK_FORMAT
         for col in ("K", "M", "O", "P"):
             ws_t[f"{col}{r}"].number_format = HOURS_FORMAT
-        block_rows.setdefault((t["service_id"], t["block_key"]), []).append(r)
+        block_rows.setdefault((t["service_set"], t["block_key"]), []).append(r)
 
     # --- Blocks ----------------------------------------------------------------
     block_headers = [
-        "Service",
+        "Services",
         "Block",
         "Routes",
         "Trips rows",
@@ -1241,7 +1576,7 @@ def write_workbook(
     for i, ((sid, block), rows) in enumerate(block_rows.items()):
         r = i + 2
         a, b = rows[0], rows[-1]
-        routes = trips.loc[(trips["service_id"] == sid) & (trips["block_key"] == block)]
+        routes = trips.loc[(trips["service_set"] == sid) & (trips["block_key"] == block)]
         routes = routes.loc[routes["category"] == "revenue", "route_id"]
         values: dict[str, Any] = {}
         for column in component_cols:
@@ -1255,7 +1590,7 @@ def write_workbook(
             else:
                 src = "O" if column == "layover_hours" else "P"
                 values[column] = f"=SUM(Trips!${src}${a}:${src}${b})"
-        values.update(_derived_formulas(b_cols, r, tods_supplied))
+        values.update(_derived_formulas(b_cols, r, movements_known))
         ws_b.append(
             [
                 sid,
@@ -1276,7 +1611,7 @@ def write_workbook(
         wb,
         "Services",
         [
-            "Service",
+            "Services",
             "Day types",
             "Blocks rows",
             "Blocks",
@@ -1295,7 +1630,7 @@ def write_workbook(
             c: "n/a" if n_a(c) else f"=SUM(Blocks!{b_cols[c]}{a}:{b_cols[c]}{b})"
             for c in component_cols
         }
-        values.update(_derived_formulas(s_cols, r, tods_supplied))
+        values.update(_derived_formulas(s_cols, r, movements_known))
         ws_s.append(
             [
                 sid,
@@ -1314,12 +1649,20 @@ def write_workbook(
     ws_c = _sheet(
         wb,
         "Calendar",
-        ["Period", "Date", "Weekday", "Day type", *services, "Services running"],
+        [
+            "Period",
+            "Date",
+            "Weekday",
+            "Day type",
+            "Schedule day type",
+            *services,
+            "Service sets running",
+        ],
         {1: 18, 2: 12},
     )
-    c_cols = {sid: get_column_letter(5 + i) for i, sid in enumerate(services)}
-    running_col = get_column_letter(5 + len(services))
-    last_service_col = get_column_letter(4 + len(services))
+    c_cols = {sid: get_column_letter(6 + i) for i, sid in enumerate(services)}
+    running_col = get_column_letter(6 + len(services))
+    last_service_col = get_column_letter(5 + len(services))
     for i, day in enumerate(calendar.to_dict("records")):
         r = i + 2
         ws_c.append(
@@ -1328,8 +1671,9 @@ def write_workbook(
                 day["date"],
                 day["weekday"],
                 day["day_type"],
-                *(1 if sid in day["running"] else 0 for sid in services),
-                f"=SUM(E{r}:{last_service_col}{r})",
+                day["schedule_day_type"],
+                *(1 if sid == day["service_set"] else 0 for sid in services),
+                f"=SUM(F{r}:{last_service_col}{r})",
             ]
         )
         ws_c[f"B{r}"].number_format = "yyyy-mm-dd"
@@ -1347,6 +1691,7 @@ def write_workbook(
             "Saturdays",
             "Sundays",
             "Holidays",
+            *(f"{label} schedule days" for label in DAY_TYPES),
             "Days without service",
         ],
         {1: 18, 2: 12, 3: 12},
@@ -1361,6 +1706,7 @@ def write_workbook(
                 _parse_date(last),
                 f"=COUNTIFS({key})",
                 *(f'=COUNTIFS({key},Calendar!$D:$D,"{label}")' for label in DAY_TYPES),
+                *(f'=COUNTIFS({key},Calendar!$E:$E,"{label}")' for label in DAY_TYPES),
                 f"=COUNTIFS({key},Calendar!${running_col}:${running_col},0)",
             ]
         )
@@ -1375,7 +1721,7 @@ def write_workbook(
             "Period",
             "Start",
             "End",
-            "Service",
+            "Services",
             "Service days",
             *COMPONENT_LABELS.values(),
             *DERIVED_LABELS.values(),
@@ -1392,7 +1738,7 @@ def write_workbook(
             values = {
                 c: "n/a" if n_a(c) else f"=$E{r}*Services!{s_cols[c]}{srow}" for c in component_cols
             }
-            values.update(_derived_formulas(p_cols, r, tods_supplied))
+            values.update(_derived_formulas(p_cols, r, movements_known))
             ws_p.append(
                 [
                     name,
@@ -1408,13 +1754,13 @@ def write_workbook(
         for idx in range(6, 6 + len(component_cols) + len(DERIVED)):
             col = get_column_letter(idx)
             header = ws_p.cell(1, idx).value
-            unknown = not tods_supplied and header in (
+            unknown = not movements_known and header in (
                 *(COMPONENT_LABELS[c] for c in TODS_COMPONENTS),
                 DERIVED_LABELS["nonrevenue_hours"],
                 DERIVED_LABELS["vehicle_hours"],
             )
             totals.append("n/a" if unknown else f"=SUM({col}{first_row}:{col}{r - 1})")
-        ws_p.append([name, _parse_date(first), _parse_date(last), "All services", "", *totals])
+        ws_p.append([name, _parse_date(first), _parse_date(last), "All service sets", "", *totals])
         for cell in ws_p[r]:
             cell.font = Font(bold=True)
         for row in range(first_row, r + 1):
@@ -1433,6 +1779,12 @@ def write_workbook(
         ),
         ("GTFS", str(cfg.gtfs_path), ""),
         ("TODS", str(cfg.tods_path) if cfg.tods_path else "(none: revenue only)", ""),
+        (
+            "TODS movements complete",
+            cfg.tods_movements_complete,
+            "TODS_MOVEMENTS_COMPLETE: the TODS files hold every block's pull-out, pull-in "
+            "and deadhead trips. Nonrevenue and vehicle hours need it.",
+        ),
         ("Period calendar", cfg.period_calendar, "gtfs: GTFS calendar; config: day types"),
         ("Generated", datetime.now().isoformat(timespec="seconds"), ""),
         ("", "", ""),
@@ -1440,28 +1792,46 @@ def write_workbook(
         (
             "Trips",
             "",
-            "One row per revenue (GTFS) or nonrevenue (TODS) trip, in block order. "
-            "Duration h = (End - Start) x 24. A positive gap where the vehicle stays at "
-            "the same place is layover; a positive gap where it changes place with no "
-            "trip in between is an unresolved gap.",
+            "One row per revenue (GTFS) or nonrevenue (TODS) trip, in block order, "
+            "under each service set (the services that run together on a date) that "
+            "includes the trip's service. Duration h = (End - Start) x 24. A positive gap "
+            "where the vehicle stays at the same place is layover; a positive gap where "
+            "it changes place with no trip in between is an unresolved gap.",
         ),
         ("Blocks", "", "Sums of each block's Trips rows (row range shown)."),
-        ("Services", "", "Sums of the service's Blocks rows: hours for one day of service."),
+        (
+            "Services",
+            "",
+            "Sums of the service set's Blocks rows: hours for one day on which that set runs.",
+        ),
         (
             "Calendar",
             "",
-            "1 where a service runs on a date. Edit a cell (e.g. a holiday) and the "
-            "period totals follow.",
+            "1 under the service set that runs on a date. Move the 1 (e.g. for a holiday) "
+            "and the period totals follow. Schedule day type is the day type whose typical "
+            "service set runs that date (e.g. Sunday for a holiday on Sunday service); "
+            "it does not follow edits.",
         ),
-        ("Period days", "", "Day counts per period, from the Calendar."),
+        (
+            "Period days",
+            "",
+            "Day counts per period, from the Calendar: by calendar day type and by schedule.",
+        ),
         (
             "Periods",
             "",
-            "Service days in the period x hours per day of that service, then totalled.",
+            "Days in the period x hours per day of each service set, then totalled.",
         ),
     ]
-    if not tods_supplied:
-        notes.append(("No TODS", "", "Pull-out, pull-in, deadhead and vehicle hours are n/a."))
+    if not movements_known:
+        notes.append(
+            (
+                "No complete TODS",
+                "",
+                "Pull-out, pull-in, deadhead, nonrevenue and vehicle hours are n/a: there is "
+                "no TODS, TODS_MOVEMENTS_COMPLETE is False, or the TODS has no nonrevenue trips.",
+            )
+        )
     for row in notes:
         ws_set.append(list(row))
     for row in ws_set.iter_rows(min_row=2):
@@ -1553,21 +1923,57 @@ def run(cfg: Config) -> dict[str, pd.DataFrame]:
 
     Raises:
         RuntimeError: If the run log is required and could not be written.
+        ValueError: If no service with trips runs on any date.
     """
     schedule = load_schedule(cfg.gtfs_path, cfg.tods_path)
-    blocks = block_hours(schedule.movements, schedule.stop_places)
-    services = service_hours(blocks)
+    known = set(schedule.movements["service_id"])
     types = service_day_types(schedule.active_dates, cfg.service_day_types)
-    calendar = build_calendar(services, schedule.active_dates, types, cfg)
+    # Typical days come from every date of the feed; the periods if it has no dates.
+    span = feed_span(schedule.active_dates, known)
+    if cfg.period_calendar == "config":
+        gtfs_days = build_calendar(
+            known,
+            schedule.active_dates,
+            types,
+            replace(cfg, period_calendar="gtfs"),
+            [("feed", *span)] if span is not None else cfg.periods,
+        )
+        types = config_day_types(types, gtfs_days, cfg.holiday_service_day_type)
+    calendar = build_calendar(known, schedule.active_dates, types, cfg, cfg.periods)
+    feed_calendar = (
+        build_calendar(known, schedule.active_dates, types, cfg, [("feed", *span)])
+        if span is not None
+        else calendar
+    )
+    if cfg.period_calendar == "gtfs":
+        calendar["schedule_day_type"] = schedule_day_types(calendar, feed_calendar)
+    days = pd.concat([calendar, feed_calendar], ignore_index=True)
+    sets = sorted({running for running in days["running"] if running})
+    if not sets:
+        raise ValueError(
+            "No service with trips runs on any date of the feed calendar or the periods; "
+            "check calendar.txt / calendar_dates.txt (or SERVICE_DAY_TYPES in config mode)."
+        )
+    idle = sorted(known - {sid for members in sets for sid in members})
+    if idle:
+        logging.warning("Service(s) with trips that never run, left out: %s", ", ".join(idle))
+    movements = expand_by_service_set(schedule.movements, sets)
+    blocks = block_hours(movements, schedule.stop_places)
+    known = movement_coverage_confirmed(blocks, schedule.tods_supplied, cfg.tods_movements_complete)
+    services = service_hours(blocks)
+    set_day_types: dict[str, set[str]] = {}
+    for service_set, day_type in zip(days["service_set"], days["day_type"]):
+        if service_set:
+            set_day_types.setdefault(service_set, set()).add(day_type)
     tables = {
         "block": blocks,
         "service": services.reset_index(),
-        "day_type": day_type_hours(services, types),
+        "day_type": day_type_hours(services, feed_calendar),
         "period": period_hours(services, calendar, cfg),
     }
     for key, table in tables.items():
         if not table.empty:
-            table = add_derived(table, cfg.layover_in_revenue_hours, schedule.tods_supplied)
+            table = add_derived(table, cfg.layover_in_revenue_hours, known)
             hours = [c for c in (*COMPONENTS, *DERIVED) if c in table.columns]
             table[hours] = table[hours].round(2)
         tables[key] = table
@@ -1583,18 +1989,20 @@ def run(cfg: Config) -> dict[str, pd.DataFrame]:
         logging.info("Wrote %s", cfg.output_dir / filename)
     workbook = write_workbook(
         cfg.output_dir / WORKBOOK_FILENAME,
-        movement_table(schedule.movements, schedule.stop_places),
+        movement_table(movements, schedule.stop_places),
         calendar,
-        types,
+        set_day_types,
         cfg,
-        schedule.tods_supplied,
+        known,
     )
     logging.info("Wrote %s (formulas; open in Excel to check the totals)", workbook)
 
     summary = [
         f"GTFS input:        {cfg.gtfs_path}",
         f"TODS input:        {cfg.tods_path if cfg.tods_path else '(none: revenue only)'}",
-        f"Blocks:            {len(blocks)}",
+        f"TODS movements:    {'confirmed complete' if known else 'not used (n/a)'}",
+        f"Service sets:      {len(services)}",
+        f"Blocks (per set):  {len(blocks)}",
         f"Period calendar:   {cfg.period_calendar}",
     ]
     for row in tables["day_type"].to_dict("records"):
@@ -1624,6 +2032,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--gtfs", default=GTFS_PATH, help="GTFS folder or .zip.")
     p.add_argument("--tods", default=TODS_PATH, help="TODS supplement folder or .zip.")
     p.add_argument("--no-tods", action="store_true", help="Ignore TODS (revenue hours only).")
+    p.add_argument(
+        "--tods-movements-complete",
+        action=argparse.BooleanOptionalAction,
+        default=TODS_MOVEMENTS_COMPLETE,
+        help="Confirm the TODS files hold every block's pull-out, pull-in and deadhead "
+        "trips, so nonrevenue and vehicle hours are reported.",
+    )
     p.add_argument("--output-dir", default=OUTPUT_DIR, help="Folder for the outputs.")
     p.add_argument(
         "--period",
@@ -1694,6 +2109,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         periods=[tuple(p) for p in args.period] if args.period else list(PERIODS),
         period_calendar=args.period_calendar,
         layover_in_revenue_hours=args.layover_in_revenue,
+        tods_movements_complete=args.tods_movements_complete,
     )
     try:
         tables = run(cfg)

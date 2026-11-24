@@ -24,12 +24,15 @@ on ``RIDERSHIP_ID_FIELD`` (default ``station_id``, the column written by
 ``bikeshare_ridership_trends``). Identifiers are compared as strings exactly as
 written (only surrounding whitespace is trimmed), unmatched ids are logged
 before stations are zero-filled, and a join that matches no ids at all is an
-error rather than an all-zero output.
+error rather than an all-zero output. Ridership rows with a blank id are
+logged with the activity they carry; if every row is blank, the run stops
+before writing a map.
 
 Outputs:
     - ``<stem>_ridership.geojson`` / ``<stem>_ridership.shp`` in ``OUTPUT_DIR``
       (e.g. ``gbfs_stations_ridership.geojson``): one enriched copy of each
       geometry input, carrying departures, arrivals, and total trip columns.
+      A zipped shapefile input is written as an unzipped ``.shp``.
 
 Typical usage (edit the CONFIG block, then run):
 
@@ -62,7 +65,7 @@ import pandas as pd
 # === BEGIN CONFIG ===
 RIDERSHIP_INPUT: str = "output/monthly_station_ridership.csv"
 GEOJSON_INPUT: Optional[str] = "output/gbfs_stations.geojson"
-# A .zip holding the shapefile also works.
+# A .zip holding the shapefile also works; its output is an unzipped .shp.
 SHAPEFILE_INPUT: Optional[str] = "output/gbfs_stations.shp"
 OUTPUT_DIR: str = "output"
 # Station key on the geometry layer. Capital Bikeshare trip station numbers
@@ -139,6 +142,19 @@ def _format_ids(ids: Iterable[str]) -> str:
     if len(ordered) > _MAX_IDS_LOGGED:
         listing += f", ... ({len(ordered) - _MAX_IDS_LOGGED} more)"
     return listing
+
+
+def _describe_activity(rows: pd.DataFrame) -> str:
+    """Return the summed ridership measures of *rows* for logging.
+
+    For example ``"25 departures, 17 arrivals, 42 total trips"``.
+    """
+    measures = [c for c in RIDERSHIP_MEASURES if c in rows.columns]
+    if not measures:
+        return "no ridership measures"
+    return ", ".join(
+        f"{int(rows[m].sum())} {'total trips' if m == 'total' else m}" for m in measures
+    )
 
 
 def aggregate_station_totals(
@@ -218,7 +234,8 @@ def join_ridership(
     ids. The merge is a left join validated as many-to-one against unique
     ridership keys, so a station feature can never be duplicated. Every station
     geometry is kept; unmatched ids on either side are logged, and stations
-    with no ridership get zero-filled measures.
+    with no ridership get zero-filled measures. Ridership rows with a blank id
+    are logged with their activity before they are dropped.
 
     Args:
         stations: Station point geometries (from ``gbfs_stations_exporter``).
@@ -232,7 +249,8 @@ def join_ridership(
     Raises:
         KeyError: If either side lacks its join column.
         ValueError: If ids collide after normalization, geometry keys are
-            duplicated, or no ridership id matches any station.
+            duplicated, every ridership row has a blank id, or no ridership
+            id matches any station.
     """
     if geometry_id_field not in stations.columns:
         raise KeyError(
@@ -267,7 +285,22 @@ def join_ridership(
             missing_geometry_keys,
             geometry_id_field,
         )
-    ridership = ridership.dropna(subset=["_join_key"])
+    blank_ridership = ridership["_join_key"].isna()
+    if blank_ridership.any():
+        blank_activity = _describe_activity(ridership[blank_ridership])
+        if blank_ridership.all():
+            raise ValueError(
+                f"All {len(ridership)} ridership row(s) have a blank {ridership_id_field!r}, "
+                f"so none of their activity ({blank_activity}) can be placed on a station. "
+                "Check the ridership id column."
+            )
+        logger.warning(
+            "%d ridership row(s) have a blank %r and are left off the map (%s).",
+            int(blank_ridership.sum()),
+            ridership_id_field,
+            blank_activity,
+        )
+    ridership = ridership.loc[~blank_ridership]
     if ridership["_join_key"].duplicated().any():
         raise ValueError(
             f"Ridership table has more than one row per {ridership_id_field!r}; "
@@ -338,10 +371,13 @@ def _joined_output_path(input_path: str, output_dir: Path) -> Path:
         output_dir: Directory for the joined output.
 
     Returns:
-        ``<output_dir>/<stem>_ridership<suffix>``.
+        ``<output_dir>/<stem>_ridership<suffix>``. A zipped shapefile input
+        (``.zip``) yields an unzipped ``<stem>_ridership.shp``, because the
+        shapefile writer rejects a plain ``.zip`` output path.
     """
     source = Path(input_path)
-    return output_dir / f"{source.stem}_ridership{source.suffix}"
+    suffix = ".shp" if source.suffix.lower() == ".zip" else source.suffix
+    return output_dir / f"{source.stem}_ridership{suffix}"
 
 
 def load_shapefile(path: str, member: Optional[str] = None) -> gpd.GeoDataFrame:

@@ -109,6 +109,9 @@ REQUIRE_RUN_LOG: bool = True
 # Columns required from the input table (post-load).
 REQUIRED_COLS: List[str] = ["day_type", "route_id", "month", "on_time", "evaluated"]
 
+# Label for a blank route_id, the same one otp_runtime_from_tides gives blank groups.
+BLANK_LABEL: str = "(blank)"
+
 
 # =============================================================================
 # DATA STRUCTURES
@@ -145,6 +148,8 @@ def load_otp_table(path: Path, day_types: Sequence[str] = DAY_TYPES_TO_INCLUDE) 
     Returns:
         DataFrame with columns ``route_id``, ``month``, ``on_time`` and
         ``evaluated``, one row per (route, month), with counts coerced to numeric.
+        Route IDs keep their text (``NA`` and ``NULL`` are routes); a blank one is
+        reported as ``"(blank)"``.
 
     Raises:
         FileNotFoundError: If ``path`` does not exist.
@@ -156,7 +161,8 @@ def load_otp_table(path: Path, day_types: Sequence[str] = DAY_TYPES_TO_INCLUDE) 
             "otp/otp_by_route_and_month.csv), or point --otp-monthly at the table."
         )
 
-    df = pd.read_csv(path, dtype={"route_id": str, "day_type": str})
+    # All text, with no placeholder read as missing: "NA" and "NULL" are route IDs.
+    df = pd.read_csv(path, dtype=str, keep_default_na=False)
     missing = [c for c in REQUIRED_COLS if c not in df.columns]
     if missing:
         raise ValueError(
@@ -178,6 +184,14 @@ def load_otp_table(path: Path, day_types: Sequence[str] = DAY_TYPES_TO_INCLUDE) 
                 f"{sorted(set(df['day_type'].astype(str)))}."
             )
     out["route_id"] = out["route_id"].astype(str).str.strip()
+    blank = out["route_id"].eq("")
+    if blank.any():
+        logging.warning(
+            "%d row(s) have a blank route_id; they are reported as %s.",
+            int(blank.sum()),
+            BLANK_LABEL,
+        )
+        out.loc[blank, "route_id"] = BLANK_LABEL
     out["month"] = out["month"].astype(str).str.strip()
     out["on_time"] = pd.to_numeric(out["on_time"], errors="coerce").fillna(0.0)
     out["evaluated"] = pd.to_numeric(out["evaluated"], errors="coerce").fillna(0.0)

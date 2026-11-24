@@ -2424,6 +2424,11 @@ def validate_config() -> Any:
             )
     if not Path(GTFS_PATH).exists():
         raise ValueError("GTFS_PATH does not exist; edit CONFIGURATION.")
+    # main() mkdir()s a timestamped run directory under OUTPUT_FOLDER before any
+    # work; checking the parent here keeps an unset value a configuration error
+    # (exit 2) instead of an OSError traceback part-way through setup.
+    if not Path(OUTPUT_FOLDER).parent.is_dir():
+        raise ValueError("OUTPUT_FOLDER's parent directory does not exist; edit CONFIGURATION.")
     if ROAD_POLYGONS and not arcpy.Exists(ROAD_POLYGONS):
         raise ValueError("ROAD_POLYGONS does not exist.")
     if APPROVED_SNAPS_CSV and not Path(APPROVED_SNAPS_CSV).is_file():
@@ -2726,9 +2731,18 @@ def write_run_status(destination: Path, status: str, working_folder: Path) -> No
     (destination / "run_status.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
 
 
-def main() -> None:
-    """Run timed stages, optionally build locally, and publish completed results."""
-    sr = validate_config()
+def main() -> int:
+    """Run timed stages, optionally build locally, and publish completed results.
+
+    Returns:
+        Process exit code: 0 on success, 1 on runtime failure, 2 if
+        CONFIGURATION is invalid (including a missing ArcPy), 130 if cancelled.
+    """
+    try:
+        sr = validate_config()
+    except (ValueError, RuntimeError) as exc:
+        LOGGER.error("%s", exc)
+        return 2
     started = time.perf_counter()
     name = datetime.now().strftime("walking_qa_%Y%m%d_%H%M%S_%f")
     destination = Path(OUTPUT_FOLDER) / name
@@ -2778,14 +2792,17 @@ def main() -> None:
         )
         write_csv(destination / "timings.csv", timings, ["STAGE", "SECONDS", "STATUS"])
         write_run_status(destination, "COMPLETE", folder)
-    except BaseException:
+    except BaseException as exc:
         LOGGER.exception("Run failed. Working data retained at %s; log: %s", folder, destination)
         try:
             write_csv(destination / "timings.csv", timings, ["STAGE", "SECONDS", "STATUS"])
             write_run_status(destination, "FAILED", folder)
         except OSError:
             LOGGER.exception("Could not update final status; retain the working folder above.")
-        raise
+        # Return rather than re-raise: LOGGER.exception already recorded the
+        # traceback, and a code keeps main() traceback-free in a notebook cell
+        # while still failing the run for shell callers.
+        return 130 if isinstance(exc, KeyboardInterrupt) else 1
     LOGGER.info(
         "COMPLETE in %.1f minutes. Output: %s", (time.perf_counter() - started) / 60, destination
     )
@@ -2795,7 +2812,8 @@ def main() -> None:
             shutil.rmtree(str(folder))
         except (OSError, arcpy.ExecuteError):
             LOGGER.warning("Results are published; temporary files remain at %s", folder)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

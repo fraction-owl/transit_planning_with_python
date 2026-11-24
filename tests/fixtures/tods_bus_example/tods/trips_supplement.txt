@@ -1,0 +1,3 @@
+route_id,service_id,trip_id,direction_id,block_id,TODS_trip_type
+12,DAILY,PO1,0,BLOCK-A,pull-out
+12,DAILY,PI1,1,BLOCK-A,pull-in

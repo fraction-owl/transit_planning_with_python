@@ -21,7 +21,9 @@ from scripts.stop_analysis.gtfs_route_diff import (
     compare_routes,
     date_range_relationship,
     detect_splits_merges,
+    expand_service_active_dates,
     feed_date_range,
+    fingerprint_times,
     jaccard,
     load_feed,
     main,
@@ -194,6 +196,34 @@ def test_schedule_fingerprint_distinguishes_shifted_trips() -> None:
     assert fp_early["R1"] != fp_late["R1"]  # a 10-minute shift is detectable
 
 
+def test_schedule_fingerprint_distinguishes_departures_swapped_between_directions() -> None:
+    # Eastbound a->b and westbound b->a swap their 08:00 and 17:00 departures. The
+    # pooled start/end times are identical; the direction and terminal pair are not.
+    trips = pd.DataFrame(
+        {"route_id": ["R1", "R1"], "trip_id": ["east", "west"], "direction_id": ["0", "1"]}
+    )
+    st_before = _stop_times(
+        [
+            ("east", "a", "1", "08:00:00"),
+            ("east", "b", "2", "08:30:00"),
+            ("west", "b", "1", "17:00:00"),
+            ("west", "a", "2", "17:30:00"),
+        ]
+    )
+    st_after = _stop_times(
+        [
+            ("east", "a", "1", "17:00:00"),
+            ("east", "b", "2", "17:30:00"),
+            ("west", "b", "1", "08:00:00"),
+            ("west", "a", "2", "08:30:00"),
+        ]
+    )
+    fp_before = schedule_fingerprint(trips, trip_endpoints(st_before))
+    fp_after = schedule_fingerprint(trips, trip_endpoints(st_after))
+    assert fp_before["R1"] != fp_after["R1"]
+    assert fingerprint_times(fp_before["R1"]) == fingerprint_times(fp_after["R1"])
+
+
 # ---------------------------------------------------------------------------
 # trip_endpoints / route_stop_sets / route_terminals / route_schedule_metrics
 # ---------------------------------------------------------------------------
@@ -280,6 +310,40 @@ def test_route_interline_partners_shared_block() -> None:
     partners = route_interline_partners(trips)
     assert partners["R1"] == frozenset({"R2"})
     assert partners["R3"] == frozenset()
+
+
+def test_route_interline_partners_ignores_block_shared_on_disjoint_days() -> None:
+    # R1 (weekday) and R2 (Saturday) reuse block B1 but never run on the same date.
+    trips = pd.DataFrame(
+        {"route_id": ["R1", "R2"], "block_id": ["B1", "B1"], "service_id": ["WK", "SAT"]}
+    )
+    active = expand_service_active_dates(
+        pd.DataFrame(
+            [
+                _cal("WK", "1111100", "20260901", "20260930"),
+                _cal("SAT", "0000010", "20260901", "20260930"),
+            ]
+        )
+    )
+    partners = route_interline_partners(trips, active)
+    assert partners == {"R1": frozenset(), "R2": frozenset()}
+
+
+def test_route_interline_partners_pairs_different_service_ids_with_common_date() -> None:
+    # WK runs Mon-Fri and FRI runs Fridays only: different service_ids, shared dates.
+    trips = pd.DataFrame(
+        {"route_id": ["R1", "R2"], "block_id": ["B1", "B1"], "service_id": ["WK", "FRI"]}
+    )
+    active = expand_service_active_dates(
+        pd.DataFrame(
+            [
+                _cal("WK", "1111100", "20260901", "20260930"),
+                _cal("FRI", "0000100", "20260901", "20260930"),
+            ]
+        )
+    )
+    partners = route_interline_partners(trips, active)
+    assert partners == {"R1": frozenset({"R2"}), "R2": frozenset({"R1"})}
 
 
 def test_route_interline_partners_none_without_block_id() -> None:
@@ -608,6 +672,57 @@ def test_compare_routes_flags_major_alignment() -> None:
     assert results["summary"].alignment_major_count == 1
     r1 = results["overview"].iloc[0]
     assert r1["headline_change"] == "major_alignment"
+
+
+def test_compare_routes_flags_departures_swapped_between_directions() -> None:
+    def feed(east_hour: str, west_hour: str) -> dict:
+        built = _build_feed(
+            routes=[("R1", "1")],
+            trips=[("R1", "east", "WK"), ("R1", "west", "WK")],
+            stop_times=[
+                ("east", "a", "1", f"{east_hour}:00:00"),
+                ("east", "b", "2", f"{east_hour}:30:00"),
+                ("west", "b", "1", f"{west_hour}:00:00"),
+                ("west", "a", "2", f"{west_hour}:30:00"),
+            ],
+        )
+        built["trips"]["direction_id"] = ["0", "1"]
+        return built
+
+    results = compare_routes(feed("08", "17"), feed("17", "08"), weekday="tuesday", knobs=KNOBS)
+    r1 = results["overview"].iloc[0]
+    assert r1["schedule_change"] == "minor"
+    assert r1["headline_change"] != "unchanged"
+    assert r1["schedule_detail"] == "same trip times, moved between directions or terminals"
+
+
+def test_compare_routes_no_reblock_for_block_id_reused_on_another_service_day() -> None:
+    # Only R2's block_id changes, to one R1 uses -- but R1 runs weekdays and R2
+    # Saturdays, so the two routes still never share a vehicle.
+    def feed(r2_block: str) -> dict:
+        built = _build_feed(
+            routes=[("R1", "1"), ("R2", "2")],
+            trips=[("R1", "t1", "WK"), ("R2", "t2", "SAT")],
+            stop_times=[
+                ("t1", "a", "1", "08:00:00"),
+                ("t1", "b", "2", "08:30:00"),
+                ("t2", "c", "1", "09:00:00"),
+                ("t2", "d", "2", "09:30:00"),
+            ],
+        )
+        built["trips"]["block_id"] = ["B1", r2_block]
+        built["calendar"] = pd.DataFrame(
+            [
+                _cal("WK", "1111100", "20240101", "20240131"),
+                _cal("SAT", "0000010", "20240101", "20240131"),
+            ]
+        )
+        return built
+
+    results = compare_routes(feed("B9"), feed("B1"), weekday="tuesday", knobs=KNOBS)
+    overview = results["overview"].set_index("route_id")
+    assert not overview["reblocked"].any()
+    assert set(overview["headline_change"]) == {"unchanged"}
 
 
 # ---------------------------------------------------------------------------

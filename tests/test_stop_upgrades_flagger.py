@@ -9,7 +9,7 @@ import pytest
 script_dir = Path("scripts/facilities_tools").resolve()
 sys.path.append(str(script_dir))
 
-import flag_stop_upgrades as target  # noqa: E402
+import stop_upgrades_flagger as target  # noqa: E402
 
 FIXTURE_PATH = Path("tests/fixtures/stop_usage_by_stop_id_sample.csv")
 

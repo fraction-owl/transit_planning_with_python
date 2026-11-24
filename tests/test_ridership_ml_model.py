@@ -69,6 +69,34 @@ def test_build_feature_frame_log_and_dropna() -> None:
     assert len(frame) == 3
 
 
+def test_shipped_predictor_settings_encode_month() -> None:
+    """The default explicit list omits 'month'; it is still kept and one-hot encoded."""
+    rng = np.random.default_rng(3)
+    n = 40
+    table = pd.DataFrame({col: rng.uniform(1.0, 10.0, n) for col in rml.PREDICTORS})
+    table[rml.DEPENDENT_VAR] = rng.uniform(100.0, 1000.0, n)
+    table["month"] = np.repeat(["Jan", "Feb", "Mar", "Apr"], n // 4)
+    assert "month" not in rml.PREDICTORS and "month" in rml.CATEGORICAL_PREDICTORS
+
+    predictors = rml.select_predictors(
+        table, rml.PREDICTORS, rml.DEPENDENT_VAR, rml.JOIN_KEYS, rml.CATEGORICAL_PREDICTORS
+    )
+    assert predictors == [*rml.PREDICTORS, "month"]
+    _, x_frame, _ = rml.build_feature_frame(
+        table,
+        rml.DEPENDENT_VAR,
+        predictors,
+        rml.CATEGORICAL_PREDICTORS,
+        rml.LOG_DEPENDENT,
+        rml.LOG_PREDICTORS,
+    )
+    assert [c for c in x_frame.columns if c.startswith("month_")] == [
+        "month_Feb",
+        "month_Jan",
+        "month_Mar",
+    ]
+
+
 def test_log_dependent_rejects_nonpositive() -> None:
     """Non-positive target under a log transform must raise."""
     df = pd.DataFrame({"y": [1.0, 0.0, 3.0], "x": [1.0, 2.0, 3.0]})
@@ -159,8 +187,39 @@ def test_assemble_model_table_left_join(tmp_path) -> None:
     )
 
     assert list(table.columns) == ["route_id", "ntd_boardings", "pop_served"]
-    assert table.loc[table["route_id"] == 3, "pop_served"].isna().all()  # unmatched -> NaN
-    assert table.loc[table["route_id"] == 1, "pop_served"].iloc[0] == 500
+    assert table.loc[table["route_id"] == "3", "pop_served"].isna().all()  # unmatched -> NaN
+    assert table.loc[table["route_id"] == "1", "pop_served"].iloc[0] == 500
+
+
+def _jobs_join(tmp_path, anchor_csv: str, jobs_csv: str) -> pd.DataFrame:
+    """Join a jobs feature CSV onto an anchor CSV on route_id."""
+    anchor, feature = tmp_path / "anchor.csv", tmp_path / "jobs.csv"
+    anchor.write_text(anchor_csv)
+    feature.write_text(jobs_csv)
+    jobs = rml.FeatureTable(label="jobs", path=feature, join_keys=("route_id",))
+    return rml.assemble_model_table(anchor, 0, [jobs])
+
+
+def test_numeric_looking_route_ids_stay_distinct(tmp_path) -> None:
+    """Routes '01' and '1' keep their own features instead of collapsing to 1."""
+    table = _jobs_join(
+        tmp_path,
+        "route_id,ntd_boardings\n01,500\n1,4000\n7 ,80\n",
+        "route_id,jobs\n01,100\n1,900\n7.0,30\n",
+    )
+    assert table[["route_id", "jobs"]].to_numpy().tolist() == [["01", 100], ["1", 900], ["7", 30]]
+
+
+def test_conflicting_feature_values_for_one_key_are_rejected(tmp_path, caplog) -> None:
+    """A key repeated with different values fails; an exact repeat is dropped with a warning."""
+    with pytest.raises(ValueError, match=r"conflicting values.*'route_id': '1'"):
+        _jobs_join(tmp_path, "route_id,ntd_boardings\n1,500\n", "route_id,jobs\n1,100\n1,900\n")
+    with caplog.at_level("WARNING"):
+        table = _jobs_join(
+            tmp_path, "route_id,ntd_boardings\n1,500\n", "route_id,jobs\n1,100\n1,100\n"
+        )
+    assert table["jobs"].tolist() == [100]
+    assert "1 exact duplicate row(s)" in caplog.text
 
 
 def test_end_to_end_export(tmp_path, feature_matrix) -> None:

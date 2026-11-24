@@ -32,9 +32,12 @@ transit_planning_with_python/
 │   │   ├── stop_visits.csv
 │   │   └── trips_performed.csv
 │   ├── README.md
+│   ├── county_fips_example.txt
+│   ├── event_routes_example.txt
+│   ├── express_routes_example.txt
 │   ├── gtfs_archive.zip
 │   ├── gtfs_current.zip
-│   ├── ntd_monthly_config_example.txt
+│   ├── non_revenue_routes_example.txt
 │   ├── time_periods_example.txt
 │   └── tods_current.zip
 ├── scripts/
@@ -47,15 +50,17 @@ transit_planning_with_python/
 │   │   ├── bay_assignment_optimizer.py
 │   │   ├── bay_change_sweep.py
 │   │   ├── bay_usage_analyzer.py
+│   │   ├── bus_bay_cluster_mapper.py
 │   │   ├── cluster_stops_from_zones_arcpy.py
 │   │   ├── cluster_stops_from_zones_gpd.py
-│   │   ├── flag_stop_upgrades.py
-│   │   ├── stop_improvement_coverage_summary.py
+│   │   ├── stop_upgrades_flagger.py
+│   │   ├── stop_upgrades_survey.py
 │   │   ├── walking_network_qa_arcpy.py
 │   │   └── walking_network_qa_gpd.py
 │   ├── field_tools/
 │   │   ├── gtfs_route_summary.py
 │   │   ├── gtfs_service_change_dates.py
+│   │   ├── pattern_map_exporter_gpd.py
 │   │   └── printable_block_schedules.py
 │   ├── gbfs_tools/
 │   │   ├── bikeshare_ridership_trends.py
@@ -66,15 +71,12 @@ transit_planning_with_python/
 │   │   ├── gtfs_skipped_stop_flagger_gpd.py
 │   │   ├── gtfs_stop_proximity_qc.py
 │   │   ├── gtfs_timepoint_interval_flagger.py
-│   │   ├── route_direction_classifier_arcpy.py
-│   │   ├── route_direction_classifier_gpd.py
 │   │   ├── stop_v_conflict_checker_arcpy.py
 │   │   ├── stop_v_conflict_checker_gpd.py
 │   │   ├── stop_vs_roadname_checker_arcpy.py
 │   │   └── stop_vs_roadname_checker_gpd.py
 │   ├── gtfs_exports/
 │   │   ├── block_status_timeline_exporter.py
-│   │   ├── bus_block_exporter.py
 │   │   ├── gtfs_feed_merger.py
 │   │   ├── gtfs_route_features_gpd.py
 │   │   ├── gtfs_route_timeline.py
@@ -83,7 +85,6 @@ transit_planning_with_python/
 │   │   ├── gtfs_to_shapefile_gpd.py
 │   │   ├── headway_span_exporter.py
 │   │   ├── interlined_routes_exporter.py
-│   │   ├── pattern_map_exporter_gpd.py
 │   │   ├── route_stops_exporter.py
 │   │   ├── route_transfer_calculator.py
 │   │   └── scheduled_service_hours.py
@@ -107,7 +108,6 @@ transit_planning_with_python/
 │   ├── operations_tools/
 │   │   ├── otp_by_route.py
 │   │   ├── otp_by_timepoint_from_avl.py
-│   │   ├── otp_monthly_panel.py
 │   │   ├── otp_runtime_from_tides.py
 │   │   ├── runtime_by_route.py
 │   │   └── runtime_workflow.py
@@ -121,9 +121,9 @@ transit_planning_with_python/
 │   │   ├── ntd_monthly_trends_export.py
 │   │   ├── ridership_by_hour.py
 │   │   ├── ridership_from_tides.py
-│   │   ├── stop_ridership_change.py
 │   │   ├── stops_ridership_joiner_arcpy.py
-│   │   └── stops_ridership_joiner_gpd.py
+│   │   ├── stops_ridership_joiner_gpd.py
+│   │   └── trip_cut_savings.py
 │   ├── service_coverage/
 │   │   ├── cabi_coverage_by_route_gpd.py
 │   │   ├── cordon_crossing_routes_gpd.py
@@ -146,7 +146,10 @@ transit_planning_with_python/
 │   └── stop_analysis/
 │       ├── gtfs_linear_diff_gpd.py
 │       ├── gtfs_route_diff.py
+│       ├── gtfs_shp_linear_diff_arcpy.py
+│       ├── gtfs_shp_linear_diff_gpd.py
 │       ├── gtfs_stop_diff.py
+│       ├── gtfs_timepoint_interval_flagger.py
 │       ├── service_cut_impact_arcpy.py
 │       ├── service_cut_impact_gpd.py
 │       ├── stop_impacts_target_routes.py
@@ -210,6 +213,19 @@ transit_planning_with_python/
 │   │   │   ├── Private_Shuttle_Stops.zip
 │   │   │   ├── School_Facilities.zip
 │   │   │   └── Urgent_Care_Facilities.zip
+│   │   ├── tods_bus_example/
+│   │   │   ├── gtfs/
+│   │   │   │   ├── agency.txt
+│   │   │   │   ├── calendar.txt
+│   │   │   │   ├── routes.txt
+│   │   │   │   ├── stop_times.txt
+│   │   │   │   ├── stops.txt
+│   │   │   │   └── trips.txt
+│   │   │   ├── tods/
+│   │   │   │   ├── stop_times_supplement.txt
+│   │   │   │   ├── stops_supplement.txt
+│   │   │   │   └── trips_supplement.txt
+│   │   │   └── README.md
 │   │   ├── 4331222_sample.csv
 │   │   ├── ACSDT5Y2024.B01001_2026-05-23T135534.zip
 │   │   ├── ACSDT5Y2024.B08201_2026-05-23T135430.zip
@@ -229,6 +245,7 @@ transit_planning_with_python/
 │   │   ├── UNRATE_sample.csv
 │   │   ├── capitalbikeshare_fixtures_24mo.zip
 │   │   ├── ccd_sch_052_1920_sample.zip
+│   │   ├── county_fips.txt
 │   │   ├── dc_wac_S000_JT00_2023.csv.gz
 │   │   ├── effy2019_sample.csv
 │   │   ├── express_origin_stops.txt
@@ -238,6 +255,7 @@ transit_planning_with_python/
 │   │   ├── mock_gtfs_dc.zip
 │   │   ├── mock_gtfs_dc_archive.zip
 │   │   ├── mock_tods_dc.zip
+│   │   ├── ntd_monthly_config_example.txt
 │   │   ├── ntd_monthly_multi_month.csv
 │   │   ├── output_road_shps_dc.zip
 │   │   ├── private_shuttles_sample.csv
@@ -255,15 +273,17 @@ transit_planning_with_python/
 │   │   ├── tl_2025_51_tabblock20_sample.zip
 │   │   ├── trips_performed.csv
 │   │   └── va_wac_S000_JT00_2023.csv.gz
+│   ├── test_apply_supplement.py
 │   ├── test_bay_assignment_optimizer.py
 │   ├── test_bay_change_sweep.py
 │   ├── test_bay_usage_analyzer.py
 │   ├── test_bikeshare_ridership_trends.py
 │   ├── test_block_status_timeline_exporter.py
 │   ├── test_block_timeline_helpers.py
-│   ├── test_bus_block_exporter.py
+│   ├── test_bus_bay_cluster_mapper.py
 │   ├── test_cabi_coverage_by_route_gpd.py
 │   ├── test_calendar_helpers.py
+│   ├── test_census_helpers.py
 │   ├── test_check_style.py
 │   ├── test_check_style_config_section.py
 │   ├── test_check_style_docstring_length.py
@@ -280,7 +300,6 @@ transit_planning_with_python/
 │   ├── test_distance_helpers.py
 │   ├── test_district_ridership_share_arcpy.py
 │   ├── test_district_ridership_share_gpd.py
-│   ├── test_flag_stop_upgrades.py
 │   ├── test_gbfs_ridership_join.py
 │   ├── test_gbfs_stations_exporter.py
 │   ├── test_generate_mock_cbd.py
@@ -296,6 +315,8 @@ transit_planning_with_python/
 │   ├── test_gtfs_service_change_dates.py
 │   ├── test_gtfs_service_demographics_arcpy.py
 │   ├── test_gtfs_service_demographics_gpd.py
+│   ├── test_gtfs_shp_linear_diff_arcpy.py
+│   ├── test_gtfs_shp_linear_diff_gpd.py
 │   ├── test_gtfs_skipped_stop_flagger_gpd.py
 │   ├── test_gtfs_stop_diff.py
 │   ├── test_gtfs_stop_proximity_qc.py
@@ -317,7 +338,6 @@ transit_planning_with_python/
 │   ├── test_open_gtfs_file.py
 │   ├── test_otp_by_route.py
 │   ├── test_otp_by_timepoint_from_avl.py
-│   ├── test_otp_monthly_panel.py
 │   ├── test_otp_runtime_from_tides.py
 │   ├── test_pattern_map_exporter_gpd.py
 │   ├── test_pipeline_contracts.py
@@ -330,9 +350,8 @@ transit_planning_with_python/
 │   ├── test_ridership_by_hour.py
 │   ├── test_ridership_from_tides.py
 │   ├── test_ridership_ml_model.py
-│   ├── test_route_direction_classifier_arcpy.py
-│   ├── test_route_direction_classifier_gpd.py
 │   ├── test_route_length_by_district_gtfs_zip.py
+│   ├── test_route_list_loaders.py
 │   ├── test_route_performance_model.py
 │   ├── test_route_redundancy_profile_gpd.py
 │   ├── test_route_stops_exporter.py
@@ -348,13 +367,13 @@ transit_planning_with_python/
 │   ├── test_shapefile_helpers.py
 │   ├── test_site_route_proximity_gpd.py
 │   ├── test_stop_impacts_target_routes.py
-│   ├── test_stop_improvement_coverage_summary.py
 │   ├── test_stop_pattern_id.py
 │   ├── test_stop_removal_impact_gpd.py
 │   ├── test_stop_removal_impact_gtfs_zip.py
-│   ├── test_stop_ridership_change.py
 │   ├── test_stop_spacing_flagger_arcpy.py
 │   ├── test_stop_spacing_flagger_gpd.py
+│   ├── test_stop_upgrades_flagger.py
+│   ├── test_stop_upgrades_survey.py
 │   ├── test_stop_v_conflict_checker_arcpy.py
 │   ├── test_stop_v_conflict_checker_gpd.py
 │   ├── test_stop_vs_roadname_checker_arcpy.py
@@ -362,6 +381,8 @@ transit_planning_with_python/
 │   ├── test_stops_ridership_joiner_arcpy.py
 │   ├── test_stops_ridership_joiner_gpd.py
 │   ├── test_time_helpers.py
+│   ├── test_tods_bus_example.py
+│   ├── test_trip_cut_savings.py
 │   ├── test_trip_runtime_diagnostics_from_avl.py
 │   ├── test_tsde_to_tods.py
 │   ├── test_uscensus_table_build.py
@@ -373,6 +394,7 @@ transit_planning_with_python/
 ├── utils/
 │   ├── block_timeline_helpers.py
 │   ├── calendar_helpers.py
+│   ├── census_helpers.py
 │   ├── cli_helpers.py
 │   ├── distance_helpers.py
 │   ├── gtfs_helpers.py

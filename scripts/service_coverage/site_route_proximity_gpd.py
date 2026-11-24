@@ -56,7 +56,7 @@ LOCATION_EXTRA_FIELDS = ["SCHOOL_NAM", "SCHOOL_TYP", "WEB_ADDRES"]  # Edit
 
 # Route filters
 ROUTE_FILTER_IN: list[str] = []  # keep only these (leave empty for no “in” filter)
-ROUTE_FILTER_OUT: list[str] = ["9999A", "9999B", "9999C"]  # always drop these
+ROUTE_FILTER_OUT: list[str] = []  # always drop these, e.g. ["9999A", "9999B", "9999C"]
 
 # location-mode specifics
 MANUAL_LOCATIONS = [

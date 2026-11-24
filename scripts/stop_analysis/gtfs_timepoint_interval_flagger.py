@@ -3,9 +3,10 @@
 This script reviews every trip in a GTFS feed — for all schedules
 (service_ids) by default — and measures the scheduled running time between
 each pair of consecutive timepoints. Any interval longer than
-MAX_INTERVAL_MINUTES (default 10) is flagged for review. Long gaps
-between timepoints make mid-route on-time performance hard to monitor and
-often signal that a timepoint is missing from the schedule data.
+MAX_INTERVAL_MINUTES (default 10) is flagged for review. Set it to your
+agency's timepoint-spacing policy, if it has one, and the flags show
+where the schedule exceeds that policy. Long gaps between timepoints make
+mid-route on-time performance hard to monitor.
 
 Timepoints are the stop_times.txt rows with ``timepoint == 1``. When the
 feed carries no ``timepoint`` column (or marks no rows), every stop with a
@@ -55,7 +56,8 @@ import pandas as pd
 GTFS_PATH: str = r"Path\To\Your\GTFS_Folder"  # folder of .txt files or a .zip
 OUTPUT_DIR: str = r"Path\To\Your\Output_Folder"
 
-# Maximum scheduled minutes allowed between consecutive timepoints on a trip.
+# Maximum scheduled minutes allowed between consecutive timepoints on a trip;
+# set this to your agency's timepoint-spacing policy, if it has one.
 # Intervals STRICTLY greater than this are flagged. Timepoints are commonly
 # spaced every 5-10 scheduled minutes of running time, so anything over 10
 # merits review; lower this to tighten the review.
@@ -258,6 +260,54 @@ def build_schedule_labels(calendar: Optional[pd.DataFrame]) -> dict[str, str]:
     return labels
 
 
+def parse_time_to_seconds(time_value: Optional[str]) -> Optional[int]:
+    """Convert an ``HH:MM[:SS]`` time string to whole seconds past midnight.
+
+    GTFS times may exceed 24:00 (e.g. ``"25:30:00"`` for a 1:30 AM trip on
+    the following calendar day); those values are preserved. Seconds are kept,
+    not rounded to the minute, so intervals compare exactly against a limit.
+
+    Args:
+        time_value: Time string such as ``"7:05"``, ``"07:05:20"``, or
+            ``"26:30:00"``. Leading/trailing whitespace is ignored.
+            Non-string or malformed values yield ``None``.
+
+    Returns:
+        Seconds since midnight, or ``None`` if the value cannot be parsed.
+    """
+    if not isinstance(time_value, str):
+        return None
+    parts = time_value.strip().split(":")
+    if len(parts) not in (2, 3):
+        return None
+    try:
+        hours = int(parts[0])
+        minutes = int(parts[1])
+        seconds = int(parts[2]) if len(parts) == 3 else 0
+    except ValueError:
+        return None
+    if hours < 0 or not 0 <= minutes < 60 or not 0 <= seconds < 60:
+        return None
+    return hours * 3600 + minutes * 60 + seconds
+
+
+def seconds_to_hhmmss(seconds: Optional[float], missing: str = "") -> str:
+    """Format seconds past midnight as ``HH:MM:SS`` (hours may pass 24).
+
+    Args:
+        seconds: Seconds since midnight. ``None`` and NaN yield ``missing``.
+        missing: String returned for missing values.
+
+    Returns:
+        Zero-padded ``HH:MM:SS`` string, e.g. ``95400`` -> ``"26:30:00"``.
+    """
+    if seconds is None or pd.isna(seconds):
+        return missing
+    minutes, secs = divmod(int(round(seconds)), 60)
+    hours, mins = divmod(minutes, 60)
+    return f"{hours:02d}:{mins:02d}:{secs:02d}"
+
+
 def compute_timepoint_intervals(
     timepoints: pd.DataFrame,
     trips: pd.DataFrame,
@@ -270,7 +320,8 @@ def compute_timepoint_intervals(
     interval runs from the upstream timepoint's departure time to the
     downstream timepoint's arrival time (each falling back to the other
     field when blank). Rows with no parseable time are skipped; GTFS times
-    past 24:00 are handled, and seconds are rounded to the nearest minute.
+    past 24:00 are handled. Intervals are measured in seconds, so an interval
+    of 10:20 is 10.33 minutes and exceeds a 10-minute limit.
 
     Args:
         timepoints: Output of :func:`select_timepoint_rows`.
@@ -280,38 +331,41 @@ def compute_timepoint_intervals(
 
     Returns:
         One row per consecutive timepoint pair, with the columns listed in
-        :data:`INTERVAL_COLUMNS` (``interval_minutes`` may be negative when
-        the feed's times run backwards — see :func:`flag_long_intervals`).
+        :data:`INTERVAL_COLUMNS`. ``from_departure`` and ``to_arrival`` are
+        ``HH:MM:SS``; ``interval_minutes`` is unrounded and may be negative when
+        the feed's times run backwards — see :func:`flag_long_intervals`.
     """
     tp = timepoints.copy()
     if tp.empty:
         return pd.DataFrame(columns=INTERVAL_COLUMNS)
 
-    tp["_depart_min"] = tp["departure_time"].map(parse_time_to_minutes)
-    tp["_arrive_min"] = tp["arrival_time"].map(parse_time_to_minutes)
-    tp["_depart_min"] = tp["_depart_min"].fillna(tp["_arrive_min"])
-    tp["_arrive_min"] = tp["_arrive_min"].fillna(tp["_depart_min"])
+    tp["_depart_s"] = tp["departure_time"].map(parse_time_to_seconds)
+    tp["_arrive_s"] = tp["arrival_time"].map(parse_time_to_seconds)
+    tp["_depart_s"] = tp["_depart_s"].fillna(tp["_arrive_s"])
+    tp["_arrive_s"] = tp["_arrive_s"].fillna(tp["_depart_s"])
 
-    n_untimed = int(tp["_depart_min"].isna().sum())
+    n_untimed = int(tp["_depart_s"].isna().sum())
     if n_untimed:
         logging.info("Skipped %d timepoint row(s) with no parseable scheduled time.", n_untimed)
-        tp = tp.loc[tp["_depart_min"].notna()]
+        tp = tp.loc[tp["_depart_s"].notna()]
     if tp.empty:
         return pd.DataFrame(columns=INTERVAL_COLUMNS)
 
     tp = tp.sort_values(["trip_id", "stop_sequence"], kind="mergesort")
-    nxt = tp.groupby("trip_id")[["stop_id", "stop_sequence", "_arrive_min"]].shift(-1)
+    nxt = tp.groupby("trip_id")[["stop_id", "stop_sequence", "_arrive_s"]].shift(-1)
     tp["to_stop_id"] = nxt["stop_id"]
     tp["to_stop_sequence"] = nxt["stop_sequence"]
-    tp["_to_arrive_min"] = nxt["_arrive_min"]
+    tp["_to_arrive_s"] = nxt["_arrive_s"]
 
     pairs = tp.loc[tp["to_stop_id"].notna()].copy()
     if pairs.empty:
         return pd.DataFrame(columns=INTERVAL_COLUMNS)
 
-    pairs["interval_minutes"] = pairs["_to_arrive_min"] - pairs["_depart_min"]
-    pairs["from_departure"] = pairs["_depart_min"].map(minutes_to_hhmm)
-    pairs["to_arrival"] = pairs["_to_arrive_min"].map(minutes_to_hhmm)
+    # Compare in seconds: rounding each time to a minute first would let
+    # 08:00:00 -> 08:10:20 pass a strict 10-minute limit.
+    pairs["interval_minutes"] = (pairs["_to_arrive_s"] - pairs["_depart_s"]) / 60
+    pairs["from_departure"] = pairs["_depart_s"].map(seconds_to_hhmmss)
+    pairs["to_arrival"] = pairs["_to_arrive_s"].map(seconds_to_hhmmss)
     pairs = pairs.rename(columns={"stop_id": "from_stop_id", "stop_sequence": "from_stop_sequence"})
     pairs["from_stop_sequence"] = pairs["from_stop_sequence"].astype(int)
     pairs["to_stop_sequence"] = pairs["to_stop_sequence"].astype(int)
@@ -675,60 +729,6 @@ def load_gtfs_data(
             archive.close()
 
 
-def parse_time_to_minutes(time_value: Optional[str]) -> Optional[int]:
-    """Convert an ``HH:MM[:SS]`` time string to integer minutes past midnight.
-
-    GTFS times may exceed 24:00 (e.g. ``"25:30:00"`` for a 1:30 AM trip on
-    the following calendar day); those values are preserved as integers
-    greater than or equal to 1440. Seconds, when present, are rounded to the
-    nearest minute.
-
-    Args:
-        time_value: Time string such as ``"7:05"``, ``"07:05:00"``, or
-            ``"26:30:00"``. Leading/trailing whitespace is ignored.
-            Non-string or malformed values yield ``None``.
-
-    Returns:
-        Minutes since midnight, or ``None`` if the value cannot be parsed.
-    """
-    if not isinstance(time_value, str):
-        return None
-    parts = time_value.strip().split(":")
-    if len(parts) not in (2, 3):
-        return None
-    try:
-        hours = int(parts[0])
-        minutes = int(parts[1])
-        seconds = int(parts[2]) if len(parts) == 3 else 0
-    except ValueError:
-        return None
-    if hours < 0 or not 0 <= minutes < 60 or not 0 <= seconds < 60:
-        return None
-    return hours * 60 + minutes + round(seconds / 60)
-
-
-def minutes_to_hhmm(minutes: Optional[float], missing: str = "") -> str:
-    """Convert minutes past midnight to a zero-padded ``HH:MM`` string.
-
-    GTFS service days may exceed 24 hours, so values of 1440 minutes or more
-    format with hours >= 24 (e.g. ``1590`` -> ``"26:30"``).
-
-    Args:
-        minutes: Minutes since midnight (may be fractional; rounded to the
-            nearest minute). ``None`` and NaN yield ``missing``.
-        missing: String returned for missing values, e.g. ``""`` or a
-            sentinel such as ``"–"``.
-
-    Returns:
-        Zero-padded ``HH:MM`` string, or ``missing`` when *minutes* is
-        ``None``/NaN.
-    """
-    if minutes is None or pd.isna(minutes):
-        return missing
-    hours, mins = divmod(int(round(minutes)), 60)
-    return f"{hours:02d}:{mins:02d}"
-
-
 def notebook_safe_argv(argv: Optional[Sequence[str]]) -> Optional[List[str]]:
     """Return the argv to parse, shielding notebook kernels from stray flags.
 
@@ -820,8 +820,10 @@ def run(
     ensure_dir(output_dir)
     detail_path = output_dir / DETAIL_FILENAME
     summary_path = output_dir / SUMMARY_FILENAME
-    flags.to_csv(detail_path, index=False)
-    summary.to_csv(summary_path, index=False)
+    flags.round({"interval_minutes": 2}).to_csv(detail_path, index=False)
+    summary.round({"min_interval_minutes": 2, "max_interval_minutes": 2}).to_csv(
+        summary_path, index=False
+    )
     logging.info("Wrote %d flagged interval(s) → %s", len(flags), detail_path)
     logging.info("Wrote %d summary row(s) → %s", len(summary), summary_path)
     if flags.empty:

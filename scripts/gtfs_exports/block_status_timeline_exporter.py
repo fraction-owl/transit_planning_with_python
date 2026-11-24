@@ -29,14 +29,18 @@ route's visits to a different stop to test alternative bay assignments.
 
 A trip holds its vehicle from its first stop's arrival to its last stop's departure, so
 a first-stop hold (arriving 10:02, departing 10:10) keeps the bus in the bay from 10:02.
+Times round to the minute; a next stop that rounds into the first-stop departure minute
+starts a minute later, so the departure keeps its scheduled minute.
 Between-trip rows quote scheduled times: last-stop arrival and first-stop departure.
 
 Outputs
 -------
 - One Excel workbook per vehicle block (``block_<block_id>_<route(s)>.xlsx``) in
-  ``BLOCK_OUTPUT_FOLDER``: one row per minute with timestamp, route, direction, trip,
-  stop, arrival/departure times, and status; ``Estimated Time`` marks interpolated visits.
-- Optionally a single ``COMBINED_TIMELINE_FILE`` (CSV) of every block's rows for Step 2.
+  ``BLOCK_OUTPUT_FOLDER``: one row per minute with timestamp, route, the block's other
+  routes (``Interlined Route``), direction, trip and its start time, stop, arrival/departure
+  times, and status; ``Estimated Time`` marks interpolated visits.
+- Optionally a single ``COMBINED_TIMELINE_FILE`` (CSV) of every block's rows for Step 2,
+  and one workbook per route and direction (``route_<route>_dir_<direction>.xlsx``).
 - ``ASSUMPTIONS_FILE`` recording the parameters used, and ``RUN_LOG_FILENAME``, a
   run-log sidecar with the CONFIGURATION block and the effective runtime settings.
 - ``SCHEDULE_SNAPSHOT_FILE`` (for exact bay-change rescoring) and
@@ -148,6 +152,11 @@ INTERPOLATE_UNTIMED_STOPS: bool = False
 TRIP_ONLY_WITHOUT_BLOCK_ID: bool = False
 
 WRITE_PER_BLOCK_FILES = True
+# Also write one workbook per route and direction (route_<route>_dir_<direction>.xlsx)
+# listing every block's minutes on that route, by time then block. Between-trip rows
+# follow the trip on the row: ARRIVE, DWELL, LAYOVER and LONG BREAK the trip just
+# finished, LOADING the next one. DEADHEAD and INACTIVE rows have no route and are left out.
+WRITE_ROUTE_DIRECTION_FILES = False
 COMBINED_TIMELINE_FILE = r"all_blocks_timeline.csv"  # in the run folder; "" to skip
 SCHEDULE_SNAPSHOT_FILE = r"schedule_snapshot.json"  # required by the exact sweep
 ASSUMPTIONS_FILE = r"timeline_assumptions.txt"  # in the run folder; "" to skip
@@ -192,6 +201,21 @@ OPTIONAL_GTFS_FILES: tuple[str, ...] = ("calendar.txt", "calendar_dates.txt", "f
 
 # Block ID given to each trip analyzed in trip-only mode (TRIP_ONLY_WITHOUT_BLOCK_ID).
 TRIP_ONLY_BLOCK_PREFIX = "trip-only:"
+
+# Columns of the route/direction workbooks (WRITE_ROUTE_DIRECTION_FILES).
+ROUTE_DIRECTION_COLUMNS: tuple[str, ...] = (
+    "Timestamp",
+    "Trip Start Time",
+    "Block",
+    "Route",
+    "Route Short Name",
+    "Direction",
+    "Trip ID",
+    "Stop ID",
+    "Stop Name",
+    "Status",
+    "Interlined Route",
+)
 
 # ==================================================================================================
 # FUNCTIONS
@@ -450,7 +474,7 @@ def find_cluster(stop_id: str, clusters: list[dict[str, Any]]) -> Optional[str]:
 def status_for_same_trip(
     minute: int, stop_info: tuple, settings: dict[str, int]
 ) -> Optional[tuple]:
-    """Return a visit's occupancy, including both boundaries of a scheduled hold."""
+    """Return a visit's occupancy; a mid-trip hold is ARRIVE, then DWELL, then DEPART."""
     arr, dep, sid, name, tid, first, last, seq, timepoint = stop_info
     detail = (sid, name, minutes_to_hhmm(arr), minutes_to_hhmm(dep), tid, seq, timepoint)
     if first and minute == dep:
@@ -458,8 +482,13 @@ def status_for_same_trip(
     if last and minute == arr:
         return ("ARRIVE",) + detail
     if arr <= minute <= dep:
-        if not first and not last and arr == dep:
-            return ("ARRIVE/DEPART",) + detail
+        if not first and not last:
+            if arr == dep:
+                return ("ARRIVE/DEPART",) + detail
+            if minute == arr:
+                return ("ARRIVE",) + detail
+            if minute == dep:
+                return ("DEPART",) + detail
         if first and minute >= dep - settings["PRE_DEPARTURE_MINUTES"]:
             return ("LOADING",) + detail
         return ("DWELL",) + detail
@@ -720,6 +749,9 @@ def build_schedule_rows(
 ) -> list[dict[str, Any]]:
     """Render a block from scheduled visits, with one physical vehicle per minute.
 
+    A trip's first-stop departure keeps its scheduled minute even when the next
+    stop's time rounds into that minute; the next visit starts one minute later.
+
     Args:
         trips_summary: Complete scheduled trips on this block.
         timeline: Minutes to render; the pipeline requires a one-minute step.
@@ -741,16 +773,23 @@ def build_schedule_rows(
         ):
             active.setdefault(minute, []).append(trip)
         sequence = trip["stop_times_sequence"]
+        departed = -1  # the trip's first-stop departure minute, once seen
         for i, stop in enumerate(sequence):
             arr, dep = stop[:2]
+            begin = max(arr, timeline.start)
             finish = dep
-            if not stop[5] and not stop[6] and arr == dep:
-                finish = arr + settings["THROUGH_DWELL_MINUTES"] - 1
-            if i + 1 < len(sequence):
-                # Once the next visit begins, an earlier through dwell cannot reappear.
-                finish = min(finish, sequence[i + 1][0] - 1)
+            if stop[5]:
+                # The scheduled terminal departure is never cut by the next visit.
+                departed = dep
+            else:
+                begin = max(begin, departed + 1)
+                if not stop[6] and arr == dep:
+                    finish = arr + settings["THROUGH_DWELL_MINUTES"] - 1
+                if i + 1 < len(sequence):
+                    # Once the next visit begins, an earlier through dwell cannot reappear.
+                    finish = min(finish, sequence[i + 1][0] - 1)
             finish = min(finish, trip["end"], timeline.stop - 1)
-            for minute in range(max(arr, timeline.start), finish + 1):
+            for minute in range(begin, finish + 1):
                 status = status_for_same_trip(minute, stop, settings)
                 if status is not None:
                     role = "depart" if stop[5] else "arrive" if stop[6] else "through"
@@ -932,6 +971,85 @@ def process_block(
     )
     df = pd.DataFrame(rows)
     return df
+
+
+def route_display_name(short_name: object, long_name: object, route_id: object) -> str:
+    """Name a route for reports: its short name, else its long name, else its route_id.
+
+    GTFS requires only one of route_short_name and route_long_name, so either
+    may be blank; route_id, which is always present, identifies the route.
+    """
+    for value in (short_name, long_name, route_id):
+        text = "" if value is None or pd.isna(value) else str(value).strip()
+        if text:
+            return text
+    return ""
+
+
+def add_reading_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    """Add ``Trip Start Time`` and ``Interlined Route`` to one block's timeline rows.
+
+    ``Trip Start Time`` is ``Trip Start Minute`` as HH:MM. ``Interlined Route``
+    lists the block's other routes by :func:`route_display_name`, comma-separated,
+    on every row that has a route; it is blank on rows without a route and on
+    blocks that run a single route. Routes are told apart by route_id.
+    """
+    frame = frame.copy()
+    start = pd.to_numeric(frame["Trip Start Minute"], errors="coerce").map(minutes_to_hhmm)
+    frame.insert(int(frame.columns.get_loc("Trip ID")) + 1, "Trip Start Time", start)
+    route_ids = frame["Route"].fillna("").astype(str)
+    routes = frame.loc[route_ids.ne(""), ["Route", "Route Short Name", "Route Long Name"]]
+    labels = {
+        str(route_id): route_display_name(short, long_name, route_id)
+        for route_id, short, long_name in routes.drop_duplicates("Route").itertuples(index=False)
+    }
+    others = {
+        route_id: ",".join(sorted({label for other, label in labels.items() if other != route_id}))
+        for route_id in labels
+    }
+    position = int(frame.columns.get_loc("Route Long Name")) + 1
+    frame.insert(position, "Interlined Route", route_ids.map(others).fillna(""))
+    return frame
+
+
+def route_direction_workbooks(frames: Sequence[pd.DataFrame]) -> dict[str, pd.DataFrame]:
+    """Regroup block timelines into one table per route and direction, keyed by file name.
+
+    Rows are grouped on route_id and direction_id and named by
+    :func:`route_display_name`; routes that share a name add their route_id to
+    the file name. Rows without a route (DEADHEAD, INACTIVE) are left out. Each
+    table holds ``ROUTE_DIRECTION_COLUMNS``, sorted by time, then block.
+
+    Raises:
+        ValueError: If two file names collide after sanitizing.
+    """
+    rows = pd.concat(frames, ignore_index=True)
+    rows = rows[rows["Route"].fillna("").astype(str).ne("")]
+    rows = rows.assign(_minute=rows["Timestamp"].map(parse_time_to_minutes))
+    routes = rows[["Route", "Route Short Name", "Route Long Name"]].drop_duplicates("Route")
+    labels = pd.Series(
+        {
+            str(route_id): route_display_name(short, long_name, route_id)
+            for route_id, short, long_name in routes.itertuples(index=False)
+        },
+        dtype=object,
+    )
+    shared = labels.duplicated(keep=False)
+    names = {
+        route_id: f"{label}_{route_id}" if shared[route_id] else label
+        for route_id, label in labels.items()
+    }
+    tables: dict[str, pd.DataFrame] = {}
+    used: set[str] = set()
+    for (route_id, direction), group in rows.groupby(["Route", "Direction"], dropna=False):
+        stem = f"{names[str(route_id)]}_dir_{_text(direction) or 'none'}"
+        filename = "route_" + re.sub(r'[<>:"/\\|?*]', "_", stem) + ".xlsx"
+        if filename.lower() in used:
+            raise ValueError(f"Route/direction file names collide after sanitizing: {filename}")
+        used.add(filename.lower())
+        ordered = group.sort_values(["_minute", "Block"], kind="stable")
+        tables[filename] = ordered[list(ROUTE_DIRECTION_COLUMNS)].reset_index(drop=True)
+    return tables
 
 
 # --------------------------------------------------------------------------------------------------
@@ -1354,8 +1472,10 @@ def run_step1_gtfs_to_blocks() -> None:
         used_names: set[str] = set()
         for block, group in merged.groupby("block_id", sort=False):
             block_trips = [trip for trip in summaries if trip["block"] == str(block)]
-            frame = pd.DataFrame(
-                build_schedule_rows(block_trips, range(end), str(block), clusters, settings)
+            frame = add_reading_columns(
+                pd.DataFrame(
+                    build_schedule_rows(block_trips, range(end), str(block), clusters, settings)
+                )
             )
             routes = "_".join(sorted(group["route_id"].astype(str).unique()))
             filename = "block_" + re.sub(r'[<>:"/\\|?*]', "_", f"{block}_{routes}") + ".xlsx"
@@ -1366,13 +1486,19 @@ def run_step1_gtfs_to_blocks() -> None:
                 frame.to_excel(Path(out_folder) / filename, index=False)
                 written.append(filename)
                 workbooks.append(filename)
-            if COMBINED_TIMELINE_FILE:
+            if COMBINED_TIMELINE_FILE or WRITE_ROUTE_DIRECTION_FILES:
                 frames.append(frame.assign(FileName=filename))
         if COMBINED_TIMELINE_FILE:
             pd.concat(frames, ignore_index=True).to_csv(
                 Path(out_folder) / COMBINED_TIMELINE_FILE, index=False
             )
             written.append(COMBINED_TIMELINE_FILE)
+        route_workbooks: list[str] = []
+        if WRITE_ROUTE_DIRECTION_FILES:
+            for name, table in route_direction_workbooks(frames).items():
+                table.to_excel(Path(out_folder) / name, index=False)
+                written.append(name)
+                route_workbooks.append(name)
         write_json_atomic(Path(out_folder) / SCHEDULE_SNAPSHOT_FILE, snapshot)
         written.append(SCHEDULE_SNAPSHOT_FILE)
         if ASSUMPTIONS_FILE:
@@ -1385,6 +1511,7 @@ def run_step1_gtfs_to_blocks() -> None:
             status="complete",
             combined_timeline=COMBINED_TIMELINE_FILE,
             block_workbooks=workbooks,
+            route_direction_workbooks=route_workbooks,
             schedule_snapshot=SCHEDULE_SNAPSHOT_FILE,
             assumptions_file=ASSUMPTIONS_FILE,
             timeline_end=end,

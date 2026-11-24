@@ -79,9 +79,11 @@ FEED_LABELS: Optional[list[str]] = None
 # to infer just that feed. Dates must be strictly increasing.
 CHANGE_DATES: Optional[list[Optional[str]]] = None
 
-# End date for the final feed's bar on the chart. None = the last feed's own
-# declared end (feed_info/calendar); if that too is unavailable, the final period
-# is drawn FINAL_PERIOD_FALLBACK_DAYS long with a warning.
+# End date for the final feed's bar on the chart. None = the day after the last
+# feed's own declared end (feed_info/calendar end dates are the last day of
+# service, and each period ends where the next begins); if that too is
+# unavailable or not after the feed's start, the final period is drawn
+# FINAL_PERIOD_FALLBACK_DAYS long with a warning.
 FINAL_END_DATE: Optional[str] = None
 FINAL_PERIOD_FALLBACK_DAYS: int = 90
 
@@ -144,11 +146,16 @@ class FeedPeriod:
 
 @dataclass(eq=False)  # identity equality: two distinct empty lineages are not "equal"
 class Lineage:
-    """One route tracked across feeds; ``ids`` maps feed index -> route_id."""
+    """One route tracked across feeds; ``ids`` maps feed index -> route_id.
+
+    ``notes`` maps a feed index to a flag raised there, such as a route_id
+    whose earlier row was already taken in that feed (see :func:`build_lineages`).
+    """
 
     ids: dict[int, str] = field(default_factory=dict)
     short_name: str = ""
     long_name: str = ""
+    notes: dict[int, str] = field(default_factory=dict)
 
     def first_index(self) -> int:
         """Index of the first feed this route appears in."""
@@ -439,8 +446,10 @@ def resolve_periods(
 
     Each feed's start is the user's change date when given, else the feed's
     declared start (feed_info, then calendar). Each period ends where the next
-    one starts; the final period ends at ``final_end_date``, else the last feed's
-    declared end, else ``final_fallback_days`` after its start (with a warning).
+    one starts; the final period ends at ``final_end_date``, else the day after
+    the last feed's declared (inclusive) end date, else ``final_fallback_days``
+    after its start (with a warning) when that end is missing or not after the
+    start.
 
     Args:
         feed_dirs: GTFS feed folders or .zip files, oldest first.
@@ -508,7 +517,10 @@ def resolve_periods(
                 f"FINAL_END_DATE = {final_end_date!r} is not a YYYY-MM-DD or YYYYMMDD date."
             )
     else:
-        final_end = parse_date(summaries[-1].date_bounds[1])
+        # A declared end date is the feed's last day of service; periods end at
+        # the first day they no longer cover, like the start of the next feed.
+        declared_end = parse_date(summaries[-1].date_bounds[1])
+        final_end = declared_end + dt.timedelta(days=1) if declared_end is not None else None
     if final_end is None or final_end <= starts[-1]:
         final_end = starts[-1] + dt.timedelta(days=final_fallback_days)
         logging.warning(
@@ -595,7 +607,11 @@ def build_lineages(summaries: list[FeedSummary], rekey_min_jaccard: float) -> li
     A lineage extends feed-to-feed through :func:`match_consecutive`. A route_id
     that vanishes and later returns rejoins its dormant lineage (a service gap)
     rather than starting a new row; names are refreshed from the newest feed the
-    route appears in.
+    route appears in. Each lineage takes at most one route_id per feed: when
+    several returning ids match the same dormant lineage, the one it last
+    carried keeps it (else the first in sorted order). A returning id whose
+    lineage is already taken in that feed starts a new row, with a warning and
+    a note on the new lineage.
 
     Returns:
         Lineages ordered by first appearance, then input order.
@@ -635,20 +651,44 @@ def build_lineages(summaries: list[FeedSummary], rekey_min_jaccard: float) -> li
             for p_id, c_id in mapping.items():
                 continuing[c_id] = prev_present[p_id]
 
+        # Same route_id returning after a gap: rejoin its dormant lineage, one id
+        # per lineage, preferring the id the lineage carried most recently.
+        assigned: dict[str, Lineage] = dict(continuing)
+        taken = set(continuing.values())
+        returning: dict[Lineage, list[str]] = {}
         for c_id in cur_ids:
-            lineage = continuing.get(c_id)
+            dormant = by_last_id.get(c_id)
+            if c_id not in assigned and dormant is not None and dormant not in taken:
+                returning.setdefault(dormant, []).append(c_id)
+        for dormant, ids in returning.items():
+            latest = dormant.ids[dormant.last_index()]
+            assigned[latest if latest in ids else ids[0]] = dormant
+
+        placed: dict[str, Lineage] = {}
+        for c_id in cur_ids:
+            lineage = assigned.get(c_id)
             if lineage is None:
-                dormant = by_last_id.get(c_id)
-                if dormant is not None and dormant not in continuing.values():
-                    lineage = dormant  # same route_id returning after a gap
-                else:
-                    lineage = Lineage()
-                    lineages.append(lineage)
+                lineage = Lineage()
+                lineages.append(lineage)
             lineage.ids[i] = c_id
             short, long_ = names[c_id]
             lineage.short_name = short or lineage.short_name
             lineage.long_name = long_ or lineage.long_name
-            by_last_id[c_id] = lineage
+            placed[c_id] = lineage
+
+        for c_id, lineage in placed.items():
+            owner = by_last_id.get(c_id)
+            if owner is None or owner is lineage:
+                continue
+            note = (
+                f"ambiguous reuse: route_id {c_id} was earlier on the row for route "
+                f"{owner.display_name()!r}"
+            )
+            if i in owner.ids:
+                note += f", which is {owner.ids[i]} in this feed"
+            lineage.notes[i] = note
+            logging.warning("Feed %d: %s; %s is kept on a separate row.", i + 1, note, c_id)
+        by_last_id.update(placed)
 
         prev_present = {lineage.ids[i]: lineage for lineage in lineages if i in lineage.ids}
 
@@ -705,7 +745,8 @@ def build_events_table(lineages: list[Lineage], periods: list[FeedPeriod]) -> pd
     Events: ``added`` (first appearance after the first feed), ``removed`` (in
     the previous feed, not this one), ``reappeared`` (returns after a gap) and
     ``rekeyed`` (continues under a new route_id). The event date is the start of
-    the feed period in which the change is first visible.
+    the feed period in which the change is first visible. A lineage's note for
+    that feed (e.g. ambiguous route_id reuse) is added to ``detail``.
     """
     rows: list[dict[str, object]] = []
     for lineage in lineages:
@@ -725,6 +766,9 @@ def build_events_table(lineages: list[Lineage], periods: list[FeedPeriod]) -> pd
             elif prev_id != cur_id:
                 event = "rekeyed"
                 detail = f"{prev_id} -> {cur_id}"
+            note = lineage.notes.get(i, "")
+            if event and note:
+                detail = f"{detail}; {note}" if detail else note
             if event:
                 rows.append(
                     {

@@ -29,11 +29,13 @@ Typical usage:
 from __future__ import annotations
 
 import logging
+import os
 import sys
-import tempfile
 import zipfile
+from collections.abc import Generator
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Sequence, Set, Tuple
+from typing import IO, Any, Dict, Iterable, Iterator, List, Sequence, Set, Tuple
 
 import geopandas as gpd
 import numpy as np
@@ -50,8 +52,8 @@ from shapely.ops import substring
 GTFS_PATH: str = r"Path\To\Your\GTFS_Data_Folder"  # folder or .zip
 OUTPUT_FOLDER: str = r"Path\To\Your\Output_Folder"
 
-FILTER_OUT_LIST: list[str] = ["9999A", "9999B", "9999C"]
-INCLUDE_ROUTE_IDS: list[str] = ["101", "202"]
+FILTER_OUT_LIST: list[str] = []  # route_id values to drop, e.g. ["9999A", "9999B", "9999C"]
+INCLUDE_ROUTE_IDS: list[str] = []  # e.g. ["101", "202"]; empty → all routes except filtered-out
 
 # Union each route/direction's shapes in routes.shp only; spacing is always
 # measured along each stopping pattern's own shape.
@@ -396,13 +398,71 @@ def _flag_long_spacing_csv(
         logging.info("Wrote summary → %s", summ_path.name)
 
 
+# Copied from utils/gtfs_helpers.py.
+@contextmanager
+def open_gtfs_file(
+    gtfs_path: str | os.PathLike[str], file_name: str
+) -> Generator[IO[bytes], None, None]:
+    """Open one GTFS text file from a feed folder or a ``.zip`` of the feed.
+
+    The counterpart of :func:`load_gtfs_data` for scripts that read a file with
+    their own options (``pandas.read_csv`` with ``usecols`` or
+    ``keep_default_na=False``, or the :mod:`csv` module), so they accept a
+    zipped feed without extracting it. Zip members are found the way
+    :func:`load_gtfs_data` finds them: at the archive root or inside a single
+    wrapper folder.
+
+    Args:
+        gtfs_path: Folder containing the GTFS feed, or a ``.zip`` archive of it.
+        file_name: GTFS file to open, e.g. ``"stops.txt"``.
+
+    Yields:
+        A binary file handle. ``pandas.read_csv`` reads it directly; wrap it in
+        :class:`io.TextIOWrapper` for the :mod:`csv` module.
+
+    Raises:
+        FileNotFoundError: *gtfs_path* does not exist, or the feed has no
+            *file_name*.
+        ValueError: *gtfs_path* is neither a directory nor a valid ``.zip``
+            file, or *file_name* is found in more than one place in the zip.
+    """
+    path = os.fspath(gtfs_path)
+    if os.path.isdir(path):
+        file_path = os.path.join(path, file_name)
+        if not os.path.isfile(file_path):
+            raise FileNotFoundError(f"Missing GTFS file in '{path}': {file_name}")
+        with open(file_path, "rb") as handle:
+            yield handle
+        return
+
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"The path '{path}' does not exist.")
+    if not (os.path.isfile(path) and path.lower().endswith(".zip")):
+        raise ValueError(f"'{path}' is neither a directory nor a .zip file.")
+    try:
+        archive = zipfile.ZipFile(path)
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"'{path}' is not a valid zip archive.") from exc
+    with archive:
+        matches = [name for name in archive.namelist() if os.path.basename(name) == file_name]
+        if not matches:
+            raise FileNotFoundError(f"Missing GTFS file in '{path}': {file_name}")
+        if len(matches) > 1:
+            raise ValueError(
+                f"Ambiguous GTFS file in '{path}' (found in multiple locations): {file_name}"
+            )
+        with archive.open(matches[0]) as handle:
+            yield handle
+
+
 def _read_gtfs_tables(gtfs_path: Path) -> Dict[str, pd.DataFrame]:
     """Load the five core GTFS tables into DataFrames.
 
     Parameters
     ----------
     gtfs_path
-        Path to either a directory containing ``*.txt`` files or a ``.zip`` GTFS.
+        Path to either a directory containing ``*.txt`` files or a ``.zip`` GTFS,
+        with the tables at the archive root or inside one wrapper folder.
 
     Returns:
     -------
@@ -423,21 +483,16 @@ def _read_gtfs_tables(gtfs_path: Path) -> Dict[str, pd.DataFrame]:
         "shapes": "shapes.txt",
     }
 
-    def _read(path: Path) -> pd.DataFrame:
-        return pd.read_csv(path, dtype=str, keep_default_na=False)
-
-    if gtfs_path.is_dir():
-        return {k: _read(gtfs_path / v) for k, v in filenames.items()}
-
-    if gtfs_path.is_file() and gtfs_path.suffix.lower() == ".zip":
-        logging.info("Detected GTFS zip – extracting to temporary directory …")
-        tmp = tempfile.TemporaryDirectory()
-        with zipfile.ZipFile(gtfs_path, "r") as zf:
-            zf.extractall(tmp.name)
-        root = Path(tmp.name)
-        return {k: _read(root / v) for k, v in filenames.items()}
-
-    raise ValueError("GTFS_PATH must be a folder or a .zip file.")
+    is_zip = gtfs_path.is_file() and gtfs_path.suffix.lower() == ".zip"
+    if not (gtfs_path.is_dir() or is_zip):
+        raise ValueError("GTFS_PATH must be a folder or a .zip file.")
+    if is_zip:
+        logging.info("Detected GTFS zip – reading its tables …")
+    tables: Dict[str, pd.DataFrame] = {}
+    for key, name in filenames.items():
+        with open_gtfs_file(gtfs_path, name) as handle:
+            tables[key] = pd.read_csv(handle, dtype=str, keep_default_na=False)
+    return tables
 
 
 def _validate_columns(dfs: Dict[str, pd.DataFrame]) -> None:
@@ -924,7 +979,11 @@ def main() -> int:  # noqa: D401
     # -----------------------------------------------------------------
     logging.info("STEP 0  Reading GTFS tables …")
     gtfs_path = Path(GTFS_PATH)
-    dfs = _read_gtfs_tables(gtfs_path)
+    try:
+        dfs = _read_gtfs_tables(gtfs_path)
+    except (FileNotFoundError, ValueError) as err:
+        logging.error("Could not read the GTFS feed: %s", err)
+        return 1
 
     try:
         _validate_columns(dfs)

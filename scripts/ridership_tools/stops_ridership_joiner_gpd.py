@@ -20,6 +20,19 @@ Outputs:
     - Optional polygon layer with aggregated ridership
     - Optional per-route boardings/alightings maps from GTFS shapes (see DRAW_PLOTS)
 
+Multi-period mode:
+    Write stop_ridership_by_period.csv and optional WGS84 GeoPackage. SPLIT_BY_ROUTE
+    also writes route_stop_ridership_by_period for observed route/stop combinations.
+    stop_key is the configured textual join key. Period presence columns distinguish
+    workbook observations from inventory membership (not proof that a route serves
+    a stop). Changes compare the first and last configured periods. Both endpoints
+    must have a workbook row and a feed match. Percent changes are in percent units
+    (12.5 = +12.5%) and are blank when the first period's value is zero or negative.
+    Existing cell-value policies apply.
+    The map uses the most recent usable location; CSV also retains unlocated rows.
+    Each period has its own reconciliation and value diagnostics. Comparison mode
+    uses the stop inventory directly; polygon exports and PNGs are single-period options.
+
 Typical usage:
     Update the paths in the CONFIGURATION section and run from a shell or a
     Jupyter notebook with the open-source geospatial stack (geopandas) installed.
@@ -30,6 +43,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import re
 import shutil
 import sys
 import zipfile
@@ -72,6 +86,18 @@ EXCEL_FILE = Path(r"Your\File\Path\To\STOP_USAGE_(BY_STOP_ID).XLSX")
 
 # Route names are compared as trimmed text, so a numeric Excel route 798
 # matches "798".
+
+# Multi-period comparison. Leave empty for the original single-workbook workflow.
+# List comparable reports oldest first (same units, day type and route scope).
+# Each tuple is (unique label, GTFS feed or point layer, ridership workbook).
+# Reuse a feed path when appropriate. Labels become CSV column suffixes.
+PERIOD_INPUTS: list[tuple[str, Path, Path]] = [
+    # ("sep_2026", Path(r"C:/data/sep_gtfs.zip"), Path(r"C:/data/sep_weekday.xlsx")),
+    # ("oct_2026", Path(r"C:/data/oct_gtfs.zip"), Path(r"C:/data/oct_weekday.xlsx")),
+]
+WRITE_COMPARISON_GPKG = True
+MOVE_THRESHOLD_FT = 75.0  # Flag largest move between successive available locations.
+
 ROUTE_FILTER_LIST: list[str] = []
 SPLIT_BY_ROUTE = False
 
@@ -512,14 +538,15 @@ def load_shapefile(path: str, member: Optional[str] = None) -> gpd.GeoDataFrame:
     return gpd.read_file(source)
 
 
-def load_bus_stops() -> tuple[gpd.GeoDataFrame, str]:
+def load_bus_stops(source: Optional[Path] = None) -> tuple[gpd.GeoDataFrame, str]:
     """Load bus stop points as a GeoDataFrame and return (gdf, key_field).
 
     GTFS ID columns are read as text, so leading zeros survive and a blank
     code cannot turn the others into floats ("123.0").
     """
-    if is_gtfs_input(BUS_STOPS_INPUT):
-        stops_table = resolve_stops_table(BUS_STOPS_INPUT)
+    source = BUS_STOPS_INPUT if source is None else source
+    if is_gtfs_input(source):
+        stops_table = resolve_stops_table(source)
 
         def _read(source: Path | IO[bytes]) -> pd.DataFrame:
             return pd.read_csv(
@@ -529,10 +556,10 @@ def load_bus_stops() -> tuple[gpd.GeoDataFrame, str]:
                 na_values=[""],
             )
 
-        if is_gtfs_txt(BUS_STOPS_INPUT):
+        if is_gtfs_txt(source):
             df = _read(stops_table)
         else:
-            with open_gtfs_file(BUS_STOPS_INPUT, "stops.txt") as handle:
+            with open_gtfs_file(source, "stops.txt") as handle:
                 df = _read(handle)
         _require_columns(
             df,
@@ -549,16 +576,16 @@ def load_bus_stops() -> tuple[gpd.GeoDataFrame, str]:
         return gdf, GTFS_KEY_FIELD
 
     gdf = (
-        load_shapefile(str(BUS_STOPS_INPUT))
-        if str(BUS_STOPS_INPUT).lower().endswith(".zip")
-        else gpd.read_file(BUS_STOPS_INPUT)
+        load_shapefile(str(source))
+        if str(source).lower().endswith(".zip")
+        else gpd.read_file(source)
     )
     _require_columns(
         gdf,
         [SHAPE_KEY_FIELD, SHAPE_SECONDARY_ID_FIELD],
-        context=f"stop layer {BUS_STOPS_INPUT}",
+        context=f"stop layer {source}",
     )
-    logging.info("Loaded stop layer with %d features: %s", len(gdf), BUS_STOPS_INPUT)
+    logging.info("Loaded stop layer with %d features: %s", len(gdf), source)
     return gdf, SHAPE_KEY_FIELD
 
 
@@ -650,7 +677,7 @@ def find_value_issues(df: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-def read_and_filter_excel() -> tuple[pd.DataFrame, pd.DataFrame]:
+def read_and_filter_excel(source: Optional[Path] = None) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Read ridership data from Excel and optionally filter by routes; adds TOTAL.
 
     STOP_ID and ROUTE_NAME are read as text (only blank cells count as
@@ -671,8 +698,9 @@ def read_and_filter_excel() -> tuple[pd.DataFrame, pd.DataFrame]:
         ValueError: A policy is invalid, or values its "error" policy covers
             are present.
     """
+    source = EXCEL_FILE if source is None else source
     df = pd.read_excel(
-        EXCEL_FILE,
+        source,
         dtype={EXCEL_STOP_ID_FIELD: str, EXCEL_ROUTE_FIELD: str},
         keep_default_na=False,
         na_values=[""],
@@ -681,7 +709,7 @@ def read_and_filter_excel() -> tuple[pd.DataFrame, pd.DataFrame]:
     _require_columns(
         df,
         [EXCEL_STOP_ID_FIELD, EXCEL_ROUTE_FIELD, EXCEL_BOARD_FIELD, EXCEL_ALIGHT_FIELD],
-        context=f"Excel ridership file {EXCEL_FILE}",
+        context=f"Excel ridership file {source}",
     )
     df[EXCEL_STOP_ID_FIELD] = _safe_to_str(df[EXCEL_STOP_ID_FIELD])
     df[EXCEL_ROUTE_FIELD] = _safe_to_str(df[EXCEL_ROUTE_FIELD])
@@ -705,7 +733,7 @@ def read_and_filter_excel() -> tuple[pd.DataFrame, pd.DataFrame]:
         if policy == "error" and not found.empty:
             sample = found.head(10)[["excel_row", "field", "original_value"]].to_dict("records")
             raise ValueError(
-                f"{len(found)} {issue} boardings/alightings value(s) in {EXCEL_FILE}, e.g. "
+                f"{len(found)} {issue} boardings/alightings value(s) in {source}, e.g. "
                 f"{sample}. Fix them, or set {setting} = 'zero' to count them as 0 (they are "
                 "then listed in ridership_value_issues.csv)."
             )
@@ -945,6 +973,170 @@ def write_reconciliation(
 # =============================================================================
 # PIPELINES
 # =============================================================================
+
+
+def validate_periods() -> None:
+    """Check period labels and paths before creating a run directory."""
+    if len(PERIOD_INPUTS) < 2:
+        raise ValueError("Supply at least two PERIOD_INPUTS in chronological order.")
+    # Reserved for the first-to-last change and percent change columns.
+    labels: set[str] = {"change", "pct_change"}
+    for label, stops_path, workbook in PERIOD_INPUTS:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", label) or label.casefold() in labels:
+            raise ValueError(f"Invalid or duplicate period label: {label!r}")
+        labels.add(label.casefold())
+        for path in (stops_path, workbook):
+            if not Path(path).exists():
+                raise FileNotFoundError(path)
+    if not math.isfinite(MOVE_THRESHOLD_FT) or MOVE_THRESHOLD_FT < 0:
+        raise ValueError("MOVE_THRESHOLD_FT must be finite and nonnegative.")
+
+
+def period_inventory(stops: gpd.GeoDataFrame, key: str) -> pd.DataFrame:
+    """Return one WGS84 point per comparable stop key, without polygon splits."""
+    geo = stops.to_crs(4326)
+    geo = geo.loc[_safe_to_str(geo[key]).notna()].copy()
+    valid = geo.geometry.notna() & ~geo.geometry.is_empty
+    if not geo.loc[valid].geom_type.eq("Point").all():
+        raise ValueError("Comparison stop layers must contain point geometries.")
+    names = geo.get("stop_name", pd.Series(pd.NA, index=geo.index))
+    points = geo.geometry.where(valid)
+    locations = pd.DataFrame(
+        {
+            "stop_key": _safe_to_str(geo[key]),
+            "stop_name": names,
+            "longitude": points.x,
+            "latitude": points.y,
+        }
+    )
+    if (
+        valid
+        & locations.longitude.notna()
+        & locations.latitude.notna()
+        & ~(locations.longitude.between(-180, 180) & locations.latitude.between(-90, 90))
+    ).any():
+        raise ValueError("Comparison stop layer has unusable coordinates.")
+    locations = locations.drop_duplicates(["stop_key", "longitude", "latitude"])
+    ambiguous = locations.loc[locations.stop_key.duplicated(False), "stop_key"]
+    if not ambiguous.empty:
+        raise ValueError(
+            f"Multiple locations for the same stop key: {ambiguous.unique()[:10]}. "
+            "Choose a unique key or resolve those points before comparison."
+        )
+    return locations.set_index("stop_key")
+
+
+def comparison_table(
+    counts: list[pd.DataFrame], inventories: list[pd.DataFrame], by_route: bool
+) -> pd.DataFrame:
+    """Pivot period counts, retaining presence, comparable changes and location history."""
+    from pyproj import Geod
+
+    geod = Geod(ellps="WGS84")
+    labels = [entry[0] for entry in PERIOD_INPUTS]
+    index = counts[0].index
+    for frame in counts[1:]:
+        index = index.union(frame.index)
+    if not by_route:
+        for inventory in inventories:
+            index = index.union(inventory.index)
+    result = pd.DataFrame(index=index.sort_values()).reset_index()
+    keys = result["stop_key"]
+    result["longitude"] = float("nan")
+    result["latitude"] = float("nan")
+    result["location_period"] = pd.Series(pd.NA, index=result.index, dtype="string")
+    result["stop_name"] = pd.Series(pd.NA, index=result.index, dtype="string")
+    result["max_move_ft"] = float("nan")
+    for label, count, inventory in zip(labels, counts, inventories):
+        aligned = count.reindex(
+            pd.MultiIndex.from_frame(result[["route", "stop_key"]]) if by_route else pd.Index(keys)
+        )
+        in_feed = keys.isin(inventory.index)
+        present = aligned["boardings"].notna().to_numpy()
+        result[f"in_feed_{label}"] = in_feed
+        result[f"in_workbook_{label}"] = present
+        for metric in ("boardings", "alightings", "total"):
+            result[f"{metric}_{label}"] = aligned[metric].to_numpy()
+        lon = keys.map(inventory["longitude"])
+        lat = keys.map(inventory["latitude"])
+        located = lon.notna() & lat.notna()
+        compare = located & result["longitude"].notna()
+        if compare.any():
+            _, _, distance = geod.inv(
+                result.loc[compare, "longitude"].to_numpy(),
+                result.loc[compare, "latitude"].to_numpy(),
+                lon[compare].to_numpy(),
+                lat[compare].to_numpy(),
+            )
+            feet = pd.Series(distance / 0.3048, index=result.index[compare])
+            result.loc[compare, "max_move_ft"] = pd.concat(
+                [result.loc[compare, "max_move_ft"], feet], axis=1
+            ).max(axis=1)
+        result.loc[located, "longitude"] = lon[located]
+        result.loc[located, "latitude"] = lat[located]
+        result.loc[located, "location_period"] = label
+        result["stop_name"] = keys.map(inventory["stop_name"]).combine_first(result["stop_name"])
+    result["moved"] = (
+        result.max_move_ft.gt(MOVE_THRESHOLD_FT).astype("boolean").where(result.max_move_ft.notna())
+    )
+    first, last = labels[0], labels[-1]
+    comparable = result[f"in_feed_{first}"] & result[f"in_feed_{last}"]
+    for metric in ("boardings", "alightings", "total"):
+        before = result[f"{metric}_{first}"]
+        change = (result[f"{metric}_{last}"] - before).where(comparable)
+        result[f"{metric}_change"] = change
+        # A zero or negative base has no meaningful percent change.
+        result[f"{metric}_pct_change"] = change / before.where(before > 0) * 100.0
+    return result
+
+
+def run_period_comparison(run_dir: Path) -> None:
+    """Compare workbook totals by stop and optionally by route and stop."""
+    inventories = []
+    stop_counts = []
+    route_counts = []
+    metrics = {EXCEL_BOARD_FIELD: "boardings", EXCEL_ALIGHT_FIELD: "alightings", "TOTAL": "total"}
+    for label, stops_path, workbook in PERIOD_INPUTS:
+        period_dir = run_dir / "periods" / label
+        period_dir.mkdir(parents=True)
+        stops, key = load_bus_stops(Path(stops_path))
+        inventory = period_inventory(stops, key)
+        data, issues = read_and_filter_excel(Path(workbook))
+        totals = aggregate_excel_per_stop(data)
+        matched = merge_ridership(stops, totals, key)
+        write_reconciliation(period_dir, data, matched, key, False)
+        _write_csv(issues, period_dir / "ridership_value_issues.csv")
+        inventories.append(inventory)
+        stop_counts.append(
+            totals.rename(columns={EXCEL_STOP_ID_FIELD: "stop_key", **metrics}).set_index(
+                "stop_key"
+            )
+        )
+        if SPLIT_BY_ROUTE:
+            if data[EXCEL_ROUTE_FIELD].isna().any():
+                logging.warning("%s: blank-route rows included only in stop totals.", label)
+            route_counts.append(
+                data.rename(
+                    columns={EXCEL_STOP_ID_FIELD: "stop_key", EXCEL_ROUTE_FIELD: "route", **metrics}
+                )
+                .groupby(["route", "stop_key"])[list(metrics.values())]
+                .sum()
+            )
+    for by_route, counts, stem in [
+        (False, stop_counts, "stop_ridership_by_period"),
+        (True, route_counts, "route_stop_ridership_by_period"),
+    ]:
+        if not counts:
+            continue
+        table = comparison_table(counts, inventories, by_route)
+        _write_csv(table, run_dir / f"{stem}.csv")
+        if WRITE_COMPARISON_GPKG:
+            rows = table.dropna(subset=["longitude", "latitude"]).copy()
+            if not rows.empty:
+                layer = gpd.GeoDataFrame(
+                    rows, geometry=gpd.points_from_xy(rows.longitude, rows.latitude), crs=4326
+                )
+                layer.to_file(run_dir / f"{stem}.gpkg", layer=stem, driver="GPKG")
 
 
 def run_single(run_dir: Path) -> None:
@@ -1640,19 +1832,22 @@ def main() -> int:
 
     _DEFAULT_BUS_STOPS = r"Your\File\Path\To\GTFS_folder"
     _DEFAULT_EXCEL = r"Your\File\Path\To\STOP_USAGE_(BY_STOP_ID).XLSX"
-    if str(BUS_STOPS_INPUT) == _DEFAULT_BUS_STOPS or str(EXCEL_FILE) == _DEFAULT_EXCEL:
-        logging.warning(
-            "File paths are still set to their defaults. Update BUS_STOPS_INPUT and "
-            "EXCEL_FILE in the CONFIGURATION section before running."
-        )
-        return 2
+    if PERIOD_INPUTS:
+        validate_periods()
+    else:
+        if str(BUS_STOPS_INPUT) == _DEFAULT_BUS_STOPS or str(EXCEL_FILE) == _DEFAULT_EXCEL:
+            logging.warning(
+                "File paths are still set to their defaults. Update BUS_STOPS_INPUT and "
+                "EXCEL_FILE in the CONFIGURATION section before running."
+            )
+            return 2
 
-    if not BUS_STOPS_INPUT.exists():
-        raise FileNotFoundError(f"BUS_STOPS_INPUT not found: {BUS_STOPS_INPUT}")
-    if not EXCEL_FILE.exists():
-        raise FileNotFoundError(f"EXCEL_FILE not found: {EXCEL_FILE}")
-    if POLYGON_LAYER is not None and not POLYGON_LAYER.exists():
-        raise FileNotFoundError(f"POLYGON_LAYER not found: {POLYGON_LAYER}")
+        if not BUS_STOPS_INPUT.exists():
+            raise FileNotFoundError(f"BUS_STOPS_INPUT not found: {BUS_STOPS_INPUT}")
+        if not EXCEL_FILE.exists():
+            raise FileNotFoundError(f"EXCEL_FILE not found: {EXCEL_FILE}")
+        if POLYGON_LAYER is not None and not POLYGON_LAYER.exists():
+            raise FileNotFoundError(f"POLYGON_LAYER not found: {POLYGON_LAYER}")
 
     logging.info("Output folder: %s", OUTPUT_FOLDER)
     logging.info("Split by route: %s", SPLIT_BY_ROUTE)
@@ -1678,6 +1873,9 @@ def main() -> int:
         return 1
 
     try:
+        if PERIOD_INPUTS:
+            run_period_comparison(run_dir)
+            return 0
         if SPLIT_BY_ROUTE:
             run_split_by_route(run_dir)
         else:

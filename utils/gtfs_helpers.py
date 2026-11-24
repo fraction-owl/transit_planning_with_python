@@ -1,7 +1,7 @@
 """General-purpose helper functions for GTFS and transit data workflows.
 
-Includes reusable utilities for loading GTFS files and other common tasks used
-across transit data processing scripts.
+Includes reusable utilities for loading GTFS files, applying TODS 2.1 supplement
+files to them, and other common tasks used across transit data processing scripts.
 """
 
 from __future__ import annotations
@@ -326,6 +326,30 @@ def load_express_route_ids(
     return load_id_set(inline_ids, txt_path, kind="express route")
 
 
+def load_non_revenue_route_ids(
+    inline_ids: Optional[Sequence[str]] = None,
+    txt_path: Optional[str] = None,
+) -> set[str]:
+    """Resolve the set of non-revenue route ids (see ``load_id_set``).
+
+    Non-revenue routes are test, training and other routes that carry no
+    passengers. Example file: ``sample_data/non_revenue_routes_example.txt``.
+    """
+    return load_id_set(inline_ids, txt_path, kind="non-revenue route")
+
+
+def load_event_route_ids(
+    inline_ids: Optional[Sequence[str]] = None,
+    txt_path: Optional[str] = None,
+) -> set[str]:
+    """Resolve the set of event-route ids (see ``load_id_set``).
+
+    Event routes carry passengers to and from special events, such as a stadium
+    shuttle on game days. Example file: ``sample_data/event_routes_example.txt``.
+    """
+    return load_id_set(inline_ids, txt_path, kind="event route")
+
+
 def stop_pattern_id(stop_ids: Iterable[object]) -> str:
     """Return a short text ID for an ordered stop pattern that is stable across runs.
 
@@ -348,3 +372,92 @@ def stop_pattern_id(stop_ids: Iterable[object]) -> str:
     # with a different split of the same characters (["a,b"] vs ["a", "b"]).
     payload = json.dumps([str(stop_id) for stop_id in stop_ids])
     return hashlib.sha1(payload.encode("utf-8"), usedforsecurity=False).hexdigest()[:8]
+
+
+def apply_supplement(
+    base: Optional[pd.DataFrame], supplement: Optional[pd.DataFrame], keys: Sequence[str]
+) -> pd.DataFrame:
+    """Apply one TODS supplement file to its GTFS table (TODS 2.1 evaluation rules).
+
+    A row whose primary key matches the GTFS table deletes that row when
+    ``TODS_delete`` is ``1`` and otherwise overwrites it with the row's
+    non-empty values; a row with a new key is added whole.
+
+    Args:
+        base: The GTFS table (``None`` or empty if the feed lacks it).
+        supplement: The ``*_supplement.txt`` table, or ``None``.
+        keys: The GTFS file's primary-key columns.
+
+    Returns:
+        The supplemented table, all values as text.
+
+    Raises:
+        ValueError: If the supplement lacks a key column or both deletes and
+            re-adds the same primary key.
+    """
+    base = pd.DataFrame(columns=list(keys)) if base is None else base.fillna("")
+    if supplement is None or supplement.empty:
+        return base.copy()
+    supplement = supplement.fillna("")
+    missing = [k for k in keys if k not in supplement.columns]
+    if missing:
+        raise ValueError(f"Supplement file is missing primary-key column(s): {missing}")
+    rows: dict[tuple, dict[str, Any]] = {
+        tuple(r[k] for k in keys): r for r in base.to_dict("records")
+    }
+    order = list(rows)
+    deleted: set[tuple] = set()
+    written: set[tuple] = set()
+    for record in supplement.to_dict("records"):
+        key = tuple(record[k] for k in keys)
+        values = {c: v for c, v in record.items() if c != "TODS_delete"}
+        if str(record.get("TODS_delete", "")).strip() == "1":
+            if key in rows:
+                deleted.add(key)
+            else:
+                logging.warning("TODS_delete for %s matches no GTFS row; ignored.", key)
+            continue
+        written.add(key)
+        if key in rows:
+            rows[key].update({c: v for c, v in values.items() if v != ""})
+        else:
+            rows[key] = values
+            order.append(key)
+    if deleted & written:
+        raise ValueError(f"Supplement both deletes and re-adds key(s): {sorted(deleted & written)}")
+    out = pd.DataFrame([rows[k] for k in order if k not in deleted])
+    return out.reindex(columns=list(dict.fromkeys([*base.columns, *out.columns]))).fillna("")
+
+
+def drop_trips_on_deleted_routes(
+    trips: pd.DataFrame, routes_before: pd.DataFrame, routes_after: pd.DataFrame
+) -> pd.DataFrame:
+    """Drop trips whose route a TODS ``routes_supplement.txt`` deletes.
+
+    TODS ignores trips that reference a deleted route unless they are
+    reassigned, so pass *trips* after ``trips_supplement.txt`` has been
+    applied: a trip moved to a surviving route keeps its new ``route_id`` and
+    stays. Each dropped trip is counted in a warning.
+
+    Args:
+        trips: Trips table with a ``route_id`` column, already supplemented.
+        routes_before: ``routes.txt`` before ``routes_supplement.txt``.
+        routes_after: The same table after :func:`apply_supplement`.
+
+    Returns:
+        *trips* without the rows on deleted routes.
+    """
+    deleted = set(routes_before.get("route_id", pd.Series(dtype=str)).astype(str)) - set(
+        routes_after.get("route_id", pd.Series(dtype=str)).astype(str)
+    )
+    if not deleted:
+        return trips
+    on_deleted = trips["route_id"].astype(str).isin(deleted)
+    if on_deleted.any():
+        logging.warning(
+            "Ignoring %d trip(s) on route(s) deleted in routes_supplement.txt (%s); "
+            "reassign them to another route in trips_supplement.txt to keep them.",
+            int(on_deleted.sum()),
+            ", ".join(sorted(deleted)),
+        )
+    return trips.loc[~on_deleted]

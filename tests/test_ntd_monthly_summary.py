@@ -17,7 +17,7 @@ import pytest
 import scripts.ridership_tools.ntd_monthly_summary as mod
 
 FIXTURE_CSV = Path("tests/fixtures/ridership_by_route_and_stop.csv")
-EXAMPLE_CONFIG = Path("sample_data/ntd_monthly_config_example.txt")
+EXAMPLE_CONFIG = Path("tests/fixtures/ntd_monthly_config_example.txt")
 
 
 # ---------------------------------------------------------------------------
@@ -32,7 +32,7 @@ def fixture_df() -> pd.DataFrame:
 
 @pytest.fixture
 def config() -> mod.AppConfig:
-    """The shipped example configuration."""
+    """The example configuration fixture."""
     return mod.load_config(EXAMPLE_CONFIG)
 
 
