@@ -24,6 +24,12 @@ Participation is welcome from anyone, whether you’re new to Python, an experie
     failure, `2` = configuration error (e.g. placeholder paths still unset). Returning the code —
     rather than calling `sys.exit()` inside `main()` — keeps `main()` traceback-free when called
     from a notebook cell, while shell callers, cron jobs, and Makefiles still see failures.
+    Enforced in two places: `dev_tools/check_style.py` (`exit_code_contract` check) grades the
+    shape — the `-> int` annotation, no bare `return`, a guard that propagates the value — and
+    `tests/test_exit_code_contract.py` runs every script's `main()` against its shipped
+    placeholder CONFIGURATION and asserts it returns `2`. Scripts that do not yet comply are
+    listed in that test's `KNOWN_VIOLATIONS`; the list is strict-xfailed, so fixing one fails
+    the suite until its entry is removed.
 - Include a clear **configuration section at the top** of each script, headed by a banner
   comment spelling out `CONFIGURATION` in full caps (`# CONFIGURATION`). Rule characters and a
   trailing note are fine — `# ==== CONFIGURATION ====` and `# CONFIGURATION -- notes` both
