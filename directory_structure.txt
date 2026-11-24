@@ -213,6 +213,19 @@ transit_planning_with_python/
 │   │   │   ├── Private_Shuttle_Stops.zip
 │   │   │   ├── School_Facilities.zip
 │   │   │   └── Urgent_Care_Facilities.zip
+│   │   ├── tods_bus_example/
+│   │   │   ├── gtfs/
+│   │   │   │   ├── agency.txt
+│   │   │   │   ├── calendar.txt
+│   │   │   │   ├── routes.txt
+│   │   │   │   ├── stop_times.txt
+│   │   │   │   ├── stops.txt
+│   │   │   │   └── trips.txt
+│   │   │   ├── tods/
+│   │   │   │   ├── stop_times_supplement.txt
+│   │   │   │   ├── stops_supplement.txt
+│   │   │   │   └── trips_supplement.txt
+│   │   │   └── README.md
 │   │   ├── 4331222_sample.csv
 │   │   ├── ACSDT5Y2024.B01001_2026-05-23T135534.zip
 │   │   ├── ACSDT5Y2024.B08201_2026-05-23T135430.zip
@@ -260,6 +273,7 @@ transit_planning_with_python/
 │   │   ├── tl_2025_51_tabblock20_sample.zip
 │   │   ├── trips_performed.csv
 │   │   └── va_wac_S000_JT00_2023.csv.gz
+│   ├── test_apply_supplement.py
 │   ├── test_bay_assignment_optimizer.py
 │   ├── test_bay_change_sweep.py
 │   ├── test_bay_usage_analyzer.py
@@ -367,6 +381,7 @@ transit_planning_with_python/
 │   ├── test_stops_ridership_joiner_arcpy.py
 │   ├── test_stops_ridership_joiner_gpd.py
 │   ├── test_time_helpers.py
+│   ├── test_tods_bus_example.py
 │   ├── test_trip_cut_savings.py
 │   ├── test_trip_runtime_diagnostics_from_avl.py
 │   ├── test_tsde_to_tods.py

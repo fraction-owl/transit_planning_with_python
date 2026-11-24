@@ -4,8 +4,8 @@ Reads a GTFS feed and, optionally, its TODS supplement files, rebuilds each
 vehicle block's day (pull-out, revenue trips, layovers, deadheads, pull-in) and
 totals the hours by service set (the GTFS services that run together on a date),
 by day type (Weekday / Saturday / Sunday / Holiday) and by reporting period, such
-as a month. TODS supplements are applied to the GTFS tables by the TODS 2.1 rules
-(delete, update, add) before anything is counted. Until TODS_MOVEMENTS_COMPLETE confirms
+as a month. TODS supplements are applied by the TODS 2.1 rules (delete, update, add; trips on
+a deleted route are ignored) before anything is counted. Until TODS_MOVEMENTS_COMPLETE confirms
 the TODS holds every block's movements, only revenue trip hours and layover are reported.
 
 Blocks are rebuilt once for each service set that runs on some date, from the
@@ -34,8 +34,8 @@ Inputs
 ------
 - GTFS_PATH: GTFS feed, as a folder or ``.zip``. A feed with frequency-based
   trips (rows in frequencies.txt) stops the run: their repetitions are not expanded.
-- TODS_PATH (optional): TODS supplement files for that feed, as a folder or
-  ``.zip`` (for example from ``tsde_to_tods.py``).
+- TODS_PATH (optional): TODS 2.1 supplement files for that feed, as a folder or ``.zip``
+  (for example from ``tsde_to_tods.py``); TODS v1 deadhead tables stop the run.
 
 Outputs
 -------
@@ -674,6 +674,28 @@ def feed_members(path: Path) -> set[str]:
         return {Path(name).name for name in archive.namelist() if not name.endswith("/")}
 
 
+TODS_V1_TABLES = ("deadheads.txt", "deadhead_times.txt")
+
+
+def reject_tods_v1(path: Path) -> None:
+    """Stop when a TODS input holds TODS v1 deadhead tables.
+
+    This script reads TODS 2.1 supplements (pull-outs, pull-ins and deadheads
+    as ``trips_supplement.txt`` rows). A v1 folder would otherwise load without
+    its deadheads and report plausible but incomplete vehicle hours.
+
+    Raises:
+        ValueError: If *path* contains ``deadheads.txt`` or ``deadhead_times.txt``.
+    """
+    found = sorted(set(TODS_V1_TABLES) & feed_members(path))
+    if found:
+        raise ValueError(
+            f"'{path}' contains TODS v1 deadhead tables ({', '.join(found)}). This script "
+            "expects TODS 2.1 supplements (trips_supplement.txt, stop_times_supplement.txt); "
+            "convert the files to TODS 2.1 first."
+        )
+
+
 def load_tables(path: Path, wanted: Sequence[str]) -> dict[str, pd.DataFrame]:
     """Load the files of *wanted* that exist in the feed, as all-text DataFrames.
 
@@ -744,6 +766,40 @@ def apply_supplement(
     return out.reindex(columns=list(dict.fromkeys([*base.columns, *out.columns]))).fillna("")
 
 
+def drop_trips_on_deleted_routes(
+    trips: pd.DataFrame, routes_before: pd.DataFrame, routes_after: pd.DataFrame
+) -> pd.DataFrame:
+    """Drop trips whose route a TODS ``routes_supplement.txt`` deletes.
+
+    TODS ignores trips that reference a deleted route unless they are
+    reassigned, so pass *trips* after ``trips_supplement.txt`` has been
+    applied: a trip moved to a surviving route keeps its new ``route_id`` and
+    stays. Each dropped trip is counted in a warning.
+
+    Args:
+        trips: Trips table with a ``route_id`` column, already supplemented.
+        routes_before: ``routes.txt`` before ``routes_supplement.txt``.
+        routes_after: The same table after :func:`apply_supplement`.
+
+    Returns:
+        *trips* without the rows on deleted routes.
+    """
+    deleted = set(routes_before.get("route_id", pd.Series(dtype=str)).astype(str)) - set(
+        routes_after.get("route_id", pd.Series(dtype=str)).astype(str)
+    )
+    if not deleted:
+        return trips
+    on_deleted = trips["route_id"].astype(str).isin(deleted)
+    if on_deleted.any():
+        logging.warning(
+            "Ignoring %d trip(s) on route(s) deleted in routes_supplement.txt (%s); "
+            "reassign them to another route in trips_supplement.txt to keep them.",
+            int(on_deleted.sum()),
+            ", ".join(sorted(deleted)),
+        )
+    return trips.loc[~on_deleted]
+
+
 @dataclass
 class Schedule:
     """Supplemented trips with their timing, plus calendar and stop locations."""
@@ -809,8 +865,9 @@ def load_schedule(gtfs_path: Path, tods_path: Optional[Path]) -> Schedule:
 
     Raises:
         OSError: If an input path is missing.
-        ValueError: If required GTFS tables are missing or inconsistent, or the
-            feed has frequency-based trips.
+        ValueError: If required GTFS tables are missing or inconsistent, the
+            feed has frequency-based trips, the TODS input holds TODS v1
+            deadhead tables, or the supplements leave no trips.
     """
     gtfs = load_tables(
         gtfs_path,
@@ -818,6 +875,7 @@ def load_schedule(gtfs_path: Path, tods_path: Optional[Path]) -> Schedule:
             "trips.txt",
             "stop_times.txt",
             "stops.txt",
+            "routes.txt",
             "calendar.txt",
             "calendar_dates.txt",
             "frequencies.txt",
@@ -845,13 +903,24 @@ def load_schedule(gtfs_path: Path, tods_path: Optional[Path]) -> Schedule:
                 "trips_supplement.txt",
                 "stop_times_supplement.txt",
                 "stops_supplement.txt",
+                "routes_supplement.txt",
                 "calendar_supplement.txt",
                 "calendar_dates_supplement.txt",
             ),
         )
+        reject_tods_v1(tods_path)
         if not tods:
             raise ValueError(f"No TODS supplement files found in '{tods_path}'.")
     trips = apply_supplement(gtfs["trips"], tods.get("trips_supplement"), ["trip_id"])
+    routes = apply_supplement(gtfs.get("routes"), tods.get("routes_supplement"), ["route_id"])
+    trips = drop_trips_on_deleted_routes(
+        trips, gtfs.get("routes", pd.DataFrame(columns=["route_id"])), routes
+    )
+    if trips.empty:
+        raise ValueError(
+            f"No trips remain after applying the TODS supplements in '{tods_path}': every trip "
+            "was deleted or is on a route deleted in routes_supplement.txt."
+        )
     stop_times = apply_supplement(
         gtfs["stop_times"], tods.get("stop_times_supplement"), ["trip_id", "stop_sequence"]
     )

@@ -1,0 +1,5 @@
+route_id,service_id,trip_id,direction_id,block_id
+12,DAILY,101,0,BLOCK-A
+12,DAILY,102,1,BLOCK-A
+12,DAILY,103,0,BLOCK-A
+12,DAILY,104,1,BLOCK-A

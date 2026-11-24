@@ -37,11 +37,13 @@ Key Features
 - Adds a writable row for positive gaps between trips, with scheduled times,
   duration, actual times, and location/activity notes. Different endpoint stops
   are labeled "Between trips" because the gap may include travel.
-- With ``TODS_PATH`` (TODS supplement files for the same feed, e.g. from
-  ``tsde_to_tods.py``), lists each block's scheduled pull-out, pull-in and
-  deadheads, and splits a gap that a deadhead covers into the deadhead and the
-  layover before or after it, so "Between trips" is left only for gaps the
-  TODS files do not explain.
+- With ``TODS_PATH`` (TODS 2.1 supplement files for the same feed, e.g. from
+  ``tsde_to_tods.py``), applies their edits and deletions (a corrected
+  departure prints at its new time; trips on a deleted route are dropped),
+  lists each block's scheduled pull-out, pull-in and deadheads with the waits
+  around them, and splits a gap that a deadhead covers into the deadhead and
+  the layover before or after it, so "Between trips" is left only for gaps the
+  TODS files do not explain. File names span the pull-out to the pull-in.
 """
 
 from __future__ import annotations
@@ -97,10 +99,11 @@ STOP_ID_FIELD: str = "stop_code"
 # Add observation rows for positive scheduled gaps between trips in a block.
 INCLUDE_LAYOVER_ROWS: bool = True  # False → stop events only.
 
-# Optional: TODS supplement files for the same GTFS feed (folder or .zip). Adds
-# each block's scheduled pull-out, pull-in and deadhead rows (trips with a
-# TODS_trip_type) and splits deadhead-covered gaps into deadhead + layover.
-# TODS rows that modify or delete GTFS trips are not applied. Blank: GTFS only.
+# Optional: TODS 2.1 supplement files for the same GTFS feed (folder or .zip).
+# Their edits, additions and deletions to trips, stop times, stops and routes are
+# applied first; then each block's pull-out, pull-in and deadhead rows (trips with
+# a TODS_trip_type) are listed and deadhead-covered gaps split into deadhead +
+# layover. TODS v1 deadhead tables stop the run. Blank: GTFS only.
 TODS_PATH = r""
 
 # Placeholder values for printing:
@@ -533,15 +536,20 @@ def build_service_labels(calendar_df: pd.DataFrame) -> dict[str, str]:
     return labels
 
 
-def build_block_filename(block_df: pd.DataFrame, service_labels: Mapping[str, str]) -> str:
+def build_block_filename(
+    block_df: pd.DataFrame,
+    service_labels: Mapping[str, str],
+    movements: Sequence[Mapping[str, Any]] = (),
+) -> str:
     """Build a human-readable ``.xlsx`` file name for one block.
 
     Format: ``block_<block_id>_<route>_<route>…_<HHMM>-<HHMM>_<calendar>.xlsx``,
     e.g. ``block_101_10_20_0532-1847_Weekday.xlsx``.
 
     * Routes are listed in the order the block first serves them.
-    * Times span the block's earliest and latest scheduled times; hours of
-      24 or more are kept for after-midnight service, GTFS-style (``2530``).
+    * Times span the block's earliest and latest scheduled times, including
+      its TODS pull-out, pull-in and deadheads; hours of 24 or more are kept
+      for after-midnight service, GTFS-style (``2530``).
     * Several calendars on one block are joined with ``+``.
     * Characters not allowed in Windows file names, and spaces, become ``-``.
 
@@ -551,13 +559,16 @@ def build_block_filename(block_df: pd.DataFrame, service_labels: Mapping[str, st
             ``arrival_time`` and ``departure_time`` columns.
         service_labels: Output of :pyfunc:`build_service_labels`; service_ids
             missing from it are shown as-is.
+        movements: This block's TODS movements (see
+            :pyfunc:`build_tods_movements`), with ``start``/``end`` seconds.
 
     Returns:
         The file name (no directory).
     """
     departures = pd.to_numeric(block_df["departure_time"].map(parse_time_to_minutes))
     arrivals = pd.to_numeric(block_df["arrival_time"].map(parse_time_to_minutes))
-    all_minutes = pd.concat([departures, arrivals])
+    moves = pd.Series([m[k] / 60 for m in movements for k in ("start", "end")], dtype=float)
+    all_minutes = pd.concat([departures, arrivals, moves])
     start = minutes_to_hhmm(all_minutes.min()).replace(":", "")
     end = minutes_to_hhmm(all_minutes.max()).replace(":", "")
 
@@ -576,60 +587,128 @@ def build_block_filename(block_df: pd.DataFrame, service_labels: Mapping[str, st
     return "_".join(safe_parts) + ".xlsx"
 
 
-def load_tods_movements(
-    tods_path: str, stops_df: Optional[pd.DataFrame] = None
-) -> dict[tuple[str, str], list[dict[str, Any]]]:
-    """Read TODS nonrevenue trips, keyed by ``(block_id, service_id)``.
+TODS_V1_TABLES = ("deadheads.txt", "deadhead_times.txt")
+TODS_SUPPLEMENT_FILES = (
+    "trips_supplement.txt",
+    "stop_times_supplement.txt",
+    "stops_supplement.txt",
+    "routes_supplement.txt",
+)
+
+
+def feed_members(path: str) -> set[str]:
+    """Return the file names present in a feed folder or ``.zip`` (basenames).
+
+    Raises:
+        OSError: If *path* is neither a folder nor a readable ``.zip``.
+    """
+    if os.path.isdir(path):
+        return {name for name in os.listdir(path) if os.path.isfile(os.path.join(path, name))}
+    try:
+        with zipfile.ZipFile(path) as archive:
+            return {os.path.basename(name) for name in archive.namelist() if not name.endswith("/")}
+    except (OSError, zipfile.BadZipFile) as exc:
+        raise OSError(f"TODS_PATH '{path}' is neither a folder nor a readable .zip.") from exc
+
+
+def load_tods_supplements(tods_path: str) -> dict[str, pd.DataFrame]:
+    """Load the TODS 2.1 supplement files present in *tods_path*.
 
     Args:
-        tods_path: Folder or ``.zip`` holding ``trips_supplement.txt`` and
-            ``stop_times_supplement.txt`` (``stops_supplement.txt`` optional).
-        stops_df: GTFS ``stops.txt``, used to name the movements' end stops.
+        tods_path: Folder or ``.zip`` holding the ``*_supplement.txt`` files.
+
+    Returns:
+        File stem (e.g. ``"trips_supplement"``) to an all-text DataFrame.
+
+    Raises:
+        OSError: If *tods_path* cannot be read.
+        ValueError: If it holds TODS v1 deadhead tables, or no supplement file.
+    """
+    members = feed_members(tods_path)
+    found_v1 = sorted(set(TODS_V1_TABLES) & members)
+    if found_v1:
+        raise ValueError(
+            f"'{tods_path}' contains TODS v1 deadhead tables ({', '.join(found_v1)}). This "
+            "script expects TODS 2.1 supplements (trips_supplement.txt, "
+            "stop_times_supplement.txt); convert the files to TODS 2.1 first."
+        )
+    present = [name for name in TODS_SUPPLEMENT_FILES if name in members]
+    if not present:
+        raise ValueError(f"No TODS supplement files found in '{tods_path}'.")
+    tables = load_gtfs_data(tods_path, files=present, dtype=str)
+    return {name: df.fillna("") for name, df in tables.items()}
+
+
+def apply_tods_supplements(
+    gtfs: Mapping[str, pd.DataFrame], supplements: Mapping[str, pd.DataFrame]
+) -> dict[str, pd.DataFrame]:
+    """Apply TODS 2.1 supplements to the GTFS trips, stop times, stops and routes.
+
+    Rows are deleted, updated or added by :func:`apply_supplement`, so a TODS
+    edit to a public trip (a corrected departure, say) prints at its new time.
+    Trips on a route deleted in ``routes_supplement.txt`` are then dropped
+    unless ``trips_supplement.txt`` moved them to another route.
+
+    Args:
+        gtfs: ``trips``, ``stop_times``, ``stops`` and ``routes`` tables.
+        supplements: Output of :func:`load_tods_supplements`.
+
+    Returns:
+        The four tables after the supplements, with blank text as missing
+        values (as when GTFS is read without TODS). ``trips`` keeps a
+        ``TODS_trip_type`` column, blank for public trips.
+    """
+    routes_before = gtfs["routes"].fillna("")
+    out = {
+        "trips": apply_supplement(gtfs["trips"], supplements.get("trips_supplement"), ["trip_id"]),
+        "stop_times": apply_supplement(
+            gtfs["stop_times"],
+            supplements.get("stop_times_supplement"),
+            ["trip_id", "stop_sequence"],
+        ),
+        "stops": apply_supplement(gtfs["stops"], supplements.get("stops_supplement"), ["stop_id"]),
+        "routes": apply_supplement(
+            routes_before, supplements.get("routes_supplement"), ["route_id"]
+        ),
+    }
+    out["trips"] = drop_trips_on_deleted_routes(out["trips"], routes_before, out["routes"])
+    if "TODS_trip_type" not in out["trips"].columns:
+        out["trips"]["TODS_trip_type"] = ""
+    return {name: df.mask(df == "") for name, df in out.items()}
+
+
+def build_tods_movements(
+    trips: pd.DataFrame, stop_times: pd.DataFrame, stops: pd.DataFrame
+) -> dict[tuple[str, str], list[dict[str, Any]]]:
+    """Collect TODS nonrevenue trips, keyed by ``(block_id, service_id)``.
+
+    Args:
+        trips: Supplemented trips (see :func:`apply_tods_supplements`); only
+            rows with a ``TODS_trip_type`` count.
+        stop_times: Supplemented stop times.
+        stops: Supplemented stops, used to name and label the end stops.
 
     Returns:
         Per block and service, the movements sorted by start: ``trip_id``,
         ``label`` (Event Type), ``start``/``end`` seconds and the ``from_*`` /
         ``to_*`` stop IDs, Stop ID labels (``from_label`` / ``to_label``, per
-        ``STOP_ID_FIELD``) and names. Only rows with a ``TODS_trip_type`` count.
+        ``STOP_ID_FIELD``) and names.
 
     Raises:
-        OSError: If the TODS files are missing.
         ValueError: If a nonrevenue trip has no stop times or no end times.
     """
-    tods = load_gtfs_data(
-        tods_path, files=["trips_supplement.txt", "stop_times_supplement.txt"], dtype=str
-    )
-    try:
-        extra = load_gtfs_data(tods_path, files=["stops_supplement.txt"], dtype=str)
-        tods_stops = extra["stops_supplement"]
-    except OSError:
-        tods_stops = pd.DataFrame(columns=["stop_id", "stop_name"])
-    names: dict[str, str] = {}
-    codes: dict[str, str] = {}
-    for frame in (stops_df, tods_stops):
-        if frame is not None and {"stop_id", "stop_name"} <= set(frame.columns):
-            names.update(zip(frame["stop_id"].astype(str), frame["stop_name"].fillna("")))
-        if frame is not None and {"stop_id", "stop_code"} <= set(frame.columns):
-            codes.update(zip(frame["stop_id"].astype(str), frame["stop_code"].fillna("")))
+    stops = stops.fillna("")
+    names = dict(zip(stops["stop_id"].astype(str), stops.get("stop_name", stops["stop_id"])))
+    codes = dict(zip(stops["stop_id"].astype(str), stops.get("stop_code", "")))
     # Stop ID labels follow prepare_stop_times: stop_code if stops.txt has that column.
-    use_codes = (
-        STOP_ID_FIELD == "stop_code" and stops_df is not None and "stop_code" in stops_df.columns
-    )
+    use_codes = STOP_ID_FIELD == "stop_code" and "stop_code" in stops.columns
 
     def stop_label(stop_id: str) -> str:
         return codes.get(stop_id, "") if use_codes else stop_id
 
-    trips = tods["trips_supplement"].fillna("")
-    if "TODS_trip_type" not in trips.columns:
-        trips["TODS_trip_type"] = ""
-    nonrevenue = trips.loc[trips["TODS_trip_type"].str.strip() != ""]
-    ignored = len(trips) - len(nonrevenue)
-    if ignored:
-        logging.warning(
-            "%d TODS trip row(s) without TODS_trip_type (edits to GTFS trips) are not applied.",
-            ignored,
-        )
-    stop_times = tods["stop_times_supplement"].fillna("")
+    trips = trips.fillna("")
+    nonrevenue = trips.loc[trips["TODS_trip_type"].astype(str).str.strip() != ""]
+    stop_times = stop_times.loc[stop_times["trip_id"].isin(set(nonrevenue["trip_id"]))].fillna("")
     stop_times = stop_times.assign(_seq=pd.to_numeric(stop_times["stop_sequence"]))
     calls = {trip: g.sort_values("_seq") for trip, g in stop_times.groupby("trip_id")}
 
@@ -643,7 +722,7 @@ def load_tods_movements(
         end = time_to_seconds(last["arrival_time"] or last["departure_time"])
         if pd.isna(start) or pd.isna(end):
             raise ValueError(f"TODS trip {trip['trip_id']} lacks a first or last stop time.")
-        kind = trip["TODS_trip_type"].strip()
+        kind = str(trip["TODS_trip_type"]).strip()
         movements.setdefault((trip.get("block_id", ""), trip["service_id"]), []).append(
             {
                 "trip_id": trip["trip_id"],
@@ -660,7 +739,7 @@ def load_tods_movements(
         )
     for legs in movements.values():
         legs.sort(key=lambda m: (m["start"], m["end"]))
-    logging.info("Loaded %d TODS nonrevenue trip(s) from %s.", len(nonrevenue), tods_path)
+    logging.info("Loaded %d TODS nonrevenue trip(s).", len(nonrevenue))
     return movements
 
 
@@ -705,7 +784,8 @@ def add_layover_rows(
         trip's first departure, with the other time at that same event used
         only if the preferred time is missing. Actual time fields record the
         observed waiting period; Comments records its location and activity.
-        A gap row carries the preceding trip ID, with no stop sequence or
+        A gap row carries the preceding trip ID (the first trip's, for a wait
+        between a pull-out and the first trip), with no stop sequence or
         timepoint flag. Without TODS there are no rows before the first or
         after the last trip, and no rows for zero or negative gaps. Endpoints
         come from full trips even when only timepoints are printed. Separate
@@ -826,21 +906,39 @@ def add_layover_rows(
     placed: set[str] = set()
     rows: list[dict[str, Any]] = []
     first_start = trips[0][1]["trip_start_seconds"]
+    # Before the first trip, follow the vehicle from movement to movement so a
+    # wait between a pull-out's arrival and the first departure gets its row.
+    cursor: Optional[float] = None
+    here: Any = None
     for move in movements:
         if move["end"] <= first_start:
+            if include_gaps and cursor is not None and move["start"] > cursor:
+                rows.append(gap_row(trips[0], cursor, move["start"], here, move_stop(move, "from")))
             rows.append(movement_row(move))
             placed.add(move["trip_id"])
+            cursor, here = move["end"], move_stop(move, "to")
+    if include_gaps and cursor is not None and first_start > cursor:
+        rows.append(gap_row(trips[0], cursor, first_start, here, trips[0][1]))
 
     latest_end = -math.inf
     for pos, (trip_id, first, last) in enumerate(trips):
         rows.extend(stop_rows.get(trip_id, []))
         if pos + 1 == len(trips):
             end_seconds = trip_end(last)
+            if pd.isna(end_seconds):
+                continue
+            cursor, here = end_seconds, last
             for move in movements:
-                if move["trip_id"] not in placed and pd.notna(end_seconds):
-                    if move["start"] >= end_seconds:
-                        rows.append(movement_row(move))
-                        placed.add(move["trip_id"])
+                if move["trip_id"] not in placed and move["start"] >= end_seconds:
+                    if include_gaps and move["start"] > cursor:
+                        rows.append(
+                            gap_row(
+                                trips[pos], cursor, move["start"], here, move_stop(move, "from")
+                            )
+                        )
+                    rows.append(movement_row(move))
+                    placed.add(move["trip_id"])
+                    cursor, here = move["end"], move_stop(move, "to")
             continue
 
         next_trip_id, next_first, _ = trips[pos + 1]
@@ -955,7 +1053,8 @@ def export_blocks(
         block_subset = block_subset.merge(first_departures, on="trip_id", how="left")
 
         block_subset["Trip Start Time"] = block_subset["trip_start_hhmm"]
-        filename = build_block_filename(block_subset, service_labels or {})
+        movements = (tods_movements or {}).get((str(block_id), str(service_id)), [])
+        filename = build_block_filename(block_subset, service_labels or {}, movements)
         if service_counts.loc[block_id] > 1:
             safe_service = re.sub(r'[\\/:*?"<>|\s]+', "-", str(service_id))
             filename = f"{os.path.splitext(filename)[0]}_service-{safe_service}.xlsx"
@@ -1044,7 +1143,6 @@ def export_blocks(
         final_df["_trip_start_seconds"] = block_subset["trip_start_seconds"]
         final_df = final_df.sort_values(by=["_trip_start_seconds", "Trip ID", "Stop Sequence"])
         final_df = final_df.drop(columns="_trip_start_seconds")
-        movements = (tods_movements or {}).get((str(block_id), str(service_id)), [])
         if INCLUDE_LAYOVER_ROWS or movements:
             final_df = add_layover_rows(
                 final_df, full_block, movements, include_gaps=INCLUDE_LAYOVER_ROWS
@@ -1242,6 +1340,95 @@ def load_gtfs_data(
 # =============================================================================
 
 
+def apply_supplement(
+    base: Optional[pd.DataFrame], supplement: Optional[pd.DataFrame], keys: Sequence[str]
+) -> pd.DataFrame:
+    """Apply one TODS supplement file to its GTFS table (TODS 2.1 evaluation rules).
+
+    A row whose primary key matches the GTFS table deletes that row when
+    ``TODS_delete`` is ``1`` and otherwise overwrites it with the row's
+    non-empty values; a row with a new key is added whole.
+
+    Args:
+        base: The GTFS table (``None`` or empty if the feed lacks it).
+        supplement: The ``*_supplement.txt`` table, or ``None``.
+        keys: The GTFS file's primary-key columns.
+
+    Returns:
+        The supplemented table, all values as text.
+
+    Raises:
+        ValueError: If the supplement lacks a key column or both deletes and
+            re-adds the same primary key.
+    """
+    base = pd.DataFrame(columns=list(keys)) if base is None else base.fillna("")
+    if supplement is None or supplement.empty:
+        return base.copy()
+    supplement = supplement.fillna("")
+    missing = [k for k in keys if k not in supplement.columns]
+    if missing:
+        raise ValueError(f"Supplement file is missing primary-key column(s): {missing}")
+    rows: dict[tuple, dict[str, Any]] = {
+        tuple(r[k] for k in keys): r for r in base.to_dict("records")
+    }
+    order = list(rows)
+    deleted: set[tuple] = set()
+    written: set[tuple] = set()
+    for record in supplement.to_dict("records"):
+        key = tuple(record[k] for k in keys)
+        values = {c: v for c, v in record.items() if c != "TODS_delete"}
+        if str(record.get("TODS_delete", "")).strip() == "1":
+            if key in rows:
+                deleted.add(key)
+            else:
+                logging.warning("TODS_delete for %s matches no GTFS row; ignored.", key)
+            continue
+        written.add(key)
+        if key in rows:
+            rows[key].update({c: v for c, v in values.items() if v != ""})
+        else:
+            rows[key] = values
+            order.append(key)
+    if deleted & written:
+        raise ValueError(f"Supplement both deletes and re-adds key(s): {sorted(deleted & written)}")
+    out = pd.DataFrame([rows[k] for k in order if k not in deleted])
+    return out.reindex(columns=list(dict.fromkeys([*base.columns, *out.columns]))).fillna("")
+
+
+def drop_trips_on_deleted_routes(
+    trips: pd.DataFrame, routes_before: pd.DataFrame, routes_after: pd.DataFrame
+) -> pd.DataFrame:
+    """Drop trips whose route a TODS ``routes_supplement.txt`` deletes.
+
+    TODS ignores trips that reference a deleted route unless they are
+    reassigned, so pass *trips* after ``trips_supplement.txt`` has been
+    applied: a trip moved to a surviving route keeps its new ``route_id`` and
+    stays. Each dropped trip is counted in a warning.
+
+    Args:
+        trips: Trips table with a ``route_id`` column, already supplemented.
+        routes_before: ``routes.txt`` before ``routes_supplement.txt``.
+        routes_after: The same table after :func:`apply_supplement`.
+
+    Returns:
+        *trips* without the rows on deleted routes.
+    """
+    deleted = set(routes_before.get("route_id", pd.Series(dtype=str)).astype(str)) - set(
+        routes_after.get("route_id", pd.Series(dtype=str)).astype(str)
+    )
+    if not deleted:
+        return trips
+    on_deleted = trips["route_id"].astype(str).isin(deleted)
+    if on_deleted.any():
+        logging.warning(
+            "Ignoring %d trip(s) on route(s) deleted in routes_supplement.txt (%s); "
+            "reassign them to another route in trips_supplement.txt to keep them.",
+            int(on_deleted.sum()),
+            ", ".join(sorted(deleted)),
+        )
+    return trips.loc[~on_deleted]
+
+
 def main() -> int:
     """Command-line entry point.
 
@@ -1307,6 +1494,22 @@ def main() -> int:
         routes_df = gtfs_data["routes"]
         service_labels = build_service_labels(gtfs_data["calendar"])
 
+        tods_movements = None
+        if TODS_PATH.strip():
+            logging.info("TODS supplement files: %s", TODS_PATH)
+            tods = apply_tods_supplements(gtfs_data, load_tods_supplements(TODS_PATH))
+            stop_times_df, stops_df, routes_df = tods["stop_times"], tods["stops"], tods["routes"]
+            tods_movements = build_tods_movements(tods["trips"], stop_times_df, stops_df)
+            # Pull-outs, pull-ins and deadheads print as movement rows, not stop rows.
+            trip_types = tods["trips"]["TODS_trip_type"].fillna("").astype(str).str.strip()
+            trips_df = tods["trips"].loc[trip_types == ""]
+            if trips_df.empty:
+                logging.warning(
+                    "No public trips remain after applying the TODS supplements (every trip "
+                    "was deleted or is on a deleted route) – no files generated."
+                )
+                return 1
+
         trips_df, stop_times_df = filter_data(trips_df, stop_times_df, routes_df)
         if trips_df.empty or stop_times_df.empty:
             logging.warning("No data remains after filtering – no files generated.")
@@ -1323,10 +1526,6 @@ def main() -> int:
             )
             return 1
 
-        tods_movements = None
-        if TODS_PATH.strip():
-            logging.info("TODS supplement files: %s", TODS_PATH)
-            tods_movements = load_tods_movements(TODS_PATH, stops_df)
         export_blocks(prepared, service_labels, tods_movements)
         logging.info("Script finished successfully.")
         logging.info("Script completed successfully.")
