@@ -196,6 +196,56 @@ def test_build_schedule_rows_through_dwell_stops_at_next_arrival() -> None:
     ]
 
 
+# The "direct conflict" preset: 1 / 0 / 0 / 10.
+DIRECT = {
+    **SETTINGS,
+    "THROUGH_DWELL_MINUTES": 1,
+    "PRE_DEPARTURE_MINUTES": 0,
+    "POST_ARRIVAL_MINUTES": 0,
+}
+
+
+@pytest.mark.parametrize(
+    ("settings", "first_arrival", "expected"),
+    [
+        # Likely conflict: loading, the departure minute, then the next stop's dwell.
+        (
+            SETTINGS,
+            720,
+            [("LOADING", "BAY_D")] * 5
+            + [("DEPART", "BAY_D"), ("ARRIVE/DEPART", "S2"), ("TRAVELING BETWEEN STOPS", "")],
+        ),
+        # Direct conflict: the bay is occupied in its scheduled departure minute only.
+        (
+            DIRECT,
+            720,
+            [("INACTIVE", "")] * 5 + [("DEPART", "BAY_D")] + [("TRAVELING BETWEEN STOPS", "")] * 2,
+        ),
+        # A first-stop hold (11:55 to 12:00) keeps its departure minute too.
+        (
+            SETTINGS,
+            715,
+            [("LOADING", "BAY_D")] * 5
+            + [("DEPART", "BAY_D"), ("ARRIVE/DEPART", "S2"), ("TRAVELING BETWEEN STOPS", "")],
+        ),
+    ],
+)
+def test_build_schedule_rows_keeps_first_stop_departure_when_next_stop_rounds_into_it(
+    settings: dict[str, int], first_arrival: int, expected: list[tuple[str, str]]
+) -> None:
+    # Departs Bay D at 12:00:00 and reaches the next stop at 12:00:25, also minute 12:00.
+    trip = _trip(
+        "T1",
+        [
+            _stop(first_arrival, 720, "BAY_D", True, False, 1),
+            _stop(720, 720, "S2", False, False, 2),
+            _stop(730, 730, "S3", False, True, 3),
+        ],
+    )
+    rows = build_schedule_rows([trip], range(715, 723), "B1", [], settings)
+    assert [(r["Status"], r["Stop ID"]) for r in rows] == expected
+
+
 def test_build_schedule_rows_occupancy_only_and_zero_gap_handoff() -> None:
     arriving = _trip(
         "T1", [_stop(400, 400, "S9", True, False, 1), _stop(420, 420, "S1", False, True, 2)]

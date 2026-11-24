@@ -1,9 +1,12 @@
 """Generate printable Excel schedules for each vehicle block in a GTFS feed.
 
 The script reads the five core GTFS tables—``trips``, ``stop_times``, ``stops``,
-``routes`` and ``calendar``—and optionally filters them by *service ID* and/or
-*route short name*.  For every vehicle ``block_id`` that survives filtering it
-produces a nicely-formatted ``.xlsx`` file ready for field auditing.
+``routes`` and ``calendar``—and optionally filters them by *service ID* (or the
+service IDs active on one *service date*) and/or *route short name*.  For every
+vehicle ``block_id`` that survives filtering it produces a nicely-formatted
+``.xlsx`` file ready for field auditing. A frequency-based trip
+(``frequencies.txt``) on a selected block stops the export, since a block sheet
+cannot list each of its runs.
 
 Outputs
 -------
@@ -13,7 +16,9 @@ Outputs
   field notes. Set ``TIMEPOINTS_ONLY`` to list only timepoint stops; otherwise
   all stops are listed and timepoint rows are shaded.
   Blocks shared by service IDs are exported separately, with a service-ID
-  suffix on their file names. Optional layover rows are enabled by default.
+  suffix on their file names. With ``SERVICE_DATE`` set, each block's trips on
+  that date share one file, named with the date, and layovers connect trips of
+  different service IDs. Optional layover rows are enabled by default.
 
 Typical usage
 -------------
@@ -48,6 +53,7 @@ Key Features
 
 from __future__ import annotations
 
+import datetime as dt
 import logging
 import math
 import os
@@ -80,10 +86,18 @@ REQUIRED_GTFS_FILES = [
 ]
 
 # If you only want certain service IDs or route short names, specify them here.
-# A route filter keeps each block (per service ID) that serves one of the routes
-# on the selected service IDs, including its interlined trips on other routes.
+# A route filter keeps each block (per service ID, or on SERVICE_DATE) that serves
+# one of the routes on the selected service, including its interlined trips on
+# other routes.
 FILTER_SERVICE_IDS: list[str] = []  # e.g. ["WKD", "SAT"]
 FILTER_ROUTE_SHORT_NAMES: list[str] = []  # e.g. ["101", "202"]
+
+# Optional service date (YYYYMMDD), used instead of FILTER_SERVICE_IDS. Every
+# service_id active on that date per calendar.txt and calendar_dates.txt is
+# selected, and each block's trips from all of them go on one sheet: the
+# vehicle's whole day, with layovers between trips of different service IDs.
+# Leave "" to export each block once per service ID.
+SERVICE_DATE: str = ""  # e.g. "20260105"
 
 # Calendar label used in output file names, by service_id. Unlisted service_ids
 # are labeled from their calendar.txt days (e.g. "Weekday", "Saturday", "MonTueWedThu").
@@ -138,6 +152,10 @@ COLLECTION_DATE_HEADER: str = "Date: ____________________"
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
 
 # === END CONFIG ===
+
+# GTFS files loaded only when the feed has them: calendar_dates.txt for SERVICE_DATE,
+# frequencies.txt to stop on frequency-based trips.
+OPTIONAL_GTFS_FILES: tuple[str, ...] = ("calendar_dates.txt", "frequencies.txt")
 
 # TODS_trip_type -> Event Type label; other types are shown capitalized.
 TODS_EVENT_LABELS: dict[str, str] = {
@@ -358,20 +376,28 @@ def export_to_excel(data_frame: pd.DataFrame, output_file: str) -> None:
 
 
 def filter_data(
-    trips_df: pd.DataFrame, stop_times_df: pd.DataFrame, routes_df: pd.DataFrame
+    trips_df: pd.DataFrame,
+    stop_times_df: pd.DataFrame,
+    routes_df: pd.DataFrame,
+    date_service_ids: Optional[Sequence[str]] = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Apply route and service filters, propagating them to stop times.
 
-    Service IDs are filtered first. The route filter then keeps every trip of
-    each ``(block_id, service_id)`` schedule with at least one trip on a
-    selected route, so interlined trips stay on the sheet. Blocks are matched
-    per service ID because each is exported separately, and a ``block_id``
-    reused on another service may not serve the route there.
+    Service IDs are filtered first: *date_service_ids* when given, otherwise
+    ``FILTER_SERVICE_IDS``. The route filter then keeps every trip of each
+    ``(block_id, service_id)`` schedule with at least one trip on a selected
+    route, so interlined trips stay on the sheet. Blocks are matched per
+    service ID because each is exported separately, and a ``block_id`` reused
+    on another service may not serve the route there. With
+    *date_service_ids*, every kept trip runs on that date, so blocks are
+    matched on ``block_id`` alone.
 
     Args:
         trips_df: Parsed **trips.txt** table.
         stop_times_df: Parsed **stop_times.txt** table.
         routes_df: Parsed **routes.txt** table (for ``route_short_name``).
+        date_service_ids: The service_ids active on ``SERVICE_DATE``, or
+            ``None`` to select by ``FILTER_SERVICE_IDS``.
 
     Returns:
         ``(filtered_trips, filtered_stop_times)``.
@@ -389,12 +415,14 @@ def filter_data(
     trips_df = trips_df.merge(routes_subset, on="route_id", how="left")
 
     # Apply Service ID Filtering
-    if FILTER_SERVICE_IDS:
+    if date_service_ids is not None:
+        trips_df = trips_df[trips_df["service_id"].isin(list(date_service_ids))]
+    elif FILTER_SERVICE_IDS:
         trips_df = trips_df[trips_df["service_id"].isin(FILTER_SERVICE_IDS)]
 
-    # Apply Route Filtering to whole block/service schedules
+    # Apply Route Filtering to whole block/service (or block/date) schedules
     if FILTER_ROUTE_SHORT_NAMES:
-        keys = ["block_id", "service_id"]
+        keys = ["block_id"] if date_service_ids is not None else ["block_id", "service_id"]
         serving = (
             trips_df.loc[trips_df["route_short_name"].isin(FILTER_ROUTE_SHORT_NAMES), keys]
             .dropna()
@@ -403,7 +431,7 @@ def filter_data(
         if serving.empty:
             logging.info(
                 "No blocks found with the specified route short names%s.",
-                " on the specified service IDs" if FILTER_SERVICE_IDS else "",
+                " on the selected service" if FILTER_SERVICE_IDS or date_service_ids else "",
             )
             return pd.DataFrame(), pd.DataFrame()
 
@@ -743,6 +771,59 @@ def build_tods_movements(
     return movements
 
 
+def movements_on_date(
+    movements: Mapping[tuple[str, str], Sequence[dict[str, Any]]],
+    service_ids: Sequence[str],
+    service_date: str,
+) -> dict[tuple[str, str], list[dict[str, Any]]]:
+    """Regroup TODS movements for a ``SERVICE_DATE`` export, keyed by ``(block_id, date)``.
+
+    Args:
+        movements: Output of :pyfunc:`load_tods_movements`.
+        service_ids: The service_ids active on *service_date*; movements on
+            other services are dropped.
+        service_date: The date (``YYYYMMDD``) used as each key's second part.
+
+    Returns:
+        Each block's movements on the active services, sorted by start.
+    """
+    merged: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for (block_id, service_id), legs in movements.items():
+        if service_id in service_ids:
+            merged.setdefault((block_id, service_date), []).extend(legs)
+    for legs in merged.values():
+        legs.sort(key=lambda m: (m["start"], m["end"]))
+    return merged
+
+
+def reject_frequency_trips(frequencies_df: Optional[pd.DataFrame], trip_ids: pd.Series) -> None:
+    """Stop when a trip to be printed is frequency-based.
+
+    frequencies.txt repeats a trip at a headway (with or without
+    ``exact_times``), and its stop_times describe one template run, so a block
+    sheet would list a single run and silently omit the rest. Frequency-based
+    trips outside the selected blocks are ignored.
+
+    Args:
+        frequencies_df: Parsed ``frequencies.txt``, or ``None`` if the feed has none.
+        trip_ids: The trip_id of every stop event to be printed.
+
+    Raises:
+        ValueError: If any of *trip_ids* appears in *frequencies_df*.
+    """
+    if frequencies_df is None or frequencies_df.empty or "trip_id" not in frequencies_df:
+        return
+    frequency_trips = set(frequencies_df["trip_id"].dropna().astype(str))
+    selected = sorted(frequency_trips & set(trip_ids.astype(str)))
+    if selected:
+        listed = ", ".join(selected[:5]) + (", ..." if len(selected) > 5 else "")
+        raise ValueError(
+            f"{len(selected)} selected trip(s) are frequency-based ({listed}); a block sheet "
+            "can list only one run of each. Expand them into scheduled trips, or exclude "
+            "their blocks with FILTER_SERVICE_IDS, SERVICE_DATE or FILTER_ROUTE_SHORT_NAMES."
+        )
+
+
 def _duration_text(seconds: float) -> str:
     """Format a duration as ``"10 min"`` or ``"17m 30s"``."""
     if seconds % 60:
@@ -755,6 +836,7 @@ def add_layover_rows(
     block_df: pd.DataFrame,
     movements: Sequence[Mapping[str, Any]] = (),
     include_gaps: bool = True,
+    service_date: str = "",
 ) -> pd.DataFrame:
     """Insert observation rows between adjacent trips in one block/service ID.
 
@@ -766,6 +848,8 @@ def add_layover_rows(
             :pyfunc:`load_tods_movements`), placed before the first trip,
             between trips or after the last trip by their scheduled times.
         include_gaps: Add rows for waiting time (``INCLUDE_LAYOVER_ROWS``).
+        service_date: The date (``YYYYMMDD``) every trip in *block_df* runs
+            on, which lets them span several service IDs; ``""`` otherwise.
 
     Returns:
         Stop rows with their positive scheduled gaps and TODS movements.
@@ -789,11 +873,19 @@ def add_layover_rows(
         timepoint flag. Without TODS there are no rows before the first or
         after the last trip, and no rows for zero or negative gaps. Endpoints
         come from full trips even when only timepoints are printed. Separate
-        service IDs are never connected; selecting an actual date is outside
-        this exporter.
+        service IDs are connected only through *service_date*, the date on
+        which all of them run.
     """
-    if len(block_df["service_id"].unique()) != 1:
-        raise ValueError("Layover rows require one service ID per block schedule.")
+    if not service_date and len(block_df["service_id"].unique()) != 1:
+        raise ValueError(
+            "Layover rows require one service ID per block schedule, or a SERVICE_DATE "
+            "on which all of its trips run."
+        )
+    schedule = (
+        f"service date {service_date}"
+        if service_date
+        else f"service {block_df['service_id'].iloc[0]}"
+    )
 
     ordered = block_df.sort_values(["trip_start_seconds", "trip_id", "stop_sequence"])
     trips = [
@@ -802,9 +894,9 @@ def add_layover_rows(
     ]
     if any(pd.isna(first["trip_start_seconds"]) for _, first, _ in trips):
         logging.warning(
-            "Block %s / service %s has a trip with no start time; layover rows skipped.",
+            "Block %s / %s has a trip with no start time; layover rows skipped.",
             block_df["block_id"].iloc[0],
-            block_df["service_id"].iloc[0],
+            schedule,
         )
         return schedule_df
 
@@ -954,11 +1046,11 @@ def add_layover_rows(
         if gap_seconds < 0 or overlaps_earlier_trip:
             logging.warning(
                 "Overlapping trips affect the gap after %s before %s in block %s / "
-                "service %s; no gap row added.",
+                "%s; no gap row added.",
                 trip_id,
                 next_trip_id,
                 first["block_id"],
-                first["service_id"],
+                schedule,
             )
             continue
 
@@ -1013,7 +1105,9 @@ def export_blocks(
         service_labels: ``service_id`` → calendar label for file names (see
             :pyfunc:`build_service_labels`). ``None`` shows raw service_ids.
         tods_movements: TODS nonrevenue trips by ``(block_id, service_id)``
-            (see :pyfunc:`load_tods_movements`); ``None`` lists GTFS trips only.
+            (see :pyfunc:`load_tods_movements`), or by ``(block_id,
+            SERVICE_DATE)`` when that is set (see :pyfunc:`movements_on_date`);
+            ``None`` lists GTFS trips only.
 
     Side Effects:
         Writes one file per block/service, named by :pyfunc:`build_block_filename`, to
@@ -1029,8 +1123,18 @@ def export_blocks(
         ``Event Type`` is always present so stop records can be selected during
         ingestion. A block reused across service IDs is exported separately
         for each service, with its service ID appended to prevent name collisions.
+        With ``SERVICE_DATE`` set, the stop times must all run on that date
+        (see :pyfunc:`filter_data`): each block is exported once, with every
+        trip of every service ID, and the date is appended to its file name.
     """
-    groups = stop_times_df.groupby(["block_id", "service_id"], dropna=False, sort=True)
+    service_date = SERVICE_DATE.strip()
+    # One schedule per block and service ID, or per block on the service date.
+    schedule = (
+        pd.Series(service_date, index=stop_times_df.index, name="service_id")
+        if service_date
+        else stop_times_df["service_id"]
+    )
+    groups = stop_times_df.groupby([stop_times_df["block_id"], schedule], dropna=False, sort=True)
     service_counts = stop_times_df.groupby("block_id")["service_id"].nunique(dropna=False)
     logging.info("Found %d block/service schedules to export.\n", groups.ngroups)
 
@@ -1053,9 +1157,11 @@ def export_blocks(
         block_subset = block_subset.merge(first_departures, on="trip_id", how="left")
 
         block_subset["Trip Start Time"] = block_subset["trip_start_hhmm"]
-        movements = (tods_movements or {}).get((str(block_id), str(service_id)), [])
-        filename = build_block_filename(block_subset, service_labels or {}, movements)
-        if service_counts.loc[block_id] > 1:
+        filename = build_block_filename(block_subset, service_labels or {})
+        if service_date:
+            safe_date = re.sub(r'[\\/:*?"<>|\s]+', "-", service_date)
+            filename = f"{os.path.splitext(filename)[0]}_{safe_date}.xlsx"
+        elif service_counts.loc[block_id] > 1:
             safe_service = re.sub(r'[\\/:*?"<>|\s]+', "-", str(service_id))
             filename = f"{os.path.splitext(filename)[0]}_service-{safe_service}.xlsx"
 
@@ -1145,7 +1251,11 @@ def export_blocks(
         final_df = final_df.drop(columns="_trip_start_seconds")
         if INCLUDE_LAYOVER_ROWS or movements:
             final_df = add_layover_rows(
-                final_df, full_block, movements, include_gaps=INCLUDE_LAYOVER_ROWS
+                final_df,
+                full_block,
+                movements,
+                include_gaps=INCLUDE_LAYOVER_ROWS,
+                service_date=service_date,
             )
 
         output_path = os.path.join(BASE_OUTPUT_PATH, filename)
@@ -1155,6 +1265,196 @@ def export_blocks(
 # -----------------------------------------------------------------------------
 # REUSABLE FUNCTIONS
 # -----------------------------------------------------------------------------
+
+
+def available_gtfs_files(gtfs_path: str, names: Sequence[str]) -> tuple[str, ...]:
+    """Return the *names* present, and not empty, in a GTFS folder or ZIP archive.
+
+    ZIP members are matched by base name, as :func:`load_gtfs_data` matches
+    them, so a feed nested one folder deep inside the archive is found too.
+    Zero-byte files are skipped with a warning because the loader rejects them.
+    """
+    sizes: dict[str, int] = {}
+    if os.path.isdir(gtfs_path):
+        for name in names:
+            path = os.path.join(gtfs_path, name)
+            if os.path.isfile(path):
+                sizes[name] = os.path.getsize(path)
+    else:
+        with zipfile.ZipFile(gtfs_path) as archive:
+            for info in archive.infolist():
+                name = os.path.basename(info.filename)
+                if name in names:
+                    sizes[name] = max(sizes.get(name, 0), info.file_size)
+    for name in names:
+        if sizes.get(name) == 0:
+            logging.warning("Skipping empty optional file %s.", name)
+    return tuple(name for name in names if sizes.get(name, 0) > 0)
+
+
+def resolve_service_ids(
+    calendar_df: Optional[pd.DataFrame],
+    calendar_dates_df: Optional[pd.DataFrame],
+    service_date: str,
+) -> list[str]:
+    """Return every service_id active on ``service_date`` (``YYYYMMDD``).
+
+    Expands calendar.txt and calendar_dates.txt into each service's real set
+    of active dates (see :func:`expand_service_active_dates`) and keeps the
+    services that operate on the requested day.
+
+    Args:
+        calendar_df: Parsed ``calendar.txt``, or ``None`` if the feed has none.
+        calendar_dates_df: Parsed ``calendar_dates.txt``, or ``None``.
+        service_date: The day to analyze, as ``YYYYMMDD``.
+
+    Returns:
+        Sorted list of service_id strings (possibly empty).
+
+    Raises:
+        ValueError: If *service_date* is not a valid ``YYYYMMDD`` date.
+    """
+    try:
+        target = dt.datetime.strptime(service_date.strip(), "%Y%m%d").date()
+    except ValueError as exc:
+        raise ValueError(f"SERVICE_DATE must be a YYYYMMDD date; got {service_date!r}") from exc
+    active = expand_service_active_dates(calendar_df, calendar_dates_df, today=target)
+    return sorted(service_ids_active_on(active, target))
+
+
+# Canonical version lives in utils/calendar_helpers.py -- keep this copy in sync.
+def expand_service_active_dates(
+    calendar_df: Optional[pd.DataFrame],
+    calendar_dates_df: Optional[pd.DataFrame] = None,
+    max_days_per_service: int = 1830,
+    today: Optional[dt.date] = None,
+) -> dict[str, set[dt.date]]:
+    """Expand each service_id into its real set of active calendar dates.
+
+    Builds the base date set from each ``calendar.txt`` row (day-of-week
+    pattern × ``start_date``–``end_date`` range), then applies
+    ``calendar_dates.txt`` exceptions (``exception_type`` 1 adds a date,
+    2 removes it). Handles calendar_dates-only feeds (*calendar_df* empty or
+    ``None``), redundant additions, and fully negated base patterns — the
+    returned sets reflect only the dates a service truly operates.
+
+    Rows with unparseable or reversed dates are skipped with a warning.
+    A date range longer than *max_days_per_service* (a common placeholder
+    pattern, e.g. 2000–2099) is clamped to a window of that length centred
+    on *today* and logged, so expansion stays fast and downstream per-year
+    statistics stay meaningful.
+
+    Args:
+        calendar_df: Parsed ``calendar.txt``, or ``None`` if the feed has
+            none. Expected columns: ``service_id``, the seven day-of-week
+            flags, ``start_date``, ``end_date``.
+        calendar_dates_df: Parsed ``calendar_dates.txt`` or ``None``.
+            Expected columns: ``service_id``, ``date``, ``exception_type``.
+        max_days_per_service: Longest date range expanded per service before
+            clamping kicks in. The default (1830 ≈ 5 years) is far beyond
+            any real service span but well short of placeholder ranges.
+        today: Anchor date for clamping oversized ranges. Defaults to the
+            current date; pass a fixed date for deterministic tests.
+
+    Returns:
+        Mapping of ``service_id`` (as ``str``) to the set of dates the
+        service operates. Services whose dates never parse map to an empty
+        set rather than being dropped, so callers can report them.
+
+    Raises:
+        ValueError: If *calendar_df* is provided but lacks ``service_id``,
+            ``start_date``, or ``end_date`` columns.
+    """
+    day_cols = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+    anchor = dt.date.today() if today is None else today
+    active: dict[str, set[dt.date]] = {}
+
+    if calendar_df is not None and not calendar_df.empty:
+        required = {"service_id", "start_date", "end_date"}
+        missing = required - set(calendar_df.columns)
+        if missing:
+            raise ValueError(f"calendar.txt is missing required column(s): {sorted(missing)}")
+        for _, row in calendar_df.iterrows():
+            sid = str(row["service_id"]).strip()
+            try:
+                start = dt.datetime.strptime(str(row["start_date"]).strip(), "%Y%m%d").date()
+                end = dt.datetime.strptime(str(row["end_date"]).strip(), "%Y%m%d").date()
+            except ValueError:
+                logging.warning("Service %s: unparseable start/end date — skipping row.", sid)
+                active.setdefault(sid, set())
+                continue
+            if end < start:
+                logging.warning(
+                    "Service %s: end_date %s precedes start_date %s — skipping row.",
+                    sid,
+                    end,
+                    start,
+                )
+                active.setdefault(sid, set())
+                continue
+            if (end - start).days + 1 > max_days_per_service:
+                half = max_days_per_service // 2
+                clamped_start = max(start, anchor - dt.timedelta(days=half))
+                clamped_end = min(end, anchor + dt.timedelta(days=half))
+                logging.warning(
+                    "Service %s: date range %s–%s looks like a placeholder; "
+                    "clamping expansion to %s–%s.",
+                    sid,
+                    start,
+                    end,
+                    clamped_start,
+                    clamped_end,
+                )
+                start, end = clamped_start, clamped_end
+            pattern = [str(row.get(c, "0")).strip() == "1" for c in day_cols]
+            dates = active.setdefault(sid, set())
+            d = start
+            while d <= end:
+                if pattern[d.weekday()]:
+                    dates.add(d)
+                d += dt.timedelta(days=1)
+
+    if calendar_dates_df is not None and not calendar_dates_df.empty:
+        bad_rows = 0
+        for _, row in calendar_dates_df.iterrows():
+            sid = str(row["service_id"]).strip()
+            try:
+                d = dt.datetime.strptime(str(row["date"]).strip(), "%Y%m%d").date()
+            except ValueError:
+                bad_rows += 1
+                continue
+            etype = str(row.get("exception_type", "")).strip()
+            dates = active.setdefault(sid, set())
+            if etype == "1":
+                dates.add(d)
+            elif etype == "2":
+                dates.discard(d)
+            else:
+                bad_rows += 1
+        if bad_rows:
+            logging.warning(
+                "calendar_dates.txt: skipped %d row(s) with unparseable date/exception_type.",
+                bad_rows,
+            )
+
+    return active
+
+
+# Canonical version lives in utils/calendar_helpers.py -- keep this copy in sync.
+def service_ids_active_on(
+    active_dates: Mapping[str, set[dt.date]],
+    target_date: dt.date,
+) -> set[str]:
+    """Return the service_ids operating on *target_date*.
+
+    Args:
+        active_dates: Output of :func:`expand_service_active_dates`.
+        target_date: The calendar date to query.
+
+    Returns:
+        Set of service_id strings active on that date (possibly empty).
+    """
+    return {sid for sid, dates in active_dates.items() if target_date in dates}
 
 
 def parse_time_to_minutes(time_value: Optional[str]) -> Optional[int]:
@@ -1478,6 +1778,8 @@ def main() -> int:
         logging.info("Filtering for Routes: %s", FILTER_ROUTE_SHORT_NAMES)
     if FILTER_SERVICE_IDS:
         logging.info("Filtering for Service IDs: %s", FILTER_SERVICE_IDS)
+    if SERVICE_DATE.strip():
+        logging.info("Service date: %s", SERVICE_DATE.strip())
     if TIMEPOINTS_ONLY:
         logging.info("Listing timepoint stops only.")
 
@@ -1487,6 +1789,9 @@ def main() -> int:
             files=REQUIRED_GTFS_FILES,
             dtype=str,
         )
+        optional_files = available_gtfs_files(GTFS_FOLDER_PATH, OPTIONAL_GTFS_FILES)
+        if optional_files:
+            gtfs_data.update(load_gtfs_data(GTFS_FOLDER_PATH, files=optional_files, dtype=str))
 
         trips_df = gtfs_data["trips"]
         stop_times_df = gtfs_data["stop_times"]
@@ -1494,23 +1799,18 @@ def main() -> int:
         routes_df = gtfs_data["routes"]
         service_labels = build_service_labels(gtfs_data["calendar"])
 
-        tods_movements = None
-        if TODS_PATH.strip():
-            logging.info("TODS supplement files: %s", TODS_PATH)
-            tods = apply_tods_supplements(gtfs_data, load_tods_supplements(TODS_PATH))
-            stop_times_df, stops_df, routes_df = tods["stop_times"], tods["stops"], tods["routes"]
-            tods_movements = build_tods_movements(tods["trips"], stop_times_df, stops_df)
-            # Pull-outs, pull-ins and deadheads print as movement rows, not stop rows.
-            trip_types = tods["trips"]["TODS_trip_type"].fillna("").astype(str).str.strip()
-            trips_df = tods["trips"].loc[trip_types == ""]
-            if trips_df.empty:
-                logging.warning(
-                    "No public trips remain after applying the TODS supplements (every trip "
-                    "was deleted or is on a deleted route) – no files generated."
-                )
-                return 1
+        date_service_ids: Optional[list[str]] = None
+        if SERVICE_DATE.strip():
+            if FILTER_SERVICE_IDS:
+                raise ValueError("Set either FILTER_SERVICE_IDS or SERVICE_DATE, not both.")
+            date_service_ids = resolve_service_ids(
+                gtfs_data["calendar"], gtfs_data.get("calendar_dates"), SERVICE_DATE
+            )
+            if not date_service_ids:
+                raise ValueError(f"No service_id is active on {SERVICE_DATE.strip()} in this feed.")
+            logging.info("Service IDs active on that date: %s", date_service_ids)
 
-        trips_df, stop_times_df = filter_data(trips_df, stop_times_df, routes_df)
+        trips_df, stop_times_df = filter_data(trips_df, stop_times_df, routes_df, date_service_ids)
         if trips_df.empty or stop_times_df.empty:
             logging.warning("No data remains after filtering – no files generated.")
             return 1
@@ -1519,6 +1819,7 @@ def main() -> int:
         if prepared.empty:
             logging.warning("No data remains after preparation – no files generated.")
             return 1
+        reject_frequency_trips(gtfs_data.get("frequencies"), prepared["trip_id"])
         if TIMEPOINTS_ONLY and not (prepared["timepoint"] == 1).any():
             logging.warning(
                 "TIMEPOINTS_ONLY is True but no stops have timepoint = 1 in stop_times.txt "
@@ -1526,6 +1827,14 @@ def main() -> int:
             )
             return 1
 
+        tods_movements = None
+        if TODS_PATH.strip():
+            logging.info("TODS supplement files: %s", TODS_PATH)
+            tods_movements = load_tods_movements(TODS_PATH, stops_df)
+            if date_service_ids is not None:
+                tods_movements = movements_on_date(
+                    tods_movements, date_service_ids, SERVICE_DATE.strip()
+                )
         export_blocks(prepared, service_labels, tods_movements)
         logging.info("Script finished successfully.")
         logging.info("Script completed successfully.")
