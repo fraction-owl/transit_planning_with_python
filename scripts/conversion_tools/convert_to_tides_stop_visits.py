@@ -38,8 +38,7 @@ Key behaviors:
   leaves unsupported stop-level attributes (APC, door events, ramp activity,
   revenue) blank with explicit warnings.
 
-The conversion is deterministic: given the same input file and configuration,
-the output identifiers and records are stable across runs.
+The conversion is deterministic: the same inputs and configuration give the same output.
 
 Column names are configured via COLUMN_MAP in the CONFIGURATION section.
 Defaults are pre-set for CLEVER "Stop Visit Events" exports; update COLUMN_MAP
@@ -51,6 +50,7 @@ Outputs
   `stop_visits` record per source stop visit event, with columns in the exact
   order of the TIDES template (`TIDES_COLS`).
 - Optional combined input (`COMBINED_INPUT_FILENAME`, folder input only).
+- `stop_visits_runlog.txt` - run log with row counts and the verbatim CONFIGURATION.
 
 Typical usage
 -------------
@@ -62,6 +62,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -176,6 +177,12 @@ OPT_COLS: list[str] = [
 ]
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
+
+# When True, a failed run-log write makes the script exit with code 1 so the
+# analyst is never left with an output that lacks a matching configuration
+# record. Set to False only when writing to a location where a sidecar file
+# cannot be created (e.g. a read-only share).
+REQUIRE_RUN_LOG: bool = True
 
 # === END CONFIG ===
 
@@ -717,6 +724,126 @@ def convert_to_tides(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # =============================================================================
+# RUN LOG
+# =============================================================================
+
+
+def resolve_source_file() -> Path | None:
+    """Best-effort path to this script's source (``None`` in notebooks)."""
+    try:
+        return Path(__file__).resolve()
+    except NameError:
+        return None
+
+
+# Canonical version lives in utils/run_log.py — keep this copy in sync.
+def extract_config_block(source_file: Path) -> str:
+    r"""Return the text between the CONFIG markers in *source_file*.
+
+    Reads ``source_file`` as UTF-8 text and slices out the lines strictly
+    *between* the first occurrence of ``# === BEGIN CONFIG ===`` and the first
+    subsequent occurrence of ``# === END CONFIG ===``.  The marker lines
+    themselves are excluded; whitespace and inline comments inside the block
+    are preserved verbatim.
+
+    Args:
+        source_file: Path to the Python source file to scan (typically
+            ``Path(__file__)`` from the calling script).
+
+    Returns:
+        The verbatim text of the configuration block, joined with ``\n``.
+
+    Raises:
+        ValueError: If either marker is missing or they appear out of order.
+        OSError: If ``source_file`` cannot be read.
+    """
+    _BEGIN = "# === BEGIN CONFIG ==="
+    _END = "# === END CONFIG ==="
+
+    lines: list[str] = source_file.read_text(encoding="utf-8").splitlines()
+
+    begin_idx: int | None = None
+    end_idx: int | None = None
+    for i, line in enumerate(lines):
+        stripped: str = line.strip()
+        if begin_idx is None and stripped == _BEGIN:
+            begin_idx = i
+        elif begin_idx is not None and stripped == _END:
+            end_idx = i
+            break
+
+    if begin_idx is None or end_idx is None:
+        raise ValueError(
+            f"Config markers not found in '{source_file}'. Expected '{_BEGIN}' and '{_END}'."
+        )
+
+    return "\n".join(lines[begin_idx + 1 : end_idx])
+
+
+def run_log_path(output_file: Path) -> Path:
+    """Return the run-log sidecar path for *output_file* (same folder and stem)."""
+    return output_file.with_name(f"{output_file.stem}_runlog.txt")
+
+
+def write_run_log(output_file: Path, summary_lines: list[str]) -> bool:
+    """Write the run-log sidecar for *output_file*.
+
+    The log records the run timestamp, the source script, *summary_lines*, and
+    the CONFIGURATION block verbatim, so it cannot drift from the settings that
+    produced the output.
+
+    Args:
+        output_file: The stop_visits CSV this run wrote.
+        summary_lines: What the run read and wrote, such as the rows kept from
+            each input file. The CONFIGURATION block records only a folder's
+            path, and the folder's contents can change after the run.
+
+    Returns:
+        ``True`` if the log was written, ``False`` otherwise.
+    """
+    log_path = run_log_path(output_file)
+
+    source_file = resolve_source_file()
+    if source_file is None:
+        config_text = "(config block unavailable: interactive session, no __file__ on disk)"
+        source_display = "<interactive>"
+    else:
+        try:
+            config_text = extract_config_block(source_file)
+        except (OSError, ValueError) as exc:
+            logging.error("Could not extract config block for run log: %s", exc)
+            return False
+        source_display = str(source_file)
+
+    lines: list[str] = [
+        "=" * 72,
+        "TIDES STOP VISITS CONVERSION RUN LOG",
+        "=" * 72,
+        f"Run timestamp: {datetime.now().isoformat(timespec='seconds')}",
+        f"Output file:   {output_file}",
+        f"Source script: {source_display}",
+        "",
+        "-" * 72,
+        "RUN SUMMARY",
+        "-" * 72,
+        *summary_lines,
+        "",
+        "-" * 72,
+        "CONFIGURATION (verbatim from source)",
+        "-" * 72,
+        config_text,
+        "=" * 72,
+    ]
+    try:
+        log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except OSError as exc:
+        logging.error("Error writing run log: %s", exc)
+        return False
+    logging.info("Run log saved to '%s'.", log_path)
+    return True
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 
@@ -755,26 +882,36 @@ def main() -> int:
 
     # Read as text: type inference would turn IDs like "00123" into 123 (or
     # "123.0" in a column with blanks) and break joins to trips_performed.
+    summary: list[str] = []
     if INPUT_PATH.is_dir():
         combined_csv = OUTPUT_DIR / COMBINED_INPUT_FILENAME if COMBINED_INPUT_FILENAME else None
+        own_outputs = (OUTPUT_CSV, run_log_path(OUTPUT_CSV), combined_csv)
         combined = read_input_folder(
             INPUT_PATH,
             pattern=INPUT_GLOB,
             recursive=INPUT_RECURSIVE,
             drop_duplicates=DROP_DUPLICATE_ROWS,
             # A rerun must not read back this script's own outputs.
-            exclude=tuple(p for p in (OUTPUT_CSV, combined_csv) if p is not None),
+            exclude=tuple(p for p in own_outputs if p is not None),
         )
         if combined.empty:
             logging.warning("No usable stop visit rows in %s; nothing written.", INPUT_PATH)
             return 1
+        kept = combined.groupby(SOURCE_FILE_COL, sort=False).size()
+        summary += [
+            f"Input folder: {INPUT_PATH}",
+            "Rows kept per input file (after dropping rows repeated across files):",
+            *(f"  {name}: {n}" for name, n in kept.items()),
+        ]
         if combined_csv is not None:
             combined_csv.parent.mkdir(parents=True, exist_ok=True)
             combined.to_csv(combined_csv, index=False)
             logging.info("Wrote combined input (%d rows) -> %s", len(combined), combined_csv)
+            summary.append(f"Combined input written: {combined_csv}")
         df = combined.drop(columns=SOURCE_FILE_COL)
     else:
         df = pd.read_csv(INPUT_PATH, dtype=str, low_memory=False)
+        summary.append(f"Input file: {INPUT_PATH}")
     logging.info("Read %d rows, %d columns", len(df), df.shape[1])
 
     out = convert_to_tides(df)
@@ -782,6 +919,16 @@ def main() -> int:
     OUTPUT_CSV.parent.mkdir(parents=True, exist_ok=True)
     out.to_csv(OUTPUT_CSV, index=False)
     logging.info("Wrote %d rows -> %s", len(out), OUTPUT_CSV)
+
+    summary += [f"Input rows:  {len(df)}", f"Output rows: {len(out)}"]
+    # Sidecar run log — required by default so outputs are always traceable.
+    if not write_run_log(OUTPUT_CSV, summary) and REQUIRE_RUN_LOG:
+        logging.error(
+            "Run log could not be written. Set REQUIRE_RUN_LOG = False to "
+            "suppress this error when a sidecar file is genuinely impossible."
+        )
+        return 1
+
     logging.info("Script completed successfully.")
     return 0
 

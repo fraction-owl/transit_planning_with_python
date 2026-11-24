@@ -515,3 +515,62 @@ def test_main_folder_without_usable_files_returns_1(tmp_path, monkeypatch) -> No
     code, out = _run_main_on_folder(monkeypatch, in_dir, tmp_path / "out")
     assert code == 1
     assert out is None
+
+
+# ---------------------------------------------------------------------------
+# Run log
+# ---------------------------------------------------------------------------
+
+
+def test_main_writes_run_log_for_folder_input(tmp_path, monkeypatch) -> None:
+    in_dir, out_dir = tmp_path / "in", tmp_path / "out"
+    in_dir.mkdir()
+    df = _input_df()
+    df.to_csv(in_dir / "a.csv", index=False)
+    df.iloc[[1]].to_csv(in_dir / "b.csv", index=False)  # all rows repeat a.csv
+    pd.concat([df.iloc[[0]]] * 2).assign(Date="1/16/2025").to_csv(in_dir / "c.csv", index=False)
+
+    code, _ = _run_main_on_folder(monkeypatch, in_dir, out_dir)
+    assert code == 0
+    log = (out_dir / "stop_visits_runlog.txt").read_text(encoding="utf-8")
+    assert f"Input folder: {in_dir}" in log
+    assert "  a.csv: 2\n  c.csv: 2\n" in log  # b.csv kept no rows
+    assert "Input rows:  4" in log
+    assert "Output rows: 4" in log
+    assert "INPUT_GLOB" in log  # verbatim CONFIGURATION block
+    assert "=== BEGIN CONFIG ===" not in log
+
+
+def test_main_writes_run_log_for_single_file(tmp_path, monkeypatch) -> None:
+    input_csv = tmp_path / "Stop Visit Events.csv"
+    _input_df().to_csv(input_csv, index=False)
+    code, _ = _run_main_on_folder(monkeypatch, input_csv, tmp_path / "out")
+    assert code == 0
+    log = (tmp_path / "out" / "stop_visits_runlog.txt").read_text(encoding="utf-8")
+    assert f"Input file: {input_csv}" in log
+    assert "Output rows: 2" in log
+
+
+@pytest.mark.parametrize(("require", "expected_code"), [(True, 1), (False, 0)])
+def test_main_run_log_failure_respects_require_run_log(
+    tmp_path, monkeypatch, require: bool, expected_code: int
+) -> None:
+    input_csv = tmp_path / "Stop Visit Events.csv"
+    _input_df().to_csv(input_csv, index=False)
+
+    def _no_markers(_source_file: object) -> str:
+        raise ValueError("Config markers not found")
+
+    monkeypatch.setattr(target, "extract_config_block", _no_markers)
+    code, out = _run_main_on_folder(
+        monkeypatch, input_csv, tmp_path / "out", REQUIRE_RUN_LOG=require
+    )
+    assert code == expected_code
+    assert out is not None  # the CSV is written before the log
+    assert not (tmp_path / "out" / "stop_visits_runlog.txt").exists()
+
+
+def test_extract_config_block_reads_this_scripts_configuration() -> None:
+    block = target.extract_config_block(target.resolve_source_file())
+    assert block.lstrip().startswith("# A single Stop Visit Events CSV")
+    assert "REQUIRE_RUN_LOG: bool = True" in block
