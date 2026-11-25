@@ -2,4 +2,4 @@ event_id,start_date,end_date,shape,scope,target,category,severity,source,notes
 SL2-OPEN,2022-11-15,,step,system,ALL,wmata,,WMATA; MWAA,"Silver Line Phase 2 opens: six stations from Reston Town Center to Ashburn, including Dulles Airport"
 7000-STANDDOWN,2021-10-18,2022-06-15,pulse,system,ALL,wmata,,WMSC order; WMATA,"WMSC ordered all 748 7000-series railcars (about 60% of the fleet) out of service by 5 a.m. Oct 18, 2021; the first eight trains returned June 16, 2022, and the rest came back in phases after that"
 EXAMPLE-RT30-DETOUR,2024-03-04,2024-04-12,pulse,route,30,construction,2,illustrative,"Fictional detour on Mock DC Transit route 30 (sample_data/gtfs_current.zip)"
-EXAMPLE-STOP-CLOSURE,2024-06-10,2024-06-30,pulse,stop,DC_NS_020,construction,1,illustrative,"Fictional stop closure; resolves to routes 10 and 50H, which both serve the stop"
+EXAMPLE-STOP-CLOSURE,2024-06-10,2024-06-30,pulse,stop,DC_NS_020,construction,1,illustrative,"Fictional closure of a stop that routes 10 and 50H both serve (sample_data/gtfs_current.zip)"
