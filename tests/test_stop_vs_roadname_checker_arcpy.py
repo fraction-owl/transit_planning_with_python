@@ -91,6 +91,24 @@ def test_normalize_street_strips_only_last_non_leading_modifier(
     assert mod.normalize_street(name, {"st", "rd"}) == expected
 
 
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("Buckley's Gate Dr", "buckleys gate"),
+        ("Buckley’s Gate Dr", "buckleys gate"),
+        ("Buckleys Gate Dr", "buckleys gate"),
+        ("Franconia-Springfield Pkwy", "franconia springfield"),
+        ("Franconia Springfield Pkwy", "franconia springfield"),
+        ("U.S.G.S Dr", "usgs"),
+        ("Mt. Vernon Hwy", "mt vernon"),
+    ],
+)
+def test_normalize_street_drops_apostrophes_and_periods_spaces_hyphens(
+    mod: types.ModuleType, name: str, expected: str
+) -> None:
+    assert mod.normalize_street(name, {"dr", "pkwy", "hwy"}) == expected
+
+
 def test_normalize_street_ignores_empty_modifier(mod: types.ModuleType) -> None:
     # "" in the pattern matched at the end of every name, so nothing was removed.
     assert mod.normalize_street("Johns Rd", {"st", "rd", ""}) == "johns"

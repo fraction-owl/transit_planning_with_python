@@ -388,6 +388,10 @@ def normalize_street_name(name: str, modifiers_set: Set[str]) -> str:
     Empty modifiers are ignored: one in the pattern matches at every word
     boundary, so no street type would ever be removed.
 
+    Apostrophes and periods are dropped, so "Buckley's" equals "Buckleys" and
+    "U.S.G.S" equals "USGS"; other punctuation becomes a space, so
+    "Franconia-Springfield" equals "Franconia Springfield".
+
     Args:
         name (str): The street name to normalize.
         modifiers_set (set): A set of known modifiers to remove from the name.
@@ -407,7 +411,8 @@ def normalize_street_name(name: str, modifiers_set: Set[str]) -> str:
         ]
         if matches:
             name = name[: matches[-1].start()] + " " + name[matches[-1].end() :]
-    name = re.sub(r"[^\w\s]", "", name)
+    name = re.sub(r"['’.]", "", name)
+    name = re.sub(r"[^\w\s]", " ", name)
     return re.sub(r"\s+", " ", name).strip().lower()
 
 
