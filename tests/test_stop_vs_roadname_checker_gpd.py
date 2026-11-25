@@ -231,6 +231,12 @@ def test_normalize_street_name_strips_only_last_non_leading_modifier(
     assert target.normalize_street_name(name, {"st", "rd"}) == expected
 
 
+def test_normalize_street_name_ignores_empty_modifier() -> None:
+    # "" in the pattern matched at the end of every name, so nothing was removed.
+    assert target.normalize_street_name("Johns Rd", {"st", "rd", ""}) == "johns"
+    assert target.normalize_street_name("St Johns Rd", {"st", "rd", ""}) == "st johns"
+
+
 # ---------------------------------------------------------------------------
 # extract_modifiers
 # ---------------------------------------------------------------------------

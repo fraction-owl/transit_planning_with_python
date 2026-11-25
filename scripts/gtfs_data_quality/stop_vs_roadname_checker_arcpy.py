@@ -207,6 +207,9 @@ def normalize_street(name: str, mods: set[str]) -> str:
     "Park St SE"), so "St Johns Rd" becomes "st johns" rather than "johns",
     which would equal "Johns Rd".
 
+    Empty modifiers are ignored: one in the pattern matches at every word
+    boundary, so no street type would ever be removed.
+
     Args:
         name: The street name to normalize.
         mods: A set of modifier words (like 'rd', 'st', 'blvd') to remove.
@@ -216,6 +219,7 @@ def normalize_street(name: str, mods: set[str]) -> str:
     """
     if not isinstance(name, str):
         return ""
+    mods = {m for m in mods if m}
     if mods:
         pattern = r"\b(" + "|".join(map(re.escape, mods)) + r")\b"
         matches = [
@@ -420,12 +424,16 @@ def modifiers_from_roads(fc: str, fld: str) -> set[str]:
 
     Returns:
         A set of unique, lowercase string values from the specified field.
+        Blank values are skipped, including whitespace-only ones: ArcPy reads
+        an empty shapefile text field as spaces (e.g. ``"    "``), which
+        would otherwise add ``""`` to the set.
     """
     mods = set()
     with arcpy.da.SearchCursor(fc, [fld]) as cur:
         for (v,) in cur:
-            if v:
-                mods.add(str(v).strip().lower())
+            text = str(v).strip().lower() if v is not None else ""
+            if text:
+                mods.add(text)
     return mods
 
 

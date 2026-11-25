@@ -385,6 +385,8 @@ def normalize_street_name(name: str, modifiers_set: Set[str]) -> str:
     Only one modifier is removed: the last one that is not the first word. The
     street type follows the name ("Johns Rd", "Park St SE"), so "St Johns Rd"
     becomes "st johns" rather than "johns", which would equal "Johns Rd".
+    Empty modifiers are ignored: one in the pattern matches at every word
+    boundary, so no street type would ever be removed.
 
     Args:
         name (str): The street name to normalize.
@@ -395,6 +397,7 @@ def normalize_street_name(name: str, modifiers_set: Set[str]) -> str:
     """
     if pd.isna(name) or not isinstance(name, str):
         return ""
+    modifiers_set = {m for m in modifiers_set if m}
     if modifiers_set:
         pattern = r"\b(" + "|".join(re.escape(m) for m in modifiers_set) + r")\b"
         matches = [
