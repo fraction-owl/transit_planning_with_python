@@ -48,3 +48,7 @@ rapidfuzz==3.14.6            # Fast fuzzy string matching
 
 # Optimization
 pulp==3.3.1                  # Linear programming solver interface (bundles CBC)
+
+# AI video passenger counting pilot (ridership_tools/video_passenger_count_pilot.py)
+anthropic==0.125.0           # Claude API client; last release that supports Python 3.9
+opencv-python-headless==4.11.0.86  # Video decoding; last release that allows numpy 1.x

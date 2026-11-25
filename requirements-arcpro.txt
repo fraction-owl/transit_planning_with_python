@@ -36,3 +36,11 @@ xlrd==2.0.2                  # Read legacy Excel .xls files (no .xlsx support)
 # pulp==3.3.1                # NOT bundled with ArcGIS Pro. bay_assignment_optimizer.py
 #                            # needs it only to optimize (check-only runs do not); pip-install
 #                            # it into a cloned Pro environment
+
+# AI video passenger counting pilot
+# anthropic                  # NOT bundled with ArcGIS Pro. video_passenger_count_pilot.py
+#                            # needs it for API calls (not for DRY_RUN); pip-install it into
+#                            # a cloned Pro environment
+# opencv-python<4.12         # NOT bundled with ArcGIS Pro. video_passenger_count_pilot.py
+#                            # reads video with it; 4.12+ require numpy 2, which pandas 1.x
+#                            # in older Pro environments can't use
