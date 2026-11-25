@@ -24,10 +24,6 @@ anchor (``route_id`` + ``period``) joins both. The analysis mode is determined
 by the anchor's grain, not by a flag:
     - Cross-sectional rollup -> residuals rank routes over/under fundamentals.
     - Route x period panel -> month/period effects surface "weird" months.
-On a panel, ROUTE_GROUPS / INTERACTIONS give named route sets their own slope
-on a driver or their own seasonal shape (e.g. tourism routes), and the
-disruption exposure columns from ``disruption_exposure_builder.py`` enter as
-ordinary predictors.
 
 Everything is implemented with the ArcGIS Pro Python stack (``numpy`` /
 ``scipy`` / ``pandas`` / ``matplotlib``); no ``scikit-learn`` / ``statsmodels``
@@ -56,7 +52,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from collections.abc import Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Final, NamedTuple
@@ -170,36 +165,6 @@ PREDICTORS: Final[tuple[str, ...]] = (
 # Categorical columns to one-hot encode (first level dropped as the reference).
 # "month" is derived automatically from the "period" column after table assembly.
 CATEGORICAL_PREDICTORS: Final[tuple[str, ...]] = ("month",)
-
-# Column-name prefixes to add to PREDICTORS: every numeric column whose name
-# starts with one of these joins the model. The disruption exposure columns from
-# disruption_exposure_builder.py are named per event, so a prefix saves listing
-# them: ("ev_", "sys_ev_") for one column per event, ("evcat_", "sys_evcat_")
-# for one per category. Events close together in time can be strongly
-# collinear; check the VIFs.
-PREDICTOR_PREFIXES: Final[tuple[str, ...]] = ()
-
-# -----------------------------------------------------------------------------
-#  Route groups & interactions
-# -----------------------------------------------------------------------------
-
-# Named sets of route labels (as in the anchor's route_id), used to give a few
-# routes their own response to a driver rather than one system-wide term.
-#   e.g. {"tourism": ("101",), "dulles": ("950", "981", "983")}
-ROUTE_GROUPS: Final[dict[str, tuple[str, ...]]] = {}
-
-# Each (column, group) pair adds column x I(route_id in group). A numeric
-# column gets the same log/standardize transform as its main effect; it need
-# not be in PREDICTORS (leave it out to fit the effect for the group only). A
-# categorical column interacts every dummy, e.g. ("month", "tourism") gives the
-# group its own seasonal shape on top of the system-wide month effects.
-#   e.g. (("airport_passengers", "dulles"), ("month", "tourism"))
-INTERACTIONS: Final[tuple[tuple[str, str], ...]] = ()
-
-# Add a 0/1 main effect (grp_<name>) for every group used in INTERACTIONS. Set
-# False if "route_id" is in CATEGORICAL_PREDICTORS: route fixed effects already
-# absorb it, and keeping both makes the design matrix singular.
-INCLUDE_GROUP_MAIN_EFFECTS: Final[bool] = True
 
 # -----------------------------------------------------------------------------
 #  Transforms & estimator options
@@ -585,12 +550,8 @@ def select_predictors(
     dependent: str,
     join_keys: tuple[str, ...],
     categoricals: tuple[str, ...],
-    prefixes: tuple[str, ...] = (),
 ) -> list[str]:
     """Resolve the predictor list, auto-selecting numerics when none is given.
-
-    Categoricals present in ``df`` are appended in both modes; one that is
-    absent (e.g. ``month`` on a cross-sectional anchor) is left out.
 
     Args:
         df: The merged modeling table.
@@ -598,8 +559,6 @@ def select_predictors(
         dependent: Dependent variable name (always excluded).
         join_keys: Join key columns (always excluded from auto-selection).
         categoricals: Categorical predictors (kept even though non-numeric).
-        prefixes: Numeric columns starting with any of these are added to an
-            explicit list (auto-selection already includes them).
 
     Returns:
         The ordered list of predictor column names.
@@ -607,28 +566,19 @@ def select_predictors(
     Raises:
         KeyError: If any explicitly named predictor is absent from ``df``.
     """
-    present_cats = [c for c in categoricals if c in df.columns]
-    excluded = {dependent, *join_keys, *categoricals}
     if explicit:
         missing = [c for c in explicit if c not in df.columns]
         if missing:
             raise KeyError(f"Configured predictors not found in data: {missing}")
-        by_prefix = [
-            c
-            for c in df.columns
-            if prefixes
-            and c.startswith(prefixes)
-            and c not in explicit
-            and c not in excluded
-            and pd.api.types.is_numeric_dtype(df[c])
-        ]
-        if by_prefix:
-            logging.info("Added %d predictor(s) by prefix: %s", len(by_prefix), by_prefix)
-        return [*explicit, *by_prefix, *(c for c in present_cats if c not in explicit)]
+        return list(explicit)
 
-    auto = [c for c in df.columns if c not in excluded and pd.api.types.is_numeric_dtype(df[c])]
+    auto = [
+        c
+        for c in df.columns
+        if c not in {dependent, *join_keys, *categoricals} and pd.api.types.is_numeric_dtype(df[c])
+    ]
     logging.info("Auto-selected %d numeric predictors: %s", len(auto), auto)
-    return auto + present_cats
+    return auto + list(categoricals)
 
 
 def build_design_matrix(
@@ -639,35 +589,20 @@ def build_design_matrix(
     log_dependent: bool,
     log_predictors: tuple[str, ...],
     standardize: bool,
-    *,
-    interactions: Sequence[tuple[str, str]] = (),
-    route_groups: Mapping[str, Sequence[str]] | None = None,
-    group_key: str = "route_id",
-    include_group_main_effects: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, list[str], pd.DataFrame, np.ndarray]:
     """Construct the response vector and design matrix for OLS.
 
-    Applies optional log transforms, one-hot encodes categoricals, adds any
-    route-group interactions, drops rows with missing values, and prepends an
-    intercept column.
+    Applies optional log transforms, one-hot encodes categoricals, drops rows
+    with missing values, and prepends an intercept column.
 
     Args:
         df: The merged modeling table.
         dependent: Dependent variable name.
         predictors: Predictor column names (numeric and categorical).
-        categoricals: Columns to one-hot encode (only those in ``predictors``
-            or ``interactions`` are used).
+        categoricals: Subset of ``predictors`` to one-hot encode.
         log_dependent: Whether to ``log`` the dependent variable.
         log_predictors: Numeric predictors to ``log1p``.
         standardize: Whether to z-score numeric predictors.
-        interactions: ``(column, group)`` pairs; each adds
-            ``column x I(group_key in route_groups[group])`` (every dummy of a
-            categorical column), named ``<term>_x_<group>``.
-        route_groups: Group name -> route labels, matched to ``group_key`` with
-            the same key folding as the bundle joins.
-        group_key: Column holding the route label.
-        include_group_main_effects: Add a ``grp_<group>`` 0/1 column for each
-            group used in ``interactions``.
 
     Returns:
         A tuple ``(y, X, term_names, model_frame, keep_mask)`` where ``y`` is the
@@ -677,32 +612,15 @@ def build_design_matrix(
         (aligned with ``df``) of observations retained after dropping NaNs.
 
     Raises:
-        KeyError: If an interaction names a missing column or an unknown group.
-        ValueError: If no complete rows remain, the response is non-positive
-            under a log transform, or a group matches none of the kept rows.
+        ValueError: If no complete rows remain or the response is non-positive
+            under a log transform.
     """
-    groups = dict(route_groups or {})
-    inter_sources = list(dict.fromkeys(col for col, _ in interactions))
-    if interactions:
-        unknown_groups = sorted({g for _, g in interactions if g not in groups})
-        if unknown_groups:
-            raise KeyError(f"INTERACTIONS name group(s) not in ROUTE_GROUPS: {unknown_groups}")
-        missing = [c for c in [*inter_sources, group_key] if c not in df.columns]
-        if missing:
-            raise KeyError(f"Interaction column(s) not found in data: {missing}")
-
     numeric_predictors = [c for c in predictors if c not in categoricals]
-    numeric_needed = list(
-        dict.fromkeys([*numeric_predictors, *(c for c in inter_sources if c not in categoricals)])
-    )
-    extra_cols = [c for c in inter_sources if c not in predictors]
-    if interactions and group_key not in predictors:
-        extra_cols.append(group_key)
-    used_cols = [dependent, *predictors, *extra_cols]
+    used_cols = [dependent, *predictors]
     frame = df[used_cols].copy()
 
     # Coerce numeric predictors and the response; categoricals stay as labels.
-    for col in [dependent, *numeric_needed]:
+    for col in [dependent, *numeric_predictors]:
         frame[col] = pd.to_numeric(frame[col], errors="coerce")
 
     before = len(frame)
@@ -734,8 +652,8 @@ def build_design_matrix(
         y = np.log(y)
 
     # --- Numeric predictors ----------------------------------------------
-    transformed: dict[str, tuple[str, np.ndarray]] = {}
-    for col in numeric_needed:
+    feature_cols: dict[str, np.ndarray] = {}
+    for col in numeric_predictors:
         values = frame[col].to_numpy(dtype=float)
         name = col
         if col in log_predictors:
@@ -748,45 +666,14 @@ def build_design_matrix(
             std = values.std(ddof=0)
             values = (values - values.mean()) / std if std > 0 else values - values.mean()
             name = f"z_{name}"
-        transformed[col] = (name, values)
+        feature_cols[name] = values
 
-    design = pd.DataFrame(
-        {transformed[c][0]: transformed[c][1] for c in numeric_predictors}, index=frame.index
-    )
+    design = pd.DataFrame(feature_cols, index=frame.index)
 
     # --- Categorical predictors (one-hot, drop first level) --------------
-    def _dummies(col: str) -> pd.DataFrame:
-        encoded = pd.get_dummies(frame[col].astype("string"), prefix=col, drop_first=True)
-        return encoded.astype(float)
-
     for col in categoricals:
-        if col in predictors:
-            design = pd.concat([design, _dummies(col)], axis=1)
-
-    # --- Route-group main effects and interactions -----------------------
-    if interactions:
-        route_key = _canonical_key(frame[group_key])
-        indicators: dict[str, pd.Series] = {}
-        for group in dict.fromkeys(g for _, g in interactions):
-            members = set(_canonical_key(pd.Series(list(groups[group]), dtype="string")))
-            indicator = route_key.isin(members).astype(float)
-            if not indicator.any():
-                raise ValueError(
-                    f"Route group '{group}' matches none of the modeled rows; check its "
-                    f"labels {sorted(members)} against the anchor's {group_key} values."
-                )
-            indicators[group] = indicator
-            if include_group_main_effects:
-                design[f"grp_{group}"] = indicator
-        for col, group in interactions:
-            if col in categoricals:
-                terms = _dummies(col).mul(indicators[group], axis=0)
-            else:
-                name, values = transformed[col]
-                terms = pd.DataFrame({name: values}, index=frame.index).mul(
-                    indicators[group], axis=0
-                )
-            design = pd.concat([design, terms.add_suffix(f"_x_{group}")], axis=1)
+        dummies = pd.get_dummies(frame[col].astype("string"), prefix=col, drop_first=True)
+        design = pd.concat([design, dummies.astype(float)], axis=1)
 
     term_names = ["intercept", *design.columns.tolist()]
     x_matrix = np.column_stack([np.ones(len(design)), design.to_numpy(dtype=float)])
@@ -1349,12 +1236,7 @@ def main() -> int:
     # === STEP 2: BUILD DESIGN MATRIX =========================================
     logging.info("=== STEP 2: BUILD DESIGN MATRIX ===")
     predictors = select_predictors(
-        table,
-        PREDICTORS,
-        DEPENDENT_VAR,
-        JOIN_KEYS,
-        CATEGORICAL_PREDICTORS,
-        PREDICTOR_PREFIXES,
+        table, PREDICTORS, DEPENDENT_VAR, JOIN_KEYS, CATEGORICAL_PREDICTORS
     )
     y, x_matrix, term_names, model_frame, _ = build_design_matrix(
         table,
@@ -1364,9 +1246,6 @@ def main() -> int:
         LOG_DEPENDENT,
         LOG_PREDICTORS,
         STANDARDIZE_PREDICTORS,
-        interactions=INTERACTIONS,
-        route_groups=ROUTE_GROUPS,
-        include_group_main_effects=INCLUDE_GROUP_MAIN_EFFECTS,
     )
 
     # === STEP 3: FIT OLS =====================================================

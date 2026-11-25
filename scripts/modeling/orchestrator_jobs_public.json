@@ -37,16 +37,7 @@
     "so avg_weekday_riders is non-holiday weekdays, matching the GTFS-side features). Its tables",
     "are month- or station_id-keyed, so inference rightly skips them all; only",
     "cabi_coverage_by_route_gpd.py's route rollup ships. gbfs_ridership_join.py writes enriched",
-    "station GeoJSON for mapping only (never collected; the collector gathers csv/xlsx).",
-    "NOTE: disruption_exposure_builder.py resolves the hand-kept events file",
-    "({input}/disruptions/disruptions.csv) into exposure columns. Its outputs are deliberately",
-    "not described: the columns are named per event (ev_<event_id>, sys_ev_<event_id>), so a",
-    "fixed keep_cols list would go stale with every new event and a described table missing",
-    "a keep_col is skipped wholesale. Inference handles all three files correctly:",
-    "disruption_exposure_by_route.csv bundles on route_id + period, disruption_exposure_system.csv",
-    "joins the period bundle, and disruption_exposure_long.csv (keys route_label / year_month)",
-    "matches no candidate key and is skipped. Set --start-month / --end-month to the NTD anchor's",
-    "period range; anchor months outside it get no exposure values and drop out of the model."
+    "station GeoJSON for mapping only (never collected; the collector gathers csv/xlsx)."
   ],
   "scripts": [
     {
@@ -113,12 +104,6 @@
         {"file": "private_shuttle_coverage_by_route.csv", "join_keys": ["route_id"],
          "keep_cols": ["shuttle_sites_served", "shuttle_feeder_sites_served"]}
       ]
-    },
-    {
-      "script": "disruption_exposure_builder.py",
-      "cmd": ["{python}", "{script}", "--events-csv", "{input}/disruptions/disruptions.csv",
-              "--gtfs-path", "{input}/gtfs", "--start-month", "2019-01", "--end-month", "2025-12",
-              "--output-dir", "{output}"]
     },
     {
       "script": "gbfs_stations_exporter.py",

@@ -32,7 +32,6 @@ transit_planning_with_python/
 │   │   ├── stop_visits.csv
 │   │   └── trips_performed.csv
 │   ├── README.md
-│   ├── disruptions_example.csv
 │   ├── gtfs_archive.zip
 │   ├── gtfs_current.zip
 │   ├── ntd_monthly_config_example.txt
@@ -87,7 +86,6 @@ transit_planning_with_python/
 │   │   ├── route_transfer_calculator.py
 │   │   └── scheduled_service_hours.py
 │   ├── modeling/
-│   │   ├── disruption_exposure_builder.py
 │   │   ├── monthly_ridership_model.py
 │   │   ├── orchestrator_jobs_private.json
 │   │   ├── orchestrator_jobs_public.json
@@ -282,7 +280,6 @@ transit_planning_with_python/
 │   ├── test_convert_to_tides_trips_performed.py
 │   ├── test_cordon_crossing_routes_gpd.py
 │   ├── test_data_request_by_stop_processor.py
-│   ├── test_disruption_exposure_builder.py
 │   ├── test_distance_helpers.py
 │   ├── test_district_ridership_share_arcpy.py
 │   ├── test_district_ridership_share_gpd.py
