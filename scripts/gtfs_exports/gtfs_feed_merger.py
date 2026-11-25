@@ -17,6 +17,10 @@ stops with a ``parent_station`` or inside a transit-center polygon layer (or,
 with no layer, named like ``BAY_NAME_PATTERNS``); stops outside the polygons
 that look like a bay cluster are reported so the missing polygons can be drawn.
 
+Feeds may record ``shape_dist_traveled`` in different units; when more than
+one feed has distances, ``FEED_DISTANCE_UNITS`` names each feed's unit and all
+are converted to one before the tables are combined.
+
 Each feed keeps its own service_ids. By default every calendar is clipped to
 the date window all feeds cover and trips left with no dates are dropped, so
 one agency's current schedule is never paired with another's expired one.
@@ -42,6 +46,10 @@ Outputs
   renamed route name in every feed.
 - ``merge_feed_summary.csv``: one row per input feed.
 - ``merge_possible_bay_clusters.csv``: street stops that look like bus bays.
+- ``merge_transfer_conflicts.csv``: transfers.txt rules from different feeds
+  that disagree at a merged stop (e.g. one requires 120 seconds, the other
+  forbids the transfer), and how each was kept: limited to its own feed's
+  routes, or flagged as unresolved. Identical rules are kept once.
 - A run-log sidecar capturing the verbatim CONFIGURATION block.
 
 Typical usage
@@ -60,7 +68,9 @@ import os
 import re
 import sys
 import zipfile
+import zoneinfo
 from datetime import datetime
+from importlib import resources
 from pathlib import Path
 from typing import IO, Any, List, Mapping, NamedTuple, Optional, Sequence, Union
 
@@ -160,6 +170,16 @@ CLIP_TO_COMMON_WINDOW: bool = True
 WINDOW_START: str = ""
 WINDOW_END: str = ""
 
+# --- Distances ----------------------------------------------------------------
+# Unit of shape_dist_traveled (stop_times.txt and shapes.txt) in each feed,
+# parallel to GTFS_FEEDS: "feet", "meters", "km" or "miles". GTFS leaves the unit
+# to each producer, so two feeds can measure the same mile as 1 and 1609.344.
+# Required when two or more feeds carry shape_dist_traveled values; the merge
+# stops with an error if it is empty then. Every feed's distances are converted
+# to MERGED_DISTANCE_UNIT (blank = the dominant feed's unit).
+FEED_DISTANCE_UNITS: list[str] = []  # e.g. ["miles", "meters"]
+MERGED_DISTANCE_UNIT: str = ""
+
 # --- feed_info.txt ------------------------------------------------------------
 # Publisher of the merged feed. Blank = the dominant feed's publisher (or agency).
 FEED_PUBLISHER_NAME: str = ""
@@ -170,6 +190,7 @@ STOP_MATCHES_FILENAME: str = r"merge_stop_matches.csv"
 CROSSWALK_FILENAME: str = r"merge_id_crosswalk.csv"
 FEED_SUMMARY_FILENAME: str = r"merge_feed_summary.csv"
 POSSIBLE_BAY_CLUSTERS_FILENAME: str = r"merge_possible_bay_clusters.csv"
+TRANSFER_CONFLICTS_FILENAME: str = r"merge_transfer_conflicts.csv"
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
 
@@ -267,6 +288,23 @@ STOP_MATCH_COLUMNS: list[str] = [
     "outcome",
 ]
 
+TRANSFER_CONFLICT_COLUMNS: list[str] = [
+    "from_stop_id",
+    "to_stop_id",
+    "feed",
+    "transfer_type",
+    "min_transfer_time",
+    "resolution",
+]
+
+# Meters per unit of shape_dist_traveled, for FEED_DISTANCE_UNITS.
+DISTANCE_UNIT_METERS: dict[str, float] = {
+    "feet": 0.3048,
+    "meters": 1.0,
+    "km": 1000.0,
+    "miles": 1609.344,
+}
+
 POSSIBLE_BAY_CLUSTER_COLUMNS: list[str] = [
     "cluster",
     "reason",
@@ -305,6 +343,8 @@ class MergeSettings(NamedTuple):
     clip_to_common_window: bool = CLIP_TO_COMMON_WINDOW
     window_start: str = WINDOW_START
     window_end: str = WINDOW_END
+    feed_distance_units: tuple[str, ...] = tuple(FEED_DISTANCE_UNITS)
+    merged_distance_unit: str = MERGED_DISTANCE_UNIT
     feed_publisher_name: str = FEED_PUBLISHER_NAME
     feed_publisher_url: str = FEED_PUBLISHER_URL
 
@@ -330,6 +370,8 @@ class MergeResult(NamedTuple):
     feed_summary: pd.DataFrame
     possible_bay_clusters: pd.DataFrame
     window: Optional[tuple[dt.date, dt.date]]
+    transfer_conflicts: pd.DataFrame
+    distance_unit: Optional[str]
 
 
 class _StopPool:
@@ -683,25 +725,96 @@ def normalize_agency_ids(feed: Feed) -> None:
         routes.loc[blank_routes, "agency_id"] = agency["agency_id"].iloc[0]
 
 
-def check_timezones(feeds: Sequence[Feed]) -> None:
-    """Require one agency_timezone across all feeds, as GTFS requires.
+def load_timezone_links() -> dict[str, str]:
+    """Map each alias in the installed tz database to the zone it names.
+
+    Reads the ``L <zone> <alias>`` lines of ``tzdata.zi``, which ships in the
+    system zoneinfo folders and in the ``tzdata`` package (installed with pandas
+    on Windows), e.g. ``US/Eastern`` -> ``America/New_York``.
+
+    Returns:
+        Mapping of alias to zone name; empty when no ``tzdata.zi`` is installed.
+    """
+    texts: list[str] = []
+    for folder in zoneinfo.TZPATH:
+        try:
+            texts.append((Path(folder) / "tzdata.zi").read_text(encoding="utf-8"))
+        except OSError:
+            continue
+    try:
+        package = resources.files("tzdata")
+        texts.append(package.joinpath("zoneinfo/tzdata.zi").read_text(encoding="utf-8"))
+    except (ImportError, OSError):
+        pass
+    links: dict[str, str] = {}
+    for text in texts:
+        for line in text.splitlines():
+            parts = line.split()
+            if len(parts) == 3 and parts[0] == "L":
+                links.setdefault(parts[2], parts[1])
+    return links
+
+
+def canonical_timezone(name: str, links: Mapping[str, str]) -> str:
+    """Follow tz database links from *name* to the zone it names.
 
     Args:
-        feeds: The feeds to merge.
+        name: A timezone name, e.g. ``US/Eastern``.
+        links: Output of :func:`load_timezone_links`.
+
+    Returns:
+        The zone name, e.g. ``America/New_York``; *name* itself when it is not an alias.
+    """
+    seen = {name}
+    while name in links and links[name] not in seen:
+        name = links[name]
+        seen.add(name)
+    return name
+
+
+def check_timezones(feeds: Sequence[Feed], links: Optional[Mapping[str, str]] = None) -> None:
+    """Require one agency_timezone across all feeds, as GTFS requires.
+
+    Names the installed tz database links to the same zone (``US/Eastern`` and
+    ``America/New_York``) count as one timezone. When the feeds spell it
+    differently, every agency is given the zone's canonical name.
+
+    Args:
+        feeds: The feeds to merge. Their agency tables may be updated in place.
+        links: Alias-to-zone mapping; defaults to :func:`load_timezone_links`.
 
     Raises:
         MergeError: The feeds' agencies use different timezones.
     """
-    found: dict[str, list[str]] = {}
+    if links is None:
+        links = load_timezone_links()
+    found: dict[str, dict[str, list[str]]] = {}
     for feed in feeds:
         for tz in feed.tables["agency"]["agency_timezone"].str.strip().unique():
-            found.setdefault(tz, []).append(feed.label)
+            zone = canonical_timezone(tz, links)
+            found.setdefault(zone, {}).setdefault(tz, []).append(feed.label)
+    spellings = {tz: labels for names in found.values() for tz, labels in names.items()}
+    detail = "; ".join(f"{tz}: {', '.join(labels)}" for tz, labels in sorted(spellings.items()))
     if len(found) > 1:
-        detail = "; ".join(f"{tz}: {', '.join(labels)}" for tz, labels in sorted(found.items()))
+        hint = (
+            ""
+            if links
+            else " No tz database link table (tzdata.zi) was found, so aliases such as "
+            "US/Eastern could not be matched to their zones."
+        )
         raise MergeError(
             "GTFS allows one agency_timezone per feed, but these feeds use several "
-            f"({detail}). Merge only feeds in the same timezone."
+            f"({detail}). Merge only feeds in the same timezone.{hint}"
         )
+    if len(found) == 1 and len(spellings) > 1:
+        zone = next(iter(found))
+        logging.info(
+            "Feeds name the same timezone differently (%s); the merged feed uses '%s'.",
+            detail,
+            zone,
+        )
+        for feed in feeds:
+            feed.tables["agency"]["agency_timezone"] = zone
 
 
 def feed_service_dates(tables: Mapping[str, pd.DataFrame]) -> dict[str, set[dt.date]]:
@@ -1593,6 +1706,223 @@ def classify_bays(
     return bay_flags, clusters
 
 
+def _format_distance(value: float) -> str:
+    """Format a converted distance without float noise (6 decimal places at most)."""
+    text = f"{value:.6f}".rstrip("0").rstrip(".")
+    return "0" if text in ("", "-0") else text
+
+
+def normalize_distance_units(feeds: Sequence[Feed], settings: MergeSettings) -> Optional[str]:
+    """Convert every feed's ``shape_dist_traveled`` to one unit, in place.
+
+    GTFS leaves the unit of ``shape_dist_traveled`` to each producer, so feeds
+    must say theirs (``settings.feed_distance_units``) before their
+    stop_times.txt and shapes.txt rows are combined. Blank values stay blank.
+
+    Args:
+        feeds: Loaded feeds in priority order. Their tables are modified.
+        settings: Merge settings.
+
+    Returns:
+        The merged feed's distance unit, or None when no units were given (at
+        most one feed carries distances, so nothing can be mixed).
+
+    Raises:
+        MergeError: Two or more feeds carry distances but no units were given,
+            or the units are not one per feed from :data:`DISTANCE_UNIT_METERS`.
+    """
+    distance_tables = ("stop_times", "shapes")
+
+    def carries_distances(feed: Feed) -> bool:
+        return any(
+            "shape_dist_traveled" in feed.tables[name].columns
+            and (feed.tables[name]["shape_dist_traveled"].str.strip() != "").any()
+            for name in distance_tables
+            if name in feed.tables
+        )
+
+    units = [str(unit).strip().lower() for unit in settings.feed_distance_units]
+    if not units:
+        with_distances = [feed.label for feed in feeds if carries_distances(feed)]
+        if len(with_distances) > 1:
+            raise MergeError(
+                f"Feeds {', '.join(with_distances)} all have shape_dist_traveled values, which "
+                "GTFS lets each agency record in its own unit. Set FEED_DISTANCE_UNITS (or "
+                "--feed-distance-units) to each feed's unit, e.g. ['miles', 'meters']."
+            )
+        return None
+    if len(units) != len(feeds):
+        raise MergeError(
+            f"FEED_DISTANCE_UNITS needs one unit per feed ({len(feeds)}), got {len(units)}."
+        )
+    target = str(settings.merged_distance_unit).strip().lower() or units[0]
+    unknown = sorted({u for u in [*units, target] if u not in DISTANCE_UNIT_METERS})
+    if unknown:
+        raise MergeError(
+            f"Unknown distance unit(s) {', '.join(unknown)}; use one of "
+            f"{', '.join(DISTANCE_UNIT_METERS)}."
+        )
+    for feed, unit in zip(feeds, units):
+        factor = DISTANCE_UNIT_METERS[unit] / DISTANCE_UNIT_METERS[target]
+        if factor == 1.0:
+            continue
+        unreadable = 0
+        for name in distance_tables:
+            df = feed.tables.get(name)
+            if df is None or "shape_dist_traveled" not in df.columns:
+                continue
+            text = df["shape_dist_traveled"]
+            numbers = pd.to_numeric(text, errors="coerce")
+            readable = numbers.notna()
+            unreadable += int((~readable & (text.str.strip() != "")).sum())
+            df.loc[readable, "shape_dist_traveled"] = (numbers[readable] * factor).map(
+                _format_distance
+            )
+        logging.info(
+            "Feed '%s': shape_dist_traveled converted from %s to %s.", feed.label, unit, target
+        )
+        if unreadable:
+            logging.warning(
+                "Feed '%s': %d non-numeric shape_dist_traveled value(s) left unconverted.",
+                feed.label,
+                unreadable,
+            )
+    return target
+
+
+def _routes_serving_stops(tables: Mapping[str, pd.DataFrame]) -> dict[str, set[str]]:
+    """Map each stop_id to the route_ids whose trips visit it."""
+    visits = tables["stop_times"][["trip_id", "stop_id"]].merge(
+        tables["trips"][["trip_id", "route_id"]], on="trip_id"
+    )
+    routes: dict[str, set[str]] = {}
+    for stop_id, route_id in zip(visits["stop_id"], visits["route_id"]):
+        routes.setdefault(stop_id, set()).add(route_id)
+    return routes
+
+
+def _conflict_row(rule: pd.Series, resolution: str) -> dict[str, Any]:
+    """Describe one disagreeing transfers.txt rule for the conflicts report."""
+    return {
+        "from_stop_id": rule["from_stop_id"],
+        "to_stop_id": rule["to_stop_id"],
+        "feed": rule["_feed"],
+        "transfer_type": rule.get("transfer_type", ""),
+        "min_transfer_time": rule.get("min_transfer_time", ""),
+        "resolution": resolution,
+    }
+
+
+def reconcile_transfers(feeds: Sequence[Feed]) -> tuple[Optional[pd.DataFrame], pd.DataFrame]:
+    """Combine the feeds' transfers.txt rows, keeping each feed's rules in force.
+
+    Call after the feeds' IDs are mapped. A merged stop can leave two feeds
+    with rules for the same stop pair (one requiring 120 seconds, the other
+    forbidding the transfer). Identical rules collapse to one. Rules that
+    disagree each governed only their own feed's routes before the merge, so
+    each is rewritten as one rule per pair of its feed's routes serving the two
+    stops (``from_route_id``/``to_route_id``), skipping route pairs that feed
+    already covers with a route-specific rule there. A feed whose own
+    transfers.txt repeats a stop pair with different values cannot be
+    resolved: its first row is kept. Every disagreement is listed in the
+    returned report.
+
+    Args:
+        feeds: Feeds in priority order, after :func:`apply_id_maps`.
+
+    Returns:
+        A tuple ``(transfers, conflicts)``: the merged transfers table (None
+        when no feed has transfers.txt) and one report row per disagreeing
+        rule (:data:`TRANSFER_CONFLICT_COLUMNS`).
+    """
+    no_conflicts = pd.DataFrame(columns=TRANSFER_CONFLICT_COLUMNS)
+    frames = [
+        f.tables["transfers"].assign(_feed=f.label)
+        for f in feeds
+        if "transfers" in f.tables and len(f.tables["transfers"].columns)
+    ]
+    if not frames:
+        return None, no_conflicts
+    combined = pd.concat(frames, ignore_index=True, sort=False).fillna("")
+    identical = combined.duplicated(subset=[c for c in combined.columns if c != "_feed"])
+    if identical.any():
+        logging.info(
+            "Dropped %d transfer row(s) repeating an identical rule (e.g. at a merged stop).",
+            int(identical.sum()),
+        )
+        combined = combined.loc[~identical]
+    key = [col for col in TRANSFER_KEY if col in combined.columns]
+    clash = combined.duplicated(subset=key, keep=False)
+    if not clash.any():
+        return combined.drop(columns="_feed").reset_index(drop=True), no_conflicts
+
+    for col in TRANSFER_KEY:
+        if col not in combined.columns:
+            combined[col] = ""
+    qualifiers = ["from_route_id", "to_route_id", "from_trip_id", "to_trip_id"]
+    serving = {f.label: _routes_serving_stops(f.tables) for f in feeds}
+    kept: list[pd.DataFrame] = [combined.loc[~clash]]
+    report: list[dict[str, Any]] = []
+    for _, group in combined.loc[clash].groupby(key, sort=False):
+        many_feeds = (group["_feed"] != group["_feed"].iloc[0]).any()
+        for label, rows in group.groupby("_feed", sort=False):
+            row = rows.iloc[0]
+            from_stop, to_stop = row["from_stop_id"], row["to_stop_id"]
+            for _, extra in rows.iloc[1:].iterrows():
+                report.append(_conflict_row(extra, "unresolved: repeated in its feed; dropped"))
+            if not many_feeds or any(row[col] for col in qualifiers):
+                kept.append(rows.iloc[[0]])
+                report.append(
+                    _conflict_row(
+                        row,
+                        "unresolved: repeated in its feed; kept"
+                        if not many_feeds
+                        else "unresolved: kept unchanged",
+                    )
+                )
+                continue
+
+            own = combined[
+                (combined["_feed"] == label)
+                & (combined["from_stop_id"] == from_stop)
+                & (combined["to_stop_id"] == to_stop)
+            ]
+            no_trip = (own["from_trip_id"] == "") & (own["to_trip_id"] == "")
+            named = own[no_trip & ((own["from_route_id"] != "") | (own["to_route_id"] != ""))]
+            covered = list(zip(named["from_route_id"], named["to_route_id"]))
+            routes_at = serving[str(label)]
+            pairs = [
+                (r1, r2)
+                for r1 in sorted(routes_at.get(from_stop, ()))
+                for r2 in sorted(routes_at.get(to_stop, ()))
+                if not any((not c1 or c1 == r1) and (not c2 or c2 == r2) for c1, c2 in covered)
+            ]
+            if pairs:
+                scoped = pd.DataFrame([row] * len(pairs)).reset_index(drop=True)
+                scoped["from_route_id"] = [r1 for r1, _ in pairs]
+                scoped["to_route_id"] = [r2 for _, r2 in pairs]
+                kept.append(scoped)
+                resolution = f"scoped to {len(pairs)} of the feed's route pair(s)"
+            else:
+                resolution = "dropped: none of the feed's routes are left for it to govern"
+            if (~no_trip).any():
+                resolution += "; the feed also has trip-specific rules here, check precedence"
+            report.append(_conflict_row(row, resolution))
+
+    conflicts = pd.DataFrame(report, columns=TRANSFER_CONFLICT_COLUMNS)
+    unresolved = int(conflicts["resolution"].str.startswith("unresolved").sum())
+    logging.warning(
+        "transfers.txt: %d rule(s) that disagreed with another feed's rule at a merged stop "
+        "now govern only their own feed's routes; %d rule(s) could not be resolved. "
+        "Review %s.",
+        len(conflicts) - unresolved,
+        unresolved,
+        TRANSFER_CONFLICTS_FILENAME,
+    )
+    merged = pd.concat(kept, ignore_index=True, sort=False).fillna("")
+    return merged.drop(columns="_feed"), conflicts
+
+
 def merge_feeds(
     feeds: Sequence[Feed],
     settings: MergeSettings,
@@ -1624,6 +1954,7 @@ def merge_feeds(
     for feed in feeds:
         normalize_agency_ids(feed)
     check_timezones(feeds)
+    distance_unit = normalize_distance_units(feeds, settings)
 
     windows: dict[str, Optional[tuple[dt.date, dt.date]]] = {}
     for feed in feeds:
@@ -1757,19 +2088,14 @@ def merge_feeds(
 
     merged: dict[str, pd.DataFrame] = {}
     for name in CARRIED_TABLES:
+        if name == "transfers":
+            continue
         frames = [f.tables[name] for f in feeds if name in f.tables and len(f.tables[name].columns)]
         if frames:
             merged[name] = pd.concat(frames, ignore_index=True, sort=False).fillna("")
-    transfers = merged.get("transfers")
+    transfers, transfer_conflicts = reconcile_transfers(feeds)
     if transfers is not None:
-        key = [col for col in TRANSFER_KEY if col in transfers.columns]
-        deduped = transfers.drop_duplicates(subset=key, keep="first")
-        if len(deduped) < len(transfers):
-            logging.info(
-                "Dropped %d duplicate transfer row(s) created by merged stops.",
-                len(transfers) - len(deduped),
-            )
-        merged["transfers"] = deduped.reset_index(drop=True)
+        merged["transfers"] = transfers
     merged["feed_info"] = build_feed_info(feeds, window, settings)
 
     merged["routes"], renames = rename_duplicate_route_names(
@@ -1808,6 +2134,8 @@ def merge_feeds(
         feed_summary=pd.DataFrame(summary_rows),
         possible_bay_clusters=possible_bay_clusters,
         window=window,
+        transfer_conflicts=transfer_conflicts,
+        distance_unit=distance_unit,
     )
 
 
@@ -2177,6 +2505,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=CLIP_TO_COMMON_WINDOW,
         help="Clip calendars to the date window every feed covers.",
     )
+    p.add_argument(
+        "--feed-distance-units",
+        nargs="+",
+        default=list(FEED_DISTANCE_UNITS),
+        help="shape_dist_traveled unit per feed (feet/meters/km/miles), parallel to --gtfs-feeds.",
+    )
+    p.add_argument(
+        "--merged-distance-unit",
+        default=MERGED_DISTANCE_UNIT,
+        help="shape_dist_traveled unit of the merged feed (blank = the dominant feed's).",
+    )
     p.add_argument("--window-start", default=WINDOW_START, help="Window override (YYYYMMDD).")
     p.add_argument("--window-end", default=WINDOW_END, help="Window override (YYYYMMDD).")
     p.add_argument(
@@ -2244,6 +2583,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         clip_to_common_window=args.clip_to_common_window,
         window_start=args.window_start,
         window_end=args.window_end,
+        feed_distance_units=tuple(args.feed_distance_units),
+        merged_distance_unit=args.merged_distance_unit,
     )
     output_dir = Path(args.output_dir)
     try:
@@ -2259,6 +2600,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         result.possible_bay_clusters.to_csv(
             output_dir / POSSIBLE_BAY_CLUSTERS_FILENAME, index=False
         )
+        result.transfer_conflicts.to_csv(output_dir / TRANSFER_CONFLICTS_FILENAME, index=False)
     except (MergeError, OSError, ValueError) as exc:
         logging.error("%s", exc)
         return 1
@@ -2273,6 +2615,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"IDs renamed: {int((result.crosswalk['change'] == 'renamed').sum())}",
         "Possible bay clusters outside the bay polygons: "
         f"{result.possible_bay_clusters['cluster'].nunique()}",
+        f"shape_dist_traveled unit: {result.distance_unit or 'as published (not converted)'}",
+        "Disagreeing transfers.txt rules: "
+        f"{len(result.transfer_conflicts)} (unresolved: "
+        f"{int(result.transfer_conflicts['resolution'].str.startswith('unresolved').sum())})",
     ]
     if not write_run_log(output_dir, summary_lines) and REQUIRE_RUN_LOG:
         logging.error(

@@ -22,7 +22,7 @@ Inputs
 Outputs
 -------
 - ``calendar_service_summary.csv``: one row per service_id — inferred labels
-  (Weekday / Saturday / Sunday / Holiday), active-date count and range,
+  (Weekday / Saturday / Sunday / Holiday / Special), active-date count and range,
   per-year rate, day-of-week breakdown, holiday overlap, trip count, and
   sample dates.
 - ``calendar_day_type_summary.csv``: one row per day type — the
@@ -63,7 +63,9 @@ SERVICE_SUMMARY_FILENAME: str = r"calendar_service_summary.csv"
 DAY_TYPE_SUMMARY_FILENAME: str = r"calendar_day_type_summary.csv"
 
 # Classification thresholds — see utils/calendar_helpers.py for guidance on
-# when to raise or lower them.
+# when to raise or lower them. A service running at or below
+# HOLIDAY_MAX_DAYS_PER_YEAR is labelled Holiday when at least one of its dates
+# is an observed U.S. federal holiday, and Special otherwise.
 HOLIDAY_MAX_DAYS_PER_YEAR: float = 25.0
 WEEKDAY_DOW_SHARE: float = 0.80
 
@@ -349,6 +351,7 @@ def classify_service_ids(
     active_dates: Mapping[str, set[dt.date]],
     holiday_max_days_per_year: float = 25.0,
     dow_share: float = 0.80,
+    holidays: Optional[set[dt.date]] = None,
 ) -> dict[str, set[str]]:
     """Classify each service_id by its real active-date pattern.
 
@@ -358,16 +361,27 @@ def classify_service_ids(
     a weekday pattern on a service that really runs five days a year).
     Otherwise, day-of-week shares of the active dates determine the labels.
 
+    The annual rate alone cannot tell a holiday service from any other rarely
+    used one (a one-day special event, a single-date exception). Pass
+    *holidays* to check: a low-rate service with none of its active dates in
+    that set is labelled ``Special`` instead of ``Holiday``.
+
     Args:
         active_dates: Output of :func:`expand_service_active_dates`.
         holiday_max_days_per_year: Services active at or below this annual
-            rate are labelled ``Holiday``.
+            rate are labelled ``Holiday`` (or ``Special``; see *holidays*).
         dow_share: Minimum fraction of active dates on a day-of-week bucket
             (Mon–Fri, Saturday, Sunday) to earn that bucket's label.
+        holidays: Optional set of holiday dates, e.g. from
+            ``federal_holidays_observed``. When given, a low-rate service
+            earns ``Holiday`` only if at least one of its active dates is in
+            this set, and ``Special`` otherwise. When ``None`` (the
+            default), every low-rate service is labelled ``Holiday``.
 
     Returns:
         Mapping of ``service_id`` to a set of labels drawn from
-        ``{"Weekday", "Saturday", "Sunday", "Holiday"}``. A service with no
+        ``{"Weekday", "Saturday", "Sunday", "Holiday", "Special"}``
+        (``Special`` only when *holidays* is given). A service with no
         active dates maps to an empty set.
     """
     result: dict[str, set[str]] = {}
@@ -380,7 +394,10 @@ def classify_service_ids(
         per_year = len(dates) / max(span_days / 365.25, 0.1)
         labels: set[str] = set()
         if per_year <= holiday_max_days_per_year:
-            labels.add("Holiday")
+            if holidays is None or not dates.isdisjoint(holidays):
+                labels.add("Holiday")
+            else:
+                labels.add("Special")
         else:
             n = len(dates)
             wd = sum(1 for d in dates if d.weekday() < 5)
@@ -670,13 +687,49 @@ def notebook_safe_argv(argv: Optional[Sequence[str]]) -> Optional[List[str]]:
 # ---- SCRIPT-SPECIFIC LOGIC --------------------------------------------------
 
 
+def _feed_has_file(gtfs_path: Path, file_name: str) -> bool:
+    """Return False only if the feed folder or ``.zip`` exists and lacks *file_name*.
+
+    A missing path, a path that is neither a folder nor a ``.zip``, or an
+    unreadable zip returns True, so ``load_gtfs_data`` reports the problem.
+    """
+    path = str(gtfs_path)
+    if os.path.isdir(path):
+        return os.path.exists(os.path.join(path, file_name))
+    if os.path.isfile(path) and path.lower().endswith(".zip"):
+        try:
+            with zipfile.ZipFile(path) as archive:
+                return any(os.path.basename(name) == file_name for name in archive.namelist())
+        except zipfile.BadZipFile:
+            return True
+    return True
+
+
 def _load_optional(gtfs_path: Path, file_name: str) -> Optional[pd.DataFrame]:
-    """Load one GTFS file via ``load_gtfs_data``, returning ``None`` if absent."""
+    """Load one GTFS file via ``load_gtfs_data``, returning ``None`` if absent.
+
+    A file that is present but cannot be read stops the run instead of being
+    skipped: dropping a damaged ``calendar_dates.txt`` would silently restore
+    every service its valid rows cancel.
+
+    Raises:
+        OSError: If the feed path is missing or the file cannot be read.
+        ValueError: If the feed path is not a folder or valid ``.zip``, or the
+            file is present but empty or not valid CSV.
+    """
+    if not _feed_has_file(gtfs_path, file_name):
+        logging.info("%s not in the feed — continuing without it.", file_name)
+        return None
     try:
         return load_gtfs_data(str(gtfs_path), files=(file_name,))[file_name[:-4]]
     except (OSError, ValueError) as exc:
-        logging.info("%s not usable (%s) — continuing without it.", file_name, exc)
-        return None
+        msg = (
+            f"Could not read {file_name} from '{gtfs_path}' ({exc}). The run stops "
+            "rather than continue without a file the feed includes; fix or remove it."
+        )
+        if isinstance(exc, OSError):
+            raise OSError(msg) from exc
+        raise ValueError(msg) from exc
 
 
 def _holidays_for(active_dates: Mapping[str, set[dt.date]]) -> set[dt.date]:
@@ -687,6 +740,37 @@ def _holidays_for(active_dates: Mapping[str, set[dt.date]]) -> set[dt.date]:
         for year in range(min(years), max(years) + 2):
             holidays |= federal_holidays_observed(year)
     return holidays
+
+
+def _label_special_services(
+    labels: Mapping[str, set[str]],
+    active_dates: Mapping[str, set[dt.date]],
+    holidays: set[dt.date],
+) -> dict[str, set[str]]:
+    """Relabel infrequent services that run on no holiday from Holiday to Special.
+
+    :func:`classify_service_ids` labels a service Holiday from its rarity alone.
+    A feed's exception dates do not say why a service runs, so the Holiday label
+    is kept only when one of the service's dates is an observed holiday.
+
+    Args:
+        labels: Output of :func:`classify_service_ids`.
+        active_dates: Output of :func:`expand_service_active_dates`.
+        holidays: Observed federal holidays overlapping the feed.
+
+    Returns:
+        A copy of *labels* with unsupported Holiday labels replaced by Special.
+    """
+    result: dict[str, set[str]] = {}
+    for sid, sid_labels in labels.items():
+        result[sid] = set(sid_labels)
+        if "Holiday" in sid_labels and not active_dates.get(sid, set()) & holidays:
+            result[sid] = (result[sid] - {"Holiday"}) | {"Special"}
+            logging.info(
+                "Service %s: infrequent but runs on no observed federal holiday -> Special.",
+                sid,
+            )
+    return result
 
 
 def build_service_summary(
@@ -700,7 +784,7 @@ def build_service_summary(
 
     Args:
         active_dates: Output of :func:`expand_service_active_dates`.
-        labels: Output of :func:`classify_service_ids`.
+        labels: Output of :func:`_label_special_services`.
         trip_counts: Trips per service_id (empty mapping when trips.txt is
             unavailable).
         holidays: Observed federal holidays overlapping the feed.
@@ -831,8 +915,10 @@ def run(
 
     Raises:
         ValueError: If the feed contains neither ``calendar.txt`` nor
-            ``calendar_dates.txt``.
-        OSError: If the run log is required but cannot be written.
+            ``calendar_dates.txt``, or one of them or ``trips.txt`` is present
+            but empty or not valid CSV.
+        OSError: If the feed path is missing, a present file cannot be read,
+            or the run log is required but cannot be written.
     """
     gtfs_path = GTFS_PATH if gtfs_path is None else Path(gtfs_path)
     output_dir = OUTPUT_DIR if output_dir is None else Path(output_dir)
@@ -853,6 +939,7 @@ def run(
         dow_share=WEEKDAY_DOW_SHARE,
     )
     holidays = _holidays_for(active)
+    labels = _label_special_services(labels, active, holidays)
     trip_counts: dict[str, int] = {}
     if trips is not None and "service_id" in trips.columns:
         trip_counts = trips["service_id"].astype(str).str.strip().value_counts().to_dict()

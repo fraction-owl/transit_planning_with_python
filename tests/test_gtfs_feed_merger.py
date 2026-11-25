@@ -388,6 +388,45 @@ def test_merge_rejects_mixed_timezones(tmp_path: Path) -> None:
         merge_feeds(_feeds(tmp_path, b_files), MergeSettings())
 
 
+def test_merge_accepts_timezone_aliases(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Fairfax Connector's archived feed says US/Eastern and WMATA's says America/New_York;
+    # the tz database links the first to the second, so they are one timezone.
+    monkeypatch.setattr(gfm, "load_timezone_links", lambda: {"US/Eastern": "America/New_York"})
+    b_files = dict(FEED_B)
+    b_files["agency"] = [FEED_B["agency"][0], "Agency B,https://b.example,US/Eastern"]
+    result = merge_feeds(_feeds(tmp_path, b_files), MergeSettings())
+    assert set(result.tables["agency"]["agency_timezone"]) == {"America/New_York"}
+
+
+def test_merge_rejects_mixed_timezones_without_link_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(gfm, "load_timezone_links", dict)
+    b_files = dict(FEED_B)
+    b_files["agency"] = [FEED_B["agency"][0], "Agency B,https://b.example,US/Eastern"]
+    with pytest.raises(MergeError, match="tzdata.zi"):
+        merge_feeds(_feeds(tmp_path, b_files), MergeSettings())
+
+
+def test_load_timezone_links_reads_tzdata_zi(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "tzdata.zi").write_text(
+        "# version test\nZ Test/Zone -5 - EST\nL Test/Zone Test/Alias\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(gfm.zoneinfo, "TZPATH", (str(tmp_path),))
+    links = gfm.load_timezone_links()
+    assert links["Test/Alias"] == "Test/Zone"
+    assert "Test/Zone" not in links
+
+
+def test_canonical_timezone_follows_link_chains() -> None:
+    links = {"A/Old": "A/Mid", "A/Mid": "A/Zone", "Loop/1": "Loop/2", "Loop/2": "Loop/1"}
+    assert gfm.canonical_timezone("A/Old", links) == "A/Zone"
+    assert gfm.canonical_timezone("A/Zone", links) == "A/Zone"
+    assert gfm.canonical_timezone("Loop/1", links) == "Loop/2"
+
+
 def test_merge_dedupes_transfers_on_merged_stops(tmp_path: Path) -> None:
     result = merge_feeds(_feeds(tmp_path), MergeSettings())
     transfers = result.tables["transfers"]
@@ -662,3 +701,133 @@ def test_merge_renames_lower_priority_route_names(tmp_path: Path) -> None:
     ]
     summary = result.feed_summary.set_index("feed")
     assert summary["route_names_renamed"].to_dict() == {"A": 0, "B": 1}
+
+
+# ---------------------------------------------------------------------------
+# transfers.txt rules that disagree at a merged stop
+# ---------------------------------------------------------------------------
+
+
+def _merged_transfers(
+    tmp_path: Path, b_transfers: list[str], a_transfers: list[str] | None = None
+) -> gfm.MergeResult:
+    a_files = {**FEED_A, "transfers": a_transfers or FEED_A["transfers"]}
+    a = _write_feed(tmp_path / "a", a_files)
+    b = _write_feed(tmp_path / "b", {**FEED_B, "transfers": b_transfers})
+    return merge_feeds([load_feed(str(a), "A"), load_feed(str(b), "B")], MergeSettings())
+
+
+def _rules(result: gfm.MergeResult) -> list[tuple[str, ...]]:
+    cols = ["from_stop_id", "to_stop_id", "from_route_id", "to_route_id", "transfer_type"]
+    return sorted(map(tuple, result.tables["transfers"][cols].to_numpy().tolist()))
+
+
+def test_merge_keeps_a_prohibition_that_disagrees_with_another_feed(tmp_path: Path) -> None:
+    # A requires 120 s at stop 2; B forbids transfers at stop 21, which merges into 2.
+    result = _merged_transfers(tmp_path, ["from_stop_id,to_stop_id,transfer_type", "21,21,3"])
+    # Each rule now governs only its own feed's routes at the merged stop.
+    assert _rules(result) == [("2", "2", "B_R1", "B_R1", "3"), ("2", "2", "R1", "R1", "2")]
+    conflicts = result.transfer_conflicts.set_index("feed")
+    assert conflicts.loc["B", "transfer_type"] == "3"
+    assert conflicts["resolution"].str.startswith("scoped to 1").all()
+    assert gfm.find_broken_references(result.tables) == []
+
+
+def test_merge_scoping_skips_route_pairs_the_feed_already_names(tmp_path: Path) -> None:
+    b_transfers = [
+        "from_stop_id,to_stop_id,from_route_id,to_route_id,transfer_type",
+        "21,21,,,3",
+        "21,21,R1,,1",  # B's own, more specific rule for transfers off its R1
+    ]
+    result = _merged_transfers(tmp_path, b_transfers)
+    rules = _rules(result)
+    assert ("2", "2", "B_R1", "", "1") in rules
+    assert not any(rule[2] == "B_R1" and rule[4] == "3" for rule in rules)
+    b_row = result.transfer_conflicts.set_index("feed").loc["B"]
+    assert b_row["resolution"].startswith("dropped")
+
+
+def test_merge_flags_a_feed_that_repeats_a_stop_pair(tmp_path: Path) -> None:
+    a_transfers = ["from_stop_id,to_stop_id,transfer_type", "1,1,3", "1,1,0"]
+    result = _merged_transfers(tmp_path, FEED_B["transfers"], a_transfers)
+    assert ("1", "1", "", "", "3") in _rules(result)
+    resolutions = result.transfer_conflicts["resolution"].tolist()
+    assert sorted(resolutions) == [
+        "unresolved: repeated in its feed; dropped",
+        "unresolved: repeated in its feed; kept",
+    ]
+
+
+# ---------------------------------------------------------------------------
+# shape_dist_traveled units
+# ---------------------------------------------------------------------------
+
+
+def _with_distances(files: dict[str, list[str]], one_mile: str) -> dict[str, list[str]]:
+    """Add shape_dist_traveled: 0 at each trip's first stop, one_mile at the next."""
+    header, *rows = files["stop_times"]
+    seen: set[str] = set()
+    out = [header + ",shape_dist_traveled"]
+    for row in rows:
+        trip = row.split(",")[0]
+        out.append(f"{row},{one_mile if trip in seen else '0'}")
+        seen.add(trip)
+    return {**files, "stop_times": out}
+
+
+def _unit_feeds(tmp_path: Path, a_mile: str = "1", b_mile: str = "1609.344") -> list[gfm.Feed]:
+    a = _write_feed(tmp_path / "a", _with_distances(FEED_A, a_mile))
+    b = _write_feed(tmp_path / "b", _with_distances(FEED_B, b_mile))
+    return [load_feed(str(a), "A"), load_feed(str(b), "B")]
+
+
+def test_merge_requires_units_when_feeds_carry_distances(tmp_path: Path) -> None:
+    with pytest.raises(MergeError, match="FEED_DISTANCE_UNITS"):
+        merge_feeds(_unit_feeds(tmp_path), MergeSettings())
+
+
+@pytest.mark.parametrize(
+    ("merged_unit", "expected"), [("", {"1"}), ("meters", {"1609.344"}), ("feet", {"5280"})]
+)
+def test_merge_converts_distances_to_one_unit(
+    tmp_path: Path, merged_unit: str, expected: set[str]
+) -> None:
+    settings = MergeSettings(
+        feed_distance_units=("miles", "meters"), merged_distance_unit=merged_unit
+    )
+    result = merge_feeds(_unit_feeds(tmp_path), settings)
+    distances = set(result.tables["stop_times"]["shape_dist_traveled"])
+    assert distances - {"0"} == expected
+    assert result.distance_unit == (merged_unit or "miles")
+
+
+@pytest.mark.parametrize("units", [("miles",), ("miles", "furlongs")])
+def test_merge_rejects_bad_distance_units(tmp_path: Path, units: tuple[str, ...]) -> None:
+    with pytest.raises(MergeError, match="unit"):
+        merge_feeds(_unit_feeds(tmp_path), MergeSettings(feed_distance_units=units))
+
+
+def test_merge_needs_no_units_when_one_feed_has_distances(tmp_path: Path) -> None:
+    a = _write_feed(tmp_path / "a", _with_distances(FEED_A, "1"))
+    b = _write_feed(tmp_path / "b", FEED_B)
+    result = merge_feeds([load_feed(str(a), "A"), load_feed(str(b), "B")], MergeSettings())
+    assert result.distance_unit is None
+    assert set(result.tables["stop_times"]["shape_dist_traveled"]) == {"0", "1", ""}
+
+
+def test_main_writes_transfer_conflicts_and_converts_units(tmp_path: Path) -> None:
+    a = _write_feed(tmp_path / "in" / "a", _with_distances(FEED_A, "1"))
+    b_files = {
+        **_with_distances(FEED_B, "1609.344"),
+        "transfers": ["from_stop_id,to_stop_id,transfer_type", "21,21,3"],
+    }
+    b = _write_feed(tmp_path / "in" / "b", b_files)
+    out = tmp_path / "out"
+    args = ["--gtfs-feeds", str(a), str(b), "--feed-labels", "A", "B", "--output-dir", str(out)]
+    assert gfm.main(args) == 1  # distances in two feeds, no units given
+    assert gfm.main([*args, "--feed-distance-units", "miles", "meters"]) == 0
+    conflicts = pd.read_csv(out / "merge_transfer_conflicts.csv", dtype=str)
+    assert sorted(conflicts["feed"]) == ["A", "B"]
+    runlog = (out / "merged_gtfs_runlog.txt").read_text(encoding="utf-8")
+    assert "shape_dist_traveled unit: miles" in runlog
+    assert "Disagreeing transfers.txt rules: 2 (unresolved: 0)" in runlog

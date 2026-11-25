@@ -1,20 +1,20 @@
 """Compute route-level on-time performance (OTP), windowed for ridership modeling.
 
-This is the windowed-rollup stage that turns ``otp_monthly_panel.py``'s monthly
-OTP panel into one OTP value per route, so it can join the route-level modeling
-table on the secured box (see ``scripts/modeling/prep_features_private.py``).
+This is the windowed-rollup stage that turns the monthly route OTP table of
+``otp_runtime_from_tides.py`` (``otp/otp_by_route_and_month.csv``) into one OTP value
+per route, so it can join the route-level modeling table on the secured box (see
+``scripts/modeling/prep_features_private.py``).
 
-It deliberately does NOT re-score OTP from raw TIDES events. ``otp_monthly_panel``
+It deliberately does NOT re-score OTP from raw TIDES events. ``otp_runtime_from_tides``
 already owns the OTP definition (the early/late window, timepoint-only filter,
-``Scheduled``-only rule, and departure-with-arrival fallback) and writes
-``otp_monthly_processed.csv`` -- a tidy panel with one row per
-``(level, group, month)`` carrying the early / on-time / late counts. Keeping the
+``Scheduled``-only rule, and departure-with-arrival fallback) and writes one row per
+``(day type, route, month)`` carrying the early / on-time / late counts. Keeping the
 scoring in one place means "on-time" cannot quietly come to mean two different
-things; this script's only job is the temporal reduction. Point it at any panel
-CSV that carries ``level`` / ``route_id`` / ``month`` / ``on_time`` /
-``evaluated`` columns.
+things; this script's only job is the temporal reduction. Point it at any CSV that
+carries ``day_type`` / ``route_id`` / ``month`` / ``on_time`` / ``evaluated`` columns.
 
-The reduction takes the route-level rows over a configurable trailing window
+The day types in ``DAY_TYPES_TO_INCLUDE`` (all of them by default) are pooled first.
+The reduction then takes the route rows over a configurable trailing window
 (e.g. last 12, 24, or 36 months -- 1, 2, or 3 years) and collapses them two
 possible ways:
 
@@ -24,8 +24,8 @@ possible ways:
                     equally, so a single heavy month cannot dominate).
 
 Inputs:
-    - ``otp_monthly_processed.csv`` from ``otp_monthly_panel.py`` (or any CSV
-      with the columns listed above).
+    - ``otp_by_route_and_month.csv`` from ``otp_runtime_from_tides.py`` (or any
+      CSV with the columns listed above).
 
 Outputs:
     - ``otp_by_route.csv`` - one row per route with the windowed % on-time.
@@ -59,13 +59,16 @@ CONFIG_END_MARKER: str = "# === END CONFIG ==="
 # =============================================================================
 # === BEGIN CONFIG ===
 
-# Path to the monthly OTP panel produced by otp_monthly_panel.py.
-OTP_PROCESSED_PATH: str = r"Path\To\Your\otp_monthly_processed.csv"
+# The route x month OTP table written by otp_runtime_from_tides.py
+# (otp/otp_by_route_and_month.csv in its output folder).
+OTP_MONTHLY_PATH: str = r"Path\To\Your\otp_by_route_and_month.csv"
 OUTPUT_DIR: str = r"Path\To\Your\Output_Folder"
 
-# Which aggregation level in the panel to roll up. "route" is the modeling grain;
-# the panel also carries "route_direction" / "service_type" / "overall".
-LEVEL: str = "route"
+# Day types (the table's day_type column) pooled into the rollup; empty = all of
+# them. With otp_runtime_from_tides.py's default DAY_TYPES no date falls in two day
+# types, so pooling all of them gives all-days OTP. If you set overlapping day types
+# there, list the ones to pool here so no visit counts twice.
+DAY_TYPES_TO_INCLUDE: Sequence[str] = ()
 
 # Trailing window length, in months, for the rollup. The most recent
 # WINDOW_MONTHS months present (up to END_MONTH, if set) are used. Any positive
@@ -103,8 +106,11 @@ REQUIRE_RUN_LOG: bool = True
 
 # === END CONFIG ===
 
-# Columns required from the input panel (post-load).
-REQUIRED_COLS: List[str] = ["level", "route_id", "month", "on_time", "evaluated"]
+# Columns required from the input table (post-load).
+REQUIRED_COLS: List[str] = ["day_type", "route_id", "month", "on_time", "evaluated"]
+
+# Label for a blank route_id, the same one otp_runtime_from_tides gives blank groups.
+BLANK_LABEL: str = "(blank)"
 
 
 # =============================================================================
@@ -116,9 +122,9 @@ REQUIRED_COLS: List[str] = ["level", "route_id", "month", "on_time", "evaluated"
 class Config:
     """Runtime configuration for an OTP-by-route rollup run."""
 
-    otp_processed_path: Path
+    otp_monthly_path: Path
     output_dir: Path
-    level: str = LEVEL
+    day_types: Sequence[str] = DAY_TYPES_TO_INCLUDE
     window_months: int = WINDOW_MONTHS
     normalize_by_month: bool = NORMALIZE_BY_MONTH
     end_month: str = END_MONTH
@@ -132,42 +138,65 @@ class Config:
 # =============================================================================
 
 
-def load_otp_panel(path: Path, level: str = LEVEL) -> pd.DataFrame:
-    """Read the monthly OTP panel and return tidy route-level monthly rows.
+def load_otp_table(path: Path, day_types: Sequence[str] = DAY_TYPES_TO_INCLUDE) -> pd.DataFrame:
+    """Read the route x month OTP table and pool the chosen day types.
 
     Args:
-        path: Path to ``otp_monthly_processed.csv`` (or a compatible panel CSV).
-        level: Aggregation level to keep (``"route"`` for the modeling grain).
+        path: Path to ``otp_by_route_and_month.csv`` (or a compatible CSV).
+        day_types: Day types to pool; empty pools every day type in the table.
 
     Returns:
-        DataFrame with columns ``route_id``, ``month``, ``on_time``,
-        ``evaluated`` for the requested level, with counts coerced to numeric.
+        DataFrame with columns ``route_id``, ``month``, ``on_time`` and
+        ``evaluated``, one row per (route, month), with counts coerced to numeric.
+        Route IDs keep their text (``NA`` and ``NULL`` are routes); a blank one is
+        reported as ``"(blank)"``.
 
     Raises:
         FileNotFoundError: If ``path`` does not exist.
-        ValueError: If a required column is missing.
+        ValueError: If a required column is missing or no row has a chosen day type.
     """
     if not path.exists():
         raise FileNotFoundError(
-            f"OTP panel not found: {path}. Run otp_monthly_panel.py first to produce "
-            "otp_monthly_processed.csv, or point --otp-processed at the panel."
+            f"OTP table not found: {path}. Run otp_runtime_from_tides.py first (it writes "
+            "otp/otp_by_route_and_month.csv), or point --otp-monthly at the table."
         )
 
-    df = pd.read_csv(path, dtype={"route_id": str})
+    # All text, with no placeholder read as missing: "NA" and "NULL" are route IDs.
+    df = pd.read_csv(path, dtype=str, keep_default_na=False)
     missing = [c for c in REQUIRED_COLS if c not in df.columns]
     if missing:
         raise ValueError(
-            f"OTP panel '{path}' is missing required column(s): {missing}. "
+            f"OTP table '{path}' is missing required column(s): {missing}. "
             f"Expected at least {REQUIRED_COLS}."
         )
 
-    out = df.loc[df["level"].astype(str) == level, ["route_id", "month", "on_time", "evaluated"]]
-    out = out.copy()
+    out = df[REQUIRED_COLS].copy()
+    out["day_type"] = out["day_type"].astype(str).str.strip()
+    if day_types:
+        wanted = {str(d).strip() for d in day_types}
+        absent = sorted(wanted - set(out["day_type"]))
+        if absent:
+            logging.warning("DAY_TYPES_TO_INCLUDE entries not in the table: %s", ", ".join(absent))
+        out = out.loc[out["day_type"].isin(wanted)]
+        if out.empty:
+            raise ValueError(
+                f"No row of '{path}' has a day type in {sorted(wanted)}; the table holds "
+                f"{sorted(set(df['day_type'].astype(str)))}."
+            )
     out["route_id"] = out["route_id"].astype(str).str.strip()
+    blank = out["route_id"].eq("")
+    if blank.any():
+        logging.warning(
+            "%d row(s) have a blank route_id; they are reported as %s.",
+            int(blank.sum()),
+            BLANK_LABEL,
+        )
+        out.loc[blank, "route_id"] = BLANK_LABEL
     out["month"] = out["month"].astype(str).str.strip()
     out["on_time"] = pd.to_numeric(out["on_time"], errors="coerce").fillna(0.0)
     out["evaluated"] = pd.to_numeric(out["evaluated"], errors="coerce").fillna(0.0)
-    return out.reset_index(drop=True)
+    pooled = out.groupby(["route_id", "month"], as_index=False)[["on_time", "evaluated"]].sum()
+    return pooled.reset_index(drop=True)
 
 
 # =============================================================================
@@ -380,7 +409,7 @@ def run(cfg: Config) -> pd.DataFrame:
     Returns:
         The windowed route-level rollup (also written to disk).
     """
-    panel = load_otp_panel(cfg.otp_processed_path, cfg.level)
+    panel = load_otp_table(cfg.otp_monthly_path, cfg.day_types)
 
     if cfg.routes_to_include:
         keep = {str(r) for r in cfg.routes_to_include}
@@ -404,7 +433,7 @@ def run(cfg: Config) -> pd.DataFrame:
         "normalized (equal month weight)" if cfg.normalize_by_month else "naive (pooled counts)"
     )
     summary_lines = [
-        f"Level:              {cfg.level}",
+        f"Day types pooled:   {', '.join(cfg.day_types) or '(all)'}",
         f"Routes in rollup:   {len(rollup)}",
         f"Window applied:     {window[0] if window else 'none'}.."
         f"{window[-1] if window else 'none'} ({len(window)} month(s))",
@@ -455,16 +484,22 @@ def notebook_safe_argv(argv: Optional[Sequence[str]]) -> Optional[List[str]]:
 def build_arg_parser() -> argparse.ArgumentParser:
     """Create the command-line argument parser."""
     p = argparse.ArgumentParser(
-        description="Windowed route-level OTP rollup from otp_monthly_panel's output.",
+        description="Windowed route-level OTP rollup from otp_runtime_from_tides's output.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument(
-        "--otp-processed",
-        default=OTP_PROCESSED_PATH,
-        help="Path to otp_monthly_processed.csv.",
+        "--otp-monthly",
+        default=OTP_MONTHLY_PATH,
+        help="Path to otp_by_route_and_month.csv.",
     )
     p.add_argument("--output-dir", default=OUTPUT_DIR, help="Directory for outputs.")
-    p.add_argument("--level", default=LEVEL, help="Panel level to roll up.")
+    p.add_argument(
+        "--day-types",
+        nargs="*",
+        default=list(DAY_TYPES_TO_INCLUDE),
+        metavar="DAY_TYPE",
+        help="Day types to pool (none = all of them).",
+    )
     p.add_argument(
         "--window-months",
         type=int,
@@ -506,17 +541,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(notebook_safe_argv(argv))
 
-    if args.otp_processed == OTP_PROCESSED_PATH:
+    if args.otp_monthly == r"Path\To\Your\otp_by_route_and_month.csv":
         logging.warning(
-            "OTP_PROCESSED_PATH is still a placeholder. Update the CONFIGURATION section "
-            "or pass --otp-processed before running."
+            "OTP_MONTHLY_PATH is still a placeholder. Update the CONFIGURATION section "
+            "or pass --otp-monthly before running."
         )
         return 2
 
     cfg = Config(
-        otp_processed_path=Path(args.otp_processed).expanduser(),
+        otp_monthly_path=Path(args.otp_monthly).expanduser(),
         output_dir=Path(args.output_dir).expanduser(),
-        level=args.level,
+        day_types=tuple(args.day_types),
         window_months=args.window_months,
         normalize_by_month=args.normalize,
         end_month=args.end_month,

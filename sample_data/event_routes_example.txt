@@ -1,0 +1,9 @@
+# Example event-route list: Mock DC Transit event service. Route 60E, the
+# Stadium Shuttle, carries passengers on game days. In trip_cut_savings.py,
+# point OTHER_EXCLUDED_ROUTES at a copy of this file to keep event service in
+# passenger-service totals but out of cut proposals.
+#
+# One route per line, as its GTFS route_short_name or route_id. Blank lines and
+# lines that start with "#" are ignored. Put comments on their own lines:
+# trip_cut_savings.py reads text after a route on the same line as part of it.
+60E

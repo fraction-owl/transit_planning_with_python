@@ -4,6 +4,7 @@ import hashlib
 import shutil
 import zipfile
 from pathlib import Path
+from typing import Optional
 
 import geopandas as gpd
 import pandas as pd
@@ -18,12 +19,25 @@ from scripts.gtfs_exports.gtfs_route_features_gpd import (
     find_cbd_stop_ids,
     load_cbd_area,
     main,
+    run,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
 GTFS_BASIC = FIXTURES / "gtfs_basic"
 MOCK_GTFS_DC_ZIP = FIXTURES / "mock_gtfs_dc.zip"
 MOCK_CBD_ZIP = FIXTURES / "mock_cbd_dc.zip"
+
+
+def _gtfs_basic_without_frequencies(tmp_path: Path) -> Path:
+    """Copy gtfs_basic without frequencies.txt, so its trip T2 is an ordinary scheduled trip.
+
+    The script stops on selected frequency-based trips (see the tests below);
+    the tests that use this copy exercise other behavior on the same schedule.
+    """
+    feed = tmp_path / "gtfs_basic_scheduled"
+    shutil.copytree(GTFS_BASIC, feed)
+    (feed / "frequencies.txt").unlink()
+    return feed
 
 
 def _two_stop_times(spec: list[tuple[str, str, str]]) -> pd.DataFrame:
@@ -82,12 +96,19 @@ def test_coverage_departures_in_same_bin_dedupe() -> None:
     assert cov["A"] == pytest.approx(100.0 * 1 / 24)
 
 
-def test_coverage_keeps_extended_clock_no_wrap() -> None:
-    # 01:00 -> hour 1 and 25:00 -> hour 25 stay distinct; wrapping 25:00 to 01:00 would
-    # wrongly collapse them into a single bin.
+def test_coverage_wraps_extended_clock() -> None:
+    # 01:00 and 25:00 are the same clock hour, so they fill one bin, not two.
     trips = pd.DataFrame({"route_id": ["A", "A"], "start_sec": [3600.0, 90000.0]})
     cov = _service_day_coverage(trips).set_index("route_id")["pct_day_with_service"]
-    assert cov["A"] == pytest.approx(100.0 * 2 / 24)
+    assert cov["A"] == pytest.approx(100.0 * 1 / 24)
+
+
+def test_coverage_never_exceeds_100_percent() -> None:
+    # WMATA C11 departs in GTFS hours 0 through 25: 26 extended hours, but only 24 clock
+    # hours, so the route covers 100% of the day, not 108.33%.
+    trips = pd.DataFrame({"route_id": ["C11"] * 26, "start_sec": [h * 3600.0 for h in range(26)]})
+    cov = _service_day_coverage(trips).set_index("route_id")["pct_day_with_service"]
+    assert cov["C11"] == pytest.approx(100.0)
 
 
 def test_coverage_drops_missing_start() -> None:
@@ -274,7 +295,8 @@ def test_no_collision_passes_new_columns_through() -> None:
 
 
 def test_main_end_to_end_on_gtfs_basic(tmp_path: Path) -> None:
-    assert main(["--gtfs-dir", str(GTFS_BASIC), "--output-dir", str(tmp_path)]) == 0
+    feed = _gtfs_basic_without_frequencies(tmp_path)
+    assert main(["--gtfs-dir", str(feed), "--output-dir", str(tmp_path)]) == 0
     assert (tmp_path / "gtfs_route_features_runlog.txt").exists()
 
     features = pd.read_csv(tmp_path / "gtfs_route_features.csv").set_index("route_id")
@@ -300,6 +322,92 @@ def test_main_end_to_end_on_gtfs_basic(tmp_path: Path) -> None:
     assert "serves_cbd" not in features.columns
     runlog = (tmp_path / "gtfs_route_features_runlog.txt").read_text(encoding="utf-8")
     assert "CBD layer:       (none)" in runlog
+
+
+def _write_two_route_feed(
+    feed: Path, trips: str, stop_times: str, frequencies: Optional[str] = None
+) -> Path:
+    """Write a minimal feed for routes 101 (WK, Mon-Fri) and 102 (DAILY), Nov 16-22, 2026.
+
+    Tuesday, November 17 is the only Tuesday in range, so it is always the
+    analysis date whatever today's date is.
+    """
+    feed.mkdir()
+    (feed / "routes.txt").write_text("route_id,route_short_name\n101,101\n102,102\n")
+    (feed / "calendar.txt").write_text(
+        "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,start_date,end_date\n"
+        "WK,1,1,1,1,1,0,0,20261116,20261122\n"
+        "DAILY,1,1,1,1,1,1,1,20261116,20261122\n"
+        "SAT,0,0,0,0,0,1,0,20261116,20261122\n"
+    )
+    (feed / "trips.txt").write_text("route_id,service_id,trip_id,direction_id,shape_id\n" + trips)
+    (feed / "stop_times.txt").write_text(
+        "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n" + stop_times
+    )
+    (feed / "shapes.txt").write_text(
+        "shape_id,shape_pt_lat,shape_pt_lon,shape_pt_sequence\n"
+        "SH,38.80,-77.20,1\nSH,38.81,-77.20,2\n"
+    )
+    if frequencies is not None:
+        (feed / "frequencies.txt").write_text(frequencies)
+    return feed
+
+
+def test_run_keeps_daily_service_on_the_analysis_weekday(tmp_path: Path) -> None:
+    # 101 runs Mon-Fri and 102 runs daily; each has one Tuesday trip, and they
+    # share stop HUB.
+    feed = _write_two_route_feed(
+        tmp_path / "feed",
+        "101,WK,T101,0,SH\n102,DAILY,T102,0,SH\n",
+        "T101,08:00:00,08:00:00,A,1\nT101,08:20:00,08:20:00,HUB,2\n"
+        "T102,09:00:00,09:00:00,HUB,1\nT102,09:30:00,09:30:00,B,2\n",
+    )
+    features = run(gtfs_dir=feed, output_dir=tmp_path / "out", analysis_weekday="tuesday")
+
+    assert features is not None
+    features = features.set_index("route_id")
+    assert features.index.tolist() == ["101", "102"]
+    assert features["trips_per_day"].tolist() == [1, 1]
+    # Each route sees the other at the shared stop.
+    assert features["n_competitor_routes"].tolist() == [1, 1]
+    runlog = (tmp_path / "out" / "gtfs_route_features_runlog.txt").read_text(encoding="utf-8")
+    assert "2026-11-17" in runlog
+
+
+def test_run_stops_on_selected_frequency_based_trip(tmp_path: Path) -> None:
+    # A 20-minute template trip repeated every 10 minutes from 08:00 to 09:50.
+    feed = _write_two_route_feed(
+        tmp_path / "feed",
+        "101,WK,T101,0,SH\n",
+        "T101,08:00:00,08:00:00,A,1\nT101,08:20:00,08:20:00,B,2\n",
+        frequencies="trip_id,start_time,end_time,headway_secs,exact_times\n"
+        "T101,08:00:00,10:00:00,600,1\n",
+    )
+    out = tmp_path / "out"
+    with pytest.raises(ValueError, match=r"selected trip\(s\) \(T101\) are frequency-based"):
+        run(gtfs_dir=feed, output_dir=out, analysis_weekday="tuesday")
+    assert not (out / "gtfs_route_features.csv").exists()
+
+
+def test_run_ignores_frequency_trips_that_are_not_selected(tmp_path: Path) -> None:
+    # The frequency-based trip runs only on Saturdays, outside the Tuesday analysis.
+    feed = _write_two_route_feed(
+        tmp_path / "feed",
+        "101,WK,T101,0,SH\n101,SAT,T_SAT,0,SH\n",
+        "T101,08:00:00,08:00:00,A,1\nT101,08:20:00,08:20:00,B,2\n"
+        "T_SAT,08:00:00,08:00:00,A,1\nT_SAT,08:20:00,08:20:00,B,2\n",
+        frequencies="trip_id,start_time,end_time,headway_secs,exact_times\n"
+        "T_SAT,08:00:00,10:00:00,600,1\n",
+    )
+    features = run(gtfs_dir=feed, output_dir=tmp_path / "out", analysis_weekday="tuesday")
+    assert features is not None
+    assert features["trips_per_day"].tolist() == [1]
+
+
+def test_main_end_to_end_stops_on_gtfs_basic_frequency_trip(tmp_path: Path) -> None:
+    # gtfs_basic's T2 (a weekday R1 trip) is repeated by frequencies.txt.
+    with pytest.raises(ValueError, match=r"\(T2\) are frequency-based"):
+        main(["--gtfs-dir", str(GTFS_BASIC), "--output-dir", str(tmp_path)])
 
 
 # ---------------------------------------------------------------------------
@@ -360,8 +468,7 @@ def test_main_reads_zipped_feed_like_extracted_folder(tmp_path: Path) -> None:
 def test_serves_cbd_counts_a_stop_served_only_on_another_schedule(tmp_path: Path) -> None:
     # R2's only CBD stop (S11) is on a Saturday trip; the weekday supply features still
     # come from the Tuesday trips, but the flag counts every schedule in the feed.
-    feed = tmp_path / "feed"
-    shutil.copytree(GTFS_BASIC, feed)
+    feed = _gtfs_basic_without_frequencies(tmp_path)
     with (feed / "calendar.txt").open("a", encoding="utf-8") as fh:
         fh.write("SAT,0,0,0,0,0,1,0,20260101,20261231\n")
     with (feed / "stops.txt").open("a", encoding="utf-8") as fh:

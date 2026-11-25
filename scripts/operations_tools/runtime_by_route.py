@@ -1,14 +1,14 @@
 """Compute route-level running-time features from TIDES, windowed for ridership modeling.
 
-This is the *modeling-feature* counterpart to ``runtime_by_trip.py``. Where
-that script diagnoses individual scheduled trips (per-trip stats, variation
-flags, day-of-week anomalies), this one rolls observed running time up to one
-value per route so it can join the route-level modeling table on the secured
-box (see ``scripts/modeling/prep_features_private.py``).
+This is the *modeling-feature* counterpart to the trip running-time tables of
+``otp_runtime_from_tides.py``. Where that script diagnoses individual scheduled
+trips (per-trip stats, variation flags, day-of-week anomalies), this one rolls
+observed running time up to one value per route so it can join the route-level
+modeling table on the secured box (see ``scripts/modeling/prep_features_private.py``).
 
-It runs in two stages, mirroring the OTP pipeline (``otp_monthly_panel.py`` ->
-``otp_by_route.py``) but packaged in a single file because no monthly-runtime
-panel exists elsewhere to consume:
+It runs in two stages, mirroring the OTP pipeline (``otp_runtime_from_tides.py`` ->
+``otp_by_route.py``) but packaged in a single file with its own all-days panel
+(the exporter's route x month running times are split by day type):
 
     derive -> panel        Observed trip running times (last served arrival minus
                            first served departure) are derived from a TIDES
@@ -139,7 +139,7 @@ class Config:
 
 # =============================================================================
 # LOADING & RUNTIME DERIVATION
-#   (mechanics mirror runtime_by_trip.py; kept self-contained on purpose)
+#   (mechanics mirror otp_runtime_from_tides.py; kept self-contained on purpose)
 # =============================================================================
 
 # TIDES identifies a performed trip by (service_date, trip_id_performed): the same
@@ -237,8 +237,9 @@ def join_route_attributes(
     Canceled / non-in-service trips are dropped via the inner join, which is
     keyed on ``TRIP_KEY`` (``service_date`` + ``trip_id_performed``). A
     ``trip_key`` is added for per-trip outlier trimming: the scheduled trip id
-    when present, else a route/direction/start-label fallback so the same
-    recurring trip is trimmed as one group.
+    when present, else (per row, including rows whose id is blank) a
+    route/direction/start-label fallback so the same recurring trip is trimmed
+    as one group.
 
     Args:
         trip_runtimes: Output of :func:`compute_trip_runtimes`.
@@ -262,12 +263,17 @@ def join_route_attributes(
 
     merged = _parse_service_date(trip_runtimes).merge(trips_small, on=TRIP_KEY, how="inner")
 
+    start_label = merged["start_time"].dt.strftime("%H:%M")
+    direction = merged["direction_id"].astype(str) if "direction_id" in merged.columns else ""
+    fallback = merged["route_id"].astype(str) + "_" + direction + "_" + start_label
     if "trip_id_scheduled" in merged.columns:
-        merged["trip_key"] = merged["trip_id_scheduled"].astype(str)
+        # Rows with a missing or blank scheduled id fall back one by one, so
+        # unrelated trips never share a "nan" or "" key and get trimmed together.
+        scheduled = merged["trip_id_scheduled"]
+        blank = scheduled.isna() | (scheduled.astype(str).str.strip() == "")
+        merged["trip_key"] = scheduled.astype(str).where(~blank, fallback)
     else:
-        start_label = merged["start_time"].dt.strftime("%H:%M")
-        direction = merged["direction_id"].astype(str) if "direction_id" in merged.columns else ""
-        merged["trip_key"] = merged["route_id"].astype(str) + "_" + direction + "_" + start_label
+        merged["trip_key"] = fallback
     return merged
 
 

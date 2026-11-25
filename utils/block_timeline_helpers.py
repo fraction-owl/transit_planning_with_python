@@ -59,7 +59,7 @@ def find_cluster(stop_id: str, clusters: list[dict[str, Any]]) -> Optional[str]:
 def status_for_same_trip(
     minute: int, stop_info: tuple, settings: dict[str, int]
 ) -> Optional[tuple]:
-    """Return a visit's occupancy, including both boundaries of a scheduled hold."""
+    """Return a visit's occupancy; a mid-trip hold is ARRIVE, then DWELL, then DEPART."""
     arr, dep, sid, name, tid, first, last, seq, timepoint = stop_info
     detail = (sid, name, minutes_to_hhmm(arr), minutes_to_hhmm(dep), tid, seq, timepoint)
     if first and minute == dep:
@@ -67,8 +67,13 @@ def status_for_same_trip(
     if last and minute == arr:
         return ("ARRIVE",) + detail
     if arr <= minute <= dep:
-        if not first and not last and arr == dep:
-            return ("ARRIVE/DEPART",) + detail
+        if not first and not last:
+            if arr == dep:
+                return ("ARRIVE/DEPART",) + detail
+            if minute == arr:
+                return ("ARRIVE",) + detail
+            if minute == dep:
+                return ("DEPART",) + detail
         if first and minute >= dep - settings["PRE_DEPARTURE_MINUTES"]:
             return ("LOADING",) + detail
         return ("DWELL",) + detail
@@ -237,6 +242,9 @@ def build_schedule_rows(
 ) -> list[dict[str, Any]]:
     """Render a block from scheduled visits, with one physical vehicle per minute.
 
+    A trip's first-stop departure keeps its scheduled minute even when the next
+    stop's time rounds into that minute; the next visit starts one minute later.
+
     Args:
         trips_summary: Complete scheduled trips on this block.
         timeline: Minutes to render; the pipeline requires a one-minute step.
@@ -258,16 +266,23 @@ def build_schedule_rows(
         ):
             active.setdefault(minute, []).append(trip)
         sequence = trip["stop_times_sequence"]
+        departed = -1  # the trip's first-stop departure minute, once seen
         for i, stop in enumerate(sequence):
             arr, dep = stop[:2]
+            begin = max(arr, timeline.start)
             finish = dep
-            if not stop[5] and not stop[6] and arr == dep:
-                finish = arr + settings["THROUGH_DWELL_MINUTES"] - 1
-            if i + 1 < len(sequence):
-                # Once the next visit begins, an earlier through dwell cannot reappear.
-                finish = min(finish, sequence[i + 1][0] - 1)
+            if stop[5]:
+                # The scheduled terminal departure is never cut by the next visit.
+                departed = dep
+            else:
+                begin = max(begin, departed + 1)
+                if not stop[6] and arr == dep:
+                    finish = arr + settings["THROUGH_DWELL_MINUTES"] - 1
+                if i + 1 < len(sequence):
+                    # Once the next visit begins, an earlier through dwell cannot reappear.
+                    finish = min(finish, sequence[i + 1][0] - 1)
             finish = min(finish, trip["end"], timeline.stop - 1)
-            for minute in range(max(arr, timeline.start), finish + 1):
+            for minute in range(begin, finish + 1):
                 status = status_for_same_trip(minute, stop, settings)
                 if status is not None:
                     role = "depart" if stop[5] else "arrive" if stop[6] else "through"

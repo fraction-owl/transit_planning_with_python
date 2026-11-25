@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import math
 import os
+import shutil
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import pandas as pd
@@ -23,6 +25,7 @@ from scripts.field_tools.printable_block_schedules import (
     header_width,
     load_gtfs_data,
     main,
+    movements_on_date,
     prepare_stop_times,
     service_day_label,
     time_to_seconds,
@@ -235,6 +238,38 @@ def test_filter_data_no_matching_route_returns_empty_dataframes() -> None:
     assert fst.empty
 
 
+def _make_reused_block_trips() -> pd.DataFrame:
+    # Block 100 runs routes 10 and 20 on weekdays (interlined), only route 20 on Saturdays.
+    return pd.DataFrame(
+        {
+            "trip_id": ["W1", "W2", "S1"],
+            "route_id": ["R1", "R2", "R2"],
+            "block_id": ["100", "100", "100"],
+            "service_id": ["WKDY", "WKDY", "SAT"],
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    ("service_ids", "kept"),
+    [(["SAT"], set()), ([], {"W1", "W2"}), (["WKDY", "SAT"], {"W1", "W2"})],
+    ids=["route-not-on-service", "route-only", "both-services"],
+)
+def test_filter_data_route_filter_matches_block_per_service_id(
+    service_ids: list[str], kept: set[str]
+) -> None:
+    with (
+        patch(f"{_MODULE}.FILTER_ROUTE_SHORT_NAMES", ["10"]),
+        patch(f"{_MODULE}.FILTER_SERVICE_IDS", service_ids),
+    ):
+        ft, fst = filter_data(
+            _make_reused_block_trips(), _make_stop_times(["W1", "W2", "S1"]), _make_routes()
+        )
+    # The Saturday block never serves route 10; the weekday block keeps its route 20 trip.
+    assert set(ft.get("trip_id", [])) == kept
+    assert set(fst.get("trip_id", [])) == kept
+
+
 def test_filter_data_stop_times_restricted_to_filtered_trips() -> None:
     with (
         patch(f"{_MODULE}.FILTER_ROUTE_SHORT_NAMES", ["20"]),
@@ -350,6 +385,42 @@ def test_prepare_stop_times_sorted_by_block_trip_sequence() -> None:
     # Re-sorting should not change the row order if already sorted correctly
     re_sorted = result.sort_values(["block_id", "trip_id", "stop_sequence"])
     assert re_sorted.index.tolist() == list(range(len(result)))
+
+
+def test_prepare_stop_times_without_direction_id_prints_blank_direction() -> None:
+    trips = _make_prep_trips().drop(columns="direction_id")
+    result = prepare_stop_times(trips, _make_prep_stop_times(), _make_stops())
+    assert len(result) == len(_make_prep_stop_times())
+    assert (result["direction_id"] == "").all()
+
+
+def test_main_runs_without_direction_id(tmp_path: Path) -> None:
+    feed = tmp_path / "feed"
+    feed.mkdir()
+    (feed / "trips.txt").write_text("route_id,service_id,trip_id,block_id\nR1,WKDY,T1,100\n")
+    (feed / "routes.txt").write_text("route_id,route_short_name\nR1,10\n")
+    (feed / "calendar.txt").write_text(
+        "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,"
+        "start_date,end_date\nWKDY,1,1,1,1,1,0,0,20260101,20261231\n"
+    )
+    (feed / "stops.txt").write_text("stop_id,stop_name\nS1,Oak St\nS2,Elm Ave\n")
+    (feed / "stop_times.txt").write_text(
+        "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+        "T1,07:00:00,07:00:00,S1,1\nT1,07:10:00,07:10:00,S2,2\n"
+    )
+    out = tmp_path / "out"
+    with (
+        patch(f"{_MODULE}.GTFS_FOLDER_PATH", str(feed)),
+        patch(f"{_MODULE}.BASE_OUTPUT_PATH", str(out)),
+        patch(f"{_MODULE}.FILTER_ROUTE_SHORT_NAMES", []),
+        patch(f"{_MODULE}.FILTER_SERVICE_IDS", []),
+        patch(f"{_MODULE}.TODS_PATH", ""),
+    ):
+        assert main() == 0
+    (path,) = out.glob("*.xlsx")
+    sheet = pd.read_excel(path, dtype=str, keep_default_na=False)
+    assert sheet["Direction"].tolist() == ["", ""]
+    assert sheet["Scheduled Departure Time"].tolist() == ["07:00", "07:10"]
 
 
 def test_prepare_stop_times_drops_rows_with_missing_block_id() -> None:
@@ -825,15 +896,27 @@ def test_export_to_excel_no_highlight_in_timepoints_only_mode(tmp_path: Path) ->
 # ---------------------------------------------------------------------------
 
 
+def _gtfs_basic_without_frequencies(tmp_path: Path) -> Path:
+    """Copy gtfs_basic without frequencies.txt, so its trip T2 is an ordinary scheduled trip.
+
+    main() stops on selected frequency-based trips (see the tests below).
+    """
+    feed = tmp_path / "gtfs_basic"
+    shutil.copytree(GTFS_BASIC, feed)
+    (feed / "frequencies.txt").unlink()
+    return feed
+
+
 def test_main_timepoints_only_without_timepoints_returns_1(tmp_path: Path) -> None:
     # gtfs_basic has no timepoint column, so every stop is treated as timepoint = 0
+    out = tmp_path / "out"
     with (
-        patch(f"{_MODULE}.GTFS_FOLDER_PATH", str(GTFS_BASIC)),
-        patch(f"{_MODULE}.BASE_OUTPUT_PATH", str(tmp_path)),
+        patch(f"{_MODULE}.GTFS_FOLDER_PATH", str(_gtfs_basic_without_frequencies(tmp_path))),
+        patch(f"{_MODULE}.BASE_OUTPUT_PATH", str(out)),
         patch(f"{_MODULE}.TIMEPOINTS_ONLY", True),
     ):
         assert main() == 1
-    assert not list(tmp_path.glob("*.xlsx"))
+    assert not list(out.glob("*.xlsx"))
 
 
 def test_main_blank_paths_return_2() -> None:
@@ -845,17 +928,209 @@ def test_main_blank_paths_return_2() -> None:
 
 
 def test_main_exports_gtfs_basic_fixture(tmp_path: Path) -> None:
+    out = tmp_path / "out"
     with (
-        patch(f"{_MODULE}.GTFS_FOLDER_PATH", str(GTFS_BASIC)),
-        patch(f"{_MODULE}.BASE_OUTPUT_PATH", str(tmp_path)),
+        patch(f"{_MODULE}.GTFS_FOLDER_PATH", str(_gtfs_basic_without_frequencies(tmp_path))),
+        patch(f"{_MODULE}.BASE_OUTPUT_PATH", str(out)),
         patch(f"{_MODULE}.TIMEPOINTS_ONLY", False),
     ):
         assert main() == 0
-    files = list(tmp_path.glob("*.xlsx"))
+    files = list(out.glob("*.xlsx"))
     assert files
     result = pd.read_excel(files[0], dtype=str, keep_default_na=False)
     stop_ids = result.loc[result["Event Type"] == "Stop", "Stop ID"]
     assert stop_ids.str.fullmatch(r"\d+").all()  # gtfs_basic stop_codes, not S-prefixed stop_ids
+
+
+# ---------------------------------------------------------------------------
+# Frequency-based trips and SERVICE_DATE
+# ---------------------------------------------------------------------------
+
+_CALENDAR = (
+    "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,start_date,end_date\n"
+    "WKDY,1,1,1,1,1,0,0,20260101,20261231\n"
+    "MON,1,0,0,0,0,0,0,20260101,20261231\n"
+)
+
+
+def _write_feed(folder: Path, **files: str) -> Path:
+    """Write a small GTFS feed; each keyword is a file stem, e.g. ``trips="..."``."""
+    folder.mkdir()
+    base = {
+        "routes": "route_id,route_short_name\nR1,1\nR2,2\n",
+        "stops": "stop_id,stop_name\nA,Stop A\nX,Stop X\nY,Stop Y\n",
+        "calendar": _CALENDAR,
+    }
+    for stem, text in {**base, **files}.items():
+        (folder / f"{stem}.txt").write_text(text, encoding="utf-8")
+    return folder
+
+
+def _run_main(feed: Path, out: Path, **settings: Any) -> int:
+    patches = {"FILTER_ROUTE_SHORT_NAMES": [], "FILTER_SERVICE_IDS": [], "SERVICE_DATE": ""}
+    with (
+        patch(f"{_MODULE}.GTFS_FOLDER_PATH", str(feed)),
+        patch(f"{_MODULE}.BASE_OUTPUT_PATH", str(out)),
+        patch(f"{_MODULE}.TODS_PATH", ""),
+        patch(f"{_MODULE}.TIMEPOINTS_ONLY", False),
+        patch.multiple(_MODULE, **{**patches, **settings}),
+    ):
+        return main()
+
+
+def _frequency_feed(tmp_path: Path, frequencies: str) -> Path:
+    # One 10-minute trip; frequencies.txt may repeat it every 15 minutes, 08:00-09:00.
+    return _write_feed(
+        tmp_path / "feed",
+        trips="route_id,service_id,trip_id,block_id\nR1,WKDY,F1,B1\n",
+        stop_times=(
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+            "F1,08:00:00,08:00:00,A,1\nF1,08:10:00,08:10:00,X,2\n"
+        ),
+        frequencies=frequencies,
+    )
+
+
+def test_main_stops_on_selected_frequency_trip(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    feed = _frequency_feed(
+        tmp_path,
+        "trip_id,start_time,end_time,headway_secs,exact_times\nF1,08:00:00,09:00:00,900,1\n",
+    )
+    # Exporting would list the 08:00 run and silently omit 08:15, 08:30 and 08:45.
+    assert _run_main(feed, tmp_path / "out") == 1
+    assert not list((tmp_path / "out").glob("*.xlsx"))
+    assert "1 selected trip(s) are frequency-based (F1)" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "frequencies",
+    ["", "trip_id,start_time,end_time,headway_secs\n"],
+    ids=["zero-byte", "header-only"],
+)
+def test_main_exports_when_frequencies_file_is_empty(tmp_path: Path, frequencies: str) -> None:
+    assert _run_main(_frequency_feed(tmp_path, frequencies), tmp_path / "out") == 0
+    assert len(list((tmp_path / "out").glob("*.xlsx"))) == 1
+
+
+def test_main_ignores_frequency_trips_outside_the_selected_blocks(tmp_path: Path) -> None:
+    # gtfs_basic repeats T2 (block B2, route R1); route R3 runs on blocks B4-B6 only.
+    out = tmp_path / "out"
+    assert _run_main(GTFS_BASIC, out, FILTER_ROUTE_SHORT_NAMES=["R3"]) == 0
+    assert {path.name.split("_")[1] for path in out.glob("*.xlsx")} == {"B4", "B5", "B6"}
+
+
+def _two_service_feed(tmp_path: Path, monday_route: str = "R1", **files: str) -> Path:
+    # Block 100: a weekday trip ends at X at 08:10; a Monday-only trip leaves X at 08:15.
+    return _write_feed(
+        tmp_path / "feed",
+        trips=(
+            "route_id,service_id,trip_id,direction_id,block_id\n"
+            f"R1,WKDY,W1,0,100\n{monday_route},MON,M1,1,100\n"
+        ),
+        stop_times=(
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+            "W1,07:40:00,07:40:00,Y,1\nW1,08:10:00,08:10:00,X,2\n"
+            "M1,08:15:00,08:15:00,X,1\nM1,08:45:00,08:45:00,Y,2\n"
+        ),
+        **files,
+    )
+
+
+def test_main_without_service_date_splits_block_by_service_id(tmp_path: Path) -> None:
+    out = tmp_path / "out"
+    assert _run_main(_two_service_feed(tmp_path), out) == 0
+    assert sorted(path.name for path in out.glob("*.xlsx")) == [
+        "block_100_1_0740-0810_Weekday_service-WKDY.xlsx",
+        "block_100_1_0815-0845_Mon_service-MON.xlsx",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("service_date", "filename", "events"),
+    [
+        (  # Monday: the vehicle runs both trips with a five-minute layover.
+            "20260105",
+            "block_100_1_0740-0845_Mon+Weekday_20260105.xlsx",
+            [("Stop", "W1"), ("Stop", "W1"), ("Layover", "W1"), ("Stop", "M1"), ("Stop", "M1")],
+        ),
+        (  # Tuesday: weekday trip only.
+            "20260106",
+            "block_100_1_0740-0810_Weekday_20260106.xlsx",
+            [("Stop", "W1"), ("Stop", "W1")],
+        ),
+        (  # A Monday holiday that calendar_dates.txt removes from MON.
+            "20260119",
+            "block_100_1_0740-0810_Weekday_20260119.xlsx",
+            [("Stop", "W1"), ("Stop", "W1")],
+        ),
+    ],
+    ids=["monday", "tuesday", "monday-removed"],
+)
+def test_main_service_date_puts_the_vehicles_whole_day_on_one_sheet(
+    tmp_path: Path, service_date: str, filename: str, events: list[tuple[str, str]]
+) -> None:
+    feed = _two_service_feed(
+        tmp_path, calendar_dates="service_id,date,exception_type\nMON,20260119,2\n"
+    )
+    out = tmp_path / "out"
+    assert _run_main(feed, out, SERVICE_DATE=service_date) == 0
+    (path,) = out.glob("*.xlsx")
+    assert path.name == filename
+    sheet = pd.read_excel(path, dtype=str, keep_default_na=False)
+    assert list(zip(sheet["Event Type"], sheet["Trip ID"])) == events
+    gaps = sheet[sheet["Event Type"] == "Layover"]
+    if len(gaps):
+        gap = gaps.iloc[0]
+        assert (gap["Stop Name"], gap["Scheduled Arrival Time"]) == ("Stop X", "08:10")
+        assert gap["Scheduled Departure Time"] == "08:15"
+        assert gap["Comments"].startswith("Scheduled gap: 5 min\n")
+
+
+def test_main_service_date_route_filter_keeps_the_whole_block(tmp_path: Path) -> None:
+    # Only W1 is on route 1, but on Monday block 100 also runs M1 on route 2.
+    feed = _two_service_feed(tmp_path, monday_route="R2")
+    out = tmp_path / "out"
+    assert _run_main(feed, out, SERVICE_DATE="20260105", FILTER_ROUTE_SHORT_NAMES=["1"]) == 0
+    (path,) = out.glob("*.xlsx")
+    sheet = pd.read_excel(path, dtype=str, keep_default_na=False)
+    assert sheet.loc[sheet["Event Type"] == "Stop", "Trip ID"].unique().tolist() == ["W1", "M1"]
+
+
+@pytest.mark.parametrize(
+    ("settings", "message"),
+    [
+        ({"SERVICE_DATE": "20260104"}, "No service_id is active on 20260104"),  # a Sunday
+        ({"SERVICE_DATE": "2026-01-05"}, "SERVICE_DATE must be a YYYYMMDD date"),
+        (
+            {"SERVICE_DATE": "20260105", "FILTER_SERVICE_IDS": ["WKDY"]},
+            "either FILTER_SERVICE_IDS or SERVICE_DATE",
+        ),
+    ],
+    ids=["no-service", "bad-format", "both-set"],
+)
+def test_main_service_date_errors(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, settings: dict[str, Any], message: str
+) -> None:
+    out = tmp_path / "out"
+    assert _run_main(_two_service_feed(tmp_path), out, **settings) == 1
+    assert message in caplog.text
+    assert not list(out.glob("*.xlsx"))
+
+
+def test_movements_on_date_merges_the_active_services_of_each_block() -> None:
+    def leg(trip_id: str, start: int) -> dict[str, Any]:
+        return {"trip_id": trip_id, "start": start, "end": start + 600}
+
+    movements = {
+        ("100", "WKDY"): [leg("PULL-IN", 30000)],
+        ("100", "MON"): [leg("PULL-OUT", 20000)],
+        ("100", "SAT"): [leg("SAT-OUT", 10000)],
+    }
+    merged = movements_on_date(movements, ["MON", "WKDY"], "20260105")
+    assert list(merged) == [("100", "20260105")]
+    assert [m["trip_id"] for m in merged["100", "20260105"]] == ["PULL-OUT", "PULL-IN"]
 
 
 @pytest.mark.parametrize(
@@ -943,6 +1218,8 @@ def _move(trip_id: str, label: str, start: str, end: str, origin: str, dest: str
         "end": time_to_seconds(end),
         "from_stop": origin,
         "to_stop": dest,
+        "from_label": origin,
+        "to_label": dest,
         "from_name": origin,
         "to_name": dest,
     }
@@ -1026,6 +1303,40 @@ def test_tods_movements_fill_the_block_day() -> None:
     assert "Between trips" not in result["Event Type"].tolist()
 
 
+def test_tods_wait_between_deadheads_is_at_the_first_deadheads_destination() -> None:
+    # T1 ends at S2 07:20; deadhead S2 -> D, wait at D, deadhead D -> S1 for T2 at 08:00.
+    movements = [
+        _move("DH1", "Deadhead", "07:20:00", "07:28:00", "S2", "D"),
+        _move("DH2", "Deadhead", "07:38:00", "08:00:00", "D", "S1"),
+    ]
+    result = _rows_with_movements(movements)
+    assert result["Event Type"].tolist() == [
+        "Stop",
+        "Stop",
+        "Deadhead",
+        "Layover",
+        "Deadhead",
+        "Stop",
+    ]
+    wait = result.iloc[3]
+    assert wait[
+        ["Stop ID", "Stop Name", "Scheduled Arrival Time", "Scheduled Departure Time"]
+    ].tolist() == ["D", "D", "07:28", "07:38"]
+
+
+def test_tods_wait_where_movements_do_not_connect_is_between_trips() -> None:
+    # DH2 starts at E, not D where DH1 left the bus, so the wait may include travel.
+    movements = [
+        _move("DH1", "Deadhead", "07:20:00", "07:28:00", "S2", "D"),
+        _move("DH2", "Deadhead", "07:38:00", "08:00:00", "E", "S1"),
+    ]
+    result = _rows_with_movements(movements)
+    wait = result.iloc[3]
+    assert wait["Event Type"] == "Between trips"
+    assert wait["Stop Name"] == "From: D\nTo: E"
+    assert wait["Comments"].startswith("Scheduled gap: 10 min (may include travel)\n")
+
+
 def test_tods_movements_without_gap_rows() -> None:
     movements = [_move("DH", "Deadhead", "07:25:00", "07:45:00", "S2", "S1")]
     result = _rows_with_movements(movements, include_gaps=False)
@@ -1039,14 +1350,27 @@ def test_tods_movement_overlapping_a_trip_is_not_listed(caplog: pytest.LogCaptur
     assert "overlap revenue trips" in caplog.text
 
 
-def test_load_tods_movements_reads_the_mock_supplements() -> None:
-    from scripts.field_tools.printable_block_schedules import load_gtfs_data, load_tods_movements
+def test_build_tods_movements_reads_the_mock_supplements() -> None:
+    from scripts.field_tools.printable_block_schedules import (
+        apply_tods_supplements,
+        build_tods_movements,
+        load_gtfs_data,
+        load_tods_supplements,
+    )
 
-    stops = load_gtfs_data(str(MOCK_GTFS), files=["stops.txt"], dtype=str)["stops"]
-    movements = load_tods_movements(str(MOCK_TODS), stops)
+    gtfs = load_gtfs_data(
+        str(MOCK_GTFS), files=["trips.txt", "stop_times.txt", "stops.txt", "routes.txt"], dtype=str
+    )
+    stops = gtfs["stops"]
+    tods = apply_tods_supplements(gtfs, load_tods_supplements(str(MOCK_TODS)))
+    movements = build_tods_movements(tods["trips"], tods["stop_times"], tods["stops"])
     legs = movements["DC_R20_weekday_BLK001", "weekday"]
     assert [m["label"] for m in legs] == ["Pull-out", "Deadhead", "Pull-in"]
     assert legs[0]["from_name"] == "Mock DC North Garage"  # Named from stops_supplement.
+    # Stop ID labels use stop_code, as for GTFS rows; the garage has none.
+    assert legs[0]["from_label"] == ""
+    codes = dict(zip(stops["stop_id"], stops["stop_code"]))
+    assert legs[0]["to_label"] == codes[legs[0]["to_stop"]]
     assert legs[0]["end"] <= legs[1]["start"] <= legs[1]["end"] <= legs[2]["start"]
 
 

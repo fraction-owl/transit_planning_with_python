@@ -12,7 +12,7 @@ import pandas as pd
 import pytest
 from shapely.geometry import LineString
 
-import scripts.gtfs_exports.pattern_map_exporter_gpd as target
+import scripts.field_tools.pattern_map_exporter_gpd as target
 
 # Stops along 38.90 N from west (A) to east (E); X sits north of the line.
 STOPS = {
@@ -226,6 +226,41 @@ def test_boarding_restrictions_merged_when_split_is_off(tmp_path: Path) -> None:
     assert list(outbound["n_trips"]) == [6, 2, 1, 1]
     assert not any(c.startswith("weekday_") for c in summary.columns)
     assert set(summary["route"]) == {"10"}
+
+
+def test_agencies_sharing_a_route_number_stay_separate(tmp_path: Path) -> None:
+    feed = _write_feed(tmp_path)
+    # A second agency's Route 10 runs the same stops on the same shape.
+    (feed / "routes.txt").write_text(
+        "route_id,agency_id,route_short_name,route_long_name,route_type\n"
+        "R10,AA,10,Main Street,3\n"
+        "R20,AA,20,Crosstown,3\n"
+        "B10,BB,10,Beta Line,3\n",
+        encoding="utf-8",
+    )
+    with (feed / "trips.txt").open("a", encoding="utf-8") as handle:
+        handle.write("B10,WKD,TB1,0,SH_MAIN,East\n")
+    with (feed / "stop_times.txt").open("a", encoding="utf-8") as handle:
+        handle.write("\n".join(_stop_rows("TB1", ["A", "B", "C", "D", "E"], 18)) + "\n")
+
+    out = tmp_path / "out"
+    summary = target.run(gtfs_path=feed, output_dir=out, route_names=["10"], day_types=[])
+    beta = summary[summary["agency_id"] == "BB"]
+    assert list(
+        beta[["route", "route_ids", "route_long_name", "pattern_id", "n_trips"]].iloc[0]
+    ) == [
+        "10",
+        "B10",
+        "Beta Line",
+        "P1",
+        1,
+    ]
+    alpha_main = _pattern(summary, "10", "0", 5, agency_id="AA", pattern_id="P1")
+    assert (alpha_main["route_ids"], alpha_main["n_trips"]) == ("R10", 5)
+    assert beta["map_file"].iloc[0] == "pattern_maps/route_10_BB_dir0.png"
+    assert alpha_main["map_file"] == "pattern_maps/route_10_AA_dir0.png"
+    stops = pd.read_csv(out / target.STOPS_FILENAME, dtype=str)
+    assert len(stops[(stops["agency_id"] == "BB") & (stops["pattern_id"] == "P1")]) == 5
 
 
 def test_service_filter_limits_trips(tmp_path: Path) -> None:

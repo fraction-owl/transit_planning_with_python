@@ -402,6 +402,20 @@ def test_load_ipeds_wide_missing_graduate_level_is_nan(staged_dir: Path) -> None
     assert pd.isna(df.set_index("UNITID").loc["163426", "g_graduate"])
 
 
+def test_load_ipeds_wide_blank_total_stays_nan(tmp_path: Path) -> None:
+    # A blank EFYTOTLT cell is unknown enrollment, not zero students; the level
+    # breakout from the same institution's other rows must survive alongside it.
+    raw = pd.read_csv(FIXTURE_DIR / "effy2019_sample.csv", dtype=str)
+    raw.loc[(raw["UNITID"] == "232186") & (raw["EFFYLEV"] == "1"), "EFYTOTLT"] = ""
+    edited = tmp_path / "effy2019_blank_total.csv"
+    raw.to_csv(edited, index=False)
+    df = mod._load_ipeds_wide(edited, mod.SCHOOL_TYPES["postsec"])
+    row = df.set_index("UNITID").loc["232186"]
+    assert pd.isna(row["enroll_total"])
+    assert row["g_undergrad"] == 34722
+    assert row["g_graduate"] == 13956
+
+
 def test_enrollment_postsec_auto_uses_ipeds(staged_dir: Path) -> None:
     df = mod.load_enrollment_wide(staged_dir, "postsec", source="auto")
     assert set(df["UNITID"]) == POSTSEC_IPEDS_MATCHED | {POSTSEC_IPEDS_ORPHAN}

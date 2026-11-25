@@ -270,6 +270,9 @@ class OLSResult(NamedTuple):
         durbin_watson: Durbin-Watson autocorrelation statistic.
         condition_number: Condition number of the scaled design matrix.
         se_type: Standard-error estimator used ("classical" or "HC1").
+        dropped_terms: Predictors pruned for a VIF above the threshold.
+        constant_terms: Predictors dropped before fitting because they took
+            one value in every model row (see :func:`drop_constant_terms`).
     """
 
     term_names: list[str]
@@ -298,6 +301,7 @@ class OLSResult(NamedTuple):
     condition_number: float
     se_type: str
     dropped_terms: tuple[str, ...] = ()
+    constant_terms: tuple[str, ...] = ()
 
 
 # =============================================================================
@@ -561,16 +565,21 @@ def select_predictors(
         categoricals: Categorical predictors (kept even though non-numeric).
 
     Returns:
-        The ordered list of predictor column names.
+        The ordered list of predictor column names. Categoricals are always
+        included, after the explicit predictors when *explicit* leaves them out.
 
     Raises:
-        KeyError: If any explicitly named predictor is absent from ``df``.
+        KeyError: If any explicitly named or categorical predictor is absent
+            from ``df``.
     """
     if explicit:
-        missing = [c for c in explicit if c not in df.columns]
+        # Categoricals must reach the design matrix to be encoded, even when the
+        # explicit list leaves them out.
+        predictors = [*explicit, *(c for c in categoricals if c not in explicit)]
+        missing = [c for c in predictors if c not in df.columns]
         if missing:
             raise KeyError(f"Configured predictors not found in data: {missing}")
-        return list(explicit)
+        return predictors
 
     auto = [
         c
@@ -686,11 +695,50 @@ def build_design_matrix(
 # =============================================================================
 
 
+def _zero_variance_columns(x_matrix: np.ndarray) -> list[int]:
+    """Return the indices of non-intercept columns holding one value in every row."""
+    return [j for j in range(1, x_matrix.shape[1]) if np.ptp(x_matrix[:, j]) == 0]
+
+
+def drop_constant_terms(
+    x_matrix: np.ndarray, term_names: list[str]
+) -> tuple[np.ndarray, list[str], tuple[str, ...]]:
+    """Remove predictors that take one value in every model row, with a warning.
+
+    A constant predictor (zero snowfall when only warm-weather months are
+    modeled, say) duplicates the intercept, so its effect cannot be estimated:
+    the normal equations are singular and a VIF cannot be calculated for it.
+
+    Args:
+        x_matrix: Design matrix with the intercept in column 0.
+        term_names: Column labels aligned with ``x_matrix``.
+
+    Returns:
+        A tuple ``(x_matrix, term_names, dropped)`` without the constant
+        columns; ``dropped`` names them (empty when none).
+    """
+    constant = _zero_variance_columns(x_matrix)
+    if not constant:
+        return x_matrix, list(term_names), ()
+    dropped = tuple(term_names[j] for j in constant)
+    logging.warning(
+        "Dropped %d predictor(s) with the same value in all %d model rows (zero "
+        "variance), before the VIF check and fit; their effect cannot be estimated "
+        "from this data: %s.",
+        len(dropped),
+        x_matrix.shape[0],
+        ", ".join(dropped),
+    )
+    keep = [j for j in range(x_matrix.shape[1]) if j not in constant]
+    return x_matrix[:, keep], [term_names[j] for j in keep], dropped
+
+
 def _variance_inflation_factors(x_matrix: np.ndarray, term_names: list[str]) -> dict[str, float]:
     """Compute VIFs for every non-intercept column of the design matrix.
 
     Each predictor is regressed on the remaining predictors (intercept
-    included); ``VIF = 1 / (1 - R^2)``.
+    included); ``VIF = 1 / (1 - R^2)``. A predictor with zero variance is
+    perfectly collinear with the intercept, so its VIF is ``inf``.
 
     Args:
         x_matrix: Design matrix with the intercept in column 0.
@@ -703,12 +751,15 @@ def _variance_inflation_factors(x_matrix: np.ndarray, term_names: list[str]) -> 
     n_terms = x_matrix.shape[1]
     for j in range(1, n_terms):  # skip intercept
         target = x_matrix[:, j]
+        ss_tot = float(((target - target.mean()) ** 2).sum())
+        if ss_tot <= 0:
+            vif[term_names[j]] = float("inf")
+            continue
         others = np.delete(x_matrix, j, axis=1)  # keeps the intercept column
         beta, _, _, _ = np.linalg.lstsq(others, target, rcond=None)
         resid = target - others @ beta
         ss_res = float(resid @ resid)
-        ss_tot = float(((target - target.mean()) ** 2).sum())
-        r_sq = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+        r_sq = 1.0 - ss_res / ss_tot
         vif[term_names[j]] = float("inf") if r_sq >= 1.0 else 1.0 / (1.0 - r_sq)
     return vif
 
@@ -740,8 +791,9 @@ def fit_ols(
         A populated :class:`OLSResult`.
 
     Raises:
-        ValueError: If there are fewer observations than parameters, or
-            ``se_type`` is not recognized.
+        ValueError: If there are fewer observations than parameters,
+            ``se_type`` is not recognized, or a predictor has zero variance
+            (remove it first with :func:`drop_constant_terms`).
     """
     n_obs, n_params = x_matrix.shape
     if n_obs <= n_params:
@@ -751,6 +803,12 @@ def fit_ols(
         )
     if se_type not in {"classical", "HC1", "HC3"}:
         raise ValueError(f"SE_TYPE must be 'classical', 'HC1', or 'HC3', got '{se_type}'.")
+    constant = [term_names[j] for j in _zero_variance_columns(x_matrix)]
+    if constant:
+        raise ValueError(
+            f"Predictor(s) {constant} have the same value in every row, so their effect "
+            "cannot be estimated; drop them before fitting."
+        )
 
     beta, _, _, _ = np.linalg.lstsq(x_matrix, y, rcond=None)
     fitted = x_matrix @ beta
@@ -929,6 +987,7 @@ def build_summary_frame(result: OLSResult, dependent: str, log_dependent: bool) 
         ("condition_number", round(result.condition_number, 1)),
         ("se_type", result.se_type),
         ("dropped_for_collinearity", ", ".join(result.dropped_terms) or "none"),
+        ("dropped_zero_variance", ", ".join(result.constant_terms) or "none"),
     ]
     return pd.DataFrame(metrics, columns=["metric", "value"])
 
@@ -1250,10 +1309,12 @@ def main() -> int:
 
     # === STEP 3: FIT OLS =====================================================
     logging.info("=== STEP 3: FIT OLS (%s standard errors) ===", SE_TYPE)
+    x_matrix, term_names, constant_terms = drop_constant_terms(x_matrix, term_names)
     if DROP_HIGH_VIF:
         result = prune_collinear(y, x_matrix, term_names, VIF_THRESHOLD, SE_TYPE)
     else:
         result = fit_ols(y, x_matrix, term_names, SE_TYPE)
+    result = result._replace(constant_terms=constant_terms)
     log_model_report(result)
 
     high_vif = {k: v for k, v in result.vif.items() if v > VIF_THRESHOLD}

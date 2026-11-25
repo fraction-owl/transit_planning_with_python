@@ -1003,6 +1003,33 @@ def test_pass_per_hour_divides_total_boardings_by_total_hours(tmp_path: Path) ->
     assert row["pass_per_hour"] == pytest.approx(10.0)
 
 
+@pytest.mark.parametrize("reverse", [False, True])
+def test_pass_per_hour_reads_timestamps_with_and_without_milliseconds(
+    tmp_path: Path, reverse: bool
+) -> None:
+    """Runs stamped with and without milliseconds both count, in either input order."""
+    with_ms = _trip("2026-03-02", "A1", "A")
+    for col in ("schedule_trip_start", "schedule_trip_end", "actual_trip_start", "actual_trip_end"):
+        with_ms[col] += ".000"
+    trips = [with_ms, _trip("2026-03-09", "A2", "A")]
+    visits = [_visit("2026-03-02", "A1", 1, 2), _visit("2026-03-09", "A2", 1, 20)]
+    if reverse:
+        trips, visits = trips[::-1], visits[::-1]
+    result, _ = _synthetic_run(tmp_path, trips, visits)
+    row = result.trip_rows.iloc[0]
+    assert (row["avg_daily_boardings"], row["days_observed"]) == (11.0, 2)
+    assert row["pass_per_hour"] == pytest.approx(11.0)
+
+
+def test_parse_utc_timestamps_reads_mixed_iso_forms() -> None:
+    """Fractional seconds, Z, offsets and blanks parse together to UTC."""
+    stamps = target.parse_utc_timestamps(
+        pd.Series(["2026-03-02T08:00:00.500", "2026-03-02T09:00:00Z", "2026-03-02T05:00-05:00", ""])
+    )
+    assert stamps.iloc[:3].dt.hour.tolist() == [8, 9, 10]
+    assert pd.isna(stamps.iloc[3])
+
+
 def test_duplicate_stop_visits_are_removed_or_flagged(tmp_path: Path) -> None:
     """Exact duplicates are dropped; conflicting ones keep the first and flag the date."""
     trips = [_trip("2026-03-02", "A", "A"), _trip("2026-03-09", "B", "A")]

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 import zipfile
 from pathlib import Path
@@ -212,6 +213,24 @@ def test_normalize_street_name_collapses_spaces() -> None:
     assert "  " not in result
 
 
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("St Johns Rd", "st johns"),
+        ("Johns Rd", "johns"),
+        ("St Paul St", "st paul"),
+        ("Mount St Albans Rd", "mount st albans"),
+        ("N St Johns Rd", "n st johns"),
+        ("N St NW", "n nw"),
+        ("St", "st"),
+    ],
+)
+def test_normalize_street_name_strips_only_last_non_leading_modifier(
+    name: str, expected: str
+) -> None:
+    assert target.normalize_street_name(name, {"st", "rd"}) == expected
+
+
 # ---------------------------------------------------------------------------
 # extract_modifiers
 # ---------------------------------------------------------------------------
@@ -270,6 +289,46 @@ def test_extract_street_names_splits_on_ampersand() -> None:
 )
 def test_extract_street_names_splits_symbols_without_spaces(stop_name: str) -> None:
     assert target.extract_street_names(stop_name, {"st"}) == ["mainn", "elm"]
+
+
+@pytest.mark.parametrize(
+    "stop_name",
+    [
+        "Richmond Hwy at Lockhed Blvd",
+        "RICHMOND HWY AT LOCKHED BLVD",
+        "Intersection of Richmond Hwy and Lockhed Blvd",
+        "Intersection of Richmond Hwy & Lockhed Blvd",
+    ],
+)
+def test_extract_street_names_splits_at_and_leading_intersection_of(stop_name: str) -> None:
+    assert target.extract_street_names(stop_name, {"hwy", "blvd"}) == ["richmond", "lockhed"]
+
+
+def test_extract_street_names_keeps_at_inside_words() -> None:
+    assert target.extract_street_names("Battery Ln", {"ln"}) == ["battery"]
+
+
+@pytest.mark.parametrize(
+    ("stop_name", "road"), [("St Johns Rd", "Johns Rd"), ("Johns Rd", "St Johns Rd")]
+)
+def test_compare_stop_to_roads_flags_saint_dropped_or_added(stop_name: str, road: str) -> None:
+    # Stripping every "St" made both names "johns", so the exact-match skip hid them.
+    mods = {"st", "rd"}
+    streets = target.extract_street_names(stop_name, mods)
+    roads = {target.normalize_street_name(road, mods): {road}}
+    typos = target.compare_stop_to_roads("1", stop_name, streets, roads, 80)
+    assert [t["similar_road_name_original"] for t in typos] == [road]
+
+
+def test_compare_stop_to_roads_flags_typo_after_at() -> None:
+    # Unsplit, "richmond at lockhed" scored 100 against "richmond" (token subset)
+    # and 51.9 against "lockheed", so the typo was missed and Richmond misreported.
+    streets = target.extract_street_names("Richmond Hwy at Lockhed Blvd", {"hwy", "blvd"})
+    roads = {"richmond": {"Richmond Hwy"}, "lockheed": {"Lockheed Blvd"}}
+    typos = target.compare_stop_to_roads("1", "Richmond Hwy at Lockhed Blvd", streets, roads, 80)
+    assert [(t["street_in_stop_name"], t["similar_road_name_original"]) for t in typos] == [
+        ("lockhed", "Lockheed Blvd")
+    ]
 
 
 def test_extract_street_names_single_name() -> None:
@@ -396,6 +455,31 @@ def test_process_typos_empty_when_no_nearby_roads() -> None:
     empty_join = pd.DataFrame(columns=["stop_id", "FULLNAME", "FULLNAME_clean"])
     result = target.process_typos(stops_gdf, set(), empty_join, 80)
     assert result.empty
+
+
+def test_process_typos_logs_stops_not_assessed(caplog: pytest.LogCaptureFixture) -> None:
+    stops_df = _make_stops_df(
+        [
+            {"stop_id": sid, "stop_name": "Mainn St", "stop_lat": "38.9", "stop_lon": "-77.0"}
+            for sid in ("S1", "S2", "S3")
+        ]
+    )
+    stops_gdf = target.load_stops(stops_df).to_crs(TARGET_CRS)
+    # S1 has a named road; S2 matched nothing (left-join row with no road);
+    # S3's only road has a blank name, which cannot match any street.
+    join_gdf = pd.DataFrame(
+        {
+            "stop_id": ["S1", "S2", "S3"],
+            "FULLNAME": ["Main St", None, ""],
+            "FULLNAME_clean": ["main", None, ""],
+        }
+    )
+    caplog.set_level(logging.INFO)
+    result = target.process_typos(stops_gdf, {"st"}, join_gdf, 80)
+    assert result["stop_id"].tolist() == ["S1"]
+    assert "2 of 3 stop(s) had no named road within the buffer and were not assessed." in (
+        caplog.text
+    )
 
 
 def test_process_typos_respects_buffer_scoping() -> None:
@@ -531,13 +615,16 @@ def test_integration_dc_load_and_process(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _run_main(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stop_name: str) -> pd.DataFrame:
+def _run_main(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stop_name: str, stop_y: float = 4_300_000
+) -> pd.DataFrame:
     gtfs = tmp_path / "gtfs"
     gtfs.mkdir(exist_ok=True)
-    # Stop sits on the road below, ~50 m north of the UTM 18N origin line.
+    # By default the stop sits on the road below, ~50 m north of the UTM 18N
+    # origin line; a larger stop_y moves it away from the road.
     stops = gpd.GeoDataFrame(
         {"stop_id": ["NA"], "stop_name": [stop_name]},
-        geometry=[Point(500_000, 4_300_000)],
+        geometry=[Point(500_000, stop_y)],
         crs=TARGET_CRS,
     ).to_crs("EPSG:4326")
     pd.DataFrame(
@@ -586,6 +673,29 @@ def test_main_custom_mapping_utm_na_id_and_clean_rerun(
     second = _run_main(tmp_path, monkeypatch, "Main Rd")
     assert second.empty
     assert "stop_id" in second.columns
+
+
+def test_main_logs_join_counts_for_stop_on_road(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO)
+    _run_main(tmp_path, monkeypatch, "Mainn Rd")
+    assert "Spatial join found 1 stop-road intersection(s) across 1 of 1 stop(s)." in caplog.text
+    assert "not assessed" not in caplog.text
+
+
+def test_main_logs_join_counts_when_no_stop_is_near_a_road(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The left join keeps the unmatched stop as one row; it used to be logged
+    # as "1 candidate matches".
+    caplog.set_level(logging.INFO)
+    out = _run_main(tmp_path, monkeypatch, "Mainn Rd", stop_y=4_310_000)
+    assert out.empty
+    assert "Spatial join found 0 stop-road intersection(s) across 0 of 1 stop(s)." in caplog.text
+    assert "1 of 1 stop(s) had no named road within the buffer and were not assessed." in (
+        caplog.text
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -580,7 +580,7 @@ def describe_output(
     """
     spec = script_outputs.get(file.name) or global_outputs.get(file.name)
     # Convention: a registry spec with empty keep_cols deliberately drops an
-    # intermediate from bundling (e.g. the panel otp_monthly_panel writes,
+    # intermediate from bundling (e.g. the route x month table otp_runtime_from_tides writes,
     # which otp_by_route consumes but must not become a bundle of its own).
     if spec is not None and not spec["keep_cols"]:
         logging.info(

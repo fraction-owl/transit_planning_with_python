@@ -11,8 +11,11 @@ At a high level, the script:
     stops as the representative pattern (its stop sequence and its shape).
   - Builds ordered logical stop sequences using a configurable stop key
     (stop_id or stop_code).
-  - Treats a configurable set of base routes as references and compares each
-    base (route_id, direction_id) against all other route/direction pairs.
+  - Compares every pair of route/directions that includes a target route
+    (all routes by default) in both directions, so it reports stops the
+    target route skips and stops the overlapping route skips. A route that
+    serves the shared stops in the opposite order is not used as a reference
+    by default.
   - Identifies segments bounded by shared stops where one route has a small
     number of interior stops that the other route does not serve, flagging
     these as potential skipped-stop issues.
@@ -30,8 +33,9 @@ All files are written under ``OUTPUT_DIR``:
   per missing route + candidate stop).
 - ``intra_route_skipped_stops.csv``: intra-route trip-level skipped-stop
   findings.
-- ``segment_plots/``: PNG maps of flagged segments plus per-route overview
-  plots.
+- ``segment_plots/run_<timestamp>/``: PNG maps of flagged segments plus
+  per-route overview plots. Each run writes to a new folder, so plots from an
+  earlier run never sit beside the current CSVs.
 
 Typical usage
 -------------
@@ -41,7 +45,6 @@ Jupyter notebook.
 
 from __future__ import annotations
 
-import itertools
 import logging
 import os
 import re
@@ -50,13 +53,16 @@ from collections import Counter
 from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import IO, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, cast
+from typing import IO, Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, cast
 
 import geopandas as gpd
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 from matplotlib.axes import Axes
+from pyproj import CRS
 from shapely.errors import GEOSException
 from shapely.geometry import LineString, Point
 from shapely.geometry.base import BaseGeometry
@@ -72,7 +78,9 @@ from shapely.ops import substring
 #   - stops.txt
 #   - trips.txt
 #   - stop_times.txt
-#   - (optionally shapes.txt, routes.txt if you extend later)
+#   - routes.txt
+#   - shapes.txt (optional; without it only the within-route check can
+#     report skipped stops, and the log says which checks did not run)
 GTFS_DIR = Path("/path/to/gtfs_directory")
 
 # Output directory and filenames.
@@ -86,10 +94,13 @@ AGGREGATE_FILENAME = "stop_suspicion_scores.csv"
 # Intra-route trip-level skipped-stop findings.
 INTRA_ROUTE_FILENAME = "intra_route_skipped_stops.csv"
 
-# Subfolder for PNG plots.
+# Subfolder for PNG plots. Each run writes its plots to a new
+# run_<timestamp> folder inside it.
 PLOT_DIR = OUTPUT_DIR / "segment_plots"
 
-# CRS settings.
+# CRS settings. PROJECTED_CRS must be a projected CRS. The distance settings
+# below are in metres whatever its unit; they are converted to that unit (e.g.,
+# US survey feet for EPSG:2283) before geometries are compared.
 GTFS_CRS = "EPSG:4326"
 PROJECTED_CRS = "EPSG:26918"  # NAD83 / UTM 18N (Mid-Atlantic US).
 
@@ -109,10 +120,27 @@ ROUTE_ID_WHITELIST: Set[str] = set()
 
 # Target routes: leave empty to analyze all routes, or specify a subset.
 # Example: {"101"} or {"101", "202"}.
+# Each pair of routes that includes a target route is checked both ways: stops
+# the target route skips, and stops the other route skips that the target
+# route serves.
 TARGET_ROUTE_IDS: Set[str] = set()
 
 # Minimum number of shared logical stops between two routes to consider the pair.
 MIN_SHARED_STOPS_FOR_PAIR = 2
+
+# Route pairs whose shared stops are all terminals on both routes are skipped
+# when either route has no shape, because nothing can confirm that the routes
+# take the same path between those terminals. When both shapes exist, the
+# segment geometry checks (MAX_SHAPE_HAUSDORFF_M, MAX_STOP_TO_SHAPE_M) decide.
+# Set to False to compare every such pair.
+SKIP_TERMINAL_ONLY_PAIRS = True
+
+# A reference route that serves the shared stops in the opposite order (judged
+# from the stop sequences, since direction_id can differ between routes on the
+# same corridor) can serve stops on the opposite curb that the route under
+# review has no reason to serve. Such pairs are skipped by default. Set to True
+# to compare them anyway, with the reference's stop order reversed.
+COMPARE_REVERSED_REFERENCES = False
 
 # Minimum index distance (in stops) between boundary stops to treat as a segment.
 # For example, 2 means there must be at least one interior stop on at least one route.
@@ -173,6 +201,9 @@ class GTFSContext:
     route_sequences: Dict[RouteKey, List[str]]
     route_shapes_geo: Dict[RouteKey, LineString]
     route_shapes_proj: Dict[RouteKey, LineString]
+    # Per route with a shape: distance along it of each visit in its sequence
+    # (see locate_stops_along_shape).
+    route_stop_measures: Dict[RouteKey, List[Optional[float]]]
 
     all_route_keys: List[RouteKey]
     base_route_keys: List[RouteKey]
@@ -348,33 +379,40 @@ def normalize_direction_id(series: pd.Series) -> pd.Series:
     return numeric.astype("Int64").astype(str)
 
 
+SHAPES_COLUMNS: List[str] = ["shape_id", "shape_pt_lat", "shape_pt_lon", "shape_pt_sequence"]
+
+
 def load_gtfs_tables(gtfs_dir: Path) -> Dict[str, pd.DataFrame]:
-    """Load required GTFS tables from a feed folder or ``.zip``.
+    """Load the GTFS tables this script uses from a feed folder or ``.zip``.
 
     Every column is read as text, so identifiers keep their exact spelling in
     every table ("001" stays "001", "10" never becomes "10.0", and "NA" is not
     treated as missing). Coordinate and sequence fields are then converted to
     numbers explicitly. direction_id is optional; when trips.txt lacks it,
-    each route's trips are treated as a single direction.
+    each route's trips are treated as a single direction. shapes.txt and
+    trips.txt's shape_id column are optional too; when either is absent, no
+    route has a shape (see warn_about_routes_without_shapes).
 
     Args:
         gtfs_dir: GTFS feed folder, or a ``.zip`` of the feed.
 
     Returns:
-        Dictionary mapping table name to DataFrame.
+        Dictionary mapping table name to DataFrame. "shapes" is an empty
+        table with the shapes.txt columns when the feed has no shapes.txt.
 
     Raises:
         FileNotFoundError: If required GTFS files are missing.
         ValueError: If a file cannot be parsed as CSV, or *gtfs_dir* is
             neither a folder nor a valid ``.zip``.
     """
-    required_files = {
+    gtfs_files = {
         "stops": "stops.txt",
         "trips": "trips.txt",
         "stop_times": "stop_times.txt",
         "shapes": "shapes.txt",
         "routes": "routes.txt",
     }
+    optional_files = {"shapes"}
     numeric_fields = {
         "stops": ("stop_lat", "stop_lon"),
         "stop_times": ("stop_sequence",),
@@ -382,13 +420,16 @@ def load_gtfs_tables(gtfs_dir: Path) -> Dict[str, pd.DataFrame]:
     }
 
     tables: Dict[str, pd.DataFrame] = {}
-    for key, filename in required_files.items():
+    for key, filename in gtfs_files.items():
         try:
             with open_gtfs_file(gtfs_dir, filename) as handle:
                 table = pd.read_csv(handle, dtype=str, keep_default_na=False)
         except FileNotFoundError as exc:
-            msg = f"Required GTFS file not found: {exc}"
-            raise FileNotFoundError(msg) from exc
+            if key not in optional_files:
+                msg = f"Required GTFS file not found: {exc}"
+                raise FileNotFoundError(msg) from exc
+            logging.warning("%s not found; continuing without route shapes.", filename)
+            table = pd.DataFrame(columns=SHAPES_COLUMNS, dtype=str)
         for column in numeric_fields.get(key, ()):
             if column in table.columns:
                 table[column] = pd.to_numeric(table[column], errors="coerce")
@@ -401,6 +442,9 @@ def load_gtfs_tables(gtfs_dir: Path) -> Dict[str, pd.DataFrame]:
             "analyzed as a single direction."
         )
         trips["direction_id"] = ""
+    if "shape_id" not in trips.columns:
+        logging.warning("trips.txt has no shape_id column; no trip has a shape.")
+        trips["shape_id"] = ""
 
     trips["direction_id"] = normalize_direction_id(trips["direction_id"])
     trips["route_id"] = trips["route_id"].astype(str)
@@ -461,7 +505,11 @@ def build_shapes_gdf(shapes_df: pd.DataFrame, crs: str) -> gpd.GeoDataFrame:
             continue
         records.append({"shape_id": str(shape_id), "geometry": LineString(points)})
 
-    shapes_gdf = gpd.GeoDataFrame(records, crs=crs)
+    # The explicit columns keep an empty table (a feed without shapes.txt)
+    # indexable by shape_id.
+    shapes_gdf = gpd.GeoDataFrame(
+        records, columns=["shape_id", "geometry"], geometry="geometry", crs=crs
+    )
     shapes_gdf = shapes_gdf.set_index("shape_id")
     return shapes_gdf
 
@@ -880,81 +928,184 @@ def shares_only_terminal_stops(
     return True
 
 
-def segment_hausdorff_distance(
-    base_key: RouteKey,
-    other_key: RouteKey,
-    start_key: str,
-    end_key: str,
-    shapes_proj: Mapping[RouteKey, LineString],
+def crs_metres_per_unit(crs: Any) -> float:
+    """Return metres per linear unit of *crs* (1.0 for metres, ~0.3048 for feet).
+
+    A missing CRS (``None``) is treated as metres, the historical assumption.
+
+    Raises:
+        ValueError: If *crs* is set but is not a projected CRS.
+    """
+    if crs is None:
+        return 1.0
+    parsed = CRS.from_user_input(crs)
+    if not parsed.is_projected or not parsed.axis_info:
+        raise ValueError(f"{parsed.name} is not a projected CRS; distances need one.")
+    return float(parsed.axis_info[0].unit_conversion_factor)
+
+
+# Distance along a shape from its start to each of a route's stop visits, in
+# the projected CRS's units; None for a visit whose stop has no location.
+VisitMeasures = List[Optional[float]]
+
+
+def locate_stops_along_shape(
+    seq: Sequence[str],
+    shape: LineString,
     stops_gdf_proj: gpd.GeoDataFrame,
-    padding_m: float,
-) -> Optional[float]:
-    """Compute Hausdorff distance between the route shapes over a segment.
+    tolerance: float,
+) -> VisitMeasures:
+    """Locate each stop visit along its trip's shape, in trip order.
 
-    The segment is defined by the stop pair (start_key, end_key). For each
-    route, we:
-
-      - Project the start/end stop points onto the route's projected shape
-        (distance along the line).
-      - Extract the substring between those measures, expanded by `padding_m`
-        on both sides, clipped to [0, length].
-      - Compute Hausdorff distance between the two substrings.
+    Projecting each stop onto the whole shape on its own puts a stop the
+    route passes twice on the first pass: the closing stop of a loop that
+    ends where it starts lands at the start of the shape. Instead, every
+    pass of the shape that comes within *tolerance* of a stop's closest
+    approach is a candidate position for that visit, and the candidates are
+    chosen together (by dynamic programming) to minimise the visits'
+    distances from the shape plus any distance the chosen positions run
+    backwards along it. Each visit thus lands on its nearest pass unless
+    that would contradict the stop order, and one stop drawn slightly closer
+    to a later pass cannot pull every visit after it ahead.
 
     Args:
-        base_key: (route_id, direction_id) for the base route.
-        other_key: (route_id, direction_id) for the other route.
-        start_key: Logical stop key for the segment start.
-        end_key: Logical stop key for the segment end.
-        shapes_proj: Mapping from route key to projected LineString.
+        seq: Ordered stop keys of the trip the shape belongs to.
+        shape: That trip's shape, in PROJECTED_CRS.
         stops_gdf_proj: Stops GeoDataFrame in PROJECTED_CRS, indexed by stop key.
-        padding_m: Padding (meters) to extend the segment on each side along
-            the shape.
+        tolerance: Distance, in PROJECTED_CRS units, by which a pass may be
+            farther from a stop than its closest pass and still be a
+            candidate position.
 
     Returns:
-        Hausdorff distance in meters between the segment substrings, or None if
-        shapes or stop geometries are missing or degenerate.
+        One distance along the shape per visit in seq, or None for a visit
+        whose stop is not in stops_gdf_proj.
     """
-    base_shape = shapes_proj.get(base_key)
-    other_shape = shapes_proj.get(other_key)
-    if base_shape is None or other_shape is None:
+    coords = np.asarray(shape.coords, dtype=float)[:, :2]
+    starts = coords[:-1]
+    vectors = coords[1:] - starts
+    lengths = np.hypot(vectors[:, 0], vectors[:, 1])
+    safe_lengths = np.where(lengths > 0, lengths, 1.0)
+    start_measures = np.concatenate(([0.0], np.cumsum(lengths)[:-1]))
+
+    # Candidate (measures, distances) per visit; None for unlocated stops.
+    candidates: List[Optional[Tuple[np.ndarray, np.ndarray]]] = []
+    for stop_key in seq:
+        if stop_key not in stops_gdf_proj.index:
+            candidates.append(None)
+            continue
+        stop_geom = cast("Point", stops_gdf_proj.loc[stop_key, "geometry"])
+        point = np.array([stop_geom.x, stop_geom.y])
+        # Closest point of each shape segment to the stop.
+        fraction = np.clip(((point - starts) * vectors).sum(axis=1) / safe_lengths**2, 0.0, 1.0)
+        offsets = starts + fraction[:, None] * vectors - point
+        distances = np.hypot(offsets[:, 0], offsets[:, 1])
+        # Each run of consecutive near segments is one pass; keep its closest point.
+        near = np.concatenate(([0], (distances <= distances.min() + tolerance).astype(int), [0]))
+        edges = np.flatnonzero(np.diff(near))
+        best = [a + int(np.argmin(distances[a:b])) for a, b in zip(edges[::2], edges[1::2])]
+        candidates.append((start_measures[best] + fraction[best] * lengths[best], distances[best]))
+
+    located = [i for i, cand in enumerate(candidates) if cand is not None]
+    measures: VisitMeasures = [None] * len(seq)
+    if not located:
+        return measures
+
+    # cost[c]: least total cost of the visits so far, ending at candidate c.
+    back_pointers: List[np.ndarray] = []
+    prev_measures = cost = np.empty(0)
+    for step, i in enumerate(located):
+        cand_measures, cand_distances = cast("Tuple[np.ndarray, np.ndarray]", candidates[i])
+        if step == 0:
+            cost = cand_distances
+            back_pointers.append(np.zeros(len(cand_measures), dtype=int))
+        else:
+            backtrack = np.maximum(prev_measures[:, None] - cand_measures[None, :], 0.0)
+            totals = cost[:, None] + backtrack
+            back_pointers.append(totals.argmin(axis=0))
+            cost = totals.min(axis=0) + cand_distances
+        prev_measures = cand_measures
+
+    choice = int(cost.argmin())
+    for step in range(len(located) - 1, -1, -1):
+        i = located[step]
+        measures[i] = float(cast("Tuple[np.ndarray, np.ndarray]", candidates[i])[0][choice])
+        choice = int(back_pointers[step][choice])
+    return measures
+
+
+def _visit_span(
+    measures: Optional[Sequence[Optional[float]]], i0: int, i1: int
+) -> Optional[Tuple[float, float]]:
+    """Return the measures of visits i0 and i1, or None if either is unknown."""
+    if measures is None:
         return None
-
-    if start_key not in stops_gdf_proj.index or end_key not in stops_gdf_proj.index:
+    m0, m1 = measures[i0], measures[i1]
+    if m0 is None or m1 is None:
         return None
+    return m0, m1
 
-    start_pt = stops_gdf_proj.loc[start_key, "geometry"]
-    end_pt = stops_gdf_proj.loc[end_key, "geometry"]
 
-    # Measures along base shape.
-    m0_base = float(base_shape.project(start_pt))
-    m1_base = float(base_shape.project(end_pt))
-    if m0_base == m1_base:
+def _shape_between_measures(
+    shape: Optional[LineString],
+    span: Optional[Tuple[float, float]],
+    padding: float,
+) -> Optional[BaseGeometry]:
+    """Return the part of a shape between two measures, padded along the line.
+
+    Args:
+        shape: Projected route shape, or None.
+        span: Distances along the shape of the segment's boundary visits (see
+            locate_stops_along_shape), or None.
+        padding: Distance (PROJECTED_CRS units) to extend the substring past
+            each end, clipped to the shape.
+
+    Returns:
+        The substring geometry, or None if the shape or span is missing or
+        the substring cannot be built.
+    """
+    if shape is None or span is None:
         return None
-    if m0_base > m1_base:
-        m0_base, m1_base = m1_base, m0_base
-    m0_base = max(0.0, m0_base - padding_m)
-    m1_base = min(base_shape.length, m1_base + padding_m)
-
-    # Measures along other shape.
-    m0_other = float(other_shape.project(start_pt))
-    m1_other = float(other_shape.project(end_pt))
-    if m0_other == m1_other:
-        return None
-    if m0_other > m1_other:
-        m0_other, m1_other = m1_other, m0_other
-    m0_other = max(0.0, m0_other - padding_m)
-    m1_other = min(other_shape.length, m1_other + padding_m)
-
-    # Extract substrings.
+    lo, hi = min(span), max(span)
     try:
-        seg_base = substring(base_shape, m0_base, m1_base)
-        seg_other = substring(other_shape, m0_other, m1_other)
+        segment = substring(shape, max(0.0, lo - padding), min(shape.length, hi + padding))
     except (GEOSException, ValueError, TypeError):  # defensive: geometries can be weird
         return None
+    return None if segment.is_empty else segment
 
-    if seg_base.is_empty or seg_other.is_empty:
+
+def segment_hausdorff_distance(
+    base_shape: Optional[LineString],
+    base_span: Optional[Tuple[float, float]],
+    other_shape: Optional[LineString],
+    other_span: Optional[Tuple[float, float]],
+    padding: float,
+) -> Optional[float]:
+    """Compute Hausdorff distance between two route shapes over a segment.
+
+    Each route's part of the segment runs between the distances along its
+    shape of the segment's boundary visits (see locate_stops_along_shape),
+    extended by *padding* on both sides and clipped to the shape.
+
+    Args:
+        base_shape: Projected shape of the base route, or None.
+        base_span: Distances along base_shape of the boundary visits, or None.
+        other_shape: Projected shape of the other route, or None.
+        other_span: Distances along other_shape of the boundary visits, or None.
+        padding: Distance (PROJECTED_CRS units) to extend each part along its
+            shape.
+
+    Returns:
+        Hausdorff distance in PROJECTED_CRS units between the two parts, or
+        None if a shape or span is missing or degenerate.
+    """
+    if base_span is None or other_span is None:
         return None
-
+    if base_span[0] == base_span[1] or other_span[0] == other_span[1]:
+        return None
+    seg_base = _shape_between_measures(base_shape, base_span, padding)
+    seg_other = _shape_between_measures(other_shape, other_span, padding)
+    if seg_base is None or seg_other is None:
+        return None
     return float(seg_base.hausdorff_distance(seg_other))
 
 
@@ -1035,51 +1186,16 @@ def _stop_near_shape(
     stop_key: str,
     shape: Optional[BaseGeometry],
     stops_gdf_proj: gpd.GeoDataFrame,
-    max_dist_m: float,
+    max_dist: float,
 ) -> bool:
-    """Return True if stop_key's projected geometry is within max_dist_m of shape."""
+    """Return True if stop_key's projected geometry is within max_dist of shape.
+
+    max_dist is in PROJECTED_CRS units.
+    """
     if shape is None or stop_key not in stops_gdf_proj.index:
         return False
     stop_geom = cast("Point", stops_gdf_proj.loc[stop_key, "geometry"])
-    return float(stop_geom.distance(shape)) <= max_dist_m
-
-
-def _shape_between_stops(
-    shape: Optional[LineString],
-    start_key: str,
-    end_key: str,
-    stops_gdf_proj: gpd.GeoDataFrame,
-    padding_m: float,
-) -> Optional[BaseGeometry]:
-    """Return the part of a shape between two stops, padded along the line.
-
-    Both stops are projected onto the shape, and the substring between those
-    measures is extended by padding_m on each side (clipped to the shape).
-
-    Args:
-        shape: Projected route shape, or None.
-        start_key: Logical stop key for the segment start.
-        end_key: Logical stop key for the segment end.
-        stops_gdf_proj: Stops GeoDataFrame in PROJECTED_CRS, indexed by stop key.
-        padding_m: Distance (meters) to extend the substring past each stop.
-
-    Returns:
-        The substring geometry, or None if the shape or either stop is missing
-        or the substring cannot be built.
-    """
-    if shape is None:
-        return None
-    if start_key not in stops_gdf_proj.index or end_key not in stops_gdf_proj.index:
-        return None
-
-    m0 = float(shape.project(stops_gdf_proj.loc[start_key, "geometry"]))
-    m1 = float(shape.project(stops_gdf_proj.loc[end_key, "geometry"]))
-    lo, hi = min(m0, m1), max(m0, m1)
-    try:
-        segment = substring(shape, max(0.0, lo - padding_m), min(shape.length, hi + padding_m))
-    except (GEOSException, ValueError, TypeError):  # defensive: geometries can be weird
-        return None
-    return None if segment.is_empty else segment
+    return float(stop_geom.distance(shape)) <= max_dist
 
 
 def compare_segments_for_route_pair(
@@ -1087,11 +1203,12 @@ def compare_segments_for_route_pair(
     other_key: RouteKey,
     sequences: Mapping[RouteKey, Sequence[str]],
     stop_names: Mapping[str, str],
-    shapes_proj: Mapping[RouteKey, LineString],
+    shapes_proj: Mapping[RouteKey, Optional[LineString]],
     stops_gdf_proj: gpd.GeoDataFrame,
     max_shape_hausdorff_m: Optional[float],
     max_stop_to_shape_m: float,
     segment_measure_padding_m: float,
+    stop_measures: Optional[Mapping[RouteKey, Sequence[Optional[float]]]] = None,
 ) -> List[Dict[str, object]]:
     """Compare shared segments between two routes using sequences + shapes.
 
@@ -1100,7 +1217,9 @@ def compare_segments_for_route_pair(
           * consecutive shared stops (in the same order on both routes)
             define a segment boundary.
       - For each segment, optionally apply a geometry gating step:
-          * Build route-substrings between start/end stops on each shape.
+          * Build route-substrings between the segment's boundary visits on
+            each shape, located in trip order (locate_stops_along_shape), so
+            the closing leg of a loop is not mistaken for its first leg.
           * If the segment Hausdorff distance exceeds max_shape_hausdorff_m,
             treat this as a divergent corridor and skip the segment.
       - For segments that pass gating, compare interior subsequences:
@@ -1111,7 +1230,9 @@ def compare_segments_for_route_pair(
             route's shape between the segment's boundary stops (padded by
             segment_measure_padding_m along the shape).
 
-    This generalizes the 2-1-2 pattern to arbitrary interior lengths.
+    This generalizes the 2-1-2 pattern to arbitrary interior lengths. The
+    three distance settings are in metres; they are converted to the units of
+    stops_gdf_proj's CRS (e.g., US survey feet) before use.
 
     Args:
         base_key: (route_id, direction_id) for the base route.
@@ -1129,9 +1250,15 @@ def compare_segments_for_route_pair(
         segment_measure_padding_m: Padding (meters) to extend the segment on
             both sides along each shape when computing the substrings for the
             Hausdorff gate and the proximity test.
+        stop_measures: Optional precomputed locate_stops_along_shape result
+            per route key, aligned with *sequences* and *shapes_proj*. Routes
+            missing from it are located here.
 
     Returns:
         List of dictionaries describing segment-level stop mismatches.
+
+    Raises:
+        ValueError: If stops_gdf_proj's CRS is set but is not projected.
     """
     base_seq = sequences.get(base_key)
     other_seq = sequences.get(other_key)
@@ -1150,6 +1277,27 @@ def compare_segments_for_route_pair(
     if len(aligned_pairs) < 2:
         return []
 
+    # Distance settings, converted from metres to the CRS's units.
+    metres_per_unit = crs_metres_per_unit(stops_gdf_proj.crs)
+    max_hausdorff = (
+        None if max_shape_hausdorff_m is None else max_shape_hausdorff_m / metres_per_unit
+    )
+    max_stop_to_shape = max_stop_to_shape_m / metres_per_unit
+    padding = segment_measure_padding_m / metres_per_unit
+
+    def _route_geometry(
+        key: RouteKey, seq: Sequence[str]
+    ) -> Tuple[Optional[LineString], Optional[Sequence[Optional[float]]]]:
+        shape = shapes_proj.get(key)
+        if shape is None:
+            return None, None
+        if stop_measures is not None and key in stop_measures:
+            return shape, stop_measures[key]
+        return shape, locate_stops_along_shape(seq, shape, stops_gdf_proj, max_stop_to_shape)
+
+    base_shape, base_measures = _route_geometry(base_key, base_seq)
+    other_shape, other_measures = _route_geometry(other_key, other_seq)
+
     results: List[Dict[str, object]] = []
     base_route_id, base_dir = base_key
     other_route_id, other_dir = other_key
@@ -1163,21 +1311,20 @@ def compare_segments_for_route_pair(
         start_key = base_seq[i0]
         end_key = base_seq[i1]
         # j0, j1 are already aligned; no recheck needed
+        base_span = _visit_span(base_measures, i0, i1)
 
         # Optional segment-level geometry gating.
-        if max_shape_hausdorff_m is not None:
+        if max_hausdorff is not None:
             seg_hd = segment_hausdorff_distance(
-                base_key=base_key,
-                other_key=other_key,
-                start_key=start_key,
-                end_key=end_key,
-                shapes_proj=shapes_proj,
-                stops_gdf_proj=stops_gdf_proj,
-                padding_m=segment_measure_padding_m,
+                base_shape=base_shape,
+                base_span=base_span,
+                other_shape=other_shape,
+                other_span=_visit_span(other_measures, j0, j1),
+                padding=padding,
             )
             # If we got a valid distance and it's too large, treat this as a
             # divergent corridor and skip the segment.
-            if seg_hd is not None and seg_hd > max_shape_hausdorff_m:
+            if seg_hd is not None and seg_hd > max_hausdorff:
                 continue
 
         # Interior subsequences between the boundary stops. A loop can revisit
@@ -1218,18 +1365,12 @@ def compare_segments_for_route_pair(
         # Filter false-positive candidates: a stop is only a real "miss" if it
         # physically lies near the base route's path through this segment,
         # not merely near some other part of the base's shape.
-        base_segment_proj = _shape_between_stops(
-            shapes_proj.get(base_key),
-            start_key,
-            end_key,
-            stops_gdf_proj,
-            segment_measure_padding_m,
-        )
+        base_segment_proj = _shape_between_measures(base_shape, base_span, padding)
 
         stops_only_on_other = [
             s
             for s in stops_only_on_other
-            if _stop_near_shape(s, base_segment_proj, stops_gdf_proj, max_stop_to_shape_m)
+            if _stop_near_shape(s, base_segment_proj, stops_gdf_proj, max_stop_to_shape)
         ]
 
         if not stops_only_on_other:  # nothing missing from base in this segment
@@ -1263,30 +1404,23 @@ def compare_segments_for_route_pair(
 def sequences_are_reversed(base_seq: Sequence[str], other_seq: Sequence[str]) -> bool:
     """Return True if other_seq runs in the opposite direction to base_seq.
 
-    Uses position-pair concordance/discordance on shared stops (Kendall-tau
-    sign test).  Returns False when fewer than 2 shared stops exist.
+    Aligns other_seq with base_seq as given and reversed, using
+    find_aligned_common_stops so every visit to a repeated stop counts, and
+    compares how many shared stops each order keeps in sequence. A loop that
+    returns to its first stop (A-B-C-A) therefore still runs the same way as
+    a route serving A-B-X-C. Returns False when fewer than 2 shared stops
+    exist.
 
     Args:
         base_seq: Ordered stop keys for the base route.
         other_seq: Ordered stop keys for the other route.
 
     Returns:
-        True if discordant pairs outnumber concordant pairs.
+        True if more shared stops align with other_seq reversed than as given.
     """
-    base_pos = {s: i for i, s in enumerate(base_seq)}
-    other_pos = {s: i for i, s in enumerate(other_seq)}
-    shared = set(base_pos) & set(other_pos)
-    if len(shared) < 2:
-        return False
-    pairs = [(base_pos[s], other_pos[s]) for s in shared]
-    concordant = discordant = 0
-    for (a1, b1), (a2, b2) in itertools.combinations(pairs, 2):
-        d = (a1 - a2) * (b1 - b2)
-        if d > 0:
-            concordant += 1
-        elif d < 0:
-            discordant += 1
-    return discordant > concordant
+    forward = len(find_aligned_common_stops(base_seq, other_seq))
+    backward = len(find_aligned_common_stops(base_seq, list(reversed(other_seq))))
+    return backward > forward
 
 
 def aggregate_candidates(df: pd.DataFrame) -> pd.DataFrame:
@@ -1329,6 +1463,33 @@ def aggregate_candidates(df: pd.DataFrame) -> pd.DataFrame:
     return agg
 
 
+def skipped_positions(sub: Sequence[str], full: Sequence[str]) -> Optional[List[int]]:
+    """Return the positions in full that sub skips, if sub is a subsequence.
+
+    Each item of sub is matched to its earliest available occurrence in full,
+    so a skipped repeat visit is found by position: A-B-X-C skips position 3
+    (the second B) of A-B-X-B-C, although both sequences contain B.
+
+    Args:
+        sub: Candidate subsequence.
+        full: Sequence that may contain sub's items in the same order.
+
+    Returns:
+        Indices of full that no item of sub matched, in order, or None if sub
+        cannot be obtained from full by deleting items only.
+    """
+    matched: Set[int] = set()
+    pos = 0
+    for item in sub:
+        try:
+            pos = full.index(item, pos)
+        except ValueError:
+            return None
+        matched.add(pos)
+        pos += 1
+    return [i for i in range(len(full)) if i not in matched]
+
+
 def is_ordered_subsequence(sub: Sequence[str], full: Sequence[str]) -> bool:
     """Return True if sub can be obtained from full by deleting items only.
 
@@ -1339,13 +1500,7 @@ def is_ordered_subsequence(sub: Sequence[str], full: Sequence[str]) -> bool:
     Returns:
         True if every item of sub appears in full, in order.
     """
-    pos = 0
-    for item in sub:
-        try:
-            pos = full.index(item, pos) + 1
-        except ValueError:
-            return False
-    return True
+    return skipped_positions(sub, full) is not None
 
 
 def find_intra_route_skipped_stops(
@@ -1359,7 +1514,9 @@ def find_intra_route_skipped_stops(
     ordered tuple of stop keys) is treated as canonical.  Any trip whose
     sequence is an ordered subsequence of the canonical sequence (it omits
     stops but adds or reorders none) — and whose first and last stops match
-    the canonical first and last — is flagged for the stops it omits.
+    the canonical first and last — is flagged for the stop visits it omits,
+    listed in travel order. A skipped second visit to a stop the trip also
+    serves earlier (e.g., on a loop) counts as an omission.
     Genuine short-turn or branched patterns are excluded by the first/last
     stop guard, and variants that add or reorder stops (e.g., a deviation)
     by the subsequence test.
@@ -1393,23 +1550,22 @@ def find_intra_route_skipped_stops(
         seqs = group.tolist()
         counter: Counter = Counter(seqs)
         canonical, n_canonical = counter.most_common(1)[0]
-        canonical_set = set(canonical)
         for trip_id, seq in zip(group.index.get_level_values("trip_id"), seqs):
             if seq == canonical:
                 continue
             if not seq or seq[0] != canonical[0] or seq[-1] != canonical[-1]:
                 continue  # genuine short-turn or branch
-            if not is_ordered_subsequence(seq, canonical):
+            skipped = skipped_positions(seq, canonical)
+            if skipped is None:
                 continue  # adds or reorders stops: a different pattern, not an omission
-            missing = canonical_set - set(seq)
-            if missing:
+            if skipped:
                 rows.append(
                     {
                         "route_id": rid,
                         "direction_id": did,
                         "trip_id": trip_id,
                         "n_canonical_trips": n_canonical,
-                        "missing_stop_keys": ";".join(sorted(missing)),
+                        "missing_stop_keys": ";".join(canonical[i] for i in skipped),
                     }
                 )
     return pd.DataFrame(rows, columns=INTRA_ROUTE_COLUMNS)
@@ -1482,6 +1638,7 @@ def plot_mismatch_segment(
     route_shapes_geo: Mapping[RouteKey, LineString],
     stops_gdf_geo: gpd.GeoDataFrame,
     stop_names: Mapping[str, str],
+    plot_dir: Optional[Path] = None,
 ) -> Optional[Path]:
     """Create a PNG plot for one mismatched segment.
 
@@ -1492,6 +1649,7 @@ def plot_mismatch_segment(
             geometries in GTFS_CRS for plotting.
         stops_gdf_geo: Stops GeoDataFrame (GTFS_CRS), indexed by logical stop key.
         stop_names: Mapping from logical stop key to stop_name.
+        plot_dir: Folder for the PNG (created if needed); defaults to PLOT_DIR.
 
     Returns:
         Path to the saved PNG file, or None if plotting was not possible.
@@ -1624,8 +1782,9 @@ def plot_mismatch_segment(
     safe_start = _sanitize_token(start_key)
     safe_end = _sanitize_token(end_key)
     filename = f"seg_{safe_base}_vs_{safe_other}_{safe_start}_{safe_end}.png"
-    PLOT_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = PLOT_DIR / filename
+    out_dir = PLOT_DIR if plot_dir is None else plot_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / filename
 
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -1639,6 +1798,7 @@ def plot_route_pair_overview(
     other_key: RouteKey,
     ctx: GTFSContext,
     buffer_m: float,
+    plot_dir: Optional[Path] = None,
 ) -> Optional[Path]:
     """Plot an overview of a route pair and an additional side-by-side view.
 
@@ -1660,6 +1820,7 @@ def plot_route_pair_overview(
         buffer_m: Buffer distance in meters for each route shape; also used as
             the distance threshold for classifying corridor vs off-corridor
             non-shared stops.
+        plot_dir: Folder for the PNGs (created if needed); defaults to PLOT_DIR.
 
     Returns:
         Path to the saved combined PNG file, or None if plotting was not
@@ -1688,6 +1849,9 @@ def plot_route_pair_overview(
     base_only = set(base_seq) - shared
     other_only = set(other_seq) - shared
 
+    # buffer_m in PROJECTED_CRS units (e.g., US survey feet).
+    buffer_dist = buffer_m / crs_metres_per_unit(PROJECTED_CRS)
+
     # --------------------------------------------------------------------- #
     # Helpers shared by both plots
     # --------------------------------------------------------------------- #
@@ -1699,8 +1863,8 @@ def plot_route_pair_overview(
         linestyle: str,
     ) -> None:
         """Plot a route LineString and its buffer on the given axis."""
-        if buffer_m > 0.0:
-            buf_proj = geom_proj.buffer(buffer_m)
+        if buffer_dist > 0.0:
+            buf_proj = geom_proj.buffer(buffer_dist)
             buf_geo = gpd.GeoSeries([buf_proj], crs=PROJECTED_CRS).to_crs(GTFS_CRS).iloc[0]
             if buf_geo.geom_type == "Polygon":
                 x_buf, y_buf = buf_geo.exterior.xy
@@ -1758,9 +1922,9 @@ def plot_route_pair_overview(
 
     def _split_near_far(
         keys: Iterable[str],
-        max_dist_m: float,
+        max_dist: float,
     ) -> Tuple[Set[str], Set[str]]:
-        """Split stops into near/far based on distance to BOTH projected shapes."""
+        """Split stops by distance (CRS units) to BOTH projected shapes."""
         near: Set[str] = set()
         far: Set[str] = set()
 
@@ -1771,15 +1935,15 @@ def plot_route_pair_overview(
             d_base = pt_proj.distance(base_geom_proj)
             d_other = pt_proj.distance(other_geom_proj)
 
-            if d_base <= max_dist_m and d_other <= max_dist_m:
+            if d_base <= max_dist and d_other <= max_dist:
                 near.add(key)
             else:
                 far.add(key)
 
         return near, far
 
-    base_only_near, base_only_far = _split_near_far(base_only, buffer_m)
-    other_only_near, other_only_far = _split_near_far(other_only, buffer_m)
+    base_only_near, base_only_far = _split_near_far(base_only, buffer_dist)
+    other_only_near, other_only_far = _split_near_far(other_only, buffer_dist)
 
     # --------------------------------------------------------------------- #
     # 1) Combined overview plot
@@ -1843,8 +2007,9 @@ def plot_route_pair_overview(
     safe_other = f"{_sanitize_token(other_route_id)}_{_sanitize_token(other_dir)}"
     filename_combined = f"overview_{safe_base}_vs_{safe_other}.png"
 
-    PLOT_DIR.mkdir(parents=True, exist_ok=True)
-    out_path_combined = PLOT_DIR / filename_combined
+    out_dir = PLOT_DIR if plot_dir is None else plot_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path_combined = out_dir / filename_combined
     fig.savefig(out_path_combined, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
@@ -1934,7 +2099,7 @@ def plot_route_pair_overview(
     )
 
     filename_side = f"overview_{safe_base}_vs_{safe_other}_side_by_side.png"
-    out_path_side = PLOT_DIR / filename_side
+    out_path_side = out_dir / filename_side
     fig2.savefig(out_path_side, dpi=150, bbox_inches="tight")
     plt.close(fig2)
 
@@ -1948,13 +2113,58 @@ def plot_route_pair_overview(
 # =============================================================================
 
 
+def warn_about_routes_without_shapes(
+    route_keys: Sequence[RouteKey],
+    route_shapes_proj: Mapping[RouteKey, LineString],
+) -> List[RouteKey]:
+    """Log which geometry-based checks cannot run for routes without a shape.
+
+    A route has no usable shape when the feed has no shapes.txt, its
+    representative trip has no shape_id, or that shape_id is not in
+    shapes.txt.
+
+    Args:
+        route_keys: Route/direction keys taking part in the analysis.
+        route_shapes_proj: Mapping from route key to projected shape.
+
+    Returns:
+        The keys in route_keys that have no shape, in their original order.
+    """
+    missing = [key for key in route_keys if key not in route_shapes_proj]
+    if missing:
+        logging.warning(
+            "%d of %d route/direction(s) have no usable shape (e.g., %s). For these, "
+            "the geometry-based checks did not run: (1) the test of whether a stop "
+            "another route serves lies on their path, so %s and %s report no skipped "
+            "stops on them; (2) the corridor (Hausdorff) check when they are the "
+            "reference route; (3) comparisons with routes they meet only at terminals "
+            "while SKIP_TERMINAL_ONLY_PAIRS is True; (4) their plots. The within-route "
+            "check (%s) does not use shapes and is unaffected.",
+            len(missing),
+            len(route_keys),
+            ", ".join(f"{route_id} dir {direction_id}" for route_id, direction_id in missing[:5]),
+            OUTPUT_FILENAME,
+            AGGREGATE_FILENAME,
+            INTRA_ROUTE_FILENAME,
+        )
+    return missing
+
+
 def prepare_gtfs_context() -> GTFSContext:
     """Load GTFS and build all derived structures needed for QA and plotting.
 
     Returns:
         GTFSContext containing DataFrames, GeoDataFrames, sequences, shapes,
         and route key sets.
+
+    Raises:
+        FileNotFoundError: If a required GTFS file is missing.
+        ValueError: If a GTFS file cannot be parsed, or PROJECTED_CRS is not
+            a projected CRS.
     """
+    # Fail before loading the feed if distances cannot be measured.
+    metres_per_unit = crs_metres_per_unit(PROJECTED_CRS)
+
     logging.info("Loading GTFS tables from: %s", GTFS_DIR)
     tables = load_gtfs_tables(GTFS_DIR)
 
@@ -2013,6 +2223,7 @@ def prepare_gtfs_context() -> GTFSContext:
             route_sequences={},
             route_shapes_geo={},
             route_shapes_proj={},
+            route_stop_measures={},
             all_route_keys=[],
             base_route_keys=[],
             route_id_whitelist=route_id_whitelist,
@@ -2025,6 +2236,14 @@ def prepare_gtfs_context() -> GTFSContext:
     logging.info("Building stops GeoDataFrames...")
     stops_gdf_geo = build_stops_gdf(stops_df, GTFS_CRS, STOP_KEY_FIELD)
     stops_gdf_proj = stops_gdf_geo.to_crs(PROJECTED_CRS)
+
+    logging.info("Locating each route's stop visits along its shape...")
+    tolerance = MAX_STOP_TO_SHAPE_M / metres_per_unit
+    route_stop_measures = {
+        key: locate_stops_along_shape(seq, route_shapes_proj[key], stops_gdf_proj, tolerance)
+        for key, seq in route_sequences.items()
+        if key in route_shapes_proj
+    }
 
     all_route_keys = list(route_sequences.keys())
 
@@ -2040,6 +2259,9 @@ def prepare_gtfs_context() -> GTFSContext:
         len(all_route_keys),
         len(base_keys),
     )
+    warn_about_routes_without_shapes(
+        [key for key in all_route_keys if key[0] not in route_id_whitelist], route_shapes_proj
+    )
 
     return GTFSContext(
         stops_df=stops_df,
@@ -2054,24 +2276,62 @@ def prepare_gtfs_context() -> GTFSContext:
         route_sequences=route_sequences,
         route_shapes_geo=route_shapes_geo,
         route_shapes_proj=route_shapes_proj,
+        route_stop_measures=route_stop_measures,
         all_route_keys=all_route_keys,
         base_route_keys=base_keys,
         route_id_whitelist=route_id_whitelist,
     )
 
 
+def route_pairs_to_compare(
+    base_route_keys: Sequence[RouteKey],
+    all_route_keys: Sequence[RouteKey],
+    route_id_whitelist: Set[str],
+) -> List[Tuple[RouteKey, RouteKey]]:
+    """List the ordered (base, other) route pairs to compare.
+
+    compare_segments_for_route_pair reports only stops missing from its base
+    route, so every pair that includes a base route is listed in both orders:
+    once for stops the base route skips, and once for stops the other route
+    skips. Pairs with a whitelisted route are left out.
+
+    Args:
+        base_route_keys: Route/direction keys selected for analysis.
+        all_route_keys: Every route/direction key with a stop sequence.
+        route_id_whitelist: route_ids to leave out entirely.
+
+    Returns:
+        Ordered (base_key, other_key) pairs, each listed once.
+    """
+    pairs: Dict[Tuple[RouteKey, RouteKey], None] = {}
+    for base_key in base_route_keys:
+        if base_key[0] in route_id_whitelist:
+            continue
+        for other_key in all_route_keys:
+            if other_key == base_key or other_key[0] in route_id_whitelist:
+                continue
+            pairs[(base_key, other_key)] = None
+            pairs[(other_key, base_key)] = None
+    return list(pairs)
+
+
 def run_segment_comparison(ctx: GTFSContext) -> pd.DataFrame:
     """Run segment-level stop comparison between routes.
 
-    For each base (route_id, direction_id), compare its logical stop sequence
-    against all other route/direction sequences and identify segments bounded
-    by pairs of shared stops where the interior subsequences differ.
+    Each pair of route/directions that includes a base route is compared in
+    both orders (see route_pairs_to_compare), identifying segments bounded by
+    pairs of shared stops where the interior subsequences differ.
 
     Geometry is used at the *segment* level via a Hausdorff distance gate
     (configured by MAX_SHAPE_HAUSDORFF_M). For each candidate segment
     between two shared stops, the corresponding shape substrings are
     compared; segments whose substrings are too far apart are treated as
     different corridors and skipped.
+
+    Pairs that share only terminal stops are skipped when either route lacks
+    a shape (SKIP_TERMINAL_ONLY_PAIRS), and references that serve the shared
+    stops in the opposite order are skipped unless COMPARE_REVERSED_REFERENCES
+    is True.
 
     Args:
         ctx: Prepared GTFSContext.
@@ -2082,74 +2342,95 @@ def run_segment_comparison(ctx: GTFSContext) -> pd.DataFrame:
     if not ctx.route_sequences:
         return pd.DataFrame(columns=SEGMENT_COLUMNS)
 
+    pairs = route_pairs_to_compare(ctx.base_route_keys, ctx.all_route_keys, ctx.route_id_whitelist)
     logging.info(
-        "Comparing segments for %d base route/direction pairs out of %d total.",
+        "Comparing %d ordered route/direction pairs that involve %d base "
+        "route/direction(s) out of %d total.",
+        len(pairs),
         len(ctx.base_route_keys),
         len(ctx.all_route_keys),
     )
 
     results: List[Dict[str, object]] = []
+    n_reversed_skipped = 0
 
-    for base_key in ctx.base_route_keys:
-        base_route_id, base_dir = base_key
+    for base_key, other_key in pairs:
         base_seq = ctx.route_sequences.get(base_key)
-        if base_seq is None:
+        other_seq = ctx.route_sequences.get(other_key)
+        if base_seq is None or other_seq is None:
             continue
 
-        logging.info("  Base route %s (direction %s)", base_route_id, base_dir)
+        # A pair that shares only terminal stops is compared only when both
+        # shapes exist, so the segment geometry can confirm a shared path.
+        if (
+            SKIP_TERMINAL_ONLY_PAIRS
+            and shares_only_terminal_stops(base_seq, other_seq)
+            and (base_key not in ctx.route_shapes_proj or other_key not in ctx.route_shapes_proj)
+        ):
+            continue
 
-        for other_key in ctx.all_route_keys:
-            if other_key == base_key:
+        # A reference that runs the corridor in the opposite order can serve
+        # opposite-curb stops; compare it only if configured, with its
+        # sequence (and shape) reversed so aligned shared-stop pairs are found.
+        if sequences_are_reversed(base_seq, other_seq):
+            if not COMPARE_REVERSED_REFERENCES:
+                n_reversed_skipped += 1
                 continue
-
-            other_route_id, _ = other_key
-            if other_route_id in ctx.route_id_whitelist:
-                continue
-
-            other_seq = ctx.route_sequences.get(other_key)
-            if other_seq is None:
-                continue
-
-            # Optional: skip route pairs that only share terminal stops.
-            if shares_only_terminal_stops(base_seq, other_seq):
-                continue
-
-            # Fix 6: if the other route runs the corridor in the opposite
-            # direction, reverse its sequence (and shape) before comparing so
-            # that aligned shared-stop pairs are found correctly.
-            if sequences_are_reversed(base_seq, other_seq):
-                effective_other_seq: Sequence[str] = list(reversed(other_seq))
-                raw_other_shape = ctx.route_shapes_proj.get(other_key)
-                effective_shapes_proj: Mapping[RouteKey, LineString | None] = {
-                    **ctx.route_shapes_proj,
-                    other_key: (
-                        LineString(list(raw_other_shape.coords)[::-1])
-                        if raw_other_shape is not None
-                        else raw_other_shape
-                    ),
-                }
-                effective_sequences: Mapping[RouteKey, Sequence[str]] = {
-                    **ctx.route_sequences,
-                    other_key: effective_other_seq,
-                }
-            else:
-                effective_sequences = ctx.route_sequences
-                effective_shapes_proj = ctx.route_shapes_proj
-
-            segment_results = compare_segments_for_route_pair(
-                base_key=base_key,
-                other_key=other_key,
-                sequences=effective_sequences,
-                stop_names=ctx.stop_names,
-                shapes_proj=effective_shapes_proj,
-                stops_gdf_proj=ctx.stops_gdf_proj,
-                max_shape_hausdorff_m=MAX_SHAPE_HAUSDORFF_M,
-                max_stop_to_shape_m=MAX_STOP_TO_SHAPE_M,
-                segment_measure_padding_m=SEGMENT_MEASURE_PADDING_M,
+            effective_other_seq: Sequence[str] = list(reversed(other_seq))
+            raw_other_shape = ctx.route_shapes_proj.get(other_key)
+            effective_shapes_proj: Mapping[RouteKey, LineString | None] = {
+                **ctx.route_shapes_proj,
+                other_key: (
+                    LineString(list(raw_other_shape.coords)[::-1])
+                    if raw_other_shape is not None
+                    else raw_other_shape
+                ),
+            }
+            effective_sequences: Mapping[RouteKey, Sequence[str]] = {
+                **ctx.route_sequences,
+                other_key: effective_other_seq,
+            }
+            # Visits keep their place on the shape: counted from the far end.
+            effective_measures: Mapping[RouteKey, Sequence[Optional[float]]] = (
+                ctx.route_stop_measures
             )
+            raw_other_measures = ctx.route_stop_measures.get(other_key)
+            if raw_other_shape is not None and raw_other_measures is not None:
+                other_length = raw_other_shape.length
+                effective_measures = {
+                    **ctx.route_stop_measures,
+                    other_key: [
+                        None if m is None else other_length - m
+                        for m in reversed(raw_other_measures)
+                    ],
+                }
+        else:
+            effective_sequences = ctx.route_sequences
+            effective_shapes_proj = ctx.route_shapes_proj
+            effective_measures = ctx.route_stop_measures
 
-            if segment_results:
-                results.extend(segment_results)
+        segment_results = compare_segments_for_route_pair(
+            base_key=base_key,
+            other_key=other_key,
+            sequences=effective_sequences,
+            stop_names=ctx.stop_names,
+            shapes_proj=effective_shapes_proj,
+            stops_gdf_proj=ctx.stops_gdf_proj,
+            max_shape_hausdorff_m=MAX_SHAPE_HAUSDORFF_M,
+            max_stop_to_shape_m=MAX_STOP_TO_SHAPE_M,
+            segment_measure_padding_m=SEGMENT_MEASURE_PADDING_M,
+            stop_measures=effective_measures,
+        )
+
+        if segment_results:
+            results.extend(segment_results)
+
+    if n_reversed_skipped:
+        logging.info(
+            "Skipped %d ordered pair(s) whose reference serves the shared stops in the "
+            "opposite order (COMPARE_REVERSED_REFERENCES = False).",
+            n_reversed_skipped,
+        )
 
     if not results:
         logging.info("No segment-level stop mismatches were identified.")
@@ -2171,8 +2452,32 @@ def run_segment_comparison(ctx: GTFSContext) -> pd.DataFrame:
     return df
 
 
+def new_plot_run_dir(plot_dir: Path) -> Path:
+    """Return an unused folder path under plot_dir for this run's plots.
+
+    The folder is named after the run's start time (with a numeric suffix if
+    that name is taken) and is created when the first plot is saved, so plots
+    from an earlier run never sit beside the current run's CSVs.
+
+    Args:
+        plot_dir: Parent folder for every run's plots (PLOT_DIR).
+
+    Returns:
+        Path of a folder that does not exist yet.
+    """
+    stem = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    candidate = plot_dir / stem
+    suffix = 2
+    while candidate.exists():
+        candidate = plot_dir / f"{stem}_{suffix}"
+        suffix += 1
+    return candidate
+
+
 def run_plotting(ctx: GTFSContext, mismatches_df: pd.DataFrame) -> None:
     """Generate PNG plots for mismatched segments or overview plots if none.
+
+    Plots go to a new run folder under PLOT_DIR (see new_plot_run_dir).
 
     If mismatches_df is non-empty, one plot is generated per segment showing:
       - Base and other shapes.
@@ -2184,9 +2489,11 @@ def run_plotting(ctx: GTFSContext, mismatches_df: pd.DataFrame) -> None:
       - Share at least one logical stop, and
       - Do not overlap solely at terminal stops in both sequences.
     """
+    run_plot_dir = new_plot_run_dir(PLOT_DIR)
+
     # Case 1: we have real segment mismatches -> plot them.
     if not mismatches_df.empty:
-        logging.info("Generating plots in: %s", PLOT_DIR)
+        logging.info("Generating plots in: %s", run_plot_dir)
         for _, row in mismatches_df.iterrows():
             plot_mismatch_segment(
                 row=row,
@@ -2194,6 +2501,7 @@ def run_plotting(ctx: GTFSContext, mismatches_df: pd.DataFrame) -> None:
                 route_shapes_geo=ctx.route_shapes_geo,
                 stops_gdf_geo=ctx.stops_gdf_geo,
                 stop_names=ctx.stop_names,
+                plot_dir=run_plot_dir,
             )
         return
 
@@ -2235,6 +2543,7 @@ def run_plotting(ctx: GTFSContext, mismatches_df: pd.DataFrame) -> None:
                 other_key=other_key,
                 ctx=ctx,
                 buffer_m=ROUTE_OVERVIEW_BUFFER_M,
+                plot_dir=run_plot_dir,
             )
 
 
@@ -2264,10 +2573,8 @@ def main() -> int:
         logging.error("Error during GTFS preparation: %s", exc)
         return 1
 
-    if not ctx.route_sequences:
-        # Nothing to compare; bail out.
-        return 0
-
+    # With no route sequences there is nothing to compare, but the steps below
+    # still write header-only CSVs, replacing any from an earlier run.
     try:
         mismatches_df = run_segment_comparison(ctx)
     except (FileNotFoundError, ValueError) as exc:

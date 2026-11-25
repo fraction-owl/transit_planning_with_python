@@ -969,6 +969,7 @@ def classify_service_ids(
     active_dates: Mapping[str, set[dt.date]],
     holiday_max_days_per_year: float = 25.0,
     dow_share: float = 0.80,
+    holidays: Optional[set[dt.date]] = None,
 ) -> dict[str, set[str]]:
     """Classify each service_id by its real active-date pattern.
 
@@ -978,16 +979,27 @@ def classify_service_ids(
     a weekday pattern on a service that really runs five days a year).
     Otherwise, day-of-week shares of the active dates determine the labels.
 
+    The annual rate alone cannot tell a holiday service from any other rarely
+    used one (a one-day special event, a single-date exception). Pass
+    *holidays* to check: a low-rate service with none of its active dates in
+    that set is labelled ``Special`` instead of ``Holiday``.
+
     Args:
         active_dates: Output of :func:`expand_service_active_dates`.
         holiday_max_days_per_year: Services active at or below this annual
-            rate are labelled ``Holiday``.
+            rate are labelled ``Holiday`` (or ``Special``; see *holidays*).
         dow_share: Minimum fraction of active dates on a day-of-week bucket
             (Mon–Fri, Saturday, Sunday) to earn that bucket's label.
+        holidays: Optional set of holiday dates, e.g. from
+            ``federal_holidays_observed``. When given, a low-rate service
+            earns ``Holiday`` only if at least one of its active dates is in
+            this set, and ``Special`` otherwise. When ``None`` (the
+            default), every low-rate service is labelled ``Holiday``.
 
     Returns:
         Mapping of ``service_id`` to a set of labels drawn from
-        ``{"Weekday", "Saturday", "Sunday", "Holiday"}``. A service with no
+        ``{"Weekday", "Saturday", "Sunday", "Holiday", "Special"}``
+        (``Special`` only when *holidays* is given). A service with no
         active dates maps to an empty set.
     """
     result: dict[str, set[str]] = {}
@@ -1000,7 +1012,10 @@ def classify_service_ids(
         per_year = len(dates) / max(span_days / 365.25, 0.1)
         labels: set[str] = set()
         if per_year <= holiday_max_days_per_year:
-            labels.add("Holiday")
+            if holidays is None or not dates.isdisjoint(holidays):
+                labels.add("Holiday")
+            else:
+                labels.add("Special")
         else:
             n = len(dates)
             wd = sum(1 for d in dates if d.weekday() < 5)
@@ -2508,7 +2523,7 @@ def minute_of_day(values: pd.Series) -> pd.Series:
         Float minutes since midnight, NaN where the value is blank or unreadable.
     """
     text = values.astype("string").str.strip()
-    text = text.mask(text == "")
+    text = text.mask(text == "", pd.NA)
     minutes = pd.Series(np.nan, index=values.index, dtype="float64")
 
     iso = text.str.extract(_ISO_CLOCK_RE)
@@ -2577,7 +2592,7 @@ def service_day_hour(values: pd.Series, service_dates: pd.Series, cutover_hour: 
         Float service-day hours, NaN where the value is blank or unreadable.
     """
     text = values.astype("string").str.strip()
-    text = text.mask(text == "")
+    text = text.mask(text == "", pd.NA)
     days = pd.to_datetime(service_dates, errors="coerce").dt.normalize()
     hours = pd.Series(np.nan, index=values.index, dtype="float64")
 
@@ -3275,6 +3290,45 @@ def build_max_load_by_trip_export(
 # =============================================================================
 
 
+# pandas 2 infers one format from the first value and turns values written
+# another way (e.g. without fractional seconds) into NaT unless ISO 8601 or mixed
+# formats are asked for; pandas 1 (older ArcGIS Pro) parses value by value and
+# has neither option.
+_PANDAS_MAJOR: int = int(pd.__version__.split(".", 1)[0])
+
+
+def parse_utc_timestamps(values: pd.Series) -> pd.Series:
+    """Parse timestamps to UTC, whichever ISO 8601 forms they mix.
+
+    Values with and without fractional seconds, a ``Z`` or a numeric UTC offset
+    all parse, whatever order they come in; values without an offset are taken
+    as UTC. Anything that is not ISO 8601 is handed to pandas' mixed-format
+    parser.
+
+    Args:
+        values: Timestamps as text.
+
+    Returns:
+        UTC datetimes, NaT where the value is blank or unreadable.
+    """
+    text = values.astype("string").str.strip()
+    text = text.mask(text == "", pd.NA)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        if _PANDAS_MAJOR < 2:
+            return pd.to_datetime(text.astype(object), errors="coerce", utc=True)
+        stamps = pd.to_datetime(text, errors="coerce", utc=True, format="ISO8601")
+        rest = stamps.isna() & text.notna()
+        if rest.any():
+            try:
+                others = pd.to_datetime(text[rest], errors="coerce", utc=True, format="mixed")
+            except (ValueError, TypeError):
+                others = None
+            if others is not None:
+                stamps.loc[rest] = others
+    return stamps
+
+
 def _trip_duration_hours(performed: pd.DataFrame) -> pd.Series:
     """Per-row trip duration in hours from trips_performed start/end times.
 
@@ -3289,10 +3343,8 @@ def _trip_duration_hours(performed: pd.DataFrame) -> pd.Series:
     ):
         if start_col not in performed.columns or end_col not in performed.columns:
             continue
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            start = pd.to_datetime(performed[start_col], errors="coerce", utc=True)
-            end = pd.to_datetime(performed[end_col], errors="coerce", utc=True)
+        start = parse_utc_timestamps(performed[start_col])
+        end = parse_utc_timestamps(performed[end_col])
         hours = (end - start).dt.total_seconds() / 3600.0
         duration = duration.fillna(hours.where(hours > 0))
     return duration

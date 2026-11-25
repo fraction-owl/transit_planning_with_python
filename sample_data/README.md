@@ -12,8 +12,12 @@ The GTFS, TODS and TIDES files are copies of fixtures in [`tests/fixtures/`](../
 | `gtfs_archive.zip` | Three yearly editions of that feed, in folders `dc_2024/`, `dc_2025/` and `dc_2026/`. See [Archive editions](#archive-editions). | Copy of `tests/fixtures/mock_gtfs_dc_archive.zip` |
 | `tods_current.zip` | TODS 2.1 supplements for `gtfs_current.zip`: garages, pull-outs, pull-backs and deadheads between trips. | Copy of `tests/fixtures/mock_tods_dc.zip` |
 | `tides/stop_visits.csv`, `tides/trips_performed.csv` | TIDES tables for a sample of service dates from January to March 2026 on routes 10, 20 and 30, plus the 50H loop on January 1. Pull-outs, pull-ins and deadheads carry the TODS trip IDs. | Copies of `tests/fixtures/stop_visits.csv` and `tests/fixtures/trips_performed.csv` |
-| `time_periods_example.txt` | Time-of-day periods for `ridership_from_tides.py` (`TIME_PERIODS_FILE`). | Moved from `scripts/ridership_tools/` |
-| `ntd_monthly_config_example.txt` | Settings template for `ntd_monthly_summary.py`. Its paths are placeholders, and the workbooks it lists aren't included. | Moved from `scripts/ridership_tools/` |
+| `time_periods_example.txt` | Time-of-day periods for `ridership_from_tides.py` and `otp_runtime_from_tides.py` (`TIME_PERIODS_FILE`). | Moved from `scripts/ridership_tools/` |
+| `county_fips_example.txt` | County FIPS list for the `uscensus_*` scripts (`COUNTY_FIPS_FILE` / `FIPS_FILE`). The Washington, DC area counties are commented out, so a script pointed at an unedited copy stops with a message instead of filtering to DC by mistake. | Written by hand; codes from the [FCC county FIPS list](https://transition.fcc.gov/oet/info/maps/census/fips/fips.txt) |
+
+## Route lists
+
+These optional examples are lists of Mock DC Transit routes. `express_routes_example.txt` lists route 20 by its `gtfs_current.zip` route ID, `DC_R20`. In `gtfs_service_demographics_gpd.py`, point `EXPRESS_ROUTES_FILE` (or `--express-routes-file`) at it to label route 20 "express" in route mode; a relative path is read from the folder you run the script in. The non-revenue and event examples use invented route IDs that `gtfs_current.zip` does not contain. In `trip_cut_savings.py`, point `NON_REVENUE_ROUTES` at `non_revenue_routes_example.txt` to remove test routes from baseline totals and cut screening. Point `OTHER_EXCLUDED_ROUTES` at `event_routes_example.txt` when event shuttles should remain in passenger-service totals and be excluded from cut proposals. Both settings accept absolute paths or paths relative to the script. Scripts can read these files with `load_express_route_ids`, `load_non_revenue_route_ids` or `load_event_route_ids` from `utils/gtfs_helpers.py`.
 
 ## Archive editions
 

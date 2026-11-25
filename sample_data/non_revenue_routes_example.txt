@@ -1,0 +1,11 @@
+# Example non-revenue route list: Mock DC Transit test and training routes.
+# These routes carry no passengers. In trip_cut_savings.py, point
+# NON_REVENUE_ROUTES at a copy of this file to drop them from baseline totals
+# and from cut screening.
+#
+# One route per line, as its GTFS route_short_name or route_id. Blank lines and
+# lines that start with "#" are ignored. Put comments on their own lines:
+# trip_cut_savings.py reads text after a route on the same line as part of it.
+990
+991
+992

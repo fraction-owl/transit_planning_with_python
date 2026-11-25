@@ -10,49 +10,60 @@ script_dir = Path("scripts/operations_tools").resolve()
 sys.path.append(str(script_dir))
 
 import otp_by_route as target  # noqa: E402
-import otp_monthly_panel as otp_tides  # noqa: E402
+
+import scripts.operations_tools.otp_runtime_from_tides as exporter  # noqa: E402
 
 STOP_VISITS = Path("tests/fixtures/stop_visits.csv")
 TRIPS_PERFORMED = Path("tests/fixtures/trips_performed.csv")
 
 
-def _write_panel(path: Path) -> Path:
-    """Write a synthetic otp_monthly_processed-style panel and return its path."""
+def _write_table(path: Path) -> Path:
+    """Write a synthetic otp_by_route_and_month-style table and return its path."""
     pd.DataFrame(
         {
-            "level": ["route", "route", "overall"],
-            "group": ["A", "A", "ALL"],
-            "route_id": ["A", "A", ""],
-            "month": ["2025-01", "2025-02", "2025-01"],
-            "on_time": [8, 30, 38],
-            "evaluated": [10, 30, 40],
+            "day_type": ["Weekday", "Saturday", "Weekday"],
+            "route_id": ["A", "A", "A"],
+            "month": ["2025-01", "2025-01", "2025-02"],
+            "on_time": [6, 2, 30],
+            "evaluated": [7, 3, 30],
+            "pct_on_time": [85.7, 66.7, 100.0],
         }
     ).to_csv(path, index=False)
     return path
 
 
-def test_load_otp_panel_filters_to_level_and_coerces(tmp_path: Path) -> None:
-    """Loading keeps only the requested level with numeric counts."""
-    panel = target.load_otp_panel(_write_panel(tmp_path / "p.csv"), level="route")
-    assert set(panel["route_id"].unique()) == {"A"}
+def test_load_otp_table_pools_day_types_and_coerces(tmp_path: Path) -> None:
+    """Loading sums every day type per (route, month) with numeric counts."""
+    panel = target.load_otp_table(_write_table(tmp_path / "p.csv"))
     assert list(panel.columns) == ["route_id", "month", "on_time", "evaluated"]
+    assert panel["on_time"].tolist() == [8, 30]
+    assert panel["evaluated"].tolist() == [10, 30]
     assert panel["evaluated"].dtype.kind in "fi"
 
 
-def test_load_otp_panel_missing_column_raises(tmp_path: Path) -> None:
-    """A panel missing a required column fails loudly."""
+def test_load_otp_table_keeps_only_the_chosen_day_types(tmp_path: Path) -> None:
+    """DAY_TYPES_TO_INCLUDE limits the pooled day types; none matching fails loudly."""
+    path = _write_table(tmp_path / "p.csv")
+    weekday = target.load_otp_table(path, ["Weekday"])
+    assert weekday["evaluated"].tolist() == [7, 30]
+    with pytest.raises(ValueError, match="No row"):
+        target.load_otp_table(path, ["Sunday"])
+
+
+def test_load_otp_table_missing_column_raises(tmp_path: Path) -> None:
+    """A table missing a required column fails loudly."""
     p = tmp_path / "bad.csv"
-    pd.DataFrame({"level": ["route"], "route_id": ["A"], "month": ["2025-01"]}).to_csv(
+    pd.DataFrame({"day_type": ["Weekday"], "route_id": ["A"], "month": ["2025-01"]}).to_csv(
         p, index=False
     )
     with pytest.raises(ValueError, match="missing required column"):
-        target.load_otp_panel(p)
+        target.load_otp_table(p)
 
 
-def test_load_otp_panel_missing_file_raises(tmp_path: Path) -> None:
-    """A missing panel file points the user at otp_monthly_panel."""
-    with pytest.raises(FileNotFoundError, match="otp_monthly"):
-        target.load_otp_panel(tmp_path / "nope.csv")
+def test_load_otp_table_missing_file_raises(tmp_path: Path) -> None:
+    """A missing table points the user at otp_runtime_from_tides."""
+    with pytest.raises(FileNotFoundError, match="otp_runtime_from_tides"):
+        target.load_otp_table(tmp_path / "nope.csv")
 
 
 def test_select_window_trailing_and_end_month() -> None:
@@ -105,9 +116,9 @@ def test_reduce_naive_pools_counts() -> None:
 
 def test_run_writes_rollup_and_runlog(tmp_path: Path) -> None:
     """End-to-end run writes otp_by_route.csv and the run-log sidecar."""
-    panel_path = _write_panel(tmp_path / "otp_monthly_processed.csv")
+    table_path = _write_table(tmp_path / "otp_by_route_and_month.csv")
     cfg = target.Config(
-        otp_processed_path=panel_path,
+        otp_monthly_path=table_path,
         output_dir=tmp_path / "out",
         window_months=0,
     )
@@ -115,27 +126,66 @@ def test_run_writes_rollup_and_runlog(tmp_path: Path) -> None:
     assert (tmp_path / "out" / target.ROLLUP_FILENAME).exists()
     assert (tmp_path / "out" / "otp_by_route_runlog.txt").exists()
     assert set(rollup["route_id"]) == {"A"}
+    assert rollup.iloc[0]["pct_on_time"] == pytest.approx(90.0)  # (80 + 100) / 2
 
 
-def test_consumes_real_otp_monthly_panel_output(tmp_path: Path) -> None:
-    """Integration: roll up the panel that otp_monthly_panel actually writes."""
-    otp_tides.run(
-        otp_tides.Config(
+def test_main_guards_the_placeholder_path() -> None:
+    assert target.main([]) == 2
+
+
+def test_consumes_real_otp_runtime_from_tides_output(tmp_path: Path) -> None:
+    """Integration: roll up the route x month table otp_runtime_from_tides actually writes."""
+    periods = exporter.build_time_periods(
+        exporter.specs_from_mapping(exporter.TIME_PERIODS), "defaults"
+    )
+    exporter.run(
+        exporter.RunSettings(
             stop_visits_path=STOP_VISITS,
             trips_performed_path=TRIPS_PERFORMED,
             output_dir=tmp_path,
+            periods=periods,
+            measures=["otp"],
+            levels=["route"],
+            time_cuts=["month"],
+            export_stop_flags=False,
+            export_charts=False,
         )
     )
-    processed = tmp_path / otp_tides.PROCESSED_FILENAME
-    assert processed.exists()
+    table = tmp_path / "otp" / exporter.grain_filename("otp", "route", "month")
+    assert table.exists()
 
     rollup = target.run(
         target.Config(
-            otp_processed_path=processed,
+            otp_monthly_path=table,
             output_dir=tmp_path / "rollup",
             window_months=0,
+            normalize_by_month=False,
         )
     )
     assert not rollup.empty
     assert {"route_id", "pct_on_time"} <= set(rollup.columns)
     assert (rollup["pct_on_time"].between(0, 100)).all()
+    # Pooled counts equal the exporter's route rows summed over day types and months.
+    source = pd.read_csv(table, dtype={"route_id": str})
+    expected = source.groupby("route_id")["evaluated"].sum()
+    assert rollup.set_index("route_id")["evaluated"].to_dict() == expected.to_dict()
+
+
+def test_load_otp_table_keeps_literal_na_route_ids_distinct(tmp_path: Path) -> None:
+    """Route IDs NA and NULL are routes, not missing values; a blank ID gets its own label."""
+    p = tmp_path / "p.csv"
+    pd.DataFrame(
+        {
+            "day_type": ["Weekday"] * 3,
+            "route_id": ["NA", "NULL", ""],
+            "month": ["2025-01"] * 3,
+            "on_time": [10, 0, 4],
+            "evaluated": [10, 10, 5],
+        }
+    ).to_csv(p, index=False)
+    rollup = target.reduce_to_route(target.load_otp_table(p), ["2025-01"], normalize_by_month=False)
+    assert rollup.set_index("route_id")["on_time"].to_dict() == {
+        "(blank)": 4,
+        "NA": 10,
+        "NULL": 0,
+    }

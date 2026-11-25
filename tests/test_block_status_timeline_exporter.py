@@ -13,6 +13,7 @@ import pytest
 import scripts.gtfs_exports.block_status_timeline_exporter as mod
 from scripts.gtfs_exports.block_status_timeline_exporter import (
     _merge_and_filter_data,
+    add_reading_columns,
     apply_bay_overrides,
     assumptions_text,
     fill_stop_ids_for_dwell_layover_loading,
@@ -24,6 +25,7 @@ from scripts.gtfs_exports.block_status_timeline_exporter import (
     parse_time_to_minutes,
     process_block,
     resolve_service_ids,
+    route_direction_workbooks,
     row_for_inactive,
     run_output_folder,
     validate_folders,
@@ -214,8 +216,8 @@ def test_get_status_for_minute_hold_boundaries_are_occupied() -> None:
         (440, 440, "S3", "Elm St", "T1", False, True, 3, 0),
     ]
     assert [get_status_for_minute(m, seq)[:2] for m in (430, 431, 432)] == [
-        ("DWELL", "S2"),
-        ("DWELL", "S2"),
+        ("ARRIVE", "S2"),
+        ("DEPART", "S2"),
         ("TRAVELING BETWEEN STOPS", None),
     ]
 
@@ -515,6 +517,117 @@ def test_main_returns_1_when_required_run_log_fails(
     assert mod.main() == 1
     monkeypatch.setattr(mod, "REQUIRE_RUN_LOG", False)
     assert mod.main() == 0
+
+
+def test_run_step1_writes_route_direction_workbooks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _point_at_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(mod, "WRITE_ROUTE_DIRECTION_FILES", True)
+
+    mod.run_step1_gtfs_to_blocks()
+
+    names = ["route_R1_dir_0.xlsx", "route_R2_dir_0.xlsx", "route_R3_dir_0.xlsx"]
+    assert sorted(p.name for p in tmp_path.glob("route_*.xlsx")) == names
+    r1 = pd.read_excel(tmp_path / "route_R1_dir_0.xlsx", dtype=str, keep_default_na=False)
+    assert list(r1.columns) == list(mod.ROUTE_DIRECTION_COLUMNS)
+    # B1-B3 each run one R1 trip and one R2 trip.
+    assert set(r1["Block"]) == {"B1", "B2", "B3"}
+    assert set(r1["Interlined Route"]) == {"R2"}
+    manifest = json.loads((tmp_path / "timeline_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["route_direction_workbooks"] == names
+    assert set(names) <= set(manifest["files"])
+
+    # Every timeline row carries its trip's start time and the block's other routes.
+    combined = pd.read_csv(tmp_path / mod.COMBINED_TIMELINE_FILE, dtype=str, keep_default_na=False)
+    b1 = combined[combined["Block"] == "B1"]
+    assert {("R1", "R2"), ("R2", "R1")} <= set(zip(b1["Route"], b1["Interlined Route"]))
+    assert set(b1.loc[b1["Trip ID"] == "T1", "Trip Start Time"]) == {"07:00"}
+    b4 = combined[combined["Block"] == "B4"]
+    assert set(b4["Interlined Route"]) == {""}
+
+
+def _timeline_rows(block: str, rows: list[tuple[str, str, str, str, str, object]]) -> pd.DataFrame:
+    """Timeline rows from (timestamp, route_id, short name, direction, status, start minute)."""
+    return pd.DataFrame(
+        {
+            "Timestamp": [row[0] for row in rows],
+            "Block": block,
+            "Route": [row[1] for row in rows],
+            "Route Short Name": [row[2] for row in rows],
+            "Route Long Name": [f"Long {row[1]}" if row[1] else "" for row in rows],
+            "Direction": [row[3] for row in rows],
+            "Trip ID": [f"T{row[1]}" if row[1] else "" for row in rows],
+            "Stop ID": "",
+            "Stop Name": "",
+            "Status": [row[4] for row in rows],
+            "Trip Start Minute": [row[5] for row in rows],
+        }
+    )
+
+
+def test_add_reading_columns_trip_start_and_interlined_routes() -> None:
+    frame = _timeline_rows(
+        "B1",
+        [
+            ("07:00", "R1", "10", "0", "DEPART", 420),
+            ("07:30", "", "", "", "DEADHEAD", ""),
+            ("08:00", "R2", "", "1", "DEPART", 480),  # no short name: named by its long name
+            ("08:30", "R3", "30", "0", "DEPART", 510),
+        ],
+    )
+    out = add_reading_columns(frame)
+    assert list(out["Trip Start Time"]) == ["07:00", "", "08:00", "08:30"]
+    assert list(out["Interlined Route"]) == ["30,Long R2", "", "10,30", "10,Long R2"]
+    columns = list(out.columns)
+    assert columns.index("Trip Start Time") == columns.index("Trip ID") + 1
+    assert columns.index("Interlined Route") == columns.index("Route Long Name") + 1
+
+
+def test_add_reading_columns_single_route_block_has_no_interline() -> None:
+    frame = _timeline_rows(
+        "B4",
+        [
+            ("07:00", "R3", "30", "0", "DEPART", 420),
+            ("07:01", "R3", "30", "0", "TRAVELING BETWEEN STOPS", 420),
+        ],
+    )
+    assert set(add_reading_columns(frame)["Interlined Route"]) == {""}
+
+
+def test_route_direction_workbooks_group_sort_and_name() -> None:
+    b2 = _timeline_rows(
+        "B2",
+        [
+            ("07:01", "R1", "10", "0", "TRAVELING BETWEEN STOPS", 420),
+            ("07:00", "R1", "10", "0", "DEPART", 420),
+            ("07:30", "", "", "", "DEADHEAD", ""),
+        ],
+    )
+    b1 = _timeline_rows(
+        "B1",
+        [
+            ("07:00", "R1", "10", "0", "DEPART", 415),
+            ("08:00", "R1", "10", "1", "DEPART", 480),
+            ("09:00", "R9", "10", "", "DEPART", 540),  # shares R1's short name; no direction
+        ],
+    )
+    tables = route_direction_workbooks([add_reading_columns(b2), add_reading_columns(b1)])
+    # Routes sharing a name add their route_id; a blank direction is named "none".
+    assert sorted(tables) == [
+        "route_10_R1_dir_0.xlsx",
+        "route_10_R1_dir_1.xlsx",
+        "route_10_R9_dir_none.xlsx",
+    ]
+    outbound = tables["route_10_R1_dir_0.xlsx"]
+    assert list(outbound.columns) == list(mod.ROUTE_DIRECTION_COLUMNS)
+    assert list(zip(outbound["Timestamp"], outbound["Block"])) == [
+        ("07:00", "B1"),
+        ("07:00", "B2"),
+        ("07:01", "B2"),
+    ]
+    # DEADHEAD rows have no route, so no table holds them.
+    assert all("DEADHEAD" not in set(table["Status"]) for table in tables.values())
 
 
 def test_run_step1_uses_configured_stop_clusters(
