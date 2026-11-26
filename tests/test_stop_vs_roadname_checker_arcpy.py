@@ -91,6 +91,50 @@ def test_normalize_street_strips_only_last_non_leading_modifier(
     assert mod.normalize_street(name, {"st", "rd"}) == expected
 
 
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("Buckley's Gate Dr", "buckleys gate"),
+        ("Buckley’s Gate Dr", "buckleys gate"),
+        ("Buckleys Gate Dr", "buckleys gate"),
+        ("Franconia-Springfield Pkwy", "franconia springfield"),
+        ("Franconia Springfield Pkwy", "franconia springfield"),
+        ("U.S.G.S Dr", "usgs"),
+        ("Mt. Vernon Hwy", "mt vernon"),
+    ],
+)
+def test_normalize_street_drops_apostrophes_and_periods_spaces_hyphens(
+    mod: types.ModuleType, name: str, expected: str
+) -> None:
+    assert mod.normalize_street(name, {"dr", "pkwy", "hwy"}) == expected
+
+
+def test_normalize_street_ignores_empty_modifier(mod: types.ModuleType) -> None:
+    # "" in the pattern matched at the end of every name, so nothing was removed.
+    assert mod.normalize_street("Johns Rd", {"st", "rd", ""}) == "johns"
+    assert mod.normalize_street("St Johns Rd", {"st", "rd", ""}) == "st johns"
+
+
+# ---------------------------------------------------------------------------
+# modifiers_from_roads
+# ---------------------------------------------------------------------------
+
+
+def test_modifiers_from_roads_skips_blank_values(mod: types.ModuleType) -> None:
+    rows = [("RD",), (" St ",), ("    ",), ("",), (None,), ("rd",)]
+
+    class _Cursor:
+        def __enter__(self) -> list[tuple[Any]]:
+            return rows
+
+        def __exit__(self, *exc: object) -> None:
+            return None
+
+    mod.arcpy.da = types.SimpleNamespace(SearchCursor=lambda *a, **k: _Cursor())
+    # ArcPy reads an empty shapefile text field as spaces; it must not become "".
+    assert mod.modifiers_from_roads("roads_proj", "RW_TYPE_US") == {"rd", "st"}
+
+
 # ---------------------------------------------------------------------------
 # split_stop_name
 # ---------------------------------------------------------------------------
