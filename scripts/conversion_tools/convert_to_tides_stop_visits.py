@@ -1,6 +1,6 @@
-"""Convert an AVL stop visit export into TIDES-compliant stop_visits records.
+"""Convert an AVL stop visit export, or a folder of them, into TIDES stop_visits records.
 
-This module reads an AVL "Stop Visit Events" report (CSV) and produces a
+This module reads AVL "Stop Visit Events" reports (CSV) and produces a
 `stop_visits.csv` file aligned with the TIDES `stop_visits` schema. It
 normalizes common real-world export issues (inconsistent whitespace, AM/PM
 timestamps, mixed null tokens) and applies pragmatic, schema-aware rules so
@@ -29,6 +29,8 @@ Key behaviors:
 - Shifts a trip whose Timepoint Order starts at 0 up by one as a whole, and
   warns when a trip repeats a sequence value.
 - Reads every input column as text, so identifiers keep leading zeros.
+- Accepts a folder as INPUT_PATH: its CSVs are combined in name order before
+  conversion; rows repeated across files are dropped, unusable files skipped.
 - Extracts `stop_id` from Timepoint ID, marks all records as
   `timepoint = True`, and synthesizes `pattern_id` from available route,
   direction, and variation fields.
@@ -36,8 +38,7 @@ Key behaviors:
   leaves unsupported stop-level attributes (APC, door events, ramp activity,
   revenue) blank with explicit warnings.
 
-The conversion is deterministic: given the same input file and configuration,
-the output identifiers and records are stable across runs.
+The conversion is deterministic: the same inputs and configuration give the same output.
 
 Column names are configured via COLUMN_MAP in the CONFIGURATION section.
 Defaults are pre-set for CLEVER "Stop Visit Events" exports; update COLUMN_MAP
@@ -48,6 +49,8 @@ Outputs
 - `stop_visits.csv` (`OUTPUT_FILENAME`, written to `OUTPUT_DIR`) - one TIDES
   `stop_visits` record per source stop visit event, with columns in the exact
   order of the TIDES template (`TIDES_COLS`).
+- Optional combined input (`COMBINED_INPUT_FILENAME`, folder input only).
+- `stop_visits_runlog.txt` - run log with row counts and the verbatim CONFIGURATION.
 
 Typical usage
 -------------
@@ -59,6 +62,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -68,7 +72,21 @@ import pandas as pd
 # =============================================================================
 # === BEGIN CONFIG ===
 
-INPUT_CSV: Path = Path(r"Path\To\Stop Visit Events.csv")
+# A single Stop Visit Events CSV, or a folder of them. A folder's matching CSVs
+# are combined into one table before conversion, so a trip or service date
+# split across two exports is converted as a whole.
+INPUT_PATH: Path = Path(r"Path\To\Stop Visit Events.csv")
+
+# Folder input only (ignored when INPUT_PATH is a file):
+INPUT_GLOB: str = "*.csv"  # file name pattern, e.g. "Stop Visit Events*.csv"
+INPUT_RECURSIVE: bool = False  # also search subfolders
+# Drop rows that exactly repeat a row from an earlier file (sorted by name), as
+# overlapping date-range exports do. Repeats within one file are kept.
+DROP_DUPLICATE_ROWS: bool = True
+# Also write the combined input, with a source_file column naming each row's
+# file, to OUTPUT_DIR under this name. None skips it.
+COMBINED_INPUT_FILENAME: str | None = None
+
 OUTPUT_DIR: Path = Path(r"Path\To\Your\Output_Folder")
 OUTPUT_FILENAME: str = "stop_visits.csv"
 OUTPUT_CSV: Path = OUTPUT_DIR / OUTPUT_FILENAME
@@ -159,6 +177,12 @@ OPT_COLS: list[str] = [
 ]
 
 LOG_LEVEL: int = logging.INFO  # DEBUG / INFO / WARNING / ERROR
+
+# When True, a failed run-log write makes the script exit with code 1 so the
+# analyst is never left with an output that lacks a matching configuration
+# record. Set to False only when writing to a location where a sidecar file
+# cannot be created (e.g. a read-only share).
+REQUIRE_RUN_LOG: bool = True
 
 # === END CONFIG ===
 
@@ -268,6 +292,98 @@ def warn_missing_columns(df: pd.DataFrame) -> None:
     missing_opt = [c for c in OPT_COLS if c not in df.columns]
     if missing_opt:
         logging.warning("Missing optional input columns (will continue): %s", missing_opt)
+
+
+# Column read_input_folder adds to name the file each row came from.
+SOURCE_FILE_COL: str = "source_file"
+
+
+def read_input_folder(
+    folder: Path,
+    *,
+    pattern: str = "*.csv",
+    recursive: bool = False,
+    drop_duplicates: bool = True,
+    exclude: tuple[Path, ...] = (),
+) -> pd.DataFrame:
+    """Read every CSV in *folder* matching *pattern* into one DataFrame.
+
+    Files are read as text in sorted path order, so the combined rows come out
+    in the same order on every run. A file that cannot be read or lacks any of
+    ``REQ_COLS`` is skipped with a warning. A file whose columns differ from
+    the first file's is kept with a warning; columns it lacks are blank for its
+    rows.
+
+    Args:
+        folder: Folder to search.
+        pattern: Glob pattern for file names, e.g. ``"*.csv"``.
+        recursive: Also search subfolders.
+        drop_duplicates: Drop rows that exactly repeat a row from an earlier
+            file, keeping the earliest file's copy. Repeats within a single
+            file are kept, as they are for single-file input.
+        exclude: Paths to leave out even when they match, such as this
+            script's own output files.
+
+    Returns:
+        The combined rows plus a ``SOURCE_FILE_COL`` column holding each row's
+        path relative to *folder*. Empty when no file was usable.
+    """
+    excluded = {p.resolve() for p in exclude}
+    matches = folder.rglob(pattern) if recursive else folder.glob(pattern)
+    paths = sorted(p for p in matches if p.is_file() and p.resolve() not in excluded)
+    if not paths:
+        logging.warning("No files matching %r in %s.", pattern, folder)
+        return pd.DataFrame()
+
+    frames: list[pd.DataFrame] = []
+    first_cols: set[str] | None = None
+    for p in paths:
+        name = p.relative_to(folder).as_posix()
+        try:
+            frame = pd.read_csv(p, dtype=str, low_memory=False).dropna(how="all")
+        except (OSError, UnicodeDecodeError, pd.errors.ParserError, pd.errors.EmptyDataError) as e:
+            logging.warning("Skipped %s: could not read it (%s).", name, e)
+            continue
+        missing = [c for c in REQ_COLS if c not in frame.columns]
+        if missing:
+            logging.warning("Skipped %s: missing required columns %s.", name, missing)
+            continue
+        cols = set(frame.columns)
+        if first_cols is None:
+            first_cols = cols
+        elif cols != first_cols:
+            logging.warning(
+                "%s columns differ from the first file's (missing %s, extra %s); "
+                "columns a file lacks are blank for its rows.",
+                name,
+                sorted(first_cols - cols),
+                sorted(cols - first_cols),
+            )
+        logging.info("Read %d rows from %s", len(frame), name)
+        frames.append(frame.assign(**{SOURCE_FILE_COL: name}))
+
+    if not frames:
+        return pd.DataFrame()
+    combined = pd.concat(frames, ignore_index=True)
+
+    if drop_duplicates and len(frames) > 1:
+        row_cols = [c for c in combined.columns if c != SOURCE_FILE_COL]
+        first_source = combined.groupby(row_cols, dropna=False, sort=False)[
+            SOURCE_FILE_COL
+        ].transform("first")
+        repeat = combined[SOURCE_FILE_COL] != first_source
+        if repeat.any():
+            logging.warning(
+                "Dropped %d rows that repeat a row from an earlier file "
+                "(overlapping exports); kept the earliest file's copy.",
+                int(repeat.sum()),
+            )
+            combined = combined.loc[~repeat].reset_index(drop=True)
+
+    logging.info(
+        "Combined %d of %d matching files: %d rows.", len(frames), len(paths), len(combined)
+    )
+    return combined
 
 
 def normalize_timepoint_order(series: pd.Series, trip_key: pd.DataFrame | None = None) -> pd.Series:
@@ -608,6 +724,126 @@ def convert_to_tides(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # =============================================================================
+# RUN LOG
+# =============================================================================
+
+
+def resolve_source_file() -> Path | None:
+    """Best-effort path to this script's source (``None`` in notebooks)."""
+    try:
+        return Path(__file__).resolve()
+    except NameError:
+        return None
+
+
+# Canonical version lives in utils/run_log.py — keep this copy in sync.
+def extract_config_block(source_file: Path) -> str:
+    r"""Return the text between the CONFIG markers in *source_file*.
+
+    Reads ``source_file`` as UTF-8 text and slices out the lines strictly
+    *between* the first occurrence of ``# === BEGIN CONFIG ===`` and the first
+    subsequent occurrence of ``# === END CONFIG ===``.  The marker lines
+    themselves are excluded; whitespace and inline comments inside the block
+    are preserved verbatim.
+
+    Args:
+        source_file: Path to the Python source file to scan (typically
+            ``Path(__file__)`` from the calling script).
+
+    Returns:
+        The verbatim text of the configuration block, joined with ``\n``.
+
+    Raises:
+        ValueError: If either marker is missing or they appear out of order.
+        OSError: If ``source_file`` cannot be read.
+    """
+    _BEGIN = "# === BEGIN CONFIG ==="
+    _END = "# === END CONFIG ==="
+
+    lines: list[str] = source_file.read_text(encoding="utf-8").splitlines()
+
+    begin_idx: int | None = None
+    end_idx: int | None = None
+    for i, line in enumerate(lines):
+        stripped: str = line.strip()
+        if begin_idx is None and stripped == _BEGIN:
+            begin_idx = i
+        elif begin_idx is not None and stripped == _END:
+            end_idx = i
+            break
+
+    if begin_idx is None or end_idx is None:
+        raise ValueError(
+            f"Config markers not found in '{source_file}'. Expected '{_BEGIN}' and '{_END}'."
+        )
+
+    return "\n".join(lines[begin_idx + 1 : end_idx])
+
+
+def run_log_path(output_file: Path) -> Path:
+    """Return the run-log sidecar path for *output_file* (same folder and stem)."""
+    return output_file.with_name(f"{output_file.stem}_runlog.txt")
+
+
+def write_run_log(output_file: Path, summary_lines: list[str]) -> bool:
+    """Write the run-log sidecar for *output_file*.
+
+    The log records the run timestamp, the source script, *summary_lines*, and
+    the CONFIGURATION block verbatim, so it cannot drift from the settings that
+    produced the output.
+
+    Args:
+        output_file: The stop_visits CSV this run wrote.
+        summary_lines: What the run read and wrote, such as the rows kept from
+            each input file. The CONFIGURATION block records only a folder's
+            path, and the folder's contents can change after the run.
+
+    Returns:
+        ``True`` if the log was written, ``False`` otherwise.
+    """
+    log_path = run_log_path(output_file)
+
+    source_file = resolve_source_file()
+    if source_file is None:
+        config_text = "(config block unavailable: interactive session, no __file__ on disk)"
+        source_display = "<interactive>"
+    else:
+        try:
+            config_text = extract_config_block(source_file)
+        except (OSError, ValueError) as exc:
+            logging.error("Could not extract config block for run log: %s", exc)
+            return False
+        source_display = str(source_file)
+
+    lines: list[str] = [
+        "=" * 72,
+        "TIDES STOP VISITS CONVERSION RUN LOG",
+        "=" * 72,
+        f"Run timestamp: {datetime.now().isoformat(timespec='seconds')}",
+        f"Output file:   {output_file}",
+        f"Source script: {source_display}",
+        "",
+        "-" * 72,
+        "RUN SUMMARY",
+        "-" * 72,
+        *summary_lines,
+        "",
+        "-" * 72,
+        "CONFIGURATION (verbatim from source)",
+        "-" * 72,
+        config_text,
+        "=" * 72,
+    ]
+    try:
+        log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except OSError as exc:
+        logging.error("Error writing run log: %s", exc)
+        return False
+    logging.info("Run log saved to '%s'.", log_path)
+    return True
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 
@@ -625,27 +861,57 @@ def main() -> int:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    if INPUT_CSV == Path(r"Path\To\Stop Visit Events.csv") or OUTPUT_DIR == Path(
+    if INPUT_PATH == Path(r"Path\To\Stop Visit Events.csv") or OUTPUT_DIR == Path(
         r"Path\To\Your\Output_Folder"
     ):
         logging.warning(
-            "INPUT_CSV and/or OUTPUT_DIR are still set to placeholder values. "
+            "INPUT_PATH and/or OUTPUT_DIR are still set to placeholder values. "
             "Please update them in the CONFIGURATION section before running."
         )
         return 2
 
-    if not INPUT_CSV.exists():
+    if not INPUT_PATH.exists():
         logging.warning(
-            "INPUT_CSV path does not exist: %s — update INPUT_CSV in the CONFIGURATION "
-            "section to your actual Stop Visit Events export before running.",
-            INPUT_CSV,
+            "INPUT_PATH does not exist: %s — update INPUT_PATH in the CONFIGURATION "
+            "section to your actual Stop Visit Events export (or a folder of them) "
+            "before running.",
+            INPUT_PATH,
         )
-        logging.info("Completed (no data processed — update INPUT_CSV to proceed).")
+        logging.info("Completed (no data processed — update INPUT_PATH to proceed).")
         return 1
 
     # Read as text: type inference would turn IDs like "00123" into 123 (or
     # "123.0" in a column with blanks) and break joins to trips_performed.
-    df = pd.read_csv(INPUT_CSV, dtype=str, low_memory=False)
+    summary: list[str] = []
+    if INPUT_PATH.is_dir():
+        combined_csv = OUTPUT_DIR / COMBINED_INPUT_FILENAME if COMBINED_INPUT_FILENAME else None
+        own_outputs = (OUTPUT_CSV, run_log_path(OUTPUT_CSV), combined_csv)
+        combined = read_input_folder(
+            INPUT_PATH,
+            pattern=INPUT_GLOB,
+            recursive=INPUT_RECURSIVE,
+            drop_duplicates=DROP_DUPLICATE_ROWS,
+            # A rerun must not read back this script's own outputs.
+            exclude=tuple(p for p in own_outputs if p is not None),
+        )
+        if combined.empty:
+            logging.warning("No usable stop visit rows in %s; nothing written.", INPUT_PATH)
+            return 1
+        kept = combined.groupby(SOURCE_FILE_COL, sort=False).size()
+        summary += [
+            f"Input folder: {INPUT_PATH}",
+            "Rows kept per input file (after dropping rows repeated across files):",
+            *(f"  {name}: {n}" for name, n in kept.items()),
+        ]
+        if combined_csv is not None:
+            combined_csv.parent.mkdir(parents=True, exist_ok=True)
+            combined.to_csv(combined_csv, index=False)
+            logging.info("Wrote combined input (%d rows) -> %s", len(combined), combined_csv)
+            summary.append(f"Combined input written: {combined_csv}")
+        df = combined.drop(columns=SOURCE_FILE_COL)
+    else:
+        df = pd.read_csv(INPUT_PATH, dtype=str, low_memory=False)
+        summary.append(f"Input file: {INPUT_PATH}")
     logging.info("Read %d rows, %d columns", len(df), df.shape[1])
 
     out = convert_to_tides(df)
@@ -653,6 +919,16 @@ def main() -> int:
     OUTPUT_CSV.parent.mkdir(parents=True, exist_ok=True)
     out.to_csv(OUTPUT_CSV, index=False)
     logging.info("Wrote %d rows -> %s", len(out), OUTPUT_CSV)
+
+    summary += [f"Input rows:  {len(df)}", f"Output rows: {len(out)}"]
+    # Sidecar run log — required by default so outputs are always traceable.
+    if not write_run_log(OUTPUT_CSV, summary) and REQUIRE_RUN_LOG:
+        logging.error(
+            "Run log could not be written. Set REQUIRE_RUN_LOG = False to "
+            "suppress this error when a sidecar file is genuinely impossible."
+        )
+        return 1
+
     logging.info("Script completed successfully.")
     return 0
 
