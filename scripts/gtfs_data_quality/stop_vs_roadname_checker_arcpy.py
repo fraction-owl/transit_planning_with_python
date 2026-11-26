@@ -16,6 +16,7 @@ Typical usage:
 
 from __future__ import annotations
 
+import datetime as _dt  # aliased: notebooks often rebind 'datetime' to the module
 import difflib
 import logging
 import os
@@ -25,7 +26,6 @@ import zipfile
 from collections import defaultdict
 from collections.abc import Generator
 from contextlib import contextmanager
-from datetime import datetime
 from pathlib import Path
 from typing import IO
 
@@ -85,7 +85,7 @@ def create_work_gdb(base_dir: str) -> str:
     Re-use if it already exists in this session.
     """
     Path(base_dir).mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     name = f"typo_work_{ts}.gdb"
     gdb = os.path.join(base_dir, name)
     if not arcpy.Exists(gdb):

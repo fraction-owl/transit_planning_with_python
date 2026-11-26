@@ -8,6 +8,7 @@ runs with its geoprocessing steps replaced by fakes.
 from __future__ import annotations
 
 import importlib
+import re
 import sys
 import types
 import zipfile
@@ -410,3 +411,34 @@ def test_main_clean_rerun_replaces_stale_csv(
     second = _run_main(mod, monkeypatch, tmp_path, "Main St", col_map)
     assert second.empty
     assert "stop_id" in second.columns
+
+
+# ---------------------------------------------------------------------------
+# create_work_gdb
+# ---------------------------------------------------------------------------
+
+
+def test_create_work_gdb_survives_datetime_rebound_to_module(
+    mod: types.ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A notebook kernel shares one namespace, so an ``import datetime`` elsewhere can
+    # leave the bare name bound to the module; ``datetime.now()`` then raised.
+    import datetime as datetime_module
+
+    created: list[tuple[str, str]] = []
+    monkeypatch.setattr(mod, "datetime", datetime_module, raising=False)
+    monkeypatch.setattr(mod.arcpy, "Exists", lambda path: False, raising=False)
+    monkeypatch.setattr(
+        mod.arcpy,
+        "management",
+        types.SimpleNamespace(CreateFileGDB=lambda base, name: created.append((base, name))),
+        raising=False,
+    )
+
+    gdb = mod.create_work_gdb(str(tmp_path))
+
+    assert len(created) == 1
+    base, name = created[0]
+    assert base == str(tmp_path)
+    assert re.fullmatch(r"typo_work_\d{8}_\d{6}\.gdb", name)
+    assert gdb == str(tmp_path / name)
