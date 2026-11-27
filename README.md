@@ -13,7 +13,7 @@ Start with the task you need. Read the selected script's opening comments for in
 | Summarize monthly ridership | [ntd_monthly_summary.py](scripts/ridership_tools/ntd_monthly_summary.py) | Monthly ridership workbooks |
 | Answer a stop-ridership request | [data_request_by_stop_processor.py](scripts/ridership_tools/data_request_by_stop_processor.py) | Stop-ridership export |
 | Export timetables | [gtfs_schedule_exporter.py](scripts/gtfs_exports/gtfs_schedule_exporter.py) | GTFS |
-| Check service dates | [gtfs_calendar_inspector.py](scripts/gtfs_data_quality/gtfs_calendar_inspector.py) | GTFS |
+| Check feed versions for overlapping dates | [gtfs_calendar_series_checker.py](scripts/gtfs_data_quality/gtfs_calendar_series_checker.py) | Several GTFS feed versions |
 | Compare route changes | [gtfs_route_diff.py](scripts/stop_analysis/gtfs_route_diff.py) | Before/after GTFS |
 | Summarize observed OTP and runtime | [otp_runtime_from_tides.py](scripts/operations_tools/otp_runtime_from_tides.py) | TIDES |
 | Calculate planned service hours | [scheduled_service_hours.py](scripts/gtfs_exports/scheduled_service_hours.py) | GTFS + optional TODS supplements |
@@ -117,10 +117,10 @@ Every script is also a normal command-line program — nothing about the noteboo
 2. **Override the configuration with flags (no file editing needed)**
    - Many scripts mirror their CONFIGURATION constants as command-line flags, so you can point at new inputs per run without touching the file. See what a script accepts (and each flag's current default) with:
      ```bash
-     python scripts/gtfs_data_quality/gtfs_calendar_inspector.py --help
+     python scripts/gtfs_data_quality/gtfs_calendar_series_checker.py --help
      ```
      ```bash
-     python scripts/gtfs_data_quality/gtfs_calendar_inspector.py --gtfs data/feed.zip --output-dir out
+     python scripts/gtfs_data_quality/gtfs_calendar_series_checker.py --gtfs data/old.zip data/new.zip --output-dir out
      ```
    - Flags are parsed strictly: a mistyped flag stops the script with an error instead of being silently ignored.
 

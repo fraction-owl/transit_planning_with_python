@@ -28,7 +28,7 @@ origin). transfers.txt is honored: ``transfer_type`` 3 pairs never count, and a 
 ``exact_times=1`` in frequencies.txt count at every scheduled run.
 
 By default (``DAY_OF_WEEK = "weekday"``) one representative weekday is analysed: the
-date ``gtfs_calendar_inspector.py`` reports, from calendar.txt and calendar_dates.txt.
+date ``representative_service_date`` picks and logs, from calendar.txt and calendar_dates.txt.
 A connection counts if one of its trips runs that date, compared as real clock times,
 so a 24:05 arrival can feed a 00:10 departure the next day within the filter's days.
 A day name picks a representative date of that day; ``SERVICE_DATE`` analyses one

@@ -67,7 +67,7 @@ transit_planning_with_python/
 │   │   ├── gbfs_ridership_join.py
 │   │   └── gbfs_stations_exporter.py
 │   ├── gtfs_data_quality/
-│   │   ├── gtfs_calendar_inspector.py
+│   │   ├── gtfs_calendar_series_checker.py
 │   │   ├── gtfs_skipped_stop_flagger_gpd.py
 │   │   ├── gtfs_stop_proximity_qc.py
 │   │   ├── gtfs_timepoint_interval_flagger.py
@@ -303,7 +303,7 @@ transit_planning_with_python/
 │   ├── test_gbfs_ridership_join.py
 │   ├── test_gbfs_stations_exporter.py
 │   ├── test_generate_mock_cbd.py
-│   ├── test_gtfs_calendar_inspector.py
+│   ├── test_gtfs_calendar_series_checker.py
 │   ├── test_gtfs_feed_merger.py
 │   ├── test_gtfs_linear_diff_gpd.py
 │   ├── test_gtfs_route_diff.py
