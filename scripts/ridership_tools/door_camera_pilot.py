@@ -32,8 +32,11 @@ Ridecheck: defaults accept one row per clip, stop_code, sequence and door.
 For shared visits, enter the same unique visit_id for every reopening and camera
 in the manual sheet, then map visit_id (instead of clip) in RIDECHECK_COLUMNS.
 Alternatively map service_date, bus, trip, stop_code and stop_sequence on both
-tables. Enter the operating date explicitly for after-midnight service. For
-vehicle totals use a shared visit key and omit the door mapping. Supply a
+tables. Enter the operating date explicitly for after-midnight service. Keys
+match on YYYY-MM-DD dates (slash dates read month first) and on numeric labels
+without leading zeros, so 0123 matches 123. The Ridecheck table is checked
+before any clip is processed. For vehicle totals use a shared visit key and
+omit the door mapping. Supply a
 kind=no_cycle row with visit labels for an observed door that stayed closed.
 For wide door columns, set RIDECHECK_WIDE to the actual board/alight headers
 for each door or door group, and supply only visit keys in RIDECHECK_COLUMNS.
@@ -200,6 +203,25 @@ def _clean_id(value):
     return re.sub(r"\.0$", "", str(value).strip())
 
 
+def service_date(value, context):
+    """Normalize an operating date to YYYY-MM-DD; slash dates read month first."""
+    value = str(value).strip()
+    if not value:
+        return ""
+    try:
+        return pd.Timestamp(value).strftime("%Y-%m-%d")
+    except (ValueError, OverflowError) as exc:
+        raise ValueError(f"{context}: invalid service_date {value!r}") from exc
+
+
+def _visit_key_part(name, value):
+    """Match visit labels across systems: numeric labels ignore leading zeros."""
+    value = _clean_id(value)
+    if name != "clip" and value.isdigit():
+        return value.lstrip("0") or "0"
+    return value
+
+
 def fingerprint(path):
     """Hash large clips without reading them entirely into memory."""
     digest = hashlib.sha256()
@@ -323,7 +345,7 @@ def patch(image, roi):
 
 
 def difference(a, b):
-    """Return mean absolute intensity difference."""
+    """Return the mean absolute difference between two standardized patches."""
     return float(np.abs(a - b).mean())
 
 
@@ -377,7 +399,10 @@ def reference(cfg, preview):
         cap.release()
     sep = difference(*refs)
     if sep < MIN_REFERENCE_DIFFERENCE:
-        raise ValueError(f"Open and closed references too similar ({sep:.1f}): {path}")
+        raise ValueError(
+            f"Open and closed references too similar ({sep:.2f} < "
+            f"{MIN_REFERENCE_DIFFERENCE}): {path}"
+        )
     return (*refs, sep, shape)
 
 
@@ -667,6 +692,7 @@ def load_truth():
                     "stop_sequence",
                 )
             }
+            row["service_date"] = service_date(row["service_date"], name)
             counts = {c: optional_count(r.get(c, ""), name) for c in COUNTS}
             if kind == "none":
                 if neg is not None or any(v not in (None, 0) for v in counts.values()):
@@ -700,10 +726,8 @@ def load_truth():
     return truth, coverage, closed
 
 
-def compare_visits(events, summaries, closed, issues):
-    """Aggregate reopening cycles before comparing external counts once per visit."""
-    if not RIDECHECK_PATH:
-        return []
+def load_ridecheck():
+    """Check Ridecheck keys, door groups, headers, labels and counts before scanning."""
     keys = [k for k in RIDECHECK_COLUMNS if k not in (*COUNTS, "door")]
     if not (
         {"clip", "visit_id"} & set(keys)
@@ -733,6 +757,10 @@ def compare_visits(events, summaries, closed, issues):
     totals = "door" not in RIDECHECK_COLUMNS and not RIDECHECK_WIDE
     if (totals or any(len(g) > 1 for g in groups.values())) and "clip" in keys:
         raise ValueError("Use a shared visit key instead of clip for pooled doors")
+    if any(len(cols) != 2 for cols in RIDECHECK_WIDE.values()):
+        raise ValueError(
+            "Each RIDECHECK_WIDE entry needs a boarding and an alighting header"
+        )
     data = read_table(RIDECHECK_PATH)
     selected = list(RIDECHECK_COLUMNS.values()) + [
         col for pair in RIDECHECK_WIDE.values() for col in pair
@@ -741,8 +769,60 @@ def compare_visits(events, summaries, closed, issues):
         raise ValueError(
             f"Missing Ridecheck headers: {sorted(set(selected) - set(data))}"
         )
-    known = {
-        r["clip"]: r for r in summaries if r["eligible_validation"] and r["reviewed"]
+    if data.empty:
+        raise ValueError(f"Ridecheck table has no rows: {RIDECHECK_PATH}")
+    entries = []
+    seen = set()
+    for number, source in enumerate(data.to_dict("records"), 1):
+        where = f"Ridecheck data row {number}"
+        labels = {k: _clean_id(source[RIDECHECK_COLUMNS[k]]) for k in keys}
+        if "service_date" in labels:
+            labels["service_date"] = service_date(labels["service_date"], where)
+        if not all(labels.values()):
+            raise ValueError(f"{where}: blank visit key {labels}")
+        key = tuple(_visit_key_part(k, labels[k]) for k in keys)
+        columns = RIDECHECK_WIDE or {
+            (
+                "vehicle"
+                if totals
+                else source[RIDECHECK_COLUMNS["door"]].strip().lower()
+            ): tuple(RIDECHECK_COLUMNS[c] for c in COUNTS)
+        }
+        for label, cols in columns.items():
+            if (key, label) in seen:
+                raise ValueError(
+                    f"{where}: duplicate visit and door group {labels} {label!r}"
+                )
+            seen.add((key, label))
+            expected = doors if totals else groups.get(label)
+            if not expected:
+                raise ValueError(
+                    f"{where}: door {label!r} is not a RIDECHECK_GROUPS key {sorted(groups)}"
+                )
+            entries.append(
+                {
+                    "key": key,
+                    "labels": labels,
+                    "label": label,
+                    "expected": expected,
+                    "counts": {
+                        c: optional_count(source[col], f"{where} {label!r}")
+                        for c, col in zip(COUNTS, cols)
+                    },
+                }
+            )
+    return {"keys": keys, "entries": entries}
+
+
+def compare_visits(events, summaries, closed, issues, ridecheck):
+    """Aggregate reopening cycles before comparing external counts once per visit."""
+    if not ridecheck:
+        return []
+    keys = ridecheck["keys"]
+    door_of = {r["clip"]: r["door"] for r in summaries}
+    known = {r["clip"] for r in summaries if r["eligible_validation"] and r["reviewed"]}
+    excluded = {
+        r["clip"] for r in summaries if r["reviewed"] and not r["eligible_validation"]
     }
     extra = {
         r["clip"]
@@ -750,25 +830,32 @@ def compare_visits(events, summaries, closed, issues):
         if r["match"] == "extra" and any(r.get(c, 0) for c in COUNTS)
     }
     by_visit = {}
+    excluded_visits = {}
     unassigned = set()
 
     def add(r, labels, cycle):
-        if r["clip"] not in known:
+        clip = r["clip"]
+        if clip not in known and clip not in excluded:
             return
-        key = tuple(_clean_id(labels.get(k, "")) for k in keys)
-        if not all(key):
+        values = [_clean_id(labels.get(k, "")) for k in keys]
+        if not all(values):
+            if clip in excluded:
+                return
             if any(r.get(c, 0) for c in COUNTS):
-                unassigned.add(r["clip"])
+                unassigned.add(clip)
             issues.append(
                 {
-                    "clip": r["clip"],
+                    "clip": clip,
                     "issue": "missing Ridecheck visit key",
-                    "detail": str(key),
+                    "detail": str(dict(zip(keys, values))),
                 }
             )
             return
-        door = known[r["clip"]]["door"]
-        by_visit.setdefault(key, {}).setdefault(door, []).append((r, cycle))
+        key = tuple(_visit_key_part(k, v) for k, v in zip(keys, values))
+        if clip in excluded:
+            excluded_visits.setdefault(key, set()).add(door_of[clip])
+            return
+        by_visit.setdefault(key, {}).setdefault(door_of[clip], []).append((r, cycle))
 
     for r in events:
         if r["match"] in ("matched", "missed"):
@@ -784,70 +871,50 @@ def compare_visits(events, summaries, closed, issues):
         add(r, r, False)
     output = []
     used = set()
-    seen = set()
-    for source in data.to_dict("records"):
-        key = tuple(_clean_id(source[RIDECHECK_COLUMNS[k]]) for k in keys)
-        if not all(key):
-            raise ValueError(f"Blank Ridecheck visit key: {key}")
-        labels = dict(zip(keys, key))
-        columns = RIDECHECK_WIDE or {
-            (
-                "vehicle"
-                if totals
-                else source[RIDECHECK_COLUMNS["door"]].strip().lower()
-            ): tuple(RIDECHECK_COLUMNS[c] for c in COUNTS)
-        }
-        for label, cols in columns.items():
-            identity = (key, label)
-            if identity in seen:
-                raise ValueError(f"Duplicate Ridecheck visit/group: {identity}")
-            seen.add(identity)
-            expected = doors if totals else groups.get(label)
-            if not expected or len(cols) != 2:
-                raise ValueError(f"Invalid Ridecheck group or columns: {label}")
-            members = by_visit.get(key, {})
-            records = [entry for door in expected for entry in members.get(door, [])]
-            used.update((key, d) for d in expected if d in members)
-            status = "compared"
-            if expected - members.keys():
-                status = "missing reviewed door coverage"
-            elif any(
-                len({r["clip"] for r, _ in members[d]}) > 1
-                or (len(members[d]) > 1 and not all(cycle for _, cycle in members[d]))
-                for d in expected
-            ):
-                status = "ambiguous visit coverage"
-            elif any(r["clip"] in unassigned for r, _ in records):
-                status = "unassigned visit label with passenger counts"
-            elif any(r["clip"] in extra for r, _ in records):
-                status = "unassigned extra cycle with passenger counts"
-            row = dict(
-                labels,
-                door_group=label,
-                status=status,
-                manual_cycles=sum(cycle for _, cycle in records),
-            )
-            for c, col in zip(COUNTS, cols):
-                comparator = optional_count(source[col], str(identity))
-                row["ridecheck_" + c] = comparator
-                if status == "compared":
-                    model = sum(r.get(c, 0) for r, _ in records)
-                    row["model_" + c] = model
-                    if comparator is not None:
-                        row["difference_" + c] = model - comparator
-            if status != "compared" or any(
-                row["ridecheck_" + c] is None for c in COUNTS
-            ):
-                issues.append(
-                    dict(
-                        labels,
-                        door_group=label,
-                        issue=status
-                        if status != "compared"
-                        else "blank Ridecheck count",
-                    )
+    for entry in ridecheck["entries"]:
+        key, labels, label = entry["key"], entry["labels"], entry["label"]
+        expected = entry["expected"]
+        members = by_visit.get(key, {})
+        records = [item for door in expected for item in members.get(door, [])]
+        used.update((key, d) for d in expected if d in members)
+        status = "compared"
+        if expected & excluded_visits.get(key, set()):
+            status = "footage excluded from validation (partial or calibration clip)"
+        elif expected - members.keys():
+            status = "missing reviewed door coverage"
+        elif any(
+            len({r["clip"] for r, _ in members[d]}) > 1
+            or (len(members[d]) > 1 and not all(cycle for _, cycle in members[d]))
+            for d in expected
+        ):
+            status = "ambiguous visit coverage"
+        elif any(r["clip"] in unassigned for r, _ in records):
+            status = "unassigned visit label with passenger counts"
+        elif any(r["clip"] in extra for r, _ in records):
+            status = "unassigned extra cycle with passenger counts"
+        row = dict(
+            labels,
+            door_group=label,
+            status=status,
+            manual_cycles=sum(cycle for _, cycle in records),
+        )
+        for c in COUNTS:
+            comparator = entry["counts"][c]
+            row["ridecheck_" + c] = comparator
+            if status == "compared":
+                model = sum(r.get(c, 0) for r, _ in records)
+                row["model_" + c] = model
+                if comparator is not None:
+                    row["difference_" + c] = model - comparator
+        if status != "compared" or any(row["ridecheck_" + c] is None for c in COUNTS):
+            issues.append(
+                dict(
+                    labels,
+                    door_group=label,
+                    issue=status if status != "compared" else "blank Ridecheck count",
                 )
-            output.append(row)
+            )
+        output.append(row)
     for key, members in by_visit.items():
         for door in members:
             if (key, door) not in used:
@@ -934,7 +1001,14 @@ def report_clip(info, actual, manual, counted, coverage):
                 r[k + "_error"] = p[k] - q[k]
         if reviewed and counted:
             for c in COUNTS:
-                truth = q[c] if q else (0 if coverage.get(c) else None)
+                if coverage.get(c):
+                    truth = q[c] if q else 0
+                elif status == "matched" and q[c] is not None:
+                    # Incomplete count review: misses and false alarms stay unscored.
+                    truth = q[c]
+                    r["count_scope_" + c] = "matched cycles only"
+                else:
+                    truth = None
                 if truth is not None:
                     r["error_" + c] = (p[c] if p else 0) - truth
                     r["abs_error_" + c] = abs(r["error_" + c])
@@ -985,11 +1059,12 @@ def accuracy(rows):
                 if truth <= 5
                 else "6+"
             )
-            scopes = (
-                ["end-to-end", "matched cycles"]
-                if r["match"] == "matched"
-                else ["end-to-end"]
-            )
+            if r["match"] != "matched":
+                scopes = ["end-to-end"]
+            elif r.get("count_scope_" + c) == "matched cycles only":
+                scopes = ["matched cycles"]
+            else:
+                scopes = ["end-to-end", "matched cycles"]
             for scope in scopes:
                 for dimension, group in [
                     ("overall", "all"),
@@ -1148,6 +1223,12 @@ def process(mode, stem, log):
             issues.append({"clip": path.name, "issue": str(e)})
     if not info_by_path:
         raise ValueError(f"Zero video filenames matched in {VIDEO_DIR}: {issues}")
+    if issues:
+        print(
+            f"Skipped {len(issues)} video file(s) not matching FILENAME_REGEX: "
+            + ", ".join(i["clip"] for i in issues),
+            file=sys.stderr,
+        )
     output = stem.with_suffix(".xlsx")
     if mode == "template":
         dest = stem.with_suffix(".csv")
@@ -1164,12 +1245,15 @@ def process(mode, stem, log):
     failures = 0
     truth, coverage, closed = {}, {}, []
     detector = None
+    ridecheck = None
     if mode in ("doors", "pilot"):
         for name in (TRUTH_PATH, RIDECHECK_PATH):
             if name:
                 log["fingerprints"][str(Path(name).resolve())] = fingerprint(Path(name))
         truth, coverage, closed = load_truth()
     if mode == "pilot":
+        if RIDECHECK_PATH:
+            ridecheck = load_ridecheck()  # Fail before hours of scanning, not after.
         log["fingerprints"][str(MODEL_PATH.resolve())] = fingerprint(MODEL_PATH)
         detector = PersonDetector(MODEL_PATH)
     refs = {}
@@ -1270,9 +1354,13 @@ def process(mode, stem, log):
         row["eligible_validation"] = row["clip"] in eligible
     scored = [r for r in events if r["eligible_validation"]]
     reviewed = [r for r in summaries if r["reviewed"] and r["eligible_validation"]]
-    ride_rows = (
-        compare_visits(events, summaries, closed, issues) if mode == "pilot" else []
-    )
+    ride_rows = []
+    try:
+        ride_rows = compare_visits(events, summaries, closed, issues, ridecheck)
+    except (KeyError, ValueError) as e:  # Keep the clip results; report the failure.
+        failures += 1
+        log["ridecheck_traceback"] = traceback.format_exc()
+        issues.append({"issue": "Ridecheck comparison failed", "detail": str(e)})
     hits = sum(r["matched_cycles"] for r in reviewed)
     manual = sum(r["truth_cycles"] for r in reviewed)
     detected = sum(r["detected_cycles"] for r in reviewed)
@@ -1330,12 +1418,11 @@ def process(mode, stem, log):
             "Reconciliation": (issues, ["clip", "issue", "detail"]),
         },
     )
-    if (
-        failures
-        or not summaries
-        or (TRUTH_PATH and not any(r["reviewed"] for r in summaries))
-    ):
-        raise ValueError(f"Input failure or zero reviewed clips matched. See {output}")
+    if failures or not summaries or (TRUTH_PATH and not reviewed):
+        raise ValueError(
+            "Input failure, or no reviewed clip eligible for validation (partial and "
+            f"calibration-source clips are excluded). See {output}"
+        )
     return output
 
 
