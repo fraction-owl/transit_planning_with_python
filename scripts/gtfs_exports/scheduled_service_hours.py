@@ -17,8 +17,12 @@ arrival of each revenue trip), layover (the vehicle waits at one place between
 movements), TODS pull-out, pull-in and deadhead trips (other TODS_trip_type
 values are totalled as other nonrevenue), and unresolved gaps, where the vehicle
 ends one movement somewhere other than where the next begins with no scheduled
-movement in between. Vehicle revenue hours add layover to revenue trip hours
-when LAYOVER_IN_REVENUE_HOURS is True; vehicle hours run from pull-out to pull-in.
+movement in between. Gaps are measured from the end of the block's latest-ending earlier
+movement, so time any movement covers is never layover. Vehicle revenue hours add layover
+to revenue trip hours when LAYOVER_IN_REVENUE_HOURS is True; vehicle hours run from
+pull-out to pull-in. A trip that starts before an earlier trip of its block ends is an
+overlap: one vehicle cannot run both, so vehicle revenue, nonrevenue and vehicle hours are
+left blank for that block and every total that includes it until its block_id is fixed.
 
 A date's day type is Weekday, Saturday or Sunday, or Holiday for HOLIDAY_DATES (and optionally
 U.S. federal holidays) and, with the GTFS calendar, dates running a service SERVICE_DAY_TYPES
@@ -919,9 +923,12 @@ def block_hours(movements: pd.DataFrame, places: Mapping[str, tuple[str, str]]) 
 
     Trips are grouped by service set and block_id, so a block's trips of different
     service_ids that run on the same dates form one vehicle day. Trips with a blank
-    block_id each form their own block. Gaps where the vehicle stays put are
-    layover; gaps where it changes place with no movement are unresolved.
-    Overlapping movements are counted, not summed as gaps.
+    block_id each form their own block. The vehicle is free once every earlier
+    movement has ended, at the stop where the latest-ending one finished: a gap from
+    then to the next movement is layover if the vehicle stays put and unresolved if
+    it changes place, so time any movement covers is never layover. A movement that
+    starts before the vehicle is free is counted in ``overlaps``: one vehicle cannot
+    run both, so :func:`add_derived` leaves such a block's vehicle-level hours blank.
 
     Args:
         movements: Output of :func:`expand_by_service_set`.
@@ -944,14 +951,17 @@ def block_hours(movements: pd.DataFrame, places: Mapping[str, tuple[str, str]]) 
         overlaps = jumps = 0
         for leg in legs:
             seconds[leg["category"]] += leg["end"] - leg["start"]
-        for before, after in zip(legs, legs[1:]):
-            gap = after["start"] - before["end"]
-            moved = not same_place(before["last_stop"], after["first_stop"], places)
+        latest = legs[0]  # The earlier movement that ends last (the later one on ties).
+        for leg in legs[1:]:
+            gap = leg["start"] - latest["end"]
+            moved = not same_place(latest["last_stop"], leg["first_stop"], places)
             jumps += moved
             if gap < 0:
                 overlaps += 1
             elif gap > 0:
                 seconds["unresolved_gap" if moved else "layover"] += gap
+            if leg["end"] >= latest["end"]:
+                latest = leg
         revenue = [leg for leg in legs if leg["category"] == "revenue"]
         row = {
             "service_ids": service_set,
@@ -971,6 +981,25 @@ def block_hours(movements: pd.DataFrame, places: Mapping[str, tuple[str, str]]) 
     return pd.DataFrame(rows)
 
 
+def warn_on_overlaps(blocks: pd.DataFrame) -> None:
+    """Log the blocks whose trips overlap in time, whose vehicle hours are withheld."""
+    flagged = blocks.loc[blocks["overlaps"] > 0] if not blocks.empty else blocks
+    if flagged.empty:
+        return
+    labels = [f"{b} ({s})" for s, b in zip(flagged["service_ids"], flagged["block_id"])]
+    logging.warning(
+        "%d block(s) have a trip that starts before an earlier trip of the block ends, "
+        "e.g. %s. One vehicle cannot run both, so vehicle revenue, nonrevenue and vehicle "
+        "hours are left blank for these blocks and for every total that includes them "
+        "until the block_ids are fixed (see overlaps in %s, and the negative gaps on the "
+        "Trips sheet of %s).",
+        len(flagged),
+        ", ".join(labels[:5]) + (", ..." if len(labels) > 5 else ""),
+        BLOCK_FILENAME,
+        WORKBOOK_FILENAME,
+    )
+
+
 def _clock(seconds: float) -> str:
     """Format seconds after midnight as ``HH:MM`` (24+ hours allowed)."""
     total = int(seconds) // 60
@@ -981,7 +1010,10 @@ def add_derived(df: pd.DataFrame, layover_in_revenue: bool, movements_known: boo
     """Add vehicle revenue, nonrevenue and vehicle hours.
 
     When *movements_known* is False (no TODS, or TODS not confirmed complete),
-    the TODS columns, nonrevenue hours and vehicle hours are blank (NaN).
+    the TODS columns, nonrevenue hours and vehicle hours are blank (NaN). Rows
+    with ``overlaps`` (a block, or a total that includes one, whose trips overlap
+    in time) have all three blank: the trips need more than one vehicle, so
+    their vehicle time is unknown until the block is fixed.
     """
     out = df.copy()
     layover = out["layover_hours"]
@@ -995,6 +1027,8 @@ def add_derived(df: pd.DataFrame, layover_in_revenue: bool, movements_known: boo
     if not movements_known:
         # Without complete TODS the pull-outs, pull-ins and deadheads are unknown, not zero.
         out[[*TODS_COMPONENTS, "nonrevenue_hours", "vehicle_hours"]] = float("nan")
+    if "overlaps" in out.columns:
+        out.loc[out["overlaps"] > 0, list(DERIVED)] = float("nan")
     return out
 
 
@@ -1173,7 +1207,8 @@ def day_type_hours(services: pd.DataFrame, calendar: pd.DataFrame) -> pd.DataFra
     Returns:
         One row per day type with service: the set (``service_ids``), the dates
         of that type with service (``days``) and running the set (``typical_days``),
-        its ``blocks`` and ``revenue_trips`` and the COMPONENTS (hours).
+        its ``blocks`` and ``revenue_trips``, the COMPONENTS (hours) and its
+        ``overlaps``.
     """
     rows = []
     typical_sets = typical_service_sets(calendar)
@@ -1209,6 +1244,7 @@ def day_type_hours(services: pd.DataFrame, calendar: pd.DataFrame) -> pd.DataFra
             "revenue_trips": int(sub["revenue_trips"]),
         }
         row.update(sub[list(COMPONENTS)].astype(float).to_dict())
+        row["overlaps"] = int(sub["overlaps"])
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -1340,7 +1376,8 @@ def period_hours(services: pd.DataFrame, calendar: pd.DataFrame, cfg: Config) ->
     """Total each period as days x hours per day of each service set, summed over sets.
 
     ``service_sets`` lists each set run in the period with its number of days, so a
-    date running an unusual set (a Friday-only schedule) stays visible.
+    date running an unusual set (a Friday-only schedule) stays visible. ``overlaps``
+    totals the sets' overlaps the same way (days x per day).
     """
     rows = []
     for name, first, last in cfg.periods:
@@ -1349,8 +1386,10 @@ def period_hours(services: pd.DataFrame, calendar: pd.DataFrame, cfg: Config) ->
         schedules = Counter(sub["schedule_day_type"])
         set_days = Counter(s for s in sub["service_set"] if s)
         totals = pd.Series(0.0, index=list(COMPONENTS))
+        overlaps = 0
         for service_set, n_days in set_days.items():
             totals += n_days * services.loc[service_set, list(COMPONENTS)].astype(float)
+            overlaps += n_days * int(services.loc[service_set, "overlaps"])
         no_service = int((sub["service_set"] == "").sum())
         row: dict[str, Any] = {
             "period": name,
@@ -1372,6 +1411,7 @@ def period_hours(services: pd.DataFrame, calendar: pd.DataFrame, cfg: Config) ->
             ),
         }
         row.update(totals.to_dict())
+        row["overlaps"] = overlaps
         rows.append(row)
         if no_service:
             logging.warning("Period %s: %d day(s) with no service counted.", name, no_service)
@@ -1414,8 +1454,9 @@ def movement_table(movements: pd.DataFrame, places: Mapping[str, tuple[str, str]
     *movements* is the output of :func:`expand_by_service_set`, so a trip appears
     once per service set it runs in. Trips with a blank block_id each form their
     own block, labelled ``(none: <trip_id>)``. ``stays_put`` is True when the trip
-    starts where the previous trip of the same block ended (same stop ID or same
-    coordinates).
+    starts where the vehicle is once every earlier trip of the block has ended: the
+    stop where the latest-ending one finished (same stop ID or same coordinates), as
+    in :func:`block_hours`.
     """
     df = movements.copy()
     df["block_key"] = df["block_id"].where(df["block_id"] != "", "(none: " + df["trip_id"] + ")")
@@ -1424,28 +1465,49 @@ def movement_table(movements: pd.DataFrame, places: Mapping[str, tuple[str, str]
     same_block = df["service_set"].eq(df["service_set"].shift()) & df["block_key"].eq(
         df["block_key"].shift()
     )
-    previous_end = df["last_stop"].shift()
     df["same_block_as_previous"] = same_block
-    df["stays_put"] = [
-        bool(sb) and same_place(str(prev), str(first), places)
-        for sb, prev, first in zip(same_block, previous_end, df["first_stop"])
-    ]
+    stays_put: list[bool] = []
+    latest_stop, latest_end = "", 0.0
+    for sb, first, last, end in zip(same_block, df["first_stop"], df["last_stop"], df["end"]):
+        stays_put.append(bool(sb) and same_place(str(latest_stop), str(first), places))
+        if not sb or end >= latest_end:
+            latest_stop, latest_end = last, end
+    df["stays_put"] = stays_put
     df["trip_type"] = df["category"].map(TRIP_TYPE_LABELS)
     return df
 
 
-def _derived_formulas(cols: Mapping[str, str], r: int, tods: bool) -> dict[str, Any]:
-    """Formulas for vehicle revenue, nonrevenue and vehicle hours on row *r*."""
+def _withheld_if_overlaps(formula: str, overlaps: str) -> str:
+    """Wrap *formula* to show "n/a" while the *overlaps* cell is above zero."""
+    return f'=IF({overlaps}>0,"n/a",{formula[1:]})'
+
+
+def _derived_formulas(
+    cols: Mapping[str, str], r: int, tods: bool, overlaps_col: str
+) -> dict[str, Any]:
+    """Formulas for vehicle revenue, nonrevenue and vehicle hours on row *r*.
+
+    Each is "n/a" while the row's overlaps (column *overlaps_col*) are above zero.
+    """
     c = {k: f"{v}{r}" for k, v in cols.items()}
     revenue = f"={c['revenue_trip_hours']}+IF({LAYOVER_CELL},{c['layover_hours']},0)"
     if not tods:
-        return {"vehicle_revenue_hours": revenue, "nonrevenue_hours": "n/a", "vehicle_hours": "n/a"}
-    moves = "+".join(c[k] for k in TODS_COMPONENTS)
-    first, last = cols["revenue_trip_hours"], cols["unresolved_gap_hours"]
+        formulas = {
+            "vehicle_revenue_hours": revenue,
+            "nonrevenue_hours": "n/a",
+            "vehicle_hours": "n/a",
+        }
+    else:
+        moves = "+".join(c[k] for k in TODS_COMPONENTS)
+        first, last = cols["revenue_trip_hours"], cols["unresolved_gap_hours"]
+        formulas = {
+            "vehicle_revenue_hours": revenue,
+            "nonrevenue_hours": f"={moves}+IF({LAYOVER_CELL},0,{c['layover_hours']})",
+            "vehicle_hours": f"=SUM({first}{r}:{last}{r})",
+        }
     return {
-        "vehicle_revenue_hours": revenue,
-        "nonrevenue_hours": f"={moves}+IF({LAYOVER_CELL},0,{c['layover_hours']})",
-        "vehicle_hours": f"=SUM({first}{r}:{last}{r})",
+        k: _withheld_if_overlaps(v, f"{overlaps_col}{r}") if v.startswith("=") else v
+        for k, v in formulas.items()
     }
 
 
@@ -1523,8 +1585,11 @@ def write_workbook(
         {2: 26, 3: 30, 5: 16, 7: 18, 8: 18},
     )
     block_rows: dict[tuple[str, str], list[int]] = {}
+    block_start = 2
     for i, t in enumerate(trips.to_dict("records")):
         r = i + 2
+        if not t["same_block_as_previous"]:
+            block_start = r
         ws_t.append(
             [
                 t["service_set"],
@@ -1539,7 +1604,7 @@ def write_workbook(
                 t["end"] / 86400,
                 f"=(J{r}-I{r})*24",
                 bool(t["same_block_as_previous"]),
-                f"=IF(L{r},(I{r}-J{r - 1})*24,0)" if r > 2 else 0,
+                (f"=IF(L{r},(I{r}-MAX(J{block_start}:J{r - 1}))*24,0)" if r > block_start else 0),
                 bool(t["stays_put"]),
                 f"=IF(AND(M{r}>0,N{r}),M{r},0)",
                 f"=IF(AND(M{r}>0,NOT(N{r})),M{r},0)",
@@ -1562,9 +1627,11 @@ def write_workbook(
         "Nonrevenue trips",
         *COMPONENT_LABELS.values(),
         *DERIVED_LABELS.values(),
+        "Overlaps",
     ]
     ws_b = _sheet(wb, "Blocks", block_headers, {2: 26, 3: 18})
     b_cols = {c: get_column_letter(7 + i) for i, c in enumerate(component_cols)}
+    b_overlaps = get_column_letter(7 + len(component_cols) + len(DERIVED))
     sums = {
         "revenue_trip_hours": ("K", "revenue"),
         "pull_out_hours": ("K", "pull-out"),
@@ -1590,7 +1657,7 @@ def write_workbook(
             else:
                 src = "O" if column == "layover_hours" else "P"
                 values[column] = f"=SUM(Trips!${src}${a}:${src}${b})"
-        values.update(_derived_formulas(b_cols, r, movements_known))
+        values.update(_derived_formulas(b_cols, r, movements_known, b_overlaps))
         ws_b.append(
             [
                 sid,
@@ -1600,6 +1667,7 @@ def write_workbook(
                 f'=COUNTIFS(Trips!$D${a}:$D${b},"revenue")',
                 f"=ROWS(Trips!$D${a}:$D${b})-E{r}",
                 *(values[c] for c in (*component_cols, *DERIVED)),
+                f'=COUNTIF(Trips!$M${a}:$M${b},"<0")',
             ]
         )
         for idx in range(7, 7 + len(component_cols) + len(DERIVED)):
@@ -1618,10 +1686,12 @@ def write_workbook(
             "Revenue trips",
             *COMPONENT_LABELS.values(),
             *DERIVED_LABELS.values(),
+            "Overlaps",
         ],
         {2: 20},
     )
     s_cols = {c: get_column_letter(6 + i) for i, c in enumerate(component_cols)}
+    s_overlaps = get_column_letter(6 + len(component_cols) + len(DERIVED))
     service_row: dict[str, int] = {}
     for i, sid in enumerate(services):
         r = i + 2
@@ -1630,7 +1700,7 @@ def write_workbook(
             c: "n/a" if n_a(c) else f"=SUM(Blocks!{b_cols[c]}{a}:{b_cols[c]}{b})"
             for c in component_cols
         }
-        values.update(_derived_formulas(s_cols, r, movements_known))
+        values.update(_derived_formulas(s_cols, r, movements_known, s_overlaps))
         ws_s.append(
             [
                 sid,
@@ -1639,6 +1709,7 @@ def write_workbook(
                 f"=ROWS(Blocks!A{a}:A{b})",
                 f"=SUM(Blocks!E{a}:E{b})",
                 *(values[c] for c in (*component_cols, *DERIVED)),
+                f"=SUM(Blocks!{b_overlaps}{a}:{b_overlaps}{b})",
             ]
         )
         for idx in range(6, 6 + len(component_cols) + len(DERIVED)):
@@ -1725,10 +1796,12 @@ def write_workbook(
             "Service days",
             *COMPONENT_LABELS.values(),
             *DERIVED_LABELS.values(),
+            "Overlaps",
         ],
         {1: 18, 2: 12, 3: 12, 4: 16},
     )
     p_cols = {c: get_column_letter(6 + i) for i, c in enumerate(component_cols)}
+    p_overlaps = get_column_letter(6 + len(component_cols) + len(DERIVED))
     r = 1
     for name, first, last in cfg.periods:
         first_row = r + 1
@@ -1738,7 +1811,7 @@ def write_workbook(
             values = {
                 c: "n/a" if n_a(c) else f"=$E{r}*Services!{s_cols[c]}{srow}" for c in component_cols
             }
-            values.update(_derived_formulas(p_cols, r, movements_known))
+            values.update(_derived_formulas(p_cols, r, movements_known, p_overlaps))
             ws_p.append(
                 [
                     name,
@@ -1747,6 +1820,7 @@ def write_workbook(
                     sid,
                     f"=SUMIFS(Calendar!{c_cols[sid]}:{c_cols[sid]},Calendar!$A:$A,$A{r})",
                     *(values[c] for c in (*component_cols, *DERIVED)),
+                    f"=$E{r}*Services!{s_overlaps}{srow}",
                 ]
             )
         r += 1
@@ -1759,7 +1833,11 @@ def write_workbook(
                 DERIVED_LABELS["nonrevenue_hours"],
                 DERIVED_LABELS["vehicle_hours"],
             )
-            totals.append("n/a" if unknown else f"=SUM({col}{first_row}:{col}{r - 1})")
+            total = f"=SUM({col}{first_row}:{col}{r - 1})"
+            if header in DERIVED_LABELS.values():
+                total = _withheld_if_overlaps(total, f"{p_overlaps}{r}")
+            totals.append("n/a" if unknown else total)
+        totals.append(f"=SUM({p_overlaps}{first_row}:{p_overlaps}{r - 1})")
         ws_p.append([name, _parse_date(first), _parse_date(last), "All service sets", "", *totals])
         for cell in ws_p[r]:
             cell.font = Font(bold=True)
@@ -1794,9 +1872,20 @@ def write_workbook(
             "",
             "One row per revenue (GTFS) or nonrevenue (TODS) trip, in block order, "
             "under each service set (the services that run together on a date) that "
-            "includes the trip's service. Duration h = (End - Start) x 24. A positive gap "
-            "where the vehicle stays at the same place is layover; a positive gap where "
-            "it changes place with no trip in between is an unresolved gap.",
+            "includes the trip's service. Duration h = (End - Start) x 24. Gap before h = "
+            "Start - the latest End among the block's earlier rows, so time any trip covers "
+            "is never a gap. A positive gap where the vehicle stays at the same place (where "
+            "that latest-ending trip finished) is layover; a positive gap where it changes "
+            "place with no trip in between is an unresolved gap. A negative gap is an "
+            "overlap: the trip starts before an earlier trip of the block ends.",
+        ),
+        (
+            "Overlaps",
+            "",
+            "Trips that start before an earlier trip of their block ends. One vehicle cannot "
+            "run both, so vehicle revenue, nonrevenue and vehicle hours are n/a for a block "
+            "with overlaps and for every service set and period total that includes it, "
+            "until the block_ids are fixed.",
         ),
         ("Blocks", "", "Sums of each block's Trips rows (row range shown)."),
         (
@@ -1959,6 +2048,7 @@ def run(cfg: Config) -> dict[str, pd.DataFrame]:
         logging.warning("Service(s) with trips that never run, left out: %s", ", ".join(idle))
     movements = expand_by_service_set(schedule.movements, sets)
     blocks = block_hours(movements, schedule.stop_places)
+    warn_on_overlaps(blocks)
     known = movement_coverage_confirmed(blocks, schedule.tods_supplied, cfg.tods_movements_complete)
     services = service_hours(blocks)
     set_day_types: dict[str, set[str]] = {}
@@ -2003,12 +2093,17 @@ def run(cfg: Config) -> dict[str, pd.DataFrame]:
         f"TODS movements:    {'confirmed complete' if known else 'not used (n/a)'}",
         f"Service sets:      {len(services)}",
         f"Blocks (per set):  {len(blocks)}",
+        f"Overlap blocks:    {int((blocks['overlaps'] > 0).sum()) if not blocks.empty else 0}",
         f"Period calendar:   {cfg.period_calendar}",
     ]
+
+    def _hours(value: float, width: int) -> str:
+        return ("n/a" if pd.isna(value) else f"{value:.2f}").rjust(width)
+
     for row in tables["day_type"].to_dict("records"):
         summary.append(
-            f"{row['day_type']:<9} vehicle revenue h {row['vehicle_revenue_hours']:>9.2f}  "
-            f"nonrevenue h {row['nonrevenue_hours']:>8.2f}"
+            f"{row['day_type']:<9} vehicle revenue h {_hours(row['vehicle_revenue_hours'], 9)}  "
+            f"nonrevenue h {_hours(row['nonrevenue_hours'], 8)}"
         )
     if not write_run_log(cfg.output_dir, summary) and REQUIRE_RUN_LOG:
         raise RuntimeError(
@@ -2118,10 +2213,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 1
     for row in tables["period"].to_dict("records"):
         logging.info(
-            "%s: %.1f vehicle revenue hours, %s nonrevenue hours.",
+            "%s: %s vehicle revenue hours, %s nonrevenue hours.",
             row["period"],
-            row["vehicle_revenue_hours"],
-            "n/a" if pd.isna(row["nonrevenue_hours"]) else f"{row['nonrevenue_hours']:.1f}",
+            *(
+                "n/a" if pd.isna(row[c]) else f"{row[c]:.1f}"
+                for c in ("vehicle_revenue_hours", "nonrevenue_hours")
+            ),
         )
     logging.info("Script completed successfully.")
     return 0

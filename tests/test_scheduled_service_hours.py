@@ -313,6 +313,63 @@ TWO_HOUR_BLOCK = {
 }
 
 
+OVERLAPPING_BLOCK = {
+    "T1": ("A", "A", "08:00:00", "10:00:00"),
+    "T2": ("A", "A", "08:15:00", "08:30:00"),  # Starts while T1 is still running.
+    "T3": ("A", "A", "09:00:00", "09:15:00"),  # So does this one.
+}
+
+
+def overlapping_block(tmp_path: Path) -> dict[str, pd.DataFrame]:
+    return run_feed(
+        tmp_path,
+        [(t, "wk", "B1") for t in OVERLAPPING_BLOCK],
+        OVERLAPPING_BLOCK,
+        [calendar_row("wk", DAYS[:5])],
+    )
+
+
+def test_time_an_earlier_trip_covers_is_not_layover(tmp_path: Path) -> None:
+    (block,) = overlapping_block(tmp_path)["block"].to_dict("records")
+    # T2 ends at 08:30 and T3 starts at 09:00, but T1 runs until 10:00.
+    assert block["layover_hours"] == 0.0
+    assert block["overlaps"] == 2
+    assert block["revenue_trip_hours"] == 2.5
+
+
+def test_overlapping_block_withholds_vehicle_hours(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level("WARNING"):
+        tables = overlapping_block(tmp_path)
+    for key in ("block", "service", "day_type", "period"):
+        row = tables[key].iloc[0]
+        assert row["overlaps"] > 0, key
+        assert all(math.isnan(row[c]) for c in target.DERIVED), key
+    assert tables["period"].iloc[0]["revenue_trip_hours"] == 21 * 2.5
+    assert "B1 (wk)" in caplog.text
+
+
+def test_gap_after_an_overlap_starts_where_the_latest_trip_ends(tmp_path: Path) -> None:
+    # T2 runs inside T1 and ends at A; the vehicle is free at 09:00 at B, where T1
+    # ends, so T3 from B at 09:30 follows half an hour of layover, not an unresolved
+    # gap from A starting at 07:00.
+    tables = run_feed(
+        tmp_path,
+        [(t, "wk", "B1") for t in ("T1", "T2", "T3")],
+        {
+            "T1": ("A", "B", "06:00:00", "09:00:00"),
+            "T2": ("A", "A", "06:30:00", "07:00:00"),
+            "T3": ("B", "A", "09:30:00", "10:00:00"),
+        },
+        [calendar_row("wk", DAYS[:5])],
+    )
+    (block,) = tables["block"].to_dict("records")
+    assert block["layover_hours"] == 0.5
+    assert block["unresolved_gap_hours"] == 0.0
+    assert block["overlaps"] == 1
+
+
 @pytest.mark.parametrize("services", [("wk", "wk"), ("wkA", "wkB")])
 def test_block_across_services_with_the_same_days_keeps_its_layover(
     tmp_path: Path, services: tuple[str, str]
@@ -936,7 +993,10 @@ def test_workbook_formulas_trace_back_to_trip_times(mock_run: tuple) -> None:
         service_row["Revenue trip h"].startswith("=$E")
         and "Services!" in service_row["Revenue trip h"]
     )
-    assert period_totals(wb)["November 2026"]["Vehicle h"].startswith("=SUM(")
+    # The total sums the service rows, or is "n/a" while any of their blocks overlap.
+    vehicle_total = period_totals(wb)["November 2026"]["Vehicle h"]
+    assert vehicle_total.startswith("=IF(") and ',"n/a",SUM(' in vehicle_total
+    assert period_totals(wb)["November 2026"]["Overlaps"].startswith("=SUM(")
     block = sheet_rows(wb["Blocks"])[0]
     assert block["Revenue trip h"].startswith("=SUMIFS(Trips!$K$")
     trip = sheet_rows(wb["Trips"])[1]
@@ -1027,6 +1087,23 @@ def test_workbook_matches_the_csv_for_blocks_across_services(tmp_path: Path) -> 
         label = target.COMPONENT_LABELS[column]
         assert total[label] == pytest.approx(nov[column], abs=0.01), label
     assert total["Vehicle revenue h"] == pytest.approx(nov["vehicle_revenue_hours"], abs=0.01)
+
+
+@needs_libreoffice
+def test_workbook_matches_the_csv_for_overlapping_trips(tmp_path: Path) -> None:
+    tables = overlapping_block(tmp_path)
+    wb = recalculate(tmp_path / "out" / target.WORKBOOK_FILENAME, tmp_path)
+    trips = {r["Trip ID"]: r for r in sheet_rows(wb["Trips"])}
+    # Gaps run from the latest end so far (T1's 10:00), not the previous row's end.
+    assert trips["T3"]["Gap before h"] == pytest.approx(-1.0)
+    (block,) = sheet_rows(wb["Blocks"])
+    assert block["Layover h"] == 0 and block["Overlaps"] == 2
+    total = period_totals(wb)["Nov"]
+    nov = tables["period"].iloc[0]
+    assert total["Revenue trip h"] == pytest.approx(nov["revenue_trip_hours"], abs=0.01)
+    assert total["Overlaps"] == nov["overlaps"]
+    for label in target.DERIVED_LABELS.values():
+        assert block[label] == total[label] == "n/a", label
 
 
 def test_workbook_without_tods_marks_unknowns(tmp_path: Path) -> None:
