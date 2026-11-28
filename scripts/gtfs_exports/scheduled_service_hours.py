@@ -12,17 +12,13 @@ Blocks are rebuilt once for each service set that runs on some date, from the
 trips of every service in that set: GTFS defines a block by its block_id and
 the days its trips share, so one block can join trips of different service_ids.
 
-Each block's time is split into revenue trip hours (first departure to last
-arrival of each revenue trip), layover (the vehicle waits at one place between
-movements), TODS pull-out, pull-in and deadhead trips (other TODS_trip_type
-values are totalled as other nonrevenue), and unresolved gaps, where the vehicle
-ends one movement somewhere other than where the next begins with no scheduled
-movement in between. Gaps are measured from the end of the block's latest-ending earlier
-movement, so time any movement covers is never layover. Vehicle revenue hours add layover
-to revenue trip hours when LAYOVER_IN_REVENUE_HOURS is True; vehicle hours run from
-pull-out to pull-in. A trip that starts before an earlier trip of its block ends is an
-overlap: one vehicle cannot run both, so vehicle revenue, nonrevenue and vehicle hours are
-left blank for that block and every total that includes it until its block_id is fixed.
+Each block's time is split into revenue trip hours (first departure to last arrival of each
+revenue trip), layover (the vehicle waits at one place between movements), TODS pull-out,
+pull-in and deadhead trips (other TODS_trip_type values are totalled as other nonrevenue), and
+unresolved gaps, where the vehicle ends one movement somewhere other than where the next begins
+with no scheduled movement in between. Vehicle revenue hours add layover to revenue trip hours
+when LAYOVER_IN_REVENUE_HOURS is True; vehicle hours run from pull-out to pull-in. Trips that
+overlap in time leave their block's vehicle-level hours, and every total including it, blank.
 
 A date's day type is Weekday, Saturday or Sunday, or Holiday for HOLIDAY_DATES (and optionally
 U.S. federal holidays) and, with the GTFS calendar, dates running a service SERVICE_DAY_TYPES
