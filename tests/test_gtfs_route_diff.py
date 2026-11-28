@@ -21,6 +21,7 @@ from scripts.stop_analysis.gtfs_route_diff import (
     compare_routes,
     date_range_relationship,
     detect_splits_merges,
+    expand_exact_frequencies,
     expand_service_active_dates,
     feed_date_range,
     fingerprint_times,
@@ -186,6 +187,20 @@ def test_classify_schedule_small_span_change_is_minor() -> None:
     assert tier == "minor"
 
 
+def test_classify_schedule_headway_frequencies_are_not_compared() -> None:
+    # Identical metrics prove nothing when the runs have no exact times.
+    row = _sched_row(4, 1.0, 15.0)
+    tier, detail = classify_schedule(row, row, identical=True, knobs=KNOBS, comparable=False)
+    assert tier == "not_compared"
+    assert "exact_times" in detail
+
+
+def test_classify_schedule_service_added_is_major_even_when_not_comparable() -> None:
+    after = _sched_row(4, 1.0, 15.0)
+    tier, _ = classify_schedule(None, after, identical=False, knobs=KNOBS, comparable=False)
+    assert tier == "major"
+
+
 def test_schedule_fingerprint_distinguishes_shifted_trips() -> None:
     trips = pd.DataFrame({"route_id": ["R1"], "trip_id": ["t1"]})
     st_early = _stop_times([("t1", "a", "1", "08:00:00"), ("t1", "b", "2", "08:30:00")])
@@ -248,6 +263,84 @@ def test_trip_endpoints_first_last_and_runtime() -> None:
     assert ends.loc["t1", "first_stop"] == "a"
     assert ends.loc["t1", "last_stop"] == "c"
     assert ends.loc["t1", "runtime_sec"] == pytest.approx(3600.0)
+
+
+def test_trip_endpoints_start_at_first_departure_and_end_at_last_arrival() -> None:
+    # Dwell at either terminal is not runtime: the trip leaves a at 06:00 and reaches
+    # b at 06:10, even though it waits at b until 06:20.
+    st = pd.DataFrame(
+        {
+            "trip_id": ["t1", "t1"],
+            "stop_id": ["a", "b"],
+            "stop_sequence": ["1", "2"],
+            "arrival_time": ["05:55:00", "06:10:00"],
+            "departure_time": ["06:00:00", "06:20:00"],
+        }
+    )
+    ends = trip_endpoints(st).set_index("trip_id")
+    assert ends.loc["t1", "start_sec"] == 6 * 3600
+    assert ends.loc["t1", "end_sec"] == 6 * 3600 + 600
+    assert ends.loc["t1", "runtime_sec"] == 600
+
+
+def test_trip_endpoints_fall_back_to_the_other_time_when_blank() -> None:
+    st = pd.DataFrame(
+        {
+            "trip_id": ["t1", "t1"],
+            "stop_id": ["a", "b"],
+            "stop_sequence": ["1", "2"],
+            "arrival_time": ["06:00:00", ""],
+            "departure_time": ["", "06:30:00"],
+        }
+    )
+    ends = trip_endpoints(st).set_index("trip_id")
+    assert ends.loc["t1", "start_sec"] == 6 * 3600
+    assert ends.loc["t1", "end_sec"] == 6 * 3600 + 1800
+
+
+def _frequencies(headway_secs: str, exact_times: str) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "trip_id": "t1",
+                "start_time": "06:00:00",
+                "end_time": "07:00:00",
+                "headway_secs": headway_secs,
+                "exact_times": exact_times,
+            }
+        ]
+    )
+
+
+def test_expand_exact_frequencies_runs_up_to_but_not_including_end_time() -> None:
+    trips = pd.DataFrame({"route_id": ["R1"], "trip_id": ["t1"], "service_id": ["WK"]})
+    ends = trip_endpoints(_stop_times([("t1", "a", "1", "06:00:00"), ("t1", "b", "2", "06:20:00")]))
+    run_trips, run_ends, inexact = expand_exact_frequencies(
+        trips, ends, _frequencies("900", "1"), "test"
+    )
+    assert inexact == frozenset()
+    assert sorted(run_trips["trip_id"]) == [
+        "t1@06:00:00",
+        "t1@06:15:00",
+        "t1@06:30:00",
+        "t1@06:45:00",
+    ]
+    assert (run_trips["service_id"] == "WK").all()
+    last = run_ends.set_index("trip_id").loc["t1@06:45:00"]
+    assert last["start_sec"] == 6 * 3600 + 45 * 60
+    assert last["end_sec"] == 7 * 3600 + 5 * 60  # The template's 20-minute runtime.
+    assert last["first_stop"] == "a" and last["last_stop"] == "b"
+
+
+def test_expand_exact_frequencies_keeps_headway_based_templates() -> None:
+    trips = pd.DataFrame({"route_id": ["R1"], "trip_id": ["t1"], "service_id": ["WK"]})
+    ends = trip_endpoints(_stop_times([("t1", "a", "1", "06:00:00"), ("t1", "b", "2", "06:20:00")]))
+    run_trips, run_ends, inexact = expand_exact_frequencies(
+        trips, ends, _frequencies("900", "0"), "test"
+    )
+    assert inexact == frozenset({"t1"})
+    assert list(run_trips["trip_id"]) == ["t1"]
+    assert list(run_ends["trip_id"]) == ["t1"]
 
 
 def test_route_stop_sets_unions_trips() -> None:
@@ -539,6 +632,17 @@ def test_summarize_change_unchanged_when_no_flags() -> None:
     assert summary == "No change detected"
 
 
+def test_summarize_change_schedule_not_compared_is_not_unchanged() -> None:
+    flags = {
+        "status": "present",
+        "schedule_change": "not_compared",
+        "schedule_detail": "headway-based frequencies.txt trips (exact_times 0)",
+    }
+    headline, summary = summarize_change(flags)
+    assert headline == "schedule_not_compared"
+    assert summary.startswith("Schedule not compared (headway-based")
+
+
 def test_summarize_change_detail_parentheses_balanced() -> None:
     # Regression: the detail parenthetical must close even when other parts follow.
     flags = {
@@ -694,6 +798,63 @@ def test_compare_routes_flags_departures_swapped_between_directions() -> None:
     assert r1["schedule_change"] == "minor"
     assert r1["headline_change"] != "unchanged"
     assert r1["schedule_detail"] == "same trip times, moved between directions or terminals"
+
+
+def test_compare_routes_detects_an_earlier_final_arrival() -> None:
+    # The trip now reaches b at 06:10 instead of 06:20 but still leaves b at 06:20:
+    # a 10-minute runtime cut, not an unchanged schedule.
+    def feed(final_arrival: str) -> dict:
+        built = _build_feed(
+            routes=[("R1", "1")],
+            trips=[("R1", "t1", "WK")],
+            stop_times=[("t1", "a", "1", "06:00:00"), ("t1", "b", "2", "06:20:00")],
+        )
+        built["stop_times"].loc[1, "arrival_time"] = final_arrival
+        return built
+
+    results = compare_routes(feed("06:20:00"), feed("06:10:00"), weekday="tuesday", knobs=KNOBS)
+    r1 = results["overview"].iloc[0]
+    assert r1["schedule_change"] == "minor"
+    assert r1["headline_change"] == "minor_schedule"
+
+
+def _frequency_feed(headway_secs: str, exact_times: str) -> dict:
+    feed = _build_feed(
+        routes=[("R1", "1")],
+        trips=[("R1", "t1", "WK")],
+        stop_times=[("t1", "a", "1", "06:00:00"), ("t1", "b", "2", "06:20:00")],
+    )
+    feed["frequencies"] = _frequencies(headway_secs, exact_times)
+    return feed
+
+
+def test_compare_routes_counts_every_exact_frequency_run() -> None:
+    # 30-minute -> 15-minute headway from 06:00 to 07:00: 2 runs -> 4 runs.
+    results = compare_routes(
+        _frequency_feed("1800", "1"), _frequency_feed("900", "1"), weekday="tuesday", knobs=KNOBS
+    )
+    r1 = results["overview"].iloc[0]
+    assert r1["schedule_change"] == "major"
+    assert "trips/day 2->4" in r1["schedule_detail"]
+    assert len(results["schedule"]) == 1
+
+
+def test_compare_routes_identical_exact_frequencies_are_unchanged() -> None:
+    results = compare_routes(
+        _frequency_feed("900", "1"), _frequency_feed("900", "1"), weekday="tuesday", knobs=KNOBS
+    )
+    assert results["overview"].iloc[0]["headline_change"] == "unchanged"
+
+
+def test_compare_routes_marks_headway_frequencies_not_compared() -> None:
+    results = compare_routes(
+        _frequency_feed("1800", "0"), _frequency_feed("900", "0"), weekday="tuesday", knobs=KNOBS
+    )
+    r1 = results["overview"].iloc[0]
+    assert r1["schedule_change"] == "not_compared"
+    assert r1["headline_change"] == "schedule_not_compared"
+    assert results["summary"].schedule_not_compared_count == 1
+    assert len(results["schedule"]) == 1  # Listed with the schedule changes for review.
 
 
 def test_compare_routes_no_reblock_for_block_id_reused_on_another_service_day() -> None:

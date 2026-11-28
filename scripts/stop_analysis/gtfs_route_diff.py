@@ -10,7 +10,10 @@ the service-change buckets planners actually track:
 - major / minor schedule changes (trips/day, span, headway, revenue-hours on a
   representative weekday). "none" means the weekday trips are *identical* (an exact
   fingerprint check of each trip's direction, terminals and times), so shifted
-  individual trips read as a minor change;
+  individual trips read as a minor change. Trips run from ``exact_times=1`` rows in
+  ``frequencies.txt`` count at every scheduled run; a route with headway-based
+  frequency trips (``exact_times`` 0) is marked "not_compared", since its runs have
+  no exact times;
 - candidate route splits (1 -> 2+) and merges (2+ -> 1), inferred from stop-set
   containment and flagged for planner review;
 - reblocking (the set of routes a route interlines with changed: routes interline when
@@ -33,8 +36,8 @@ Design decisions (all threshold knobs live in the CONFIG block and are CLI flags
 Outputs:
     - routes_overview.csv         : one row per route with flags + a plain-English summary
     - routes_eliminated.csv / routes_added.csv : routes only in the before / after feed
-    - routes_alignment_changes.csv, routes_schedule_changes.csv, routes_reblocked.csv,
-      routes_name_attr_changes.csv
+    - routes_alignment_changes.csv, routes_schedule_changes.csv (including routes whose
+      schedule was not compared), routes_reblocked.csv, routes_name_attr_changes.csv
     - routes_daytype_changes.csv  : routes that gained/lost weekday/Saturday/Sunday service
     - routes_split_merge_candidates.csv : heuristic split (1->2+) / merge (2+->1) candidates
     - calendar_changes.csv        : service_ids added/removed/redefined
@@ -103,6 +106,8 @@ ALIGN_MINOR_JACCARD: float = 0.80
 #   minor : the schedule changed but no metric reaches its *_MAJOR knob below.
 #   major : at least one metric change reaches its *_MAJOR knob.
 # Only the major boundary is a knob; "minor vs none" is decided by exact equality.
+# A route with weekday trips from headway-based frequencies.txt rows (exact_times 0)
+# is "not_compared" instead: its runs have no exact times to fingerprint.
 SCHED_TRIPS_PCT_MAJOR: float = 0.30  # fractional change in trips/day
 SCHED_SPAN_MIN_MAJOR: float = 60.0  # absolute change in service span (minutes)
 SCHED_HEADWAY_PCT_MAJOR: float = 0.50  # fractional change in median headway
@@ -180,6 +185,7 @@ class Summary:
     alignment_minor_count: int
     schedule_major_count: int
     schedule_minor_count: int
+    schedule_not_compared_count: int
     reblocked_count: int
     name_changed_count: int
     attr_changed_count: int
@@ -787,6 +793,10 @@ def route_day_types(
 def trip_endpoints(stop_times: pd.DataFrame) -> pd.DataFrame:
     """Per trip: first/last stop_id and start/end/runtime seconds.
 
+    A trip starts at its first stop's departure and ends at its last stop's arrival, so
+    dwell at either terminal is not counted as runtime; each falls back to the other
+    time at that stop when it is blank.
+
     Returns a frame keyed on ``trip_id`` with ``first_stop``, ``last_stop``,
     ``start_sec``, ``end_sec`` and ``runtime_sec`` (NaN runtime guards clock anomalies).
     """
@@ -801,20 +811,134 @@ def trip_endpoints(stop_times: pd.DataFrame) -> pd.DataFrame:
     arr = st["arrival_time"] if "arrival_time" in st.columns else pd.Series("", index=st.index)
     dep = dep.where(dep.astype(str).str.len() > 0)
     arr = arr.where(arr.astype(str).str.len() > 0)
-    st["t_sec"] = time_to_seconds(dep.fillna(arr))
+    st["dep_sec"] = time_to_seconds(dep.fillna(arr))
+    st["arr_sec"] = time_to_seconds(arr.fillna(dep))
 
     idx_first = st.groupby("trip_id")["stop_sequence"].idxmin()
     idx_last = st.groupby("trip_id")["stop_sequence"].idxmax()
-    first = st.loc[idx_first, ["trip_id", "stop_id", "t_sec"]].rename(
-        columns={"stop_id": "first_stop", "t_sec": "start_sec"}
+    first = st.loc[idx_first, ["trip_id", "stop_id", "dep_sec"]].rename(
+        columns={"stop_id": "first_stop", "dep_sec": "start_sec"}
     )
-    last = st.loc[idx_last, ["trip_id", "stop_id", "t_sec"]].rename(
-        columns={"stop_id": "last_stop", "t_sec": "end_sec"}
+    last = st.loc[idx_last, ["trip_id", "stop_id", "arr_sec"]].rename(
+        columns={"stop_id": "last_stop", "arr_sec": "end_sec"}
     )
     out = first.merge(last, on="trip_id", how="inner")
     out["runtime_sec"] = out["end_sec"] - out["start_sec"]
     out.loc[out["runtime_sec"] < 0, "runtime_sec"] = np.nan
     return out[cols]
+
+
+def _hhmmss(seconds: float) -> str:
+    """Format seconds after midnight as ``HH:MM:SS`` (hours may exceed 24)."""
+    total = int(round(seconds))
+    return f"{total // 3600:02d}:{total % 3600 // 60:02d}:{total % 60:02d}"
+
+
+def expand_exact_frequencies(
+    trips: pd.DataFrame,
+    endpoints: pd.DataFrame,
+    frequencies: Optional[pd.DataFrame],
+    label: str,
+) -> tuple[pd.DataFrame, pd.DataFrame, frozenset[str]]:
+    """Replace each exact-times frequency trip with its scheduled runs.
+
+    A frequencies.txt row with ``exact_times=1`` schedules a run at ``start_time`` and
+    every ``headway_secs`` after it, up to but not including ``end_time``. The trip's
+    stop_times are a template, not a run of their own, so the template is replaced in
+    both frames by one row per run (trip_id ``<trip_id>@<HH:MM:SS>``), shifted to leave
+    its first stop at that run's start.
+
+    Headway-based rows (``exact_times`` blank or 0) have no exact departures, and rows
+    with an unreadable window or headway cannot be expanded. Their trips are returned
+    so the caller can mark the routes they run on as not compared; a trip with no
+    expandable row keeps its single template row.
+
+    Args:
+        trips: trips.txt rows (``trip_id`` plus any other columns).
+        endpoints: Output of :func:`trip_endpoints`.
+        frequencies: Parsed frequencies.txt, or None when the feed has none.
+        label: Feed label used in log messages (e.g. ``"before"``).
+
+    Returns:
+        ``(trips, endpoints, inexact_trip_ids)``.
+    """
+    none: frozenset[str] = frozenset()
+    if frequencies is None or frequencies.empty or endpoints.empty:
+        return trips, endpoints, none
+    required = ("trip_id", "start_time", "end_time", "headway_secs")
+    missing = [col for col in required if col not in frequencies.columns]
+    if missing:
+        ids = frozenset(frequencies["trip_id"].astype(str)) if "trip_id" in frequencies else none
+        logging.warning(
+            "%s: frequencies.txt has no %s column(s); its trips' routes are not compared.",
+            label,
+            ", ".join(missing),
+        )
+        return trips, endpoints, ids
+
+    freq = frequencies[frequencies["trip_id"].astype(str).isin(set(endpoints["trip_id"]))]
+    exact_col = freq["exact_times"] if "exact_times" in freq.columns else pd.Series("", freq.index)
+    exact = exact_col.astype(str).str.strip() == "1"
+    start = time_to_seconds(freq["start_time"])
+    end = time_to_seconds(freq["end_time"])
+    headway = pd.to_numeric(freq["headway_secs"], errors="coerce")
+    valid = exact & start.notna() & end.notna() & (headway > 0) & (start < end)
+    inexact = frozenset(freq.loc[~valid, "trip_id"].astype(str))
+    headway_trips = freq.loc[~exact, "trip_id"].nunique()
+    unreadable = int((exact & ~valid).sum())
+    if headway_trips:
+        logging.warning(
+            "%s: %d trip(s) in frequencies.txt run on a headway without exact times "
+            "(exact_times 0); the weekday schedules of their routes are marked not compared.",
+            label,
+            headway_trips,
+        )
+    if unreadable:
+        logging.warning(
+            "%s: %d exact_times row(s) in frequencies.txt have an unreadable time window or "
+            "headway; the weekday schedules of their trips' routes are marked not compared.",
+            label,
+            unreadable,
+        )
+
+    runs = [
+        (str(trip_id), float(run))
+        for trip_id, s, e, h in zip(
+            freq.loc[valid, "trip_id"], start[valid], end[valid], headway[valid]
+        )
+        for run in np.arange(s, e, float(h))
+    ]
+    if not runs:
+        return trips, endpoints, inexact
+    starts = pd.DataFrame(runs, columns=["trip_id", "_run_start"]).drop_duplicates()
+    expanded_ids = set(starts["trip_id"])
+    runs_ends = endpoints[endpoints["trip_id"].isin(expanded_ids)].merge(starts, on="trip_id")
+    runs_ends["end_sec"] = runs_ends["end_sec"] + runs_ends["_run_start"] - runs_ends["start_sec"]
+    runs_ends["start_sec"] = runs_ends["_run_start"]
+    runs_ends["_run_id"] = runs_ends["trip_id"] + "@" + runs_ends["_run_start"].map(_hhmmss)
+    id_map = runs_ends[["trip_id", "_run_id"]]
+    runs_ends = runs_ends.drop(columns=["trip_id", "_run_start"]).rename(
+        columns={"_run_id": "trip_id"}
+    )
+    run_trips = (
+        trips.merge(id_map, on="trip_id")
+        .drop(columns="trip_id")
+        .rename(columns={"_run_id": "trip_id"})[trips.columns]
+    )
+    logging.info(
+        "%s: frequencies.txt: %d exact-times trip(s) expanded to %d scheduled run(s).",
+        label,
+        len(expanded_ids),
+        len(runs_ends),
+    )
+    out_trips = pd.concat(
+        [trips[~trips["trip_id"].isin(expanded_ids)], run_trips], ignore_index=True
+    )
+    out_ends = pd.concat(
+        [endpoints[~endpoints["trip_id"].isin(expanded_ids)], runs_ends[endpoints.columns]],
+        ignore_index=True,
+    )
+    return out_trips, out_ends, inexact
 
 
 def route_stop_sets(trips: pd.DataFrame, stop_times: pd.DataFrame) -> dict[str, frozenset[str]]:
@@ -962,6 +1086,7 @@ def classify_schedule(
     identical: bool,
     knobs: dict[str, float],
     same_times: bool = False,
+    comparable: bool = True,
 ) -> tuple[str, str]:
     """Classify a route's schedule change and describe the deltas.
 
@@ -969,7 +1094,10 @@ def classify_schedule(
     (``identical`` is True); a route running on the representative weekday in only one
     feed is ``"major"`` (weekday service added/dropped); otherwise the magnitude of the
     trips/day, span and headway deltas decides ``"minor"`` vs ``"major"`` against the
-    ``*_major`` knobs.
+    ``*_major`` knobs. A route whose weekday trips run on a headway without exact
+    times (``comparable`` is False) is ``"not_compared"`` unless service was added or
+    dropped: its runs are not individually scheduled, so neither "none" nor a
+    magnitude can be claimed.
 
     Args:
         before: The route's before-feed metric row (or None if it runs no weekday trips).
@@ -979,14 +1107,19 @@ def classify_schedule(
         same_times: Whether the two feeds' trips have the same start/end times, so a
             fingerprint difference comes only from directions or terminal pairs. Picks
             the description when no summary metric moved.
+        comparable: False when either feed runs the route's weekday trips from
+            headway-based frequencies.txt rows (``exact_times`` 0).
 
     Returns:
-        ``(tier, description)`` where tier is ``"none"``/``"minor"``/``"major"``.
+        ``(tier, description)`` where tier is ``"none"``/``"minor"``/``"major"``, or
+        ``"not_compared"``.
     """
     if before is None and after is None:
         return "none", ""
     if (before is None) != (after is None):
         return "major", "weekday service added" if before is None else "weekday service dropped"
+    if not comparable:
+        return "not_compared", "headway-based frequencies.txt trips (exact_times 0)"
     if identical:
         return "none", ""
 
@@ -1515,6 +1648,7 @@ _HEADLINE_PRIORITY: tuple[str, ...] = (
     "daytype_change",
     "fare_change",
     "attr_change",
+    "schedule_not_compared",
     "unchanged",
 )
 
@@ -1564,6 +1698,9 @@ def summarize_change(flags: dict[str, object]) -> tuple[str, str]:
     elif sched == "minor":
         present.add("minor_schedule")
         parts.append(_labeled("Minor schedule change", flags.get("schedule_detail")))
+    elif sched == "not_compared":
+        present.add("schedule_not_compared")
+        parts.append(_labeled("Schedule not compared", flags.get("schedule_detail")))
 
     if flags.get("split_merge"):
         present.add("split_merge")
@@ -1633,7 +1770,16 @@ def compare_routes(
     stops_b = route_stop_sets(trips_b, st_b)
     stops_a = route_stop_sets(trips_a, st_a)
     ends_b, ends_a = trip_endpoints(st_b), trip_endpoints(st_a)
-    terms_b, terms_a = route_terminals(trips_b, ends_b), route_terminals(trips_a, ends_a)
+    # Trips as scheduled: each exact-times frequencies.txt template becomes its runs.
+    # Stop sets above use the templates, since every run serves the same stops.
+    run_trips_b, ends_b, inexact_b = expand_exact_frequencies(
+        trips_b, ends_b, before.get("frequencies"), "before"
+    )
+    run_trips_a, ends_a, inexact_a = expand_exact_frequencies(
+        trips_a, ends_a, after.get("frequencies"), "after"
+    )
+    terms_b = route_terminals(run_trips_b, ends_b)
+    terms_a = route_terminals(run_trips_a, ends_a)
 
     # Correspondence (matched / rekeyed / eliminated / added).
     corr = build_correspondence(routes_b, routes_a, stops_b, stops_a, knobs["rekey_jaccard"])
@@ -1668,8 +1814,19 @@ def compare_routes(
                 label,
                 weekday,
             )
-    wk_trips_b = trips_b[trips_b["service_id"].astype(str).str.strip().isin(sids_b)]
-    wk_trips_a = trips_a[trips_a["service_id"].astype(str).str.strip().isin(sids_a)]
+
+    def _on_weekday(trips: pd.DataFrame, sids: object) -> pd.DataFrame:
+        return trips[trips["service_id"].astype(str).str.strip().isin(sids)]
+
+    def _headway_routes(trips: pd.DataFrame, sids: object, inexact: frozenset[str]) -> set[str]:
+        """Routes with a weekday trip that runs on a headway without exact times."""
+        wk = _on_weekday(trips, sids)
+        return set(wk.loc[wk["trip_id"].isin(inexact), "route_id"].astype(str))
+
+    wk_trips_b = _on_weekday(run_trips_b, sids_b)
+    wk_trips_a = _on_weekday(run_trips_a, sids_a)
+    headway_b = _headway_routes(trips_b, sids_b, inexact_b)
+    headway_a = _headway_routes(trips_a, sids_a, inexact_a)
     sched_b = route_schedule_metrics(wk_trips_b, ends_b).set_index("route_id")
     sched_a = route_schedule_metrics(wk_trips_a, ends_a).set_index("route_id")
     fp_b = schedule_fingerprint(wk_trips_b, ends_b)
@@ -1787,7 +1944,12 @@ def compare_routes(
                 fp_a[after_id]
             )
             sched_tier, sched_detail = classify_schedule(
-                b_sched, a_sched, sched_identical, knobs, same_times=same_times
+                b_sched,
+                a_sched,
+                sched_identical,
+                knobs,
+                same_times=same_times,
+                comparable=before_id not in headway_b and after_id not in headway_a,
             )
 
         # Reblocking.
@@ -1892,7 +2054,7 @@ def compare_routes(
         else overview
     )
     schedule_df = (
-        _subset(overview["schedule_change"].isin(["minor", "major"]))
+        _subset(overview["schedule_change"].isin(["minor", "major", "not_compared"]))
         if not overview.empty
         else overview
     )
@@ -1936,6 +2098,7 @@ def compare_routes(
         alignment_minor_count=_count(overview, "alignment_change", "minor"),
         schedule_major_count=_count(overview, "schedule_change", "major"),
         schedule_minor_count=_count(overview, "schedule_change", "minor"),
+        schedule_not_compared_count=_count(overview, "schedule_change", "not_compared"),
         reblocked_count=int(overview["reblocked"].sum()) if not overview.empty else 0,
         name_changed_count=int(overview["name_change"].sum()) if not overview.empty else 0,
         attr_changed_count=(
@@ -2071,7 +2234,7 @@ def run_compare(
     summary: Summary = results["summary"]  # type: ignore[assignment]
     logging.info(
         "Done. eliminated=%d added=%d rekeyed=%d | alignment major/minor=%d/%d | "
-        "schedule major/minor=%d/%d | reblocked=%d | unchanged=%d",
+        "schedule major/minor/not compared=%d/%d/%d | reblocked=%d | unchanged=%d",
         summary.eliminated_count,
         summary.added_count,
         summary.rekeyed_count,
@@ -2079,6 +2242,7 @@ def run_compare(
         summary.alignment_minor_count,
         summary.schedule_major_count,
         summary.schedule_minor_count,
+        summary.schedule_not_compared_count,
         summary.reblocked_count,
         summary.unchanged_count,
     )
